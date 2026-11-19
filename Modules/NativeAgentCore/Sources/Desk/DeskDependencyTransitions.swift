@@ -145,41 +145,6 @@ extension SwiftNativeDeskStore {
             return true
         }
     }
-    /// Automatic completion requires the exact reservation’s typed goal_satisfied outcome and unchanged artifacts.
-    /// Prose cannot stand in for completion evidence.
-    @discardableResult
-    public func closePursuitIfGoalSatisfied(
-        _ handle: String,
-        reservationId: String,
-        expectedUpdatedAt: String,
-        outcomeSummary: String
-    ) async throws -> Bool {
-        try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            let feed = try await readFeedUnlocked()
-            let state = Self.compact(base: feed.base, feed.ops)
-            guard let item = state.items.first(where: { $0.handle == handle }) else {
-                throw DeskError.unknownHandle(handle)
-            }
-            guard item.isPursuit, !item.status.isTerminal,
-                  item.updatedAt == expectedUpdatedAt,
-                  let reservation = item.workAttempts.first(where: {
-                      $0.lane == .pursuit && $0.attemptId == reservationId
-                  }),
-                  reservation.completedAt != nil,
-                  reservation.disposition == .goalSatisfied else {
-                return false
-            }
-            var op = DeskOp(
-                handle: handle,
-                body: .closeItem(outcomeSummary: outcomeSummary, status: .done)
-            )
-            try Self.validateHierarchyTransition(op, in: state)
-            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return true
-        }
-    }
     /// Reopen contradictory terminal ancestors with compensating events, preserving canonical history.
     /// Recovery is explicit so liveState remains a pure read.
     @discardableResult

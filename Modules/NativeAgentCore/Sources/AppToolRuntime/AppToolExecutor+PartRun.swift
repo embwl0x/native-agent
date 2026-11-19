@@ -105,15 +105,7 @@ extension AppToolExecutor {
         let row: [String: JSONValue]?
         do { row = try Parts(root: root).row(id) }
         catch {
-            // Unsettled, the journal moves to the private run store on disk under the same reference; the result names it, never its raw answers.
-            if let named = reference?.stringValue, let journal = OwnedProgramRunner.journal(reference) {
-                do {
-                    try await PartRunStore.keepJournal(journal, reference: named, root: root)
-                    out["unsettled_journal"] = .string(named)
-                } catch let kept {
-                    out = partSettlementFailure(out, error: kept, operation: "ability.unsettled_journal", id: named, root: root)
-                }
-            }
+            _ = OwnedProgramRunner.journal(reference)
             return .object(partSettlementFailure(out, error: error, operation: "ability.metadata", id: id, root: root))
         }
         let calls = OwnedProgramRunner.journal(reference)
@@ -282,9 +274,10 @@ extension AppToolExecutor {
             }
         }
         if let requestedAbility, Self.doorText(run["skill"]) != requestedAbility {
-            return await checkpoint(Self.doorRefusal("wrong_ability", "\(runID) is not a stopped run of \(requestedAbility). Nothing ran.",
-                remedy: "select_run", "Read the saved run ids and choose this ability's run_id.",
-                next: ["page": .string("tools")], extra: ["id": .string(requestedAbility), "run_id": .string(runID)]), consume: false)
+            return await checkpoint(Self.failure("wrong_ability", "\(runID) is not a stopped run of \(requestedAbility). Nothing ran.",
+                extra: ["id": .string(requestedAbility), "run_id": .string(runID), "remedy": .object(["kind": .string("select_run"),
+                    "instruction": .string("Read the saved run ids and choose this ability's run_id."),
+                    "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("tools")])])])]), consume: false)
         }
         let steer: (sources: [String], elevated: [String])
         do { steer = try PeerDataTaint.steer(in: run["steer"]) }
@@ -366,11 +359,10 @@ extension AppToolExecutor {
                 operation: "ability.resume_queue", id: runID, root: root))
         }
         func closed(_ reason: String, _ why: String) async -> JSONValue {
-            await checkpoint(settled(Self.doorRefusal(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
-                : " Run \(runID) is closed; nothing ran."), remedy: "none", """
+            await checkpoint(settled(Self.failure(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
+                : " Run \(runID) is closed; nothing ran."), extra: ["id": .string(id), "remedy": .object(["kind": .string("none"), "instruction": .string("""
                     Read the ability and affected state before choosing what remains; do not repeat completed effects.
-                    """,
-                extra: ["id": .string(id)])), consume: true)
+                    """), "next_call": .null])])), consume: true)
         }
         let row: [String: JSONValue]?
         do { row = try Parts(root: root).row(id) }

@@ -24,7 +24,7 @@ public enum MemoryApprovalTransactions {
             case "approved":
                 let rows = MemoryKindBackfill.rowProposals(fromPayload: rec.payload)
                 guard !rows.isEmpty else {
-                    throw ApprovalInboxError.malformedResponse("kind-backfill payload carries no row proposals")
+                    return ApprovalExecution.notDone("kind-backfill payload carries no row proposals")
                 }
                 let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
                 let outcome = try await MemoryKindBackfill.apply(rows, storage: storage)

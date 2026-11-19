@@ -1,11 +1,16 @@
 @_exported import AgentLinkTransport
 import Foundation
-// Blueprint: | `AgentLinkTransport.swift` | Re-exports `AgentLinkTransport` |
+// Blueprint: | `AgentLinkTransport.swift` | Conversation transport callbacks retain task handles before forwarding live progress. |
 
 extension AgentPeerHTTP {
     public static func send(conversation: AgentConversationContext, _ request: AgentA2AWire.Request, bearerToken: String? = nil,
                             timeout: TimeInterval = 45) async throws -> Response {
-        try await send(request, bearerToken: bearerToken, timeout: timeout, liveUpdate: conversationLiveUpdate(conversation: conversation))
+        try await send(request, bearerToken: bearerToken, timeout: timeout, liveUpdate: conversationLiveUpdate(conversation: conversation),
+            taskOpened: { task in
+                guard let target = conversation.liveTarget else { return }
+                try AgentConversationStore(dataRoot: target.dataRoot).handle(target, readInput: [
+                    "agent": .string(target.agent), "task_id": .string(task), "details": .bool(true)])
+            })
     }
 
     private static func conversationLiveUpdate(conversation: AgentConversationContext) -> LiveUpdateSink? {

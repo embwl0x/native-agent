@@ -215,7 +215,7 @@ extension AdaptiveMemoryPromoter {
         }
         // Include pending ids so updates can retire them; hold the turn if its memory history is unreadable.
         var existing: [MemoryManagerExistingMemory] = []
-        var forgotten: [String] = []
+        var standing = 0
         var pendingRows: [ProposalRecord] = []
         var factsReadable = true
         var factsBasis: OwedBasis?
@@ -225,8 +225,8 @@ extension AdaptiveMemoryPromoter {
             factsBasis = await beforeJudgment(.memory)
             factEmbeddingBasis = await beforeJudgment(.embedding)
             do {
-                existing = try await memory.recall(
-                    MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK),
+                let recalled = try await memory.recall(
+                    MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK, surface: surface),
                     recordingUsage: false
                 ).scored.map {
                     MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
@@ -235,36 +235,33 @@ extension AdaptiveMemoryPromoter {
                 }
                 // A newer ruling must be judged against every current pin, even when recall ranks its old wording elsewhere.
                 let now = Date()
-                for record in try await memory.listMemory(kind: nil).filter({
-                    $0.pinned == true && $0.status == "active"
+                let eligible = try await memory.listMemory(kind: nil).filter {
+                    $0.status == "active"
                         && !MemoryStorage.metadataFlag($0.extras, MemoryStorage.pendingAdmissionKey)
                         && MemoryRecordDisclosurePolicy.classify($0, at: now)?.permits(surface: surface, personaID: nil) == true
-                }) where !existing.contains(where: { $0.id == record.id }) {
-                    existing.append(MemoryManagerExistingMemory(id: record.id, content: record.text,
-                        correctionSubject: record.extras?.objectValue?["correction_subject"]?.stringValue, kind: record.memoryKind))
                 }
-                for record in try await memory.listMemory(kind: "correction")
-                    .filter({ ($0.status ?? "active") == "active"
-                        && !MemoryStorage.metadataFlag($0.extras, MemoryStorage.pendingAdmissionKey) })
-                    .sorted(by: { ($0.createdAt ?? "") > ($1.createdAt ?? "") }).prefix(24) {
-                    let subject = record.extras?.objectValue?["correction_subject"]?.stringValue
-                    let known = MemoryManagerExistingMemory(id: record.id, content: record.text,
-                                                            correctionSubject: subject, kind: record.memoryKind)
-                    if let index = existing.firstIndex(where: { $0.id == record.id }) { existing[index] = known }
-                    else { existing.append(known) }
+                var standingRecords = eligible.filter { $0.pinned == true }.sorted {
+                    ($0.createdAt, $0.id) < ($1.createdAt, $1.id)
                 }
-                // The manager must judge restated forgotten claims; the store gate only refuses near-verbatim matches.
-                forgotten = try await memory.forgottenClaims(near: "\(user)\n\(assistant)",
-                                                             limit: MemoryManagerLane.forgottenTopK)
-                pendingRows = Array(try await memory.listProposals(status: "pending")
-                    .filter { !MemoryMoments.isMoment($0.metadata) }
-                    .sorted { $0.createdAt > $1.createdAt }
-                    .prefix(MemoryManagerLane.pendingCap))
+                for record in eligible.filter({ $0.memoryKind == "correction" })
+                    .sorted(by: { $0.createdAt > $1.createdAt }).prefix(24) where record.pinned != true {
+                    standingRecords.append(record)
+                }
+                existing = standingRecords.map { record in
+                    MemoryManagerExistingMemory(id: record.id, content: record.text,
+                        correctionSubject: record.extras?.objectValue?["correction_subject"]?.stringValue, kind: record.memoryKind)
+                }
+                standing = existing.count
+                for row in recalled where !existing.contains(where: { $0.id == row.id }) { existing.append(row) }
+                pendingRows = Array(try await memory.listProposals(status: "pending").lazy.filter {
+                    !MemoryMoments.isMoment($0.metadata) && MemoryRecordDisclosurePolicy.classify(personaID: $0.personaId,
+                        status: "active", lifecycle: nil, tags: nil, metadata: $0.metadata)?.permits(surface: surface, personaID: nil) == true
+                }.prefix(MemoryManagerLane.pendingCap))
             } catch {
                 factsFailure = error
                 factsReadable = false
                 existing = []
-                forgotten = []
+                standing = 0
                 nativeLog("MemoryV2: fact lane held this turn, the memory store could not be read: \(error.localizedDescription)")
             }
         }
@@ -288,8 +285,8 @@ extension AdaptiveMemoryPromoter {
             userMessage: user,
             assistantMessage: assistant,
             existing: existing,
+            standing: standing,
             pendingTargets: pendingRows.map { MemoryManagerExistingMemory(id: $0.id, content: $0.content) },
-            forgotten: forgotten,
             personName: fromReply ? "NativeAgent" : speaker ?? originalHumanName,
             standingAgent: standingAgent, appAuthored: fromReply, took: origin?.took,
             occurredAt: origin?.occurredAt,
@@ -298,6 +295,7 @@ extension AdaptiveMemoryPromoter {
         )
         let interpretation: AfterTurnInterpretation?
         let attemptBasis = await beforeJudgment(.provider)
+        let judgmentBasis = await beforeJudgment(.judgment)
         do {
             // A moment already judged (`meant`) folds with its recorded meaning: the model is not asked again.
             if let storedMeaning { interpretation = storedMeaning } else {
@@ -312,6 +310,11 @@ extension AdaptiveMemoryPromoter {
                     call: LLMCall(turn: turn, surface: surface, purpose: held ? "memory_held" : "memory_interpret"))
                 if judged != nil { await answered(momentID, route: attemptBasis?.route, door: momentDoor) }
                 interpretation = judged.map { MemoryManagerLane.resolvingTargets($0, request: request) }
+                if let faults = judged?.careFaults, !faults.isEmpty {
+                    Self.whyInterpretation(turn: turn.id, session: sessionId, surface: surface,
+                        route: TurnEnvelope.current(turn: turn, surface: surface).replyRoute,
+                        outcome: "judged with faulty care entries dropped", heldTurn: turn, careFaults: faults)
+                }
             }
         } catch {
             // The row stays owed; a failed judgment changes nothing.
@@ -332,10 +335,14 @@ extension AdaptiveMemoryPromoter {
             }
             let failure = (error as? AfterTurnMemoryFailure) ?? AfterTurnMemoryFailure(
                 reason: reason,
-                recovery: "Check the selected memory model in Settings; the turn stays owed and is judged again after its next successful answer.",
+                recovery: "Check the selected memory model in Settings; the turn stays owed until its failed dependency changes.",
                 model: nil, surface: surface)
-            if reason != .cancelled {
-                await waitForChange(momentID, since: attemptBasis, cause: .provider, words: failure.localizedDescription)
+            if reason != .cancelled, failure.reason != .cancelled {
+                let shape = [AfterTurnMemoryFailure.Reason.invalidJSON, .missingSections,
+                             .invalidCaring, .invalidAffect, .invalidMemories, .invalidCares]
+                    .contains(failure.reason)
+                await waitForChange(momentID, since: shape ? judgmentBasis : attemptBasis,
+                    cause: shape ? .judgment : .provider, words: failure.localizedDescription)
             }
             return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [],
                 semanticStatus: failure.reason == .deadline ? .timedOut : .failed, failure: failure))
@@ -616,14 +623,9 @@ extension AdaptiveMemoryPromoter {
                                           memory: SwiftNativeMemoryV2) async -> Bool {
         guard let old, old.id != successor else { return true }
         do {
-            if old.status == "superseded" {
-                guard old.metadata?.objectValue?["supersededBy"]?.stringValue == successor else {
-                    throw MemoryV2Error.recordNotFound
-                }
-            } else {
-                guard try await memory.supersedeProposal(id: old.id, by: successor) else {
-                    throw MemoryV2Error.recordNotFound
-                }
+            guard try await memory.supersedeProposal(id: old.id, by: successor) else {
+                nativeLog("MemoryV2: proposal \(old.id) could not be retired by \(successor)")
+                return false
             }
             return true
         } catch {

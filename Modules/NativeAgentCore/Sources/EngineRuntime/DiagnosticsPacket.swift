@@ -39,7 +39,8 @@ extension NativeAgentEngine {
                      activityRefresh: doctor.activityRefresh, runStartedAt: doctor.runStartedAt, latestRunFailure: doctor.latestRunFailure,
                      reportCompletedAt: doctor.reportCompletedAt),
                     (rows: runs.rows, readSucceeded: runs.readSucceeded),
-                    (sessions: self.transcripts.sessions, sessionIndexError: self.transcripts.sessionIndexError))
+                    (sessions: self.transcripts.sessions, loaded: self.transcripts.hasLoadedSessionIndex,
+                     sessionIndexError: self.transcripts.sessionIndexError))
         }
         var keys: [String: JSONValue] = [:]
         // Each action's id is the Doctor verb it calls; a check's repair names its check.
@@ -120,7 +121,8 @@ extension NativeAgentEngine {
             "loops": .array(loops), "watchdog": watchdog, "mac": mac,
             "runs": .object(["read": runs.readSucceeded.map(JSONValue.bool) ?? .null, "count": .int(Int64(runs.rows.count)),
                              "recent": .array(recentRuns)]),
-            "sessions": .object(["count": .int(Int64(transcripts.sessions.count)), "error": faceText(transcripts.sessionIndexError)]),
+            "sessions": .object(["count": transcripts.loaded && transcripts.sessionIndexError == nil
+                ? .int(Int64(transcripts.sessions.count)) : .null, "error": faceText(transcripts.sessionIndexError)]),
             "living": .object(living),
             "activity": .object(["refreshed": .bool(refresh != nil), "failed": .bool(refresh?.failedEndpoints.contains("activity") == true),
                                  "tail": .array(tail)]),
@@ -145,7 +147,7 @@ private enum DiagnosticsFacts {
     static func ownerPage(_ check: CheckResult) -> String? {
         switch check.checkID {
         case "live.providers", "oauth_token_expiry": return "page:providers"
-        case "live.telegram": return "page:telegram"
+        case "live.telegram": return "page:connectors"
         case "status.desk_attention": return "page:desk"
         default: return nil
         }

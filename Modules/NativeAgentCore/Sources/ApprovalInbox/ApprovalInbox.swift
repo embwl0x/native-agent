@@ -137,56 +137,29 @@ public actor SwiftNativeApprovalInbox {
             now: Date()
         )
         if outcome.created {
-            ApprovalLifecycleBus.fire(.init(phase: .requested, record: outcome.record))
+            await ApprovalLifecycleBus.shared.publish(.init(phase: .requested, record: outcome.record))
         }
         // Idempotent births repair missing experience even when an existing card is touched.
-        await recordFiled(outcome.record, expired: outcome.expired)
+        await recordProjection(outcome.record).value
         return (outcome.record, outcome.created)
-    }
-    /// Recorded after the approvals lock is released. Cards this write aged out let theirs go.
-    private func recordFiled(_ record: ApprovalRecord, expired: [ApprovalRecord]) async {
-        await recordProjection(record).value
-        for expired in expired {
-            await recordProjection(expired).value
-            ApprovalLifecycleBus.fire(.init(phase: .resolved, record: expired))
-        }
     }
     @discardableResult
     private func recordProjection(_ record: ApprovalRecord) -> Task<Void, Never> {
         let projection = ExperienceStore.record(root, record.id) { [root] store in
             try await Self.project(record, into: store, dataRoot: root)
         }
-        let settlement = Task.detached { [root] in
-            await projection.value
-            if record.status != "pending", record.decision == nil {
-                let operation = "approval.expiry:" + record.id
-                do {
-                    try await ForPerson.at(root).answered(record.id, evidence: nil, letGo: .expired)
-                    await RepairOwed.settle(root, operation: operation, evidence: .init(source: Matter.approvals, id: record.id)).value
-                } catch {
-                    await RepairOwed.owe(root, id: record.id, kind: .decision, operation: operation, owner: Matter.approvals,
-                        words: "Approval expiry could not settle: " + error.localizedDescription,
-                        lever: "Repair the approval's matter and refresh the approval projection.").value
-                }
-            }
-        }
-        // Later answers settle with the decision; the first rides its continuation. Without a decision, the inbox lets go of every answer it held.
-        guard record.status != "pending", case .object(let payload) = record.payload else { return settlement }
-        var heards: [JSONValue] = if case .array(let waiting)? = payload["waitingHeards"] { waiting } else { [] }
-        if record.decision == nil, case .object(let origin)? = payload["origin"],
-           case .string(let heard)? = origin["answerExperienceID"], !heards.contains(.string(heard)) {
-            heards.append(.string(heard))
-        }
-        let settle: ExperienceStore.Change = record.decision != nil
-            ? .obligation(key: "answer", phase: .accepted, evidence: .init(source: "workflows/approvals/requests.json", id: record.id))
-            : .letGo(key: "answer", reason: .expired)
+        // Later answers settle with the decision; the first rides its continuation.
+        guard record.status != "pending", case .object(let payload) = record.payload else { return projection }
+        let heards: [JSONValue] = if case .array(let waiting)? = payload["waitingHeards"] { waiting } else { [] }
+        let settle: ExperienceStore.Change = .obligation(key: "answer", phase: .accepted,
+            evidence: .init(source: "workflows/approvals/requests.json", id: record.id))
         for case .string(let heard) in heards {
             ExperienceStore.record(root, heard) { store in
                 guard try await store.experience(heard)?.owes["answer"]?.phase.isSettled == false else { return }
                 try await store.append([settle], to: heard)
             }
         }
-        return settlement
+        return projection
     }
     /// The durable domain row is the decision's source, not its advisory copy. Reads are projections only; a failed experience write cannot hold a turn.
     public func decisionsForREM() async throws -> [String: Experience] {
@@ -213,20 +186,8 @@ public actor SwiftNativeApprovalInbox {
         if let outcome = projection.outcome {
             changes += [.outcome(outcome), .obligation(key: "decide", phase: .accepted,
                 evidence: projection.owes["decide"]?.evidence)]
-        } else if projection.owes["decide"]?.phase == .letGo {
-            changes.append(.letGo(key: "decide", reason: .expired))
         }
         try await store.append(changes, to: record.id)
-    }
-    /// Aging is the only way a capped write may drop pending work.
-    static func expired(from before: [JSONValue], to after: [JSONValue]) -> [ApprovalRecord] {
-        let pending = Set(after.compactMap { ApprovalRecord(json: $0) }.filter { $0.status == "pending" }.map(\.id))
-        return before.compactMap { row in
-            guard var record = ApprovalRecord(json: row), record.status == "pending",
-                  !pending.contains(record.id) else { return nil }
-            record.status = "orphaned"
-            return record
-        }
     }
     private static func _createOrTouchPendingImpl(
         body: JSONValue,
@@ -236,7 +197,7 @@ public actor SwiftNativeApprovalInbox {
         matchesPending: @Sendable (JSONValue) -> Bool,
         approvalsPath: URL,
         now: Date
-    ) async throws -> (record: ApprovalRecord, created: Bool, expired: [ApprovalRecord]) {
+    ) async throws -> (record: ApprovalRecord, created: Bool) {
       return try await SwiftNativePersistenceCore.withFileLock(approvalsPath) {
         var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
         let stamp = Self.isoTimestamp(now)
@@ -260,13 +221,13 @@ public actor SwiftNativeApprovalInbox {
             guard let touched = ApprovalRecord(json: .object(obj)) else { continue }
             items[idx] = .object(obj)
             try await SwiftNativePersistenceCore.writeJSON(.array(items), to: approvalsPath)
-            return (touched, false, [])
+            return (touched, false)
         }
         let approval = try Self.makeApprovalRecord(body: body, now: now, turn: turn, handsBack: handsBack)
         items.insert(approval.toJSON(forStorage: true), at: 0)
         let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now, lifeID: lifeID)
         try await SwiftNativePersistenceCore.writeJSON(.array(capped), to: approvalsPath)
-        return (approval, true, Self.expired(from: items, to: capped))
+        return (approval, true)
       }
     }
     /// Resolve with a typed authority origin. Remote authorization is checked against the same row generation inside the same file lock as the write.
@@ -274,12 +235,12 @@ public actor SwiftNativeApprovalInbox {
     public func resolve(
         _ id: String,
         decision: ApprovalDecision,
-        provenance: ApprovalResolutionProvenance
+        provenance: ApprovalResolutionProvenance, scope: String? = nil
     ) async throws -> ApprovalRecord {
         let lifeID = try DataRootLife.current(in: root)
         let record = try await Self._resolveImpl(
             id: id, decision: decision,
-            provenance: provenance,
+            provenance: provenance, scope: scope,
             lifeID: lifeID,
             approvalsPath: approvalsPath,
             now: Date()
@@ -325,7 +286,7 @@ public actor SwiftNativeApprovalInbox {
         }
         let payloadPreview = String(rawPayloadPreview.prefix(previewLimit))
         // Remote resolution is authority: hard-local actions ignore caller overrides. Otherwise honor only a literal JSON Boolean; missing or malformed flags
-        // default to false unless the action is remote-safe.
+        // default to false.
         let isHardLocalOnly = Self.hardLocalOnlyActions.contains(action)
         let isOwnerReview = Self.ownerReviewActions.contains(action)
         let declaredRemoteResolvable = Self.strictBool(bodyObj["remoteResolvable"])
@@ -337,7 +298,7 @@ public actor SwiftNativeApprovalInbox {
         } else if let declaredRemoteResolvable {
             remoteResolvable = declaredRemoteResolvable
         } else {
-            remoteResolvable = Self.remoteSafeActions.contains(action)
+            remoteResolvable = false
         }
         let localOnly: Bool
         if isHardLocalOnly {
@@ -382,7 +343,7 @@ public actor SwiftNativeApprovalInbox {
     private static func _resolveImpl(
         id: String,
         decision: ApprovalDecision,
-        provenance: ApprovalResolutionProvenance,
+        provenance: ApprovalResolutionProvenance, scope: String?,
         lifeID: String,
         approvalsPath: URL,
         now: Date
@@ -402,6 +363,7 @@ public actor SwiftNativeApprovalInbox {
             if Self.terminalApprovalStatuses.contains(currentStatus) {
                 throw ApprovalInboxError.alreadyResolved(id: id, status: currentStatus)
             }
+            obj["scope"] = scope.map(JSONValue.string)
             // All decisions share the resolved status; retain the outcome separately.
             obj["status"] = .string("resolved")
             obj["decision"] = .string(decision.rawValue)

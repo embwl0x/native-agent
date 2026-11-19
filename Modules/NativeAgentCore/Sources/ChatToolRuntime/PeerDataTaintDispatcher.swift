@@ -22,8 +22,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient {
     public static func peerApproval(turn: Turn, surface: String, protectedAction: Bool,
                                     peerName: String? = nil) -> (requester: String?, required: Bool) {
         let taint = turn.peerSteering
-        // The person answered this command's card: its peers steer no more of this run.
-        let answered = !(taint?.elevatedSources ?? []).isEmpty
+        let answered = !(taint?.elevatedSources ?? []).isEmpty && taint?.isTainted != true
         let requester = answered || (PeerDataTaint.trustedTurn(turn) && taint?.isTainted != true) ? nil : PeerTurnEffectPolicy.peerRequester(
             surface: surface, peerID: turn.envelope?.verifiedUserId, peerName: peerName,
             taintSource: taint.flatMap { $0.isTainted ? $0.sourceDescription : nil })

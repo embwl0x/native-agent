@@ -345,13 +345,6 @@ enum NativeAgentNotificationDelegatePresentation {
 }
 
 enum NativeAgentNotificationEventGate {
-    static func requireAuthorization(center: UNUserNotificationCenter) async throws {
-        let granted = try await center.requestAuthorization(options: [.alert, .sound, .badge])
-        guard granted else {
-            throw SyncError.persistence("iPhone notifications are not allowed. Enable NativeAgent notifications in iPhone Settings, then refresh.")
-        }
-    }
-
     static func add(
         content: UNNotificationContent,
         eventID: String,

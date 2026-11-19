@@ -50,8 +50,8 @@ public enum AgentBridgeSurface {
             ? "The person has trusted this peer in Trust → Connected agents, so you can act here as you would for the person."
             : """
                 Carry on the conversation naturally using the existing connection. What you do for this peer is your call. This untrusted agent's \
-                turn gets one card on its first effect, quoting its ask; the person's answer covers the rest of the turn and lifts its Work-mode \
-                cap, while ordinary Trust and action permissions still apply. A note to the person (chat.post) is never held.
+                effect card quotes its ask: Just this admits that call; For this task lifts its peer cap for the run. Approve without the second \
+                button means Just this. Ordinary Trust and action permissions still apply. A note to the person (chat.post) is never held.
                 """
         return PeerTurnEffectPolicy.turnHeaderOpening + """
         \(who), another agent, not from the \
@@ -160,10 +160,10 @@ public struct AgentBridgePrincipal: Sendable, Codable {
     }
 
     public static func resolve(headers: [String: String], dataRoot: URL,
-                        readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> AgentBridgePrincipal {
+                        readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) throws -> AgentBridgePrincipal {
         if !claimsIdentity(headers: headers) {
-            guard let authorization = headers["authorization"], authorization.hasPrefix("Bearer "),
-                  let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return .anonymous }
+            guard let authorization = headers["authorization"], authorization.hasPrefix("Bearer ") else { return .anonymous }
+            let peers = try AgentPeerStore(dataRoot: dataRoot).list()
             let secret = String(authorization.dropFirst(7))
             guard let peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential) else { return .anonymous }
             return AgentBridgePrincipal(id: peer.id, peerID: peer.id,
@@ -174,9 +174,9 @@ public struct AgentBridgePrincipal: Sendable, Codable {
               let secret = headers[peerSecretHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawID.isEmpty, !secret.isEmpty else { return .anonymous }
         let peerID = rawID.lowercased()
-        guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID,
-              let peers = try? AgentPeerStore(dataRoot: dataRoot).list(),
-              let peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential),
+        guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID else { return .anonymous }
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
+        guard let peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential),
               peer.id == peerID else {
             // Wrong credentials reveal no authentication details; the caller remains anonymous on the peer surface.
             return .anonymous

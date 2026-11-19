@@ -40,19 +40,10 @@ extension AppModel {
     var personaDocuments: [PersonaDocSpec] {
         face.slot(.settings).select("persona.documents", as: SettingsFace.self) { $0?.persona.documents ?? [] }
     }
-    var personaProfileIssue: String? {
-        face.slot(.settings).select("persona.profileIssue", as: SettingsFace.self) { $0?.persona.profileIssue }
-    }
     var personaDocumentsIssue: String? {
         face.slot(.settings).select("persona.documentsIssue", as: SettingsFace.self) { $0?.persona.documentsIssue }
     }
     var settingsScreenCaptureEnabled: Bool? {
         face.slot(.settings).select("trust.screenCapture", as: SettingsFace.self) { $0?.trust.policy?.multimodalPolicy?.screen_capture }
-    }
-    var settingsChromeControlEnabled: Bool? {
-        face.slot(.settings).select("trust.chromeControl", as: SettingsFace.self) { $0?.trust.policy?.chromeControlPolicy?.enabled }
-    }
-    var settingsFullMacGrantIsActive: Bool? {
-        face.slot(.settings).select("trust.fullMacGrant", as: SettingsFace.self) { $0?.trust.fullMacGrantIsActive }
     }
 }

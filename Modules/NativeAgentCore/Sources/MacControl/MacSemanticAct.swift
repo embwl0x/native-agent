@@ -240,9 +240,10 @@ extension MacFourVerbs {
                 if mode == .replace, reply.detail["status"] == .string("in_process_route") {
                     return Self.ownAppRoute(verb: rawVerb, target: target, text: text)
                 }
-                if app == nil, Self.isMenuPath(target), [.click, .open, .select, .toggle].contains(verb),
-                   Self.string(reply.detail["error"]) == "no_frontmost_window" {
-                    return await menuPressNoWindow(target, frontPid: expect?.pid, turn: turn, context: context)
+                if Self.isMenuPath(target), [.click, .open, .select, .toggle].contains(verb),
+                   (app == nil && Self.string(reply.detail["error"]) == "no_frontmost_window")
+                    || (app != nil && Self.windowlessApp(reply.detail)) {
+                    return await menuPressNoWindow(target, app: app, frontPid: expect?.pid, turn: turn, context: context)
                 }
                 return reply
             case .seen(let hit): sighting = hit

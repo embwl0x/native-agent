@@ -72,7 +72,7 @@ public struct SurpriseReading: Sendable {
         case none
     }
     /// The dream's sections, in the order its block shows them.
-    public enum Section: Int, CaseIterable, Sendable { case failures, expansion, organism, corrections, turnProgram }
+    public enum Section: Int, CaseIterable, Sendable { case failures, organism, corrections, turnProgram }
     public struct Group: Sendable {
         public let section: Section
         public let owner: Owner
@@ -138,7 +138,7 @@ public struct SurpriseReading: Sendable {
 
     public static func read(dataRoot: URL, since: Date, through: Date) async -> SurpriseReading {
         var reading = SurpriseReading()
-        let kinds = ["tool.dispatch", "expansion.check", "turn.terminal", "turn.cancelled", "turn.failed", "turn.observation",
+        let kinds = ["tool.dispatch", "turn.terminal", "turn.cancelled", "turn.failed", "turn.observation",
                      "turn.part.recovered", "turn.part.helper"]
         let read: TraceRead
         do {
@@ -180,8 +180,6 @@ public struct SurpriseReading: Sendable {
         struct Slog: Hashable { let turn, part: String }
         var reading: SurpriseReading
         var failures: [FailureKey: (count: Int, reason: String)] = [:]
-        var expansionCount = 0
-        var expansionExamples: [String] = []
         var helper: [String: String] = [:]
         var parts: [String: Set<String>] = [:]
         var surprised: [String: Set<String>] = [:]
@@ -235,19 +233,15 @@ public struct SurpriseReading: Sendable {
                         let path = fields["argument_path"]?.stringValue.map { " (argument: \($0))" } ?? ""
                         failures[key] = (1, reason + path)
                     }
-                case "expansion.check":
-                    guard inWindow, fields["outcome"] == .string("miss") else { continue }
-                    expansionCount += 1
-                    guard let situation = fields["situation"]?.stringValue,
-                          let prediction = fields["prediction"]?.stringValue else { throw malformed(event, field: "situation/prediction") }
-                    expansionExamples.append("At \(situation), expected \(prediction); the next call differed or never came.")
-                    if expansionExamples.count > 3 { expansionExamples.removeFirst() }
                 case "turn.observation":
                     guard let reason = fields["reason"]?.stringValue else { throw malformed(event, field: "reason") }
                     if ["reply_repeated_block", "reply_repeated_action"].contains(reason) { surprised[event.turnId, default: []].insert("repeated") }
                     if reason == "malformed_call" { surprised[event.turnId, default: []].insert("malformed") }
                 case "turn.part.recovered":
-                    if inWindow, let from = fields["fromDigest"]?.stringValue { heals.insert(Heal(turn: event.turnId, digest: from)) }
+                    // A helper fault is the body's, never the program's: it does not count as the program needing healing.
+                    if inWindow, fields["helperFailure"] != .bool(true), let from = fields["fromDigest"]?.stringValue {
+                        heals.insert(Heal(turn: event.turnId, digest: from))
+                    }
                 default:
                     // turn.terminal, turn.cancelled and turn.failed settle the turn.
                     let status = fields["status"]?.stringValue ?? ""
@@ -270,10 +264,6 @@ public struct SurpriseReading: Sendable {
                 let owner: Owner = ToolNameAliases.authoredTool(key.action).map { Owner.ability($0) } ?? Owner.none
                 reading.groups.append(.init(section: .failures, owner: owner, kind: "failed", count: value.count, uses: reading.uses[owner],
                     lines: ["\(key.action) [\(key.code)] ×\(value.count): \(value.reason)"]))
-            }
-            if expansionCount > 0 {
-                reading.groups.append(.init(section: .expansion, owner: SurpriseReading.Owner.none, kind: "expansion_miss", count: expansionCount,
-                    lines: ["Expansion predictions: \(expansionCount) missed."] + expansionExamples))
             }
             // A turn is a use of the turn program once it settles in the window; each of its own kinds counts once for that turn.
             var turnCounts: [Owner: [String: Int]] = [:]

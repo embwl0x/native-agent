@@ -169,7 +169,7 @@ extension InlineInteractionResolver {
             let witness = InlineInteractionSignatureWitness.Witness(
                 sessionID: sessionID, interactionID: record.id, continuation: continuation,
                 originEnvelope: origin, interaction: record)
-            let signed = await Task.detached { InlineInteractionSignatureWitness.isStillSigned(witness) }.value
+            let signed = try await Task.detached { try InlineInteractionSignatureWitness.isStillSigned(witness) }.value
             guard signed else {
                 throw failure("This came from your iPhone and I can't verify that phone any more. "
                     + "Sign in from the phone again, then Try again.")

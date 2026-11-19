@@ -24,23 +24,22 @@ extension AppDelegate {
                 guard let process = await MainActor.run(body: { faceProcess }) else { throw FaceWireError.disconnected }
                 try await handler.attachRenderer(sink: sink, call: { request in try await process.call(request, connection: sink) })
                 await services.rendererConnected(sink)
-            }, disconnected: { connection, detail in
+            }, disconnected: { connection, detail, attached in
                 do { try await handler.detachRenderer() }
                 catch { ModuleLog.app("[face] release failed: %@", error.localizedDescription) }
                 await services.rendererDisconnected(connection)
                 ModuleLog.app("[face] connection closed: %@", detail)
-                // Her window lives as long as she does: a window that ended without Quit comes back at once.
-                await MainActor.run { reopenAfterLoss() }
+                await MainActor.run {
+                    guard !quitWaitingForTurns else { return }
+                    guard attached else {
+                        return presentFaceUnavailable(WireFailure(code: "face_not_attached", message: detail, cause: nil, effects: .none))
+                    }
+                    Task {
+                        do { try await openFaceWindow() }
+                        catch { ModuleLog.app("[face] window did not come back: %@", error.localizedDescription) }
+                    }
+                }
             })
-    }
-
-    @MainActor
-    private static func reopenAfterLoss() {
-        guard !quitWaitingForTurns else { return }
-        Task {
-            do { try await openFaceWindow() }
-            catch { ModuleLog.app("[face] window did not come back: %@", error.localizedDescription) }
-        }
     }
 
     @MainActor
@@ -195,21 +194,19 @@ extension AppDelegate {
         }
     }
 
-    /// Use SMAppService for sandbox-compatible login registration.
-    @MainActor
     static func registerLoginItemIfNeeded() async {
         let bundlePath = Bundle.main.bundlePath
         guard InstallPaths.allowsLoginItem(bundlePath: bundlePath) else {
-            print("[app] skipped login auto-start registration for non-installed bundle: \(bundlePath)")
+            ModuleLog.app("[app] skipped login auto-start registration for non-installed bundle: %@", bundlePath)
             return
         }
         let service = SMAppService.mainApp
         if service.status == .enabled { return }
         do {
             try service.register()
-            print("[app] registered for login auto-start")
+            ModuleLog.app("[app] registered for login auto-start")
         } catch {
-            print("[app] login auto-start register failed: \(error.localizedDescription)")
+            ModuleLog.app("[app] login auto-start register failed: %@", error.localizedDescription)
         }
     }
 

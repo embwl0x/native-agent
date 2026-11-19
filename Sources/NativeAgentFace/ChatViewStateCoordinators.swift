@@ -2,8 +2,6 @@ import AppKit
 import NativeAgentShared
 import Foundation
 import SwiftUI
-/// Distinguish transcript layout motion from reader input so unintended jumps remain observable.
-let scrollMoveLog = ModuleLog(category: "TranscriptScroll")
 
 // Blueprint: | `ChatViewStateCoordinators.swift` | Card clearance, one-shot clear and occurrence-preserving toasts |
 

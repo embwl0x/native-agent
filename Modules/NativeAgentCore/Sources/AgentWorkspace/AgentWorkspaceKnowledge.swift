@@ -1,9 +1,8 @@
 import Foundation
 import PersistenceCore
 import ChatToolParsing
-// Blueprint: | `AgentWorkspaceKnowledge.swift` | `AgentWorkspaceKnowledge` enum; `project`, `memoryTitle` |
+// Blueprint: | `AgentWorkspaceKnowledge.swift` | `AgentWorkspaceKnowledge`: memory/web reads and existing app memory actions |
 
-/// Presents the existing memory and research owners without retaining their content or interpreting instructions embedded in retrieved material.
 enum AgentWorkspaceKnowledge {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "memory", title: "Memory", summary: "Recall something, inspect its evidence, or record a memory.",
@@ -12,7 +11,6 @@ enum AgentWorkspaceKnowledge {
               tool: nil, tools: ["read_page", "browser.chrome_navigate"]),
     ]
 
-    /// Private web searches must not open a tab.
     static let webSearchTool = "web_search"
 
     static let readTools: Set<String> = ["recall_memory", "recall_search", "read_page", webSearchTool]
@@ -22,7 +20,6 @@ enum AgentWorkspaceKnowledge {
         case webSearchTool: return webSearch(input: input, result: result)
         case "recall_memory", "recall_search": return memory(input: input, result: result)
         case "read_page":
-            // Coverage and source receipts stay attached, including partial or unsupported extraction. A fetch is never labeled verified truth.
             var actions: [AgentWorkspaceButton] = [
                 .init(label: "Search the web", action: .searchWeb, needsText: true),
                 .init(label: "Read another web page", action: .perform(tool: "read_page", input: [:], title: "Web source", textField: "url", isEffect: false),
@@ -38,7 +35,6 @@ enum AgentWorkspaceKnowledge {
         }
     }
 
-    /// Reading a result stays private; only explicit selection opens it in Chrome.
     private static func webSearch(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         let reply = ToolResult(result)
         var content = result.objectValue ?? [:]
@@ -50,23 +46,20 @@ enum AgentWorkspaceKnowledge {
         let items = rows.enumerated().compactMap { index, value -> AgentWorkspaceItem? in
             let row = value.objectValue ?? [:]
             guard let url = validWebURL(row["url"]) else {
-                gaps.append(.string("results[\(index)].url: this workspace reader requires an HTTP or HTTPS URL without credentials."))
+                gaps.append(.string("results[\(index)].url: this home reader requires an HTTP or HTTPS URL without credentials."))
                 return nil
             }
             let title = row["title"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 } ?? url
-            // Remove the search engine's empty “Read more” tail so the row retains useful evidence.
             let site = URL(string: url)?.host?.replacingOccurrences(of: #"^www\."#, with: "", options: .regularExpression) ?? url
             let snippet = row["snippet"]?.stringValue?.replacingOccurrences(of: #"\s*(…|\.\.\.)?\s*Read more$"#, with: "…", options: .regularExpression)
             return .init(title: String(title.prefix(200)), content: .object(["site": .string(site), "snippet": snippet.map(JSONValue.string) ?? .null]),
                 actions: [
                 .init(label: "Read this page", action: .open(.record(tool: "read_page", input: ["url": .string(url)], title: String(title.prefix(100))))),
-                // Navigation reuses this conversation's tab or opens one in the agent's group.
                 .init(label: "Chrome: open it in my tab", action: .perform(tool: "browser.chrome_navigate",
                     input: ["url": .string(url)], title: "Background browser", textField: nil, isEffect: true)),
             ])
         }
         content["gaps"] = .array(gaps)
-        // A failed search reads as its error, never as "no results".
         let failed = reply.carriesFailureEvidence
         if !failed, content["status"] == nil || content["status"] == .string("ok") {
             content["status"] = .string("ok")
@@ -92,13 +85,12 @@ enum AgentWorkspaceKnowledge {
         var actions: [AgentWorkspaceButton] = [
             .init(label: "Recall something else", action: .perform(tool: "recall_memory", input: [:], title: "Memory", textField: "query", isEffect: false),
                 needsText: true),
-            .init(label: "Record a memory", action: .configure(tool: "commit_memory", input: [:], title: "Record a memory")),
+            .init(label: "Record a memory", action: .open(.record(tool: "app", input: ["find": .string("commit_memory"), "args": .object([:])], title: "Record a memory"))),
         ]
         if case .array(let hits)? = content.removeValue(forKey: "hits") {
             items = hits.map { hit in
                 let row = hit.objectValue ?? [:]
                 var buttons: [AgentWorkspaceButton] = []
-                // IDs come only from the canonical hit, never its text/evidence.
                 if let id = identifier(row["id"]) {
                     buttons.append(.init(label: "Read memory and evidence", action: .open(.record(
                         tool: "recall_memory", input: ["memory_id": .string(id), "offset": .int(0), "max_characters": .int(2000)], title: memoryTitle(row)))))

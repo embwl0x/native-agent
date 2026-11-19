@@ -44,10 +44,12 @@ enum AppScriptRunner {
         case .object(let fields): keys = Array(fields.keys)
         case .value(.object(let fields)): keys = Array(fields.keys)
         case .unknown: return nil
-        default: return ("invalid_args", "The second argument of a named call must be an options object with expected_version or preview.")
+        default:
+            return ("invalid_args",
+                "The second argument of a named call must be an options object with \(OwnedProgram.Calls.optionKeys.joined(separator: ", ")).")
         }
-        if let stray = keys.sorted().first(where: { !["expected_version", "preview"].contains($0) }) {
-            return ("unknown_option", "The second object takes expected_version or preview, not \(stray).")
+        if let stray = keys.sorted().first(where: { !OwnedProgram.Calls.optionKeys.contains($0) }) {
+            return ("unknown_option", "Unknown option \(stray). The second object takes \(OwnedProgram.Calls.optionKeys.joined(separator: ", ")).")
         }
         return nil
     }
@@ -86,7 +88,6 @@ enum AppScriptRunner {
         return .object(fields)
     }
 
-    /// Object arguments are named, with preview/version in a second object; other values follow declaration order.
     static func doorInput(id: String, given: [JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
                           turn: Turn?) -> Result<[String: JSONValue], ScriptError> {
         let checked: AppAction?
@@ -116,10 +117,6 @@ enum AppScriptRunner {
             input["args"] = .object(named)
             if let refusal = secretRefusal(action, named) { return .failure(refusal) }
             if given.count > 1, case .object(let options) = given[1] {
-                if let stray = options.keys.first(where: { !["expected_version", "preview"].contains($0) }) {
-                    return .failure(argumentFailure("unknown_option",
-                        "The second object takes expected_version or preview, not \(stray)."))
-                }
                 input.merge(options) { _, new in new }
             }
             return .success(input)
@@ -217,7 +214,7 @@ enum AppScriptRunner {
                 throw ScriptError(reason: "argument_evidence_unavailable", detail: "\(id)'s call has no arguments to record. Nothing ran.")
             }
             var kept = [args]
-            let options = evidence.filter { ["preview", "expected_version"].contains($0.key) }
+            let options = evidence.filter { OwnedProgram.Calls.optionKeys.contains($0.key) }
             if !options.isEmpty { kept.append(.object(options)) }
             return kept
         }

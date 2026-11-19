@@ -51,6 +51,9 @@ extension NativeCognitionRuntime {
         guard configuration.persistenceEnabled else {
             throw PersistenceCoreError.ioFailure("dream reflection requires durable inner life")
         }
+        var rem = replayReflectionMaterial ?? [:]
+        replayReflectionMaterial = nil
+        defer { if !rem.isEmpty { replayReflectionMaterial = rem.merging(replayReflectionMaterial ?? [:]) { _, new in new } } }
         let replay = await runEventDrivenReplay(reason: reason, material: nil)
         switch replay {
         case .completed: break
@@ -60,7 +63,8 @@ extension NativeCognitionRuntime {
         }
         let outcome = await runReflectionIfDue(
             llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self, assembly: .suppliedPersona),
-            reason: reason, material: material, retainForDream: true)
+            reason: reason, material: material.merging(rem) { dream, _ in dream }, retainForDream: true)
+        if case .skipped = outcome {} else { rem = [:] }
         await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
         // Retain produced receipts even when care or mood settlement remains owed.
         if let receipt = await substrate.reflectionReceiptSnapshot().first(where: {
@@ -74,7 +78,6 @@ extension NativeCognitionRuntime {
         // Switched-off reflection settles with its off reason.
         case .skipped(let reason, _) where reason.hasPrefix(LoopTickOutcome.offPrefix):
             return .skipped(String(reason.dropFirst(LoopTickOutcome.offPrefix.count)))
-        // A held slot keeps the reflection owed as busy, not failed.
         case .skipped(let reason, _) where reason.hasPrefix(LoopTickOutcome.busyPrefix):
             throw DreamBusy(String(reason.dropFirst(LoopTickOutcome.busyPrefix.count)))
         case .skipped(let reason, _): throw PersistenceCoreError.ioFailure("dream reflection remains owed: \(reason)")
@@ -121,6 +124,7 @@ extension NativeCognitionRuntime {
             reason: reason,
             material: material
         )
+        if case .skipped = outcome { replayReflectionMaterial = material.merging(replayReflectionMaterial ?? [:]) { _, new in new } }
         await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
     }
 
@@ -137,11 +141,11 @@ extension NativeCognitionRuntime {
         if let bootstrapFailure { return Self.beatReflection(.failed(error: bootstrapFailure)) }
         if let providerRoutingFailure { return Self.beatReflection(.failed(error: providerRoutingFailure)) }
         let request: CognitiveReflectionRequest
-        // Acquire the lease before planning so refusal cannot strand an in-flight reservation.
         let lease = host.backgroundWorkLease(dataRoot: dataRoot)
         let now = Date()
         let window = host.backgroundWorkWindow(now)
-        guard await lease.tryAcquire(holder: "reflection", window: window) else {
+        let acquired = await lease.tryAcquire(holder: "reflection", window: window)
+        if !acquired, !retainForDream {
             // A claimed slot is busy and names its holder and the next slot; a lease that cannot be read is a failure, never a hold.
             let held: (holder: String, acquiredAt: String)?
             do { held = try await lease.claim(window: window) }
@@ -150,9 +154,7 @@ extension NativeCognitionRuntime {
                 return Self.beatReflection(.failed(error: "the background work lease refused window \(window), but no claim on it was read"))
             }
             let opens = NativeTimestampFormat.plainZulu(host.backgroundWorkWindowEnd(now))
-            // For the loop, a slot reflection already took is the rule working (one reflection a slot), not a hold that counts toward a
-            // stuck organ. A dream's reflection is still owed, so for it the slot is busy.
-            if held.holder == "reflection", !retainForDream {
+            if held.holder == "reflection" {
                 if let failed = failedReflection, failed.window == window {
                     return Self.beatReflection(.failed(error: "\(failed.error); this slot is spent, the next opens at \(opens)"))
                 }
@@ -168,7 +170,7 @@ extension NativeCognitionRuntime {
             request = planned
         case .refused(let admission):
             // The refusing gate becomes the typed outcome once, here; its detail carries the spend and reservation evidence.
-            _ = await lease.releaseUnused(holder: "reflection", window: window)
+            if acquired { _ = await lease.releaseUnused(holder: "reflection", window: window) }
             switch admission.reason {
             case CognitiveSubstrate.reflectionRefusalDisabled: return Self.beatReflection(.off("reflection disabled"))
             // The daily ceiling or a reflection already in flight means not now: it stays owed as busy, never failed.
@@ -176,7 +178,7 @@ extension NativeCognitionRuntime {
             }
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm, retainForDream: retainForDream)
-        if case .skipped(let why, _) = reflectionOutcome, why != "reflection cancelled" {
+        if acquired, case .skipped(let why, _) = reflectionOutcome, why != "reflection cancelled" {
             // Return the unused slot if routing refused before provider work; cancellation after dispatch spends it.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
         }
@@ -352,11 +354,12 @@ extension NativeCognitionRuntime {
             let turn = Turn().with(\.envelope, TurnEnvelope.native("reflection", surface: request.surface))
                 .with(\.admission, ModelAdmission(provider: provider, model: route.modelId,
                     reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier))
-            let call = LLMCall(turn: turn, surface: request.surface, purpose: "reflection")
+            var call = LLMCall(turn: turn, surface: request.surface, purpose: "reflection")
+            call.session = nil
             let raw = try await llm.complete(
                 prompt: request.prompt, system: system, model: nil,
                 tools: nil, call: call)
-            result = try JSONDecoder().decode(CognitiveReflectionJudgment.self, from: Data(raw.utf8))
+            result = try JSONValue.decodeCompletion(raw, as: CognitiveReflectionJudgment.self)
             try result.validate(material: request.material, cares: request.cares)
         } catch let error as CognitiveReflectionPersonaError {
             await substrate.recordReceipt(

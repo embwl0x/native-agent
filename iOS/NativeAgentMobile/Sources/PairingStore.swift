@@ -330,6 +330,10 @@ final class PairingStore: ObservableObject {
             if result.status == errSecSuccess, let data = result.data, data.count == 32 {
                 self.secretStorageError = nil
                 self.material = .installed(data)
+            } else if result.status == errSecItemNotFound,
+                      UserDefaults.standard.object(forKey: Keys.iCloudPairingSecretLegacy) == nil {
+                self.material = .removed
+                self.secretStorageError = nil
             } else {
                 self.pairingUnavailable("""
                     The saved pairing key could not be verified after unlock (Keychain status \(result.status)). Retained sense state is unchanged; check the \

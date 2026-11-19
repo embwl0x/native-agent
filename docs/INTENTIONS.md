@@ -25,7 +25,8 @@ amount of time is one moment that far from now, for `when` and `until` alike:
 such as `{seconds: 120}`. The stored
 clock rhythm uses `IntentionClock`; it is not a new store or a `moments`
 array. An omitted rhythm end is `standing`; a single moment defaults to
-`once`. A condition in words closes when the after-turn judgment sees it met.
+`once`. The after-turn judgment can close a step with a condition in words by
+quoting evidence that the condition was met.
 The system date reader interprets local words in the Mac's zone; accepted
 moments persist as absolute ISO timestamps. An incomplete match, a range or
 a repeated local clock time refuses with the supplied text and its reading;
@@ -33,6 +34,10 @@ an ISO timestamp with its UTC offset resolves a repeated time. No detected
 date is an unrecognized input, never a ready/done verdict.
 An explicit `standing` end is retained for person/news/signal moments too;
 it is not coerced to `once` when no clock rhythm is present.
+Deferring a one-time `at` MY QUEUE step without a habit through `desk.defer`
+moves its time on the one clock and clears a prior hold. A different instant gives it a new moment key.
+Deferring a habit, a rhythm, a captured promise on a board item or another
+condition holds readiness until the defer ends.
 
 **Body signals (source built).** `queue.add` also accepts `on <signal>`,
 stored in the existing `when`. A nonempty name matches itself or its
@@ -124,13 +129,20 @@ offer can accept them into a new batch with a new delivery id. The stopped
 delivery never reopens. Stop releases the carry and reads what remains owed
 without starting another effect in that drain.
 Claimed care crossings and night readings retain their own thought admission.
-Idle refreshes and unrelated source changes do not re-offer moments. No repeated
-post, restart, timer or second pending-moment list is needed.
+Idle refreshes and unrelated source changes do not re-offer moments. A moment
+still owed (its hand-off or its thought failed or stopped) keeps one MY QUEUE time,
+`<owner>:owed`, at its birth plus 1, 2, 4, 8, 16, 32 minutes and then every 30;
+that time re-offers owed queue moments and is withdrawn when none is owed. No
+repeated post, restart or second pending-moment list is needed.
 The due selector, next-clock selector and next-turn selector all exclude
 terminal Desk items; no second completed-step list is kept.
 
 Taking a moment runs its reflex or posts it. A habit runs first (below). Fixed
-words (`say`) owed to the person or originating with `self` are said as they are.
+words (`say`) owed to the person or originating with `self` are said as they are,
+and the moment still comes to them: saying never closes the step, keeps a promise
+or unblocks a dependent (the add/update receipt's `at_its_moment` says so, or,
+for a step whose words the stem does not say (`MyQueue.spoken`), that it comes
+back with these words to say).
 Each admission reuses `MyQueueReady.due` at the current time against the
 current Desk revision, including after suspension before a habit call, speech,
 or a new moment post. A changed or unreadable revision returns the remaining batch
@@ -165,9 +177,13 @@ destination conversation. The words land at their time; declared quiet hours
 hold only the tap, through the attention router's quiet-hour policy.
 
 Successful speech settles through `settle`: an agent-authored Desk note,
-`Said <MyQueue.shown(now)>: "<words>"`, records it. A `once` intention then
-closes with reason `said`, using a fresh unchanged-step snapshot because the
-note advanced `updatedAt`. A rhythm stays open; an until-time still ends it.
+`Said <MyQueue.shown(now)>: "<words>"`, records it; that Desk write brings a fresh
+pass, which finds the moment spent and posts it to their as any timed step's is (a
+`Said` note does not count as handling a release, so a signal or news step's
+moment survives it),
+its line reading that note to say the words are already out. They ends the step
+themselves. With no habit a rhythm with `say` wakes their every beat. An
+until-time still ends it.
 MY QUEUE's carried ledger (`desk/my-queue-carried.json`, `MyQueueCarried`)
 records the delivered occurrence and its owed notes/once-close in one write.
 Each pass finishes those debts with idempotent agent notes and a fresh
@@ -189,9 +205,10 @@ under the Desk's unchanged-revision transaction. `action:null` drops a habit,
 moment to `next_turn` and clears its card/rhythm. Omitted fields stay intact.
 Receipts name the stored habit. At a carried moment the action runs first,
 through the same self door, Autonomy and Trust posture as a part wake, with
-the step's peer steering retained. A successful run without `needs_me` gets
-its `Ran h:mm a: <one-line result>` note and the same until settlement as
-speech. If `say` is present it is spoken only after that success, then both
+the step's peer steering retained. A successful run that did something,
+without `needs_me`, gets its `Ran h:mm a: <one-line result>` note and the same
+until settlement as speech. A run that only looked (plain reads, no ability)
+wakes their with its receipt and the time it ran. If `say` is present it is spoken only after that success, then both
 notes and the one until settlement are kept. Conditions in words still post
 the moment for the agent to judge. Failed/refused/unfinished/person-waiting runs
 and returned `needs_me` post the moment with the receipt beside it as
@@ -264,7 +281,7 @@ stay unavailable or meant for repair, never settle as an empty judgment. The
 Cancellation creates no failure wait. A matching judgment returned before Stop
 is retained through settlement and files on the next drain without rematching.
 
-A promise closes because their body saw the deed; they never files the closing.
+The after-turn judgment can close a promise with quoted evidence of its deed.
 The shared after-turn interpretation, at once or when owed, receives open moments
 across conversations, the person's recorded incoming words, this turn's
 completed acts and whether their reply reached a person (`reply_delivered`).
@@ -329,7 +346,10 @@ Settlements use `MyQueue.finish`, the same closure as `queue.done` or `queue.dro
 with the reason, outcome, evidence quote and recorded turn; act reasons also name
 the dispatch receipt id. A `settled` trace names its basis (`person_words`, `act`
 or `reply`), never the quote. The Desk checks
-the judged row's `updatedAt` before closing it, so newer work is kept. A closed
+the judged row's `updatedAt` before closing it. A retained settlement whose row
+changed or closed is void: `memory.promise` records `void` with the
+`MyQueue.Superseded` reason, preserves the newer Desk state and continues
+without owing repair for that closure. A closed
 resume step also releases its saved run through that shared closure owner.
 `desk.read {handle}` exposes that reason; `desk.set_status {handle,status:"todo"}`
 reopens a live terminal row, subject to the existing parent and hold rules. The judgment is retained
@@ -401,7 +421,8 @@ already retained in meaning need no provider wait. [Cognition wiring](COGNITION_
 every remaining model wait and its exact release.
 The judgment must classify every candidate exactly once; missing groups never
 mean ignored. `memory.promise` traces report `matching`, `ignored`, `added`,
-`updated`, `reused`, `already_captured`, `settled`, `already_settled` or `failed`; landings name their Desk id.
+`updated`, `reused`, `already_captured`, `settled`, `already_settled`, `void` or `failed`; landings name their Desk id.
+Every `failed` row carries its reason.
 A provider that never settles leaves matching open until its terminal event or
 cancellation; no clock chooses an outcome.
 
@@ -484,14 +505,13 @@ occurrences. A stored moment is never reinterpreted in another year.
 
 | Until | When it ends |
 |---|---|
-| `once` | After it comes up and they acts. Default for everything except rhythms |
+| `once` | The after-turn judgment can close it with quoted evidence of its deed; a habit that acts and finishes closes it, a look wakes their with what it read. Default for steps without a rhythm |
 | a time | At that time ("until 9 pm Nov 4"), with no cancel job |
-| their words | Checked each time it comes up ("until User answers"); it closes when the after-turn judgment sees them met |
-| standing | Rhythms only, set explicitly (the office check-in). Ends only on `queue.drop` |
+| their words | The after-turn judgment can close it with quoted evidence that the condition was met ("until User answers") |
+| standing | Explicit, or the default for rhythms. One occurrence leaves it open |
 
 Elapsed inactivity does not close an intention. MY QUEUE expires only an explicit
-`until` time; a deed the after-turn judgment sees, or `queue.drop`, closes it through
-its owner (`queue.done` stays their free act, untaught).
+`until` time. They can mark it done with `queue.done` or let it go with `queue.drop`.
 
 ## Arrival and pacing
 
@@ -501,22 +521,24 @@ its owner (`queue.done` stays their free act, untaught).
   each run of a rhythm is its own, written once in the record.
 - It opens a thought in the agent's mind stream (or, for a promise to the
   person, in the conversation it was made in) whose line is
-  `You meant to (<desk.N>): <words> …` with its moment and until.
+  `You meant to (<desk.N>): <words> …` with its moment and until. For a step
+  without a rhythm, the line says `desk.N is open on your Desk.`
 - What the agent says to the person goes to the intention's `replyRoute`. A
   legacy promise without one recovers only proven originating provenance;
   absent or unreadable provenance keeps it waiting for route repair, never
   moves it to Chat. The intention's moments pace it; speech has no hourly quota.
-- An eligible `say` intention goes straight to the person's current
-  conversation through the shared speech owner, as built above.
+- An eligible `say` intention's words go straight to the person's current
+  conversation through the shared speech owner, as built above; its moment
+  still comes to them.
 
 **In a turn.**
 - A message is only what its sender said. Next-turn and message-triggered
   steps appear only in the changing moment packet, never appended to a person's
   or peer's words. `MyQueueReady.forTurn` marks matching steps `due now`;
   reading them neither runs nor closes them. A dedicated step's thought keeps
-  its own `MyQueueReady.line` opening: do it now when safe, reversible and
-  allowed, it closes by itself once the work is seen done, or `desk.wait` holds
-  it on what it needs. No line teaches closing a row by hand.
+  its own `MyQueueReady.line` opening. For a step without a rhythm it says
+  to act when safe, reversible and allowed, names the step as open on their Desk,
+  and names `desk.wait` for work that needs something first.
   Trust and posture still judge every act; the words grant no authority.
 - Every turn carries
   `# What I mean to do (mine; I do what's safe now, and raise one only when it's done, it needs someone, or I'm asked)`
@@ -527,9 +549,7 @@ its owner (`queue.done` stays their free act, untaught).
   A due line reads
   `- desk.N · due now · <head> <rest>` with the whole `MyQueueReady.line`,
   uncapped, including fixed `say` words and the wait instruction.
-  The desk.N names what they are shown; `queue.drop` (and `queue.done`, untaught)
-  take it as `id` — or the step's own words, when exactly one open step has
-  those words (or, failing that, contains them); several matches refuse and name them.
+  `queue.done` and `queue.drop` take the shown `desk.N` or the exact Desk handle as `id`.
   The carried line that brings a step back (`You meant to …`) and home's MY QUEUE
   rows (ready and waiting alike) name it the same way, `desk.read {query: <its words>}`
   finds it, and `desk.read {query: "my queue"}` lists the whole queue.
@@ -587,6 +607,8 @@ its owner (`queue.done` stays their free act, untaught).
   one paged list; its agent page shows the same queue separately from the board.
   `place` distinguishes `board` from `MY QUEUE`; each intention carries `name`,
   full `words`, `filed_at`, its recorded `when` and current `waits_on`.
+  A queue item with no step is a plain board item, labeled `board`, outside
+  the intention count; they can finish or cancel it.
   `liveItemCount`/`topLevelItemCount` count the board; `openIntentionCount` counts
   open MY QUEUE intentions, and `board_counts` says both. Exact, query and
   complete-record reads retain that intention detail. Archives remain explicit reads.
@@ -604,7 +626,10 @@ one clock (`TriggerScheduler/OneClock.swift`), delivered to whoever declared it:
 
 - a part's own `schedule:` wakes (`part:<id>:<cron>`), from its header
 - `connector_action` watches (`watch:<id>`) and `proactive_scan` (`scan:<id>`)
-- inbox briefs (`brief:<name>`) and helpers' cadences
+- helpers' cadences
+
+A morning brief is callable as the `native-morning-brief` part; they may bind
+their own queue step to it. It declares no time of its own.
 
 MY QUEUE's moments are times on that same clock under owner `moment`.
 Their own hour is an attention opportunity on a presence edge, not a declared time ([Subconscious](SUBCONSCIOUS.md#the-hour)).

@@ -5,7 +5,7 @@ import PersistenceCore
 // Blueprint: | `iCloudBridge+DeliveryReceipts.swift` | Signed phone receipts accept their matter's phone obligation at arrival; transport evidence journal |
 
 extension iCloudBridge {
-    /// Both transports share durable receipts; ephemeral phone presentation must never enter this journal.
+    /// CloudKit uses durable receipts; ephemeral phone presentation must never enter this journal.
     @discardableResult
     nonisolated static func appendChatDeliveryReceipt(
         _ message: BridgeMessage,

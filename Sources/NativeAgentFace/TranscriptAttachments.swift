@@ -3,43 +3,6 @@ import Foundation
 import NativeAgentShared
 import SwiftUI
 
-/// Renderer diagnostics contain reader identities and geometry, never transcript words or body-store paths.
-let transcriptLog = TranscriptDiagnostics()
-
-/// The window's own record of what opened, followed, measured and loaded, beside FaceLink.log in her data root.
-struct TranscriptDiagnostics: Sendable {
-    private let fileName: String
-    private let lane: DispatchQueue
-
-    init(fileName: String = "TranscriptDocument.log") {
-        self.fileName = fileName
-        lane = DispatchQueue(label: "NativeAgentFace.diagnostics." + fileName, qos: .utility)
-    }
-
-    func callAsFunction(_ format: String, _ arguments: CVarArg...) {
-        let message = arguments.isEmpty ? format : String(format: format, arguments: arguments)
-        append { message }
-    }
-
-    /// The line is built on the diagnostics queue, so counting a large value costs the window nothing.
-    func append(_ message: @escaping @Sendable () -> String) {
-        guard let root = ProcessInfo.processInfo.environment["NATIVEAGENT_FACE_DATA_ROOT"], !root.isEmpty else { return }
-        let at = Date()
-        let fileName = fileName
-        lane.async {
-            let file = URL(fileURLWithPath: root).appendingPathComponent("diagnostics/" + fileName)
-            do {
-                if !FileManager.default.fileExists(atPath: file.path) { try Data().write(to: file, options: .withoutOverwriting) }
-                let handle = try FileHandle(forWritingTo: file)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                let stamp = at.ISO8601Format(.init(includingFractionalSeconds: true))
-                try handle.write(contentsOf: Data((stamp + " face " + message() + "\n").utf8))
-            } catch { NSLog("%@ diagnostic append failed: %@", fileName, error.localizedDescription) }
-        }
-    }
-}
-
 // Blueprint: | `TranscriptAttachments.swift` | Document view attachments: one hosted view per block id, fed from the model, sized to fit |
 
 /// Retain one hosted view per block id; updates push the model and the controller places its measured frame.
@@ -89,8 +52,6 @@ struct TranscriptDiagnostics: Sendable {
         entries[blockID] = entry
         // Sized before TextKit first lays the paragraph out, so the first layout is the right one.
         measure(entry)
-        transcriptLog("attach.new block=%@ column=%.0f size=%.0fx%.0f", blockID, columnWidth,
-                      entry.attachment.bounds.width, entry.attachment.bounds.height)
         return entry.attachment
     }
 
@@ -154,7 +115,6 @@ struct TranscriptDiagnostics: Sendable {
         pending = []
         for blockID in blockIDs {
             guard let entry = entries[blockID], measure(entry) else { continue }
-            transcriptLog("attach.resized block=%@ size=%.0fx%.0f", blockID, entry.attachment.bounds.width, entry.attachment.bounds.height)
             heightChanged(blockID)
         }
     }

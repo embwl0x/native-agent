@@ -18,17 +18,15 @@ extension ChatStore {
                 guard generation == sessionSwitchGeneration else { return }
                 if !batch.errors.isEmpty { errorBanner = batch.errors.joined(separator: "\n") }
                 let receiptKey = "NativeAgentMobile.importedShareIDs"
-                var receipts = Set(defaults.stringArray(forKey: receiptKey) ?? [])
+                var receipts = Set(try await storage.read([String].self, key: receiptKey) ?? [])
                 for (url, item) in batch.items {
                     guard generation == sessionSwitchGeneration else { return }
                     let retainedReceipt = receipts.contains(item.id.uuidString)
                     if !retainedReceipt {
                         if !queuedSends.contains(where: { $0.id == item.id }) {
                             guard let pairing = item.pairingFingerprint else {
-                                errorBanner = """
-                                    This shared item has no saved pairing. It remains in the shared inbox; share it again after \
-                                    connecting this iPhone.
-                                    """
+                                try await Task.detached(priority: .utility) { try FileManager.default.removeItem(at: url) }.value
+                                errorBanner = "This shared item had no saved pairing and was removed. Share it again after connecting this iPhone."
                                 continue
                             }
                             guard enqueueSend(QueuedChatSend(id: item.id, sessionID: selectedSessionID,

@@ -65,11 +65,22 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
 
     static func transcriptCause(_ row: [String: JSONValue], session: String, dataRoot: URL) -> CognitiveReflectionCause? {
         guard case .string(let role)? = row["role"] else { return nil }
-        var metadata: [String: JSONValue] = [:]
-        if case .object(let value)? = row["metadata"] { metadata = value }
-        metadata["sessionId"] = .string(session)
         guard ["user", "assistant"].contains(role), case .string(let content)? = row["content"] else { return nil }
         let text = "\(role):\n\(content)"
+        var metadata: [String: JSONValue] = [:]
+        switch row["metadata"] {
+        case .object(let value)?: metadata = value
+        case .string(let encoded)?:
+            do {
+                guard case .object(let value) = try JSONValue.parse(Data(encoded.utf8)) else {
+                    return CognitiveReflectionCause(text: text)
+                }
+                metadata = value
+            } catch { return CognitiveReflectionCause(text: text) }
+        case .null?, nil: break
+        default: return CognitiveReflectionCause(text: text)
+        }
+        metadata["sessionId"] = .string(session)
         var peers = CognitiveSubstrate.peerIdentity(metadata: metadata, dataRoot: dataRoot).map { [$0] } ?? []
         let binding = ConversationHistory.continuityBinding(role: role, metadata: metadata)
         if case .object(let value)? = binding, case .string(let participant)? = value["participant"],
@@ -193,7 +204,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
                         break
                     }
                 } else if blockStarted, !line.trimmingCharacters(in: .whitespaces).isEmpty,
-                          !(line.hasPrefix(DreamCycleRunner.consumedFooter) && line.hasSuffix(" -->")),
+                          !(line.hasPrefix("<!-- dream-consumed-through: ") && line.hasSuffix(" -->")),
                           !(line.hasPrefix(DreamPendingWork.identityPrefix) && line.hasSuffix(" -->")) {
                     unavailable = "section \(sectionIndex + 1) (starts at line \(start + 1)), line \(index + 1): claim block is not trailing"
                     break

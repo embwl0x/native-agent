@@ -317,9 +317,6 @@ extension AbilityStore {
     private func recordRunEvidence(id: String, version: String, receipt: JSONValue, input: JSONValue?, nativeSense: JSONValue?, turn: Turn?) throws -> (
         written: Bool,
         upgrade: String?) {
-        // Only the runner's explicit evidence proves a successful no-op. Missing evidence, failures and unknown effects still count.
-        if let fields = receipt.objectValue, fields["status"] == .string("ok"), fields["effects"] == .string("none"),
-           fields["calls"] == .array([]), fields["notebook_changed"] == .bool(false) { return (false, nil) }
         return try Self.withLock {
             // Native/bundled reads have a registry record but no executable file.
             guard let current = try readFile(id: id, slot: .current) ?? nativeSense.map({
@@ -472,6 +469,7 @@ extension AbilityStore {
         if fields["status"] == .string("refused"), fields["returned"]?.objectValue?["status"] == .string("refused") { return "refused" }
         if fields["status"] == .string("timed_out") { return "cut" }
         let fault = fields["error"]?.objectValue ?? fields["stopped"]?.objectValue ?? fields
+        if fault["origin"] == .string("javascript") { return "error" }
         let reason = fault["reason"]?.stringValue ?? fields["reason"]?.stringValue ?? ""
         if ["timeout", "resource_limit", "cancelled"].contains(reason) { return "cut" }
         if ["network", "http", "connection_failed", "connection_closed", "transport", "network_error", "http_error", "transport_error"].contains(
@@ -487,7 +485,7 @@ extension AbilityStore {
         if let call = failedCall, ![JSONValue.string("ok"), .string("preview"), .string("answered")].contains(call["status"] ?? .null) {
             return runOutcome(.object(call.merging(["calls": .array([])]) { _, new in new }))
         }
-        if fault["origin"] == .string("javascript") || fields["status"] == .string("error") && reason.isEmpty { return "error" }
+        if fields["status"] == .string("error") && reason.isEmpty { return "error" }
         return "refused"
     }
     /// Cache accounting only by its exact checked file identity.

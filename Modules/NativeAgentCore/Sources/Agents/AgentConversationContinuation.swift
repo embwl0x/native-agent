@@ -18,10 +18,11 @@ import NativeAgentCore
 import PersistenceCore
 import StandingBots
 import Transcripts
+import TriggerScheduler
 import os
 import Experiences
 
-// Blueprint: | `AgentConversationContinuation.swift` | Read delayed replies without resending. |
+// Blueprint: | `AgentConversationContinuation.swift` | Read delayed replies on the one clock without resending. |
 
 /// Read delayed replies under the delegation runner’s lifecycle; stored routes grant no execution authority and never authorize resends.
 public struct AgentConversationContinuation: Sendable {
@@ -58,6 +59,7 @@ public struct AgentConversationContinuation: Sendable {
     /// Resume through the original gated chain without an approval filer; card-requiring sends stay held with their reason.
     private func resumeQueues(workspace: WorkspaceOperation) async throws {
         try Task.checkCancellation()
+        if replyWork.withLock({ $0.stopped }) { queuesResumed.withLock { $0 = false } }
         replyWork.withLock { $0.stopped = false }
         await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot)
         try Task.checkCancellation()
@@ -72,7 +74,7 @@ public struct AgentConversationContinuation: Sendable {
                 for row in try store.records() where row.agent == "peer:" + peer
                     && row.automaticRead && row.phase == "waiting"
                     && (row.readInput?["task_id"] == .string(task) || row.receiptField("task_id") == .string(task)) {
-                    _ = try store.update(id: row.id, operationID: row.operationID, touch: false) { $0.nextReadAt = Date() }
+                    _ = try store.update(id: row.id, operationID: row.operationID, touch: false) { if $0.phase == "waiting" { $0.nextReadAt = Date() } }
                 }
             } catch {
                 RepairOwed.owe(dataRoot, id: "contact-push:" + peer, kind: .message,
@@ -83,18 +85,6 @@ public struct AgentConversationContinuation: Sendable {
             }
         }
         try Task.checkCancellation()
-        if !queuesResumed.withLock({ $0 }) {
-            // Read retained waiting tasks once at startup after registering their invalidation source. The task owns current state.
-            for row in try store.records() where row.agent.hasPrefix("peer:")
-                && row.automaticRead && row.phase == "waiting"
-                && string(row.readInput?["task_id"] ?? row.receiptField("task_id")) != nil {
-                _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
-                    if $0.automaticRead && $0.phase == "waiting" && $0.nextReadAt == row.nextReadAt {
-                        $0.nextReadAt = Date()
-                    }
-                }
-            }
-        }
         guard !queuesResumed.withLock({ $0 }) else { return }
         // Load and seed recipes before any contact row reads them.
         AgentRecipeStore.load(dataRoot: dataRoot)
@@ -104,7 +94,11 @@ public struct AgentConversationContinuation: Sendable {
         // Authored contact routes retain exchanges through the ordinary conversation owner.
         let dotAgents = Set(peers.filter { $0.ability == nil && ChatGPTDotIPCTransport.owns($0) }.map { "peer:" + $0.id })
         _ = try store.dropUnsettleable(dot: dotAgents, saved: Set(peers.map { "peer:" + $0.id }))
-        for row in try AgentConversationSession.orphanedQueues(dataRoot: dataRoot) {
+        let orphaned = try await AgentConversationSession.orphanedQueues(dataRoot: dataRoot) { row, peer in
+            try await self.readReply(input: ["agent": .string(row.agent), "conversation_id": .string(row.conversationID!),
+                "details": .bool(true)], row: row, peer: peer)
+        }
+        for row in orphaned {
             if dotAgents.contains(row.agent) { continue } // Direct-session contacts cannot resume queued sends.
             let session = row.scopeSessionID, surface = row.sourceSurface
             let tools = clients.toolDispatchClient(enforceAppAutonomy: false)
@@ -123,6 +117,9 @@ public struct AgentConversationContinuation: Sendable {
             }
         }
         queuesResumed.withLock { $0 = true }
+        await OneClock.at(dataRoot).handle("agent") { _, _ in
+            StoreChangeBus.shared.emit(.init(store: .replyDelivery, path: store.fileURL))
+        }
     }
 
     public func stop() async {
@@ -133,6 +130,7 @@ public struct AgentConversationContinuation: Sendable {
             }
             for task in tasks { task.cancel() }
             for task in tasks { await task.value }
+            await OneClock.at(dataRoot).release("agent")
             await AgentConversationWatches.stop()
             await grok.stop()
             await AgentA2APushReceiver.shared.removeInvalidator(owner: pushOwner)
@@ -178,9 +176,21 @@ public struct AgentConversationContinuation: Sendable {
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         let dotAgents = Set(try AgentPeerStore(dataRoot: dataRoot).list().filter { $0.ability == nil && ChatGPTDotIPCTransport.owns(
             $0) }.map { "peer:" + $0.id })
-        let due = try store.records().filter {
-            !dotAgents.contains($0.agent) && ($0.notice != nil || $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering"))
-                && Self.hasPendingRead($0)
+        let rows = try store.records()
+        let now = Date()
+        let due = rows.filter {
+            ($0.notice != nil || !dotAgents.contains($0.agent) && $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering"))
+                && Self.hasPendingRead($0, at: now)
+        }
+        if let next = rows.filter({ $0.agent.hasPrefix("peer:") && $0.phase == "waiting" && $0.automaticRead })
+            .compactMap(\.nextReadAt).filter({ $0 > now }).min() {
+            do { try await OneClock.at(dataRoot).declare(.init(id: "agent:next", next: next)) }
+            catch {
+                RepairOwed.owe(dataRoot, id: "contact-reply-clock", kind: .message,
+                    operation: "contact.reply.schedule", owner: "clock/times.json",
+                    words: "The next read of a waiting reply could not be scheduled: " + error.localizedDescription,
+                    lever: "Repair the clock; the next conversation change schedules it again.")
+            }
         }
         // Each contact owns its ordered replies; a turn never holds another contact's arrival behind reconciliation.
         for contact in Set(due.map(\.agent)) {
@@ -189,13 +199,15 @@ public struct AgentConversationContinuation: Sendable {
                 if state.tasks[contact] != nil { state.pending.insert(contact); return }
                 state.tasks[contact] = Task {
                     let read: Bool
-                    do { read = try await readDueReplies(contact: contact) }
+                    do { read = try await readDueReplies(contact: contact, noticesOnly: dotAgents.contains(contact)) }
                     catch is CancellationError { read = false }
                     catch {
                         read = false
+                        let who = (try? AgentContactIdentity(dataRoot: dataRoot)).flatMap { AgentScreen.peerName(identity: $0)(contact) } ?? contact
+                        let why = error.localizedDescription
                         RepairOwed.owe(dataRoot, id: "contact-reply:" + contact, kind: .message,
                             operation: "contact.reply.read:" + contact, owner: contact,
-                            words: "Conversation reply handling failed: " + error.localizedDescription + ". Its saved reply remains owed.",
+                            words: "Reply handling for \(who) failed: " + why + (why.hasSuffix(".") ? "" : ".") + " Its saved reply remains owed.",
                             lever: "Repair the named conversation or delivery evidence, then read that contact again.")
                     }
                     await settle {
@@ -212,16 +224,17 @@ public struct AgentConversationContinuation: Sendable {
         }
     }
 
-    private func readDueReplies(contact: String) async throws -> Bool {
+    private func readDueReplies(contact: String, noticesOnly: Bool) async throws -> Bool {
         var read = Set<String>()
         var rearm = false
         while true {
             try Task.checkCancellation()
             // Reread after each turn: it may have advanced this contact's conversation or accepted another reply.
+            let now = Date()
             guard let row = try store.records().filter({
                 $0.agent == contact && !read.contains($0.operationID)
-                    && ($0.notice != nil || $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering"))
-                    && Self.hasPendingRead($0)
+                    && ($0.notice != nil || !noticesOnly && $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering"))
+                    && Self.hasPendingRead($0, at: now)
             }).sorted(by: { ($0.nextReadAt ?? .distantPast) < ($1.nextReadAt ?? .distantPast) }).first else { return rearm }
             read.insert(row.operationID)
             // Delegate notices belong to the asking chat and must not change the thread’s send state.
@@ -232,12 +245,11 @@ public struct AgentConversationContinuation: Sendable {
                                       notice: notice)
                 } catch is CancellationError { throw CancellationError() }
                 catch {
-                    try attention(row, "The retained notice could not be delivered: " + error.localizedDescription
-                        + ". Repair its delivery evidence before handling this notice again.")
+                    try await repairNotice(row, notice, cause: error.localizedDescription)
                 }
                 continue
             }
-            guard row.operationStartedAt != nil else {
+            guard let started = row.operationStartedAt else {
                 try attention(row, """
                     The accepted operation's start time is unavailable. Repair its saved operation evidence before continuing; no message was \
                     repeated.
@@ -262,14 +274,14 @@ public struct AgentConversationContinuation: Sendable {
                     continue
                 }
                 // A write-triggered wake must not busy-poll its own store.
-                _ = try store.update(id: row.id, operationID: row.operationID) {
+                _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
                     $0.nextReadAt = nil
                 }
                 if row.deliveryState == "delivering", let receipt = row.receipt {
                     try await deliver(row, receipt: receipt, peer: peer)
                     continue
                 }
-                guard var input = row.readInput, input["agent"] == .string(row.agent) else {
+                guard [.nativeAgent, .a2a].contains(peer.transport), var input = row.readInput, input["agent"] == .string(row.agent) else {
                     try attention(row, "The saved reply reference is incomplete; the message has not been sent again.")
                     continue
                 }
@@ -288,8 +300,12 @@ public struct AgentConversationContinuation: Sendable {
                 }
                 let settled = fields["terminal"] == .bool(true) || fields["needs_input"] == .bool(true)
                 let cached = AgentConversationStore.cacheReceipt(receipt)
-                _ = try store.update(id: row.id, operationID: row.operationID) {
+                var offset: TimeInterval = 60
+                while started + offset <= Date() { offset += min(offset, 1800) }
+                let next = started + offset
+                _ = try store.update(id: row.id, operationID: row.operationID, touch: settled) {
                     $0.receipt = cached
+                    if !settled, $0.phase == "waiting", $0.nextReadAt == nil { $0.nextReadAt = next }
                     if $0.conversationID == nil, let conversation = string(fields["conversation_id"]) {
                         $0.conversationID = conversation
                     }
@@ -314,10 +330,11 @@ public struct AgentConversationContinuation: Sendable {
         }
     }
 
-    private static func hasPendingRead(_ row: AgentConversationRecord) -> Bool {
+    private static func hasPendingRead(_ row: AgentConversationRecord, at now: Date) -> Bool {
+        if row.notice != nil { return true }
         // A pending helper result follows its queue/shelf owner; saved read dates cannot hold that owner's event.
         if row.notice == nil, row.agent.hasPrefix("bot-run:"), row.deliveryState != "delivering" { return true }
-        return row.nextReadAt != nil
+        return row.nextReadAt.map { $0 <= now } == true
     }
 
     private func deliver(_ row: AgentConversationRecord, receipt: JSONValue, peer: AgentPeerContact? = nil,
@@ -353,23 +370,23 @@ public struct AgentConversationContinuation: Sendable {
         } else { retainedReply = nil }
         let turnSurface: String
         let turnEnvelope: TurnEnvelope
-        let origin: ChatMessageOrigin
+        var origin: ChatMessageOrigin
         let incoming: String
         if let notice {
-            // Delegate output carries only its attested agent authority, never person authorship.
             turnSurface = "chat"
-            turnEnvelope = TurnEnvelope(surface: turnSurface, agent: row.agent,
-                verifiedUserId: peer?.id,
-                deliveryRoute: route.chatToolReplyRoute, declaredRemote: false)
-            origin = try ChatMessageOrigin(surface: BridgeLane.bridgeSurfaceName(forSender: row.agent), agent: row.agent,
-                authored: BridgeLane.laneAuthorship(forSender: row.agent))
+            turnEnvelope = TurnEnvelope.native("contact.notice").withDeliveryRoute(route.chatToolReplyRoute)
+            origin = ChatMessageOrigin(surface: turnSurface, agent: "self", authored: .agent, replyTo: deliveryID)
             incoming = notice.text
         } else if let peer {
-            turnSurface = peer.elevationAllowed ? "chat" : AgentBridgeSurface.id
-            turnEnvelope = envelope(peer: peer, route: route.chatToolReplyRoute)
-            origin = ChatMessageOrigin(surface: turnSurface, agent: "agent", authored: .agent, replyTo: deliveryID)
+            turnSurface = "chat"
+            turnEnvelope = TurnEnvelope.native("contact.reply").withDeliveryRoute(route.chatToolReplyRoute)
+            origin = ChatMessageOrigin(surface: turnSurface, agent: "self", authored: .agent, replyTo: deliveryID)
             incoming = incomingText(receipt, peer: peer, label: row.label, retainedText: retainedReply?.text)
         } else { throw StandingBotsError.invalidValue("A reply must have an identified author.") }
+        // The turn is the agent's own; the words it carries have a speaker. The contact steers it as a peer source, so trust is judged at each
+        // effect (a contact the person trusts restricts nothing) and its words never run with the agent's authority unexamined. No elevation is read here.
+        if let peer { origin.peerSources = ["peer:" + peer.id] }
+        let steeredOrigin = origin
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let digest = try await lifecycle.cachedRequestDigest(deliveryId: deliveryID)
             ?? SHA256.hash(data: try encoder.encode(receipt)).map { String(format: "%02x", $0) }.joined()
@@ -379,8 +396,10 @@ public struct AgentConversationContinuation: Sendable {
                                         runID: retainedReply?.run, start: {
                 // Once the turn owns the event, glance and arrivals must not repeat it.
                 _ = try store.update(id: row.id, operationID: row.operationID, touch: notice == nil) {
-                    if notice == nil { $0.phase = "ready"; $0.deliveryState = "delivering"; $0.receipt = receipt }
-                    $0.shownInline = $0.operationID + ":" + $0.phase
+                    if notice == nil {
+                        $0.phase = "ready"; $0.deliveryState = "delivering"; $0.receipt = receipt
+                        $0.shownInline = $0.operationID + ":" + $0.phase
+                    }
                 }
             }) { runID, binding in
                 let client = clients.bridgeChatClient()
@@ -388,7 +407,7 @@ public struct AgentConversationContinuation: Sendable {
                 let request = TurnRequest(message: incoming, sessionID: session, surface: turnSurface,
                     suppressUserAppend: retainedReply != nil,
                     envelope: turnEnvelope, verifiedSessionID: session, replyRoute: route.chatToolReplyRoute,
-                    origin: origin, pinnedRunID: runID, codexCompletion: binding, threadKind: .agent,
+                    origin: steeredOrigin, pinnedRunID: runID, codexCompletion: binding, threadKind: .agent,
                     ownedSessionID: peer.map { ContactThread.session(owner: $0.id, conversation: row.conversationID) })
                 let admitted = try await TurnAdmission.admittedRun(turn: request.turn(),
                     arrival: request.arrival(retainedReply != nil ? .saved : .shown), dataRoot: dataRoot, waitForCapacity: true) { turn in
@@ -400,16 +419,30 @@ public struct AgentConversationContinuation: Sendable {
                 return admitted
             }
         } catch {
-            if let notice {
+            if notice != nil {
                 // Do not rerun uncertain execution or mark it handed over.
                 FileHandle.standardError.write(Data(("AgentConversationContinuation: delegation notice turn "
                     + "\(deliveryID) interrupted; not rerun: \(error.localizedDescription)\n").utf8))
-                try told(row, notice, handed: false)
             } else { try attention(row, "Reply handling was interrupted: " + error.localizedDescription
                 + ". The peer reply is retained; no message was repeated.", receipt: receipt) }
             throw error
         }
-        if let notice { return try told(row, notice) }
+        if let notice {
+            let cause: String?
+            switch answered {
+            case .delivered(let result, _), .settled(let result?):
+                cause = result.status == "completed" || result.status == "steered" ? nil
+                    : "Notice delivery is \(result.status) via \(result.delivery)." + (result.reason.map { " " + $0 } ?? "")
+            case .held:
+                cause = "Notice handling is in progress, of unknown outcome, or claimed with other content; no second turn was started."
+            case .settled(nil):
+                cause = "The notice has no retained delivery verdict; its outcome is unknown."
+            }
+            if let cause {
+                throw NSError(domain: "AgentConversationContinuation.notice", code: 1, userInfo: [NSLocalizedDescriptionKey: cause])
+            }
+            return try told(row, notice)
+        }
         switch answered {
         case .held:
             // Never a second turn for one event; the thread itself is untouched.
@@ -490,12 +523,20 @@ public struct AgentConversationContinuation: Sendable {
             sender: completionSender, lifecycle: lifecycle), runID: response.runId)
     }
 
-    /// The event is the agent's now: clear it, leaving the thread's own state (a stalled send is still owed its answer) as it is.
-    private func told(_ row: AgentConversationRecord, _ notice: AgentConversationNotice, handed: Bool = true) throws {
+    /// Thrown and returned non-delivery share one repair; an unsuccessful repair write leaves the notice pending.
+    private func repairNotice(_ row: AgentConversationRecord, _ notice: AgentConversationNotice, cause: String) async throws {
+        try await RepairOwed.owe(ExperienceStore.at(dataRoot),
+            id: "contact-notice:" + row.operationID + ":" + notice.event, kind: .message,
+            operation: "contact.notice:" + row.operationID + ":" + notice.event, owner: row.agent,
+            words: "The retained notice could not be delivered: " + cause,
+            lever: "Repair this notice's delivery evidence; its reply read remains independent.")
+        try told(row, notice)
+    }
+
+    /// Delivery or a saved repair owns the event now; clear only its notice, leaving the thread's own state as it is.
+    private func told(_ row: AgentConversationRecord, _ notice: AgentConversationNotice) throws {
         _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
             if $0.notice == notice { $0.notice = nil }
-            if !handed, $0.shownInline == $0.operationID + ":" + $0.phase { $0.shownInline = nil }
-            $0.nextReadAt = nil
         }
     }
 
@@ -527,7 +568,7 @@ public struct AgentConversationContinuation: Sendable {
         var entry = try exactEntry()
         if entry == nil {
             switch try BotRunQueue(dataRoot: dataRoot).presence(bot: botID, requestID: requestID) {
-            case .queued, .running, .deadlineExceeded: return false
+            case .queued, .running: return false
             case .absent:
                 // Completion may have landed between the first shelf read and the queue/claim check. Reread after proving no live writer.
                 entry = try exactEntry()
@@ -712,10 +753,10 @@ public struct AgentConversationContinuation: Sendable {
             conversation: AgentConversationContext().internalRead)
         var turn = Turn(session: row.scopeSessionID)
         turn.verifiedSessionID = row.scopeSessionID
-        turn.envelope = envelope(peer: peer, route: nil)
+        turn.envelope = .native("contact.reply.read")
         // Reads re-enter the app action's gate with one operation shared by its pages.
         let invocation = ChatToolInvocation()
-        let first = try await tools.dispatch(tool: "agent_read", input: input, surface: AgentBridgeSurface.id, turn: turn, invocation: invocation)
+        let first = try await tools.dispatch(tool: "agent_read", input: input, surface: "chat", turn: turn, invocation: invocation)
         guard peer.transport == .nativeAgent, case .object(var fields) = first,
               case .object(var evidence)? = fields["remote_evidence"],
               var body = string(fields["reply"]) else { return first }
@@ -724,7 +765,7 @@ public struct AgentConversationContinuation: Sendable {
             try Task.checkCancellation()
             guard let offset = evidence["next_offset"] else { break }
             var page = input; page["offset"] = offset
-            let next = try await tools.dispatch(tool: "agent_read", input: page, surface: AgentBridgeSurface.id, turn: turn, invocation: invocation)
+            let next = try await tools.dispatch(tool: "agent_read", input: page, surface: "chat", turn: turn, invocation: invocation)
             guard case .object(let nextFields) = next,
                   nextFields["status"] == fields["status"],
                   let addition = string(nextFields["reply"]),
@@ -737,16 +778,11 @@ public struct AgentConversationContinuation: Sendable {
         return .object(fields)
     }
 
-    private func envelope(peer: AgentPeerContact, route: ChatToolSessionContext.ReplyRoute?) -> TurnEnvelope {
-        TurnEnvelope(surface: peer.elevationAllowed ? "chat" : AgentBridgeSurface.id, agent: "peer", verifiedUserId: peer.id,
-            commandSignatureVerified: true, deliveryRoute: route, declaredRemote: !peer.elevationAllowed)
-    }
-
     private func incomingText(_ receipt: JSONValue, peer: AgentPeerContact, label: String, retainedText: String? = nil) -> String {
         guard case .object(let fields) = receipt else { return "The contact's reply is unreadable." }
-        let body = (retainedText ?? string(fields["reply"])).map(AgentBridgeSurface.quotingImpersonation)
-        var message = AgentBridgeSurface.turnHeader(peerName: peer.name, elevated: peer.elevationAllowed)
-            + AgentBridgeSurface.contactLines(name: peer.name, id: peer.id, conversation: label, answering: true)
+        let body = (retainedText ?? string(fields["reply"]) ?? (fields["status"] == .string("failed") ? string(fields["detail"]) : nil))
+            .map(AgentBridgeSurface.quotingImpersonation)
+        var message = AgentBridgeSurface.contactLines(name: peer.name, id: peer.id, conversation: label, answering: true)
         message += body ?? "The contact reported \(string(fields["status"]) ?? "an unknown outcome") without reply text."
         let remoteHasMore: Bool = if case .object(let evidence)? = fields["remote_evidence"] {
             evidence["has_more"] == .bool(true)

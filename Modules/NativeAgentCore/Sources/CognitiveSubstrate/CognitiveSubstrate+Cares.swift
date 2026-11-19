@@ -49,8 +49,8 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
         self.acted = acted
     }
 
-    /// Missing or malformed care judgments fail interpretation; an unshown key cannot be silently discarded or guessed.
-    public static func parse(_ raw: Any?, shown: [CognitiveCareLine]) -> [CognitiveCareJudgment]? {
+    /// A non-array refuses interpretation; each faulty entry names its field and leaves valid siblings intact.
+    public static func parse(_ raw: Any?, shown: [CognitiveCareLine]) -> (judgments: [CognitiveCareJudgment], faults: [String])? {
         guard let items = raw as? [Any] else { return nil }
         let ids = Dictionary(shown.map { ($0.key.lowercased(), $0.id) }, uniquingKeysWith: { first, _ in first })
         func text(_ value: Any?) -> String? {
@@ -64,32 +64,40 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
             return .some(text(value))
         }
         var out: [CognitiveCareJudgment] = []
-        for item in items {
-            guard let object = item as? [String: Any],
-                  let care = text(object["care"])?.lowercased(),
-                  let number = object["moved"] as? NSNumber,
-                  CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite,
-                  let by = text(object["by"]).flatMap({ CognitiveCare.Mover(rawValue: $0.lowercased()) }),
-                  let felt = text(object["felt"]), let note = text(object["note"]),
-                  let open = optionalText(object["open"]) else { return nil }
+        var faults: [String] = []
+        for (index, item) in items.enumerated() {
+            func fault(_ field: String, _ words: String) { faults.append("cares[\(index)]\(field): \(words)") }
+            guard let object = item as? [String: Any] else { fault("", "must be an object"); continue }
+            guard let care = text(object["care"])?.lowercased() else { fault(".care", "needs a shown id or new"); continue }
+            guard let number = object["moved"] as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else {
+                fault(".moved", "needs a finite number"); continue
+            }
+            guard let by = text(object["by"]).flatMap({ CognitiveCare.Mover(rawValue: $0.lowercased()) }) else {
+                fault(".by", "needs a known mover"); continue
+            }
+            guard let felt = text(object["felt"]) else { fault(".felt", "needs non-blank text"); continue }
+            guard let note = text(object["note"]) else { fault(".note", "needs non-blank text"); continue }
+            guard let open = optionalText(object["open"]) else { fault(".open", "needs text or null"); continue }
             let closes: Bool
             switch object["closes"] {
             case nil, is NSNull: closes = false
             case let value as Bool: closes = value
-            default: return nil
+            default: fault(".closes", "needs a boolean or null"); continue
             }
             let acted: Bool?
             switch object["acted"] {
             case nil, is NSNull: acted = nil
             case let value as NSNumber where CFGetTypeID(value) == CFBooleanGetTypeID(): acted = value.boolValue
-            default: return nil
+            default: fault(".acted", "needs a boolean or null"); continue
             }
-            guard acted != true || by == .her else { return nil }
+            guard acted != true || by == .her else { fault(".acted", "true requires the agent as mover"); continue }
             var stance: CognitiveCare.Stance?
             if let raw = object["stance"], !(raw is NSNull) {
-                guard let fields = raw as? [String: Any], let said = text(fields["text"]),
-                      let because = text(fields["because"]),
-                      let unless = text(fields["wouldChangeMind"]) else { return nil }
+                guard let fields = raw as? [String: Any] else { fault(".stance", "needs an object or null"); continue }
+                guard let said = text(fields["text"]) else { fault(".stance.text", "needs non-blank text"); continue }
+                guard let because = text(fields["because"]) else { fault(".stance.because", "needs non-blank text"); continue }
+                guard let unless = text(fields["wouldChangeMind"]) else { fault(".stance.wouldChangeMind", "needs non-blank text"); continue }
                 stance = CognitiveCare.Stance(text: said, because: because, wouldChangeMind: unless)
             }
             let target: Target
@@ -98,24 +106,24 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
                 switch object["between"] {
                 case nil, is NSNull: between = false
                 case let value as Bool: between = value
-                default: return nil
+                default: fault(".between", "needs a boolean or null"); continue
                 }
-                guard let about = text(object["about"]) else { return nil }
+                guard let about = text(object["about"]) else { fault(".about", "a new care needs about"); continue }
                 target = .new(about: String(about.prefix(CognitiveCare.aboutCharacters)), between: between)
             } else {
-                guard let id = ids[care] else { return nil }
+                guard let id = ids[care] else { fault(".care", "id was not shown: " + care); continue }
                 target = .existing(id)
             }
             out.append(CognitiveCareJudgment(target: target, moved: number.doubleValue, by: by, felt: felt, note: note,
                                              open: open, closes: closes, stance: stance, acted: acted))
         }
-        return out
+        return (out, faults)
     }
 }
 
 public struct CognitiveCareProvenance: Sendable, Equatable {
     public var speaker: String
-    /// The owner, or a peer the owner trusts. An untrusted peer moves only what the agent already cares about: no new care, no stance, no gap.
+    /// The owner, or a peer the owner trusts. An untrusted peer moves only an existing care: no birth, revival, stance or gap.
     public var trusted: Bool
     /// The app wrote the incoming words (the wander hour). Only what the agent's reply did counts.
     public var appAuthored: Bool
@@ -390,7 +398,7 @@ extension CognitiveSubstrate {
         }
         let peer = CognitiveCareProvenance.personKey(Self.peerIdentity(metadata: event.metadata, dataRoot: conversationDataRoot)
             ?? Self.relationalSource(for: event).subjectLabel ?? "peer")
-        return CognitiveCareProvenance(speaker: peer, trusted: dependencies.peerTrusted(peer),
+        return CognitiveCareProvenance(speaker: peer, trusted: dependencies.trustedPeers([peer]).contains(peer),
                                        appAuthored: appAuthored, source: source, at: event.occurredAt)
     }
 
@@ -572,8 +580,8 @@ extension CognitiveSubstrate {
             if provenance.trusted, current, let stance = judgment.stance {
                 Self.settleCareStance(stance, source: provenance.source, at: provenance.at, care: &care)
             }
-            // Touching an ordinarily faded care makes it live again.
-            care.fadedAt = nil
+            // Only trusted evidence brings an ordinarily faded care back.
+            if provenance.trusted { care.fadedAt = nil }
             workingCares[care.id] = care
             let embeddingText = Self.careEmbeddingText(care)
             if let vector = birthQueries[embeddingText], let birthEpoch {

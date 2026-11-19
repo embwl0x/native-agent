@@ -9,7 +9,6 @@ enum IOSPairingPresentation {
         \(appName) on your Mac → Connectors → iPhone (in Simple view, ask your agent to pair this phone and open the pairing \
         card)
         """ }
-    static let title = "Pair with the Mac app to get started."
     /// Explain at pairing that the phone depends on the Mac being awake.
     static var macDependence: String {
         "I run on your Mac. Keep it awake with \(appName) open and I can answer you here."

@@ -42,60 +42,15 @@ import Connectors
 import Browser
 import SchedulerExecution
 import TrustPersistence
-// Blueprint: | `AppModel.swift` | `AppModel`: Composition, shared drafts, retained page sessions and owner-derived UI state |
+// Blueprint: | `AppModel.swift` | `AppModel`: Composition, shared drafts and owner-derived UI state |
 
 @MainActor
 @Observable
 final class AppModel: Sendable {
-    private let editDrafts = FaceEditDrafts()
-    let pageSessions = FacePageSessions()
 
-    func editDraft<Value>(_ subject: String, seed: @autoclosure () -> Value) -> Value {
-        editDrafts.value(subject, seed: seed())
-    }
-    func editDraftBaseline<Value>(_ subject: String, seed: Value) -> Value {
-        editDrafts.baseline(subject, seed: seed)
-    }
-    func setEditDraft<Value>(_ value: Value, for subject: String, baseline: Value? = nil) {
-        editDrafts.set(value, for: subject, baseline: baseline)
-    }
-    func acceptEditDraft<Value: Equatable>(_ subject: String, submitted: Value, saved: Value) {
-        editDrafts.accept(subject, submitted: submitted, saved: saved)
-    }
-    func acceptEditDraft<Value: Codable & Equatable>(_ subject: String, submitted: Value, rebasingOn saved: Value) throws {
-        try editDrafts.accept(subject, submitted: submitted, rebasingOn: saved)
-    }
-    func mergingEditDraft<Value: Codable>(
-        _ subject: String, edited: Value, into current: Value, baseline originalBaseline: Value? = nil
-    ) throws -> Value {
-        try editDrafts.merging(subject, edited: edited, into: current, baseline: originalBaseline)
-    }
-    func editBinding<Value>(_ subject: String, seed: @autoclosure @escaping () -> Value) -> Binding<Value> {
-        Binding(get: { self.editDraft(subject, seed: seed()) }, set: { self.setEditDraft($0, for: subject) })
-    }
-    func clearEditDraft(_ subject: String) { editDrafts.clear(subject) }
-
-    /// Use the shared toast center so feedback appears in the one notice lane.
-    let systemToasts = SystemToastCenter()
-    private var iCloudAccountToastID: UUID?
-
-    func showICloudAccountFailure(_ failure: DeviceSyncAccountFailure?) {
-        guard failure != nil else {
-            if let id = iCloudAccountToastID { systemToasts.dismiss(id) }
-            iCloudAccountToastID = nil
-            return
-        }
-        guard iCloudAccountToastID == nil else { return }
-        let toast = SystemToast(kind: .error, text: DeviceSyncAccountFailure.macMessage, autoDismissAfter: nil)
-        iCloudAccountToastID = toast.id
-        systemToasts.push(toast)
-    }
+    let systemToasts = SystemToastCenter.shared
     let backgroundLoopsManager: BackgroundLoopLifetimes = .shared
 
-    // Search configuration belongs to the engine; this property only reads its projection.
-    var searxngBaseURL: String {
-        face.slot(.settings).select("configuration.searchURL", as: SettingsFace.self) { $0?.searchURL ?? "" }
-    }
 
     /// Command reads include unsaved edits, then read the provider owner, never a delayed drawing frame.
     var pendingChatBrainSelection: ProviderTurnChoice?
@@ -142,30 +97,9 @@ final class AppModel: Sendable {
     var chatMessages: [ChatMessage] { engine.transcripts.displayedTranscript(for: activeChatSessionId).messages }
     typealias PanelRefreshStatus = NativeAgentShared.PanelRefreshStatus
 
-    enum CompactReadPresentationState: Equatable, Sendable {
-        case loading, unavailable, stale, empty, content
-    }
-
-    static func compactReadPresentationState(
-        hasContent: Bool,
-        status: PanelRefreshStatus?
-    ) -> CompactReadPresentationState {
-        if status?.isStale == true { return hasContent ? .stale : .unavailable }
-        if status == nil { return .loading }
-        return hasContent ? .content : .empty
-    }
-
-    /// Offscreen reads must not consume a selected identity awaiting its live page.
-    var pendingPaletteDestination: PaletteSavedDestination?
-    var pendingMemoryFaceTarget: MemoriesFaceTarget?
 
     /// Fold transcript fetch failures into the chat panel's failed-endpoint list.
     var chatStateLoadFailed = false
-    /// Either failed session read must dim retained sidebar rows.
-    var chatSidebarSessionListOpacity: Double {
-        let indexFailed = face.slot(.sessionNavigation).select("hasIssue", as: SessionNavigationFace.self) { $0?.issue != nil }
-        return chatStateLoadFailed || indexFailed ? 0.55 : 1
-    }
 
     /// Transcript loading owns its failure; the session index settles its own read status.
     func markChatSidebarLoadSucceeded() {
@@ -219,8 +153,6 @@ final class AppModel: Sendable {
         get { engine.desk.faceItem }
         set { engine.desk.faceItem = newValue }
     }
-    /// Retain a message locator until ChatView can reveal it.
-    var pendingChatMessageID: String?
     var lastRefreshError: String?
     @ObservationIgnored let firstRunWelcomeTransaction = FirstRunWelcomeTransaction()
     var chatTurnLifecycleRepairCompleted: Bool {
@@ -248,17 +180,12 @@ final class AppModel: Sendable {
     }
     var agentDisplayName: String { settingsPersonaDisplayName }
 
-    /// Address and display names must share the persona owner's availability.
-    var agentAddressName: String { agentDisplayName }
 
     var dreamError: String?
 
     @ObservationIgnored var chatComposerDrafts: [String: ChatComposerDraft] = [:]
     var chatPendingAttachments: [String: [MultimodalAttachment]] = [:]
 
-    /// Retain the requested section across navigation until Today consumes it.
-    var pendingActivitySectionRaw: String? = nil
-    var diagnosticsRunID: String?
 
     @ObservationIgnored private var settingsFaceUpdates: SettingsFaceUpdates?
 

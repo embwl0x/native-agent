@@ -193,9 +193,10 @@ struct TextMarkerCodec: Sendable {
             floor: floorRows.isEmpty
                 ? "- Nothing is callable this turn."
                 : floorRows.joined(separator: "\n"),
-            appended: appendedRows.isEmpty
+            appended: ([appendedRows.isEmpty
                 ? ""
-                : "Also loaded this session (callable now with the same markers):\n" + appendedRows.joined(separator: "\n") + disclosure
+                : "Also loaded this session (callable now with the same markers):\n" + appendedRows.joined(separator: "\n") + disclosure]
+                + schemas.map(\.volatileCatalogAppendix)).filter { !$0.isEmpty }.joined(separator: "\n\n")
         )
     }
 

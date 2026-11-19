@@ -201,6 +201,7 @@ public struct ConversationFace: FaceValue {
     public var waitingForPerson: Bool?
     public var visibleReply: VisibleReplyTarget?
     public var transcriptComplete: Bool
+    public var contactName: String?
     public init(session: String, state: FaceReadState, cacheReady: Bool, actions: [MessageActionFace], attachments: [FaceResolvedAttachment],
                 otherRoomExchanges: [FaceThreadLine], waitingForPerson: Bool? = nil, visibleReply: VisibleReplyTarget? = nil,
                 transcriptComplete: Bool = true) {

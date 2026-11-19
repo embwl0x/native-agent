@@ -24,7 +24,7 @@ extension Parts {
         }
     }
 
-    /// Own work is the agent's to keep under Full Mac; untrusted/pack work and lower authority require the person's decision. Untrusted turns cannot write
+    /// Own work is the agent's to keep under Full Mac; untrusted work and lower authority require the person's decision. Untrusted turns cannot write
     /// before their command card is answered.
     public static func keepRefusal(origin: JSONValue?, name: String, fullMac: Bool) -> String? {
         let fields = fields(origin ?? .null)
@@ -33,7 +33,6 @@ extension Parts {
             \(name) came from untrusted agents \(strings(fields["peers"]).joined(separator: ", ")), so keeping it is the owner's card for this exact \
             version
             """
-        case "pack"?: return "\(name) came with the \(string(fields, "pack") ?? "") pack, so keeping it is the owner's"
         case nil: return "\(name) has no attested origin, so keeping it is the owner's"
         default: break
         }
@@ -61,7 +60,6 @@ extension Parts {
             // Admission preserves sealed identity and ratcheted provenance while projecting only this version's declarations.
             var declared = Self.fields(candidate.manifest).filter { $0.value != .null }
             declared["id"] = .string(candidate.id)
-            if case .object(let script)? = declared.removeValue(forKey: "script"), declared["params"] == nil { declared["params"] = script["params"] }
             let origin = Self.merged([declared["origin"]] + Self.recorded(row))
             // Its params are this version's: one it declares none for takes none.
             row.removeValue(forKey: "params")
@@ -142,10 +140,10 @@ extension Parts {
         let proved = proof != nil
         let origin = Self.merged([Self.fields(candidate.manifest)["origin"]] + Self.recorded(row))
         fields["candidate_digest"] = .string(digest)
-        // Recorded-practice code requires replayed tape before anyone may keep it.
-        if Self.fields(candidate.manifest)["compiled"] != nil, proof.map({ Self.fields($0)["tape"] == nil }) ?? true {
+        // Tape fixtures require replay before anyone may keep this version.
+        if OwnedProgramStore.tape(candidate.fixtures) != nil, proof.map({ Self.fields($0)["tape"] == nil }) ?? true {
             return .stopped((false, """
-                \(name) was compiled from recorded practice, so it is kept only once ability.validate has replayed its examples from the tape. Nothing \
+                \(name) has recorded tape fixtures, so it is kept only once ability.validate has replayed its examples from the tape. Nothing \
                 changed.
                 """,
                     fields.merging(["reason": .string("not_replayed"), "effects": .string("none"),

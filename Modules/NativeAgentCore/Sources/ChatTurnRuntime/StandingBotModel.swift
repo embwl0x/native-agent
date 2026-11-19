@@ -15,7 +15,7 @@ import Dispatcher
 import PersonaEngine
 import AgentWorkspace
 import os
-// Blueprint: | `StandingBotModel.swift` | `Expansion.withTurn`; Helper-owned measured conversation replay |
+// Blueprint: | `StandingBotModel.swift` | `TurnDispatchClosure.withTurn`; Helper-owned measured conversation replay |
 
 extension SwiftNativeChatOrchestrationClient {
     func runStandingBot(_ bot: BotDefinition, message: String, choice: ProviderTurnChoice,
@@ -35,7 +35,6 @@ extension SwiftNativeChatOrchestrationClient {
         let choices = ReplyChoices()
         let turn = turn.with(\.execution, execution).with(\.replyChoices, choices).with(\.run, run)
             .with(\.session, bot.sessionID).with(\.userText, message).with(\.fileAccess, fileAccess)
-        return try await ProviderToolResultPage.holding(turn: turn, sessionId: bot.sessionID) { turn in
         let envelope = turn.envelope
         let deliverySurface = turn.replyRoute?.surface ?? "bot"
         let taint = turn.peerSteering
@@ -272,7 +271,7 @@ extension SwiftNativeChatOrchestrationClient {
         var reply = try await withSessionContextMeasurement(sessionId: bot.sessionID, model: choice.model,
             providerID: choice.provider, surface: "bot", runId: run, progress: progress,
             nextTurnOutputBudgetTokens: bot.budget.tokens, turn: turn, work: work) { work in
-            try await Expansion.withTurn(dataRoot: dataRoot, turn: turn) {
+            try await TurnDispatchClosure.withTurn(dataRoot: dataRoot, turn: turn) {
                 try await SwiftNativeTurnEngine.untilStopped(flag) {
                     await execute(turn.with(\.offeredTools, ["app"])
                         .with(\.capabilityNote, { execution.keepCapabilityNote($0) }), call, work)
@@ -326,6 +325,6 @@ extension SwiftNativeChatOrchestrationClient {
         }
         try persisted.get()
         return reply
-        } } } }
+        } } }
     }
 }

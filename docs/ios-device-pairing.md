@@ -32,9 +32,9 @@ acknowledged it. Only the
 Mac Pair button promotes a pending key. Missing storage starts empty; malformed, unreadable, or nonregular storage refuses mutations and
 decisions without replacing its contents. No private device key reaches the Mac.
 
-KVS pairing-material publication advances its stored version with checked
-arithmetic. An exhausted version reports publication failure and leaves the
-material, version and synchronization checkpoint unchanged.
+The Mac publishes pairing material through CloudKit, with no KVS publication or
+synchronization checkpoint. Its unsigned resync hint retains the shared wire
+schema's local `pairing_secret_version` field.
 
 The Mac's paired-phone snapshot publishes reloads through `LatestRead` and
 committed status changes through its `write` boundary. A newer pending read

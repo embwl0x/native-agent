@@ -1,9 +1,9 @@
 /* NativeAgent ability
-{"id": "native-messages", "kind": "ability", "version": 1, "reach": {"capabilities": ["app_write:com.apple.MobileSMS", "computer_files"], "readPaths": ["~/Library/Messages/chat.db"]}, "face": {"page": "messages"}, "record": {"description": "Read Messages conversations and history from chat.db and send texts through Messages, with the recovery words for each failure reason.", "actions": []}, "answers": {"messages.recent": {"summary": "List Messages threads with selected fields, latest-unread filtering and a since window; or read sent, received and exact conversation history", "description": "Read Messages: from_me selects newest sent or received messages across all conversations, with named participants and exact sent_count or received_count when since is given; otherwise list conversations with optional fields, since and latest-unread filtering, order by oldest unread incoming message (past 30 days by default), find them by person or words, or open an exact thread. Threads include unread_count across all dates and latest_message_is_read; history includes each message's is_read when chat.db exposes it, otherwise unread_state says unavailable. These are local read flags, not recipient read receipts. Requires Messages Read permission and macOS Full Disk Access. Plain and supported archived text are shown; unsupported formats and attachment content are explicitly unavailable, never presented as empty messages.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {"limit": {"type": "integer", "description": "Maximum threads or messages to return (1-30, default 10); exact window counts are independent of this limit."}, "from_me": {"type": "boolean", "description": "true: latest messages sent by you across all threads, newest first, with thread_id, named participants, date and text or attachment label. false: latest received messages. Omit to keep the conversation view. Cannot combine with thread_id, query, unread_only, sort, offset or before_message_id."}, "since": {"type": "string", "description": "Inclusive window: local YYYY-MM-DD, ISO-8601 with time zone, a positive duration such as 7d (m/h/d/w), or this week (start of the local calendar week). Thread lists use latest-message dates; oldest_unread also selects its unread message within this window and defaults to the past 30 days. Other sorts have no default date cutoff. With from_me, returns exact sent_count or received_count over local message records, including attachments, reactions and special records. Omit for an exact thread read."}, "fields": {"type": "array", "items": {"type": "string"}, "description": "Thread-list row keys to return; omitted returns every existing field. [] returns empty rows with envelope counts. Choose thread_id, name, participants, date, preview, snippet, latest_message_is_read, unread_count, oldest_unread_message_id, oldest_unread_date, oldest_unread_preview, oldest_unread_preview_status. Aliases returned under the requested key: handle is an array of participant handles, last_at is date, unread is the all-date unread_count. For no message text use [handle,name,last_at,unread]. Cannot combine with thread_id or from_me."}, "offset": {"type": "integer", "description": "Conversations to skip: next_offset from the previous page; omit initially."}, "unread_only": {"type": "boolean", "description": "List only threads whose latest message is incoming and unread; default false. Older unread records alone do not qualify. Omit for an exact thread read."}, "sort": {"type": "string", "enum": ["newest", "oldest_unread"], "description": "Thread order; default newest. oldest_unread selects unread incoming messages within since (default past 30 days), earliest first, and includes oldest_unread_message_id, oldest_unread_date, oldest_unread_preview and its availability status unless fields excludes them. Omit for an exact thread read."}, "query": {"type": "string", "description": "A person (name, number or email) or words they wrote; lists only matching conversations."}, "thread_id": {"type": "string", "description": "Exact thread_id returned by this tool, to inspect that conversation."}, "before_message_id": {"type": "integer", "minimum": 1, "description": "Older-page cursor returned as older_before_message_id. Requires the same exact thread_id; omit for recent messages."}}, "required": []}}, "messages.send": {"description": "Sends a text message now (iMessage/SMS) to an explicit recipient, or sends a reply now to an exact observed Messages thread with its expected participants. Choose exactly one of to or thread_id. Requires Messages write authority.", "class": "send", "irreversible": true, "screen": false, "args": {"type": "object", "properties": {"to": {"type": "string", "description": "Phone number or email for a new message (a name: find it with contacts.search). Omit when replying by thread_id."}, "thread_id": {"type": "string", "description": "Exact observed Messages thread. Requires expected_participants; do not use a thread ID as to."}, "expected_participants": {"type": "array", "items": {"type": "string"}, "description": "Exact participant handles from the latest thread read, checked again before sending."}, "body": {"type": "string", "description": "Message body (required)."}}, "required": ["body"]}}}}
+{"id": "native-messages", "kind": "ability", "version": 1, "reach": {"capabilities": ["app_write:com.apple.MobileSMS", "computer_files"], "readPaths": ["~/Library/Messages/chat.db"]}, "face": {"page": "messages"}, "record": {"description": "Read Messages conversations and history from chat.db and send texts through Messages, with the recovery words for each failure reason.", "actions": []}, "answers": {"messages.recent": {"summary": "List Messages threads with selected fields, latest-unread filtering and a since window; or read sent, received and exact conversation history", "description": "Read Messages: from_me selects newest sent or received messages across all conversations, with named participants and exact sent_count or received_count when since is given; otherwise list conversations with optional fields, since and latest-unread filtering, order by oldest unread incoming message (past 30 days by default), find them by person or words, or open an exact thread. Threads include unread_count across all dates and latest_message_is_read; history includes each message's is_read when chat.db exposes it, otherwise unread_state says unavailable. These are local read flags, not recipient read receipts. Requires Messages Read permission and macOS Full Disk Access. Plain and supported archived text are shown; unsupported formats and attachment content are explicitly unavailable, never presented as empty messages.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {"limit": {"type": "integer", "description": "Maximum threads or messages to return (1-30, default 10); exact window counts are independent of this limit."}, "from_me": {"type": "boolean", "description": "true: latest messages sent by you across all threads, newest first, with thread_id, named participants, date and text or attachment label. false: latest received messages. Omit to keep the conversation view. Cannot combine with thread_id, query, unread_only, sort, offset or before_message_id."}, "since": {"type": "string", "description": "Inclusive window: local YYYY-MM-DD, ISO-8601 with time zone, a positive duration such as 7d (m/h/d/w), or this week (start of the local calendar week). Thread lists use latest-message dates; oldest_unread also selects its unread message within this window and defaults to the past 30 days. Other sorts have no default date cutoff. With from_me, returns exact sent_count or received_count over local message records, including attachments, reactions and special records. Omit for an exact thread read."}, "fields": {"type": "array", "items": {"type": "string"}, "description": "Thread-list row keys to return; omitted returns every existing field. [] returns empty rows with envelope counts. Choose thread_id, name, participants, date, preview, snippet, latest_message_is_read, unread_count, oldest_unread_message_id, oldest_unread_date, oldest_unread_preview, oldest_unread_preview_status. Aliases returned under the requested key: handle is an array of participant handles, last_at is date, unread is the all-date unread_count. For no message text use [handle,name,last_at,unread]. Cannot combine with thread_id or from_me."}, "offset": {"type": "integer", "description": "Conversations to skip: next_offset from the previous page; omit initially."}, "unread_only": {"type": "boolean", "description": "List only threads whose latest message is incoming and unread; default false. Older unread records alone do not qualify. Omit for an exact thread read."}, "sort": {"type": "string", "enum": ["newest", "oldest_unread"], "description": "Thread order; default newest. oldest_unread selects unread incoming messages within since (default past 30 days), earliest first, and includes oldest_unread_message_id, oldest_unread_date, oldest_unread_preview and its availability status unless fields excludes them. Omit for an exact thread read."}, "query": {"type": "string", "description": "A person (name, number or email) or words they wrote; lists only matching conversations."}, "thread_id": {"type": "string", "description": "Exact thread_id returned by this tool, to inspect that conversation. Omit query and offset with it; page its history with before_message_id."}, "before_message_id": {"type": "integer", "minimum": 1, "description": "Older-page cursor returned as older_before_message_id. Requires the same exact thread_id; omit for recent messages."}}, "required": []}}, "messages.send": {"description": "Sends a text message now (iMessage/SMS) to an explicit recipient, or sends a reply now to an exact observed Messages thread with its expected participants. Choose exactly one of to or thread_id. Requires Messages write authority.", "class": "send", "irreversible": true, "screen": false, "args": {"type": "object", "properties": {"to": {"type": "string", "description": "Phone number or email for a new message (a name: find it with contacts.search). Omit when replying by thread_id."}, "thread_id": {"type": "string", "description": "Exact observed Messages thread. Requires expected_participants; do not use a thread ID as to."}, "expected_participants": {"type": "array", "items": {"type": "string"}, "description": "Exact participant handles from the latest thread read, checked again before sending."}, "body": {"type": "string", "description": "Message body (required)."}}, "required": ["body"]}}}}
 */
 // Messages: conversations and history read from chat.db through host.files.query; texts sent through Messages' own scripting.
 const DB = "~/Library/Messages/chat.db", BUNDLE = "com.apple.MobileSMS";
-const ARCHIVE_BYTES = 64 * 1024, PAGE_ROWS = 1000, BUDGET_SECONDS = 2, REFERENCE_EPOCH = 978307200;
+const ARCHIVE_BYTES = 64 * 1024, PAGE_ROWS = 1000, REFERENCE_EPOCH = 978307200;
 const WORDS = {
     "missing_body": "Nothing to send or save: put the text in body.",
     "thread_not_found": "That conversation is not in Messages now; list threads again with messages.recent.",
@@ -14,8 +14,7 @@ const WORDS = {
     "participants_changed_read_thread_again": "The people in that thread changed; open it again and reply with the new participants. Nothing was sent."
 };
 const OPEN_NOTE = "Messages' local database could not be opened. NativeAgent may need macOS Full Disk Access. No permission was changed.";
-const LIST_LATE = "The conversation list did not finish within its bounded read; refresh to retry.";
-const READ_LATE = "The bounded conversation read was cancelled or exceeded its time budget; refresh to retry.";
+const LIST_FAILED = "The conversation list could not be read. Inspect the source failure before another read.";
 const READ_FAILED = "The bounded history read did not finish. No partial page is presented as a complete conversation; refresh to retry.";
 const graphemes = new Intl.Segmenter(undefined, {granularity: "grapheme"});
 
@@ -88,9 +87,13 @@ function recent(input) {
         since = date;
     } else if (oldestUnread) since = new Date(Date.now() - 30 * 86400 * 1000);
     if (threadID !== null && (unreadOnly || oldestUnread)) return failed("thread_filters_require_listing");
-    const offset = threadID === null ? clamped(input.offset, 0, 0, 100000) : 0;
+    const offset = clamped(input.offset, 0, 0, 100000);
     const asked = input.query === undefined ? null : scalar(input.query);
     const query = asked === null || asked.trim() === "" ? null : asked.trim();
+    if (threadID !== null && (query !== null || offset > 0)) {
+        return failed("thread_query_or_offset_requires_listing", "query and positive offset apply to thread lists. Omit them with thread_id. "
+            + "Use before_message_id from older_before_message_id to page through that thread. Nothing was read.");
+    }
     let before = null;
     if (input.before_message_id !== undefined) {
         if (threadID === null || !Number.isInteger(input.before_message_id) || input.before_message_id <= 0) return failed("invalid_history_cursor");
@@ -107,7 +110,7 @@ function recent(input) {
         result.effects = "none";
         return named(result);
     }
-    const listing = threads(threadID === null ? query : null, threadID, unreadOnly, oldestUnread, since);
+    const listing = threads(query, threadID, unreadOnly, oldestUnread, since);
     if (!Array.isArray(listing.threads)) {
         return {status: "failed", integration: "messages", reason: listing.history_reason || "history_read_failed", effects: "none",
             message: listing.history_note || "Messages' conversations could not be read; refresh to retry."};
@@ -250,7 +253,7 @@ function named(result) {
 
 function unavailable(reason, note) { return {history_status: "unavailable", history_reason: reason, history_note: note}; }
 
-// A read that cannot open the store, runs out of time or meets another schema becomes that read's named unavailability.
+// A read that cannot open the store or meets another schema names that source's unavailability.
 function readFailure(error, notes) {
     if (error.name !== "AppError" || error.reason === "cancelled") throw error;
     // The store's own remedy (Full Disk Access) rides the unavailability, as the native reader's did.
@@ -258,7 +261,6 @@ function readFailure(error, notes) {
         const remedy = error.receipt && error.receipt.remedy;
         return Object.assign(unavailable("database_unavailable", notes.open), remedy ? {remedy} : {});
     }
-    if (error.reason === "deadline") return unavailable(notes.late[0], notes.late[1]);
     if (error.reason === "sqlite_error") {
         return /no such (table|column)/.test(error.message) ? unavailable("unsupported_history_schema", notes.schema)
             : unavailable(notes.failed[0], notes.failed[1]);
@@ -267,28 +269,13 @@ function readFailure(error, notes) {
 }
 
 function once(sql, params) {
-    return host.files.query({path: DB, sql, params, limit: PAGE_ROWS, seconds: BUDGET_SECONDS}).rows;
+    return host.files.query({path: DB, sql, params, limit: PAGE_ROWS}).rows;
 }
-function deadline() {
-    const error = new Error("The read ran past its time budget.");
-    error.name = "AppError"; error.reason = "deadline";
-    return error;
-}
-// Every row of a listing, in pages of the stem's row bound, under one time budget for the whole read. A search keeps what it read when the budget
-// runs out (the array says stopped); any other read fails at the deadline.
-function all(sql, params, keepRead) {
-    const found = [], started = Date.now();
+// A listing follows each completed page until SQLite reports that no rows remain.
+function all(sql, params) {
+    const found = [];
     for (;;) {
-        const left = BUDGET_SECONDS - (Date.now() - started) / 1000;
-        let page;
-        try {
-            if (left <= 0) throw deadline();
-            page = host.files.query({path: DB, sql: sql + "\nLIMIT -1 OFFSET " + found.length, params, limit: PAGE_ROWS,
-                seconds: Math.max(1, Math.ceil(left))});
-        } catch (error) {
-            if (keepRead && error.name === "AppError" && error.reason === "deadline") { found.stopped = true; return found; }
-            throw error;
-        }
+        const page = host.files.query({path: DB, sql: sql + "\nLIMIT -1 OFFSET " + found.length, params, limit: PAGE_ROWS});
         page.rows.forEach(row => found.push(row));
         if (!page.truncated || !page.rows.length) return found;
     }
@@ -325,7 +312,7 @@ function text(plain, archive) { return plain !== null ? plain : decoded(archive)
 // Word matches carry their newest matching message as the snippet; thread handles retain conversation identity.
 function threads(words, threadID, unreadOnly, oldestUnread, since) {
     const notes = {open: OPEN_NOTE, schema: "This Messages database version cannot list its conversations.",
-        late: ["history_temporarily_unavailable", LIST_LATE], failed: ["history_read_failed", LIST_LATE]};
+        failed: ["history_read_failed", LIST_FAILED]};
     let schema, listed;
     try { schema = shape(); } catch (error) { return readFailure(error, notes); }
     const unread = schema.unread;
@@ -393,13 +380,9 @@ function threads(words, threadID, unreadOnly, oldestUnread, since) {
                 WHERE ((m.text IS NOT NULL AND folded_contains(m.text, ?1))
                     OR (m.text IS NULL AND m.attributedBody IS NOT NULL AND folded_contains(m.attributedBody, ?1)))
                   AND ${window("m.date")}
-                ORDER BY j.message_date DESC, j.message_id DESC`, bound(wanted), true);
+                ORDER BY j.message_date DESC, j.message_id DESC`, bound(wanted));
         } catch (error) {
             return readFailure(error, Object.assign({}, notes, {schema: "This Messages database version cannot search its messages."}));
-        }
-        if (matches.stopped) {
-            result.partial = true;
-            result.note = "The word search stopped at its time budget; older messages were not searched.";
         }
         matches.forEach(row => {
             if (typeof row[0] !== "string" || found[row[0]] !== undefined) return;
@@ -418,7 +401,7 @@ function history(threadID, limit, before, fromMe, since) {
     const notes = {open: fromMe === null ? "Conversation metadata is available, but its local history could not be opened. NativeAgent may need macOS "
             + "Full Disk Access. No permission was changed." : OPEN_NOTE,
         schema: "This Messages database version cannot provide this bounded history view.",
-        late: ["history_temporarily_unavailable", READ_LATE], failed: ["history_read_failed", READ_FAILED]};
+        failed: ["history_read_failed", READ_FAILED]};
     let schema;
     try { schema = shape(); } catch (error) { return readFailure(error, notes); }
     if (fromMe === null && (index(schema, "chat", ["guid"], true) === null || index(schema, "chat_message_join", ["chat_id", "message_id"], true) === null)) {
@@ -434,7 +417,7 @@ function history(threadID, limit, before, fromMe, since) {
         try { chats = once("SELECT ROWID FROM chat WHERE guid = ?1 LIMIT 1", [threadID]); }
         catch (error) {
             return readFailure(error, {open: notes.open, schema: "This Messages database could not provide an exact conversation lookup.",
-                late: ["history_read_failed", unmatched], failed: ["history_read_failed", unmatched]});
+                failed: ["history_read_failed", unmatched]});
         }
         if (!chats.length) return unavailable("exact_thread_not_found", unmatched);
         chatID = chats[0][0];

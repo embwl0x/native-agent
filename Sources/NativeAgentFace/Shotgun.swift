@@ -63,14 +63,6 @@ enum ShotgunShortcut: String, CaseIterable, Identifiable {
     static let storageKey = "NativeAgent.shotgun.shortcut"
     var id: String { rawValue }
 
-    var title: String {
-        switch self {
-        case .optionSpace: "⌥Space"
-        case .controlOptionSpace: "⌃⌥Space"
-        case .shiftCommandSpace: "⇧⌘Space"
-        case .off: "Off"
-        }
-    }
 
     var menuModifiers: SwiftUI.EventModifiers? {
         switch self {
@@ -81,10 +73,6 @@ enum ShotgunShortcut: String, CaseIterable, Identifiable {
         }
     }
 
-    @MainActor static var current: ShotgunShortcut? {
-        guard let raw = ApplicationLifetime.shared.appModel?.facePreference(storageKey, as: String.self) else { return nil }
-        return Self(rawValue: raw)
-    }
 }
 
 @MainActor

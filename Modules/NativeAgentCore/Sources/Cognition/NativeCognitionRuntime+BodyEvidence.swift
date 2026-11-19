@@ -271,8 +271,7 @@ extension NativeCognitionRuntime {
                 }
                 configurationDate = date
             } else { configurationDate = nil }
-            // The newest successful dispatch receipt is a reading kept in memory; the turn never queries the record for it.
-            liveReceipt = try await TurnTracePersistLane(dataRootOverride: dataRoot).newestSuccessfulReceipt(kind: "tool.dispatch")
+            liveReceipt = try await TurnTracePersistLane(dataRootOverride: dataRoot).newestSuccessfulDispatch()
         } catch {
             let cause = bodySourceFailure(error, source: "abilities and the life record", dataRoot: dataRoot)
             return ToolCapabilityReading(generatedAt: now, configured: false, liveCapabilityObserved: false,

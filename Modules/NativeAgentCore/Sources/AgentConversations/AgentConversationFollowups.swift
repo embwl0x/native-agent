@@ -26,7 +26,7 @@ package func withAgentMacDriver<Value>(_ mac: MacOperationContext, driver: MacDr
     return try await operation(mac)
 }
 
-// Blueprint: | `AgentConversationFollowups.swift` | Queued sends retain order, authority and settlement. |
+// Blueprint: | `AgentConversationFollowups.swift` | Queued sends retain their initiating turn and birth steering stamp |
 extension AgentConversationSession {
     /// A reply that settled meanwhile needs no queue entry; the caller can send directly.
     static func queue(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation,
@@ -39,7 +39,7 @@ extension AgentConversationSession {
         var arguments = args
         arguments["expects_reply"] = expectsReply
         guard let queued = try store.enqueue(id: row.id, scopeSessionID: scope, text: text,
-                byPerson: turn.personInitiatedSend?.matches(args) == true,
+                byPerson: turn.personInitiatedSend?.matches(args) == true, steeredBy: turn.steeringStamp(),
                 arguments: arguments,
                 stillInFlight: { try inFlight($0, transport, dataRoot: dataRoot) }) else { return nil }
         let (saved, item) = queued
@@ -68,9 +68,9 @@ extension AgentConversationSession {
             "detail": .string("Queued behind \(blocker)" + (ahead > 0 ? " and \(ahead) earlier queued message\(ahead == 1 ? "" : "s")" : "")
                 + ". Do not send it again. " + lever)])
     }
-    package static func orphanedQueues(dataRoot: URL) throws -> [AgentConversationRecord] {
-        // Settle restart-interrupted sends before releasing follow-ups queued behind them.
-        try settleInterrupted(dataRoot: dataRoot)
+    package static func orphanedQueues(dataRoot: URL,
+        read: (AgentConversationRecord, AgentPeerContact) async throws -> JSONValue) async throws -> [AgentConversationRecord] {
+        try await settleInterrupted(dataRoot: dataRoot, read: read)
         return try AgentConversationStore(dataRoot: dataRoot).records().filter { row in
             (row.queued ?? []).contains { ($0.held == nil || $0.waitingForMac == true) && !AgentConversationRunning.shared.waiting($0.id) }
                 || row.queueReservation.map { !AgentConversationRunning.shared.waiting($0) } == true
@@ -114,7 +114,7 @@ extension AgentConversationSession {
                                           dataRoot: dataRoot, perform: perform)
             }
         }
-        } catch { queueReadFailed(error, row: row.id, dataRoot: dataRoot) }
+        } catch { queueReadFailed(error, turn: turn, row: row.id, dataRoot: dataRoot) }
     }
     /// Owner changes release the queue; a refusal settles before releasing its place.
     private static func sendWhenSettled(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation,
@@ -181,11 +181,11 @@ extension AgentConversationSession {
             }
             await AgentConversationRunning.shared.change(after: seen)
         }
-        } catch { queueReadFailed(error, row: id, dataRoot: dataRoot) }
+        } catch { queueReadFailed(error, turn: turn, row: id, dataRoot: dataRoot) }
     }
 
-    package static func queueReadFailed(_ error: Error, row: String, dataRoot: URL) {
-        RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message,
+    package static func queueReadFailed(_ error: Error, turn: Turn, row: String, dataRoot: URL) {
+        RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message, steeredBy: turn.steeringStamp(),
             operation: "agent.queue:" + row, owner: dataRoot.appendingPathComponent("agents/conversations.json").path,
             words: "Queued contact work could not be read or settled: " + error.localizedDescription
                 + ". Accepted messages remain in their conversation; none was resent.",
@@ -302,7 +302,7 @@ extension AgentConversationSession {
                         """
                 } else if orphan {
                     terminal = "released"; detail = """
-                        No send to \(name) runs here any more (the app restarted mid-send), so it settled as interrupted; this conversation no \
+                        No send to \(name) runs here any more (the app restarted mid-send), so it ended; this conversation no \
                         longer waits on it, and anything \(name) answers still arrives.
                         """
                 } else if try unsettledAttentionChecked(current, dataRoot: dataRoot) {
@@ -321,7 +321,9 @@ extension AgentConversationSession {
                 }
                 let saved = try store.update(id: current.id, operationID: latest.operationID) {
                     if stoppedOrReleased($0) || $0.phase == "ready" { return }
-                    if orphan, $0.phase == "sending" { interrupted(&$0) }
+                    if orphan, $0.phase == "sending" {
+                        $0.receipt = .object(["status": .string("cancelled"), "completed": .bool(false), "terminal": .bool(true)])
+                    }
                     $0.stop = AgentConversationStop(state: terminal, operationID: latest.operationID, at: Date(), detail: detail)
                     if terminal != "cannot_stop" { $0.phase = "ready"; $0.automaticRead = false; $0.nextReadAt = nil }
                     if case .object(var receipt)? = $0.receipt {

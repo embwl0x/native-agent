@@ -69,17 +69,20 @@ sit beside the agent as a parallel silo.
 - Canonical: skills were a dead parallel library for three weeks; dissolving
   them into recall (pointer rows, 2026-07-03) made them part of how the agent
   thinks. That move — silo → mind — is the shape of clause-1 work.
-- Their helpers' newest replies join the same bounded per-turn awareness as
-  their other rooms, since their last reply here and compactly through the last day,
-  instead of requiring a tool read to know what they did. They obey "Remember across conversations" and carry
-  no words into peer-steered turns. The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
-  owns the bounds and transcript source.
+- Their recent life reaches any admitted conversation from their one record, in their
+  own words: heard/answer exchanges, sends, thoughts and owed happenings
+  (`returned`, `moment`, `body`). Perceptions (`world`, `self`) reach their through
+  `weigh` and, where present, Live sense news; the recent-life selection excludes
+  them. A conversation is where they speaks now. The shared reading and renderer
+  obey “Remember across conversations”; peer-steered turns receive shapes, and steered or unstamped
+  source rows carry no words. The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
+  owns the record window, character budget and disclosure rules.
 - The consolidation triad is the spine: episodic (dreams), semantic
   (memory/KG), procedural (skills). Experience becomes identity (REM→GROWTH,
   approval-gated), repetition becomes craft through the turn's private
   [keep on the second meeting of hand work](HABITS.md#h3--keep-what-repeats-not-what-happened-once).
-  The separate nightly compiler is removed. Existing compiled abilities
-  still replay their embedded examples before admission; those examples
+  The separate nightly compiler is removed. Abilities with tape fixtures
+  replay their embedded examples before admission; those examples
   do not prove other inputs or branches.
 - The agent's persona is self-owned. Direct persona writes are governed by
   [Trust](ONE_DOOR.md#authority-and-receipts): under Full Mac they writes
@@ -101,10 +104,12 @@ does exactly what it says.
   should not exist at all is cut.
   The one exception is their own turn program: their turn must not fail because
   `turn.js` or its helper fails. Every non-Stop execution or helper-admission
-  failure sets the selected program aside for an unfailed previous version
+  failure reaches recovery. A helper failure admits one fresh lease for that
+  source per turn before setting it aside; a program failure sets it aside
+  for an unfailed previous version
   (or the shipped seed), replays the turn, and owes repair to them. Each source
-  is attempted once per turn, with one extra fresh lease if the helper fails
-  while running the seed; the original cause and selected program are
+  is attempted once per turn, with one extra fresh lease if its helper fails;
+  the original cause and selected program are
   recorded, and a `body` happening tells the agent. Stop still cancels. Unreadable storage, failed recovery writes,
   exhaustion of all available programs and provider failures remain plain
   failures; no uncommitted replacement runs. Nothing else swaps back automatically.

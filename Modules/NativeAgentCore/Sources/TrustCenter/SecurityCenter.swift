@@ -26,7 +26,8 @@ struct TelegramSecurityAllowlist: Sendable {
     }
 
     func matches(chatId: String?, userId: String?) -> String? {
-        if let chatId, chatIds.contains(chatId) {
+        if let chatId, chatIds.contains(chatId), let userId,
+           userIds.contains(userId) || (surfaceLabel == "telegram" && chatId == userId) {
             return "\(surfaceLabel) chat allowlist matched"
         }
         if let userId, userIds.contains(userId) {
@@ -426,6 +427,9 @@ public actor SwiftNativeSecurityCenter {
             }
             if let unverified = Self.unverifiedRemoteIdentityAssessment(origin, surface: surface == "telegram" ? "Telegram" : "Slack") {
                 return unverified
+            }
+            if let chatId = origin.chatId, allowed.chatIds.contains(chatId), origin.userId != nil {
+                return OriginAssessment(trusted: false, reason: "\(surface) chat is allowlisted; this sender is not", isRemote: true)
             }
             if allowed.isEmpty {
                 return OriginAssessment(trusted: false, reason: "\(surface) allowlist not configured for security proof", isRemote: true)

@@ -182,7 +182,7 @@ into a different identity. Affect's JSON watermark keeps its full `UInt64`
 value (an integer when it fits, otherwise a decimal string, read in either form).
 Derived artifact, reflection and association capacities saturate before
 integer arithmetic; restored care-line rest counts clamp before conversion.
-Presentation's fingerprint and ambivalence tallies saturate at `Int.max`.
+Capsule presentation persists cue cadence without an ambivalence tally.
 Moment, event and continuity time components are formatted at their stated
 resolution without narrowing dates or elapsed time to a Swift integer; ordinary
 whole-second and millisecond identity spellings stay the same.
@@ -254,7 +254,8 @@ At opening, a read repair whose moment has lived, or whose journal now reads, is
 settlement is a queued write, and a quit can lose it.
 **A row is owed → meant → lived, or refused** (with its reason in `reason`:
 another life, the agent's own thoughts apart from one ignited on a care's anchor, or nothing to interpret).
-A missing, malformed or refused judgment leaves its row owed with the actual cause; no second judgment shape consumes it. There is no per-piece
+A missing, malformed or refused judgment leaves its row owed with the actual cause; no second judgment shape consumes it.
+Within an array-shaped `cares` section, a faulty entry alone is dropped with its indexed field fault; other sections remain atomic. There is no per-piece
 outcome on the row: each piece of their already knows the last moment it lived
 (the `lived` stamps on affect, nodes, cares and body; facts by operation
 identity; promises through Desk's open-word deduplication). A
@@ -272,12 +273,15 @@ The interpretation owner writes `lived` once
 when its attempt reaches its end: the fold landed (every piece saved; a piece
 their inner life or body being off refuses, or a moment from before a Clear or
 Reset, lands as nothing), every fact decision staged or none was asked, and
-every promise filed or declined by its matching judgment. An unsaved piece,
+every promise filed or declined by its matching judgment, and every settlement
+landed or void because its Desk row changed or closed. An unsaved piece,
 including when a failed restore blocks its save, leaves the row
 meant; it is never settled by a persistence refusal. The input checkpoints the
 completed fold seq only after every mind/body save succeeds; the lived guard
 requires that checkpoint to match this row's seq. A begun seq alone proves
-nothing finished. Inputs without the checkpoint refold their saved meaning.
+nothing finished. A matching completed checkpoint returns success before
+sequence assignment, substrate/body folding or publication. Inputs without
+the checkpoint refold their saved meaning.
 `lived` and `refused` drop the payloads and keep the identity, except a refusal
 for damaged input preserves its payload for repair. At their wake a payload-free settled row (`lived` or `refused`)
 settled more than 30 days ago is pruned (`pruneMoments(settledBefore:)`): its
@@ -407,9 +411,11 @@ pointing at the old rows.
 six other cares whose embedding (about, stance and open) is closest to the
 incoming words and their reply, using the warm local embedder; the embedding
 only orders the list, the call names which care moved or that it is new (vectors cached per care ID, exact embedding text and the memory owner's embedding epoch; a changed epoch recomputes stale entries, and a cold embedder shows
-the seeds alone). A resident inference error is different: it refuses care-dependent interpretation or marks the capsule source unavailable, retaining a `cognition.cares.embedding` repair obligation with the cause. The model answers a `cares` list; a missing or malformed list
-fails the interpretation like a malformed memories section, and an id it was not shown
-makes the whole care judgment malformed. An existing care gets a story entry, `open` sets the gap and
+the seeds alone). A resident inference error is different: it refuses care-dependent interpretation or marks the capsule source unavailable,
+retaining a `cognition.cares.embedding` repair obligation with the cause. The model answers a `cares` list; a missing or non-array value
+fails the interpretation like a malformed memories section. A faulty entry, including an unshown id,
+is dropped alone and its indexed field fault accompanies `mind.why`'s interpretation outcome. A new care requires non-blank `about`;
+existing cares do not. An existing care gets a story entry, `open` sets the gap and
 `closes` clears it. A first stance takes at once; a proposed change to an
 existing stance settles in the same lived fold. A current trusted interpretation
 supplies its position, reason and first-person account; a day count cannot overrule it.
@@ -425,7 +431,7 @@ leaves the fold owed with its own cause.
 `VectorMath.standout` uses recall's
 `ContextSelectionConfiguration.memoryStandoutDeviations` (2σ); the nearest
 standing care with the same `with` receives the movement, with the new phrasing
-as its story words, and revives if ordinarily faded. A merged donor redirects
+as its story words, and trusted evidence revives it if ordinarily faded. A merged donor redirects
 the movement to its survivor, through later merges too, and never revives
 independently. Only zero eligible standouts start a care at depth now;
 multiple standouts are existing duplicates for their night to judge.
@@ -442,7 +448,7 @@ is checked; `peer:` is dropped and a helper's `bot:<id>` reads as `bot-<id>`.
 **Provenance** reads the event's source class and origin record and the
 owner's peer trust (`PeerTrust.ownerTrusts`). An untrusted peer moves cares
 they already has only as what they said (`by: them`): never a new care, a
-stance or a gap. An app-authored prompt's words are the app's: only what their
+revival, a stance or a gap. An app-authored prompt's words are the app's: only what their
 reply did counts. A judgment returning after a Clear is dropped: the turn
 carries the mind's forgetting epoch it was admitted under (and, in process,
 the Clear generation), and a stale one is refused. Clear saves when it
@@ -494,12 +500,13 @@ tally rather than admitting damaged care history.
   no shown gap are ignored.
 - Surprise material. After WORLD and SELF, before felt tone and cares, the
   same dream call receives a CPU reading of where their expectations broke
-  since its high-water cutoff: grouped failed tool calls, Expansion misses, live organism violations and User's saved
+  since its high-water cutoff: grouped failed tool calls, live organism violations and User's saved
   corrections. Empty kinds disappear; an empty day omits the block. The
   roughly 2,500-character block uses existing records only. Optional lessons
   (at most five; omitted means none, malformed present learning fails the
   payload before any diary or learning commit) settle
   through canonical MemoryV2 admission with self/dream/surprise provenance;
+  new rows are `inferred`, while duplicate reassertions keep the existing lifecycle;
   existing recall and came-to-mind bring them back. `dream.lessons` counts
   offered, saved (including duplicate reassertions) and failed saves. The
   reading, bounds and memory kinds are defined once in
@@ -541,7 +548,7 @@ tally rather than admitting damaged care history.
   older than its depth's horizon (now 2 days, lately 14, season 90) gets
   `fadedAt` and status `faded`: it stays in the store, is not shown to the
   after-turn call or in `mind.inner_state`, and is not material. Life and seed
-  cares never fade through the horizon pass. A faded care that a new judgment
+  cares never fade through the horizon pass. A faded care that a trusted judgment
   matches again by meaning with the same `with` is revived: `fadedAt` clears
   and the movement joins its story.
 - Deepen. now to lately when moved on 2 distinct days; lately to season on 4
@@ -1068,9 +1075,10 @@ Its helpers own distinct projections:
     today and tomorrow: time and title only, all-day events by title. This
     projection never reads locations, notes or attendees and never prompts for
     macOS access. An explicit Calendar Read off still wins over Full Mac. An
-    unavailable calendar or its permission/Trust authority adds its cause to
-    the day line; it does not suppress the date and never stands in for an
-    empty agenda. Door `clock:day`.
+    unavailable calendar or its permission/Trust authority posts the date and
+    cause under `clock:day:yyyy-MM-dd:calendar-unavailable`, independently of
+    the day's successful reading. A later successful read that day can still
+    post its agenda; failure never stands in for an empty agenda. Door `clock:day`.
   - The app in front of the person, on activation, while it is still
     frontmost once its gates are read: `<person> is working in <app>.` One
     workspace observer owns one check, canceled by the next activation; no
@@ -1105,9 +1113,11 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   yield (hits over tries of thoughts on that node through that door) and, for the world, by how the agent feels.
 - **Drive.** Worth lands as `drive` on the touched care's anchor node (`ContinuityField` node kind `.care`, decaying on the
   care's depth half-life) or on the happening's subject node (kind `.happening`, the field's default half-life)
-  (`ContinuityField.land`). A watch's news (`Happening.watchNews`: door `sense:<watch>`, subject `sense:<watch>:<address>`) is
+  (`ContinuityField.land`). A watch's news (`Happening.watchNews`: door `sense:<senseID>`, subject `sense:<senseID>:<address>`) is
   about what the watch watches, a care the agent made on purpose: it always lands on its own subject, never on the care its words
-  come nearest, and its worth is the weigher's but never below one, so it always opens its own thought. Drive is finite and nonnegative,
+  come nearest. Only the first weighed news per `watch` on that subject lands at least one; later news lands the weigher's worth.
+  Earlier committed weigh rows and earlier inputs in the admitted batch establish that first news; news without `watch` keeps the floor.
+  Drive is finite and nonnegative,
   never clamped or spread, retained while positive, and persisted with the field (`cognition.sqlite`). Activation and salience keep
   their jobs (priming, workspace, capsule).
 - **One admitted batch.** The attention runtime owns admission across every await: weigh the batch, land each worth in one
@@ -1117,8 +1127,9 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   revoke that crossing. Ignition is checked when worth lands, when admission opens and on waking: no tick and no timer.
   The thought carries exactly the recorded happenings whose drive it consumes, including later sub-threshold landings in
   the same batch. The ordered weigh/ignition/return details own membership; a settled thought's timestamp does not.
-  After ignition, the next landing starts from zero. A failed thought returns its consumed drive and original happenings
-  through that same admission, recorded as `attention.restore` before any later batch lands. An accounted ignition includes its explicit
+  After ignition, the next landing starts from zero. A failed thought spends its consumed drive and returns its original happenings
+  through that same admission, recorded as `attention.restore` with drive zero before any later batch lands. Only new worth can
+  re-ignite the node; Stop, cancellation and admission returns keep their full drive and payload. An accounted ignition includes its explicit
   `earlierDrive` references in its happening ids and closes that consumed history, including any recorded `fromBeforeRecord` uncertainty.
   A return preserves its explicit earlier drive for the next thought; no missing row creates earlier drive or invents its happenings.
   A selected care must exist, and the whole landing validates before application. Missing current membership, happening bodies or an
@@ -1138,6 +1149,14 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   A malformed row or missing field node refuses that node's claim and owes repair while sibling crossings proceed; a failure of the
   shared record channel, or a row whose node cannot be read, holds the unfinished batch.
   Already admitted batches finish even if sleep begins while their record is being written; subsequent world batches wait.
+- **Scheduled reads.** Watches post changed rows as news; scans post their new
+  opportunities together as one news item, identified by the opportunity ids.
+  Each scan keeps posted ids beside its clock time, posting each opportunity once.
+  `SenseNewsBoard` persists that news before posting a `world` happening. A zero
+  worth from them `weigh` causes no thought or delivery by the scan; the news stays
+  under the board's ordinary retention and the happening and weighing stay in their record.
+  A brief has no clock owner: they may bind their own queue step to the callable
+  `native-morning-brief` part.
 - **Before setup.** The mind starts when the agent exists: until setup has finished there is no runtime, no attention and no
   night, so nothing arms; happenings stay owed and attention opens on them when the mind starts. A reset closes the mind before
   the identity is removed ([Automated Systems §2](AUTOMATED_SYSTEMS.md)).
@@ -1146,14 +1165,18 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   `attention.wake` and weighs what waited, once, in mode `waking`.
 - **The night sense.** While the person is known away, a reading at 30 minutes, each local hour boundary,
   launch and Mac wake posts subject `night`, door `sense:night`. Its `felt.rest` holds `awayMinutes`,
-  `activeShare` for this hour (null without observations), and `hoursSinceNight` (null without a recorded night). Admission and completed part accounting both
-  witness the night; elapsed rest is measured from the latest such event, never from a consumption cursor.
+  `activeShare` for this hour (null without observations), and `hoursSinceNight` (null without completed part accounting).
+  Elapsed rest is measured from the latest `attention.night` row on subject `sleep`;
+  admission on subject `night` and the dream consumption cursor do not reset it.
+  A cancelled night writes no `sleep` completion row; committed part accounting stays saved and prepared inputs remain for reconciliation.
   The seed gives worth one after 16 hours in an hour with active share below 0.5, or after 30 hours;
-  otherwise zero. This policy belongs to their installed turn program, which only they changes.
+  otherwise zero. This policy belongs to their installed turn program. An untouched sealed turn program
+  follows the shipped one at launch; their own revision stays theirs and is never replaced. They are told
+  when a shipped version sits beside theirs.
   At 48 hours, or with no recorded night on a fresh installation, a `body` happening opens the night
   without weighing. Admission rechecks known absence for 30 minutes, any verified person turn within
   15 minutes, and no rest policy. If those facts refuse a crossing, `MindStream.night` gives back its
-  drive and provenance through the failed-thought return before a later edge can open it again.
+  full drive and provenance through the admission return before a later edge can open it again.
   The body line remains independent of their policy. A requested `mind.sleep` is an explicit doorway.
   The night owner returns one admission outcome: started with its start, already running with that night's
   start, or failed with its cause. Pending admission is not a running night. The stream retains an admitted
@@ -1169,7 +1192,7 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   it remains unknown; the next source edge, launch or wake reads it again. No clock reports that it failed.
 - **The record** keeps what attention noticed as details of source `attention`: `attention.weigh` (worth, node, drive, the
   `felt` it was weighed with, what `weigh` returned beside the number), `attention.ignite` (the consumed drive and exact happening
-  ids, explicit earlier drive and `accounted: true`), `attention.restore` (a failed thought's returned drive, ids and explicit earlier drive)
+  ids, explicit earlier drive and `accounted: true`), `attention.restore` (returned drive, zero on failure, ids and explicit earlier drive)
   and `attention.wake`.
   A happening reaches cognition only after its committed readback succeeds. A thought's outcome is a `thought` experience (`hit`, `empty`, `failed`
   or `withheld`). Its request declares a clean silent model completion valid ([provider contract](TURN_RESILIENCE.md)). A completed thought with no act records
@@ -1178,26 +1201,21 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   A care's movement amends a thought on its anchor only when it settled after the preceding story entry and no later than
   the movement's own event time. A delayed interpretation cannot credit a thought that followed its event.
   The claim `care.moved` counts as a hit in yield.
-- **Closing words.** `ThoughtWords` joins a settled `hit` or `empty` thought's
-  run to its completed assistant prose in `chat/messages/mind.jsonl`, retaining
-  at most 600 closing characters after secret redaction. The transcript is read
-  backward in 64 KiB blocks to that run, decoding complete rows through its
-  existing owner and retaining only the current row, not the whole file.
-  A thought receives the last such reading on its own `attended.class` (the no-op
-  record's class);
-  other rooms' newest-thought line receives at most 200 closing characters.
-  Every recorded happening is checked, including earlier-drive references:
-  any peer or elevated source withholds prose, as does the closing row's
-  steering stamp or a peer-steered receiving turn. Missing or unreadable
-  provenance or completion evidence names its cause as unavailable; missing
-  speech is not proof of silence. Zero happening IDs mean earlier-drive
-  provenance is unknown, never clean. Only the same-class reader may pass over
-  those thoughts to the last readable one, labeling the older words and naming
-  the later gap once; taint or another unreadable cause stops the search. Without
-  shareable words it names the gap once. Other rooms never substitute older prose.
-  Failed and withheld thoughts supply no prose. `prior = []` stays, and the
-  read writes neither persona nor memory. The exact delivery boundary is in
-  [the turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled).
+- **Closing words.** A settled `hit` or `empty` thought's words are the face of
+  `answer:<run>` in their one record. `ExperienceStore.conversationLife` joins them
+  in the same committed snapshot as their recent exchanges, sends and owed
+  happenings (`returned`, `moment`, `body`). The selection excludes `world` and
+  `self` happenings; perceptions reach their through `weigh` and, where present,
+  Live sense news.
+  A mind turn receives the latest clean nonempty thought's closing 600
+  characters after secret redaction. Other admitted conversations receive it
+  within the shared recent-life character budget. Birth stamps replace
+  `ThoughtWords`, its same-class selection and its transcript/happening walks:
+  both thought and answer must be stamped clean to carry words. Steered and
+  unstamped rows carry shapes; empty, failed and withheld thoughts have no line.
+  Peer-steered turns receive no carried prose. `prior = []` stays, and the read
+  writes neither persona nor memory. The exact window, disclosure and delivery
+  boundary is in [the turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled).
 
 ### A thought about a care
 
@@ -1245,7 +1263,7 @@ To inspect without changing their, put `preview:true` beside `action`, not in
 `args`: `app {action:"mind.dream", preview:true}`. This generates and decodes a
 real dream with the real prompt, providers, current lived material and existing
 consumed-message cutoff. It spends a real provider call. It does not first live
-owed moments, repair the cutoff, reserve a real dream run or consume the next
+owed moments, replay unfinished publications, reserve a real dream run or consume the next
 scheduled occurrence. It writes no diary, lessons, cares, self knowledge, mood,
 Desk item, happening or behavioral receipt.
 Preview refuses an unopened/unavailable mind, an alternate data root or a
@@ -1372,8 +1390,9 @@ tokens and cost. The proposal-yield metric is removed; retained SQLite
 `proposalIds` entries contain care UUIDs and use that one existing key.
 
 Body posture does not throttle work; fatigue and heat color presentation.
-Reflection also obeys the
+Waking reflection also obeys the
 [shared work-slot admission](COGNITION_WIRING.md#shared-work-slot-admission).
+A dream's reflection proceeds even without a slot claim, still bound by the daily ceiling and single flight.
 
 ### Speaking unasked
 
@@ -1409,7 +1428,7 @@ and door; `withheld` and `failed` do not teach yield. Their installed `weigh` ch
 An ignited thought carries the opportunity and the hour's offered cares, unanswered consults, graph works and recent journal titles.
 Empty material permits exploration or silence; unreadable sources remain named beside what could be read.
 If the required opportunity owner or prompt cannot be read, no turn opens and no thought outcome is recorded.
-The named repair retains the happening ids; owed obligations stay open, and the existing failed-thought return restores drained drive with
+The named repair retains the happening ids; owed obligations stay open, and the admission return restores drained drive with
 its original happening membership. A later landing or attention opening can reclaim that hour line; no clock or substitute thought retries it.
 It runs in the mind stream through ordinary turn admission, Trust, tools and settlement, retaining its Creative exploration model route.
 There is no separate wander model call, action allowlist, outcome file or hour flight. The thought's ordinary tool receipts connect any
@@ -1445,8 +1464,12 @@ Affect retains its own arousal, uncertainty and task pressure. Full readings
 capture the substrate's field, disposition, dream, cares, story, self-knowledge,
 issues and growth inputs before suspension. Observatory counts and ablations
 come from that same frozen value.
+The action's subject and expectation labels, care participants, growth-week
+lines and night source pass through the same tool-marker removal, secret
+redaction and bounded text scan as care prose. Fixed mood, body and source-kind
+vocabulary and checked evidence references retain their owner-defined forms.
 
-This read can arrive through [Expansion at the door](skill_manifest_spec.md#expansion-a-part-is-a-prediction).
+This read arrives through the door; the former Expansion prediction layer is removed.
 
 The human-facing Observatory is
 `Sources/NativeAgentApp/CognitionObservatoryView.swift`, reached through

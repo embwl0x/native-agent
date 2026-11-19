@@ -4,7 +4,7 @@
   "reach": {"capabilities": [], "readPaths": [], "hosts": [], "apps": []},
   "face": {"projection":true},
   "record": {
-    "description": "Draw Home from its packet: my mind (awake or asleep, my latest thoughts, what is owed to me), then my layout's sections.",
+    "description": "Draw Home's mind, owner facts and named rooms from its packet in layout order.",
     "actions": [], "inputSchema": {"type": "object",
       "required": ["person","order","attention","thoughts","owed","waits","queue","working","people","helpers","senses","elsewhere",
         "places","mac","gaps","keys"]}
@@ -103,8 +103,6 @@ function face(input) {
         }),
         working: () => input.working.map(j => row({id: j.key, title: j.title, detail: j.name, value: j.state, at: j.at, tone: "live",
             actions: actions(j.key)})),
-        open: () => [row({id: "windows", title: "This conversation's open places",
-            detail: "Windows and browser tabs stay with the conversation that owns them.", open: open("windows")})],
         people: () => input.people.map(p => {
             if (p.kind === "found") return row({id: p.key, title: "Found " + p.name,
                 detail: p.app ? "No recipe yet; tell me in chat to look." : "Tell me in chat to connect.", at: p.at, tone: "attention",
@@ -125,12 +123,12 @@ function face(input) {
         mac: () => input.mac.map(m => row({id: m.key, title: m.app, detail: m.about, value: m.readout, at: m.at, open: open(m.key)}))
     };
     const TITLE = {notable: "Notable", changed: "Changed", waits: capital(person) + " waits", queue: "My queue", working: "Working",
-        open: "Open", people: "People", helpers: "Helpers", senses: "My senses", elsewhere: "Elsewhere", places: "Places", mac: "Mac"};
+        people: "People", helpers: "Helpers", senses: "My senses", elsewhere: "Elsewhere", places: "Places", mac: "Mac"};
     const COVERAGE = {
         notable: "Prior Mail previews, not a current inbox scan.", changed: "The agent's door compares tracked records per look.",
         waits: "Desk, inbox asks and repairs; approvals stand above, yours to decide; no fresh calendar, reminders or Mail read.",
         queue: "Queued Desk steps, reviews, handoffs and repairs; not all of my own activity.",
-        working: "Jobs and lines at work; agent.jobs lists them all.", open: "Retained places by conversation; not Mac windows.",
+        working: "Jobs and lines at work; agent.jobs lists them all.",
         people: "Contacts, exchanges, discovery offers and local health; no full Doctor check.",
         helpers: "Definitions, latest shelf results and run queue; not full run history.", senses: "Retained abilities, senses and watches.",
         elsewhere: "Latest speakers across recent transcripts; not a complete activity log.",

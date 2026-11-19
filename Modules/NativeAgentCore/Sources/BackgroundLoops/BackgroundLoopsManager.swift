@@ -65,15 +65,18 @@ public actor BackgroundLoopLifetimes {
     }
 
     /// The app's one fact that setup has finished, so the agent exists. Until it is installed every pass may start.
-    private nonisolated let agentFact = Mutex<(@Sendable () -> Bool)?>(nil)
+    private struct AgentFact: Sendable {
+        let exists: @Sendable () -> Bool
+    }
+    private nonisolated let agentFact = Mutex<AgentFact?>(nil)
 
     /// Install the fact before start: a pass that needs the agent is not started until it holds.
     public nonisolated func admitAgentPasses(when agentExists: @escaping @Sendable () -> Bool) {
-        agentFact.withLock { $0 = agentExists }
+        agentFact.withLock { $0 = AgentFact(exists: agentExists) }
     }
 
     nonisolated func agentExists() -> Bool {
-        agentFact.withLock { $0 }?() ?? true
+        agentFact.withLock { $0 }?.exists() ?? true
     }
 
     public func setFailureRecoveryPush(
@@ -211,7 +214,7 @@ public actor BackgroundLoopLifetimes {
                 running: running,
                 executing: snapshot.executing,
                 executionStartedAt: snapshot.executionStartedAt,
-                executionTimeout: runner.tickTimeoutOverride ?? 300,
+                waitingOn: snapshot.executing ? runner.waitingOn : nil,
                 // Listener liveness is separate from registration and manager uptime.
                 eventListener: physiologyRunners[state.loopId] == nil
                     ? nil
@@ -301,42 +304,15 @@ public actor BackgroundLoopLifetimes {
         loopId: String,
         runner: ManagedLoopRunner,
         gate: LoopExecutionGate,
-        automaticLifecycle: UInt64?,
         execution: ManagedLoopExecution,
         isDue: @escaping @Sendable () async -> Bool
     ) async -> LoopTickOutcome {
-        let result: Result<LoopTickOutcome, Error>
-        do {
-            result = .success(try await tickWithTimeoutOutcome(
-                { await runner.tickOutcome(ifDue: isDue, execution: execution) },
-                timeout: runner.tickTimeoutOverride ?? 300
-            ))
-        } catch { result = .failure(error) }
+        let outcome = await runner.tickOutcome(ifDue: isDue, execution: execution)
         let execution = await gate.snapshot()
-        guard registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: automaticLifecycle) else {
-            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
-        }
-        switch result {
-        case .success(let outcome):
-            await recordOutOfBandOutcome(loopId: loopId, outcome: outcome, startedAt: execution.executionStartedAt)
-            return outcome
-        case .failure(let error):
-            let outcome: LoopTickOutcome
-            if error is CancellationError {
-                outcome = .skipped(reason: "cancelled")
-            } else if error is TickTimeoutError {
-                let detail = "timeout after \(formatTimeout(runner.tickTimeoutOverride ?? 300))"
-                // A timeout does not advance the durable successful-run clock.
-                await scheduler.recordFailure(loopId: loopId, error: detail, advanceDurableRun: false)
-                outcome = .failed(error: detail)
-            } else {
-                let detail = String(describing: error)
-                await scheduler.recordFailure(loopId: loopId, error: detail)
-                outcome = .failed(error: detail)
-            }
-            await reschedulePhysiologyDeadline(loopId: loopId)
-            return outcome
-        }
+        // Admission checks cannot discard a produced outcome. Stop and replacement
+        // drain this execution's accounting before releasing its registration.
+        await recordOutOfBandOutcome(loopId: loopId, outcome: outcome, startedAt: execution.executionStartedAt)
+        return outcome
     }
 
     /// Revalidate registration after suspension and gate admission; automatic wakes also retain their admitting lifecycle.
@@ -356,7 +332,7 @@ public actor BackgroundLoopLifetimes {
         }
         let execution = ManagedLoopExecution()
         let outcome = await executeAndRecordOutcome(loopId: loopId, runner: runner, gate: runner.gate,
-            automaticLifecycle: lifecycle, execution: execution, isDue: isDue)
+            execution: execution, isDue: isDue)
         await execution.accounting.didRecord()
         return outcome
     }

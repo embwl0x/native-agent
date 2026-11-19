@@ -177,8 +177,18 @@ final flush of affect, consumed residue and nodes, `persistAffectAndNodes`). Its
 final save and the moments left unlived (a `lifecycle.sleep` receipt); a save
 that fails is reported, never swallowed.
 
-Ordinary quit waits for the turns captured at entry and joins the retained
-producer/turn settlement and final mind save from their actual completion.
+Reply-mirror reconciliation keeps each row's failed preparation owed and names
+its cause after processing the remaining rows. Cancellation stops the pass;
+an unavailable shared reconciliation read fails the pass before delivery.
+
+Ordinary quit raises each captured in-flight turn's own Stop, waits for its
+settlement, then joins the turn engine's retained dispatch bodies, including
+calls whose stopped waiters or turns have already returned. Each body joins
+its actual exit and journal settlement; accepted trace writes drain before the
+final mind save. A body that never returns keeps Quit held without a clock,
+and the app log names the calls it waits on. Outside Quit, a stopped call's
+late body does not hold its conversation: the next turn is admitted while it
+settles, and its real result lands in the journal, never in that next turn.
 The held quit then retires resident dependencies (Chrome, senses, resident
 programs, ACP, ContextFlow, memory services, attention, the trace feed, then
 the app index) before it answers the termination, so none of it is cut by
@@ -282,9 +292,9 @@ model response. Publication recovers by the section's immutable diary identity.
 Lessons, reflection, care and dated mood delivery checkpoint that record only
 after their checked durable effects land; diary evidence stays byte-stable.
 Disabled reflection settles with its off reason;
-reflection that must wait (its daily ceiling, one in flight, a held slot), failed reflection and
+reflection that must wait (its daily ceiling or one in flight), failed reflection and
 care/self persistence remain owed for the next real run, including older and archived dates;
-scheduling alone clears nothing.
+scheduling alone clears nothing. A held two-hour slot never defers a dream's reflection.
 A returned weekly analysis and its terminal
 outcome are saved in its digest through `settle`; Stop prevents subsequent mood
 changes, proposal staging and practice. Interpretation and reflection follow
@@ -310,7 +320,9 @@ original body keeps its checkpoint until actual exit, records the real receipt
 through `settle`, and emits `tool.dispatch.settled` with the invocation/call
 IDs. A late receipt is evidence, not a replacement response or another
 dispatch. Missing completion stays unknown; neither Stop nor the bound asserts
-effects stopped. A quiet call asks what it waits on whether it is alive, and
+effects stopped. The turn engine retains each dispatch's settlement separately
+from its caller; Quit joins it before the final mind save and dependency
+retirement. A quiet call asks what it waits on whether it is alive, and
 a person's wait is never silence;
 [turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline)
 owns where it comes from and where nested calls take theirs. Practice keep turns retain

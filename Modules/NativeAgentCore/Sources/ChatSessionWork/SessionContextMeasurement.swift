@@ -217,7 +217,8 @@ public struct SessionContextMeasurement: Sendable {
             * ContextBudgetPolicy.transcriptCharactersPerToken
         if Double(projected.characters) > inputBudget {
             let tail = SessionHistoryTail(admission, rowCharacters: projected.rowCharacters)
-            let halfBudget = SessionHistoryTail.halfBudgetCharacters(windowTokens: windowTokens, outputTokens: outputTokens)
+            let halfBudget = try SessionHistoryTail.halfBudgetCharacters(windowTokens: windowTokens, outputTokens: outputTokens,
+                charactersPerToken: ContextBudgetPolicy.transcriptCharactersPerToken)
             for checkpoint in tail.fittingCheckpoints(halfBudgetCharacters: halfBudget,
                 maximumRetainedCharacters: inputBudget) {
                 projected = tail.project(after: checkpoint)

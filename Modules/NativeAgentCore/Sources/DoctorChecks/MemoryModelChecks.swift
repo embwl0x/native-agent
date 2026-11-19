@@ -136,6 +136,14 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     public init(root: URL = defaultDataRoot()) { self.root = root }
 
     public func run(repair: Bool) async -> CheckResult {
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
+        guard let runtime = await memory.embeddingRuntimeSnapshot() else {
+            return CheckResult(source: "memory embedding runtime", id: id, title: title, status: "warn",
+                detail: "The canonical memory provider is not available to measure.")
+        }
+        if runtime.requestedBackend == ManagedEmbeddingProvider.mockBackend {
+            return await probe(memory: memory, installed: nil)
+        }
         // Missing and unusable assets fail through the same named resolver.
         let installed: CoreMLEmbeddingProvider.InstalledExtrasModel
         do {
@@ -184,7 +192,8 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
                     repairApplied: false, repair_available: true)
             }
             #endif
-            let after = await probe(installed: installed, reconcileRefusal: true)
+            let after = await probe(memory: memory, installed: installed, reconcileRefusal: true)
+            if after.status == "off" { return after }
             return CheckResult(source: after.source, nextCall: after.nextCall,
                 id: id, title: title, status: after.status, detail: after.detail,
                 harm: after.harm,
@@ -196,21 +205,21 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
                 repair_available: true
             )
         }
-        return await probe(installed: installed)
+        return await probe(memory: memory, installed: installed)
     }
 
-    private func probe(installed: CoreMLEmbeddingProvider.InstalledExtrasModel, reconcileRefusal: Bool = false) async -> CheckResult {
+    private func probe(memory: SwiftNativeMemoryV2, installed: CoreMLEmbeddingProvider.InstalledExtrasModel?,
+                       reconcileRefusal: Bool = false) async -> CheckResult {
         do {
-            let epoch = try CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: root)
-            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: root)
-            var state = try await storage.embeddingEpochState()
-            if reconcileRefusal, state.activationFailure?.epoch == epoch.rawValue {
-                let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
+            let epoch = try installed.map { _ in try CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: root) }
+            var state: MemoryEmbeddingEpochState?
+            if installed != nil { state = try await memory.memoryEmbeddingEpochState() }
+            if let epoch, reconcileRefusal, state?.activationFailure?.epoch == epoch.rawValue {
                 _ = await memory.releaseEmbeddingMemory(reason: "Doctor repaired the refused model's compile cache")
                 _ = await memory.reconcileEmbeddingEpochAtLaunch()
-                state = try await storage.embeddingEpochState()
+                state = try await memory.memoryEmbeddingEpochState()
             }
-            if let failure = state.activationFailure, failure.epoch == epoch.rawValue {
+            if let epoch, let failure = state?.activationFailure, failure.epoch == epoch.rawValue {
                 return CheckResult(source: "memory/memory.sqlite",
                     id: id, title: title, status: "fail",
                     detail: "Memory search activation refused at \(failure.recordedAt) for \(failure.epoch): \(failure.reason)",
@@ -222,30 +231,45 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
                         """,
                     repair_available: true)
             }
-            let provider = try CoreMLEmbeddingProvider(
-                modelURL: installed.modelURL, vocabURL: installed.vocabURL,
-                dimensions: installed.dimensions, modelId: installed.modelID)
-            let batch = try await provider.embedWithEpoch([MemoryEmbeddingEpoch.activationProbeText])
-            guard batch.vectors.count == 1 else {
+            let batch = try await memory.embedForDerivedContextWithEpoch([MemoryEmbeddingEpoch.activationProbeText])
+            guard batch.vectors.count == 1, let vector = batch.vectors.first else {
                 throw DoctorChecksError.underlying("The model returned no activation probe vector.")
             }
-            try VectorMath.requireUsable(batch.vectors[0], dimensions: installed.dimensions)
-            guard state.activeEpoch == provider.embeddingEpoch.rawValue, state.dimensions == provider.dimensions else {
+            guard let runtime = await memory.embeddingRuntimeSnapshot(), runtime.embeddingEpoch == batch.epoch.rawValue else {
+                return CheckResult(source: "memory embedding runtime", id: id, title: title, status: "warn",
+                    detail: "The serving provider's epoch is unavailable or changed during the probe; memory search health remains unmeasured.")
+            }
+            try VectorMath.requireUsable(vector, dimensions: runtime.dimensions)
+            if runtime.requestedBackend == ManagedEmbeddingProvider.mockBackend {
+                return CheckResult(source: "config/embeddings.json", id: id, title: title, status: "off",
+                    detail: """
+                        Meaning-based memory is Off; the canonical memory owner's selected \(runtime.modelId), \(runtime.dimensions)-d provider \
+                        produces a usable vector.
+                        """,
+                    repair_available: false)
+            }
+            guard let installed, batch.epoch == epoch, state?.activeEpoch == batch.epoch.rawValue,
+                  state?.dimensions == runtime.dimensions, runtime.dimensions == installed.dimensions else {
                 return CheckResult(source: "memory/memory.sqlite",
                     id: id, title: title, status: "warn",
                     detail: """
-                        The model's activation probe produces a usable vector, but memory search has not activated this model and dimension. \
+                        The canonical memory probe produces a usable vector, but the serving, installed and active model epochs or dimensions differ. \
                         Canonical activation is still unmeasured; inspect convergence before judging memory search healthy.
                         """)
             }
             return CheckResult(source: installed.modelURL.path,
                 id: id, title: title, status: "ok",
                 detail: """
-                    \(provider.modelId), \(provider.dimensions)-d: memory search has activated this epoch, model loads, WordPiece vocab parses \
-                    and the activation probe produces a usable vector.
+                    \(installed.modelID), \(installed.dimensions)-d: memory search has activated this epoch; the canonical memory owner's \
+                    activation probe produces a usable vector with the installed model's epoch.
                     """
             )
         } catch {
+            if installed == nil {
+                return CheckResult(source: "memory embedding runtime", id: id, title: title, status: "warn",
+                    detail: "Meaning-based memory was Off, but its selected provider could not be measured (\(String(describing: error))).",
+                    repair_available: false)
+            }
             return CheckResult(source: "Core ML model \(CoreMLEmbeddingProvider.bundledModelID) and its compiled cache",
                 id: id, title: title, status: "fail",
                 detail: """

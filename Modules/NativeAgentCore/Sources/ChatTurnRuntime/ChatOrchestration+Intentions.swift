@@ -116,7 +116,7 @@ extension SwiftNativeTurnEngine {
         // A person's turn carries only the steps due on it: handed the whole list every turn, she recited it to the person. The rest ride her own turns.
         let personTurn = !peerTurn && turn.originPrincipal == "person"
         let shown = personTurn ? moments.filter { due.contains($0.entry.item.handle) } : moments
-        let later = moments.count - shown.count
+        let later = moments.count - min(shown.count, 6)
         let lines = shown.prefix(6).map { row in
             if due.contains(row.entry.item.handle) {
                 let line = MyQueueReady.line(row.entry.item, at: now)
@@ -129,12 +129,11 @@ extension SwiftNativeTurnEngine {
             case .time(let date): until = MyQueue.shown(date)
             case .words(let words): until = words
             }
-            // Carry the item's name so the shown work can be named; its deed, once seen, closes it.
             return "- " + row.entry.name + " · " + Self.intentionLine(row.entry.step.words) + " · " + Self.intentionLine(row.moment)
                 + " · until " + Self.intentionLine(until)
         }
         let heading = "# What I mean to do (mine; I do what's safe now, and raise one only when it's done, it needs someone, or I'm asked)"
-        let rest = later > 0 ? ["+\(later) more for my own turns; queue.list reads them when I need to."] : []
+        let rest = later > 0 ? ["+\(later) more; queue.list reads them when I need to."] : []
         return lines.isEmpty && rest.isEmpty ? "" : ([heading] + lines + rest).joined(separator: "\n")
     }
 

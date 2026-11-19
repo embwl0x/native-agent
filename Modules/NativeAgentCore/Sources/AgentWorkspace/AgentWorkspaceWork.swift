@@ -1,13 +1,12 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceWork.swift` | `AgentWorkspaceWork` enum; `desk`, `continuation` |
+// Blueprint: | `AgentWorkspaceWork.swift` | `AgentWorkspaceWork`: Desk reads, existing app edits and owner continuations |
 
-/// Work navigation binds only canonical handles and typed owner continuations. Free text, archived claims and nested recipes never become executable work.
 enum AgentWorkspaceWork {
     static func desk(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         var content = (result.objectValue ?? [:])
         var actions = [open("Shared task ledger (separate from Desk)", tool: "task_ledger_list"), open("Delegated work", tool: "delegation_status"),
-                       configure("Add work", tool: "desk_add_item")]
+                       open("Add work", tool: "app", input: ["find": .string("desk_add_item"), "args": .object([:])])]
         var items: [AgentWorkspaceItem] = []
         if content["status"] == .string("record_changed"), let handle = input["handle"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
             content["handle"] == .string(handle) {
@@ -19,11 +18,11 @@ enum AgentWorkspaceWork {
         let record = (content["record"]?.objectValue ?? [:])
         let selectedHandle = record["handle"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
         if let selectedHandle, input["handle"] != nil {
-            actions += [configure("Add a note", tool: "desk_note", input: ["handle": .string(selectedHandle)]),
-                        configure("Update work", tool: "desk_update_item", input: ["handle": .string(selectedHandle)]),
-                        configure("Update status", tool: "desk_set_status", input: ["handle": .string(selectedHandle)]),
-                        configure("Link evidence", tool: "desk_add_ref", input: ["handle": .string(selectedHandle)]),
-                        configure("Add part", tool: "desk_add_item", input: ["parent": .string(selectedHandle)])]
+            actions += [open("Add a note", tool: "app", input: ["find": .string("desk_note"), "args": .object(["handle": .string(selectedHandle)])]),
+                        open("Update work", tool: "app", input: ["find": .string("desk_update_item"), "args": .object(["handle": .string(selectedHandle)])]),
+                        open("Update status", tool: "app", input: ["find": .string("desk_set_status"), "args": .object(["handle": .string(selectedHandle)])]),
+                        open("Link evidence", tool: "app", input: ["find": .string("desk_add_ref"), "args": .object(["handle": .string(selectedHandle)])]),
+                        open("Add part", tool: "app", input: ["find": .string("desk_add_item"), "args": .object(["parent": .string(selectedHandle)])])]
             if let parent = recordRead(record["parent_read"], label: "Parent work", title: "Parent work") { actions.append(parent) }
             if input["detail_offset"] == nil {
                 actions.append(open("Read complete record", tool: "desk_read", input: ["handle": .string(selectedHandle), "detail_offset": .int(0)],
@@ -70,7 +69,6 @@ enum AgentWorkspaceWork {
             }
             items.append(.init(title: title, content: value, actions: buttons))
         }
-        // Preserve the selected canonical identity when its visible alias was supplied. Only this owner response resolves aliases to handles.
         var pagingInput = input
         if let selectedHandle { pagingInput["handle"] = .string(selectedHandle) }
         for (field, offset, label) in [("next_read", "offset", selectedHandle == nil ? "More work" : "More parts"),
@@ -122,7 +120,5 @@ enum AgentWorkspaceWork {
     private static func open(_ label: String, tool: String, input: [String: JSONValue] = [:], title: String? = nil) -> AgentWorkspaceButton {
         .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
     }
-    private static func configure(_ label: String, tool: String, input: [String: JSONValue] = [:]) -> AgentWorkspaceButton {
-        .init(label: label, action: .configure(tool: tool, input: input, title: label))
-    }
+
 }

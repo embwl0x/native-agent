@@ -62,7 +62,6 @@ extension SwiftNativeTurnEngine {
         turn: Turn, work: ChatTurnWork
     ) async -> TurnEngineResult {
         let recalledIds = ctx.resolvedRecalledIds
-        await ctx.fluidContextTurn?.recordOutcome(.completed)
         var held = afterReply
         if afterTurn {
             await queueStoppedRuns(dispatches: dispatches, surface: surface, turn: turn)

@@ -185,6 +185,7 @@ extension CloudKitDeviceTransport {
     private func drainIncomingBody(recovery: DeviceSyncRecovery) async -> DeviceSyncDrainResult {
         let (handler, since) = loadHandlerAndCursor()
         guard handler != nil else { return .skipped(0) }
+        let assetSecret = await loadAssetSecretProvider()?()
         let queryStartedAt = Date()
 
         let inbound = role.inboundDirection.rawValue
@@ -195,6 +196,7 @@ extension CloudKitDeviceTransport {
                 recordType: NADeviceSyncRecordType.chatMessage,
                 since: since,
                 inboundDirection: inbound,
+                assetSecret: assetSecret,
                 recovery: recovery
             )
             if role == .ios {
@@ -206,6 +208,7 @@ extension CloudKitDeviceTransport {
                     recordType: NADeviceSyncRecordType.notification,
                     since: since,
                     inboundDirection: inbound,
+                    assetSecret: assetSecret,
                     recovery: recovery
                 )
                 records.records = notifications.records
@@ -320,9 +323,11 @@ extension CloudKitDeviceTransport {
               loadControlAdmission() != nil, beginControlDrain() else { return 0 }
         defer { endControlDrain() }
         let (_, since) = loadHandlerAndCursor()
+        let assetSecret = await loadAssetSecretProvider()?()
         do {
             let records = try await pull(recordType: NADeviceSyncRecordType.chatMessage,
-                                         since: since, inboundDirection: role.inboundDirection.rawValue, recovery: recovery)
+                                         since: since, inboundDirection: role.inboundDirection.rawValue,
+                                         assetSecret: assetSecret, recovery: recovery)
             if let error = records.payloadError { nativeLog("[ck-device] cancellation payload failed: %@", error.localizedDescription) }
             var decoded: [Int: (id: String, message: Result<BridgeMessage, Error>?)] = [:]
             return await deliverAdmittedControls(Self.orderedIncoming(records.records), decoded: &decoded, recovery: recovery)

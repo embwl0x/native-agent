@@ -18,7 +18,12 @@ Turn traces and standalone receipts are details in `experiences/experiences.sqli
 the record forgets details older than `ExperienceStore.detailHorizon` (14 days) and
 refuses a detail row over 8 MiB. `TurnTraceEvent.swift` summarizes ordinary
 turn-trace payloads at 12 KiB; `llm.call` receipts use the detail owner's 8 MiB
-row ceiling. A `context.snapshot` retains its complete first-class `feelingFrame`
+row ceiling. `tool.dispatch` preserves an inline result up to the shared 8,000-byte
+result limit, or its durable reference; whole-row summaries reserve 12 KiB plus
+six times that limit for JSON escaping, so neither string nor row bounding clips it.
+`ProviderToolResultRecoveryStore` retains a redacted head up to 4 MiB under `tool_results/`,
+with any cut named in body and reference; store-time pruning deletes files at the same 14-day horizon.
+A `context.snapshot` retains its complete first-class `feelingFrame`
 alongside that ordinary summary, also within the shared 8 MiB row ceiling.
 The paragraph is redacted before recording and is exempt from per-string,
 preview and 120-byte cue clipping. The retained field is identical on trace
@@ -40,8 +45,7 @@ The Shared `FaceLinkLog` keeps the body–face link record
 `diagnostics/FaceLink.log` to the recent past: the write that takes it past 32 MiB
 copies it to `diagnostics/FaceLink.previous.log`, replacing the earlier copy, and
 truncates the record, whose first line says it turned over. At most two records
-are kept. `diagnostics/TranscriptDocument.log` and `diagnostics/FacePage.log` are
-appended without a bound.
+are kept.
 
 The daily `DataRootDiskHygieneCheck` reports oversized state; it does not
 automatically delete it or enforce a global quota. Chat recovery backups have

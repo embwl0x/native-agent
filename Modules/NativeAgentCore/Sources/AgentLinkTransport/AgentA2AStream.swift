@@ -29,13 +29,16 @@ public enum AgentA2AStream {
         let requestID: String?
         let expectedTaskID: String?
         let bearerToken: String?
+        let taskOpened: @Sendable (String) throws -> Void
         private var latest: AgentA2AWire.Result?
         private var task: [String: JSONValue]?
         private var liveUpdate = LiveUpdate()
 
-        init(interface: AgentA2AWire.Interface, requestID: String?, expectedTaskID: String? = nil, bearerToken: String? = nil) {
+        init(interface: AgentA2AWire.Interface, requestID: String?, expectedTaskID: String? = nil, bearerToken: String? = nil,
+             taskOpened: @escaping @Sendable (String) throws -> Void = { _ in }) {
             self.interface = interface; self.requestID = requestID; self.expectedTaskID = expectedTaskID
             self.bearerToken = bearerToken
+            self.taskOpened = taskOpened
         }
 
         mutating func receive(_ event: JSONValue) throws -> LiveUpdate {
@@ -121,9 +124,10 @@ public enum AgentA2AStream {
             guard try wrapped.serializedData(pretty: false).count <= AgentPeerHTTP.maximumResponseBytes else {
                 throw AgentPeerHTTP.TransportError.tooLarge
             }
-            latest = try AgentA2AWire.normalizeResponse(wrapped, interface: interface,
+            let result = try AgentA2AWire.normalizeResponse(wrapped, interface: interface,
                 expectedRequestID: requestID, expectedTaskID: expectedTaskID)
-            let result = latest!
+            if let id = result.taskID, latest?.taskID != id { try taskOpened(id) }
+            latest = result
             var update = liveUpdate
             if result.kind == "message" { update.text = AgentPeerHTTP.redactLiveText(result.text, token: bearerToken) }
             else {

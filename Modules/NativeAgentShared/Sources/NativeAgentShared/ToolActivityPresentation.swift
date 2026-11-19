@@ -24,7 +24,7 @@ public enum ToolActivityPresentation {
     /// Progress copy admits only short plain names from arguments, never paths or query payloads.
     public static func progress(_ name: String, args: [String: String] = [:]) -> String {
         switch name.lowercased() {
-        case "app", "workspace":
+        case "app":
             if let page = plainName(args["page"]) { return "Opening \(page)" }
             if let item = args["item"] {
                 let head = item.split(separator: ".").first.map(String.init)

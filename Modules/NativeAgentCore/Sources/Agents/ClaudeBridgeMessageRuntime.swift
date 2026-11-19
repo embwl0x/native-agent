@@ -225,106 +225,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         return root.appendingPathComponent("claude-bridge/message-replies.jsonl")
     }
 
-    /// Read bounded existing receipts without replay or another store; damaged scope proves neither absence nor uniqueness. Match only the authenticated
-    /// principal, even when another caller reused the same IDs.
-    public static func agentReplyReceipt(requestID: String, sessionID: String, offset: Int = 0,
-                                  maxChars: Int = 8000, logURL: URL, principal: String? = nil) -> [String: Any] {
-        var result: [String: Any] = ["request_id": requestID, "session_id": sessionID,
-            "status": "unavailable", "original_outcome": "unknown",
-            "detail": "A missing receipt does not prove failure or authorize replay."]
-        func finish(_ evidence: String, complete: Bool = false) -> [String: Any] {
-            var value = result
-            value["evidence"] = evidence
-            value["coverage"] = ["complete": complete, "scope": "retained_reply_receipts"]
-            value["retrieval_result_class"] = result["status"] as? String == "ok" ? "succeeded" : "failed"
-            return value
-        }
-        guard !requestID.isEmpty, requestID.utf8.count <= 128,
-              !sessionID.isEmpty, sessionID.utf8.count <= 128,
-              offset >= 0, offset <= 1_048_576, (1...16000).contains(maxChars) else {
-            result["status"] = "invalid_request"
-            return finish("invalid_request")
-        }
-        let fd = Darwin.open(logURL.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else {
-            if errno == ENOENT {
-                result["status"] = "not_found"
-                return finish("no_retained_receipt", complete: true)
-            }
-            return finish("unreadable_receipts")
-        }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        defer { try? handle.close() }
-        var before = stat()
-        guard fstat(fd, &before) == 0, before.st_mode & S_IFMT == S_IFREG else { return finish("unreadable_receipts") }
-        let maximumScanBytes = 16 * 1_048_576
-        let maximumRowBytes = 1_048_576
-        guard before.st_size <= maximumScanBytes else { return finish("scan_limit") }
-        var pending = Data()
-        var total = 0
-        var matches = 0
-        var matched: [String: Any]?
-        func inspect(_ line: Data) -> String? {
-            guard line.count <= maximumRowBytes else { return "row_limit" }
-            if line.isEmpty { return nil }
-            guard let text = String(data: line, encoding: .utf8) else { return "invalid_encoding" }
-            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
-            guard let row = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return "malformed_receipts" }
-            // Validate payloads only after request identity matches; malformed JSON invalidates scope.
-            if let rawID = row["requestId"], !(rawID is String) { return "malformed_receipts" }
-            guard row["requestId"] as? String == requestID else { return nil }
-            if let principal, row["principal"] as? String != principal { return nil }
-            matches += 1
-            guard let rowSession = row["sessionId"] as? String,
-                  let status = row["status"] as? String, !status.isEmpty,
-                  row["reply"] is String else { return "malformed_receipts" }
-            if rowSession == sessionID { matched = row }
-            return nil
-        }
-        do {
-            while let chunk = try handle.read(upToCount: 65536), !chunk.isEmpty {
-                total += chunk.count
-                guard total <= maximumScanBytes else { return finish("scan_limit") }
-                pending.append(chunk)
-                while let newline = pending.firstIndex(of: 0x0A) {
-                    if let error = inspect(Data(pending[..<newline])) { return finish(error) }
-                    pending.removeSubrange(...newline)
-                }
-                guard pending.count <= maximumRowBytes else { return finish("row_limit") }
-            }
-            if !pending.isEmpty, let error = inspect(pending) { return finish(error) }
-        } catch { return finish("unreadable_receipts") }
-        var after = stat()
-        var current = stat()
-        guard fstat(fd, &after) == 0, lstat(logURL.path, &current) == 0,
-              before.st_size == after.st_size, before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
-              before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
-              after.st_ino == current.st_ino, after.st_dev == current.st_dev else { return finish("receipts_changed") }
-        guard matches <= 1 else { return finish("ambiguous_receipt", complete: true) }
-        guard let row = matched, let reply = row["reply"] as? String else {
-            result["status"] = "not_found"
-            return finish("no_retained_receipt", complete: true)
-        }
-        guard offset <= reply.count else {
-            result["status"] = "invalid_request"
-            return finish("offset_out_of_range", complete: true)
-        }
-        let slice = String(reply.dropFirst(offset).prefix(maxChars))
-        result["status"] = "ok"
-        result.removeValue(forKey: "original_outcome")
-        result["original_status"] = row["status"]
-        // Combined delivery wording proves neither execution nor settlement.
-        result["execution_result_class"] = row["execution_result_class"] ?? "unknown"
-        result["execution_terminal"] = row["execution_terminal"] ?? NSNull()
-        for key in ["attachments", "completionDelivery", "deliveryId"] { result[key] = row[key] }
-        result["run_id"] = row["runId"] as? String ?? NSNull()
-        result["reply"] = slice
-        result["offset"] = offset
-        result["next_offset"] = offset + slice.count
-        result["has_more"] = offset + slice.count < reply.count
-        return finish("exact_receipt", complete: true)
-    }
-
     static func messageReplyRecord(_ payload: [String: Any], requestID: String) -> [String: Any] {
         var record = payload
         record["requestId"] = requestID
@@ -383,7 +283,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 let accepted = try await tasks.sendBridge(context: context, request: requestID, principal: principal,
                     digest: digest, binding: binding) { bindRun in
                     var prepared = request
-                    var produced: ChatTurnRuntime.ChatResponse?
+                    var produced: (reply: ChatTurnRuntime.ChatResponse, turn: Turn)?
                     do {
                         // The exact run is retained before enqueue can append the user row.
                         try await bindRun(session, requestID)
@@ -422,7 +322,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                             return Self.steeredOutcome(steered)
                         }
                         let reply = execution.0
-                        produced = reply
+                        produced = (reply, execution.1)
                         let result = try await self.settleMessageReply(turn: execution.1, reply, request: request, principal: principal,
                             owner: owner, claudeReplyID: claudeReplyID, replyText: rawText,
                             requestID: requestID, started: started, sessionID: session, enqueued: enqueuedMode)
@@ -432,11 +332,11 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         if let produced {
                             // A settlement error cannot discard already produced words or files.
                             let detail = "The turn returned, but bridge settlement needs repair: " + error.localizedDescription
-                            RepairOwed.owe(self.portDataRoot, id: requestID, kind: .message,
+                            RepairOwed.owe(self.portDataRoot, id: requestID, kind: .message, steeredBy: produced.turn.steeringStamp(),
                                 operation: "bridge.reply.settle:" + requestID, owner: taskID,
                                 words: detail, lever: "Repair the exact bridge delivery from its retained task and run; do not repeat the turn.")
-                            return Self.bridgeOutcome(produced, taskID: taskID,
-                                result: ["status": produced.terminalState?.rawValue ?? "incomplete", "detail": detail])
+                            return Self.bridgeOutcome(produced.reply, taskID: taskID,
+                                result: ["status": produced.reply.terminalState?.rawValue ?? "incomplete", "detail": detail])
                         }
                         throw error
                     }

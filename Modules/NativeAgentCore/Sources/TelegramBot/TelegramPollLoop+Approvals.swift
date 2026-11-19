@@ -66,7 +66,7 @@ extension TelegramPollLoop {
 
     private func resolveApprovalCallback(update: TelegramUpdate, callback: JSONValue) async -> Bool {
         guard let parsed = TelegramApprovalCallback(callback) else { return false }
-        let authorization = Self.inboundAuthorizationDecision(
+        let authorization = Self.controlAuthorizationDecision(
             allowedChatIds: allowedChatIds, allowedUserIds: allowedUserIds,
             chatId: parsed.chatId, fromUserId: parsed.fromUserId)
         guard authorization != .allowlistEmpty else {
@@ -83,7 +83,7 @@ extension TelegramPollLoop {
             await recordBlocked(reason: "not_allowlisted", update: update, message: nil, text: nil)
             await answerRecordedCallback(
                 parsed.callbackId,
-                text: "This Telegram chat is not allowlisted.",
+                text: "This is the owner's control; your Telegram sender must be allowlisted.",
                 context: "approval_unauthorized_callback_answer",
                 update: update
             )

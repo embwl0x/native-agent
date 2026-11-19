@@ -427,7 +427,7 @@ public enum AgentBridgeCompletionRouter {
           requestDigest: requestDigest, artifact: artifact) {
           do { try await sender.preflight(surface: surface, route: route, artifacts: [artifact]) }
           catch { return .preDispatchFailed(reason: String(describing: error)) }
-          guard !Task.isCancelled else { return .outcomeUnknown(reason: "completion_delivery_cancelled") }
+          guard !Task.isCancelled else { return .preDispatchFailed(reason: "completion_delivery_cancelled") }
           return await sender.send(artifact: artifact,
             idempotencyKey: stableUUID("\(deliveryId):\(artifact.id)"), surface: surface, route: route)
         }

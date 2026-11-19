@@ -128,7 +128,7 @@ import TrustPersistence
             do {
                 if try await prepareUpkeep(verb: verb, input: input, turn: turn) != nil { return nil }
             } catch { return NativeAgentEngine.prepareRefusal(error, verb: verb) }
-            return await appModel.engine.pageVerbFence(verb, input: input)
+            return await appModel.engine.pageVerbFence(verb, input: input, surface: turn.envelope?.surface)
         case ("connections", _): return await connectionsFence(verb: verb, input: input, turn: turn)
         case ("provider", _):
             do {
@@ -252,7 +252,7 @@ import TrustPersistence
         default:
             // Trust's and Settings' Mac buttons first, then the agent's pages' rows; each owner answers its own.
             if let trust = await runTrustSettingsUpkeep(verb: verb, input: input) { return trust }
-            return await appModel.engine.pageVerb(verb, input: input)
+            return await appModel.engine.pageVerb(verb, input: input, surface: turn.envelope?.surface)
         }
     }
 }

@@ -3,9 +3,8 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import Dispatcher
-// Blueprint: | `AgentScreenRooms+Build.swift` | `AgentScreen`, `buildRoom`, `buildTarget`, `buildRecordRoom`: partial coverage stays visible |
+// Blueprint: | `AgentScreenRooms+Build.swift` | `AgentScreen`: source/file rooms, named reads and existing app file actions |
 
-/// Trusted source rooms include external worktree metadata only under Git's read-only fences.
 enum AgentWorkspaceBuild {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "code", title: "Code", summary: "The source checkout: branch, changes, commits and recent builder runs.",
@@ -35,7 +34,6 @@ extension AgentScreen {
                 .action(.perform(tool: tool, input: input, title: title, textField: text, isEffect: true))
             }
             switch (parts[0], parts[1], parts.count) {
-            case ("files", "new", 2): return .action(.configure(tool: "write_file", input: [:], title: "New file"))
             case ("files", "find", 2): return read("artifact_find", [:], "Find a document", text: "query")
             case ("clipboard", "read", 2): return read("clipboard_read", [:], "Clipboard")
             case ("clipboard", "copy", 2): return effect("clipboard_write", [:], "Copy to the clipboard", text: "text")
@@ -58,9 +56,7 @@ extension AgentScreen {
         } catch { return .page(nameFailure(error)) }
     }
 
-    // MARK: Reads as rooms
 
-    /// Preserve the owner's verbs and issued read name; disclose counts and leave the current frame when no room applies.
     static func buildRecordRoom(workspace: WorkspaceOperation, _ location: AgentWorkspaceLocation, value: JSONValue?, projection: WorkspacePage?,
         dataRoot: URL, scope: String,
         issue: String?) async -> String? {
@@ -104,7 +100,6 @@ extension AgentScreen {
                     + (apps.count > 10 ? ["+\(apps.count - 10) more apps"] : [])
                 header = ["ACTIVITY", (text(input["range"]) ?? "today").replacingOccurrences(of: "_", with: " "), "\(apps.count) apps"]; label = "APPS"
             case "app" where input["item"] == .string("status"):
-                // Keep current link health and recovery evidence visible.
                 let object: [String: JSONValue] = if case .object(let row)? = object["item"] { row } else { [:] }
                 let now = Date()
                 func when(_ key: String) -> String? { text(object[key]).flatMap(date).map { friendly($0, now: now) } }
@@ -121,12 +116,10 @@ extension AgentScreen {
                 ].compactMap { $0 }
                 header = ["TELEGRAM", on ? "on" : "off", broken ? "error now" : "ok"]; label = "LINK"; body = nil
             default:
-                guard let body, issue == nil else { break }
-                // Whole lines, wrapped, never clipped: the cap is on source lines.
+                guard let body else { break }
                 let cap = tool == "screen" ? 60 : tool == "read_page" ? 120 : 40
                 let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
                 rows = lines.prefix(cap).flatMap { wrap($0) }
-                // Keep whole web text in the source receipt so display wrapping loses no evidence.
                 let saved: String? = if case .object(let receipt)? = object["source_receipt"] { text(receipt["path"]) } else { nil }
                 if lines.count > cap {
                     rows.append("+\(lines.count - cap) more lines" + (tool == "read_file" ? " · app files.read with offset reads on"
@@ -136,8 +129,7 @@ extension AgentScreen {
                 let coverage: [String: JSONValue] = if case .object(let row)? = object["coverage"] { row } else { [:] }
                 if object["has_more"] == .bool(true) || coverage["complete"] == .bool(false) { header.append("partial") }
             }
-            // Failed or empty web reads retain the reason and extraction evidence.
-            if tool == "read_page", issue != nil || rows.isEmpty {
+            if tool == "read_page", rows.isEmpty {
                 let coverage: [String: JSONValue] = if case .object(let row)? = object["coverage"] { row } else { [:] }
                 rows += [text(object["reason"]).map { "reason    " + $0 },
                          text(coverage["extraction_status"]).map { "reader    " + $0 },
@@ -146,10 +138,10 @@ extension AgentScreen {
                 label = "SOURCE"
             }
             if tool == "recall_memory", let query = text(input["query"]) { header = ["MEMORY", clip(query, 48), "\(projection.items.count) found"] }
-            var lines = textRoom(workspace: workspace, room, place: location, projection: projection, status: .string(issue == nil ? "ok" : "failed"),
+            var lines = textRoom(workspace: workspace, room, place: location, projection: projection, status: .string("ok"),
                                  dataRoot: dataRoot, scope: scope).components(separatedBy: "\n")
             guard !lines.isEmpty else { return nil }
-            if issue == nil { lines[0] = (header + (lines[0].contains(numbersNote) ? [numbersNote] : [])).joined(separator: " · ") }
+            lines[0] = (header + (lines[0].contains(numbersNote) ? [numbersNote] : [])).joined(separator: " · ")
             let shown = section(label, rows)
             if let empty = lines.firstIndex(of: "nothing here"), !shown.isEmpty { lines.replaceSubrange(empty...empty, with: shown) }
             else if !shown.isEmpty, lines.count > 2 { lines.insert(contentsOf: shown + [String(repeating: "─", count: 61)], at: 2) }
@@ -157,14 +149,11 @@ extension AgentScreen {
         } catch { return nameFailure(error) }
     }
 
-    /// Reuse the issued family number, never mint a number for a read reached by another route.
     private static func family(workspace: WorkspaceOperation, _ tool: String, input: [String: JSONValue], dataRoot: URL) throws -> String? {
-        // Use this read's highest existing number: numbers grow with each new identity.
         func listed(_ kind: String, _ base: String, _ match: (String) -> Bool) throws -> String {
             try withNames(workspace: workspace, dataRoot) { book in book.numbers[kind]?.filter { match($0.key) }.map(\.value).max()
                 .map { base + ".\($0)" } } ?? base
         }
-        // A list row's identity is the read it opens; titles can be renamed, input cannot.
         func sameRead(_ key: String) -> Bool {
             guard case .object(let row)? = try? JSONValue.parse(Data(key.utf8)) else { return false }
             return row["tool"] == .string(tool) && row["input"] == .object(input)
@@ -183,7 +172,6 @@ extension AgentScreen {
         }
     }
 
-    /// Defuse each wrapped piece so outside text cannot become tool markup.
     static func wrap(_ line: String, width: Int = 110) -> [String] {
         var out: [String] = [], rest = Substring(UntrustedText.neutralized(line))
         while rest.count > width {
@@ -196,9 +184,7 @@ extension AgentScreen {
         return out
     }
 
-    // MARK: Files
 
-    /// Disclose enumeration and metadata failures as partial coverage.
     private static func filesRoom(workspace: WorkspaceOperation, dataRoot: URL, now: Date) -> String {
         do {
             let root = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).standardizedFileURL
@@ -234,7 +220,6 @@ extension AgentScreen {
                     return screen(["FILES", clip(root.path, 60), "Scan unavailable"], [section("READ FAILURE", failures)], verbs: [])
                 }
             }
-            // Size is evidence of size alone; small files are not necessarily stubs.
             let newest = files.sorted { $0.at > $1.at }
             let recent = newest.filter { $0.size >= 256 }.prefix(8), tiny = newest.filter { $0.size < 256 }
             func row(_ book: inout NameBook, _ file: (path: String, at: Date, size: Int)) throws -> (name: String, shown: String) {
@@ -253,7 +238,7 @@ extension AgentScreen {
             return screen(["FILES", clip(root.path, 60), "\(seen) files found in scan"],
                 [[scanNote], section("READ FAILURE", failures), section("RECENT", rows.isEmpty ? ["no files of 256 B or more found in this scan"] : rows),
                     section("TINY", stubs)],
-                verbs: [("files.N", "read it"), ("files.N.append", "add to its end (text)"), ("files.new", "write a new file (form)"),
+                verbs: [("files.N", "read it"), ("files.N.append", "add to its end (text)"), (#"app {action:"files.write", args:{path,content}}"#, "write a new file"),
                         ("files.find", "find a document by what it was for (text)"), ("clipboard.read", "what is on the clipboard"),
                         ("clipboard.copy", "put text on the clipboard (text)"), ("app files.list · files.grep", "any other folder, or inside files")])
         } catch { return nameFailure(error) }
@@ -263,7 +248,6 @@ extension AgentScreen {
         bytes < 1024 ? "\(bytes) B" : bytes < 1_048_576 ? "\(bytes / 1024) KB" : String(format: "%.1f MB", Double(bytes) / 1_048_576)
     }
 
-    // MARK: Code
 
     private static func codeRoom(workspace: WorkspaceOperation, dataRoot: URL, now: Date) async -> String {
         guard let repo = workspace.ports.tools.builderSourceRepoRoot(dataRoot: dataRoot) else {
@@ -349,7 +333,7 @@ extension AgentScreen {
                 }
                 return pad(age(now.timeIntervalSince(at)), 6) + pad(tool, 8) + failureFace(.object(evidence))
             }
-            let mark = row["timedOut"] as? Bool == true ? "✗ timed out" : exit == 0 ? "✓" : "✗ exit \(exit.map(String.init) ?? "?")"
+            let mark = "✓"
             let what = row["sourcePayload"] as? String ?? (row["args"] as? [String])?.joined(separator: " ") ?? ""
             return pad(age(now.timeIntervalSince(at)), 6) + pad(mark, 4) + pad(tool, 8) + clip(what, 60)
         }

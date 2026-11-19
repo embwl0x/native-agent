@@ -585,7 +585,7 @@ export_archive() {
   rm -rf "$EXPORT_PATH"
   mkdir -p "$EXPORT_PATH"
   local options
-  options="$(mktemp -t NativeAgentExportOptions).plist"
+  options="$(mktemp -t NativeAgentExportOptions)" && mv "$options" "$options.plist" && options+=".plist" || { local_fail "Could not create temporary export options."; return; }
   sed "s/__NATIVEAGENT_TEAM_ID__/$TEAM_ID/g" "$EXPORT_TEMPLATE" >"$options"
   if ! plutil -lint "$options" >/dev/null 2>&1 ||
      [[ "$(plist_value "$options" teamID || true)" != "$TEAM_ID" ]]; then
@@ -693,6 +693,4 @@ main() {
   printf '.\n'
 }
 
-if [[ "${NATIVEAGENT_IOS_RELEASE_LIB_ONLY:-0}" != "1" ]]; then
-  main "$@"
-fi
+main "$@"

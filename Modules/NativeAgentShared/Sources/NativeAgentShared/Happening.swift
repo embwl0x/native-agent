@@ -10,7 +10,7 @@ public struct Happening: Codable, Sendable, Equatable {
     public var kind: Kind
     /// What it is about (a watch, a job, a queue step, a care); worth that touches no care, and a watch's news always, gathers on this subject.
     public var subject: String
-    /// Where it came from: `sense:<watch>`, `part:<id>`, `clock:day`, `mac:front`, `job:<id>`, `contact:<id>`, `queue:<handle>`, `stem`.
+    /// Where it came from: `sense:<senseID>`, `part:<id>`, `clock:day`, `mac:front`, `job:<id>`, `contact:<id>`, `queue:<handle>`, `stem`.
     public var door: String
     /// Whose words it carries: `self`, `world`, `person`, or an agent's id.
     public var who: String
@@ -32,19 +32,23 @@ public struct Happening: Codable, Sendable, Equatable {
     public var elevated: [String]?
     /// Material the thought shows beside the line, quoted (a habit's receipt, an organ to grow). Never drawn on a face.
     public var shows: String?
+    /// Identity of the watch that produced this news; absent when the source supplies none.
+    public var watch: String?
 
     public init(_ kind: Kind, subject: String, door: String, who: String = "world", words: String, once: String,
                 signal: String? = nil, care: String? = nil, moved: Double? = nil, open: Bool? = nil,
-                route: String? = nil, reply: String? = nil, peers: [String]? = nil, elevated: [String]? = nil, shows: String? = nil) {
+                route: String? = nil, reply: String? = nil, peers: [String]? = nil, elevated: [String]? = nil,
+                shows: String? = nil, watch: String? = nil) {
         self.kind = kind; self.subject = subject; self.door = door; self.who = who
         self.words = String(words.prefix(Self.wordsLimit)); self.once = once; self.signal = signal
         self.care = care; self.moved = moved.flatMap { $0.isFinite ? $0 : nil }; self.open = open; self.route = route; self.reply = reply
         self.peers = peers.flatMap { $0.isEmpty ? nil : $0 }; self.elevated = elevated.flatMap { $0.isEmpty ? nil : $0 }
         self.shows = shows.map { String($0.prefix(Self.showsLimit)) }
+        self.watch = watch
     }
 
-    /// News from a watch the agent set (`SenseNewsBoard`: door `sense:<watch>`, subject `sense:<watch>:<address>`). The watch is a care the
-    /// agent made on purpose: its news gathers on its own subject and always opens its own thought.
+    /// News from a watch the agent set (`SenseNewsBoard`: door `sense:<senseID>`, subject `sense:<senseID>:<address>`).
+    /// It gathers on its own subject; its first weighed news keeps the thought-opening floor (each news without a watch id).
     public var watchNews: Bool { kind == .world && door.hasPrefix("sense:") && subject.hasPrefix(door + ":") }
     /// Someone waits on it (a person or agent, the conversation that started some work, the agent's past self, its body): it opens a thought unweighed.
     public var owed: Bool { kind != .world && kind != .self }

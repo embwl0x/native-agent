@@ -98,10 +98,7 @@ struct MobileAgentThreadView: View {
 
     private func refresh() async {
         guard !busy else { return }
-        guard pairing.isPaired else {
-            error = "Pair with your Mac to read or send agent messages."
-            return
-        }
+        guard pairing.isPaired else { return }
         busy = true; error = nil
         defer { busy = false }
         do {

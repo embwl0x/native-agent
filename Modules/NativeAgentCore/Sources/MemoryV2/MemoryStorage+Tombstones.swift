@@ -2,7 +2,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Tombstones.swift` | `MemoryStorage`, `nearestTombstones`: exact/semantic suppression and owed vectors |
+// Blueprint: | `MemoryStorage+Tombstones.swift` | `MemoryStorage`: exact/semantic suppression and owed vectors |
 
 extension MemoryStorage {
     // MARK: - Tombstones
@@ -121,39 +121,6 @@ extension MemoryStorage {
                 query: query,
                 queryEpoch: queryEpoch?.rawValue
             )
-        }
-    }
-
-    /// Show nearest forgotten claims to the memory manager so claim identity is judged rather than decided by a threshold.
-    public func nearestTombstones(
-        embedding query: [Float],
-        embeddingEpoch queryEpoch: MemoryEmbeddingEpoch?,
-        limit: Int
-    ) async throws -> [String] {
-        guard !query.isEmpty, limit > 0 else { return [] }
-        return try await dbPool.read { db in
-            try Self.requireTombstoneVectors(in: db)
-            let activeEpoch = try Self.embeddingEpochState(in: db).activeEpoch
-            if let activeEpoch, queryEpoch?.rawValue != activeEpoch {
-                throw MemoryStorageError.embeddingEpochMismatch(expected: activeEpoch, actual: queryEpoch?.rawValue)
-            }
-            var sql = "SELECT content, embedding FROM tombstones WHERE embedding IS NOT NULL"
-            var arguments: StatementArguments = []
-            if let activeEpoch {
-                sql += " AND embedding_epoch = ?"
-                arguments = [activeEpoch]
-            }
-            var scored: [(content: String, cosine: Double)] = []
-            for row in try Row.fetchAll(db, sql: sql, arguments: arguments) {
-                guard let e = try Self.decodeEmbedding(row.decode(forColumn: "embedding")), e.count == query.count else {
-                    throw MemoryStorageError.databaseUnavailable("""
-                        Rejection vector dimensions do not match the active memory model; repair the tombstone before semantic admission.
-                        """)
-                }
-                guard let content: String = try row.decode(forColumn: "content") else { continue }
-                scored.append((content: content, cosine: VectorMath.cosine(query, e)))
-            }
-            return scored.sorted { $0.cosine > $1.cosine }.prefix(limit).map(\.content)
         }
     }
 

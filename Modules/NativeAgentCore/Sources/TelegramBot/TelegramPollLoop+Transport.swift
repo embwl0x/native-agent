@@ -81,13 +81,15 @@ extension TelegramPollLoop {
     public static let defaultSendSilentRichMessage: @Sendable (
         String, TelegramDestination, TelegramInputRichMessage
     ) async throws -> Int = { token, destination, richMessage in
-        let result = try await _tgPostJSON(token: token, method: "sendRichMessage", resultType: TelegramAPIMessageResult.self) {
-            var fields = _tgDestinationFields(destination)
-            fields["rich_message"] = richMessage.jsonValue
-            fields["disable_notification"] = .bool(true)
-            return try JSONValue.object(fields).serializedData(pretty: false)
+        return try await _tgSendInChatLane(chatId: destination.chatId) {
+            let result = try await _tgPostJSON(token: token, method: "sendRichMessage", resultType: TelegramAPIMessageResult.self) {
+                var fields = _tgDestinationFields(destination)
+                fields["rich_message"] = richMessage.jsonValue
+                fields["disable_notification"] = .bool(true)
+                return try JSONValue.object(fields).serializedData(pretty: false)
+            }
+            return try result.value.messageId
         }
-        return try result.value.messageId
     }
 
     static let defaultEditRichMessage: @Sendable (

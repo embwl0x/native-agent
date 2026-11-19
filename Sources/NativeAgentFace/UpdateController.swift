@@ -10,9 +10,6 @@ enum UpdateController {
     private static var driver: SPUStandardUserDriver?
     private static var operation: UUID?
 
-    static func request(_ command: UpdateCommand, appModel: AppModel) async throws -> FaceActReply {
-        try await appModel.checkedFaceAct(.requestUpdate(command))
-    }
 
     static func present(_ request: UpdatePresentationRequest, appModel: AppModel) async throws -> FaceReply {
         let driver: SPUStandardUserDriver

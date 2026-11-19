@@ -13,6 +13,7 @@ extension ChatView {
     var isSavingComposerChoice: Bool { appModel.providerSavingChatBrain || composerCardState.savingChoice }
 
     func send() {
+        guard draft.hasVisibleText || !pendingAttachments.isEmpty || !voiceSessionId.isEmpty else { return }
         guard !isSubmittingSend else { return }
         guard !isCapturing else { showToast("Screen capture is still in progress"); return }
         guard !isSavingComposerChoice else { showToast("The Chat model choice is still being saved"); return }
@@ -122,12 +123,9 @@ extension ChatView {
                 case .help:
                     try await appModel.chatAct(.appendSlashHelp(session: session)).checkedAcknowledgement()
                 case .new:
-                    appModel.chatSelectionGeneration = UUID()
-                    let selection = appModel.chatSelectionGeneration
-                    let created = try appModel.acceptedConversation(await appModel.chatAct(.createConversation))
-                    guard appModel.chatSelectionGeneration == selection else { return }
-                    clearSuccessfulSlashCommandDraft(captured, sessionId: session, editedAt: editedAt)
-                    appModel.commitChatSessionSelection(created)
+                    _ = try await appModel.createFaceConversation {
+                        clearSuccessfulSlashCommandDraft(captured, sessionId: session, editedAt: editedAt)
+                    }
                     return
                 case .model, .think, .fast:
                     showToast(try await appModel.performSlashBrain(route, argument: argument, session: session))

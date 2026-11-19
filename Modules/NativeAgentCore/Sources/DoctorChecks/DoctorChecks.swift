@@ -6,33 +6,7 @@ import PersistenceCore
 public protocol DoctorCheck: Sendable {
     var id: String { get }
     var title: String { get }
-    /// Operator-only checks must opt out of unattended execution, health and failure counts.
-    var heartbeatEligible: Bool { get }
     func run() async -> CheckResult
-}
-
-public extension DoctorCheck {
-    var heartbeatEligible: Bool { true }
-}
-
-/// Derive core exclusions from defaultChecks; persisted-report readers also need explicit app-mounted live IDs.
-public enum DoctorHeartbeatPolicy {
-    public static let ineligibleCheckIDs: Set<String> = Set(
-        SwiftNativeDoctorChecks.defaultChecks
-            .filter { !$0.heartbeatEligible }
-            .map(\.id)
-    ).union([
-        // Historical and operator-only cognition readings belong in Doctor and cannot trigger unattended phone alerts.
-        "live.cognition.runtime", "live.cognition.persistence",
-        "live.cognition.receipts", "live.cognition.readouts",
-        "live.cognition.body", "live.cognition.welfare",
-        "live.cognition.capacity", "live.cognition.associations",
-        "live.cognition.context_flow", "live.cognition.phone_pairing",
-    ])
-
-    public static func isEligible(_ id: String) -> Bool {
-        !ineligibleCheckIDs.contains(id)
-    }
 }
 
 public protocol RepairingDoctorCheck: DoctorCheck {
@@ -48,7 +22,7 @@ public extension RepairingDoctorCheck {
 public actor SwiftNativeDoctorChecks: Sendable {
     private let checks: [DoctorCheck]
 
-    /// The production check list also owns DoctorHeartbeatPolicy's core exclusions.
+    /// The production check list is shared by default and root-scoped Doctor runs.
     public static let defaultChecks: [DoctorCheck] = checks()
 
     public static func checks(root: URL? = nil) -> [DoctorCheck] {

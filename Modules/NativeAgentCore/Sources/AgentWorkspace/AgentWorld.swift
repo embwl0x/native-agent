@@ -233,7 +233,7 @@ extension AgentScreen {
                 return (nil, [], "Your jobs are not readable in this app yet, so what carries each Desk item is unknown.")
             }
             let live: Set<String>
-            do { live = Set(try read(dataRoot).filter(\.working).compactMap(\.desk)) }
+            do { live = Set(try read.read(dataRoot).filter(\.working).compactMap(\.desk)) }
             catch {
                 return (nil, [], readFailure(error, reason: "jobs_unavailable", remedy: Repair.remedy(owner: at("agents/jobs.json").path,
                     nextCall: nil, tap: nil, instruction: ToolFailureError.fileRepairInstruction(at("agents/jobs.json"),
@@ -298,7 +298,7 @@ extension AgentScreen {
             guard let read = jobGlances.withLock({ $0 }) else {
                 throw NameFailure("Your jobs are not readable in this app yet; job ownership needs repair.")
             }
-            return try read(dataRoot)
+            return try read.read(dataRoot)
         } ?? []
         world.touched = part("touched", [AgentTouched.path(dataRoot)]) { try touched(dataRoot: dataRoot, now: Date()) } ?? []
         world.repairs = part("owed", [], notifications: [HomeFace.experiencesChanged]) {
@@ -348,7 +348,8 @@ extension AgentScreen {
 
     // MARK: - Since you looked
 
-    /// Compare each stable name's fingerprint to distinguish changes from first appearance or removal.
+    /// Compare each stable name's fingerprint to distinguish changes from first appearance or removal. A fingerprint is made only of
+    /// what its line tells, so a source rewritten with nothing new is no change.
     /// `waits` and `what` are read from the world on every look, so the saved record keeps only what a comparison needs.
     struct Mark: Codable, Equatable {
         var fp: String
@@ -364,15 +365,15 @@ extension AgentScreen {
     }
 
     struct Seen: Codable {
+        /// The form its fingerprints are made in. A look saved in another form tells nothing; only a whole look replaces it, as a first look.
+        static let form = 1
         var at: Double
         var marks: [String: Mark]
+        var form: Int? = Seen.form
         /// Read failure evidence is never persisted as an observation.
         var problem: String? = nil
-        private enum CodingKeys: String, CodingKey { case at, marks }
+        private enum CodingKeys: String, CodingKey { case at, marks, form }
     }
-
-    /// Full precision, so two updates in one second still differ.
-    private static func fp(_ date: Date?) -> String { date.map { String($0.timeIntervalSince1970) } ?? "-" }
 
     /// Build observations independently of the viewer; exclude the active chat only when reading changes.
     static func worldMarks(workspace: WorkspaceOperation, _ world: AgentWorld, dataRoot: URL, person: String, now: Date,
@@ -390,13 +391,16 @@ extension AgentScreen {
                 // Already-shown replies are silent.
                 let shown = record.map { $0.shownInline == $0.operationID + ":" + $0.phase } ?? false
                 let line = shown || change.isEmpty ? "" : slug + " " + change
+                let exchange = record?.exchanges?.last { $0.id == record?.operationID }
+                let late = record?.exchanges?.filter { $0.id != record?.operationID && $0.reply != nil }.compactMap(\.settledAt).max()
                 // My sending is no change; what a contact says back, or what became of my send, needs me.
-                marks[slug] = Mark(fp: [fp(record?.updatedAt), fp(answered), record?.phase ?? "-"].joined(separator: "|"),
-                    line: line, at: ([record?.updatedAt, answered].compactMap { $0 }.max() ?? .distantPast).timeIntervalSince1970,
+                marks[slug] = Mark(fp: [record?.operationID ?? "-", change, late.map { String($0.timeIntervalSince1970) } ?? "-"].joined(separator: "|"),
+                    line: line, at: ([answered ?? exchange?.settledAt ?? exchange?.sentAt ?? record?.operationStartedAt, late].compactMap { $0 }.max()
+                        ?? .distantPast).timeIntervalSince1970,
                     waits: true, what: change)
                 for id in Set([contact.id] + contact.agents) {
-                    if let health = world.health[id], health.current, current("health") {
-                        marks["health:" + id] = Mark(fp: health.status + ":" + health.detail,
+                    if let health = world.health[id], health.current, record != nil || health.status != "unavailable", current("health") {
+                        marks["health:" + id] = Mark(fp: health.problem ?? "",
                             line: health.problem.map { slug + ": " + $0 } ?? "", at: health.checkedAt.timeIntervalSince1970,
                             waits: true, what: health.status)
                     }
@@ -404,17 +408,17 @@ extension AgentScreen {
                 // A chat the agent already answered is not news: the agent was there.
                 for chat in world.chats where !chat.answered && (chat.who == contact.id || chat.who == contact.name.lowercased()) {
                     guard let heard = chat.heard else { continue }
-                    marks["chat:" + chat.id] = Mark(fp: fp(heard), line: slug + " wrote", at: heard.timeIntervalSince1970, waits: true, what: "wrote")
+                    marks["chat:" + chat.id] = Mark(fp: String(heard.timeIntervalSince1970), line: slug + " wrote", at: heard.timeIntervalSince1970,
+                        waits: true, what: "wrote")
                 }
             }
             for bot in world.bots where current("bots", "running helpers", "people") {
                 let slug = book.slug(id: "bot:" + bot.id.uuidString, name: bot.name)
                 let entry = world.latest[bot.id], running = world.running.contains(bot.id)
                 // A helper that answered my ask, failed, or waits on the person needs me; a run or a stop is counted.
-                var what = "ran", detail = "", waits = false
+                var what = "", detail = "", waits = false
                 if running { what = "running" }
-                else if let entry, world.handed.contains(entry.id.uuidString) { what = "" }
-                else if let entry {
+                else if let entry, !world.handed.contains(entry.id.uuidString) {
                     switch entry.runtimeStatus {
                     case .completed:
                         (what, waits, detail) = (entry.asked == true ? "answered" : "ran", entry.asked == true, ": " + clip(entry.headline, 36))
@@ -424,8 +428,7 @@ extension AgentScreen {
                     }
                 }
                 let line = what.isEmpty ? "" : slug + " " + what + detail
-                marks[slug] = Mark(fp: [entry?.id.uuidString ?? "-", entry?.runtimeStatus.rawValue ?? "-",
-                                      entry?.statusDetail ?? "-", entry?.approvalID ?? "-", running ? "running" : "idle"].joined(separator: "|"), line: line,
+                marks[slug] = Mark(fp: (entry?.id.uuidString ?? "-") + "|" + what, line: line,
                                    at: (running ? now : entry?.runAt ?? .distantPast).timeIntervalSince1970, waits: waits, what: what)
             }
         }
@@ -486,7 +489,7 @@ extension AgentScreen {
     }
 
     static func changes(since seen: Seen?, now marks: [String: Mark], excluding scope: String?) -> [Change] {
-        guard let seen, seen.problem == nil else { return [] }
+        guard let seen, seen.problem == nil, seen.form == Seen.form else { return [] }
         var found: [String: Change] = [:]
         func add(_ name: String, _ line: String, _ at: Double, waits: Bool, what: String) {
             guard !line.isEmpty else { return }
@@ -582,7 +585,7 @@ extension AgentScreen {
     /// time of the last look stays where it was, so Home does not tell the change back as news. A wait on the person is still told, and
     /// a step under another item was never told by itself.
     package static func sawOwnDeskChange(_ handle: String, dataRoot: URL) async {
-        guard let seen = readSeen(seenURL(dataRoot)), seen.problem == nil,
+        guard let seen = readSeen(seenURL(dataRoot)), seen.problem == nil, seen.form == Seen.form,
               let item = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items.first(where: { $0.handle == handle }),
               item.parent == nil, !OwnerAttentionPolicy.waitsOnOwner(item) else { return }
         let name = "desk." + item.alias
@@ -591,14 +594,14 @@ extension AgentScreen {
     }
 
     /// A look merges only identities represented in its output, retaining hidden and capped records at their previous observation. One writer at a time: read,
-    /// merge and write happen under one lock.
+    /// merge and write happen under one lock. A look over a record saved in another fingerprint form saves all it read, as a first look.
     static func markSeen(_ dataRoot: URL, marks: [String: Mark], only names: Set<String>? = nil, now: Date = Date()) {
         let url = seenURL(dataRoot)
         AgentMemo.shared.seenLock.withLock {
             let previous = readSeen(url)
             guard previous?.problem == nil else { return }
             var seen: Seen
-            if let names {
+            if let names, previous == nil || previous?.form == Seen.form {
                 var saved = previous ?? Seen(at: now.timeIntervalSince1970, marks: [:])
                 for name in names { saved.marks[name] = marks[name] }
                 // The time of the last look never moves back: a write that carries an older reading leaves a newer look standing.
@@ -628,7 +631,7 @@ extension AgentScreen {
             let world: AgentWorld
             if let observation { world = observation.world }
             else { world = await readWorld(workspace: workspace, dataRoot, now: now) }
-            guard world.failures.isEmpty else { return }
+            guard world.failures.isEmpty, readSeen(seenURL(dataRoot)).map({ $0.form == Seen.form }) ?? true else { return }
             let marks = try worldMarks(workspace: workspace, world, dataRoot: dataRoot, person: names(dataRoot).person, now: now, currentOnly: true)
             var names: Set<String> = []
             switch location {
@@ -736,7 +739,7 @@ extension AgentScreen {
                 parts.append("Since you looked (\(age(now.timeIntervalSince1970 - seen.at))): " + shown.joined(separator: " · ")
                     + (shown.last?.hasSuffix("…") == true ? "" : "."))
             }
-            if !waits.isEmpty { parts.append(person + " waits on: " + waits.joined(separator: ", ") + ".") }
+            if !waits.isEmpty { parts.append("Waiting on " + person + ": " + waits.joined(separator: ", ") + ".") }
             if !mine.isEmpty { parts.append("Mine: " + mine.joined(separator: ", ") + ".") }
             if !unread.isEmpty { parts.append("Not read yet: " + unread.joined(separator: ", ") + ", so there may be news there.") }
             return parts.joined(separator: " ") + " (app {} for home)"

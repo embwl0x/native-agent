@@ -21,14 +21,13 @@ extension ContextPreparation {
         }
         // The reducer requires one seed per atom ID.
         var seenSeedIDs: Set<ContextAtomID> = []
-        let seeds = try generation.atoms.compactMap { atom -> ContextFeedbackSeed? in
+        let seeds = generation.atoms.compactMap { atom -> ContextFeedbackSeed? in
             guard seenSeedIDs.insert(atom.draft.id).inserted else { return nil }
             return ContextFeedbackSeed(
                 atomID: atom.draft.id,
                 baseUtility: atom.draft.recentUsefulness,
                 baseActivation: atom.draft.activation,
-                baseDecay: atom.draft.decayState,
-                createdBucket: try Self.feedbackTimeBucket(atom.draft.freshness.createdAt ?? atom.draft.freshness.updatedAt)
+                baseDecay: atom.draft.decayState
             )
         }
         let validIDs = Set(seeds.map(\.atomID))

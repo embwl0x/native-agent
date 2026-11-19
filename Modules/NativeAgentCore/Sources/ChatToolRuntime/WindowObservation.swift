@@ -363,8 +363,9 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 let item = (itemValue.objectValue ?? [:])
                 guard item["role"]?.stringValue == "AXMenuItem", let rect = frame(item["frame"]) else { continue }
                 let label = screenText(item["label"]) ?? MacScreenText("")
-                let enabled = item["enabled"]?.boolValue ?? false
-                let states = (enabled ? [] : ["disabled"]) + (item["selected"]?.boolValue == true ? ["selected"] : [])
+                let enabled = item["enabled"]?.boolValue
+                let states = (enabled.map { $0 ? [] : ["disabled"] } ?? ["state unavailable"])
+                    + (item["selected"]?.boolValue == true ? ["selected"] : [])
                 controls.append(MacScreenRender.Control(
                     label: label, kind: "menu item", states: states, provenance: .ax
                 ))
@@ -394,7 +395,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 }
                 return path
             }()
-            let enabled = mark["enabled"]?.boolValue ?? true
+            let enabled = mark["enabled"]?.boolValue
             let isRow = rowRoles.contains(role)
             if isRow {
                 rows.append(MacScreenRender.Row(
@@ -407,7 +408,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 controls.append(MacScreenRender.Control(
                     label: label,
                     kind: kind,
-                    states: enabled ? (published == nil ? ["unnamed"] : []) : ["disabled"],
+                    states: (enabled.map { $0 ? [] : ["disabled"] } ?? ["state unavailable"]) + (published == nil ? ["unnamed"] : []),
                     provenance: .ax,
                     sourceAXPath: sourceAXPath
                 ))

@@ -79,7 +79,7 @@ extension AppToolExecutor {
             return result
         }
         // Direct calls include the fresh page; workspace calls keep structured results.
-        let direct = !dryRun && execution.lookSource != "workspace"
+        let direct = !dryRun && execution.lookSource != "app"
         var input = input
         if actionId == "browser.chrome_snapshot", let more = input["more"]?.scalarText, more.hasPrefix("site:") {
             let scope = turn.verifiedSessionID ?? ""
@@ -419,8 +419,9 @@ extension AppToolExecutor {
                 ?? envelope.primaryReason
             let instruction = "Call \(tool) explicitly to request approval; no follow-up ran."
             return ("browser_follow_up_approval_required: \(cause) \(instruction)",
-                Self.doorRefusal("browser_follow_up_approval_required", cause,
-                    remedy: "request_approval", instruction, next: ["action": .string(ToolNameAliases.appAction(tool) ?? tool)]))
+                Self.failure("browser_follow_up_approval_required", cause,
+                    extra: ["remedy": .object(["kind": .string("request_approval"), "instruction": .string(instruction),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["action": .string(ToolNameAliases.appAction(tool) ?? tool)])])])]))
         }
         return (nil, nil)
     }

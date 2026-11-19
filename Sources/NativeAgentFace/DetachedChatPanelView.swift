@@ -129,7 +129,7 @@ struct DetachedChatPanelView: View {
         }
         .focusedSceneValue(\.chatCommandActions, ChatFocusedCommandActions(
             send: send,
-            attach: attachFromClipboardOrPickFile,
+            attach: pickFileToAttach,
             toggleVoice: toggleVoice,
             focusComposer: { inputFocused = true },
             focusTranscriptSearch: { transcriptHandle.showFind() },
@@ -272,7 +272,7 @@ struct DetachedChatPanelView: View {
                 onToggleVoice: toggleVoice,
                 onDiscardVoice: discardPanelDictation,
                 onCaptureScreen: captureScreen,
-                onAttach: attachFromClipboardOrPickFile,
+                onAttach: pickFileToAttach,
                 onDrop: handleDrop,
                 onStop: { appModel.stopChatStream(sessionId: sessionId) },
                 onSend: send,
@@ -429,12 +429,8 @@ struct DetachedChatPanelView: View {
         ChatAttachmentTypeResolver.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript)
     }
 
-    private func attachFromClipboardOrPickFile() {
-        ChatAttachmentTypeResolver.attachFromClipboardOrPickFile(
-            appModel: appModel, session: sessionId,
-            appendImage: {
-                pendingAttachments.append($0)
-            },
+    private func pickFileToAttach() {
+        ChatAttachmentTypeResolver.pickFileToAttach(
             attachFile: attachLocalFile,
             showToast: showToast
         )
@@ -481,7 +477,6 @@ enum DetachedChatSessionPresentation: Equatable {
 
     static let unavailableTitle = "This chat session is no longer available"
     static let unavailableDetail = "Messages cannot be sent from this window. Close it and choose another conversation in the main app."
-    static let unavailableActionMessage = "This chat session is no longer available. Your message was not sent."
 
     var isAvailable: Bool {
         if case .available = self { return true }

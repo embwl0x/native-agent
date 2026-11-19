@@ -3,25 +3,8 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 
-// Blueprint: | `AppShellMenuPresentation.swift` | `NavigateMenuPresentation`, `MenuBarStatusPresentation`: Rail-derived shortcuts and one status line; `ShellRailRow`: the rail's rows in layout order, a page of the agent's own among them |
+// Blueprint: | `AppShellMenuPresentation.swift` | `MenuBarStatusPresentation`, `ShellRailRow`: Status line and ordered rail rows |
 
-/// Derive Navigate order and labels from SidebarItem.rail so numbered shortcuts always match the visible rail.
-enum NavigateMenuPresentation {
-    struct Entry: Equatable, Identifiable {
-        let item: SidebarItem
-        /// Only the first nine rail items receive shortcuts to avoid duplicate or misleading digits.
-        let shortcut: Character?
-
-        var id: String { item.rawValue }
-        var title: String { item.shellRailTitle }
-    }
-
-    static func entries(_ layout: SurfaceLayoutAvailability) -> [Entry] {
-        SidebarItem.rail(layout).compactMap { $0 }.enumerated().map { index, item in
-            Entry(item: item, shortcut: index < 9 ? Character("\(index + 1)") : nil)
-        }
-    }
-}
 
 /// Render reachability before status detail on one line so conflicting status cannot obscure an unavailable runtime.
 enum MenuBarStatusPresentation {
@@ -30,7 +13,7 @@ enum MenuBarStatusPresentation {
         guard let health else {
             return status.isEmpty ? "My connection status is unknown" : status
         }
-        let reachability = health.ok ? "I'm online" : "I'm unavailable"
+        let reachability = health.reachable.map { $0 ? "I'm online" : "I'm unavailable" } ?? "My connection status is unknown"
         guard !status.isEmpty,
               status.caseInsensitiveCompare(reachability) != .orderedSame else {
             return reachability

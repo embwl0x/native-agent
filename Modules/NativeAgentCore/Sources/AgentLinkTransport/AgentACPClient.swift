@@ -3,9 +3,13 @@ import Dispatch
 import Foundation
 import Experiences
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `AgentACPClient.swift` | `AgentACPClient`, `startupTimeoutReceipt`, `turn`, `learned`, `Mismatch` |
+import Synchronization
+// Blueprint: | `AgentACPClient.swift` | ACP turns and retained connections; shared memory pressure releases idle resumable sessions first, preserving restoration outcomes |
+
+private let nativeLog = ModuleLog(category: "AgentLinkTransport")
 
 /// EOF cannot prove a prompt response; sends never retry, launch a shell or grant optional services or permissions.
 public actor AgentACPClient {
@@ -16,6 +20,7 @@ public actor AgentACPClient {
         package let text: String
         package let stopReason: String
         package let continued: Bool
+        package var prompt: String? = nil
         /// The model the agent said its session uses, when it says.
         package var model: String? = nil
         /// Said when the session runs in a mode other than the recipe's, because the recipe's is not offered.
@@ -112,6 +117,7 @@ public actor AgentACPClient {
     private var newSessionRequestID: Int64?
     private var failure: (any Error)?
     private var text = ""
+    private var replayedPrompt: String?
     private var peerCredential: String?
     private var receivedBytes = 0
     /// A bounded turn caps what it reads; a job's turn runs to its own end.
@@ -127,6 +133,10 @@ public actor AgentACPClient {
     private var lifeID: UUID?
     private var started = false
     private var closing = false
+    private nonisolated let endedFlag = Atomic<Bool>(false)
+
+    /// Whether this connection has ended: its program exited, its pipe failed, or it was closed. Readable without waiting on the connection.
+    package nonisolated var hasEnded: Bool { endedFlag.load(ordering: .acquiring) }
     private var tree: ProcessTreeSnapshot?
     private var cleanup: Task<String?, Never>?
     private var terminationFailure: String?
@@ -139,6 +149,7 @@ public actor AgentACPClient {
     package var said: String { text }
     private var active = false
     private var restoredHistory = false
+    private var replayingPrompt = false
     private var initialized: JSONValue?
     private var advertised: [String]?
     /// The mode this session runs in, picked from the agent's own offer; nil when it offers none.
@@ -176,7 +187,7 @@ public actor AgentACPClient {
               capped: Bool = true, life: TurnDeadline? = nil, named: String = "the other agent",
               permission: @escaping Permission,
               update: @escaping Update = { _ in },
-              sessionOpened: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> Reply {
+              sessionOpened: @escaping @Sendable (String) async throws -> Void = { _ in }) async throws -> Reply {
         guard !active else { throw Failure.busy }
         guard !closing, failure == nil else { throw Failure.interrupted }
         if started { guard conversationID == sessionID else { throw Failure.sessionUnavailable } }
@@ -186,7 +197,8 @@ public actor AgentACPClient {
             if let lifeID { self.life?.detach(lifeID) }
             self.life = nil; lifeID = nil
         }
-        text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false; requiredMode = nil; chosenMode = nil; modeNote = nil; delivered = false
+        text = ""; replayedPrompt = nil; receivedBytes = 0; deniedPermission = false; restoredHistory = false; replayingPrompt = false
+        requiredMode = nil; chosenMode = nil; modeNote = nil; delivered = false
         bounded = capped
         startupTimeout = .initializationTimedOut
         self.permission = permission
@@ -257,7 +269,7 @@ public actor AgentACPClient {
             }
             sessionID = id
             let model = session.objectValue?["models"]?.objectValue?["currentModelId"]?.stringValue
-            await sessionOpened(id)
+            try await sessionOpened(id)
             startupTimeout = .modeSetupTimedOut
             let available = session.objectValue?["modes"]?.objectValue?["availableModes"]
             // A continued session need not restate modes, so retain the approved recipe's.
@@ -283,13 +295,15 @@ public actor AgentACPClient {
                 // A continued session need not restate its modes: the recipe's verified ones stand.
                 chosenMode = line.modes?.contains(line.permissionMode) == true ? line.permissionMode : nil
             }
-            if let chosenMode {
+            if let chosenMode, message != nil || conversationID == nil {
                 requiredMode = chosenMode
                 _ = try await request("session/set_mode", ["sessionId": .string(id), "modeId": .string(chosenMode)])
             }
             guard let message else {
-                return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued, modeNote: modeNote)
+                return Reply(sessionID: id, text: text, stopReason: "dry_run", continued: continued,
+                    prompt: replayedPrompt, modeNote: requiredMode == nil ? nil : modeNote)
             }
+            text = ""
             // Conservative boundary: any attempted prompt write makes delivery uncertain.
             prompting = true; delivered = true
             let response = try await request("session/prompt", ["sessionId": .string(id),
@@ -503,10 +517,19 @@ public actor AgentACPClient {
                     guard object["id"] == nil, let event = params["update"] else { throw Failure.invalidResponse }
                     let ours = sessionID != nil && params["sessionId"] == sessionID.map(JSONValue.string)
                     guard prompting else {
-                        // Before the prompt only the session being restored replays history; news of a session not yet answered is not a fault.
-                        if ours, [
-                            JSONValue.string("agent_message_chunk"),
-                            .string("user_message_chunk")].contains(event.objectValue?["sessionUpdate"] ?? .null) { restoredHistory = true }
+                        let user = ours && event.objectValue?["sessionUpdate"] == .string("user_message_chunk")
+                        defer { if ours { replayingPrompt = user } }
+                        if user {
+                            restoredHistory = true; text = ""
+                            let content = event.objectValue?["content"]?.objectValue
+                            let chunk = content?["type"] == .string("text") ? content?["text"]?.stringValue : nil
+                            replayedPrompt = replayingPrompt ? [replayedPrompt, chunk].compactMap { $0 }.joined() : chunk
+                        } else if ours, restoredHistory, event.objectValue?["sessionUpdate"] == .string("agent_message_chunk"),
+                                  let content = event.objectValue?["content"]?.objectValue,
+                                  content["type"] == .string("text"), case .string(let chunk)? = content["text"] {
+                            guard text.utf8.count + chunk.utf8.count <= 1_048_576 else { throw Failure.tooLarge }
+                            text += chunk
+                        }
                         return
                     }
                     guard ours else { throw Failure.invalidResponse }
@@ -537,14 +560,17 @@ public actor AgentACPClient {
             }
             if let error = object["error"] {
                 let detail = (try? error.serialize(pretty: false)) ?? ""
-                // ACP's "authentication required" (-32000), at any step (opening, restoring or answering): the agent is not signed in.
                 if error.objectValue?["code"] == .int(-32000) {
                     complete(request, .failure(Failure.signInRequired))
                     return
                 }
                 if !prompting {
-                    let code: Int64? = if case .int(let code)? = error.objectValue?["code"] { code } else { nil }
                     let said: String = if case .string(let said)? = error.objectValue?["message"] { said } else { detail }
+                    if requiredMode != nil {
+                        complete(request, .failure(ToolFailureError(said, effects: .none, code: Failure.busy.rawValue, status: .refused)))
+                        return
+                    }
+                    let code: Int64? = if case .int(let code)? = error.objectValue?["code"] { code } else { nil }
                     complete(request, .failure(Mismatch(method: "", code: code, detail: said + (code.map { " (\($0))" } ?? ""))))
                     return
                 }
@@ -681,7 +707,7 @@ public actor AgentACPClient {
 
     private func cancel(error: any Error) {
         guard failure == nil else { return }
-        do { try cancelSession(notify: write) }
+        do { if prompting { try cancelSession(notify: write) } }
         catch let settlementError {
             if var unavailable = error as? PermissionUnavailable {
                 unavailable.settlementFailure = settlementError.localizedDescription
@@ -708,6 +734,7 @@ public actor AgentACPClient {
     private func shutdown() {
         guard !closing else { return }
         closing = true
+        endedFlag.store(true, ordering: .releasing)
         deadline?.cancel(); deadline = nil
         pipeReader?.cancel(); pipeReader = nil
         reader?.cancel()
@@ -805,68 +832,91 @@ final class AgentACPPipeReader: @unchecked Sendable {
     }
 }
 
-/// Process ownership is bounded; conversation history remains with the peer.
+/// Conversation processes stay owned until explicit release, replacement or idle memory-pressure release.
 package actor AgentACPConnections {
     package static let shared = AgentACPConnections()
     package struct Lease: Sendable { let key: String; let generation: UUID; package let client: AgentACPClient }
     private struct Entry {
         let client: AgentACPClient
+        let peer: String
         let configuration: String
         var generation: UUID = UUID()
         var busy: Bool
-        var expiry: Task<Void, Never>?
-        var idleSince = Date()
     }
     private var entries: [String: Entry] = [:]
+    private var pressureObservation: Task<Void, Never>?
+
+    deinit { pressureObservation?.cancel() }
+
+    private func observePressure() {
+        guard pressureObservation == nil else { return }
+        let changes = MemoryPressureSense.changes
+        pressureObservation = Task { [weak self] in
+            for await level in changes {
+                guard !Task.isCancelled else { return }
+                await self?.releaseIdle(under: level)
+            }
+        }
+    }
+
+    private func releaseIdle(under level: MemoryPressureSense.Level) async {
+        guard level != .normal else { return }
+        let before = entries.count
+        defer { nativeLog("ACP memory pressure %@: %ld retained conversations before, %ld after", "\(level)", before, entries.count) }
+        var other: [(String, Entry)] = []
+        for (key, entry) in entries.filter({ !$0.value.busy }) {
+            if await entry.client.canRestoreSession {
+                await releaseIdle(key, generation: entry.generation, resumable: true)
+            } else if level == .critical {
+                other.append((key, entry))
+            }
+        }
+        for (key, entry) in other {
+            await releaseIdle(key, generation: entry.generation, resumable: false)
+        }
+    }
+
+    private func releaseIdle(_ key: String, generation: UUID, resumable: Bool) async {
+        // Capability reads and earlier closes suspend this actor: a newly leased or replaced entry is never ours to release.
+        guard let pressure = MemoryPressureSense.current,
+              pressure == .critical || (resumable && pressure == .warning),
+              let entry = entries[key], entry.generation == generation, !entry.busy else { return }
+        entries.removeValue(forKey: key)
+        nativeLog("ACP contact %@: released under memory pressure", entry.peer)
+        await entry.client.close()
+    }
 
     package func acquire(peer: String, conversation: String?, configuration: String, dataRoot: URL) async throws -> Lease {
+        observePressure()
         let key = peer + ":" + (conversation ?? UUID().uuidString)
         if let entry = entries[key] {
             guard !entry.busy else { throw AgentACPClient.Failure.busy }
-            if entry.configuration == configuration, entry.client.dataRoot == dataRoot.standardizedFileURL {
-                entry.expiry?.cancel()
+            // A program that exited on its own is closed here and replaced, so its next message restores the session where the agent can.
+            if entry.configuration == configuration, entry.client.dataRoot == dataRoot.standardizedFileURL, !entry.client.hasEnded {
                 let generation = UUID()
                 entries[key]?.busy = true
                 entries[key]?.generation = generation
                 return Lease(key: key, generation: generation, client: entry.client)
             }
             entries.removeValue(forKey: key)
-            entry.expiry?.cancel()
             await entry.client.close()
             guard entries[key] == nil else { throw AgentACPClient.Failure.busy }
         }
-        // Evict after 30 idle minutes or at capacity: prefer resumable sessions, else require 10 idle minutes before losing context.
-        if entries.count >= 8 {
-            let idle = entries.filter { !$0.value.busy }.sorted { $0.value.idleSince < $1.value.idleSince }
-            var victim: String?
-            for candidate in idle where await candidate.value.client.canRestoreSession { victim = candidate.key; break }
-            if victim == nil, let oldest = idle.first, Date().timeIntervalSince(oldest.value.idleSince) > 600 { victim = oldest.key }
-            if let victim, entries[victim]?.busy == false, let evicted = entries.removeValue(forKey: victim) {
-                evicted.expiry?.cancel()
-                await evicted.client.close()
-                guard entries[key] == nil else { throw AgentACPClient.Failure.busy }
-            }
-        }
-        guard entries.count < 8 else { throw AgentACPClient.Failure.busy }
         let client = AgentACPClient(dataRoot: dataRoot)
-        entries[key] = Entry(client: client, configuration: configuration, busy: true)
-        return Lease(key: key, generation: entries[key]!.generation, client: client)
+        let entry = Entry(client: client, peer: peer, configuration: configuration, busy: true)
+        entries[key] = entry
+        return Lease(key: key, generation: entry.generation, client: client)
     }
 
     @discardableResult
     package func finish(_ lease: Lease, peer: String, conversation: String?) async -> Bool {
         guard let entry = entries[lease.key], entry.generation == lease.generation else { return false }
         entries.removeValue(forKey: lease.key)
-        entry.expiry?.cancel()
         guard let conversation else { await entry.client.close(); return true }
         let key = peer + ":" + conversation
         guard entries[key] == nil else { await entry.client.close(); return false }
-        let generation = UUID()
-        let expiry = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(1800)) } catch { return }
-            await self?.expire(key, generation: generation)
-        }
-        entries[key] = Entry(client: entry.client, configuration: entry.configuration, generation: generation, busy: false, expiry: expiry)
+        entries[key] = Entry(client: entry.client, peer: peer, configuration: entry.configuration, busy: false)
+        if let pressure = MemoryPressureSense.current { await releaseIdle(under: pressure) }
         return true
     }
 
@@ -878,10 +928,12 @@ package actor AgentACPConnections {
     }
 
     package func closeAll() async {
+        pressureObservation?.cancel()
+        pressureObservation = nil
         let owned = entries.values
         entries.removeAll()
         await withTaskGroup(of: Void.self) { group in
-            for entry in owned { entry.expiry?.cancel(); group.addTask { await entry.client.close(.appQuit) } }
+            for entry in owned { group.addTask { await entry.client.close(.appQuit) } }
         }
     }
 
@@ -889,14 +941,8 @@ package actor AgentACPConnections {
         let keys = entries.keys.filter { $0.hasPrefix(peer + ":") }
         for key in keys {
             guard let entry = entries.removeValue(forKey: key) else { continue }
-            entry.expiry?.cancel()
             await entry.client.close()
         }
     }
 
-    private func expire(_ key: String, generation: UUID) async {
-        guard let entry = entries[key], entry.generation == generation, !entry.busy else { return }
-        entries.removeValue(forKey: key)
-        await entry.client.close()
-    }
 }

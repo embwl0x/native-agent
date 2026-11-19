@@ -15,9 +15,6 @@ public enum InlineCardKind: String, Sendable, Equatable, CaseIterable {
     case needsAPIKey
     case needsCapability
     case choose
-    case confirm
-    case work
-
 }
 
 /// Derive presentation from the lifecycle owner; never store a second lifecycle here.
@@ -95,7 +92,6 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
     public var grantsNow: String?
     public var outcome: String?
     public var outcomeMeta: String?
-    public var canStop: Bool
     public var canRetry: Bool
 
     /// The one answer to "does this card still need the person": delivery, the Inbox, Today and the phone all read it from the live card.
@@ -128,7 +124,6 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
         restartNote: String? = nil,
         outcome: String? = nil,
         outcomeMeta: String? = nil,
-        canStop: Bool = false,
         canRetry: Bool = false
     ) {
         self.id = id
@@ -154,7 +149,6 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
         self.restartNote = restartNote
         self.outcome = outcome
         self.outcomeMeta = outcomeMeta
-        self.canStop = canStop
         self.canRetry = canRetry
     }
 
@@ -248,8 +242,6 @@ public enum InlineCards {
             outcomeMeta: continuationFailed
                 ? [receipt.text, receipt.meta].compactMap { $0 }.joined(separator: "\n\n")
                 : receipt.meta ?? (deadControl ? descriptor.unavailableReason : nil),
-            // Only running work owns Stop; a need is waiting on the person.
-            canStop: false,
             // Retry is the shared lifecycle's; a build with no control for it cannot offer one.
             canRetry: continuationFailed || (descriptor.isActionable && interaction.state.isRetryable)
         )

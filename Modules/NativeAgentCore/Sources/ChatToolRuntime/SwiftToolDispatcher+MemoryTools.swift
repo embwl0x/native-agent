@@ -1,4 +1,5 @@
 import Foundation
+import enum NativeAgentShared.NativeTimestampFormat
 import CognitiveSubstrate
 import CryptoKit
 import NativeAgentCore
@@ -144,7 +145,7 @@ extension SwiftToolDispatcher {
     }
 
     /// One telling as the agent states it: how (one of the stated ways), by (a name of at most 40 letters, digits, spaces and . - ') and since (an
-    /// ISO-8601 date-time, not after now). Nothing stated is nil; a time with no how is kept from then, since nothing says how. Names enter
+    /// ISO-8601 date-time, or a date meaning the start of that local day; not after now). Nothing stated is nil; a time with no how is kept from then, since nothing says how. Names enter
     /// model-facing lines, so a name that could forge a delimiter is refused, never trimmed into another.
     static func telling(how rawHow: JSONValue?, by rawBy: JSONValue?, since rawSince: JSONValue?,
                         names: (how: String, by: String, since: String)) throws -> MemoryRoot.Telling? {
@@ -183,9 +184,9 @@ extension SwiftToolDispatcher {
         }
         var date: Date?
         if let since {
-            guard let parsed = MemoryRecallScoring.parseTimestamp(since), parsed <= Date() else {
-                throw ToolFailureError("\(names.since) must be an ISO-8601 date-time such as 2026-10-20T00:16:38Z, not after now.",
-                    argumentPath: names.since, accepted: "an ISO-8601 date-time, not after now", effects: .none, code: "memory_since_invalid",
+            guard let parsed = MemoryRecallScoring.parseTimestamp(since) ?? NativeTimestampFormat.parseCalendarDay(since), parsed <= Date() else {
+                throw ToolFailureError("\(names.since) must be an ISO-8601 date-time such as 2026-10-20T00:16:38Z or a date such as 2026-10-20, not after now.",
+                    argumentPath: names.since, accepted: "an ISO-8601 date-time or date, not after now", effects: .none, code: "memory_since_invalid",
                     status: .refused, instruction: "Correct \(names.since), or omit it for what you learn now.", recovery: .correctArguments)
             }
             date = parsed

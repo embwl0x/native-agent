@@ -145,6 +145,7 @@ struct CodexJobDoor: JobRunner {
                 throw JobDoorFailure("its app-server opened no thread")
             }
             thread = id
+            try job.handle(id)
             model = opened.objectValue?["model"]?.stringValue
             out.send(.started(session: id))
             await JobDoorLive.shared.hold(Self.door + ":" + id, run)

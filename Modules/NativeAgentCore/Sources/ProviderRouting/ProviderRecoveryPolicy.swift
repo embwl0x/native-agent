@@ -54,15 +54,6 @@ public enum ProviderRecoveryPolicy {
         return ProviderFailure.classify(error)?.errorDescription
     }
 
-    public static func isEmptyReply(_ error: Error?) -> Bool {
-        guard let error else { return false }
-        if let wrapped = error as? any ProviderFailureWrapping { return isEmptyReply(wrapped.providerFailureCause) }
-        switch error as? LLMError {
-        case .transient(let detail), .streamTruncated(let detail): return detail.contains("no answer text")
-        default: return false
-        }
-    }
-
     public static func describe(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }

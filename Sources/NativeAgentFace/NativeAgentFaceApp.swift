@@ -38,6 +38,8 @@ struct NativeAgentFaceApp: App {
             }
         }
         .defaultSize(width: 1280, height: 860)
+        // MainWindowFrame owns saved placement, zoom and full screen.
+        .restorationBehavior(.disabled)
         .windowStyle(.hiddenTitleBar)
         .commands {
             ChatFocusedCommands()
@@ -56,10 +58,7 @@ struct FaceWindowCommands: Commands {
         // Quit ends the body; closing the window leaves it running. The body's exit ends this process through the pipe.
         CommandGroup(replacing: .appTermination) {
             Button("Quit NativeAgent") {
-                Task {
-                    do { _ = try await appModel.client.act(.quitBody) }
-                    catch { FaceAppDelegate.endWithBody() }
-                }
+                NSApp.terminate(nil)
             }.keyboardShortcut("q", modifiers: .command)
         }
         CommandGroup(replacing: .appSettings) {
@@ -138,10 +137,6 @@ struct FaceWindowCommands: Commands {
     /// Closing the window keeps NativeAgent in the Dock, as every Mac app does; Quit is what ends it.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    /// Quit is the whole app, however it is asked for. A Quit that reaches only this process (the Dock's menu, a system quit, a logout)
-    /// asks the body to end before this process does; left running, the body would open the window again the next time it had something
-    /// to show. An answer and a failure both end the wait: the body is ending, or there is no body to ask. The ask needs main-actor work, so a
-    /// termination started inside a main-queue job goes through `endWithBody` instead.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard ProcessInfo.processInfo.environment["NATIVEAGENT_FACE_DATA_ROOT"] != nil, !Self.endingWithBody else { return .terminateNow }
         Self.endingWithBody = true

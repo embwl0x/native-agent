@@ -65,12 +65,12 @@ extension AppActions {
             """),
         "brief": ToolSchema.strSchema("The job in your words: what to make or change, and what done looks like."),
         "where": ToolSchema.strSchema("""
-            Another agent only: the one folder it works in, or a git repository's folder; omit for work that needs no place. Never your own data \
-            folder. Your own line works with your own hands.
+            Another agent only: the one folder it works in, or a git repository's folder; omit for work that needs no place. It cannot overlap your \
+            data or credential roots, including their parents; the same fence checks an omitted where's saved starting folder. Your own line has your hands.
             """),
         "reach": .object(["type": .string("object"), "additionalProperties": .bool(false), "description": .string("""
-            Another agent only: what it may touch, always within your Trust posture: writes (default true with where) lands only in where; network \
-            (default false) needs Full Mac. Your own line has your Trust.
+            Another agent only: what it may touch within Trust and this turn's file access: writes default true with where, false under read_only; \
+            explicit writes under read_only and jobs under none are refused. Network (default false) needs Full Mac. Your own line has your Trust.
             """), "properties": .object(["writes": ToolSchema.boolSchema(), "network": ToolSchema.boolSchema()])]),
         "done": .object(["type": .string("object"), "additionalProperties": .bool(false), "description": .string("""
             Your check of the result, one of {command} (another agent only: a shell command run in where under reach; exit 0 passes), {file} (that \
@@ -195,7 +195,7 @@ extension AppActions {
                   input: composer("set_page"), rename: ["page": "value", "item": "choice"]),
         AppAction("browser.show", "chat", "Show your own built-in browser (NativeAgent's browser, not Chrome)", screen: true, tool: "interaction_act",
                   input: composer("show_browser")),
-        AppAction("pane.show", "chat", "Open the Work pane beside chat", ["view:steps|screen|make", "ref?"], screen: true,
+        AppAction("pane.show", "chat", "Open the Work pane or the table window", ["view:steps|screen|make|table", "ref?"], screen: true,
                   tool: "interaction_act", input: composer("show_pane"), rename: ["view": "value", "ref": "choice"]),
         AppAction("pane.hide", "chat", "Close the Work pane", screen: true, tool: "interaction_act",
                   input: composer("hide_pane")),
@@ -210,6 +210,16 @@ extension AppActions {
                       (ids),label?; stroke x,y,points:[x0,y0,…] from x,y,color,width; colors green|yellow|purple|blue|peach|white|ink
                       """,
                   tool: "make_studio", input: verb("add"), versionExempt: true),
+        AppAction("table.put", "desk", """
+            With type, add (occupied id: exists); missing id mints e plus twelve lowercase hex digits. Without type, edit by id (absent: not_found)
+            """,
+                  ["id?", "type?:shape|text|container|arrow|stroke", "x?:number", "y?:number", "w?:number", "h?:number", "text?", "color?",
+                   "kind?", "size?", "from?", "to?", "fromSide?", "toSide?", "label?", "points?:[number]", "width?:number", "item?", "piece?"],
+                  tool: "table_change", input: verb("put"), versionExempt: true),
+        AppAction("table.cross", "desk", "Cross a Desk card off through desk.close, or toggle a mark's crossing", ["id"],
+                  tool: "table_change", input: verb("cross"), versionExempt: true),
+        AppAction("table.remove", "desk", "Remove an element and its arrows from the table", ["id"],
+                  tool: "table_change", input: verb("remove"), versionExempt: true),
         AppAction("make.read", "make", "A Make ref's versions: n, path, prompt, created (newest ref when left out). Read page:make for the paged shelf.",
                   ["ref?"],tool: "make_studio", input: verb("read"), read: true),
         AppAction("studio.intake.read", "personality", """
@@ -390,7 +400,7 @@ extension AppActions {
                   capabilities: ["memory_write", "tool_call"], warn: "text is the thing itself, one or two sentences, no date, source, ids or preamble; "
                       + "a restore that matches something forgotten stays archived; roots restates every root of yours in one call, one per telling: "
                       + "how is told, noticed, inferred, verified or remembered, by who told you or where your own past was kept, since when you "
-                      + "first knew it (an ISO-8601 date-time); roots an untrusted agent steered stay as they are; a rewrite that changes nothing "
+                      + "first knew it (an ISO-8601 date-time or date); roots an untrusted agent steered stay as they are; a rewrite that changes nothing "
                       + "writes nothing",
                   // Rewrites and restores need versions because they can overwrite another conversation's correction; commit supersedes is idempotent.
                   tool: "rewrite_memory"),
@@ -415,8 +425,6 @@ extension AppActions {
         AppAction("mind.residual_repair", "diagnostics", "Run eligible bounded residual repair now, satisfying only its quiet wait", tool: "mind_run",
             input: verb("residual_repair")),
         AppAction("mind.rem", "personality", "Run a REM pass", ["repair?:bool"], tool: "mind_run", input: verb("rem")),
-        AppAction("scheduler.trigger_fire", "desk", "Publish an inbox trigger's card now", ["name"], subject: ["name"], tool: "mind_run",
-            input: verb("trigger_fire")),
         AppAction("mind.misses", "today", "Your misses: corrections by lesson, this week against last, each with its history locator",
                  tool: "mind_run", input: verb("misses"), read: true),
         AppAction("mind.think_now", "diagnostics", "Think now", tool: "mind_run", input: verb("think_now")),
@@ -589,10 +597,13 @@ extension AppActions {
                           open?:chat:|page:|approval:|card:|dream:|url:,actions?:[{id,label,role?,unavailable?:reason}],control?:{on}|{options,selected}|\
                           {text,placeholder?}|{number:{value,min?,max?,step?}}|{date:ISO},rows?:[rows],expands?:true,\
                           meter?:{value,max,start?}}],\
-                          block?:{kind:"document",key,text?,format?:plain|markdown|code,language?,copy?}|{kind:"leaf",key,leaf,ref,alt,revision?}|\
+                          block?:{kind:"document",key,text?,format?:plain|markdown|code,language?,copy?}|\
+                          {kind:"leaf",key,leaf,ref,alt,revision?,cards?,choices?}|\
                           {kind:"form",key,fields:[{id,label,kind:line|lines|choice|switch|number|date|secret,value?,placeholder?,required?,\
                           options?:[{id,label}],min?,max?,step?}],submit:[{id,label,role?,unavailable?}],revision?,protected?,receiver?,doors?}}]} \
-                          from a frozen packet, with no host effects. A section has rows or block, never both. A count is a row's value; progress \
+                          from a frozen packet, with no host effects. A section has rows or block, never both. On leaf:board ref:table, choices \
+                          holds at most 200 {id,label,detail,item|piece} entries with unique nonempty ids, nonempty labels, string details and \
+                          one nonempty item or make:<ref> piece address. cards holds live facts keyed by element id. A count is a row's value; progress \
                           is its meter, a bar of value out of max (max above 0, value and start from 0 to max; the words stay in value); a chart \
                           or picture is a piece: an SVG, HTML and CSS with no script (previews run none) or a picture, make.add it, then lay \
                           {kind:"leaf",key:"piece:<id>",leaf:"web"|"image",ref,revision:<its version as a string>,alt:<what it shows>}. \
@@ -699,10 +710,11 @@ extension AppActions {
                           then); also words you check when it comes up, or standing (a rhythm's default).\u{20}
                           """
                       + """
-                          say is fixed words for the person, said as they are. action:{action:\"authored.<id>\",args:{…}} binds a habit: it runs through \
-                          your \
+                          say is fixed words said to the person as they are at its moment, and the step still comes back to you. \
+                          action:{action:\"authored.<id>\",args:{…}} binds a habit: it runs through your \
                           door at its moment, waking you only for needs_me or an unfinished/refused run. An action id string also works. With say, the habit \
-                          runs first.\u{20}
+                          runs first. A read as action (action:{action:\"agent.read\",args:{…}}, desk.read, files.read…) has already run when the \
+                          step comes back: the step wakes you with that read's receipt and when it ran, so you start from it.\u{20}
                           """
                       + "The receipt shows the next times the clock heard",
                   tool: "my_queue", input: verb("add"), versionExempt: true,
@@ -710,7 +722,8 @@ extension AppActions {
         AppAction("queue.update", "desk", "Edit a carried step or bind/drop its habit", ["id", "action?:any", "say?:any", "when?:any", "until?:any"],
             subject: ["id"],
                   warn: """
-                      Only named fields change. action:{action:\"authored.<id>\",args:{…}} binds a habit; action:null drops it. say:null clears fixed words. \
+                      Only named fields change. action:{action:\"authored.<id>\",args:{…}} binds a habit; action:null drops it. \
+                      say is said at its moment and the step still comes back to you; say:null clears it. \
                       when and until use queue.add's grammar. The receipt names the stored habit.
                       """,
                   tool: "my_queue", input: verb("update"), versionExempt: true, schema: queueUpdateSchema),
@@ -781,7 +794,8 @@ extension AppActions {
             """,
               [], input: ["view": .string("model_calls")], read: true),
         .fold("recent_trace_summary", "diagnostics", id: "trace.usage", """
-            Recorded model usage: exact retained call, input, cached input, output token and duration sums, grouped by model, surface or local day; since \
+            Recorded model usage: exact retained call, input, cache read/creation/write and lifetime splits, output token and duration sums by model, \
+            surface or local day; reports each cache counter separately with its provider semantics; since \
             defaults to today (local midnight) or accepts an ISO-8601 timestamp; reports missing measurements and retention coverage
             """,
               ["since?", "by?:model|surface|day"], input: ["view": .string("usage")], read: true),
@@ -1017,7 +1031,8 @@ extension AppActions {
         .fold("read_chat_message", "chat", read: true),
         .fold("chat_reply", "chat"),
         .fold("tool_result_page", "*", """
-            Page a long result retained this turn without rerunning its action; continue:true resumes the last read and ignores page (with query or raw it \
+            Page a retained result without rerunning its action; untrusted-steered turns read only their conversation's results, other turns any handle. \
+            Bodies over 4 MiB retain the head with the cut named. continue:true resumes this turn's read and ignores page (with query or raw it \
             reads that way); omit continue to select page/query/raw; source_continues names the call that reads a source past the part its answer held
             """, read: true),
 

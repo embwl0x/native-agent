@@ -20,6 +20,7 @@ An experience is one happening in their life, written once by the owner of that 
 - **id**: stable, minted where the happening starts.
 - **kind**: a message heard, an answer given, an act, a run, a decision, a message, a happening, a thought (`heard`, `answer`, `act`,
   `run`, `decision`, `message`, `happening`, `thought` in `NativeAgentShared/Experience.swift`).
+- **steeredBy**: birth steering sources, matching the producing turn's transcript stamp; `[]` attests clean and absence attests nothing. Happenings mirror peers and elevated sources here.
 - **cause**: the experiences that brought it about (the person's message, a signal, the turn it ran in). Their autobiography is this graph.
 - **evidence**: references to the raw record (trace rows, receipts, frames, audio, files). Never copies.
 - **outcome**: one typed outcome, owned by the domain that produced it. MacControl stays authoritative for what its acts did, and the browser for what it loaded. Effects are none, occurred or unknown, from that domain's own count.
@@ -36,6 +37,18 @@ A detail's `once` key is checked in its write transaction before insertion. Repe
 that key writes no row and does not advance SQLite's detail sequence.
 
 ## Reading their own record
+
+Recent speech continuity uses `ExperienceStore.conversationLife`: one committed
+newest-first record reading of heard/answer exchanges, sends, thoughts joined
+to their run's answer, and owed happenings (`returned`, `moment`, `body`).
+The selection excludes `world` and `self` happenings; perceptions reach their
+through `weigh` and, where present, Live sense news. The current conversation
+is already history. Its boundary is the last nonempty answer here, else an hour;
+later breaths start at the last step. Clean birth stamps admit words, steered or
+unstamped rows carry shapes, and peer-steered turns carry shapes throughout.
+Open obligations stay beside their exchange. The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
+owns the character budget and delivery position. This replaces transcript
+stitching and `ThoughtWords`; no historical stamp is inferred or migrated.
 
 Each conversation turn receives up to four recent acts, decisions or runs in
 its changing context, newest change first since their last delivered reply in
@@ -124,8 +137,9 @@ filters in that snapshot. Missing attention provenance remains unknown.
   (`attention.weigh`, `attention.ignite`, `attention.restore`, `attention.wake`) about the happening; their sequence owns which
   happenings each admitted batch consumed or returned. Each ignition requires an `accounted: true` boundary naming its consumed happenings,
   including any `earlierDrive` references; an explicit `fromBeforeRecord` gap stays recorded as unknown history. The boundary closes that
-  consumed membership. A failed thought's return carries its named happenings and explicit earlier drive into the next claim; missing provenance
-  is never inferred from absent rows. Missing current membership refuses that node's claim with repair owed, leaving drive unconsumed
+  consumed membership. A failed thought spends its consumed drive; its return records drive zero and carries its named happenings and explicit
+  `earlierDrive` provenance into the next claim when new worth ignites the node. Stop, cancellation and admission returns keep their full drive.
+  Missing provenance is never inferred from absent rows. Missing current membership refuses that node's claim with repair owed, leaving drive unconsumed
   ([Subconscious](SUBCONSCIOUS.md#attention)). The waiting read selects all unweighed `world`/`self` births without an age or row-count limit.
   Presence occurrence keys come from the settled here/away transition and its time. Its words describe that transition alone; source evidence
   belongs to the parts' signal payload. Every posted occurrence reaches `ExperienceStore.begin`: a repeat under the same key from the same door
@@ -137,7 +151,10 @@ filters in that snapshot. Missing attention provenance remains unknown.
   movement's event time, so a delayed interpretation cannot credit a later thought. Its `thought` field names the node and drive that ignited it,
   the happenings, their doors and its no-op class. A clean silent model completion declared valid by the thought's request settles as `empty`
   when no act occurred, accepts its owed happenings and teaches that class's no-op record. `withheld` is a thought ended on CPU by the no-op
-  record itself; it supplies no new no-op evidence. The [provider contract](TURN_RESILIENCE.md) preserves failed and incomplete outcomes.
+  record itself; it supplies no new no-op evidence. A thought-evidence failure owes the shared `thought.read` operation, owned by the
+  stream; a cancelled thought owes nothing. A committed `hit`, `empty` or `withheld` thought settles every repair the stream owes,
+  whatever operation named it (per-run debts included), with that thought as evidence. Failed or uncommitted thoughts leave it owed.
+  The [provider contract](TURN_RESILIENCE.md) preserves failed and incomplete outcomes.
 
 The experience store opens the current `experience`/`event` schema directly.
 Existing stores must have the current projection columns; unreadable or older
@@ -151,6 +168,13 @@ Document identity, fingerprints, editability and recovery drafts stay with their
 `ToolFailureError` encodes its cause, effects and recovery once beside `Repair`;
 chat, parts, senses and agent transports attach provenance and apply their own privacy bounds.
 Compact action receipts and completed Inspector tool rows render the trace's recorded verdict, including unknown outcomes; phase marks running dispatch only.
+Closing dispatch receipts distinguish an owner's explicit in-progress status or state
+(`accepted`, `held`, `pending`, `queued`, `running`, `scheduled`, `submitted`,
+`waiting`) as `outcome: pending`, with `reason: tool dispatch pending`. The shared
+display calls these Running; their exact final-result class remains `unknown`.
+Person-input waits retain `outcome: waiting`. Neither missing results nor
+`completed: false` alone establishes pending work. Mac receipts with unconfirmed
+effects retain an unknown dispatch outcome.
 Stop receipts record cancellation, execution and effects separately; an unstarted
 cancelled slot counts as neither an attempt nor a failure. Historical flags remain readable.
 Mac operation state and verification outrank transport booleans and diagnostic
@@ -194,6 +218,12 @@ explicit common-home location.
   unavailable; no advisory copy grants authority.
 
 ### Delivery and face
+
+`trace.usage` sums each recorded model-usage counter separately, including cache
+creation, cache writes and their lifetime splits. Missing measurements remain
+counted in `missing_fields`. These counters overlap: lifetime splits belong to
+their creation/write total; Anthropic input excludes cache reads and creation,
+while OpenAI input includes cached tokens. They are not one spend total.
 
 - **Unchanged is no change.** Repeating an experience's current progress writes
   nothing. The experience write stream carries the committed `updatedAt`, the
@@ -289,6 +319,7 @@ the installed iOS build or prove its renderer supports this revision.
 - **An owned no owes repair.** The act they meant (the outermost one, so nested dispatches do not multiply the debt) owes `repair` to themselves, or to the person when the lever is their. A refusal before any effect owes nothing; their own `agent.verify` probe with `effects: none` is evidence, not a new repair obligation. Readers omit those probe debts from older records without rewriting them. A no met outside a tool call (a Doctor check, a part's wake, a background job) owes it the same way through `RepairOwed.owe`.
 - **Only the work settles it.** The obligation is accepted when that operation, or its lever, works again (`RepairOwed.settle`, called by every successful act), or let go by their with a reason (`app repair.let_go {id, reason}`). A Doctor repair settles on the owning check's passing postcondition: `ok`, or a reading that the part is `off` or `not needed`. A loop's recovery requires a clean tick newer than the obligation: completed work, or a legitimate "nothing to do" tick. A separate repair action is not required. A retry, restart or recheck that has not proved recovery, and any unrelated success, is evidence only. Meeting the same no again while its debt is open is evidence on that debt, one line on their home however often it recurs; once it settled, meeting it again is a new debt.
 - **It stays in their picture.** Their home's MY QUEUE carries each repair they owes with its lever, and the person's waits carry each one that is their with its exact control, until settled.
+  Repeat evidence uses the caller's failure id and appends once for that id; further repeats append nothing unless their displayed cause changes.
 - **What it is not.** A correction to the call's own arguments owes nothing; the corrected call is the repair (remedy kinds `correct_arguments` and `inspect`). A lawful refusal never becomes a debt to override Trust: a Trust ask or block, a posture, a saved entry or a peer's elevation names its owner and the person's control with `Repair.why` (kind `person_decides`), which owes nothing. An unknown effect owes reconciliation, never a blind resend. A decision that should not exist is deleted, not given a lever. An unauthenticated caller gets no diagnostics; the owner and lever go to them.
 
 The app door preserves cause-specific remedies supplied by the failure owner.
@@ -317,9 +348,11 @@ repair remains in Went wrong rather than folded history. Repeated failures updat
 its face while repair is open. A successful release settles release repair; a
 successful configuration read settles configuration repair. Repair settlement
 never stands in for the doors' own delivery evidence.
-Experience writes never gate a reply. Projections report write gaps for the
-owner's lifetime; unrelated success does not erase them. Failure accounting
-joins its writes, without retry closures. SQLite repair belongs to Doctor.
+Experience writes never gate a reply. Only SQLite or file-persistence errors set
+the store's write gap; domain refusals stay with their caller or log. The next
+successful store transaction clears the gap and notifies projection readers.
+Until then, guarded reads report its cause. Failure accounting joins its writes,
+without retry closures. SQLite repair belongs to Doctor.
 
 Health now uses the same repair obligation. Doctor records an adverse measurement
 before attempting its repair. Each check names the state it read; executable
@@ -337,6 +370,10 @@ mints a fresh occurrence id beneath the caller's failure key; operation and owne
 deduplicate open debt. A failure after settlement creates a new experience,
 without reopening or rewriting the settled birth.
 Home, the agent's Desk, Doctor and the health pill project the experience face.
+Doctor includes every unsettled `owes.repair`, not only failures measured by Doctor;
+saved debt supplies evidence, while only a current check supplies an executable Doctor repair.
+Projecting a measured check again preserves its verdict, detail and repair fields;
+the experience supplies the obligation identity without replacing that measurement.
 Doctor no longer files a parallel Desk item or keeps a deferred retry timer.
 Phone pairing is checked independently of optional APNS configuration. Body
 resource observations and felt-word concentration do not establish damage.
@@ -352,8 +389,8 @@ shows what is owed.
 
 The evidence: in Resolve they ran one seven-step render flow four times because it stopped on its last step, and every run did the six landed steps again; on a fresh install eight wakes spent 49 model rounds re-reading the same waiting work, because a wait was a note; and discovery rebuilt its action vectors in memory, so the first find after a launch paid for the whole inventory.
 
-- **A flow that stopped unfinished is an experience that owes `finish` to them** (`Experiences/Flow.swift`, RepairOwed's shape). Its claims are the steps that landed, in order, as digests; its evidence is the owner's raw record. Asking for it again continues it: what landed, or may have, is answered from that record and never done again (an effect that stopped unknown gets its recorded outcome again, never a blind resend), and only what did nothing runs, on a fresh read, or what its owner keeps progress for itself. A flow that finished, asked again, is a new flow. `again: true` is their "start over". Nothing landed means nothing is born.
-- **Current owners:** `mac.act` owns stopped screen batches. `OwnedProgram.isStrict` selects journaled part runs; `AppToolExecutor+PartRun.swift` saves their stops and atomically claims a run for resume. Resume rechecks admission, code, dependencies and reads, and returns saved receipts for landed writes. The [manifest spec](skill_manifest_spec.md#execution-and-ownership) owns the full contract and the outside-world restriction. **History, 10-19:** an earlier strict-flow implementation was cut after review found resume and hand-back holes; that is not the current execution contract.
+- **A flow that stopped unfinished is an experience that owes `finish` to them** (`Experiences/Flow.swift`, RepairOwed's shape). Its claims record step outcomes in order as digests, backed by the owner's raw record. Asking for it again continues it: what landed, or may have, is answered from that record and never done again (an effect that stopped unknown gets its recorded outcome again, never a blind resend), and only what did nothing runs, on a fresh read, or what its owner keeps progress for itself. A flow that finished, asked again, is a new flow. `again: true` is their "start over". A stopped Mac batch creates a flow when at least one step landed or may have acted.
+- **Current owners:** `mac.act` owns stopped screen batches. It marks unverified step digests with `~`, skips repeating those steps and counts them as unverified on resume. `OwnedProgram.isStrict` selects journaled part runs; `AppToolExecutor+PartRun.swift` saves their stops and atomically claims a run for resume. Resume rechecks admission, code, dependencies and reads, and returns saved receipts for landed writes. The [manifest spec](skill_manifest_spec.md#execution-and-ownership) owns the full contract and the outside-world restriction. **History, 10-19:** an earlier strict-flow implementation was cut after review found resume and hand-back holes; that is not the current execution contract.
 - **Mac identities:** each batch step hashes one canonical object containing the app, verb, target, text, mode, destination, image place, held keys, mouse button, handle and frame id, including null optional values. Landed receipts match only that current representation. Before changing it, reconcile any unfinished `mac.act/<session>` flows; an unmatched old digest cannot establish that its effect did not happen. Mac operation rows separately require their canonical request digest: a missing or invalid digest makes `mac_control/operations.json` unreadable, preserving the bytes and refusing journaled work for reconciliation. Every in-memory screen frame carries its producer's compile caps, and effect comparison requires both cap records; there is no pre-cap frame representation.
 - **A wait names its condition** (`desk.wait {handle, on, note?}`; [Desk contract](DESK.md)): a person's name, a Desk item, or any experience the agent was
   shown (a card, a message the agent sent another agent, a repair debt, an answer). A person wait uses the existing `waitingOn` field and reads as `waiting
@@ -386,7 +423,13 @@ On a fresh install they was told a reply to Claude Code was owed and could do no
   advisory projection, never a prerequisite for release. Release reports success
   only after the owner commits that exact id as `let_go`; a missing or unreadable
   record cannot prove a release. The same owner projects its settlement into the
-  experience. A card's decision is the person's and is never theirs to let go.
+  experience. Marking its Desk finding done or canceled never releases the reply.
+  A done or canceled item's room header shows one `still owed` clause from the
+  open projection for experiences linked by repair owner, `desk` evidence, or a `reply_delivery` ref,
+  using their recorded words and obligations, with `+N more` for other experiences.
+  An unreadable projection shows a gap rather than implying nothing is owed;
+  a loop refile reopens the finding while the delivery remains owed or failed
+  before an answer. A card's decision is the person's and is never theirs to let go.
   A prefix release checks Stop between ids and each one-id admission checks
   cancellation before starting or proceeding from its reads to settlement.
   A started settlement completes; a cancelled batch reports its completed,

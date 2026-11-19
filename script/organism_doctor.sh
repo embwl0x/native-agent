@@ -58,7 +58,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 TOKEN=""
-BRIDGE_CREDENTIAL_PATH="${NATIVE_AGENT_BRIDGE_TOKEN:-$HOME/.config/claude-bridge/token}"
+BRIDGE_CREDENTIAL_PATH="${NATIVE_AGENT_BRIDGE_TOKEN:-${NATIVE_AGENT_BRIDGE_DESCRIPTOR:-$HOME/.config/claude-bridge/bridge.json}}"
 nativeagent_bridge_resolve >/dev/null 2>&1 || true
 
 status() {
@@ -117,7 +117,7 @@ bridge_rc=0
 state_json "$state_file" || bridge_rc=$?
 if [ "$bridge_rc" -eq 0 ]; then
   status PASS "bridge state" "$BASE_URL/codex/state"
-  chat_ready="$(jq -r '.chatReady // false' "$state_file")"
+  chat_ready="$(jq -r '.chatReady | if type == "boolean" then tostring else "unknown" end' "$state_file")"
   organism_enabled="$(jq -r '.organism.enabled // false' "$state_file")"
   active_model="$(jq -r '.activeModel // "unknown"' "$state_file")"
   running_revision="$(jq -r '.buildIdentity.exactSourceRevision // empty' "$state_file")"
@@ -135,7 +135,11 @@ if [ "$bridge_rc" -eq 0 ]; then
   dream_proposals="$(jq -r '.organism.dreamRepair.proposedStandingViews // 0' "$state_file")"
   evidence_count="$(jq -r '(.organism.dreamRepair.latestEvidence // []) | length' "$state_file")"
 
-  bool_status "$chat_ready" "chat ready" "false; bridge can answer state but chat is not ready"
+  if [ "$chat_ready" = "true" ]; then
+    status PASS "chat ready" "true"
+  else
+    status FAIL "chat ready" "chatReady=$chat_ready; chat readiness not established"
+  fi
   if [ -n "$repo_revision" ] && [ "$running_dirty" = "false" ] && [ "$running_revision" = "$repo_revision" ]; then
     status PASS "exact running build" "$running_revision"
   else

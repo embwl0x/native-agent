@@ -137,27 +137,8 @@ extension AppModel {
         statusText = repair ? "Running repair…" : "Running health checks…"
         do {
             let port = AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
-            var report = try await EngineDoctorRuntime(dataRoot: engine.dataRoot, port: port, turn: turn)
+            let report = try await EngineDoctorRuntime(dataRoot: engine.dataRoot, port: port, turn: turn)
                 .runDoctor(repair: repair, repairScope: repairScope, checkID: checkID)
-            let buttonRepair: Bool
-            if case .button = repairScope {
-                buttonRepair = repair && (checkID == "status.desk_attention" || (checkID == nil && doctor.report?.checks.contains {
-                    $0.checkID == "status.desk_attention" && $0.repair_available == true
-                } == true))
-            } else {
-                buttonRepair = false
-            }
-            let status = await DoctorFacade.statusChecks(
-                dataRoot: engine.dataRoot,
-                approvals: engine.approvals,
-                repairDesk: buttonRepair,
-                stuckReason: DeskPageContent.stuckReason,
-                safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail
-            )
-            report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(report, liveChecks: status.checks)
-            report.repaired = report.repaired || status.repaired
-            report.checks = await DoctorReadout.repairProjection(report.checks, dataRoot: engine.dataRoot)
-            report.status = DoctorReadout.doctorRollup(report.checks.map(\.status))
             doctor.finishRun(report)
             statusText = repair
                 ? DoctorFacade.repairCompletionMessage(report: report)
@@ -195,15 +176,4 @@ extension AppModel {
         }, publish: { engine.doctor.report = $0 })
     }
 
-}
-
-extension AppModel {
-    // MARK: Integrations / inbox
-    func inboxAction(_ id: String, action: String) async throws {
-        // A native button starts this act; no running agent turn belongs to the tap.
-        let turn = TurnRequest(message: "", sessionID: nil, surface: "native_actions",
-            envelope: TurnEnvelope.personOnMac("mac_ui:inbox." + action, surface: "native_actions")).turn()
-        try await InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot, turn: turn,
-            effects: AppInboxCardActionEffects(inbox: engine.inbox))
-    }
 }

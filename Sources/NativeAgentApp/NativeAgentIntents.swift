@@ -59,6 +59,7 @@ struct AskResidentAgentIntent: AppIntent {
 
     static let title: LocalizedStringResource = "Ask Your Agent"
     static let description = IntentDescription("Ask the resident agent by name in the conversation you're in.")
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let openAppWhenRun = false
 
     @Parameter(title: "Agent")
@@ -102,8 +103,8 @@ struct NativeAgentStatusIntent: AppIntent {
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         try await ApplicationLifetime.shared.prepare()
-        let health = NativeAgentEngine.live.doctor.readHealth()
-        let state = health.ok ? "online" : "unavailable"
+        let health = try await NativeAgentEngine.live.doctor.readHealth()
+        let state = health.reachable.map { $0 ? "online" : "unavailable" } ?? "of unknown reachability"
         if #available(macOS 27, *), systemContext.isVoiceOnly {
             return .result(dialog: "NativeAgent is \(state).")
         }
@@ -148,6 +149,7 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
 
     static let title: LocalizedStringResource = "Create NativeAgent Desk Task"
     static let description = IntentDescription("Creates a directed task on the configured agent's Desk.")
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let openAppWhenRun = false
 
     @Parameter(title: "Title")

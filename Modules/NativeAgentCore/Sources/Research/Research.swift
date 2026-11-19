@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `Research.swift` | Checked search rows, named gaps and complete saved Lab records |
+// Blueprint: | `Research.swift` | Checked search rows, named gaps and fetch receipts |
 
 // MARK: - Research
 
@@ -191,8 +191,6 @@ public struct ResearchSearchResponse: Sendable, Equatable {
     }
 }
 
-// MARK: - fetch / lab result types
-
 /// Retain bounded extraction and coverage in source receipts; selection and paging read that extraction without another fetch.
 public struct ResearchFetchRecord: Sendable, Equatable {
     public let id: String
@@ -235,82 +233,6 @@ public struct ResearchFetchRecord: Sendable, Equatable {
     }
 }
 
-public struct ResearchLabRun: Identifiable, Sendable, Hashable {
-    public let id: String
-    public let objective: String
-    public let status: String      // "completed" | "needs_connector" | "failed"
-    public let query: String
-    public let sources: [ResearchSearchResult]
-    public let brief: String
-    public let createdAt: String
-    public let connector: String   // "searxng" | "none"
-    public let error: String?
-
-    public init(
-        id: String, objective: String, status: String, query: String,
-        sources: [ResearchSearchResult], brief: String, createdAt: String,
-        connector: String, error: String?
-    ) {
-        self.id = id
-        self.objective = objective
-        self.status = status
-        self.query = query
-        self.sources = sources
-        self.brief = brief
-        self.createdAt = createdAt
-        self.connector = connector
-        self.error = error
-    }
-}
-
-// MARK: - Stored rows
-
-extension ResearchSearchResult {
-    /// One stored source row requires string title/url/snippet and nullable source, exactly as written by toJSON.
-    public init?(row: JSONValue) {
-        guard case .object(let obj) = row,
-              case .string(let title)? = obj["title"],
-              case .string(let url)? = obj["url"],
-              case .string(let snippet)? = obj["snippet"] else { return nil }
-        switch obj["source"] {
-        case .null?: self.init(title: title, url: url, snippet: snippet, source: nil)
-        case .string(let source)?: self.init(title: title, url: url, snippet: snippet, source: source)
-        default: return nil
-        }
-    }
-}
-
-extension ResearchLabRun {
-    /// The complete current saved shape. Unknown historical evidence cannot become an empty query, brief, timestamp or connector.
-    public init?(row: JSONValue) {
-        guard case .object(let obj) = row,
-              case .string(let id)? = obj["id"],
-              case .string(let objective)? = obj["objective"],
-              case .string(let status)? = obj["status"],
-              case .string(let query)? = obj["query"],
-              case .string(let brief)? = obj["brief"],
-              case .string(let createdAt)? = obj["createdAt"],
-              case .string(let connector)? = obj["connector"],
-              case .array(let sourceRows)? = obj["sources"] else { return nil }
-        var sources: [ResearchSearchResult] = []
-        for sourceRow in sourceRows {
-            guard let source = ResearchSearchResult(row: sourceRow) else { return nil }
-            sources.append(source)
-        }
-        let error: String?
-        switch obj["error"] {
-        case .null?: error = nil
-        case .string(let value)?: error = value
-        default: return nil
-        }
-        self.init(
-            id: id, objective: objective, status: status, query: query,
-            sources: sources, brief: brief, createdAt: createdAt,
-            connector: connector, error: error
-        )
-    }
-}
-
 // MARK: - Errors
 
 public enum ResearchClientError: LocalizedError, Sendable, Equatable {
@@ -318,7 +240,7 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
     case malformedResponse(String)
     case httpStatus(Int)
     case transport(String)
-    case noSuchHost(String)
+    case noSuchHost(String, resolverFailure: String? = nil)
     case connectionRefused(String)
     case timedOut(String)
     case localServerNotRunning(String)
@@ -366,8 +288,9 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
             return [404, 410].contains(status)
                 ? "The page is not there (HTTP \(status))."
                 : "The server answered with HTTP \(status)."
-        case .noSuchHost(let host):
+        case .noSuchHost(let host, let resolverFailure):
             return "No such host: \(host). DNS could not resolve the hostname; no page was read."
+                + (resolverFailure.map { " \($0)." } ?? "")
         case .connectionRefused(let host):
             return "Connection refused by \(host); no page was read."
         case .timedOut(let host):
@@ -403,7 +326,6 @@ public struct ResearchHTTPResponse: Sendable {
 public actor SwiftNativeResearchClient {
     let configPath: URL
     let receiptsDir: URL
-    let labRunsPath: URL
     let http = URLSessionResearchHTTPClient()
     let docker = SystemDockerPSExecutor()
 
@@ -411,6 +333,5 @@ public actor SwiftNativeResearchClient {
         let root = dataRoot.standardizedFileURL
         self.receiptsDir = root.appendingPathComponent("research", isDirectory: true)
         self.configPath = receiptsDir.appendingPathComponent("config.json")
-        self.labRunsPath = receiptsDir.appendingPathComponent("lab/runs.json")
     }
 }

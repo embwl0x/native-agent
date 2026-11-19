@@ -310,13 +310,6 @@ public struct TelegramSessionStore: Sendable {
         return sessionId
     }
 
-    public func boundSessionId(chatId: Int) async throws -> String? {
-        if try isOwnerDestination(.chat(chatId)) {
-            return ConversationAnchor.currentSessionId(dataRoot: dataRoot)
-        }
-        return try await mappedSessionId(chatKey: String(chatId))
-    }
-
     public func outboundDestination(sessionId: String) async throws -> TelegramDestination? {
         guard let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot), config.enabled else { return nil }
         if let owner = config.ownerUserId, let chatId = Int(exactly: owner),

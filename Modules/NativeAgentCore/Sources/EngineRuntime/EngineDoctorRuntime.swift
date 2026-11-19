@@ -36,16 +36,20 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
 
     public func runDoctor(repair: Bool = false, repairScope: DoctorRepairScope = .automatic,
                           checks suppliedChecks: SwiftNativeDoctorChecks? = nil, checkID: String? = nil) async throws -> DoctorReport {
-        let impl = suppliedChecks ?? makeDoctorChecks(root: dataRoot)
-        // Concurrent status readers do not queue another repair pass.
+        // A requested repair either owns admission or reports the active repair.
         let ownsRepair = repair && doctorRepairInFlight.withLock { running in
             guard !running else { return false }
             running = true
             return true
         }
+        if repair && !ownsRepair {
+            throw ToolFailureError("A Doctor repair is already running. This repair request did not run; read its report when it finishes.",
+                effects: .none)
+        }
         defer { if ownsRepair { doctorRepairInFlight.withLock { $0 = false } } }
+        let impl = suppliedChecks ?? makeDoctorChecks(root: dataRoot)
         var checks = await impl.runAll()
-        checks += await liveDoctorCoverageReadings(probeSearch: true, includeCognition: true)
+        checks += await liveDoctorCoverageReadings(probeSearch: true, includeCognition: true, refreshContacts: true)
         if let checkID, checkID != "status.desk_attention", !checks.contains(where: { $0.id == checkID }) {
             throw ToolFailureError("No Doctor check has id \(checkID). Nothing was repaired.",
                 argumentPath: "check_id", accepted: "A check id from doctor.run.", effects: .none)
@@ -108,15 +112,8 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
                     }
                 }
                 let verified = checks[index]
-                var text = safeDoctorDetail(receipt)
+                let text = safeDoctorDetail(receipt)
                 nativeLog("[Doctor repair] %@: %@; recheck=%@", id, text, verified.status)
-                do {
-                    try await self.doctorRecordRepair(checkID: id, receipt: text, status: verified.status)
-                } catch {
-                    let failure = "Repair receipt could not be saved: \(safeDoctorDetail(error.localizedDescription))"
-                    nativeLog("[Doctor repair] %@", failure)
-                    text += " " + failure
-                }
                 checks[index].receipt = text
                 checks[index].repairApplied = actionCompleted
                 var repairReceipt = checks[index]
@@ -126,8 +123,6 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
                 repairReceipts.append(repairReceipt)
             }
         }
-        let rollup = DoctorReadout.doctorRollup(checks.map(\.status))
-        let repaired = DoctorSafeRepairPolicy.appliedRepairCount(in: repairReceipts) > 0
         let executable = DoctorSafeRepairPolicy.executableCoreIDs(for: checks)
         for index in checks.indices {
             let row = checks[index]
@@ -142,12 +137,17 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
             checks[index] = row.settled(liveAvailable: liveAvailable, coreAvailable: executable.contains(row.id))
         }
         await DoctorReadout.recordReadings(checks, dataRoot: dataRoot)
+        let status = await DoctorFacade.statusChecks(dataRoot: dataRoot, approvals: port.doctorEngine.approvals,
+            repairDesk: ownsRepair && repairScope == .button && (checkID == nil || checkID == "status.desk_attention"),
+            stuckReason: DeskPageContent.stuckReason, safeDetail: Self.safeDetail)
+        checks += status.checks
+        let repaired = status.repaired || DoctorSafeRepairPolicy.appliedRepairCount(in: repairReceipts) > 0
         let rows = await DoctorReadout.repairProjection(checks, dataRoot: dataRoot)
         if !rows.contains(where: { $0.id == "doctor.repair_store" }) {
             _ = await MaintenanceBackgroundWork(port: EngineBackgroundWorkPort())
                 .fileDoctorAsk(dataRoot: dataRoot, rows: rows)
         }
-        return DoctorReport(status: rollup, repaired: repaired, checks: checks)
+        return DoctorReport(status: DoctorReadout.doctorRollup(rows.map(\.status)), repaired: repaired, checks: rows)
     }
 
     private func liveDoctorCheck(id: String) async -> CheckResult? {
@@ -162,7 +162,7 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
         case "live.telegram": return await telegramDoctorCoverageCheck()
         case "live.background_loops": return await self.doctorBackgroundLoopsCheck()
         case "live.bridges": return await bridgesDoctorCoverageCheck()
-        case "live.agent_connections": return await self.doctorAgentConnectionsCheck()
+        case "live.agent_connections": return await self.doctorAgentConnectionsCheck(refresh: true)
         case "live.memory": return await memoryDoctorCoverageCheck()
         case "live.inspector_feed": return await self.doctorInspectorCheck()
         case "live.embedding_download": return await self.doctorEmbeddingDownloadCheck()
@@ -188,7 +188,7 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
         return checks
     }
 
-    private func liveDoctorCoverageReadings(probeSearch: Bool, includeCognition: Bool) async -> [CheckResult] {
+    private func liveDoctorCoverageReadings(probeSearch: Bool, includeCognition: Bool, refreshContacts: Bool = false) async -> [CheckResult] {
         async let providers = providerDoctorCoverageCheck()
         async let telegram = telegramDoctorCoverageCheck()
         async let search = searchDoctorCoverageCheck(probe: probeSearch)
@@ -199,7 +199,7 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
         async let loopDetails = self.doctorBackgroundLoopChecks()
         async let memory = memoryDoctorCoverageCheck()
         async let bridges = bridgesDoctorCoverageCheck()
-        async let agents = self.doctorAgentConnectionsCheck()
+        async let agents = self.doctorAgentConnectionsCheck(refresh: refreshContacts)
         async let inspector = self.doctorInspectorCheck()
         async let embedding = self.doctorEmbeddingDownloadCheck()
         async let pulses = self.doctorOrganPulsesCheck()

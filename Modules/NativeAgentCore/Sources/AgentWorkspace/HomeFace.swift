@@ -8,19 +8,17 @@ import NativeAgentShared
 import PersistenceCore
 import StandingBots
 import Transcripts
-// Blueprint: | `HomeFace.swift` | Home's packet for `native-home`: world parts as keyed facts, thoughts, owed, attention; lifetime and gaps |
+// Blueprint: | `HomeFace.swift` | Home packet for `native-home`: named owner facts, thoughts, owed, attention and gaps |
 
 package enum HomeFace {
     static let experiencesChanged = Notification.Name("NativeAgent.homeExperiencesChanged")
     package static let jobsChanged = Notification.Name("NativeAgent.homeJobsChanged")
     @MainActor private static var readers: [String: @MainActor () async -> PartFaceSnapshot?] = [:]
 
-    /// Read the page owner, rather than keeping a second face for the workspace door.
     @MainActor package static func bind(dataRoot: URL, read: @escaping @MainActor () async -> PartFaceSnapshot?) {
         readers[dataRoot.standardizedFileURL.path] = read
     }
 
-    /// The agent's door reads Home as every door draws it: the person's levers first, then the face the agent's part drew.
     @concurrent static func door(dataRoot: URL) async throws -> PartFace {
         let read = await MainActor.run { readers[dataRoot.standardizedFileURL.path] }
         guard let read, let snapshot = await read() else {
@@ -75,7 +73,6 @@ package enum HomeFace {
             observers.forEach(NotificationCenter.default.removeObserver)
         }
 
-        /// Source changes during a refresh owe one follow-up read when it completes.
         private func signalRefresh() {
             dirty = true
             guard refresh == nil else { return }
@@ -88,8 +85,6 @@ package enum HomeFace {
             }
         }
 
-        /// What `native-home` draws Home from, read from the retained parts at this moment (the epoch). `attention` is the cognition runtime's
-        /// reading: `asleep`, `awake`, or `unavailable` when no runtime runs.
         @concurrent nonisolated package func read(layout: SurfaceLayoutAvailability, attention: String) async -> PartFaces.Packet {
             await projection.read(workspace: workspace, dataRoot: dataRoot, layout: layout, attention: attention)
         }
@@ -123,8 +118,6 @@ package enum HomeFace {
         let facts: JSONValue
     }
 
-    /// Each component retains only its last derivation of exact retained owner results. Missing readings are nil, never a success verdict.
-    /// Source failures get new identities too. Clock-dependent queue verdicts and trial levers are read at `now` rather than cached.
     private static func component(_ id: String, from names: [String], world: AgentWorld, components: inout [String: Component],
                                   keys: inout RowKeys, content: Component.Input? = nil, build: (inout RowKeys) -> JSONValue) -> JSONValue {
         let input = content ?? .readings(names.map { world.readings[$0] })
@@ -139,8 +132,6 @@ package enum HomeFace {
         return result.facts
     }
 
-    /// The keys a Home packet declares: where each row id may lead, what it may do, and the door call each action makes (`PartFace.Keys`
-    /// reads them). An action's id is the verb it calls.
     struct RowKeys {
         private(set) var all: [String: JSONValue] = [:]
 
@@ -163,11 +154,10 @@ package enum HomeFace {
     static func fact(_ fields: [String: JSONValue?]) -> JSONValue { .object(fields.compactMapValues { $0 }) }
     static func text(_ value: String?) -> JSONValue? { value.map(JSONValue.string) }
 
-    /// Which retained parts feed each section: a part never read is a gap there, and a part that failed names its failure there.
     private static let sources: [String: [String]] = [
         "mind": ["thoughts", "owed to me"], "notable": ["profile", "mail preview"], "changed": [], "waits": ["desk", "asks", "owed"],
         "queue": ["desk", "queue evidence", "reviews", "people", "contacts", "owed"],
-        "working": ["work"], "open": [], "people": ["contacts", "people", "health", "delegations", "found"],
+        "working": ["work"], "people": ["contacts", "people", "health", "delegations", "found"],
         "helpers": ["bots", "running helpers"], "senses": ["senses"],
         "elsewhere": ["elsewhere", "contacts"], "places": ["desk"], "mac": ["touched"],
     ]
@@ -186,7 +176,6 @@ package enum HomeFace {
             keys.add("mail.previews", open: "page:home/mail")
             mail = fact(["key": .string("mail.previews"), "words": .string(preview.words), "at": .string(clock(preview.at))])
         }
-        keys.add("windows", open: "page:home/windows")
         let working = component("working", from: ["work"], world: world, components: &components, keys: &keys) { keys in
             .array(world.work.filter(\.working).prefix(10).map { job in
                 keys.add("job:" + job.id, actions: [(PartFace.Call("agent.read", ["job": .string(job.id)]), false)])
@@ -198,7 +187,6 @@ package enum HomeFace {
         for name in ["mind"] + order {
             gaps[name] = .array((sources[name] ?? []).compactMap { key -> JSONValue? in
                 if let failure = world.failures[key] { return fact(["source": .string(key), "failure": .string(failure)]) }
-                // A part re-reading keeps its last value; only a part never read yet is a gap on the page.
                 return world.unread.contains(key) ? fact(["source": .string(key)]) : nil
             })
         }
@@ -241,7 +229,6 @@ package enum HomeFace {
 
     static func clock(_ date: Date) -> String { date.formatted(.iso8601) }
 
-    /// A record time in the faces' clock; a time the record cannot read is absent from the fact, never invented.
     static func recorded(_ at: String) -> JSONValue? {
         NativeTimestampFormat.parseISO8601FractionalFirst(at).map { .string(clock($0)) }
     }

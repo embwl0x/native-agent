@@ -24,32 +24,11 @@ import DeviceSync
 
 @MainActor
 extension AppModel {
-    var providerSettingsIssue: String? {
-        face.slot(.settings).select("providers.issue", as: SettingsFace.self) { $0?.providers.error }
-    }
-
-    var providerAccounts: [ProviderInfo] {
-        face.slot(.settings).select("providers.accounts", as: SettingsFace.self) { $0?.providers.snapshot?.providers } ?? []
-    }
 
     var providerReadiness: ProviderSettingsFace.Readiness {
         face.slot(.settings).select("providers.readiness", as: SettingsFace.self) { $0?.providers.readiness } ?? .loading
     }
 
-    /// Drawing readers are separate from the command getters, including while a saved frame is in flight.
-    var displayedChatModel: String {
-        pendingChatBrainSelection?.model
-            ?? face.slot(.settings).select("providers.chatModel", as: SettingsFace.self) { $0?.providers.chatChoice?.model } ?? ""
-    }
-
-    var displayedChatProvider: String {
-        pendingChatBrainSelection?.provider
-            ?? face.slot(.settings).select("providers.chatProvider", as: SettingsFace.self) { $0?.providers.chatChoice?.provider } ?? ""
-    }
-
-    var providerSavingChatBrain: Bool {
-        face.slot(.settings).select("providers.savingChatBrain", as: SettingsFace.self) { $0?.providers.isSavingChatBrain } == true
-    }
 
     func missingProviderChatGuidance() -> String? {
         guard providerReadiness == .needsConnection else { return nil }

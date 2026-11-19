@@ -85,13 +85,11 @@ enum BodyFaceDoctor {
         }
     }
 
-    private static func repair(renderer: Renderer, target: RendererInspectorReport?) async throws -> DoctorRepairAttempt {
+    private static func repair(renderer: Renderer, target: RendererInspectorReport) async throws -> DoctorRepairAttempt {
         try Task.checkCancellation()
-        if let target {
-            let current = try await read(.readInspectorHealth, renderer: renderer)
-            guard current.view == target.view, current.subscription == target.subscription, current.mounted else {
-                throw PartCallError(code: "inspector_selection_changed", message: "The Inspector view changed before repair. Nothing was rearmed.")
-            }
+        let current = try await read(.readInspectorHealth, renderer: renderer)
+        guard current.view == target.view, current.subscription == target.subscription, current.mounted else {
+            throw PartCallError(code: "inspector_selection_changed", message: "The Inspector view changed before repair. Nothing was rearmed.")
         }
         await renderer.engine.trace.rearmObservation()
         guard await renderer.engine.trace.observationActive else {
@@ -99,7 +97,7 @@ enum BodyFaceDoctor {
         }
         var receipts = ["Trace observation is active."]
         var completed = true
-        if let target, let view = target.view {
+        if let view = target.view {
             let report: RendererInspectorReport
             do { report = try await read(.rearmInspectorSubscription(view: view, subscription: target.subscription), renderer: renderer) }
             catch is CancellationError { throw CancellationError() }
@@ -139,21 +137,4 @@ enum BodyFaceDoctor {
     }
 
 
-}
-
-extension AppModel {
-    func refreshBodyDoctorCoverage() async {
-        guard let current = engine.doctor.report else { return }
-        _ = await engine.doctor.reportRead.read({
-            let port = AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
-            let live = await port.runtime.liveDoctorCoverageChecks()
-            let status = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals,
-                repairDesk: false, stuckReason: DeskPageContent.stuckReason,
-                safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail).checks
-            var report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(current, liveChecks: live + status)
-            report.checks = await DoctorReadout.repairProjection(report.checks, dataRoot: engine.dataRoot)
-            report.status = DoctorReadout.doctorRollup(report.checks.map(\.status))
-            return report
-        }, publish: { engine.doctor.report = $0 })
-    }
 }

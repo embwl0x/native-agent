@@ -95,8 +95,6 @@ public struct ConnectorActions: Sendable {
             }
             let output: JSONValue
             switch descriptor.id {
-            case "codex.work_journal":
-                output = try await self.runCodexWorkJournal(input: input, dataRoot: dataRoot)
             case "codex.handoff":
                 output = try Self.readCodexHandoff(input: input)
             case "mac_assistant.watch_templates":
@@ -196,180 +194,6 @@ public struct ConnectorActions: Sendable {
         return .object(obj)
     }
 
-    public func runCodexWorkJournal(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
-        let days = max(1, min(try Self.connectorInputInt(input["days"], default: 1), 30))
-        let maxProjects = max(1, min(try Self.connectorInputInt(input["maxProjects"], default: 40), 100))
-        let maxCommits = max(1, min(try Self.connectorInputInt(input["maxCommitsPerProject"], default: 8), 25))
-        let roots = try await Self.codexJournalRoots(input: input, maxProjects: maxProjects, dataRoot: dataRoot)
-
-        var projectRows: [JSONValue] = []
-        for root in roots.prefix(maxProjects) {
-            if let row = try await codexJournalProject(root: root, days: days, maxCommits: maxCommits) {
-                projectRows.append(row)
-            }
-        }
-
-        let handoff: JSONValue
-        do {
-            handoff = try Self.readCodexHandoff(input: [
-                "includeText": .bool(false),
-                "maxEntries": .int(3),
-                "maxEntryChars": .int(1200),
-            ])
-        } catch {
-            // This source's failure does not invalidate the collected Git evidence.
-            handoff = .object([
-                "status": .string("unavailable"),
-                "path": .string(CodexHandoff.path.path),
-                "error": .string(error.localizedDescription),
-            ])
-        }
-        let generatedAt = SwiftNativeManifestSigner.isoTimestamp(Date())
-        let snapshot = NativeAppSecretRedactor.redactValue(.object([
-            "id": .string("codex-work-\(UUID().uuidString.lowercased())"),
-            "status": .string(handoff.objectValue?["status"] == .string("available") ? "completed" : "partial"),
-            "generatedAt": .string(generatedAt),
-            "days": .int(Int64(days)),
-            "projectCount": .int(Int64(projectRows.count)),
-            "projects": .array(projectRows),
-            "handoff": handoff,
-            "source": input["source"] ?? .string("connector_action"),
-        ]))
-
-        return snapshot
-    }
-
-    public static func codexJournalRoots(
-        input: [String: JSONValue],
-        maxProjects: Int,
-        dataRoot: URL
-    ) async throws -> [URL] {
-        var candidates: [URL] = []
-        for path in Self.connectorInputStringArray(input["roots"]) {
-            candidates.append(URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(path)))
-        }
-        if ConnectorInputValue.bool(input["includeSelfRepo"], default: true) {
-            candidates.append(dataRoot.deletingLastPathComponent())
-        }
-        if ConnectorInputValue.bool(input["includeRegisteredWorkspaces"], default: true) {
-            candidates.append(contentsOf: try await Self.registeredWorkspaceRoots(dataRoot: dataRoot))
-        }
-        if ConnectorInputValue.bool(input["includeProjectsDirectory"], default: true) {
-            let projects = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Projects", isDirectory: true)
-            let children = try FileManager.default.contentsOfDirectory(
-                at: projects,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )
-            for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-                if FileManager.default.fileExists(atPath: child.appendingPathComponent(".git").path) {
-                    candidates.append(child)
-                }
-            }
-        }
-
-        var out: [URL] = []
-        var seen: Set<String> = []
-        for candidate in candidates {
-            let path = candidate.standardizedFileURL.path
-            guard !seen.contains(path), FileManager.default.fileExists(atPath: path) else { continue }
-            seen.insert(path)
-            out.append(candidate.standardizedFileURL)
-            if out.count >= maxProjects { break }
-        }
-        return out
-    }
-
-    public static func registeredWorkspaceRoots(dataRoot: URL) async throws -> [URL] {
-        let rows = try await SwiftNativeConnectorsClient(root: dataRoot).listWorkspaces()
-        return rows.compactMap { row in
-            guard case .object(let obj) = row else { return nil }
-            return SwiftNativeConnectorsClient.workspaceURL(obj["path"])
-        }
-    }
-
-    public func codexJournalProject(root: URL, days: Int, maxCommits: Int) async throws -> JSONValue? {
-        let topLevel = try await platform.runGit(["rev-parse", "--show-toplevel"], repoRoot: root, timeout: 5)
-        guard topLevel.status == 0 else {
-            return .object([
-                "name": .string(root.lastPathComponent), "path": .string(root.path),
-                "status": .string("unavailable"), "command": .string("git rev-parse --show-toplevel"),
-                "exitStatus": .int(Int64(topLevel.status)),
-                "error": .string(NativeAppSecretRedactor.redactText(topLevel.stderr)),
-            ])
-        }
-        let repoPath = topLevel.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !repoPath.isEmpty else {
-            throw NSError(domain: "NativeAgentWorkJournal", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "git rev-parse --show-toplevel returned no repository path.",
-            ])
-        }
-        let repoRoot = URL(fileURLWithPath: repoPath)
-
-        async let branchResult = platform.runGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot: repoRoot, timeout: 5)
-        async let headResult = platform.runGit(["rev-parse", "--short", "HEAD"], repoRoot: repoRoot, timeout: 5)
-        async let statusResult = platform.runGit(["status", "--short"], repoRoot: repoRoot, timeout: 8)
-        async let logResult = platform.runGit([
-            "log",
-            "--since=\(days) days ago",
-            "--max-count=\(maxCommits)",
-            "--pretty=format:%H%x1f%h%x1f%ct%x1f%an%x1f%s",
-        ], repoRoot: repoRoot, timeout: 10)
-
-        let branchValue = try await branchResult
-        let headValue = try await headResult
-        let status = try await statusResult
-        let log = try await logResult
-        for (command, result) in [("rev-parse --abbrev-ref HEAD", branchValue),
-                                  ("rev-parse --short HEAD", headValue),
-                                  ("status --short", status), ("log", log)] {
-            guard result.status == 0 else {
-                throw NSError(domain: "NativeAgentWorkJournal", code: Int(result.status), userInfo: [
-                    NSLocalizedDescriptionKey: NativeAppSecretRedactor.redactText(
-                        "git \(command) failed in \(repoRoot.path) (exit \(result.status)): \(result.stderr)"),
-                ])
-            }
-        }
-        let branch = branchValue.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let head = headValue.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let statusLines = status.stdout
-            .split(whereSeparator: \.isNewline)
-            .map { NativeAppSecretRedactor.redactText(String($0)) }
-        let commits = try Self.parseCodexJournalCommits(log.stdout)
-
-        return .object([
-            "name": .string(repoRoot.lastPathComponent),
-            "path": .string(repoRoot.path),
-            "branch": .string(branch),
-            "head": .string(head),
-            "dirty": .bool(!statusLines.isEmpty),
-            "dirtyFiles": .int(Int64(statusLines.count)),
-            "dirtySample": .array(statusLines.prefix(20).map { .string($0) }),
-            "commitCount": .int(Int64(commits.count)),
-            "commits": .array(commits),
-        ])
-    }
-
-    public static func parseCodexJournalCommits(_ raw: String) throws -> [JSONValue] {
-        try raw.split(whereSeparator: \.isNewline).map { line in
-            let parts = String(line).split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
-            guard parts.count == 5, let epoch = TimeInterval(parts[2]), epoch.isFinite else {
-                throw NSError(domain: "NativeAgentJournal", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: """
-                        Git returned a malformed commit row. Repair the journal's git-output reader before using these dates.
-                        """])
-            }
-            return .object([
-                "sha": .string(parts[0]),
-                "shortSha": .string(parts[1]),
-                "date": .string(SwiftNativeManifestSigner.isoTimestamp(Date(timeIntervalSince1970: epoch))),
-                "author": .string(NativeAppSecretRedactor.redactText(parts[3])),
-                "subject": .string(NativeAppSecretRedactor.redactText(parts[4])),
-            ])
-        }
-    }
-
     public static func recentMarkdownEntries(_ text: String, maxEntries: Int, maxEntryChars: Int) -> [String] {
         let chunks = text
             .components(separatedBy: "\n## ")
@@ -383,11 +207,6 @@ public struct ConnectorActions: Sendable {
 
     public static func connectorInputInt(_ raw: JSONValue?, default defaultValue: Int) throws -> Int {
         try MacAppleScriptBridge.clampedInt(raw, defaultValue: defaultValue, min: Int.min, max: Int.max)
-    }
-
-    public static func connectorInputStringArray(_ raw: JSONValue?) -> [String] {
-        guard case .array(let arr)? = raw else { return [] }
-        return arr.compactMap { $0.scalarText }
     }
 
     public func connectorStatusActionOutput(_ descriptor: ConnectorActionDescriptor) async throws -> JSONValue {

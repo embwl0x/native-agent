@@ -172,10 +172,6 @@ extension CognitiveSubstrate {
             .timeIntervalSince1970 ?? now.timeIntervalSince1970
         let shouldEcho = Self.soundEchoShouldSpeak(seed: latestActivity, dutyCycle: dyn.soundEchoDutyCycle)
         if !shouldEcho {
-            if emitReceipts, !candidates.isEmpty {
-                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("C02"), "site": .string(
-                    "CognitiveSubstrate+CapsuleSoundEcho.swift:soundEchoSelection")]), turn: turn)
-            }
             return quiet()
         }
         if candidates.isEmpty {

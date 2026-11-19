@@ -11,7 +11,7 @@ import Experiences
 import Transcripts
 import ApprovalInbox
 import AgentWorkspace
-// Blueprint: | `AttentionRouter.swift` | One matter reaches the person's doors through ForPerson's delivery obligations |
+// Blueprint: | `AttentionRouter.swift` | Person delivery routing carries the telling turn's steering to the matter birth |
 
 public actor AttentionRouter {
     public typealias PhoneSender = @Sendable (NativeAgentNotificationDefaults.Note, [String: String]) async throws -> MobileNotificationDeliveryReceipt
@@ -47,7 +47,7 @@ public actor AttentionRouter {
         try Task.checkCancellation()
         guard !stopped else { throw CancellationError() }
         let doors = Self.doors(reach)
-        guard try await ForPerson.at(dataRoot).tell(matter, doors: doors) != .settled, !doors.isEmpty else { return try await outcome(matter.id) }
+        guard try await ForPerson.at(dataRoot).tell(matter, doors: doors, steeredBy: turn?.steeringStamp() ?? ["unrecorded"]) != .settled, !doors.isEmpty else { return try await outcome(matter.id) }
         var namedByPerson = false
         if case .pinned = reach, let turn, turn.rows.hiddenInput == nil, turn.origin == nil,
            let envelope = turn.envelope, envelope.agent == nil {

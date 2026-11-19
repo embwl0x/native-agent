@@ -6,7 +6,7 @@ import MemoryV2
 import TrustCenter
 import NativeAgentShared
 import DeviceSync
-// Blueprint: | `EngineMemory.swift` | Canonical memory projections; lifecycle-bound SQLite/WAL graph observation through the shared LatestRead snapshot |
+// Blueprint: | `EngineMemory.swift` | Canonical memory projections; committed column-region observations and checked graph reads through LatestRead |
 
 /// Share MemoryV2 and Knowledge Graph owners per root across observable pages and phone reads.
 @MainActor
@@ -105,17 +105,30 @@ public final class MemoryFacade {
     @ObservationIgnored private lazy var rejectedHistoryRead = LatestRead()
     @ObservationIgnored private lazy var diagnosticsRead = LatestRead()
     @ObservationIgnored private lazy var graphSnapshotRead = LatestRead()
+    private var pageObservationIssues: [MemoryStorage.PageProjection: String] = [:]
 
-    /// Nil recall rows mean evidence is unavailable, never an empty successful recall.
-    public private(set) var searchResults: [MemoryV2.MemoryRecord]?
-    public private(set) var searchError: String?
-    public private(set) var searchQuery: String?
-    /// Retain the query that actually produced displayed results.
-    public private(set) var searchResultQuery: String?
-    /// Distinguish in-flight recall from an empty result.
-    public private(set) var searchIsLoading = false
-    @ObservationIgnored private lazy var searchRead = LatestRead()
-    @ObservationIgnored private var lastSuccessfulSearch: (query: String, records: [MemoryV2.MemoryRecord])?
+    /// Each surface owns its query, admitted rows and publication gate; nil rows remain unavailable evidence.
+    private struct SearchState {
+        var query: String?
+        var results: [MemoryV2.MemoryRecord]?
+        var error: String?
+        var resultQuery: String?
+        var loading = false
+        let read = LatestRead()
+        var lastSuccessful: (query: String, records: [MemoryV2.MemoryRecord])?
+    }
+    private var searchesByPhoneSurface: [Bool: SearchState] = [:]
+    private func searchState(surface: String?) -> SearchState {
+        if let state = searchesByPhoneSurface[surface == "ios"] { return state }
+        let state = SearchState()
+        searchesByPhoneSurface[surface == "ios"] = state
+        return state
+    }
+    public func searchSnapshot(surface: String?) -> (query: String?, results: [MemoryV2.MemoryRecord]?, error: String?,
+                                                     resultQuery: String?, loading: Bool) {
+        let state = searchState(surface: surface)
+        return (state.query, state.results, state.error, state.resultQuery, state.loading)
+    }
 
     /// Share one checked whole-graph snapshot across graph and Capabilities pages.
     public private(set) var graphSnapshot: CanonicalAgentGraphReadout?
@@ -144,6 +157,40 @@ public final class MemoryFacade {
     /// Keep kind reads on the memory owner's list policy, including its full result set and errors.
     public nonisolated func listMemory(kind: String?) async throws -> [MemoryV2.MemoryRecord] {
         try await resolveOwner().listMemory(kind: kind)
+    }
+
+    public func checkPageObservation(_ projection: MemoryStorage.PageProjection) throws {
+        if let issue = pageObservationIssues[projection] { throw MemoryStorageError.databaseUnavailable(issue) }
+    }
+
+    @concurrent public nonisolated func observePage(_ projection: MemoryStorage.PageProjection,
+                                                   changed: @escaping @Sendable () async -> Void) async {
+        do {
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+            await storage.observePage(projection, changed: changed) { issue in
+                await self.pageObservationFailed(projection, issue: issue)
+                await changed()
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            await pageObservationFailed(projection, issue: error.localizedDescription)
+            await changed()
+        }
+    }
+
+    private func pageObservationFailed(_ projection: MemoryStorage.PageProjection, issue: String) {
+        pageObservationIssues[projection] = issue
+        if projection == .graph { graphObservationError = issue }
+    }
+
+    @concurrent public nonisolated func todayMoments(_ day: Date, calendar: Calendar) async throws
+        -> (rows: [(id: String, at: Double, text: String)], total: Int, firstAt: Double?, unreadable: Bool) {
+        try await checkPageObservation(.moments)
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        return try await storage.moments(on: day, calendar: calendar) { content, quote in
+            let quote = TodayWords.plain(quote ?? "")
+            return quote.isEmpty ? TodayWords.plain(content) : quote
+        }
     }
 
     public func refreshDiagnostics() async {
@@ -304,31 +351,34 @@ public final class MemoryFacade {
 
     /// Clear recall for queries under three characters; resolve kept records through canonical ids. A face refresh re-ranks without recording another use.
     @discardableResult
-    public func search(query: String, recordingUsage: Bool = true) async -> MemorySearchReading {
+    public func search(query: String, recordingUsage: Bool = true, surface: String? = nil) async -> MemorySearchReading {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        searchRead.write {
-            searchQuery = trimmed
-            searchResultQuery = nil
-            searchIsLoading = trimmed.count >= 3
-            searchResults = nil
-            searchError = nil
+        var state = searchState(surface: surface)
+        state.read.write {
+            state.query = trimmed
+            state.resultQuery = nil
+            state.loading = trimmed.count >= 3
+            state.results = nil
+            state.error = nil
+            searchesByPhoneSurface[surface == "ios"] = state
         }
-        guard let reading = await readSearch(recordingUsage: recordingUsage) else {
+        guard let reading = await readSearch(recordingUsage: recordingUsage, surface: surface) else {
             return MemorySearchReading(query: trimmed, records: nil, issue: nil)
         }
         return reading
     }
 
     /// Re-rank the owner's current query without setting it again or crediting another use. Query selection and read admission share main.
-    public func refreshSearch() async {
-        _ = await readSearch(recordingUsage: false)
+    public func refreshSearch(surface: String? = nil) async {
+        _ = await readSearch(recordingUsage: false, surface: surface)
     }
 
-    private func readSearch(recordingUsage: Bool) async -> MemorySearchReading? {
-        guard let trimmed = searchQuery, trimmed.count >= 3 else { return nil }
-        let prior = lastSuccessfulSearch
+    private func readSearch(recordingUsage: Bool, surface: String?) async -> MemorySearchReading? {
+        let selected = searchState(surface: surface)
+        guard let trimmed = selected.query, trimmed.count >= 3 else { return nil }
+        let prior = selected.lastSuccessful
         // Failed reads retain proven rows with their actual query, never a substitute search.
-        let reading = await searchRead.read { () -> (String?, [MemoryV2.MemoryRecord]?, String?, [String]) in
+        let reading = await selected.read.read { () -> (String?, [MemoryV2.MemoryRecord]?, String?, [String]) in
             do {
                 // Credit usage only after accepted publication, never retrieval.
                 let response = try await recallForSearch(trimmed)
@@ -347,11 +397,13 @@ public final class MemoryFacade {
             }
         } publish: { query, records, error, deliveredIDs in
             guard records != nil || error != nil else { return }
-            searchResultQuery = query
-            searchResults = records
-            searchError = error
-            searchIsLoading = false
-            if error == nil, let query, let records { lastSuccessfulSearch = (query, records) }
+            var state = searchState(surface: surface)
+            state.resultQuery = query
+            state.results = records
+            state.error = error
+            state.loading = false
+            if error == nil, let query, let records { state.lastSuccessful = (query, records) }
+            searchesByPhoneSurface[surface == "ios"] = state
             // Credit exactly the delivered recall rows; the next serve repairs a dropped asynchronous usage bump.
             if !Task.isCancelled, !deliveredIDs.isEmpty {
                 Task { await recordSearchHits(ids: deliveredIDs) }
@@ -370,33 +422,6 @@ public final class MemoryFacade {
     }
 
     // MARK: - Knowledge Graph
-
-    /// A mounted graph owns its subscription, not another copy of the graph. Watch SQLite and its live WAL before reading.
-    @concurrent public nonisolated func watchGraphChanges() async {
-        let changes = FileChangeEvents(paths: [graphPath, URL(fileURLWithPath: graphPath.path + "-wal")], emitInitial: false)
-        await withTaskCancellationHandler {
-            let armed = await changes.waitUntilArmed()
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                graphObservationError = armed ? nil : "Knowledge graph live updates could not be observed. Reopen the graph to check again."
-            }
-            await loadGraph()
-            guard !Task.isCancelled else { return }
-            if await graphLoadError == nil { await refreshDiagnostics() }
-            for await _ in changes.stream {
-                guard !Task.isCancelled else { break }
-                await loadGraph()
-            }
-            if !Task.isCancelled, armed {
-                await MainActor.run {
-                    graphObservationError = "Knowledge graph live observation stopped. Reopen the graph to check again; the displayed snapshot is retained."
-                }
-            }
-        } onCancel: {
-            Task.detached(priority: .utility) { changes.cancel() }
-        }
-        changes.cancel()
-    }
 
     nonisolated private var graphPath: URL {
         dataRoot

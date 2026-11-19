@@ -45,15 +45,12 @@ import NativeAgentShared
 
 @MainActor enum GrokSecureSetupWindow {
     private static var controllers: [String: NSWindowController] = [:]
-    private static var operations: [String: UUID] = [:]
     static func closeAll() {
         let shown = controllers.values
         controllers.removeAll()
-        operations.removeAll()
         for controller in shown { controller.close(); controller.contentViewController = nil }
     }
     static func close(contact: String) {
-        operations.removeValue(forKey: contact)
         guard let controller = controllers.removeValue(forKey: contact) else { return }
         controller.close()
         controller.contentViewController = nil
@@ -81,7 +78,6 @@ import NativeAgentShared
             rootView: GrokSecureSetupCard(contact: contact, operation: operation).padding(20).environment(appModel))
         let controller = NSWindowController(window: window)
         controllers[contact] = controller
-        operations[contact] = operation
         controller.showWindow(nil)
         NSApp.activate()
         return window

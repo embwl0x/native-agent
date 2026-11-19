@@ -74,7 +74,7 @@ extension ChatView {
                                 onToggleVoice: toggleVoice,
                                 onDiscardVoice: discardDictation,
                                 onCaptureScreen: captureScreen,
-                                onAttach: attachFromClipboardOrPickFile,
+                                onAttach: pickFileToAttach,
                                 onStop: { appModel.stopChatStream() },
                                 onSend: send,
                                 onSlashCommand: { handleSlashCommand($0) },
@@ -127,7 +127,7 @@ extension ChatView {
         // Hidden chat must publish no commands; callback guards also reject stale scene actions.
         .focusedSceneValue(\.chatCommandActions, chatPageIsVisible ? ChatFocusedCommandActions(
             send: { if chatPageIsVisible { send() } },
-            attach: { if chatPageIsVisible { attachFromClipboardOrPickFile() } },
+            attach: { if chatPageIsVisible { pickFileToAttach() } },
             toggleVoice: { if chatPageIsVisible { toggleVoice() } },
             focusComposer: { if chatPageIsVisible { inputFocused = true } },
             focusTranscriptSearch: { if chatPageIsVisible { transcriptHandle.showFind() } },
@@ -148,7 +148,7 @@ extension ChatView {
             InboxStripContainer { notes in
                 // Keep posture in the composer so the header does not duplicate status.
                 ShellRoomHeader(
-                    name: appModel.agentDisplayName,
+                    name: chatContactName ?? appModel.agentDisplayName,
                     status: shellStatus,
                     onNewChat: inSimple
                         ? { Task { await appModel.newChatSession() } }

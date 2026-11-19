@@ -11,6 +11,7 @@ public enum FaceKey: Hashable, Sendable, Codable {
     case sessionPalette
     case sessionSearch(UUID)
     case page(String)
+    case pageTitle(String)
     case turn(session: String)
     case turns
     case counts
@@ -328,8 +329,6 @@ public final class FaceFeed {
     private let source: FaceFeedSource?
     private var remoteEpoch: UUID?
     private var remoteSequence: UInt64 = 0
-    /// The window records accepted page application separately from layout and drawing.
-    public var onPageApplied: (@MainActor (String, PartFaceSnapshot, TimeInterval) -> Void)?
 
     public init() { source = nil }
 
@@ -365,12 +364,7 @@ public final class FaceFeed {
         if batch.replacesAll { for slot in slots.values { slot.clear() } }
         for key in batch.removals { slots[key]?.clear() }
         for (key, value) in batch.values {
-            if case .page(let page) = key, let snapshot = value.base as? PartFaceSnapshot, let onPageApplied {
-                let started = ProcessInfo.processInfo.systemUptime
-                let changed = slot(key).apply(value)
-                let elapsed = ProcessInfo.processInfo.systemUptime - started
-                if changed { onPageApplied(page, snapshot, elapsed) }
-            } else { slot(key).apply(value) }
+            slot(key).apply(value)
         }
         for (key, text) in batch.appends { slot(key).extend(text) }
     }

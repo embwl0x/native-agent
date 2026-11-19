@@ -27,7 +27,7 @@ extension ChatGPTTransport {
         system: String?,
         tools: [LLMToolSchema]?,
         transport: OpenAIExecutionControls.Transport = .chatGPTOAuth,
-        supportedEfforts: [String]? = nil,
+        supportedEfforts: [String]? = nil, ultraEffort: String? = nil,
         supportsFast: Bool? = nil, call: LLMCall
     ) throws -> [String: Any] {
         var inputItems: [[String: Any]] = []
@@ -80,7 +80,6 @@ extension ChatGPTTransport {
             "store": false,
             "stream": true,
             "input": inputItems,
-            "text": ["verbosity": "medium"],
             "tool_choice": "auto",
             "parallel_tool_calls": true,
         ]
@@ -92,7 +91,7 @@ extension ChatGPTTransport {
             to: &body,
             model: model,
             transport: transport,
-            supportedEfforts: supportedEfforts,
+            supportedEfforts: supportedEfforts, ultraEffort: ultraEffort,
             supportsFast: supportsFast, call: call
         )
         // Stable prompt-cache routing is present only for a bound session.

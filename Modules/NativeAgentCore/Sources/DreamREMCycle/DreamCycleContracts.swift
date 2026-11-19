@@ -16,6 +16,7 @@ public enum DreamTrigger: String, Sendable, Equatable, CaseIterable, Codable {
 }
 
 public struct DreamReport: Sendable, Equatable {
+    public var moreMessagesRemain: Bool = false
     public var repair: JSONValue?
     public var sessionsProcessed: Int
     public var entriesWritten: Int

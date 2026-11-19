@@ -26,6 +26,11 @@ public enum ICloudChatFileAccessPolicy {
 
         private enum CodingKeys: String, CodingKey { case modes }
         public init(from decoder: any Decoder) throws {
+            do {
+                let value = try decoder.singleValueContainer()
+                modes = Ceiling(try value.decode(String.self)).modes
+                return
+            } catch DecodingError.typeMismatch(_, _) {}
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             let saved = try fields.decode([String].self, forKey: .modes)
             modes = try Array(Set(saved.map { raw in

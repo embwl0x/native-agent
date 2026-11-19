@@ -7,7 +7,7 @@ public enum MemoryV2Defaults {
     public static let personaID = "NativeAgent"
 }
 
-/// Enforce the canonical row bound in every insert/accept transaction and at store open.
+/// Bound active canonical memories in every insert/accept/restore transaction and at store open.
 public let memoryStoredRowCap = 2_000
 
 public enum MemoryLifecycle {
@@ -252,7 +252,7 @@ public enum MemoryStorageError: Error, LocalizedError {
                 code: "memory_dates_invalid", status: .refused,
                 instruction: "Correct the named date evidence in the original call.", recovery: .correctArguments)
         case .capacityExceeded:
-            return ToolFailureError("The memory store limit cannot be met without removing protected memories.", effects: .none,
+            return ToolFailureError("The active memory limit cannot be met without archiving protected memories.", effects: .none,
                 nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
                 code: "memory_capacity_reached", status: .refused,
                 instruction: "Review saved memories; leave this candidate unsaved unless you deliberately choose a memory to forget.", recovery: .inspect)

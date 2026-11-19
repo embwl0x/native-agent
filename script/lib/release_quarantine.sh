@@ -35,9 +35,6 @@
 #         ... publish ...
 #         release_quarantine_promote "$QDIR" "$ROOT/dist"
 
-# shellcheck disable=SC2034
-RELEASE_QUARANTINE_LIB_LOADED=1
-
 RELEASE_QUARANTINE_README=".QUARANTINE-DO-NOT-SHIP.txt"
 # Only artifacts THIS run put in quarantine may be promoted. Without that, a
 # v0.1.9 run that failed after quarantining would have its never-published

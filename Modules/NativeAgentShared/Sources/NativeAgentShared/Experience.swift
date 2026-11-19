@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `Experience.swift` | Canonical experience and obligation lifecycle value contracts shared by domain owners |
+// Blueprint: | `Experience.swift` | Canonical experiences with birth steering stamps and obligation lifecycle contracts |
 
 /// One happening in the agent's life (docs/EXPERIENCE.md), written once by the owner of the happening and only ever appended to: evidence attaches, claims
 /// accrue, obligations settle. Everything else is a view of experiences by id. Destinations name `her`, `person`, `conversation:<session>`, or a
@@ -92,6 +92,7 @@ public struct Experience: Codable, Sendable, Equatable {
     public var addressedTo: [String]
     public var owes: [String: Obligation]
     public var claims: [Claim]
+    public var steeredBy: [String]?
     /// The change itself, on an experience of kind `happening`.
     public var happening: Happening?
     /// What it attended, on an experience of kind `thought`.
@@ -99,7 +100,7 @@ public struct Experience: Codable, Sendable, Equatable {
 
     public init(id: String, kind: Kind, cause: [String] = [], evidence: [Ref] = [], outcome: Outcome? = nil,
                 face: Face? = nil, addressedTo: [String] = [], owes: [String: Obligation] = [:], claims: [Claim] = [],
-                happening: Happening? = nil, thought: Thought? = nil) {
+                happening: Happening? = nil, thought: Thought? = nil, steeredBy: [String]? = nil) {
         self.id = id
         self.kind = kind
         self.cause = cause
@@ -111,6 +112,7 @@ public struct Experience: Codable, Sendable, Equatable {
         self.claims = claims
         self.happening = happening
         self.thought = thought
+        self.steeredBy = steeredBy
     }
 
     /// It still owes something; the open experiences are the picture the agent is in.

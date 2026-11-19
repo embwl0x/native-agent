@@ -26,7 +26,7 @@ extension TelegramPollLoop {
                 message: nil,
                 text: nil
             )
-            await answer("This Telegram control is not authorized.")
+            await answer("This is the owner's control; your Telegram sender must be allowlisted.")
             return true
         }
         guard let card = await turnCoordinator.controlCard(
@@ -85,7 +85,7 @@ extension TelegramPollLoop {
     }
 
     func isAllowlistedControl(chatId: Int, fromUserId: Int?) -> Bool {
-        Self.inboundAuthorizationDecision(allowedChatIds: allowedChatIds, allowedUserIds: allowedUserIds,
+        Self.controlAuthorizationDecision(allowedChatIds: allowedChatIds, allowedUserIds: allowedUserIds,
             chatId: chatId, fromUserId: fromUserId) == .allowed
     }
 

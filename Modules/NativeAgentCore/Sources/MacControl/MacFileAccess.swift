@@ -3,9 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(Darwin)
 import Darwin
-#endif
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -37,10 +35,9 @@ public final class FileBytes: Sendable {
         return try handle.read(upToCount: max(0, maxBytes)) ?? Data()
     }
     private func regularFileHandle(at url: URL, writing: Bool) throws -> FileHandle {
-        #if canImport(Darwin)
         // A FIFO blocks during open, before FileHandle can impose any read limit. Inspect the opened descriptor, not a racy path preflight.
-        let flags = writing ? O_WRONLY | O_APPEND : O_RDONLY
-        let fd = Darwin.open(url.path, flags | O_NONBLOCK | O_CLOEXEC)
+        let flags = writing ? O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW : O_RDONLY
+        let fd = Darwin.open(url.path, flags | O_NONBLOCK | O_CLOEXEC, 0o666)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         var metadata = stat()
         guard fstat(fd, &metadata) == 0 else {
@@ -55,30 +52,14 @@ public final class FileBytes: Sendable {
             ])
         }
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        #else
-        return try writing ? FileHandle(forWritingTo: url) : FileHandle(forReadingFrom: url)
-        #endif
     }
     public func writeData(_ data: Data, to url: URL, append: Bool) throws {
-        let fm = FileManager.default
-        let appendToExisting: Bool
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if append {
-            switch entry(at: url) {
-            case .present: appendToExisting = true
-            case .absent: appendToExisting = false
-            case .unavailable(let error): throw error
-            }
-        } else {
-            appendToExisting = false
-        }
-        if appendToExisting {
             let handle = try regularFileHandle(at: url, writing: true)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
             try handle.write(contentsOf: data)
+            try handle.close()
         } else {
-            let parent = url.deletingLastPathComponent()
-            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
             // A failed replacement (including a full disk) must leave the previous file intact, rather than truncating it before writing.
             try data.write(to: url, options: .atomic)
         }

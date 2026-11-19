@@ -1,15 +1,13 @@
 import Foundation
 import MacIntegration
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceReadiness.swift` | `AgentWorkspaceReadiness` enum; explicit operation permission evidence through `withSnapshot`, `filter` |
+// Blueprint: | `AgentWorkspaceReadiness.swift` | Per-call permission evidence and named owner action filtering |
 
-/// Presentation evidence only. Actual execution always re-enters the normal tool admission chain. No background refresh, app launch or remote probe.
 package enum AgentWorkspaceReadiness {
     struct Snapshot: Sendable {
         let permissions: Result<MacIntegrationPermissionReadiness, Error>
     }
 
-    /// Share permission evidence within one action, never across actions where a grant may have been revoked.
     package static func withSnapshot<T: Sendable>(workspace: WorkspaceOperation, dataRoot: URL,
         operation: @Sendable (WorkspaceOperation) async throws -> T) async rethrows -> T {
         let permissions: Result<MacIntegrationPermissionReadiness, Error>
@@ -28,12 +26,9 @@ package enum AgentWorkspaceReadiness {
     }
 
     static func allows(workspace: WorkspaceOperation, _ action: AgentWorkspaceAction) -> Bool {
-        if case .window(let inner) = action { return allows(workspace: workspace, inner) }
         return tool(action).map { allows(workspace: workspace, tool: $0) } ?? true
     }
 
-    /// Remove misleading active controls from every projected surface, including Mail reply items and generic capability forms. This never grants access;
-    /// changes after presentation are still enforced by the actual dispatcher.
     static func filter(workspace: WorkspaceOperation, _ projection: WorkspacePage) -> WorkspacePage {
         var result = projection
         var hidden = 0
@@ -63,7 +58,7 @@ package enum AgentWorkspaceReadiness {
             else { content = ["result": result.content] }
             content["permission_note"] = .string(permissions == nil
                 ? "Mac permission settings could not be read. Integration actions are hidden until those settings are available."
-                : "Actions turned off by the operator are hidden. Existing drafts can still be kept or edited; no permission was changed.")
+                : "Actions turned off by the operator are hidden; no permission was changed.")
             if let cause {
                 content["permission_note"] = .string(
                     "Mac permission settings are unavailable: \(cause) Integration actions are hidden until the saved authority is repaired.")
@@ -87,8 +82,7 @@ package enum AgentWorkspaceReadiness {
 
     private static func tool(_ action: AgentWorkspaceAction) -> String? {
         switch action {
-        case .perform(let tool, _, _, _, _), .configure(let tool, _, _): return tool
-        case .submit(let form): return form.tool
+        case .perform(let tool, _, _, _, _): return tool
         case .open(.record(let tool, _, _)): return tool
         default: return nil
         }

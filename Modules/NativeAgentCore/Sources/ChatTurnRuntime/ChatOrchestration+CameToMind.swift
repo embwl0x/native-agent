@@ -10,7 +10,7 @@ import AgentWorkspace
 import Experiences
 import NativeAgentCore
 
-// Blueprint: | `ChatOrchestration+CameToMind.swift` | `SwiftNativeTurnEngine.cameToMind(after:turn:held:sessionId:surface:)`: non-preview lines first met (`FamiliarLines`) form a moment; the recorder's dispatch predicate and ExpansionDispatcher's nested preview marker exclude proposals before familiarity and recall; memories join the agent's conversation at most two a round and four a turn, traced as `mind.came_to_mind` |
+// Blueprint: | `ChatOrchestration+CameToMind.swift` | `SwiftNativeTurnEngine.cameToMind(after:turn:held:sessionId:surface:)`: non-preview lines first met (`FamiliarLines`) form a moment; the recorder's dispatch predicate excludes previews before familiarity and recall; memories join the agent's conversation at most two a round and four a turn, traced as `mind.came_to_mind` |
 
 extension SwiftNativeTurnEngine {
     func familiarityFailure(_ error: Error, root: URL, turn: Turn) -> String? {
@@ -56,7 +56,7 @@ extension SwiftNativeTurnEngine {
                     total += text.count
                 }
             case .object(let fields):
-                for name in fields.keys.sorted() where name != ExpansionDispatcher.previewResultsKey {
+                for name in fields.keys.sorted() {
                     if let field = fields[name] { walk(field) }
                 }
             case .array(let values):

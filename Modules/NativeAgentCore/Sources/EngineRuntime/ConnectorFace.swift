@@ -9,6 +9,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Transcripts
+import TrustCenter
 // Blueprint: | `ConnectorFace.swift` | The Connectors page: one connector list (accounts from `ConnectorReadiness`, the iPhone, each agent) whose rows hold their own settings, then kept secrets and folders; each row is a door call, and the `connections` verbs the stem pages call run here |
 
 /// A host verb's effect, as its owner's `prepare` returns it once every lookup the verb needs has held: what runs, and its words.
@@ -250,6 +251,7 @@ extension NativeAgentEngine {
     /// read from its own owner, and one part's failed read is that part's failed row; the others still draw.
     @MainActor func connectorsFaceRead() -> PartFaces.Read {
         let accounts = connectors.faceReader(pages: pages)
+        contactThreads.start()
         watchPhoneFace()
         return { [self] in try await connectorsFace(accounts: accounts) }
     }
@@ -308,9 +310,6 @@ extension NativeAgentEngine {
         }
     }
 
-    /// The `connections` host's verbs the rows of Providers, Connectors (Telegram, iPhone, agents) and Capabilities call
-    /// (`AppActions.providersConnectorsCapabilitiesVerbs`), each running its owner's code. The door judged the call before it came here (a
-    /// lever runs only as the person's own act); the owner's words are the reply's detail, and its refusal or failure is its own code.
     @MainActor public func connectionsVerb(_ verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let effect: HostVerbEffect
         do {
@@ -367,15 +366,18 @@ extension NativeAgentEngine {
         case "capability_check_trust": return try CapabilitiesFace.checkTrust(self, id: text("id"))
         case "connector_dry_run": return try CapabilitiesFace.connectorDryRun(self, id: text("id"))
         case "native_dry_run", "native_run": return try CapabilitiesFace.nativeAction(self, id: text("id"), dryRun: verb == "native_dry_run")
-        case "improvement_run": return { [self] in try await CapabilitiesFace.runImprovement(self) }
         case "browser_preview": return { [self] in try await CapabilitiesFace.previewBrowser(self) }
         case "browser_cancel": return try CapabilitiesFace.cancelBrowser(self, id: text("id"))
         case "tools_refresh": return { [self] in try await CapabilitiesFace.refreshTools(self) }
         case "sense_switch": return try await CapabilitiesFace.switchSense(id: text("sense_id"), version: version, on: input["value"]?.boolValue,
             byPerson: AppToolExecutor.personDecided(tool: "connections", input: input, turn: turn))
         case "sense_share": return try await CapabilitiesFace.shareSense(self, id: text("sense_id"), version: version)
-        case "ability_keep": return try CapabilitiesFace.keepAbility(self, id: text("id"), version: input["version"]?.stringValue)
-        case "ability_off": return try CapabilitiesFace.switchOffAbility(self, id: text("id"))
+        case "ability_keep": return try await CapabilitiesFace.keepAbility(self, id: text("id"), version: input["version"]?.stringValue,
+            byPerson: PermissionLaw.personDecided(tool: "app", input: ["action": .string("ability.keep"),
+                "args": .object(input.filter { $0.key != "verb" && !$0.key.hasPrefix("__") })], turn: turn), turn: turn)
+        case "ability_off": return try CapabilitiesFace.switchOffAbility(self, id: text("id"),
+            byPerson: PermissionLaw.personDecided(tool: "app", input: ["action": .string("ability.off"),
+                "args": .object(input.filter { $0.key != "verb" && !$0.key.hasPrefix("__") })], turn: turn), turn: turn)
         case "skill_build": return try CapabilitiesFace.buildSkill(self)
         default: return nil
         }
@@ -434,9 +436,9 @@ enum ConnectorFaceState: Int {
             || health.map({ ["needs_auth", "needs_probe", "needs_permission", "probe_needed", "needs_config", "needs_setup"].contains($0) }) == true {
             return .needsAuth
         }
-        if auth == "connected" || auth == "configured" || health == "ok" { return .live }
+        if health.map({ ["ok", "healthy", "connected", "active", "live"].contains($0) }) == true { return .live }
         if health == "ready" { return auth == "planned" ? .planned : .ready }
-        if auth == "not_required" { return .ready }
+        if health == nil || health == "unknown" || health == "" { return .unverified }
         return .unknown
     }
 }
@@ -459,7 +461,9 @@ extension ConnectorRecord {
         let health = healthStatus?.trimmingCharacters(in: .whitespacesAndNewlines)
         let auth = authState?.trimmingCharacters(in: .whitespacesAndNewlines)
         switch connectionState {
-        case .unverified: return auth?.lowercased() == ConnectorHealthDecay.configuredAuth ? "Set up · Not checked" : "Not checked"
+        case .unverified:
+            return auth.map { [ConnectorHealthDecay.configuredAuth, "connected", "not_required"].contains($0.lowercased()) } == true
+                ? "Set up · Not checked" : "Not checked"
         case .planned: return "Not available yet"
         case .ready: return "Ready"
         case .comingSoon: return "Coming soon"

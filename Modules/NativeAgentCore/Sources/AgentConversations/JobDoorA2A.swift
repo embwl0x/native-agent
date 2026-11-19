@@ -25,7 +25,7 @@ struct A2AJobDoor: JobRunner {
         } catch { throw JobRefusal("\(job.contact.name)'s message could not be built: \(error.localizedDescription). Nothing was sent.") }
         // From here the brief may have reached it: a failure is the stem's to record, never a refusal.
         let first = try await Self.exchange(request, link: link, contact: job.contact, task: nil)
-        return follow(job, from: first, link: link)
+        return try follow(job, from: first, link: link)
     }
 
     func resume(_ job: JobStart, session: String) async throws -> AsyncThrowingStream<JobEvent, Error> {
@@ -34,7 +34,7 @@ struct A2AJobDoor: JobRunner {
         do { request = try AgentA2AWire.taskRequest(taskID: session, interface: link.interface) }
         catch { throw JobRefusal("Task \(session) could not be asked for: \(error.localizedDescription). Nothing was sent.") }
         let first = try await Self.exchange(request, link: link, contact: job.contact, task: session)
-        return follow(job, from: first, link: link)
+        return try follow(job, from: first, link: link)
     }
 
     func cancel(session: String) async throws { await JobDoorLive.shared.stop(Self.door + ":" + session) }
@@ -62,7 +62,8 @@ struct A2AJobDoor: JobRunner {
         return try AgentA2AWire.normalizeResponse(payload, interface: link.interface, expectedRequestID: request.requestID, expectedTaskID: task)
     }
 
-    private func follow(_ job: JobStart, from first: AgentA2AWire.Result, link: Link) -> AsyncThrowingStream<JobEvent, Error> {
+    private func follow(_ job: JobStart, from first: AgentA2AWire.Result, link: Link) throws -> AsyncThrowingStream<JobEvent, Error> {
+        if first.kind == "task", let task = first.taskID { try job.handle(task) }
         let (stream, continuation) = AsyncThrowingStream<JobEvent, Error>.makeStream()
         let out = JobDoorOut(continuation, contact: job.contact)
         let run = JobDoorRun()
@@ -106,27 +107,26 @@ struct A2AJobDoor: JobRunner {
             }
         }
         guard !Task.isCancelled else {
-            // The agent's stop reaches the remote task through its own cancel.
+            var stopped = "its job was stopped"
             if let task {
-                // The stop itself must not be cancelled with the run it ends.
                 let sent = await Task.detached {
                     try await Self.exchange(try AgentA2AWire.cancelRequest(taskID: task, interface: link.interface), link: link,
                                             contact: job.contact, task: task)
                 }.result
                 if case .failure(let error) = sent {
-                    nativeLog("A2A job door: the cancel of task %@ was not confirmed: %@", task, error.localizedDescription)
+                    stopped = "its job was stopped here, but the remote task's cancel was not confirmed: " + error.localizedDescription
                 }
                 await JobDoorLive.shared.release(Self.door + ":" + task, run)
             }
-            return out.stopped("its job was stopped")
+            return out.stopped(stopped)
         }
         if let task { await JobDoorLive.shared.release(Self.door + ":" + task, run) }
         switch result.state {
         case "completed", "reply":
             let kept = Self.keep(result, interface: link.interface, job: job)
-            if let gap = kept.gap { out.send(.working(note: gap)) }
-            out.send(.deliverable(JobDeliverable(artifacts: kept.files, report: result.text.isEmpty ? nil : result.text, model: nil)))
-            out.send(.ended(.finished))
+            out.send(.deliverable(JobDeliverable(artifacts: kept.files, report: result.text.isEmpty ? nil : result.text,
+                                                model: nil, inventoryFailure: kept.gap)))
+            out.send(.ended(kept.gap.map(JobOutcome.failed) ?? .finished))
         case "canceled": out.send(.ended(.stopped("\(name) cancelled its task")))
         default: out.send(.ended(.failed("\(name)'s task ended \(result.state)" + (result.text.isEmpty ? "" : ": " + String(result.text.prefix(500))))))
         }
@@ -141,7 +141,13 @@ struct A2AJobDoor: JobRunner {
             catch { skipped.append("an unreadable part (\(error.localizedDescription))"); return nil }
         }
         for value in result.parts {
-            guard let part = canonical(value), let raw = part["raw"]?.stringValue else { continue }
+            guard let part = canonical(value) else { continue }
+            guard let raw = part["raw"]?.stringValue else {
+                if let url = part["url"]?.stringValue {
+                    skipped.append("\(part["filename"]?.stringValue ?? "a returned file") at \(url), which was not fetched")
+                }
+                continue
+            }
             guard let bytes = Data(base64Encoded: raw) else { skipped.append("a file part that is not base64"); continue }
             pieces.append((part["filename"]?.stringValue ?? "returned-file", bytes))
         }

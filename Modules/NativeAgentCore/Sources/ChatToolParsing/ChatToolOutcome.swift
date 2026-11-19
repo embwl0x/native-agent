@@ -138,7 +138,7 @@ public enum ChatToolOutcome {
         let classification = ChatToolOutcome.recordedResultClass(value) ?? reply.outcome
         let macOutcome = MacControlReceiptOutcome.projecting(envelope: value)
         let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
-        // These display distinctions belong to status/string-error envelopes, not state or structured errors.
+        // Failure and partial display distinctions use status/string-error envelopes, not state or structured errors.
         let status = fields["status"]?.stringValue == nil ? nil : reply.status
         let error = fields["error"]?.stringValue == nil ? nil : reply.failure
         switch classification {
@@ -161,7 +161,8 @@ public enum ChatToolOutcome {
             if fields["streamClosed"] == .bool(true) { return .connectionFailed }
             if reply.isWaitingInteraction { return .needsYou }
             if status == "partial" || fields["partial"] == .bool(true) { return .partial }
-            if status == "running" || macOutcome == .running { return .pending }
+            if macOutcome == .effectUnconfirmed { return .unknown }
+            if reply.status.map(inProgressStatuses.contains) == true || macOutcome == .running { return .pending }
             return .unknown
         }
     }
@@ -296,16 +297,23 @@ public enum ChatToolOutcome {
             "session_unavailable", "needs_topic",
     ]
 
+    /// An owner's explicit progress is distinct from an unconfirmed effect.
+    package static let inProgressStatuses: Set<String> = [
+        "accepted", "held", "pending", "queued", "running", "scheduled", "submitted", "waiting",
+        // The contact doors' own progress words: an A2A task working, a message enqueued, a helper joined.
+        "working", "enqueued", "joined",
+    ]
+
     /// Non-final statuses cannot establish completion.
-    package static let pendingStatuses: Set<String> = [
-        "accepted", "attention", "awaiting_approval", "dry_run",
+    package static let pendingStatuses: Set<String> = inProgressStatuses.union([
+        "attention", "awaiting_approval", "dry_run",
         // An inline question ran nothing and belongs with non-terminal envelopes.
         "needs_input",
-        "pending", "pending_approval", "partial", "queued", "scheduled", "ready",
-        "running", "started", "waiting", "waiting_approval", "skipped", "submitted", "unknown", "warning",
+        "pending_approval", "partial", "ready",
+        "started", "waiting_approval", "skipped", "unknown", "warning",
         // Unconfirmed effects and interrupted handoffs remain non-terminal.
         "interrupted", "outcome_unknown", "needs_attention", "approval_required", "approval_filed", "requires_interaction",
-    ]
+    ])
 
     /// Classification and trace status share this finality predicate so an open call cannot look finished.
     package static func saysOutcomeOpen(_ output: JSONValue) -> Bool {

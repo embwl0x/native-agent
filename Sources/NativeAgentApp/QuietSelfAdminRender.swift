@@ -363,7 +363,6 @@ struct QuietPage: Sendable, Equatable {
 
 enum QuietPages {
     static let all = QuietToolPage.all.map(QuietPage.init)
-    static var ids: [String] { QuietToolPage.ids }
     static let drawOnly: [QuietPage] = [
         QuietPage(value: QuietToolPage(id: "simple", title: "Simple view",
                   summary: "The Simple shell on Chat: my card, the places, the folded Agents and Helpers lists, and the chat.")),
@@ -500,9 +499,5 @@ enum QuietPages {
         }
     }
 
-    private static func text(_ value: JSONValue?) -> String {
-        guard case .string(let raw)? = value else { return "" }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 
 }

@@ -20,6 +20,7 @@ import MultimodalTTS
 import SystemOps
 import TelegramBot
 import DeviceSync
+import Privacy
 // Blueprint: | `AppModel+PanelRefresh.swift` | Panel commands and selected freshness reads; `PanelFreshnessOwner` admits receipts off main |
 
 @MainActor
@@ -32,7 +33,7 @@ extension AppModel {
         guard result.admitted else { return result.receipt }
         let receipt = result.receipt
         if item == .diagnostics {
-            switch engine.doctor.health?.ok {
+            switch engine.doctor.health?.reachable {
             case true?: statusText = "I'm online"
             case false?: statusText = "I'm unavailable"
             case nil: statusText = "My connection status is unknown"
@@ -57,9 +58,9 @@ extension AppModel {
         // Branches that perform no read must not claim refreshed data.
         var performedRead = true
         /// Retain displayed values while recording unavailable endpoints.
-        func fresh<T>(_ endpoint: String, _ value: T?) -> T? {
-            if value == nil { failedEndpoints.append(endpoint) }
-            return value
+        func fresh(_ endpoint: String, _ failure: String?) -> Bool {
+            if let failure { failedEndpoints.append(endpoint + ": " + failure) }
+            return failure == nil
         }
 
         // Navigation fetches page data; health reads belong to refreshAll and each health consumer.
@@ -71,12 +72,12 @@ extension AppModel {
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
             // Before the first names are saved there is no personality to read: absent, not a failed refresh.
             let named = FileManager.default.fileExists(atPath: engine.dataRoot.appendingPathComponent("memory/profile.json").path)
-            let documents = try? await persona.loadDocuments()
-            if named { _ = fresh("personality", documents) }
+            let documentsFailure = await panelRead { _ = try await persona.loadDocuments() }
+            if named { _ = fresh("personality", documentsFailure) }
             // Load the profile on Chat entry so names come from their owner.
             if persona.profile == nil {
-                let profile = try? await persona.loadProfile()
-                if named { _ = fresh("personality profile", profile) }
+                let profileFailure = await panelRead { _ = try await persona.loadProfile() }
+                if named { _ = fresh("personality profile", profileFailure) }
                 teachMemoryHygieneName(previousName: previousName)
             }
         case .bots:
@@ -86,13 +87,13 @@ extension AppModel {
             performedRead = false
             break
         case .memories, .knowledge:
-            async let nextMemories = try? memory.refreshMemories()
-            async let nextMemoryProposals = try? memory.proposals(status: "pending")
+            async let nextMemories = panelRead { _ = try await memory.refreshMemories() }
+            async let nextMemoryProposals = panelRead { _ = try await memory.proposals(status: "pending") }
             async let nextMemoryStatus = memory.refreshStatuses()
             async let nextGraph: Void = memory.loadGraph()
-            async let nextPersonality = try? persona.loadProfile()
-            async let nextTrustPolicy = try? engine.trust.load()
-            let (memoryRows, proposalRows, _, _, personalityRow, trustRow) = await (
+            async let nextPersonality = panelRead { _ = try await persona.loadProfile() }
+            async let nextTrustPolicy = panelRead { _ = try await engine.trust.load() }
+            let (memoryFailure, proposalFailure, _, _, personalityFailure, trustFailure) = await (
                 nextMemories,
                 nextMemoryProposals,
                 nextMemoryStatus,
@@ -100,19 +101,18 @@ extension AppModel {
                 nextPersonality,
                 nextTrustPolicy
             )
-            _ = fresh("memories", memoryRows)
-            if memoryRows != nil {
+            if fresh("memories", memoryFailure) {
                 // Even unchanged newest-200 rows can conceal a changed older search hit; refresh search after every successful read.
                 await memory.refreshSearch()
             }
-            _ = fresh("memory proposals", proposalRows)
+            _ = fresh("memory proposals", proposalFailure)
             failedEndpoints += memory.statusRefresh?.failedEndpoints ?? []
-            _ = fresh("personality", personalityRow)
+            _ = fresh("personality", personalityFailure)
             teachMemoryHygieneName(previousName: previousName)
-            _ = fresh("trust policy", trustRow)
+            _ = fresh("trust policy", trustFailure)
         case .connectors:
-            _ = fresh("connectors", try? await engine.connectors.refresh().get())
-            _ = fresh("shared folders", try? await engine.connectors.refreshWorkspaces())
+            _ = fresh("connectors", await panelRead { _ = try await engine.connectors.refresh().get() })
+            _ = fresh("shared folders", await panelRead { _ = try await engine.connectors.refreshWorkspaces() })
         case .providers:
             // Arriving here asks only a connected provider with no list saved for its current credential.
             engine.providers.fetchMissingModelListsInBackground()
@@ -122,77 +122,74 @@ extension AppModel {
             case .failed: failedEndpoints.append("providers")
             }
         case .settings:
-            async let nextConfig: Void? = try? RuntimeReadouts.configuration(engine: engine)
-            async let nextTelegramStatus = try? engine.telegram.refresh(manager: backgroundLoopsManager)
-            async let nextConnectors = try? engine.connectors.refresh().get()
-            let (configRow, telegramRow, connectorRows) = await (
+            async let nextConfig = panelRead { try await RuntimeReadouts.configuration(engine: engine) }
+            async let nextTelegramStatus = panelRead { _ = try await engine.telegram.refresh(manager: backgroundLoopsManager) }
+            async let nextConnectors = panelRead { _ = try await engine.connectors.refresh().get() }
+            let (configurationFailure, telegramFailure, connectorFailure) = await (
                 nextConfig,
                 nextTelegramStatus,
                 nextConnectors
             )
-            _ = fresh("config", configRow)
-            _ = fresh("telegram status", telegramRow)
-            _ = fresh("connectors", connectorRows)
+            _ = fresh("config", configurationFailure)
+            _ = fresh("telegram status", telegramFailure)
+            _ = fresh("connectors", connectorFailure)
         case .activity:
             let badgeReceipt = await refreshSidebarActivityBadge()
             failedEndpoints += badgeReceipt.failedEndpoints
         case .capabilities:
             async let nextCatalog = engine.trust.refreshCapabilityCatalog()
-            async let nextWorkflows: Void? = try? engine.desk.refreshWorkflows()
             async let nextNativePower = toolStore.refreshNativePower()
             async let nextHardening = engine.doctor.refreshHardening()
-            async let nextConnectorActions = try? engine.connectors.refreshActions()
-            async let nextTrust = try? engine.trust.load()
-            let (_, workflowRead, _, _, connectorRead, trustRead) = await (
-                nextCatalog, nextWorkflows, nextNativePower, nextHardening, nextConnectorActions, nextTrust)
+            async let nextConnectorActions = panelRead { _ = try await engine.connectors.refreshActions() }
+            async let nextTrust = panelRead { _ = try await engine.trust.load() }
+            let (_, _, _, connectorFailure, trustFailure) = await (
+                nextCatalog, nextNativePower, nextHardening, nextConnectorActions, nextTrust)
             failedEndpoints += engine.trust.catalogRefresh?.failedEndpoints ?? []
             failedEndpoints += toolStore.nativePowerRefresh?.failedEndpoints ?? []
             failedEndpoints += engine.doctor.hardeningRefresh?.failedEndpoints ?? []
-            _ = fresh("workflows", workflowRead)
-            _ = fresh("connector actions", connectorRead)
-            _ = fresh("trust policy", trustRead)
+            _ = fresh("connector actions", connectorFailure)
+            _ = fresh("trust policy", trustFailure)
             await engine.pages.refresh(page: "capabilities")
         case .dreams:
             // Refresh Trust on Dreams entry so the REM switch reflects the saved policy; the tab owns its diary read.
-            _ = fresh("trust policy", try? await engine.trust.load())
+            _ = fresh("trust policy", await panelRead { _ = try await engine.trust.load() })
         case .cognition, .inboxPolicy:
             // The Inbox face reads its own owner through engine.pages.
             performedRead = false
         case .diagnostics:
             await refreshLiveDoctorCoverage()
             await engine.refreshDiagnosticsLivingStatus()
-            async let nextActivity: Void? = try? engine.doctor.refreshActivity()
-            async let nextRuns = try? engine.runs.refresh(dataRoot: engine.dataRoot)
+            async let nextActivity = panelRead { try await engine.doctor.refreshActivity() }
+            async let nextRuns = panelRead { _ = try await engine.runs.refresh(dataRoot: engine.dataRoot) }
             async let nextWatchdog = engine.doctor.refreshWatchdog(manager: backgroundLoopsManager)
             await engine.doctor.refreshHealth()
-            let (activityRows, runRows, watchdogRow) = await (
+            let (activityFailure, runFailure, _) = await (
                 nextActivity,
                 nextRuns,
                 nextWatchdog
             )
-            _ = fresh("activity", activityRows)
-            _ = fresh("runs", runRows)
-            _ = fresh("watchdog", watchdogRow)
+            _ = fresh("activity", activityFailure)
+            _ = fresh("runs", runFailure)
         case .personality:
-            async let nextPersonality = try? persona.loadProfile()
+            async let nextPersonality = panelRead { _ = try await persona.loadProfile() }
             async let nextDocs = reloadPersonalityDocuments()
-            let (personalityRow, docsResponse) = await (
+            let (personalityFailure, docsResponse) = await (
                 nextPersonality,
                 nextDocs
             )
-            _ = fresh("personality", personalityRow)
+            _ = fresh("personality", personalityFailure)
             teachMemoryHygieneName(previousName: previousName)
-            if case .failed = docsResponse { failedEndpoints.append("personality docs") }
+            if case .failed(let detail, _) = docsResponse { failedEndpoints.append("personality docs: " + detail) }
         case .trust:
-            async let nextTrust = try? engine.trust.load()
-            async let nextConnectors = try? engine.connectors.refresh().get()
-            async let nextWorkspaces = try? engine.connectors.refreshWorkspaces()
-            async let nextBackups = try? engine.trust.refreshBackups()
-            let (trustRow, connectorRows, workspaceRows, backupRows) = await (nextTrust, nextConnectors, nextWorkspaces, nextBackups)
-            _ = fresh("trust policy", trustRow)
-            _ = fresh("connectors", connectorRows)
-            _ = fresh("workspaces", workspaceRows)
-            _ = fresh("backups", backupRows)
+            async let nextTrust = panelRead { _ = try await engine.trust.load() }
+            async let nextConnectors = panelRead { _ = try await engine.connectors.refresh().get() }
+            async let nextWorkspaces = panelRead { _ = try await engine.connectors.refreshWorkspaces() }
+            async let nextBackups = panelRead { _ = try await engine.trust.refreshBackups() }
+            let (trustFailure, connectorFailure, workspaceFailure, backupFailure) = await (nextTrust, nextConnectors, nextWorkspaces, nextBackups)
+            _ = fresh("trust policy", trustFailure)
+            _ = fresh("connectors", connectorFailure)
+            _ = fresh("workspaces", workspaceFailure)
+            _ = fresh("backups", backupFailure)
         case .inspector:
             performedRead = false
         case .ownPage:
@@ -205,10 +202,11 @@ extension AppModel {
 
     // MARK: - Panel staleness
 
-    func panelStaleNotice(for item: SidebarItem) -> String? {
-        let id = item.rawValue
-        return face.slot(.counts).select("panel.notice.\(id)", as: CountsFace.self) { $0?.panels.panels[id]?.staleNotice }
+    private func panelRead(_ operation: @MainActor () async throws -> Void) async -> String? {
+        do { try await operation(); return nil }
+        catch { return NativeAppSecretRedactor.redactText(error.localizedDescription) }
     }
+
 
     @MainActor
     @discardableResult
@@ -224,19 +222,19 @@ extension AppModel {
         let approvalStore = engine.approvals
         let inbox = engine.inbox
         let memory = engine.memory
-        async let nextApprovals = try? approvalStore.list()
-        async let nextInbox = try? inbox.list()
-        async let nextMemoryProposals = try? memory.proposals(status: "pending")
-        let (approvalRows, inboxRows, proposalRows) = await (
+        async let nextApprovals = panelRead { _ = try await approvalStore.list() }
+        async let nextInbox = panelRead { _ = try await inbox.list() }
+        async let nextMemoryProposals = panelRead { _ = try await memory.proposals(status: "pending") }
+        let (approvalFailure, inboxFailure, proposalFailure) = await (
             nextApprovals,
             nextInbox,
             nextMemoryProposals
         )
         // Approval, inbox and proposal reads must publish through their owners.
         var failed: [String] = []
-        if approvalRows == nil { failed.append("approvals") }
-        if inboxRows == nil { failed.append("inbox") }
-        if proposalRows == nil { failed.append("memory proposals") }
+        if let approvalFailure { failed.append("approvals: " + approvalFailure) }
+        if let inboxFailure { failed.append("inbox: " + inboxFailure) }
+        if let proposalFailure { failed.append("memory proposals: " + proposalFailure) }
         return failed
     }
 }

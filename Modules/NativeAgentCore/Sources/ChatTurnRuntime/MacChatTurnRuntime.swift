@@ -171,7 +171,7 @@ public final class MacChatTurnRuntime {
             }
             if let didWrite { didWrite(result) }
             else if case .failure(let error) = result {
-                SystemToastCenter.shared.push(error: "Stop could not be saved: " + error.localizedDescription, autoDismissAfter: nil)
+                SystemToastCenter.shared.push(error: "Stop could not be saved: " + error.localizedDescription)
             }
         }
         pendingStopWrites[sessionId] = write

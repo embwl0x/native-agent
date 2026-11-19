@@ -103,7 +103,7 @@ struct SettingsViewFull: View {
     private var connectionFace: PartFace {
         var healthRows: [PartFace.Row] = []
         if let health = store.sync.health {
-            healthRows = [.init(id: "state", title: "Health", value: health.ok ? "Reported healthy" : "Reported issue"),
+            healthRows = [.init(id: "state", title: "Health", value: "Doctor: \(health.doctorStatus ?? "unmeasured")"),
                 .init(id: "app", title: "App", value: health.app),
                 .init(id: "version", title: "Version", value: SettingsMacHealthPresentation.versionText(health.version)),
                 .init(id: "uptime", title: "Uptime", value: SettingsMacHealthPresentation.uptimeText(health.launchedAt))]
@@ -211,9 +211,7 @@ enum SettingsICloudRefreshPresentation {
 final class SettingsStore: ObservableObject {
     let sync: iCloudSyncEngine
     @Published var isLoading = false
-    @Published var error: String?
     @Published private(set) var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
-    @Published private(set) var hasCompletedRefresh = false
     private var refreshTask: Task<SettingsSnapshotRefreshOutcome, Never>?
     init(sync: iCloudSyncEngine = .shared) {
         self.sync = sync
@@ -225,8 +223,6 @@ final class SettingsStore: ObservableObject {
         isLoading = true
         let task = Task { @MainActor in
             let outcome = await sync.refreshSettingsSnapshot()
-            error = outcome.feedbackMessage
-            hasCompletedRefresh = true
             guard outcome.state != .superseded else { return outcome }
             availableFields = outcome.availableFields
             return outcome

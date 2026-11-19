@@ -60,8 +60,6 @@ struct DreamPayload: Decodable {
     let cares: [String]
     let lessons: [DreamLesson]
     let careMerges: [CognitiveCareMerge]
-    /// Expose unreadable written entries so dropped dream content cannot disappear silently.
-    let careMergesMalformed: Int
     let careStanceChanges: [CognitiveCareStanceChange]
     let traits: [CognitiveSelfKnowledge.Trait]
     let story: [CognitiveSelfKnowledge.Story]
@@ -126,7 +124,6 @@ struct DreamPayload: Decodable {
             }
             return CognitiveCareMerge(keep: keep, intoIt: ids, why: why)
         }
-        careMergesMalformed = 0
         careStanceChanges = try checked(.careStanceChanges, maximum: .max) { value -> CognitiveCareStanceChange? in
             guard let fields = value.objectValue,
                   let id = fields["care"]?.stringValue.flatMap(UUID.init(uuidString:)),

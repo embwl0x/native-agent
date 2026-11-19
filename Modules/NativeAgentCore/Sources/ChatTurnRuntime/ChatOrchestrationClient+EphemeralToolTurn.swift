@@ -1,5 +1,6 @@
 import Experiences
 import Foundation
+import ChatTurnContracts
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -8,7 +9,7 @@ import AuthoredCapabilities
 import Desk
 import ChatSessionWork
 import ProviderRouting
-// Blueprint: | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`; `runEphemeralToolTurn`; `runPartToolTurn` |
+// Blueprint: | `ChatOrchestrationClient+EphemeralToolTurn.swift` | Part and ephemeral turns stamp heard and answer births through success and failure |
 
 /// An internal thought owns no reply or after-turn mind work. It uses the
 /// canonical loop and inherits its caller's gates, taint and remaining limits.
@@ -51,8 +52,8 @@ extension SwiftNativeChatOrchestrationClient {
             let thought = UUID().uuidString
             let root = dataRoot
             let cause = turn.id
-            let heard = Experience(id: thought, kind: .heard, cause: [cause],
-                face: Self.face(text(last), []), addressedTo: ["her"], owes: ["answer": .init(to: "caller")])
+            let heard = Experience(id: thought, kind: .heard, cause: [cause], evidence: [.init(source: "door", id: surface)],
+                face: Self.face(text(last), [], from: "self"), addressedTo: ["her"], owes: ["answer": .init(to: "caller")], steeredBy: turn.steeringStamp())
             let began = ExperienceStore.record(root, thought) { try await $0.begin(heard) }
             await began.value
             let turn = turn.derived(id: thought, run: thought)
@@ -71,7 +72,7 @@ extension SwiftNativeChatOrchestrationClient {
             try await holding(turn.with(\.execution, ChatTurnExecution())) { turn in
                 try await engine.executeTurnWithStreamingToolLoop(surface: surface, userMessage: text(last),
                     toolSessionId: turn.verifiedSessionID, llm: client,
-                    tools: ExpansionDispatcher(inner: tools, dataRoot: root, session: turn.verifiedSessionID, work: work),
+                    tools: tools,
                     preBuiltContext: context, fileAccess: turn.fileAccess ?? "auto", turn: turn, work: work, call: call)
             } } } } } } } } } }
             produced = result
@@ -80,7 +81,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
             try Task.checkCancellation()
             _ = try await Self.settleEphemeralAnswer(runID: thought, output: result.reply,
-                dispatches: result.toolDispatches, state: .completed, dataRoot: root)
+                dispatches: result.toolDispatches, state: .completed, dataRoot: root, turn: turn)
             return result.reply
             } catch {
                 let failure = Self.ephemeralFailure(error, produced: produced, observation: observation)
@@ -88,7 +89,7 @@ extension SwiftNativeChatOrchestrationClient {
                 do {
                     _ = try await Self.settleEphemeralAnswer(runID: thought, output: failure.output,
                         dispatches: produced?.toolDispatches ?? observation.toolDispatches,
-                        state: failure.state, dataRoot: root)
+                        state: failure.state, dataRoot: root, turn: turn)
                 } catch let settlement {
                     nativeLog("Part thought %@ settlement failed after its own failure: %@", thought, settlement.localizedDescription)
                 }
@@ -195,9 +196,9 @@ extension SwiftNativeChatOrchestrationClient {
         )
         // Bind each worker's own run ID so its traces cannot be unknown or overwrite the parent turn.
         // Its answer belongs to its caller, without creating a conversation or trace store.
-        let heard = Experience(id: runId, kind: .heard, cause: [parentID],
-                               face: Self.face(message, []), addressedTo: ["her"],
-                               owes: ["answer": .init(to: "caller")])
+        let heard = Experience(id: runId, kind: .heard, cause: [parentID], evidence: [.init(source: "door", id: surface)],
+                               face: Self.face(message, [], from: "self"), addressedTo: ["her"],
+                               owes: ["answer": .init(to: "caller")], steeredBy: turn.steeringStamp())
         let began = ExperienceStore.record(dataRoot, runId) { store in
             try await store.begin(heard)
             try await store.append([.evidence(.init(source: "runtime", id: ExperienceStore.processID))], to: runId)
@@ -239,13 +240,13 @@ extension SwiftNativeChatOrchestrationClient {
         } catch {
             let failure = Self.ephemeralFailure(error, produced: nil, observation: observation)
             try await Self.settleEphemeralAnswer(runID: runId, output: failure.output,
-                dispatches: observation.toolDispatches, state: failure.state, dataRoot: dataRoot)
+                dispatches: observation.toolDispatches, state: failure.state, dataRoot: dataRoot, turn: turn)
             throw failure.error
         }
         let state = Task.isCancelled ? TurnEngineResult.TerminalState.stopped
             : result.resolvedTerminalReason(dataRoot: dataRoot).state
         let generatedAttachments = try await Self.settleEphemeralAnswer(runID: runId, output: result.reply,
-            dispatches: result.toolDispatches, state: state, dataRoot: dataRoot)
+            dispatches: result.toolDispatches, state: state, dataRoot: dataRoot, turn: turn)
         if state == .stopped {
             throw TurnEngineError.streamCancelled(partial: result.reply, underlying: CancellationError())
         }
@@ -302,13 +303,13 @@ extension SwiftNativeChatOrchestrationClient {
 
     @discardableResult
     private static func settleEphemeralAnswer(runID: String, output: String,
-        dispatches: [TurnEngineResult.ToolDispatchRecord], state: TurnEngineResult.TerminalState, dataRoot: URL
+        dispatches: [TurnEngineResult.ToolDispatchRecord], state: TurnEngineResult.TerminalState, dataRoot: URL, turn: Turn
     ) async throws -> [MultimodalAttachment] {
         let attachments = ChatGeneratedImageArtifacts.attachments(from: dispatches, dataRoot: dataRoot)
         let answer = ChatResponse(runId: runID, model: "", output: output, attachments: attachments, terminalState: state)
         await settle {
             await recordAnswer(runID: runID, heardID: runID, evidence: nil, state: state,
-                dataRoot: dataRoot, words: output, attachments: attachments, silence: answer.isSilentCompletion ? runID : nil)
+                dataRoot: dataRoot, words: output, attachments: attachments, steeredBy: turn.steeringStamp(), silence: answer.isSilentCompletion ? runID : nil)
         }
         if answer.isSilentCompletion,
            try silentTurn(dataRoot: dataRoot, sessionId: nil, runId: runID, turnId: runID) == nil {

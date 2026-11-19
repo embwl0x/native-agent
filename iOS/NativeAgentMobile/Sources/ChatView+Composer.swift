@@ -272,8 +272,8 @@ extension ChatView {
                             photoLoadGeneration &+= 1
                             isLoadingPhotos = false
                             pendingPhotos.removeAll { $0.id == photo.id }
+                            suppressNextEmptyPhotoSelection = !pendingPhotos.isEmpty && !selectedPhotoItems.isEmpty
                             selectedPhotoItems = []
-                            suppressNextEmptyPhotoSelection = !pendingPhotos.isEmpty
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 18, weight: .semibold))

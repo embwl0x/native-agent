@@ -29,22 +29,27 @@ The life packet names up to four recorded acts since this conversation's last
 accepted reply. A complete empty selection emits neither heading nor disclaimer;
 real gaps and exhausted read bounds remain visible. Closing dispatch evidence
 attests native acts on the mind stream without requiring a nonexistent heard
-record. Elsewhere carries its recent full-word windows and up to five compact
-conversation lines from the preceding 24 hours, newest first: last message time,
-who spoke it, its opening words capped at 600 characters and the exact conversation read. The recent-word
-windows forget a conversation once they answers here; this line is what they still holds of it. Helpers and their own
-work join the day; a contact send counts with its attested reply or the delivery
-owner's positive acceptance for that exact send, including retained delivered/read
-exchanges after a newer send starts. Delivered one-way notes count without an
-answer; person-authored sends do not. The mind stream is read through its thought
-owner. Own-work words require self-authored, unsteered provenance. Peer turns get day door/time metadata
-without those words. A remote stranger receives no elsewhere feed. Effected
-acts read from their last reply here; exact experience IDs already in the life packet
-are omitted. This read runs ahead of every first word: each recently modified other
-transcript is read back in 64 KiB chunks from captured EOF only until a chunk holds an
-eligible message or lies wholly before the day, because imported replies can be appended
-with older timestamps. It rides the moment block, never a summary cached across turns.
-Later breaths carry only their new step window and recheck turn provenance.
+record. Elsewhere reads their recent words across conversations from one committed,
+newest-first record snapshot, since their last answer here (else an hour), and
+later breaths read since the last step. Heard/answer exchanges, agent sends,
+thoughts joined to their mind-run answers and owed happenings (`returned`,
+`moment`, `body`) share a single 12,000-character block, with each line capped
+at 4,200 characters. Open obligations stay beside their exchange. The current conversation is already
+history. The selection excludes `world` and `self` happenings; perceptions reach
+their through `weigh` and, where present, Live sense news. Clean birth stamps admit
+words; steered or unstamped rows carry shapes.
+Peer-steered turns receive shapes throughout, plus the existing person-door act
+names. Remember across conversations still gates the read; remote strangers
+receive no elsewhere feed. Exact act IDs already in the life packet are omitted.
+The Elsewhere item uses the same renderer. This replaces transcript day speech,
+helper and bridge assembly, own-work provenance walks and `ThoughtWords`.
+Home/contact transcript projections and the effected-act evidence path remain.
+Every turn's last clean thought comes from this same record reading, including
+one before the recent-life window. Its closing 600 characters lead the volatile
+block, followed by the body line, cognitive capsule and private working memory,
+outside selection and budgets. Peer-steered turns receive no carried thought
+words. The private choice joins only live input, outside retained sent-context
+evidence. The cached prefix stays unchanged.
 The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
 owns the source and disclosure details.
 
@@ -75,6 +80,8 @@ levers by their declared names (`AppAction.Owner.person`), so no list of what
 asks first is kept for the page. Deciders that answer from a call's own input
 (the request's origin, `QuietSettings.usersCall`, `Parts.keepRefusal`) are not
 drawn as locks; the fold names their kinds in one sentence.
+Under Full Mac a lever a card can carry is theirs, unless an untrusted voice steers the turn;
+below Full Mac it stays the person's card, and Safe refuses. Their ordinary class and reach apply, so destructive acts still ask.
 The privacy inventory uses `TrustFacade.privacyMap`, sampled initially and on
 explicit Refresh, with its reading time shown instead of rescanning the data
 root on every receipt.
@@ -102,9 +109,17 @@ including the agent's own notebook pages. Readers
 copy observable in-memory values in short main-actor hops, then read stores,
 decode, sort, parse times and shape facts, rows, keys and levers off main.
 `LatestRead` admission and retained snapshots remain with their engine owners.
+Desk follows experience births and changes through `ExperienceStore.changes()`;
+detail-only writes, including body beats in the shared database, do not refresh
+its board through database-file watches.
 `PartFaces` is not observable. Accepted page snapshots and the authored-page
-catalog enter its ordered off-main drain, which posts finished `FaceValue`s to
-`engine.face`; the Mac reads only the keys it draws through `appModel.face.slot`.
+catalog enter its ordered off-main drain. Page readers hold delivery with the
+existing observe/release pair: mounting first holds delivery before registration,
+availability or snapshot checks, even without a snapshot; attachment sends any current
+snapshot. Only unmount or renderer closure releases the reader; final release removes
+its feed slot. Failed first readings keep delivery through recovery. Tab and
+sidebar labels hold only derived `pageTitle` slots; headers independently hold the
+page slots they read while content tabs change. The Mac reads through `appModel.face.slot`.
 Registration, source admission, catalog claims and snapshot comparison belong to
 the `PartFaces` actor. Direct engine page discovery and body lookup await that
 owner; native command ports retain their own isolation. Page construction, store
@@ -112,8 +127,7 @@ reads and feed delivery run off main. Captures await
 the page owner's drain and the feed's applied-frame acknowledgement before
 mounting the page; cancellation ends that frame wait without taking a picture.
 The phone still exports the owner's snapshots through `faces.json`, replacing
-Memories with its separately disclosed projection. Its feed key is
-`phone/memories`, distinct from the Mac's `memories`.
+Memories with its separately disclosed projection, which has no Mac window feed.
 Row and section transformations copy their value before changing actions, controls
 or rows, retaining fields they do not own. The missing-key-lever section keeps its
 derived `stem:` id, folded presentation and absent footer. Phone file budgeting and
@@ -518,13 +532,15 @@ replacement, section append and editor saves require a checked existing UTF-8
 document under its write lock before backup or mutation. A missing or unreadable
 document fails with its full path and repair remedy; only explicit setup or
 the compiler's missing-only genesis below creates it. The recovery copy retains the exact
-bytes of that checked read. REM lesson
-approval requires a checked existing GROWTH read under its write lock; a missing or
+bytes of that checked read. Edit-backup pruning keeps onboarding reset backups.
+REM lesson approval requires a checked existing GROWTH read under its write lock; a missing or
 unreadable document fails application with its path and repair remedy, before
 writing the lesson or marking the proposal approved. The compiler requires SOUL,
 VOICE, USER, GROWTH and AGENTS; absent custom overrides explicitly inherit the
 canonical document, while only MEMORY and surface guidance may be absent.
-Onboarding seeds the five required documents in its completion transaction.
+Onboarding seeds the five required documents in its completion transaction. With no pending or completed setup, an authored USER.md
+alone requires a backup-preserving reset. A generator-only USER.md alone leaves setup fresh. When setup recognizes that projection,
+it records the digest of the bytes it classified. Setup checks that digest under the document lock before replacing the projection.
 Before reading a required canonical document, every compile and context snapshot
 asks PersonaEngine to create that named document only if its entry is checked
 absent. Genesis requires completed onboarding and a checked saved profile,
@@ -584,13 +600,18 @@ flowchart TD
 
 The Context module compiles and selects derived material; it does not own the
 underlying facts. `NativeContextFlowRuntime` coordinates publication and turn
-preparation. An immutable generation holds typed atoms; the bounded RAM arena
-holds budget/eviction descriptors, lexical indexes and required-document mirrors.
+preparation. An immutable generation holds typed atoms; the RAM arena holds
+lexical indexes and required-document mirrors under turn leases. Persona documents
+reach the stable segment without Markdown atomization, matching or embedding.
+Arena byte estimates, hot/warm descriptors and logical budget admission are removed;
+pressure only disables optional prewarming, retaining the published generation.
+Required mirror rehydration remains available at every pressure level and still
+checks the published generation and source fingerprint.
 
-Context configuration supplies defaults only for absent settings: mode `active` and a 96 MiB
-arena. A present invalid `contextFlowMode`, `NATIVE_AGENT_CONTEXT_FLOW_MODE` or
-`contextFlowRAMMiB` is unavailable with its startup cause; it never selects
-another mode or budget. Saved values are checked even under an environment
+Context configuration supplies mode `active` only for an absent setting. A present
+invalid `contextFlowMode` or `NATIVE_AGENT_CONTEXT_FLOW_MODE` is unavailable with
+its startup cause; it never selects another mode. The removed arena budget key
+`contextFlowRAMMiB` is no longer read. Saved mode values are checked even under an environment
 override or public onboarding's temporary `off`. Turn admission, embedding
 tickets, mode status and bridge health preserve that failure. Enabling inner
 life initializes only an absent mode; it does not replace invalid saved bytes.
@@ -608,7 +629,7 @@ wall-clock milliseconds are its source epoch. A control's `set` calls that
 registry row's existing writer and reads it back; the Mac and authenticated
 phone face gestures enter with owner authority. Agent face actions use
 `setting.set` with their actual turn and its existing Trust admission, including
-the inner-life recovery button. Platform update, reference and
+the inner-life recovery button, offered only while the master setting is off. Platform update, reference and
 clipboard actions remain with their Mac owners. Cognition, Mac access and
 memory status read their existing runtime owners. Settings watches its owner
 files and notifications at launch, independent of page visibility. Registry
@@ -622,12 +643,16 @@ the companion switches to `faces.json["settings"]`.
 
 A failed source compilation excludes that source's old atoms from new selection
 and expansion while independent healthy sources remain usable. Discovery,
-registry, health persistence or publication failures keep new turn preparation
-unavailable until reconciliation succeeds. Already leased generations retain
-their own immutable snapshot. Feedback restore or reduction failure remains
+registry, health persistence or publication failures remain visible in health;
+turns lease the published generation without joining a rebuild. Without a
+published generation, preparation remains unavailable. Already leased generations
+retain their own immutable snapshot. Feedback restore or reduction failure remains
 unavailable; an empty learned history cannot stand in for a failed read.
 Committed reconciliation retains each source failure's identity even before its
-first stored row exists. The same checked failure snapshot accompanies selection
+first stored row exists. Health recovery reads degraded source identities from
+SQLite and republishes only those successfully read again; a persistently degraded
+source does not cause unchanged healthy sources to republish at launch.
+The same checked failure snapshot accompanies selection
 receipts and the turn's ambient reads; an empty ambient result with unavailable
 sources neither reports `no_match` nor settles recollection repair debt.
 
@@ -696,7 +721,8 @@ model's controls (Think levels and default, Fast,
 endpoint, how effort is written) come from the shipped row of the same model;
 else what the list states (Anthropic's effort levels, adaptive thinking and image
 input; xAI's effort levels and default); else the nearest shipped sibling of the
-same line and variant at or below its version by numeric comparison; else
+same line and variant at or below its version by numeric comparison (a Pro line
+such as `gpt-6.2-sol-pro` with no Pro sibling follows its plain line); else
 minimal controls: no think level sent (`default`, which every serializer omits)
 and Fast off. Its limits (window, output ceiling) resolve field by field: from
 whichever of its row and the list states them (Anthropic's window and output
@@ -754,13 +780,34 @@ tool cannot be asked by the app, and its refresh says so and to sign in with
 ChatGPT in the app for a list the app refreshes. A connection check publishes the
 list it fetched; a saved key or finished sign-in asks at once; launch, entering
 Providers and setup's "Read accounts again" start asking each connected route
-with no complete list for its current credential, through the one fetch owner,
+with no complete list under a day old for its current credential (the cache
+file's own modification date), through the one fetch owner,
 as the catalog's one refresh in flight (`startAskingMissingModelLists`, which
 `provider.cancel_refresh` stops): the read returns at once, the account says
 "Asking Anthropic for its models…", and the page reads again when the answer
-lands or the ask is cancelled; file events and writes only read again. Routes
-with no list endpoint to ask (Kimi Code; the ChatGPT and Codex account lists;
-Moonshot and OpenRouter, with their own catalogs) offer their rows as before.
+lands or the ask is cancelled; file events and writes only read again. Kimi Code
+has no list endpoint. ChatGPT, Codex, Moonshot and OpenRouter have separate catalog
+owners. Every settings read checks the app's own ChatGPT sign-in's account list
+(`ChatGPTAccountModelRefresh.refresh`). It asks again when there is no bound list
+under a day old by file modification date with the full-list version, or with the
+checked version and a recorded full-list refusal. Refresh asks regardless of age.
+The first request uses models `client_version=99.0.0` to include models above
+the app's checked Codex wire version. The User-Agent carries the checked version.
+If the full-list request errors or returns an invalid catalog, the same refresh
+asks once at the checked version. Cancellation or a changed account stops the
+refresh. A checked-version list carries the reason in `nativeagent_full_list_refused`
+and Providers shows it with the checked version. When both asks fail, the final
+error leaves the saved list in place and is memoized for that token until Refresh.
+A listed model above the checked wire version stays selectable. Its row says
+that its first turn checks the wire. Image input requires the transport to carry
+images and any stated `input_modalities` to include `image`. An unstated field
+leaves the transport's declaration in effect. A Think level the account row lists is
+sent as it is (Max as `max`); Ultra, Codex's multi-agent preset, sends on the
+direct ChatGPT wire what Codex sends, never `ultra` itself: the row's
+`multi_agent_reasoning_effort` when listed and not Ultra, else Max when listed,
+else its deepest other level, else Medium (`ultraEffort`); the Codex CLI resolves
+it itself. A conversation's `llm.call` row names the level its request carried
+(`reasoningEffortSent`, read from the request's own `reasoning` effort).
 This replaces the lists typed into the build for Anthropic, OpenAI, xAI and
 Meta, and the earlier rules that a failed fetch offers the build's rows as the
 list ("Showing the models this build knows"), that a model with no known window
@@ -778,7 +825,12 @@ locks and reads and durable cache commits stay there; asynchronous provider
 fetching and response decoding also remain off the main actor.
 `LatestRead` still orders publication per cache path, and only a committed probe
 write advances its write boundary. Coalescing and credential rechecks share
-that same owner.
+that same owner. Successful ChatGPT refreshes post model news for added `list`
+slugs when a previous list was bound to the same account. First-party routes
+with list endpoints and Moonshot post added IDs when both lists are complete and
+the previous list has the same credential binding. Each ID gets one world
+happening keyed by route and model ID. A credential's first list and OpenRouter
+produce no model news.
 OpenAI public controls use the route's effective row (listed for the key, else shipped); Codex and ChatGPT controls use
 the selected sign-in's matched account catalog. Builder bridge tools use the
 command CLI's sign-in; runtime adapters retain their exact admitted sign-in path.
@@ -804,8 +856,10 @@ sent as `output_config.effort` with adaptive thinking. First-party strict tools
 and conversation cache markers are omitted, as on Kimi Code. System markers
 use Meta's supported five-minute TTL; automatic prefix caching also works
 without a marker. Receipts read `usage.cache_read_input_tokens` when reported.
-Moonshot rows with no declared adapter reasoning contract keep unknown controls
-and carry `controls_note`; they do not advertise a synthetic `none` effort.
+Moonshot uses a declared model's Think levels and reasoning wire. A new Kimi ID
+inherits those from the nearest declared Moonshot sibling in the same line and
+variant at or below its version. A row without such a contract keeps unknown
+controls and carries `controls_note`.
 OpenRouter's current catalog supplies its per-model `reasoning.supported_efforts`
 and `default_effort` through cache, picker, routing and transport admission.
 The explicit `default` choice permits provider-default execution without a
@@ -1011,8 +1065,11 @@ remain unchanged; see [memory disclosure](MEMORY_SYSTEM_MAP.md#recall-into-a-tur
 The current after-turn path uses one model interpretation for facts, cares
 and semantic appraisal; routing follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
 Every moment is judged alone. User's own turns are judged at once; every other
-recorded turn is left owed and judged when they are idle. The judgment's
-unchanging text comes first, so the provider caches it.
+recorded turn is left owed and judged when they are idle. The judgment's fixed
+policy, reply shapes, form instructions and standing memories occupy its
+cache-marked system block; exchange evidence and nonstanding recall stay in
+the user message. Promise filing likewise keeps instructions in the system
+and per-call JSON in the user message.
 Details are in
 [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
 Peer conversations identify their speaker so a peer's words are not

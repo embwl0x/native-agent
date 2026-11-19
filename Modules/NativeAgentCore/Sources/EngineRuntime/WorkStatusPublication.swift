@@ -3,6 +3,7 @@ import Foundation
 import Cognition
 import OSLog
 import PersistenceCore
+import Privacy
 import StandingBots
 import NativeAgentShared
 import Desk
@@ -23,9 +24,8 @@ public final class WorkStatusPublication {
         defer { workStatusInFlight = false }
         repeat {
             workStatusDirty = false
-            let board = await engine.desk.refreshPage().board!
-            let overview = board.overview!
-            let waiting = overview.unavailable.isEmpty ? overview.needsYouCount : nil
+            let board = await engine.desk.loadBoard()
+            let waiting = board.overview.flatMap { $0.unavailable.isEmpty ? $0.needsYouCount : nil }
             if let items = board.deskState?.items { await engine.deviceSync?.evaluateNeedsUser(items: items) }
             if #available(macOS 27, *) { await publishWidgetStatus(board, engine: engine, name: displayName(), waiting: waiting, reload: reloadWidget) }
         } while workStatusDirty
@@ -77,7 +77,7 @@ public final class WorkStatusPublication {
                 } else if count > 0 {
                     status = "Waiting on you"
                 } else if let work {
-                    status = "Working on \(work.brief.split(whereSeparator: \.isNewline).first.map(String.init) ?? work.brief)"
+                    status = "Working on \(MobileDeskProjectionBounds.clipped(NativeAppSecretRedactor.redactText(work.name), to: 240))"
                     activityExpiresAt = work.updatedAt.addingTimeInterval(DeskActivityState.movementWindow)
                 } else if !busy.isEmpty {
                     status = "Activity unconfirmed"

@@ -53,9 +53,11 @@ struct SimpleTranscriptEntry: View, Equatable {
                 Text(speaker)
                     .font(ShellType.labelSemibold)
                     .foregroundStyle(NativeAgentShell.text)
-                Text(at.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "Time unavailable")
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
+                if let at {
+                    Text(at.formatted(date: .abbreviated, time: .shortened))
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
+                }
             }
             SimpleLiveText(text: text)
                 .font(ShellType.body)
@@ -77,11 +79,10 @@ struct SimpleTranscriptEntry: View, Equatable {
 struct SimpleLiveText: View {
     let text: String
     @State private var rendered: AttributedString?
-    @State private var renderedSource: String?
 
     var body: some View {
         Group {
-            if renderedSource == text, let rendered {
+            if let rendered {
                 Text(rendered)
             } else {
                 Text("Formatting message…")
@@ -93,7 +94,6 @@ struct SimpleLiveText: View {
             }.value
             guard !Task.isCancelled else { return }
             rendered = parsed
-            renderedSource = text
         }
     }
 }

@@ -170,7 +170,7 @@ extension QuietInboxHost {
                     extra: ["actions": .array(shown.map { .string($0) })]))
             }
             // Every decision verb reads the same tap or authenticated person-message authority.
-            if item.source != self.interactionSource, ["approve", "reject"].contains(action) {
+            if item.source != self.interactionSource, ["approve", "approve_task", "reject"].contains(action) {
                 if let refusal = await decisionAuthority(item) { return refuse(refusal) }
             }
             // Full Mac makes the agent's interaction buttons available to it; the person's own act needs no posture.

@@ -477,14 +477,15 @@ public enum InlineInteractionResolver {
     /// A stopped continuation left its turn, not its card: answering the card begins a fresh continue-turn from the saved conversation.
     static func continuingStopped(_ card: InlineInteraction, dataRoot: URL) async throws -> InlineInteraction {
         guard card.continuation?.state == .stopped else { return card }
+        // The stopped continuation itself, carried whole: its file-access ceiling, its run and the signature over that run (a stopped held turn
+        // never started it), peer evidence and origin. Only what a fresh continue-turn renews changes: its mode, its state and its life.
+        guard var next = card.continuation else { return card }
         var card = card
-        let previous = card.continuation
-        card.continuation = .init(mode: .continueTurn, resumeRunId: UUID().uuidString,
-            resumeText: previous?.resumeText, peerSources: previous?.peerSources,
-            elevatedPeerSources: previous?.elevatedPeerSources)
-        card.continuation?.originTurnId = previous?.originTurnId
-        card.continuation?.originRunId = previous?.originRunId
-        card.continuation?.lifeID = try await Task.detached { try DataRootLife.current(in: dataRoot) }.value
+        next.mode = .continueTurn
+        next.state = .waiting
+        next.resumedByTurnId = nil
+        next.lifeID = try await Task.detached { try DataRootLife.current(in: dataRoot) }.value
+        card.continuation = next
         return card
     }
     /// `continuesStopped`: a settle by any door continues a stopped turn as `begin` does; the agent's own answer does not, as `begin` refuses it.

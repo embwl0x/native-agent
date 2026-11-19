@@ -67,10 +67,4 @@ public enum NativeAgentICloudBridgeConstants {
         public static let chatNoticeLatest = "chat_notice_latest"
     }
 
-    public enum DriveFolder {
-        public static let outboxMac = "outbox/mac"
-        public static let outboxIos = "outbox/ios"
-        public static let processing = "processing"
-        public static let processed = "processed"
-    }
 }

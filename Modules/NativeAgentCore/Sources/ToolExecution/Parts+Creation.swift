@@ -45,7 +45,7 @@ extension Parts {
         let fixtures: JSONValue = .object(["type": .string("array"), "maxItems": .int(16),
             "description": .string("""
                 At most 16 cases in 256 KiB. Omit to inherit; [] clears. Hand-written cases supply input and expected, with optional calls and answers. \
-                Recorded tape fixtures on older compiled abilities may only be inherited.
+                Recorded tape fixtures may only be inherited.
                 """),
             "items": .object(["anyOf": .array([
                 .object(["type": .string("object"), "properties": .object(["input": .object([:]), "expected": .object([:])]),
@@ -234,7 +234,7 @@ extension Parts {
             descriptionNote = "description kept to its first \(description.count) characters"
         }
         // Inputs inherit the latest version's contract unless explicitly restated.
-        var params = was["params"] ?? Self.fields(was["script"] ?? .null)["params"]
+        var params = was["params"]
         var schema = base?.program.schema ?? .object(["type": .string("object"), "properties": .object([:])])
         if let declared = input["params"] {
             if declared == .null || declared == .object([:]) {
@@ -256,6 +256,12 @@ extension Parts {
         // Direct app members, literal door requests and reach derive dependencies; indirect calls declare theirs in actions.
         let reached = AbilityStore.reachActions(permissions)
         let calls = OwnedProgram.calls(source)
+        if calls.literal.contains(where: { $0.primitive && $0.id == "fetch" }),
+           Set(permissions).isDisjoint(with: ["network_public", "network_localhost"]) {
+            throw Self.revisionFailure("undeclared",
+                "Declare reach.capabilities network_public (network_localhost for loopback) to call fetch in ability \(id). Nothing was saved.",
+                id: id)
+        }
         let called = calls.literal.filter { $0.inferred && !$0.primitive }.map(\.id)
         let declared: [String]
         if let given = input["actions"] {
@@ -293,15 +299,13 @@ extension Parts {
             "origin": origin, "converts": try OwnedProgramStore.conversionSources(input["converts"] ?? was["converts"]),
         ]
         if let params { manifest["params"] = params }
-        manifest["compiled"] = was["compiled"]
-        if given != nil, let pack = input["capabilityPackInstallId"] { manifest["capabilityPackInstallId"] = pack }
         if let triggers = input["triggers"] ?? was["triggers"] { manifest["triggers"] = triggers }
         if FileManager.default.fileExists(atPath: guidance.path) || was["overrides"] == .string("built_in") { manifest["overrides"] = .string("built_in") }
         manifest.merge(part) { _, value in value }
         if keptSelf == nil, let base {
             // Selection/proof are not authored content. Compare before minting an identity that includes the current selection.
             let authoredKeys = AbilityStore.partKeys.union(["id", "name", "description", "language", "inputSchema", "actions", "declaredActions",
-                "origin", "converts", "params", "compiled", "capabilityPackInstallId", "triggers", "overrides"])
+                "origin", "converts", "params", "triggers", "overrides"])
             var before = was.filter { authoredKeys.contains($0.key) }
             before.merge(try AbilityStore.partHeader(was.filter { AbilityStore.partKeys.contains($0.key) })) { _, value in value }
             before["converts"] = try OwnedProgramStore.conversionSources(was["converts"])
@@ -364,7 +368,8 @@ extension Parts {
             } catch { receipt["accounting_error"] = .string(error.localizedDescription) }
             // The person's own decision of this exact call (Home's Set aside) keeps it in one act at any posture, as theirs.
             let person = invocation.execution.turn?.personAct != nil
-            if manifest["compiled"] == nil, given == nil, person || fullMac && Self.keepRefusal(origin: origin, name: name, fullMac: true) == nil {
+            if OwnedProgramStore.tape(fixtures) == nil, given == nil,
+               person || fullMac && Self.keepRefusal(origin: origin, name: name, fullMac: true) == nil {
                 // Kept by the agent under Full Mac, or by the person: a rehearsal proves no live behavior, so its first real run is its proof.
                 let proving = ContinuousClock.now
                 try store.kept(candidate, key: try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey(), turn: invocation.execution.turn)
@@ -426,7 +431,7 @@ extension Parts {
 
     /// Actions a version declared beyond those its reach and literal calls derive.
     static func declaredActions(_ manifest: [String: JSONValue], source: String) throws -> [String] {
-        let earlier = Self.strings(manifest["declaredActions"] ?? manifest["actions"] ?? Self.fields(manifest["script"] ?? .null)["actions"])
+        let earlier = Self.strings(manifest["declaredActions"] ?? manifest["actions"])
         let derived = Set(AbilityStore.reachActions(try Self.declaredStrings(Self.fields(manifest["reach"] ?? .null)["capabilities"],
             name: "reach.capabilities")) + OwnedProgram.calledActions(source))
         return manifest["declaredActions"] != nil ? earlier : earlier.filter { !derived.contains($0) }
@@ -497,8 +502,6 @@ extension Parts {
             : .object(["by": .string("peer"), "peers": .array(peers.map(JSONValue.string))])
     }
 
-    public static func origin(pack: String) -> JSONValue { .object(["by": .string("pack"), "pack": .string(pack)]) }
-
     /// Missing or malformed authorship stays unknown.
     static func originKind(_ value: JSONValue?) -> String? {
         let fields = fields(value ?? .null)
@@ -509,37 +512,22 @@ extension Parts {
             guard case .array(let peers)? = fields["peers"], !peers.isEmpty,
                   peers.allSatisfy({ if case .string(let peer) = $0 { !peer.isEmpty } else { false } }) else { return nil }
             return "peer"
-        case "pack"?: return (string(fields, "pack") ?? "").isEmpty ? nil : "pack"
         default: return nil
         }
     }
 
-    /// Origins only ratchet toward the owner: no later save of the agent's launders an untrusted agent's or a pack's mark. A nil entry is an origin that should
+    /// Origins only ratchet toward the owner: no later save of the agent's launders an untrusted agent's mark. A nil entry is an origin that should
     /// exist and doesn't, an unrecorded peer.
     static func merged(_ origins: [JSONValue?]) -> JSONValue {
-        var peers: [String] = [], pack: String?
+        var peers: [String] = []
         for given in origins.isEmpty ? [nil] : origins {
-            // Persisted origin spellings encode self-authorship or the turn's steering source.
-            let steer = Self.fields(given ?? .null)["steer"]
-            let spelled: JSONValue?
-            if given == .string("self") { spelled = Self.origin(steeredBy: []) }
-            else if let steer, Self.fields(given ?? .null)["by"] == nil {
-                guard case .array(let entries) = steer, entries.allSatisfy({
-                    if case .string(let peer) = $0 { !peer.isEmpty } else { false }
-                }) else { peers.append("unrecorded"); continue }
-                spelled = Self.origin(steeredBy: strings(steer))
-            } else { spelled = given }
-            guard let kind = originKind(spelled) else { peers.append("unrecorded"); continue }
-            let recorded = Self.fields(spelled ?? .null)
+            guard let kind = originKind(given) else { peers.append("unrecorded"); continue }
+            let recorded = Self.fields(given ?? .null)
             if kind == "peer" { peers += strings(recorded["peers"]).filter { !CapabilityLifecycle.ownerTrusts($0) } }
-            if let named = string(recorded, "pack"), !named.isEmpty, kind != "hers" { pack = pack ?? named }
         }
         var seen: Set<String> = []
         peers = peers.filter { seen.insert($0).inserted }
-        guard !peers.isEmpty else { return pack.map(origin(pack:)) ?? origin(steeredBy: []) }
-        var fields: [String: JSONValue] = ["by": .string("peer"), "peers": .array(peers.map(JSONValue.string))]
-        if let pack { fields["pack"] = .string(pack) }
-        return .object(fields)
+        return peers.isEmpty ? origin(steeredBy: []) : .object(["by": .string("peer"), "peers": .array(peers.map(JSONValue.string))])
     }
 
     /// Merge against the record's own retained origin.
@@ -551,7 +539,7 @@ extension Parts {
     /// Own work needs no untrusted-origin attribution.
     public static func voices(_ row: [String: JSONValue]) -> [String] {
         guard row["origin"] != nil, case .object(let origin) = merged([row["origin"]]) else { return [] }
-        return strings(origin["peers"]) + [string(origin, "pack")].compactMap { $0 }
+        return strings(origin["peers"])
     }
 
     // MARK: - Inputs

@@ -2,14 +2,9 @@ import AppKit
 import SwiftUI
 import NativeAgentShared
 
-// Blueprint: | `ShellTabs.swift` | Shell page/tab components: content-local action rows, shared scroll gutter and tabbed page layout |
+// Blueprint: | `ShellTabs.swift` | Shell page/tab components: shared scroll gutter and tabbed page layout |
 
 extension View {
-    /// Keep actions inside page content so navigation never adds or removes a window toolbar.
-    func pageActions<Actions: View>(@ViewBuilder _ actions: () -> Actions) -> some View {
-        modifier(PageActionsModifier(actions: actions()))
-    }
-
     /// Reserve the same scroller width even when content fits so controls and rows share one right edge.
     func pageScrollColumn() -> some View {
         modifier(PageScrollColumn())
@@ -46,38 +41,6 @@ private struct PageScrollColumn: ViewModifier {
     }
 }
 
-extension EnvironmentValues {
-    /// Let the tab row own actions so they are not drawn twice.
-    @Entry var shellTabRowHostsActions: Bool = false
-}
-
-struct ShellPageActionsKey: PreferenceKey {
-    static var defaultValue: AnyView? { nil }
-    static func reduce(value: inout AnyView?, nextValue: () -> AnyView?) {
-        value = value ?? nextValue()
-    }
-}
-
-private struct PageActionsModifier<Actions: View>: ViewModifier {
-    let actions: Actions
-    @Environment(\.shellTabRowHostsActions) private var tabRowHostsActions
-
-    func body(content: Content) -> some View {
-        if tabRowHostsActions {
-            content.preference(key: ShellPageActionsKey.self, value: AnyView(actions))
-        } else {
-            content.safeAreaInset(edge: .top, spacing: 12) {
-                HStack(spacing: 12) {
-                    Spacer(minLength: 0)
-                    actions
-                }
-                .buttonStyle(.bordered)
-                .padding(.vertical, 4)
-                .padding(.trailing, ShellScrollGutter.shared.width)
-            }
-        }
-    }
-}
 
 
 /// Persist stable keys independently of user-facing tab words.
@@ -126,7 +89,6 @@ struct ShellTabs<Key: Hashable>: View {
 struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     @Environment(AppModel.self) private var appModel
     let title: String
-    var subtitle: String? = nil
     var subtitlePage: SidebarItem? = nil
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
@@ -134,7 +96,6 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     @ViewBuilder let content: (Key) -> Content
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Environment(\.quietRailTab) private var quietRailTab
-    @State private var tabRowHeight: CGFloat = 24
 
     var body: some View {
         // Screenshots use their requested or default tab without changing the user's mounted selection.
@@ -143,35 +104,19 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
             : selection
         ShellPageFrame(
             title: title,
-            subtitle: subtitlePage.flatMap { ShellPageSubtitle.line($0, appModel) } ?? subtitle,
+            subtitle: subtitlePage.flatMap { ShellPageSubtitle.line($0, appModel) },
             alive: alive
         ) {
             VStack(alignment: .leading, spacing: 0) {
                 ShellTabs(tabs: tabs, selection: quietOffscreenRead ? .constant(shown) : $selection)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { tabRowHeight = $0 }
                     .padding(.bottom, alive ? 0 : 18)
                 content(shown)
                     .id(shown)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .aliveTopDissolve(alive ? 18 : 0)
-                    .environment(\.shellTabRowHostsActions, true)
-            }
-            // Align tab actions to the rows' trailing edge.
-            .overlayPreferenceValue(ShellPageActionsKey.self, alignment: .topTrailing) { actions in
-                if let actions {
-                    HStack(spacing: 12) { actions }
-                        .buttonStyle(.bordered)
-                        .frame(height: tabRowHeight)
-                        .padding(.trailing, ShellScrollGutter.shared.width)
-                }
             }
         }
-        .quietReadTask(id: subtitlePage?.rawValue) {
-            if let page=subtitlePage, ShellPageContent.doorPage(page) == nil {
-                do { try FaceWindowReply.check(await appModel.client.act(.requestCopy(keys: ["page:" + page.rawValue]))) }
-                catch { appModel.statusText = error.localizedDescription }
-            }
-        }
+        .modifier(FaceObservation(demand: subtitlePage.flatMap { ShellPageContent.doorPage($0) }.map { .key(.page($0)) }))
     }
 }
 
@@ -201,12 +146,10 @@ extension View {
     }
 }
 
-/// A faced page's own line is its subtitle under the rail; other pages read their prepared caption.
 enum ShellPageSubtitle {
     @MainActor static func line(_ page: SidebarItem, _ appModel: AppModel) -> String? {
-        if let id = ShellPageContent.doorPage(page) {
-            return appModel.face.slot(.page(id)).value(as: PartFaceSnapshot.self)?.face?.line
+        ShellPageContent.doorPage(page).flatMap {
+            appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self)?.face?.line
         }
-        return appModel.face.slot(PageFaceKey.copy("page:" + page.rawValue)).value(as: PartFaceSnapshot.self)?.copyWords()
     }
 }

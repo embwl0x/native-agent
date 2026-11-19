@@ -38,14 +38,11 @@ func publicKeyBase64(fromKeyMaterial text: String) -> String {
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let first = args.first, args.count == 1 else {
-    FileHandle.standardError.write(Data("usage: sparkle_ed_public_key.swift <private-key-file>|-|--new\n".utf8))
+    FileHandle.standardError.write(Data("usage: sparkle_ed_public_key.swift <private-key-file>|-\n".utf8))
     exit(2)
 }
 
 switch first {
-case "--new":
-    let fresh = Curve25519.Signing.PrivateKey()
-    print("\(fresh.rawRepresentation.base64EncodedString()) \(fresh.publicKey.rawRepresentation.base64EncodedString())")
 case "-":
     let text = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
     print(publicKeyBase64(fromKeyMaterial: text), terminator: "")

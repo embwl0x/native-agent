@@ -339,7 +339,7 @@ extension OwnedProgramRunner {
             if parts.count > 1 { input["item"] = parts[1] }
             guard case .object(let read) = await actionsInFlight.perform(input, host: host, execution: execution) else { return nil }
             guard let now = read["version"]?.scalarText else {
-                return read["status"] == .string("failed") || read["ok"] == .bool(false) ? "" : nil
+                return read["status"] == .string("failed") || read["status"] == .string("refused") || read["ok"] == .bool(false) ? "" : nil
             }
             return OwnedProgramRunner.versionScope(now) == scope ? now : nil
         }

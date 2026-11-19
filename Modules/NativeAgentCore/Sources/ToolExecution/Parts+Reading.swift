@@ -112,14 +112,6 @@ extension Parts {
             .object(["version": .string(candidate.digest), "converts": Self.fields(candidate.manifest)["converts"] ?? .array([])])
         })
         let latest = row["kind"] == .string("ability") ? try latest(row) : nil
-        // Only live learned runs earn standing; reading lifecycle state cannot grant it.
-        if let latest, case .object(var compiled)? = Self.fields(latest.manifest)["compiled"] {
-            let waiting = row["candidateDigest"] != nil
-            compiled["lifecycle"] = .string(waiting ? (row["candidateValidation"] == .string("replayed") ? "verified" : "staged")
-                : row["status"] == .string("active") ? "admitted" : "off")
-            compiled["standing"] = .string("no autonomous standing transition; learned.use records live execution evidence, replay earns none")
-            read["compiled"] = .object(compiled)
-        }
         let file = latest == nil ? try abilities.files().first(where: { $0.id == id }) : nil
         if let source = latest?.program.source ?? file?.body {
             if latest != nil || file?.pathExtension == "js" {

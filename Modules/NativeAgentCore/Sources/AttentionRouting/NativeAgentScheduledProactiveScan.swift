@@ -5,69 +5,22 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import TriggerScheduler
-import NotificationInbox
-import Experiences
 import ApprovalInbox
 // Blueprint: | `NativeAgentScheduledProactiveScan.swift` | Checked source opportunities; ProactiveScanArguments owns admission and execution |
 
 public enum NativeAgentScheduledProactiveScan {
     public struct Opportunity: Sendable, Equatable {
         public let id: String
-        public let kind: String
         public let title: String
         public let summary: String
         public let detail: String
-        public let source: String
-        public let severity: String
         public let score: Double
-        public let relatedPaths: [String]
-        /// The record ids this digest stands on, without another inbox group store.
-        public let relatedMatters: [String]
-
-        init(
-            id: String,
-            kind: String,
-            title: String,
-            summary: String,
-            detail: String,
-            source: String,
-            severity: String,
-            score: Double,
-            relatedPaths: [String],
-            relatedMatters: [String] = []
-        ) {
-            self.id = id
-            self.kind = kind
-            self.title = title
-            self.summary = summary
-            self.detail = detail
-            self.source = source
-            self.severity = severity
-            self.score = score
-            self.relatedPaths = relatedPaths
-            self.relatedMatters = relatedMatters
-        }
     }
 
     public struct Result: Sendable, Equatable {
         public let scannedCount: Int
         public let eligibleCount: Int
-        public let skippedAlreadySurfacedCount: Int
         public let surfaced: [Opportunity]
-    }
-
-    public static func inboxActions(for opportunity: Opportunity) -> [JSONValue] {
-        switch opportunity.kind.lowercased() {
-        case "approval_backlog":
-            return [
-                inboxAction(id: "view", label: "View", description: "Review the proactive card"),
-                inboxAction(id: "open_approvals", label: "Open Approvals", description: "Review pending approvals"),
-                inboxAction(id: "archive", label: "Archive", description: "Keep as handled"),
-                inboxAction(id: "dismiss", label: "Dismiss", description: "Mark this idea as not useful"),
-            ]
-        default:
-            return []
-        }
     }
 
     // MARK: - W6/G5 — a project-shaped opportunity
@@ -79,39 +32,33 @@ public enum NativeAgentScheduledProactiveScan {
     public static func evaluate(
         dataRoot: URL,
         payload: [String: JSONValue],
+        seen: [String],
         now: Date = Date()
     ) async throws -> Result {
         let arguments = try ProactiveScanArguments(payload)
         let limit = arguments.limit
         let surfaceLimit = arguments.surfaceLimit
         guard surfaceLimit > 0 else {
-            return Result(scannedCount: 0, eligibleCount: 0, skippedAlreadySurfacedCount: 0, surfaced: [])
+            return Result(scannedCount: 0, eligibleCount: 0, surfaced: [])
         }
 
-        let inboxRows = try await ForPerson.at(dataRoot).inbox()
         let pendingApprovals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending).count
 
         let deskStaleDays = arguments.staleDays
         let deskItems = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
 
-        let surfacedIDs = alreadySurfacedOpportunityIDs(inboxRows)
-        var live = try liveOpportunities(
-            inboxRows: inboxRows,
-            pendingApprovals: pendingApprovals,
-            dataRoot: dataRoot
-        )
+        let surfacedIDs = Set(seen)
+        var live = liveOpportunities(pendingApprovals: pendingApprovals)
         live.append(contentsOf: deskOpportunities(
             items: deskItems,
             staleDays: deskStaleDays,
-            now: now,
-            dataRoot: dataRoot
+            now: now
         ))
         let eligible = latestByID(live)
             .sorted { lhs, rhs in
                 if lhs.score != rhs.score { return lhs.score > rhs.score }
                 return lhs.title < rhs.title
             }
-        let skipped = eligible.filter { surfacedIDs.contains($0.id) }.count
         let surfaced = eligible
             .filter { !surfacedIDs.contains($0.id) }
             .prefix(limit)
@@ -120,54 +67,26 @@ public enum NativeAgentScheduledProactiveScan {
         return Result(
             scannedCount: live.count,
             eligibleCount: eligible.count,
-            skippedAlreadySurfacedCount: skipped,
             surfaced: Array(surfaced)
         )
     }
 
     private static func liveOpportunities(
-        inboxRows: [InboxItemRecord],
-        pendingApprovals: Int,
-        dataRoot: URL
-    ) throws -> [Opportunity] {
+        pendingApprovals: Int
+    ) -> [Opportunity] {
         var opportunities: [Opportunity] = []
-
-        let actionableInbox = inboxRows.filter(\.isAttentionWorthyBacklogItem)
-        if !actionableInbox.isEmpty {
-            let id = stableID(kind: "inbox_digest", seed: "visible-unread-\(actionableInbox.count)")
-            let memberIDs = actionableInbox.map(\.id)
-            opportunities.append(Opportunity(
-                id: id,
-                kind: "inbox_digest",
-                title: "Review inbox blockers",
-                summary: "\(actionableInbox.count) actionable inbox item(s) are waiting for the user or assistant to handle.",
-                detail: """
-                    Current scan found \(actionableInbox.count) unresolved attention-worthy inbox item(s), excluding routine receipts and prior \
-                    proactive scan cards.
-                    """,
-                source: source(kind: "inbox_digest", id: id),
-                severity: actionableInbox.count >= 3 ? "actionable" : "important",
-                score: actionableInbox.count >= 3 ? 0.74 : 0.62,
-                relatedPaths: [],
-                relatedMatters: memberIDs
-            ))
-        }
 
         if pendingApprovals > 0 {
             let id = stableID(kind: "approval_backlog", seed: "pending-\(pendingApprovals)")
             opportunities.append(Opportunity(
                 id: id,
-                kind: "approval_backlog",
                 title: "Clear pending approvals",
                 summary: """
                     \(pendingApprovals) approval request(s) are waiting. The assistant should avoid duplicate asks and surface the oldest \
                     meaningful blocker.
                     """,
                 detail: "Current scan found \(pendingApprovals) pending approval request(s).",
-                source: source(kind: "approval_backlog", id: id),
-                severity: "actionable",
-                score: 0.72,
-                relatedPaths: [dataRoot.appendingPathComponent("workflows/approvals/requests.json").path]
+                score: 0.72
             ))
         }
 
@@ -180,15 +99,13 @@ public enum NativeAgentScheduledProactiveScan {
     static func deskOpportunities(
         items: [DeskItem],
         staleDays: Int,
-        now: Date,
-        dataRoot: URL
+        now: Date
     ) -> [Opportunity] {
         let cutoff = now.addingTimeInterval(-Double(staleDays) * 86_400)
         return items.compactMap { item -> Opportunity? in
             guard deskOpportunityStatuses.contains(item.status), !item.status.isTerminal else { return nil }
             guard !item.isPursuit else { return nil }
-            // A deferUntil stamp means the item is intentionally parked, regardless of its date format.
-            guard (item.deferUntil ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            guard !DeskSequencing.isDeferred(item, now: now) else { return nil }
             guard let updated = parseDeskInstant(item.updatedAt), updated < cutoff else { return nil }
 
             let project = item.project.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -198,21 +115,16 @@ public enum NativeAgentScheduledProactiveScan {
             let since = staleSinceLabel(updated, now: now)
             let days = max(staleDays, Int(now.timeIntervalSince(updated) / 86_400))
 
-            // Include updatedAt so movement retires a stall's identity and a later stall gets a fresh card.
             let id = stableID(kind: "desk_stale", seed: "\(item.handle)|\(item.updatedAt)")
             return Opportunity(
                 id: id,
-                kind: "desk_stale",
                 title: label,
                 summary: "\(label) hasn't moved since \(since) — still the right next thing?",
                 detail: """
                     This item is marked \(item.status.rawValue) and its last update was \(item.updatedAt) (\(days) day(s) ago). If it is still \
                     the next thing, it needs a step; if it is not, it should move off now/next.
                     """,
-                source: source(kind: "desk_stale", id: id),
-                severity: "important",
-                score: 0.66,
-                relatedPaths: [dataRoot.appendingPathComponent("desk").path]
+                score: 0.66
             )
         }
     }
@@ -247,17 +159,6 @@ public enum NativeAgentScheduledProactiveScan {
         return order.compactMap { latest[$0] }
     }
 
-    private static func alreadySurfacedOpportunityIDs(_ rows: [InboxItemRecord]) -> Set<String> {
-        Set(rows.compactMap { row in
-            guard row.source.hasPrefix("proactive_autonomy:") else { return nil }
-            return row.source.split(separator: ":", omittingEmptySubsequences: false).last.map(String.init)
-        })
-    }
-
-    private static func source(kind: String, id: String) -> String {
-        "proactive_autonomy:\(sourceComponent(kind)):\(sourceComponent(id))"
-    }
-
     private static func sourceComponent(_ raw: String) -> String {
         let cleaned = raw
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -266,25 +167,11 @@ public enum NativeAgentScheduledProactiveScan {
         return String((cleaned.isEmpty ? "unknown" : cleaned).prefix(120))
     }
 
-    private static func inboxAction(id: String, label: String, description: String) -> JSONValue {
-        .object([
-            "id": .string(id),
-            "label": .string(label),
-            "description": .string(description),
-        ])
-    }
-
     private static func stableID(kind: String, seed: String) -> String {
         let digest = SHA256.hash(data: Data("\(kind):\(seed)".utf8))
             .map { String(format: "%02x", $0) }
             .joined()
             .prefix(12)
         return "opp-\(sourceComponent(kind))-\(digest)"
-    }
-
-    private static func nonEmptyString(_ raw: JSONValue?) -> String? {
-        guard case .string(let value)? = raw else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }

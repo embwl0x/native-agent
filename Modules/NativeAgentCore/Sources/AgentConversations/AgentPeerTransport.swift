@@ -19,14 +19,14 @@ public enum AgentPeerCredentials {
         return resolve(token, reads: credentialReads(peers, readCredential: readCredential))
     }
 
-    private struct CredentialRead {
+    public struct CredentialRead {
         let peer: AgentPeerContact
         let result: Result<String?, ToolFailureError>
     }
 
     /// Call-scoped evidence only; the next use reads the credential owner again. Keep failure distinct from confirmed absence, and attribute it to its row.
-    private static func credentialReads(_ peers: [AgentPeerContact],
-                                        readCredential: (String) throws -> String?) -> [CredentialRead] {
+    public static func credentialReads(_ peers: [AgentPeerContact],
+                                       readCredential: (String) throws -> String? = { try read(peerID: $0) }) -> [CredentialRead] {
         peers.filter { $0.credentialKey == AgentPeerContact.credentialKey(for: $0.id) }.map { peer in
             let result: Result<String?, ToolFailureError>
             do {
@@ -59,12 +59,10 @@ public enum AgentPeerCredentials {
         return matches.count == 1 ? matches.first?.peer : nil
     }
 
-    public static func availability(_ peer: AgentPeerContact, peers: [AgentPeerContact],
-                                    readCredential: (String) throws -> String? = { try read(peerID: $0) }) -> Result<Bool, ToolFailureError> {
+    public static func availability(_ peer: AgentPeerContact, reads: [CredentialRead]) -> Result<Bool, ToolFailureError> {
         // Local ACP sessions and desktop routes do not use a contact bearer.
         if peer.credentialKey == nil && (peer.transport == .acp || peer.transport == .desktop || peer.transport == .desktopChat) { return .success(true) }
         guard peer.credentialKey == AgentPeerContact.credentialKey(for: peer.id) else { return .success(false) }
-        let reads = credentialReads(peers, readCredential: readCredential)
         guard let selected = reads.first(where: { $0.peer.id == peer.id }) else { return .success(false) }
         switch selected.result {
         case .failure(let failure): return .failure(failure)
@@ -75,14 +73,12 @@ public enum AgentPeerCredentials {
 
     /// Authority checks deny on unreadable credentials. Local projections use `availability` so the same failure remains visible with its remedy.
     public static func isAvailable(_ peer: AgentPeerContact, peers: [AgentPeerContact]) -> Bool {
-        switch availability(peer, peers: peers) {
+        switch availability(peer, reads: credentialReads(peers)) {
         case .success(let available): return available
         case .failure: return false
         }
     }
 
-    // Only an entitled installed-app read can establish key coverage; unentitled command-line absence proves nothing.
-    static let legacyService = "com.nativeagent.agent-peer-bearer"
     static var service: String {
         get throws {
             guard let bundleID = Bundle.main.bundleIdentifier, !bundleID.isEmpty else {
@@ -90,7 +86,7 @@ public enum AgentPeerCredentials {
                     effects: .none, owner: "NativeAgent app bundle", tap: "Open the installed, signed NativeAgent app and repair its bundle identity.",
                     code: "agent_credential_install_identity_unavailable")
             }
-            return legacyService + "." + bundleID
+            return "com.nativeagent.agent-peer-bearer." + bundleID
         }
     }
     public enum CredentialError: Error, LocalizedError, Equatable {
@@ -144,9 +140,7 @@ public enum AgentPeerCredentials {
     }
     /// Read this install's Keychain at each credential use, so external repairs and removal take effect without a restart.
     public static func read(peerID: String) throws -> String? {
-        let service = try Self.service
-        if let current = try readToken(peerID: peerID, service: service) { return current }
-        return try readToken(peerID: peerID, service: legacyService)
+        try readToken(peerID: peerID, service: service)
     }
     public static func write(_ token: String, peerID: String) throws {
         let query = try query(peerID: peerID)
@@ -202,10 +196,7 @@ public enum AgentPeerCredentials {
     }
 
     public static func delete(peerID: String) throws {
-        let service = try Self.service
-        for namespace in [legacyService, service] {
-            let status = SecItemDelete(try query(peerID: peerID, service: namespace) as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable(status).failure }
-        }
+        let status = SecItemDelete(try query(peerID: peerID) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable(status).failure }
     }
 }

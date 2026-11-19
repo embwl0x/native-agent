@@ -63,7 +63,8 @@ public enum PhoneSenseHistory {
                 permission denied.
                 """]
             if let reading = events.filter({ $0.source == source && !$0.isSetup }).max(by: { $0.timestamp < $1.timestamp }) {
-                lines.append(observationLine(reading, now: now))
+                lines.append("phone \(source.title) \(reading.value)" + (reading.confidence.map { " (\($0) confidence)" } ?? "")
+                    + ((0...freshFor).contains(now.timeIntervalSince(reading.timestamp)) ? "" : "; current unknown"))
             } else if source != .places { lines.append(
                 "\(source.title): no observation received; use its setup steps below, then open the phone app. Silence is not a verdict.") }
             return lines

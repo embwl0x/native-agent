@@ -116,21 +116,13 @@ extension AnthropicOAuthTransport {
     /// Segments must reassemble the exact system bytes. Cache the stable end after identity and before dynamic text; omit an empty dynamic block.
     static func makeSystemBlocks(
         _ system: String?,
-        segments: SystemPromptSegments?
+        segments: SystemPromptSegments?,
+        cacheEligible: Bool
     ) -> [[String: Any]] {
         let usesPrefixShape = usesV2PrefixShape(system, segments: segments)
-        var blocks: [[String: Any]] = [
-            usesPrefixShape
-                ? [
-                    "type": "text",
-                    "text": claudeCodeIdentity,
-                ]
-                : [
-                    "type": "text",
-                    "text": claudeCodeIdentity,
-                    "cache_control": ephemeralCacheControl,
-                ],
-        ]
+        var identity: [String: Any] = ["type": "text", "text": claudeCodeIdentity]
+        if !usesPrefixShape, cacheEligible { identity["cache_control"] = ephemeralCacheControl }
+        var blocks = [identity]
         guard let sys = system, !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return blocks
         }
@@ -138,18 +130,16 @@ extension AnthropicOAuthTransport {
             let layout = seg.textBlockLayout
             blocks += layout.texts.enumerated().map { index, text in
                 var block: [String: Any] = ["type": "text", "text": text]
-                if index == layout.lastStableIndex {
+                if index == layout.lastStableIndex, cacheEligible {
                     block["cache_control"] = ephemeralCacheControl
                 }
                 return block
             }
             return blocks
         }
-        blocks.append([
-            "type": "text",
-            "text": sys,
-            "cache_control": ephemeralCacheControl,
-        ])
+        var block: [String: Any] = ["type": "text", "text": sys]
+        if cacheEligible { block["cache_control"] = ephemeralCacheControl }
+        blocks.append(block)
         return blocks
     }
 
@@ -200,11 +190,9 @@ extension AnthropicOAuthTransport {
 
     /// The server stops a text-tool reply where the model starts writing results itself. Where a call block ends is read by the app
     /// (`endingCallBlock`): a stop mark on the block's closing letters would also fire inside a call's own content.
-    static func applyTextLaneStops(to body: inout [String: Any], system: String?, call: LLMCall) {
+    static func applyTextLaneStops(to body: inout [String: Any], system: String?) {
         if system?.contains(textToolProtocolHeader) == true {
             body["stop_sequences"] = ["<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]
-            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L01"), "site": .string(
-                "LLMClient+AnthropicOAuthRequestBody.swift:applyTextLaneStops")]), turn: call.turn)
         }
     }
 
@@ -220,19 +208,22 @@ extension AnthropicOAuthTransport {
         let usesPrefixShape = Self.usesV2PrefixShape(
             system, segments: call.systemSegments
         )
-        let systemBlocks = Self.makeSystemBlocks(system, segments: call.systemSegments)
+        let systemBlocks = Self.makeSystemBlocks(system, segments: call.systemSegments, cacheEligible: call.session != nil)
 
         // Tool calls/results require array content even when text-only messages can use a string.
         var anthropicMessages: [[String: Any]] = []
-        for m in messages {
+        var wireSourceIndices: [Int] = []
+        for (index, m) in messages.enumerated() {
             // Empty text is never sent beside real content (a tool-only reply leaves one); the API rejects it and a cache marker on it fails the turn.
             let kept = m.content.filter { if case .text(let text) = $0 { !text.isEmpty } else { true } }
-            let blocks = try (kept.isEmpty ? m.content : kept).map(AnthropicTransport.anthropicBlock)
+            guard !kept.isEmpty else { continue }
+            let blocks = try kept.map(AnthropicTransport.anthropicBlock)
             let entry: [String: Any] = [
                 "role": Self.wireRole(m.role),
                 "content": blocks,
             ]
             anthropicMessages.append(entry)
+            wireSourceIndices.append(index)
         }
         var body: [String: Any] = [
             "model": coercedModel,
@@ -241,11 +232,11 @@ extension AnthropicOAuthTransport {
             "system": systemBlocks,
         ]
         Self.cacheConversationPrefix(&body, sourceMessages: messages,
-            wireSourceIndices: Array(messages.indices), usesPrefixShape: usesPrefixShape, call: call)
+            wireSourceIndices: wireSourceIndices, usesPrefixShape: usesPrefixShape, call: call)
         if stream {
             body["stream"] = true
         }
-        Self.applyTextLaneStops(to: &body, system: system, call: call)
+        Self.applyTextLaneStops(to: &body, system: system)
         try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel, call: call,
                                                                providerID: "anthropic_oauth_direct", dataRoot: dataRoot)
         return body

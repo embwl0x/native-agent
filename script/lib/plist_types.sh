@@ -4,9 +4,6 @@
 # Usage:  source script/lib/plist_types.sh
 #         plist_bool_state "$INFO" NativeAgentUpdateFeedPublished   # -> true|false|absent|non-boolean:<type>
 
-# shellcheck disable=SC2034
-PLIST_TYPES_LIB_LOADED=1
-
 # Echoes one of: absent | true | false | non-boolean:<type>
 # $1 — plist path, $2 — top-level key
 plist_bool_state() {

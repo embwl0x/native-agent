@@ -82,8 +82,13 @@ extension SwiftNativeProviderRouting {
             }
             // An unreadable account catalog must retain its cause in the missing-list field.
             if codexCacheURL == nil, CodexAccountModelCatalog.isAccountBackedProvider(id) {
-                extras["models_note"] = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment, preview: preview).map(
-                    JSONValue.string)
+                if let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment, preview: preview) {
+                    extras["models_note"] = .string(fault)
+                } else if let refusal = CodexAccountModelCatalog.fullListRefusal(dataRoot: dataRoot, environment: authEnvironment, preview: preview) {
+                    extras["models_note"] = .string(refusal)
+                } else {
+                    extras["models_note"] = nil
+                }
             }
             if Self.normalizeProviderId(id) == "moonshot" {
                 extras["models_note"] = MoonshotModelCatalog.cacheFault(dataRoot: dataRoot).map(JSONValue.string)
@@ -140,9 +145,6 @@ extension SwiftNativeProviderRouting {
     ) -> (ready: Bool, state: String, detail: String) {
         if let fault = cache?.reads[id]?.unreadable { return (false, "unavailable", fault) }
         if let readiness = cache?.readiness[id] { return readiness }
-        if let error = cache?.reads[id]?.unreadable {
-            return (false, "unavailable", error)
-        }
         /// A check's time is fixed into the account's words when readiness is read, so it carries its day and stays true however long it is shown.
         func checkedWords(_ date: Date) -> String { date.formatted(.dateTime.month(.abbreviated).day().hour().minute()) }
         /// Readiness grades the exact credential's own check. Rejection blocks it; absent, failed or unreadable proof stays eligible and unproven until

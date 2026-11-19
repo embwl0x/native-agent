@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import SwiftUI
 import UIKit
-// Blueprint: | `AliveWords.swift` | Count, identifier and timestamp wording for phone screens |
+// Blueprint: | `AliveWords.swift` | Count and identifier wording for phone screens |
 
 // MARK: - Words
 
@@ -39,14 +39,5 @@ enum AliveWords {
             .trimmingCharacters(in: .whitespaces)
         guard let first = spaced.first else { return raw }
         return first.uppercased() + spaced.dropFirst()
-    }
-
-    static func relative(_ iso: String?) -> String? {
-        guard let iso, let date = UserDisplayFormatters.parseISOTimestamp(iso) else { return nil }
-        return date.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))
-    }
-
-    static func readable(_ iso: String) -> String {
-        UserDisplayFormatters.parseISOTimestamp(iso)?.formatted(date: .abbreviated, time: .shortened) ?? iso
     }
 }

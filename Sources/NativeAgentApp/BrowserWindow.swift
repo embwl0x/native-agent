@@ -195,7 +195,6 @@ final class BrowserWindowController: NSObject, ObservableObject, NSWindowDelegat
     func showWindow() {
         ensureWindow()
         guard let window else { return }
-        NSApp.setActivationPolicy(.regular)
         NSApp.activate()
         if window.isMiniaturized {
             window.deminiaturize(nil)

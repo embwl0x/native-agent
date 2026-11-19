@@ -65,8 +65,4 @@ enum DeskJSON {
             return string
         }
     }
-
-    static func collection<T>(_ value: JSONValue?, decode: (JSONValue) -> T?) -> [T]? {
-        deskStoredCollection(value, decode: decode)
-    }
 }

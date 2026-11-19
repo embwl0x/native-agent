@@ -17,54 +17,14 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
     public let summary: String
     public let detail: String
     public let createdAt: String
-    /// Severity override for cards whose severity is not a function of `outcome`.
-    public var severityOverride: String? = nil
-    /// A resolved card is written already-read: the condition it reported has
-    /// cleared and the row exists only so the board stops asserting it.
-    public var resolved: Bool = false
     /// A failure delivered to the agent stays in the readout without pushing the person.
     public var reachesAgent = false
 
-    public var severity: String { severityOverride ?? (reachesAgent ? "info" : outcome.severity) }
+    public var severity: String { reachesAgent ? "info" : outcome.severity }
 
     /// Include outcome in the replay guard so escalation becomes unread while an identical retry preserves disposition.
     public var signature: String { "\(jobKey):\(outcome.rawValue)" }
 
-    /// Shared inbox fields let readers ignore which owner wrote the row.
-    public func toJSON() -> JSONValue {
-        var actions: [JSONValue] = [
-            .object(["id": .string("view"), "label": .string("View"),
-                     "description": .string("See the delegation outcome detail")]),
-        ]
-        if outcome != .succeeded {
-            actions.append(.object([
-                "id": .string("archive"), "label": .string(outcome == .unknown ? "Acknowledge" : "Archive"),
-                "description": .string("Archive this card only; preserve the original reply and never replay it"),
-            ]))
-        }
-        actions.append(.object([
-            "id": .string("dismiss"), "label": .string("Dismiss"),
-            "description": .string("Dismiss this card"),
-        ]))
-        return .object([
-            "id": .string(cardId),
-            "created_at": .string(createdAt),
-            "source": .string("delegation_outcome"),
-            "severity": .string(severity),
-            "title": .string(String(title.prefix(200))),
-            "summary": .string(String(summary.prefix(500))),
-            "detail": .string(String(detail.prefix(2_000))),
-            "related_execution_id": .null,
-            "related_delegation_id": .string(jobKey),
-            "related_approval_id": .null,
-            "related_paths": .array([]),
-            "related_groups": .array([]),
-            "actions": .array(actions),
-            "error_signature": .string(signature),
-            "status": .string(resolved ? "read" : "unread"),
-            "read_at": resolved ? .string(createdAt) : .null,
-        ])
-    }
     /// Without a declared contact name, preserve the exact identifier.
     public static func displayName(source: String, agent: String) -> String {
         agent.isEmpty ? source : agent

@@ -9,10 +9,6 @@ import ChatSessionWork
 import AppToolRuntime
 // Blueprint: | `AppModel+ChatSessions.swift` | `AppModel`, `composerDraft(for:)`: Shared drafts and checked session transactions |
 
-extension Notification.Name {
-    static let nativeAgentTurnNotice = Notification.Name("nativeagent.turn.notice")
-}
-
 @MainActor
 extension AppModel: MacChatSessionSelectionPort {
     func loadChatState() async {
@@ -79,7 +75,6 @@ extension AppModel: MacChatSessionSelectionPort {
         composerDraft(for: sessionId).text
     }
 
-    /// Prepare the draft before routing so a handoff before the first session cannot lose its starter; preserve existing edits.
     @MainActor
     @discardableResult
     func requestSkillBuild(starter: String = "Create a skill from this conversation: ") -> SkillBuildRequestPresentation.DraftOutcome {
@@ -91,7 +86,6 @@ extension AppModel: MacChatSessionSelectionPort {
         if case .draftPrepared = outcome {
             injectChatDraft(starter, sessionId: sessionID)
         }
-        NotificationCenter.default.post(name: .skillBuildRequest, object: starter)
         return outcome
     }
 
@@ -164,29 +158,6 @@ extension AppModel: MacChatSessionSelectionPort {
         await selectChatSession(resolved.session, userInitiated: false)
     }
 
-    /// Without a conversation list, Simple follows the user's cross-surface anchor; local selection lasts until that anchor moves.
-    @MainActor
-    func followMovedAnchorInSimple() async {
-        await engine.transcripts.refreshNavigationIdentity()
-        guard SimpleViewMode.isShowing,
-              let anchorId = engine.transcripts.conversationAnchor?.sessionId,
-              anchorId != MacChatSelectionIntent.lastSeenAnchorSessionId else { return }
-        if anchorId == activeChatSessionId {
-            MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId
-            return
-        }
-        if !engine.transcripts.sessions.contains(where: { $0.id == anchorId }) {
-            let selection = chatSelectionGeneration
-            await refreshChatSessionIndex()
-            guard chatSelectionGeneration == selection else { return }
-        }
-        guard let session = engine.transcripts.sessions.first(where: {
-            $0.id == anchorId && $0.archived != true && SessionConversation.kind($0).isPersonConversation
-        })
-        else { return }
-        await selectChatSession(session, userInitiated: false)
-        if activeChatSessionId == anchorId { MacChatSelectionIntent.lastSeenAnchorSessionId = anchorId }
-    }
 
     @MainActor
     private func performLoadChatState() async {
@@ -197,7 +168,7 @@ extension AppModel: MacChatSessionSelectionPort {
             _ = try? await engine.transcripts.refreshMessages(sessionId: remembered)
         }
         // Health must not block the conversation list.
-        if engine.doctor.health?.ok != true {
+        if engine.doctor.health?.reachable != true {
             Task { [engine] in await engine.doctor.refreshHealth() }
         }
         do {
@@ -253,23 +224,7 @@ extension AppModel: MacChatSessionSelectionPort {
         }
     }
 
-    func readActiveTranscript(sessionId: String) async {
-        guard activeChatSessionId == sessionId else { return }
-        await engine.readMountedTranscript(sessionId: sessionId, failure: { setFailureStatus($0, action: "refresh your chats") })
-    }
 
-    @MainActor
-    func selectChatSession(id: String) async {
-        do {
-            guard let session = try await engine.transcripts.readSessionIdentity(id) else {
-                statusText = "This conversation is not in the current index."
-                return
-            }
-            await selectChatSession(session)
-        } catch {
-            setFailureStatus(error, action: "open your conversation")
-        }
-    }
 
     func selectChatSession(_ session: ChatSession) async {
         await selectChatSession(session, userInitiated: true)

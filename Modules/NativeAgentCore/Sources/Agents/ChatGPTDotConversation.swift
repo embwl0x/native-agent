@@ -8,7 +8,6 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
-import ProviderRouting
 import Transcripts
 // Blueprint: | `ChatGPTDotConversation.swift` | `ChatGPTDotConversation`, `refresh`, `conversation`, `TurnAdmission` |
 
@@ -23,9 +22,8 @@ actor ChatGPTDotConversation {
         var lifeID: String?
         let message: JSONValue
         var started = false
-        /// Terminal reasons and provider causes grant no replay authority.
+        /// Terminal failure grants no replay authority.
         var failed: String?
-        var retryCause: ProviderFailure?
     }
     private struct AdmissionWork { var task: Task<Void, Never>? }
     private var admissionTasks: [String: AdmissionWork] = [:]
@@ -39,7 +37,8 @@ actor ChatGPTDotConversation {
 
     /// Interrupted admission has no proven network cause and remains terminal.
     func resumeAdmissions() async throws {
-        guard !retired, !recoveryAttempted, !Task.isCancelled else { return }
+        guard !recoveryAttempted, !Task.isCancelled else { return }
+        retired = false
         recoveryAttempted = true
         let generation = generation
         // Reserve this lifecycle before the recovery pass suspends.
@@ -350,21 +349,18 @@ actor ChatGPTDotConversation {
                 guard !retired, !Task.isCancelled else { return }
                 // Admission owns capacity waiting for this exact saved row.
                 var failed: String?
-                var retryCause: ProviderFailure?
                 do {
                     let outcome = try await AgentContactRuntime.run(turn, client: client, dataRoot: root,
                                                                    enqueued: accepted, emit: { _ in })
                     if outcome.state == .failed {
                         failed = outcome.detail ?? "The turn did not finish."
-                        retryCause = outcome.failure?.cause
                     }
                 } catch is CancellationError { return } catch {
                     failed = error.localizedDescription
-                    retryCause = ProviderFailure.classify(error)
                     nativeLog("Dot admission failed: %@", error.localizedDescription)
                 }
                 do { try updateAdmissions(peer: peer.id) { $0[id] = failed.map { Admission(lifeID: lifeID,
-                    message: message, started: true, failed: $0, retryCause: retryCause) } } }
+                    message: message, started: true, failed: $0) } } }
                 catch { nativeLog("Dot admission could not be saved: %@", error.localizedDescription); return }
             })
             appended = true

@@ -21,7 +21,7 @@ import Senses
 import TrustCenter
 import os
 import NativeAgentShared
-// Blueprint: | `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: delivers the message's facts (text, door, who, verified id, trust, steering, posture), runs the agent's turn part's effects, hands it each event with each result's declared effect (and, for a round's one deed whose call asked for `then_say`, its standing words as `say`), logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); before a fresh message’s opening model call, mind/authority practice may supply one gated standing read as `already_looked`; after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting no active ability's recorded route covers it puts `practice` on the round's last result once a turn, traced as `practice.keep`; `joinedProse`; `provider.roundOutput` counts safe prose and tool calls per parsed round; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated for `took`): `took` is the after-turn line, and each part called records its rounds |
+// Blueprint: | `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: delivers the message's facts (text, door, who, verified id, trust, steering, posture), runs the agent's turn part's effects, hands it each event with each result's declared effect (and, for a round's one deed whose call asked for `then_say`, its standing words as `say`), logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting no active ability's recorded route covers it puts `practice` on the round's last result once a turn, traced as `practice.keep`; `joinedProse`; `provider.roundOutput` counts safe prose and tool calls per parsed round; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated for `took`): `took` is the after-turn line, and each part called records its rounds |
 
 extension SwiftNativeTurnEngine {
     func executeContinuationTurnBody(
@@ -32,7 +32,7 @@ extension SwiftNativeTurnEngine {
         toolSessionId: String? = nil,
         runId: String? = nil,
         llm: any LLMClient,
-        tools: any ExpansionToolDispatchClient,
+        tools: any ToolDispatchClient,
         preBuiltContext: TurnContext,
         progress: ToolProgress? = nil,
         onDelivery: (@Sendable () async -> Void)? = nil,
@@ -50,17 +50,6 @@ extension SwiftNativeTurnEngine {
             && preBuiltContext.imageBlocks.isEmpty {
             throw TurnEngineError.emptyMessage
         }
-        let recoveryScope = ProviderToolResultRecoveryStore.Scope(
-            sessionId: toolSessionId ?? sessionId,
-            turnId: turn.id
-        )
-        let turn = turn.with(\.resultRecoveryScope, recoveryScope)
-        var cleanFinish = false
-        defer {
-            if cleanFinish || Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath), let recoveryScope {
-                Task { await ProviderToolResultRecoveryStore.shared.remove(scope: recoveryScope) }
-            }
-        }
         let startNs = DispatchTime.now().uptimeNanoseconds
         var dispatchTrace = ContextStageTrace(turn: turn)
         let gathered = preBuiltContext
@@ -71,6 +60,20 @@ extension SwiftNativeTurnEngine {
         var part = try await TurnPart(dataRoot: remPinsDataRoot ?? defaultDataRoot(), surface: surface, stop: cancelFlagPath,
                                       context: gathered, log: restarted?.log ?? [], turn: turn, deadlines: work.deadlines)
         defer { part.tellAgent() }
+        func settlePartRounds(status: String) {
+            do {
+                let store = AbilityStore(dataRoot: remPinsDataRoot ?? defaultDataRoot())
+                do { try store.recordRun(id: TurnPart.id, version: part.version,
+                    receipt: .object(["status": .string(status), "reason": .string(status == "stopped" ? "cancelled" : "")]), turn: turn) }
+                catch { nativeLog("The turn program's run was not recorded: %@", error.localizedDescription) }
+                for (version, rounds) in try partRounds.take().sorted(by: { ($0.key.id, $0.key.key) < ($1.key.id, $1.key.key) }) {
+                    // The rounds ledger owns repair for its own failed writes; one version's failure does not discard its siblings.
+                    do { try store.recordRounds(id: version.id, version: version.key, rounds: rounds, turn: turn) }
+                    catch { nativeLog("The agent's part %@'s rounds were not recorded: %@", version.id, error.localizedDescription) }
+                }
+            } catch { nativeLog("This turn's ability rounds were not recorded: %@", error.localizedDescription) }
+        }
+        do {
         var inFlight = false
         if part.log.isEmpty {
             // The moment's facts, read-only: the words, who sent them, the door, and the posture over the person's world.
@@ -178,6 +181,9 @@ extension SwiftNativeTurnEngine {
         dispatchTrace.record(.toolCodec, since: codecStart)
         /// Seed the opening request again when repair selects a version with different system text or tools.
         func seeded(_ composed: TurnContext) throws -> (ConversationPrefixSeeding.Seed, (prompt: String?, segments: SystemPromptSegments?)) {
+            if composed.systemSegments == nil {
+                return (ConversationPrefixSeeding.seed(composed), (nil, nil))
+            }
             let request = try ConversationPrefixSeeding.request(composed, codec: toolCallCodec, turn: turn)
             return (request.seed, (request.system, request.segments))
         }
@@ -201,16 +207,6 @@ extension SwiftNativeTurnEngine {
                 telemetry: prefixTelemetry, sink: prefixSink, surface: surface, sessionId: sessionId, runId: runId,
                 userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot, turn: turn)
         }
-        func settlePartRounds() {
-            do {
-                let store = AbilityStore(dataRoot: remPinsDataRoot ?? defaultDataRoot())
-                for (version, rounds) in try partRounds.take().sorted(by: { ($0.key.id, $0.key.key) < ($1.key.id, $1.key.key) }) {
-                    // The rounds ledger owns repair for its own failed writes; one version's failure does not discard its siblings.
-                    do { try store.recordRounds(id: version.id, version: version.key, rounds: rounds, turn: turn) }
-                    catch { nativeLog("The agent's part %@'s rounds were not recorded: %@", version.id, error.localizedDescription) }
-                }
-            } catch { nativeLog("This turn's ability rounds were not recorded: %@", error.localizedDescription) }
-        }
         do {
         dispatchTrace.setFlag("bookkeepingParallel", true)
         let preparedDispatchTrace = dispatchTrace
@@ -227,6 +223,21 @@ extension SwiftNativeTurnEngine {
                                         observedBy: "transport.dispatch", flags: ["initialRequest": true], turn: turn)
         }
         var conversation: [LLMMessage] = prefixSeed.messages
+        func reseed(keeping additional: [LLMMessage], recording: Bool, turn: Turn) throws {
+            (prefixSeed, wireSystem) = try seeded(resolvedTurnContext)
+            ctx = prefixSeed.context
+            providerTools = ProviderToolNameMap(ctx.toolSchemas)
+            conversation = ConversationPrefixSeeding.Request(seed: prefixSeed, system: wireSystem.prompt, segments: wireSystem.segments,
+                tools: toolCallCodec.requestTools(providerTools.schemas)).appending(additional).messages
+            guard recording else { return }
+            let seed = prefixSeed
+            let telemetry = Task { await Self.preparePrefixTelemetry(seed) }
+            prefixSink?.setPending(Task { let result = await telemetry.value; return result.snapshot })
+            bookkeeping = Task { [remPinsDataRoot] in
+                await Self.recordDispatchBookkeeping(seed: seed, telemetry: telemetry, sink: prefixSink, surface: surface, sessionId: sessionId,
+                    runId: runId, userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot, turn: turn)
+            }
+        }
         let turnBudget = try ContextBudgetPolicy.resolve(turn: turn, dataRoot: remPinsDataRoot)
         guard let turnWindowTokens = turnBudget.windowTokens else {
             throw ProviderRoutingError.configurationFailed("The admitted model's default window is unavailable.")
@@ -240,7 +251,6 @@ extension SwiftNativeTurnEngine {
         // The familiarity nerve fires at most once a turn, and never on a route this turn already met.
         var practiceChecked: Set<String> = [], practiceNoted = false
         func observed(_ result: TurnEngineResult, reason: TurnEngineResult.TerminalReason) -> TurnEngineResult {
-            cleanFinish = reason == .replyCompleted || reason == .incomplete
             return result.observingTerminal(reason: reason, counters: counters, cognitiveContextDelivered: cognitiveContextDelivered)
         }
         var visibleText = ""
@@ -262,8 +272,6 @@ extension SwiftNativeTurnEngine {
         var emittedProviderFirstDelta = false
         var providerCallCount = 0
         var openingAdditionalCharacters = 0
-        // Relaunches resume their recorded work; retries keep the one opening read.
-        var openingReadOwed = restarted == nil
         var replyTextSettled = false
         var lastMovement: ContinuousClock.Instant?
         var providerFailurePending = part.log.reversed().compactMap { row -> String? in
@@ -404,7 +412,7 @@ extension SwiftNativeTurnEngine {
         func capture(startingCalls: Int = 0,turn: Turn,work: ChatTurnWork) async throws {
             await work.checkpoint?.capture(
                 prose: retainedProse,
-                commentaryCharacters: workingCommentaryCharacters, conversation: conversation, log: part.log,
+                commentaryCharacters: workingCommentaryCharacters, log: part.log,
                 startingCalls: startingCalls, turn: turn)
             if !steeringOffers.isEmpty || !replayedArrivals.isEmpty {
                 guard work.checkpoint != nil, let root = remPinsDataRoot, let sessionId,
@@ -480,7 +488,6 @@ extension SwiftNativeTurnEngine {
                 }
                 await bookkeeping.value
                 let reply = Self.joinedProse(retainedProse, part.answered)
-                settlePartRounds()
                 let waiting = turn.execution.map { $0.waitingInteraction != nil || $0.waitingForApproval } ?? false
                 let completed = await finishReplyTurn(
                     reply: waiting ? ChatTurnExecution.waitingReply(visible: reply, turn: turn) : reply,
@@ -602,20 +609,7 @@ extension SwiftNativeTurnEngine {
                     let additional = try ConversationPrefixSeeding.additionalMessages(in: conversation, after: prefixSeed)
                     resolvedTurnContext.toolSchemas = gathered.toolSchemas
                     resolvedTurnContext = resolvedTurnContext.composing(system, tools: part.offeredTools)
-                    (prefixSeed, wireSystem) = try seeded(resolvedTurnContext)
-                    ctx = prefixSeed.context
-                    providerTools = ProviderToolNameMap(ctx.toolSchemas)
-                    let healedSeed = prefixSeed
-                    let healedTelemetry = Task { await Self.preparePrefixTelemetry(healedSeed) }
-                    prefixSink?.setPending(Task { let result = await healedTelemetry.value; return result.snapshot })
-                    bookkeeping = Task { [remPinsDataRoot] in
-                        await Self.recordDispatchBookkeeping(seed: healedSeed,
-                            telemetry: healedTelemetry, sink: prefixSink, surface: surface, sessionId: sessionId,
-                            runId: runId, userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot, turn: turn)
-                    }
-                    conversation = ConversationPrefixSeeding.Request(seed: prefixSeed,
-                        system: wireSystem.prompt, segments: wireSystem.segments,
-                        tools: toolCallCodec.requestTools(providerTools.schemas)).appending(additional).messages
+                    try reseed(keeping: additional, recording: true, turn: turn)
                     composed = (.some(system), part.offeredTools)
                     // A system that arrives after the agent's first acts owes its context delivery as an opening one would.
                     if late {
@@ -623,23 +617,11 @@ extension SwiftNativeTurnEngine {
                         commitPartsDelivery = resolvedTurnContext.partsDelivery
                     }
                 }
-                if case .string(let note)? = effect["note"], !note.isEmpty { Self.appendStructuredUserNudge(note, to: &conversation) }
-                if openingReadOwed {
-                    openingReadOwed = false
-                    if ctx.toolSchemas.contains(where: { $0.name == "app" }) {
-                        let looked = await holding(turn.admitting(model: .some(ctx.modelId))) { turn in
-                        await holding(work.with(\.preparedContext, ctx.fluidContextTurn)) { work in
-                        await holding(turn.with(\.runtime, .init(
-                            model: ctx.modelId, surface: surface, personaID: ctx.personaID,
-                            providerID: ctx.providerId ?? turn.admission?.provider))) { turn in
-                            await tools.readAhead(surface: surface, session: toolSessionId ?? sessionId, turn: turn, work: work)
-                        } } }
-                        if let looked {
-                            let text = try ChatSecretRedactor.redactValue(looked).serialize(pretty: false)
-                            Self.appendStructuredUserNudge(text, to: &conversation)
-                        }
-                    }
+                if toolCallCodec == .textMarkers, wireSystem.segments == nil {
+                    throw ProviderRoutingError.configurationFailed(
+                        "The text-marker request requires coherent system segments; its offered tool contract was not assembled.")
                 }
+                if case .string(let note)? = effect["note"], !note.isEmpty { Self.appendStructuredUserNudge(note, to: &conversation) }
             default:
                 // Checkpoint reply-end bookkeeping like any effect.
                 try await capture(turn: turn, work: work)
@@ -695,8 +677,8 @@ extension SwiftNativeTurnEngine {
                 // Every step after the first carries what changed in the agent elsewhere since its last one, after its reply too.
                 if providerCallCount > 0, let sessionId, !sessionId.isEmpty, let root = remPinsDataRoot, let cursor = agentNow {
                     let at = Date()
-                    let peer = try !Self.personContinuityAllowed(root: root, sessionID: sessionId, turn: turn)
-                    if !peer || Self.peerContinuityTurn(turn) {
+                    let peer = !turn.steeringStamp().isEmpty
+                    if try peer || Self.personContinuityAllowed(root: root, sessionID: sessionId, turn: turn) {
                         let breath = await ChatWorkspaceBinding.breath(turn: turn, invocation: work.invocation, dataRoot: root, scope: sessionId,
                             peer: peer, since: cursor.at, shown: breathActs, at: at)
                         // A read window is new evidence even when it renders alike; only a failed reading's repeat is withheld. Acts are shown once by id.
@@ -721,25 +703,7 @@ extension SwiftNativeTurnEngine {
                         let fitted = try await fit(resolvedTurnContext, toolCallCodec, encoded)
                         let changed = fitted.historyContextWindow != resolvedTurnContext.historyContextWindow
                         resolvedTurnContext = fitted
-                        (prefixSeed, wireSystem) = try seeded(resolvedTurnContext)
-                        ctx = prefixSeed.context
-                        providerTools = ProviderToolNameMap(ctx.toolSchemas)
-                        conversation = ConversationPrefixSeeding.Request(seed: prefixSeed,
-                            system: wireSystem.prompt, segments: wireSystem.segments,
-                            tools: toolCallCodec.requestTools(providerTools.schemas)).appending(additional).messages
-                        if providerCallCount == 0 || changed {
-                            let fittedSeed = prefixSeed
-                            let fittedTelemetry = Task { await Self.preparePrefixTelemetry(fittedSeed) }
-                            prefixSink?.setPending(Task {
-                                let result = await fittedTelemetry.value
-                                return result.snapshot
-                            })
-                            bookkeeping = Task { [remPinsDataRoot] in
-                                await Self.recordDispatchBookkeeping(seed: fittedSeed,
-                                    telemetry: fittedTelemetry, sink: prefixSink, surface: surface, sessionId: sessionId,
-                                    runId: runId, userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot, turn: turn)
-                            }
-                        }
+                        try reseed(keeping: additional, recording: providerCallCount == 0 || changed, turn: turn)
                     }
                 }
                 do {
@@ -1009,17 +973,15 @@ extension SwiftNativeTurnEngine {
             }
             providerFailurePending = turn.providerRecovery?.stopped != nil
             let iterProse = ToolCallParser.stripProtocolDebris(iterAccumulated)
-            let answerText = iterProse.replacingOccurrences(
-                of: #"</?[\p{L}_][\p{L}\p{N}_.:-]*(?:\s[^<>]*)?/?>|<[!?][^>]*>"#, with: "", options: .regularExpression)
             func saveSuspiciousReply() {
-                let visible = answerText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let visible = iterProse.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard visible.split(whereSeparator: { $0.isWhitespace }).count < 2
                     || (visible.count < 12 && iterProse.contains(where: { "<=>".contains($0) })) else { return }
                 let raw = rawProviderEvents.withLock { $0 }
                 if !raw.isEmpty { ProviderOutputDiagnostics.writeDiagnostic(raw, reason: "suspicious_reply", dataRoot: remPinsDataRoot, call: call) }
             }
             if !call.allowsSilentCompletion, toolBoundaryReason == nil,
-               streamedCalls.isEmpty && !answerText.contains(where: { !$0.isWhitespace }) {
+               streamedCalls.isEmpty && !iterProse.contains(where: { !$0.isWhitespace }) {
                 saveSuspiciousReply()
                 visibleText = roundBaseVisibleText
                 counters.emptyReplyRoundCount += 1
@@ -1027,7 +989,7 @@ extension SwiftNativeTurnEngine {
                     detail: "The provider completed without an answer or a tool call."), emitted: emitted, turn: turn)
                 continue
             }
-            if call.allowsSilentCompletion, streamedCalls.isEmpty, !answerText.contains(where: { !$0.isWhitespace }) {
+            if call.allowsSilentCompletion, streamedCalls.isEmpty, !iterProse.contains(where: { !$0.isWhitespace }) {
                 // A silent end is the thought's whole answer: what the model read was delivered, so its offers settle as consumed.
                 try await commitDelivery()
             }
@@ -1130,10 +1092,18 @@ extension SwiftNativeTurnEngine {
             throw TurnEngineError.turnPartFailed("Its steps ended the turn without a reply.end.")
         }
         await bookkeeping.value
+        let reason = result.resolvedTerminalReason(dataRoot: remPinsDataRoot)
+        // A turn that ends waiting on the person asked correctly: it counts as a clean run, never against its version.
+        settlePartRounds(status: reason == .replyCompleted || reason.state == .waiting ? "ok" : reason == .cancelled ? "stopped" : "error")
         return result
         } catch {
             await bookkeeping.value
-            settlePartRounds()
+            throw error
+        }
+        } catch {
+            var status = Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) || error is CancellationError ? "stopped" : "error"
+            if case TurnEngineError.streamCancelled = error { status = "stopped" }
+            settlePartRounds(status: status)
             throw error
         }
         }

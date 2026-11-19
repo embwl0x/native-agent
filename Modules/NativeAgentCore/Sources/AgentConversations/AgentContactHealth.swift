@@ -15,6 +15,7 @@ public actor AgentContactHealth {
     public static let shared = AgentContactHealth()
     private var running: Set<String> = []
     private var pending: Set<String> = []
+    private var refreshWaiters: [String: [UUID: CheckedContinuation<Void, Never>]] = [:]
     private var appQueries: [Probe: Task<(Bool, Date), Never>] = [:]
     private var grokVerifiers: [String: @Sendable (String) async throws -> Void] = [:]
     private var cardsRead: Set<String> = []
@@ -233,11 +234,28 @@ public actor AgentContactHealth {
 
     public func refresh(dataRoot: URL) async {
         let key = dataRoot.standardizedFileURL.path
-        guard running.insert(key).inserted else { pending.insert(key); return }
-        defer {
-            running.remove(key)
-            if pending.remove(key) != nil { Task { await refresh(dataRoot: dataRoot) } }
+        // A caller arriving mid-inspection asks for one more pass and waits for it, so changes made after the running pass read its
+        // sources are inspected too.
+        guard running.insert(key).inserted else {
+            pending.insert(key)
+            let waiter = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { refreshWaiters[key, default: [:]][waiter] = $0 }
+            } onCancel: {
+                Task { await self.cancelRefreshWaiter(waiter, key: key) }
+            }
+            return
         }
+        repeat {
+            pending.remove(key)
+            await inspect(dataRoot: dataRoot)
+        } while pending.contains(key)
+        running.remove(key)
+        for waiter in (refreshWaiters.removeValue(forKey: key) ?? [:]).values { waiter.resume() }
+    }
+
+    private func inspect(dataRoot: URL) async {
+        let key = dataRoot.standardizedFileURL.path
         let peers: [AgentPeerContact], records: [AgentConversationRecord]
         var previous: [String: AgentLocalHealth]
         do {
@@ -252,7 +270,6 @@ public actor AgentContactHealth {
         } catch { return }
         let probes: [(String, Probe)] = peers.map { ("peer:" + $0.id, probe($0)) }
         var observations: [Probe: AgentLocalHealth] = [:]
-        var changed = false
         var repairs: [(String, Probe, AgentPeerContact?, String)] = []
         for (agent, probe) in probes {
             let history = records.filter { $0.agent == agent }
@@ -273,7 +290,6 @@ public actor AgentContactHealth {
                     || previous[agent]?.brokenSince != nil || previous[agent]?.repairFor != nil || previous[agent]?.repairDetail != nil
                     || previous[agent]?.repairAttemptedAt != nil {
                     previous[agent] = observed
-                    changed = true
                 }
                 continue
             }
@@ -297,7 +313,6 @@ public actor AgentContactHealth {
                 observed.detail = "The recipe's identity cannot be read: \(error.localizedDescription). Repair its recipe file before verifying this contact."
                 observed.checkedAt = Date()
                 previous[agent] = observed
-                changed = true
                 continue
             }
             let recipeChanged = (proof?.recipeVersion != nil || proof?.recipeDigest != nil)
@@ -357,12 +372,8 @@ public actor AgentContactHealth {
                 guard observed != previous[agent] else { continue }
                 observed.checkedAt = Date()
                 previous[agent] = observed
-                changed = true
                 continue
             }
-            // Exclude live transport overlays when comparing stored rows, or each refresh rewrites the watched file.
-            if let old = previous[agent], !old.sticky, old.lastGoodAt == good, Date().timeIntervalSince(old.checkedAt) < AgentLocalHealth.refreshInterval,
-               old.failureOperation == operation { continue }
             if Task.isCancelled { return }
             var observed: AgentLocalHealth
             if let kept = observations[probe] { observed = kept }
@@ -379,14 +390,10 @@ public actor AgentContactHealth {
             observed.repairFor = observed.status == "inbound_only" ? nil : previous[agent]?.repairFor
             if let old = previous[agent] { arrive(agent, from: old, to: observed, peers: peers, dataRoot: dataRoot) }
             previous[agent] = observed
-            changed = true
         }
         for (agent, _) in probes {
-            let before = previous[agent]
             previous[agent]?.retainReplyEvidence()
-            changed = changed || before != previous[agent]
         }
-        guard changed else { return }
         let active = Set(probes.map(\.0))
         previous = previous.filter { active.contains($0.key) }
         guard let savedHealth = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
@@ -394,11 +401,18 @@ public actor AgentContactHealth {
             && saved.repairFor == previous[agent]?.repairFor {
             previous[agent]?.repairDetail = saved.repairDetail
         }
+        let checkedAt = Date()
+        for agent in previous.keys { previous[agent]?.checkedAt = checkedAt }
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(previous), to: AgentLocalHealth.url(dataRoot)) }
         catch { nativeLog("AgentContactHealth: could not save local observations: %@", error.localizedDescription); return }
         for (agent, probe, peer, operation) in repairs {
             Task { await verify(agent, probe: probe, peer: peer, operation: operation, dataRoot: dataRoot) }
         }
+    }
+
+    private func cancelRefreshWaiter(_ waiter: UUID, key: String) {
+        refreshWaiters[key]?.removeValue(forKey: waiter)?.resume()
+        if refreshWaiters[key]?.isEmpty == true { refreshWaiters.removeValue(forKey: key) }
     }
 
     private func verify(_ agent: String, probe: Probe, peer: AgentPeerContact?, operation: String, dataRoot: URL) async {
@@ -435,8 +449,10 @@ public actor AgentContactHealth {
         }
         guard var health = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
         guard health[agent]?.repairFor == operation, health[agent]?.brokenSince != nil else { return }
+        let saved = health
         health[agent]?.repairDetail = detail
         for key in health.keys { health[key]?.retainReplyEvidence() }
+        guard health != saved else { return }
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(health), to: AgentLocalHealth.url(dataRoot)) }
         catch { nativeLog("AgentContactHealth: could not save verification: %@", error.localizedDescription) }
     }

@@ -101,6 +101,14 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             throw NSError(domain: "NativeAgentBuildIdentity", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: unavailableReason])
         }
+        let path = root.appendingPathComponent(Self.launchStampFilename)
+        // A relaunch of the same build keeps the moment that build first ran; a new build starts its own.
+        var firstLaunchedAt = NativeTimestampFormat.plainZulu(at)
+        if let data = try? Data(contentsOf: path),
+           let prior = try? JSONSerialization.jsonObject(with: data) as? [String: Any], sameBuild(as: prior),
+           let first = (prior["firstLaunchedAt"] ?? prior["writtenAt"]) as? String {
+            firstLaunchedAt = first
+        }
         let payload: [String: Any] = [
             "version": version,
             "build": build,
@@ -108,12 +116,21 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             "sourceDirty": sourceDirty.map { $0 as Any } ?? NSNull(),
             "sourceContentID": sourceContentID ?? NSNull(),
             "writtenAt": NativeTimestampFormat.plainZulu(at),
+            "firstLaunchedAt": firstLaunchedAt,
             // A relaunch needs a new window identity even when the build is unchanged.
             "pid": Int(ProcessInfo.processInfo.processIdentifier),
         ]
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
-            .write(to: root.appendingPathComponent(Self.launchStampFilename), options: .atomic)
+            .write(to: path, options: .atomic)
+    }
+
+    /// Whether a stamp's identity fields name this build: version, build, source revision and content.
+    public func sameBuild(as stamp: [String: Any]) -> Bool {
+        guard unavailableReason == nil else { return false }
+        return stamp["version"] as? String == version && stamp["build"] as? String == build
+            && (stamp["sourceRevision"] as? String)?.lowercased() == sourceRevision?.lowercased()
+            && (stamp["sourceContentID"] as? String)?.lowercased() == sourceContentID?.lowercased()
     }
 
     private static func nonempty(_ value: String?) -> String? {

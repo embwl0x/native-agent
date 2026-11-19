@@ -1,8 +1,7 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceMessages.swift` | `AgentWorkspaceMessages` enum; `project` |
+// Blueprint: | `AgentWorkspaceMessages.swift` | Messages thread projections and existing app compose action |
 
-/// Navigation over Messages-owned identities. Never derive recipients from a display name, chat ID, preview text, or embedded action-looking content.
 enum AgentWorkspaceMessages {
     static func replyAction(_ row: [String: JSONValue], requested: String?, title: String) -> AgentWorkspaceAction? {
         guard let id = text(row["thread_id"]), requested == id, case .array(let participants)? = row["participants"] else { return nil }
@@ -13,7 +12,7 @@ enum AgentWorkspaceMessages {
     }
 
     static func project(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
-        let compose = AgentWorkspaceButton(label: "Compose message", action: .configure(tool: "messages.send", input: [:], title: "Compose message"))
+        let compose = AgentWorkspaceButton(label: "Compose message", action: .open(.record(tool: "app", input: ["find": .string("messages.send"), "args": .object([:])], title: "Compose message")))
         let openApp = AgentWorkspaceButton(label: "Open Messages view", action: .perform(tool: "go", input: ["name": .string("Messages")],
             title: "Messages view", textField: nil, isEffect: true))
         let rowsKey = input["from_me"] == nil ? "threads" : "messages"

@@ -15,13 +15,16 @@ public enum MemoryBringBack {
     public static let originKey = "brought_back_from"
     /// The name an archive goes by when its profile names no agent.
     public static let defaultName = "Agent"
-    static let carriedKeys = ["kind", "tags", "importance", "confidence", "pinned", "privacy", "permittedSurfaces"]
+    static let correctionLinkKeys = ["corrected_by", "superseded_by"]
+    static let carriedKeys = ["kind", "tags", "importance", "confidence", "pinned", "privacy", "permittedSurfaces",
+                              "correction_subject"] + correctionLinkKeys
 
     /// One old memory, ready for the write: what it says, whether it was archived, the telling its provenance names and the principals it recorded.
     public struct Memory: Sendable {
         public let id: String
         public let content: String
         public let archived: Bool
+        public let lifecycle: String?
         public let telling: MemoryRoot.Telling
         public let through: [String]
         let metadata: JSONValue
@@ -80,7 +83,7 @@ public enum MemoryBringBack {
         let archiveContacts: [Contact]
         do {
             let store = try copied(from, to: copy)
-            names = try? MemoryRecallQueryExpansion.names(storeDirectory: store.deletingLastPathComponent())
+            names = try MemoryRecallQueryExpansion.names(storeDirectory: store.deletingLastPathComponent())
             archiveContacts = contacts(store.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("agents/peers.json"))
             rows = try read(store)
         } catch {
@@ -89,14 +92,17 @@ public enum MemoryBringBack {
                 """)
         }
         let here: (ids: Set<String>, held: [Set<String>])
-        do { here = try broughtBack(store: dataRoot.appendingPathComponent("memory/memory.sqlite")) } catch {
+        let person: String?
+        do {
+            here = try broughtBack(store: dataRoot.appendingPathComponent("memory/memory.sqlite"))
+            person = try MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory")).user ?? names?.user
+        } catch {
             throw PartCallError(code: "memory_unavailable", message: """
-                Memory could not say what is already here (\(error.localizedDescription)); nothing was brought back.
+                Memory could not prepare bring-back (\(error.localizedDescription)); nothing was brought back.
                 """)
         }
         let todayContacts = contacts(dataRoot.appendingPathComponent("agents/peers.json"))
         let translate = { (principal: String) in translated(principal, archive: archiveContacts, today: todayContacts) }
-        let person = (try? MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory")))?.user ?? names?.user
         let pastSelf = label(name: names?.agent, last: rows.compactMap { $0.created.flatMap(MemoryRecallScoring.parseTimestamp) }.max())
         let kept = rows.filter { $0.status == "active" || $0.status == "archived" }
         var renames: [String: (to: String, teller: String?)] = [:]
@@ -111,6 +117,7 @@ public enum MemoryBringBack {
             }
             guard !here.ids.contains(old.id) else { return nil }
             return Memory(id: old.id, content: old.content, archived: old.status == "archived" || !MemoryLifecycle.isRecallEligible(old.lifecycle),
+                          lifecycle: old.lifecycle,
                           telling: telling, through: Array(Set(through)).sorted(),
                           metadata: metadata(old))
         }
@@ -175,6 +182,7 @@ public enum MemoryBringBack {
             let unzipped = copy.appendingPathComponent("unzipped", isDirectory: true)
             let ditto = Process()
             ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            ditto.environment = ManagedProcess.agentEnvironment()
             ditto.arguments = ["-x", "-k", from.path, unzipped.path]
             try ditto.run()
             ditto.waitUntilExit()
@@ -285,7 +293,7 @@ public enum MemoryBringBack {
         return MemoryRoot.validName("\(name) of \(day.string(from: last))") ?? name
     }
 
-    /// What the write keeps beside the words: kind, tags, importance, confidence, pin and dates, and the original id.
+    /// The write keeps correction links and subjects beside kind, tags, importance, confidence, pin, dates and the original id.
     static func metadata(_ old: Old) -> JSONValue {
         var fields: [String: JSONValue] = [:]
         for key in carriedKeys { if let value = old.metadata?[key] { fields[key] = value } }
@@ -332,8 +340,13 @@ public enum MemoryBringBack {
 
     /// The teller is the person, or names the person as whose words it carried ("<person> via <relay>", "<relay> relaying <person>").
     static func relays(_ teller: String, person: String?) -> Bool {
-        guard let person = person?.trimmingCharacters(in: .whitespacesAndNewlines), !person.isEmpty else { return false }
-        return teller.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).contains { $0.caseInsensitiveCompare(person) == .orderedSame }
+        guard let person = person?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !person.isEmpty else { return false }
+        let teller = teller.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if teller == person { return true }
+        let prefix = person + " via "
+        let suffix = " relaying " + person
+        return (teller.hasPrefix(prefix) && !teller.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            || (teller.hasSuffix(suffix) && !teller.dropLast(suffix.count).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     /// A time not after now; a later one is no time the agent knew it.
@@ -373,13 +386,14 @@ public enum MemoryBringBack {
 
     // MARK: - Run: the agent's own write, one memory at a time
 
-    /// Each memory through `store`; an archived one is then archived by the store's own update. One memory's refusal never stops the rest.
+    /// Each memory through `store`, with its archive status in that same write. One memory's refusal never stops the rest.
     /// The write embeds each memory (or owes its vector to the store's fill) and pokes the graph hook; an owner whose store carries no graph
     /// hook (any root but the app's own) has its graph reconciled once after. Then one note tells the agent.
     @concurrent public static func run(_ prepared: Prepared, into dataRoot: URL, owner: SwiftNativeMemoryV2) async -> Outcome {
         // A warm model embeds each write as it lands instead of owing every vector.
         try? await owner.warmUpEmbedder()
         var brought = 0, archived = 0, renamed = 0
+        var imported: [String: String] = [:]
         var refused: [String] = []
         var graph = ""
         // Memories already here take today's identity of each archive principal they name; who steered is renamed, never dropped.
@@ -391,25 +405,44 @@ public enum MemoryBringBack {
         for memory in prepared.memories {
             // What happened is recorded as it was, at its own date; whether a teller's word counts is trust's, read when the memory is used.
             let telling = memory.telling
-            let context = memory.through.isEmpty ? MemoryWriteContext(turn: nil, senseReads: nil, telling: telling)
-                : MemoryWriteContext(material: memory.through, telling: telling)
-            let record: MemoryRecord
+            let context = memory.through.isEmpty
+                ? MemoryWriteContext(turn: nil, senseReads: nil, telling: telling, lifecycle: memory.lifecycle)
+                : MemoryWriteContext(material: memory.through, telling: telling, lifecycle: memory.lifecycle)
             do {
+                // Archive ids are not current ids. No link lands until its target has actually been imported.
+                var metadata = memory.metadata
+                if case .object(var fields) = metadata {
+                    for key in correctionLinkKeys { fields.removeValue(forKey: key) }
+                    metadata = .object(fields)
+                }
                 // An archived memory keeps its own row, never folding into a live one it repeats.
-                record = try await owner.store(content: memory.content, source: source, metadata: memory.metadata,
-                                               id: memory.archived ? UUID().uuidString : nil, context: context)
+                let saved = try await owner.store(content: memory.content, source: source, metadata: metadata,
+                                                  id: memory.archived ? UUID().uuidString : nil,
+                                                  status: memory.archived ? "archived" : "active", context: context)
+                imported[memory.id] = saved.id
                 brought += 1
+                if memory.archived { archived += 1 }
             } catch {
                 refused.append("\(memory.id): \(error.localizedDescription)")
-                continue
             }
-            guard memory.archived else { continue }
+        }
+        for memory in prepared.memories {
+            guard let id = imported[memory.id] else { continue }
+            var links: [String: JSONValue] = [:]
+            for key in correctionLinkKeys {
+                if let oldID = memory.metadata.objectValue?[key]?.stringValue, let target = imported[oldID] {
+                    links[key] = .string(target)
+                }
+            }
+            guard !links.isEmpty else { continue }
             do {
-                _ = try await owner.updateMemory(id: record.id, update: .object(["status": .string("archived")]),
-                                                 context: MemoryWriteContext(turn: nil, senseReads: nil, telling: nil))
-                archived += 1
+                guard let storage = await owner.underlyingStorage() else { throw MemoryV2Error.storageUnavailable }
+                guard try await storage.updateMemory(id: id, patch: MemoryPatch(metadataMerge: links),
+                    context: MemoryWriteContext(turn: nil, senseReads: nil, telling: nil)) != nil else {
+                    throw MemoryV2Error.recordNotFound
+                }
             } catch {
-                refused.append("\(memory.id): came back active, its archiving failed: \(error.localizedDescription)")
+                refused.append("\(memory.id) correction links: \(error.localizedDescription)")
             }
         }
         if brought > 0, !SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot) {

@@ -1,4 +1,5 @@
 import AgentWorkspace
+import AgentConversations
 import AuthoredCapabilities
 #if canImport(AppKit)
 import AppKit
@@ -84,7 +85,7 @@ extension SwiftToolDispatcher {
                 """ + presence)
             return .object(result)
         }
-        if try currentPeerState(contact, peers: peers) == .unavailable {
+        if try currentPeerState(contact, credentials: AgentPeerCredentials.credentialReads(peers)) == .unavailable {
             result["status"] = .string("unavailable"); result["sent"] = .bool(false)
             result["detail"] = .string(AgentPeerCredentials.unavailableDetail + " Nothing was held: \(name) cannot call in without its key.")
             result["remedy"] = Repair.remedy(owner: "Keychain peer:" + contact.id, nextCall: .object([
@@ -166,17 +167,18 @@ extension SwiftToolDispatcher {
     static func agentLaneContacts(peers: [AgentPeerContact], selectedPeers: [AgentPeerContact],
                                   readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> [JSONValue] {
         let selected = Set(selectedPeers.map { peer in (peers.first { $0.id == peer.who } ?? peer).id })
+        let credentials = AgentPeerCredentials.credentialReads(peers, readCredential: readCredential)
         return peers.filter { selected.contains($0.id) }.map { who in
-            guard case .object(var projection) = peerProjection(who, peers: peers, readCredential: readCredential) else { return .null }
+            guard case .object(var projection) = peerProjection(who, credentials: credentials) else { return .null }
             projection["handles"] = .array((who.handles ?? []).map(JSONValue.string))
             projection["doors"] = .array(peers.filter { $0.id == who.id || $0.who == who.id }.map {
-                peerProjection($0, peers: peers, readCredential: readCredential)
+                peerProjection($0, credentials: credentials)
             })
             return .object(projection)
         }
     }
-    static func currentPeerState(_ peer: AgentPeerContact, peers: [AgentPeerContact]) throws -> AgentPeerContactState {
-        try AgentPeerCredentials.availability(peer, peers: peers).get() ? peer.state : .unavailable
+    static func currentPeerState(_ peer: AgentPeerContact, credentials: [AgentPeerCredentials.CredentialRead]) throws -> AgentPeerContactState {
+        try AgentPeerCredentials.availability(peer, reads: credentials).get() ? peer.state : .unavailable
     }
     /// Normalize executable suffixes so alternate host labels do not create duplicate contacts.
     static func sameAgent(_ a: String, _ b: String) -> Bool {
@@ -196,11 +198,10 @@ extension SwiftToolDispatcher {
         let keys: Set<String> = ["agent", "name", "state", "last_answered", "capabilities", "can_start_turn", "state_failure"]
         return .object(row.filter { keys.contains($0.key) })
     }
-    static func peerProjection(_ peer: AgentPeerContact, peers: [AgentPeerContact] = [],
-                                       readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> JSONValue {
+    static func peerProjection(_ peer: AgentPeerContact, credentials: [AgentPeerCredentials.CredentialRead]) -> JSONValue {
         guard case .object(var value) = peerHistoryProjection(peer) else { return .null }
         if let ability = peer.ability { value["ability"] = .string(ability) }
-        let availability = AgentPeerCredentials.availability(peer, peers: peers, readCredential: readCredential)
+        let availability = AgentPeerCredentials.availability(peer, reads: credentials)
         if case .failure(let failure) = availability {
             value["state"] = .string("unavailable")
             value["state_detail"] = .string(failure.localizedDescription)
@@ -361,8 +362,8 @@ extension SwiftToolDispatcher {
             value["capabilities"] = .array([.string("message")])
             value["setup"] = .string(peer.readsReplyInWindow
                 ? """
-                    A message is pasted into its chat \u{201C}\(peer.conversationLabel ?? "grok")\u{201D} in the Grok Bot app and its answer is \
-                    read back from that same chat in the same call (up to three minutes).
+                    This desktop contact cannot receive Grok Bot's answer. Connect Grok Bot by name, follow its setup steps, then disconnect \
+                    this desktop contact.
                     """
                 : desktopSetupNote)
             if let label = peer.conversationLabel { value["conversation_label"] = .string(label) }

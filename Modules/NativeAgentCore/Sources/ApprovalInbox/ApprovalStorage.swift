@@ -12,31 +12,9 @@ extension SwiftNativeApprovalInbox {
     /// The most rows `requests.json` keeps. Terminal rows above it are the store's settled history and are evictable; pending work is not.
     public static let storedApprovalCap = 300
     static let terminalApprovalStatuses: Set<String> = [
-        "resolved", "denied", "canceled", "orphaned",
+        "resolved",
     ]
-    static let pendingApprovalTimeout: TimeInterval = 24 * 3600
-    /// An unanswered card ages from its latest request without changing newest-first order or other fields.
-    nonisolated static func agingStalePendingRows(
-        _ items: [JSONValue],
-        now: Date
-    ) -> [JSONValue] {
-        // Every writer emits fractional +00:00 timestamps, making lexicographic comparison valid.
-        let cutoff = isoTimestamp(now.addingTimeInterval(-pendingApprovalTimeout))
-        return items.map { item in
-            guard case .object(var object) = item,
-                  case .string("pending")? = object["status"] else { return item }
-            // A re-asked card is stamped `lastRequestedAt`; the clock runs from the last time the agent actually wanted the answer.
-            let stamp: String = {
-                if case .string(let value)? = object["lastRequestedAt"] { return value }
-                if case .string(let value)? = object["createdAt"] { return value }
-                return ""
-            }()
-            guard !stamp.isEmpty, stamp < cutoff else { return item }
-            object["status"] = .string("orphaned")
-            return .object(object)
-        }
-    }
-    /// Over cap, ages stale pending rows and evicts oldest settled terminal rows or throws `.queueFull`.
+    /// Over cap, evicts oldest settled terminal rows or throws `.queueFull`; pending work stays answerable.
     nonisolated static func cappedEvictingTerminalRows(
         _ items: [JSONValue],
         cap: Int,
@@ -45,7 +23,6 @@ extension SwiftNativeApprovalInbox {
     ) throws -> [JSONValue] {
         var overflow = items.count - cap
         guard overflow > 0 else { return items }
-        let items = agingStalePendingRows(items, now: now)
         var dropped = Set<Int>()
         // The array is newest-first, so the oldest candidates are at the end.
         for index in stride(from: items.count - 1, through: 0, by: -1) {
@@ -224,10 +201,6 @@ extension SwiftNativeApprovalInbox {
         guard case .bool(let b)? = value else { return nil }
         return b
     }
-    /// Remote-safe actions may be decided remotely without an explicit flag; each entry widens authority.
-    nonisolated static let remoteSafeActions: Set<String> = [
-        "workflow_step",
-    ]
     /// Match the shared ISO-8601 shape: fractional seconds and a +00:00 offset.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)

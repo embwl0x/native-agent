@@ -40,8 +40,7 @@ public struct BotEventTrigger: Codable, Equatable, Sendable {
         guard filter.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(
             event.target.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame else { return false }
         if let keyword {
-            let haystack = (event.summary + "\n" + event.detail).lowercased()
-            guard haystack.contains(keyword.lowercased()) else { return false }
+            guard event.text.lowercased().contains(keyword.lowercased()) else { return false }
         }
         return true
     }
@@ -51,18 +50,18 @@ public struct BotIncomingEvent: Sendable, Equatable {
     public let id: String
     public let source: BotEventSource
     public let target: String
-    public let summary: String
-    public let detail: String
-    public let provenance: BotEventProvenance
+    public let text: String
+    public let verifiedUserID: String
 
-    public init(id: String, source: BotEventSource, target: String, summary: String, detail: String,
-                verifiedUserID: String? = nil) {
+    public var summary: String { "\(source.label) message in \(target): " + String(text.prefix(200)) }
+    public var provenance: BotEventProvenance { .init(source: source, verifiedChatID: target, verifiedUserID: verifiedUserID) }
+
+    public init(id: String, source: BotEventSource, target: String, text: String, verifiedUserID: String) {
         self.id = id
         self.source = source
         self.target = target
-        self.summary = summary
-        self.detail = detail
-        self.provenance = BotEventProvenance(source: source, verifiedChatID: target, verifiedUserID: verifiedUserID)
+        self.text = text
+        self.verifiedUserID = verifiedUserID
     }
 }
 
@@ -181,7 +180,7 @@ public struct BotEventRouter: Sendable {
             let receipt: BotRunReceipt
             do {
                 receipt = try queue.enqueue(bot: bot.id, context: context, origin: .event,
-                                            provenance: event.provenance, scope: scope)
+                                            provenance: event.provenance, steeringSources: [], scope: scope)
             } catch {
                 let admissionError = error
                 do {
@@ -213,8 +212,6 @@ public struct BotEventRouter: Sendable {
 
     /// Outside text is run input, never authority to instruct the app.
     static func context(_ event: BotIncomingEvent) -> String {
-        var lines = ["\(event.source.label) · \(event.target)", event.summary]
-        if event.detail != event.summary, !event.detail.isEmpty { lines.append(event.detail) }
-        return lines.joined(separator: "\n")
+        "\(event.source.label) · \(event.target)\n\(event.summary)\nFrom \(event.verifiedUserID) in \(event.target):\n\(event.text)"
     }
 }

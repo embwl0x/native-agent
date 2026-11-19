@@ -266,14 +266,15 @@ extension SwiftNativeProviderRouting {
                 }
             }
         }
-        // Credential changes refresh authenticated discovery without changing save success; catalog failure remains owned by its cache.
-        switch id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "moonshot":
-            _ = await MoonshotModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: true)
-        case "openrouter":
-            _ = await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: true)
-        default:
-            break
+        Task { [dataRoot] in
+            switch id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "moonshot":
+                _ = await MoonshotModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: true)
+            case "openrouter":
+                _ = await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: true)
+            default:
+                break
+            }
         }
         return try await getProvider(id: id)
     }
@@ -622,22 +623,6 @@ extension SwiftNativeProviderRouting {
             surfaces: surfaces, activeProviders: active,
             soleConnectedRoute: soleConnectedProviderID(cache: cache),
             configCache: cache, revision: revision, preview: preview
-        )
-    }
-    public func setActiveProvider(surface: String, providerId: String) async throws {
-        let surface = canonicalRoutingSurface(surface)
-        guard MODEL_SURFACES.contains(surface),
-              !providerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw ProviderRoutingError.invalidRequest
-        }
-        // Reconcile model pins with provider changes under the same transaction lock so a concurrent model pick cannot be overwritten from a stale read.
-        try await saveSurfaceConfiguration(
-            surface: surface,
-            model: nil,
-            reasoningEffort: nil,
-            serviceTier: nil,
-            providerId: providerId,
-            reconcilePinnedModelWithProvider: true
         )
     }
     /// Adoption eligibility and both picker projections commit together.

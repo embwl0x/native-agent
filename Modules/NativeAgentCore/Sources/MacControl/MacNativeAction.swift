@@ -193,7 +193,13 @@ extension SwiftNativeMacControl {
                     target: target, postState: nil, actedHandle: handle,
                     extra: ["posted_events": .int(0)])
             }
-            guard let centre = target.centre, centre.x.isFinite, centre.y.isFinite else { return nil }
+            guard let centre = target.centre, centre.x.isFinite, centre.y.isFinite else {
+                return MacActPerformed(ok: false, method: "none", requestedAction: verb.rawValue,
+                    error: "target_geometry_unavailable", target: target,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
+                    extra: ["posted_events": .int(0), "guidance": .string(
+                        "This target has no readable frame. Read its window again before a pointer action.")])
+            }
             if let refusal = refuseInput(verb.rawValue) { return refusal }
             noteActuation(verb.rawValue)
             let plan = verb == .hover ? MacHandRepertoire.hover(at: centre, dwellMs: 300)

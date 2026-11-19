@@ -10,7 +10,7 @@ import Transcripts
 
 /// A held send: the agent's message to a contact that collects its messages, owed that contact's answer. Its record is one file of lines, each
 /// appended once and never rewritten, each saying the process life that wrote it: `sent`, then at most one of `answered` (the first wins) or
-/// `withdrawn` (the agent's own), and `delivered` (the first wins) once a turn of the agent's has taken the answer into its input.
+/// `withdrawn` (the agent's own), `delivered` once a turn takes the answer in, and `outcome` once its thread row and settlement land.
 /// Nothing else ends what the send is owed: not another send, not a
 /// restart, not a missing or unreadable file, which reads as still owed and says why.
 public struct HeldSend: Sendable {
@@ -42,6 +42,7 @@ public struct HeldSend: Sendable {
     public private(set) var answered: Line?
     public private(set) var withdrawn: Line?
     public private(set) var delivered: Line?
+    public private(set) var outcome: Line?
     /// Why the record cannot be read; such a send is owed.
     public private(set) var unreadable: String?
     public private(set) var missing = false
@@ -56,7 +57,7 @@ public struct HeldSend: Sendable {
         let decoder = JSONDecoder()
         for (number, bytes) in committed.split(separator: 10).enumerated() {
             guard let line = try? decoder.decode(Line.self, from: Data(bytes)) else {
-                (sent, answered, withdrawn, delivered) = (nil, nil, nil, nil)
+                (sent, answered, withdrawn, delivered, outcome) = (nil, nil, nil, nil, nil)
                 unreadable = "line \(number + 1) of its record \(path) cannot be read"
                 return
             }
@@ -65,12 +66,13 @@ public struct HeldSend: Sendable {
             case "answered": if owed { answered = line }
             case "withdrawn": if owed { withdrawn = line }
             case "delivered": if delivered == nil { delivered = line }
+            case "outcome": if outcome == nil { outcome = line }
             default: break
             }
         }
         // A withdrawal needs no sent line: the agent can let go of a send whose record was lost.
         if sent == nil, withdrawn == nil {
-            (answered, delivered) = (nil, nil)
+            (answered, delivered, outcome) = (nil, nil, nil)
             unreadable = "its record \(path) has no sent line"
         }
     }
@@ -81,6 +83,7 @@ public struct HeldSend: Sendable {
 /// The held sends' records, one file per send under its own lock.
 public struct HeldSends: Sendable {
     public let folder: URL
+    private var archive: URL { folder.appendingPathComponent("archive", isDirectory: true) }
     var dataRoot: URL { folder.deletingLastPathComponent().deletingLastPathComponent() }
 
     public init(dataRoot: URL) { folder = dataRoot.appendingPathComponent("agents/held", isDirectory: true) }
@@ -93,7 +96,14 @@ public struct HeldSends: Sendable {
 
     public func read(_ id: String) -> HeldSend {
         guard let url = file(id) else { return HeldSend(id: id, data: nil, path: id) }
-        do { return HeldSend(id: id, data: try Data(contentsOf: url), path: url.path) }
+        do {
+            let data: Data
+            do { data = try Data(contentsOf: url) }
+            catch CocoaError.fileReadNoSuchFile {
+                data = try Data(contentsOf: archive.appendingPathComponent(url.lastPathComponent))
+            }
+            return HeldSend(id: id, data: data, path: url.path)
+        }
         catch CocoaError.fileReadNoSuchFile { return HeldSend(id: id, data: nil, path: url.path) }
         catch { return HeldSend(id: id, unreadable: "its record \(url.path) cannot be read: \(error.localizedDescription)") }
     }
@@ -199,7 +209,7 @@ public struct HeldSends: Sendable {
     }
 
     /// The one append of `delivered`, made where a turn takes an answer into its input: the turn's tool-result append (`via: tool`, the ids its
-    /// results carry as `held_answer`) and the news's intake into a turn (`via: news`). The answer's outcome lands first; the first delivery wins.
+    /// results carry as `held_answer`) and the news's intake into a turn (`via: news`). Delivery lands first; the first delivery wins.
     public static func delivered(_ ids: [String], via: String, dataRoot: URL) async {
         let sends = HeldSends(dataRoot: dataRoot)
         for id in Set(ids) where sends.file(id) != nil {
@@ -235,9 +245,9 @@ public struct HeldSends: Sendable {
         }
     }
 
-    /// The answer's thread row and the send's settled experience. Each repeats safely: a thread row already answering the send is not written
-    /// again, and only unsettled obligations move.
+    /// The answer's thread row and settled experience, receipted once. An unreceipted pass writes only a missing reply or unsettled obligations.
     private func outcome(_ record: HeldSend) async throws {
+        if record.outcome != nil { try archive(record.id); return }
         guard let answer = record.answered, let text = answer.text, let sent = record.sent, let contact = sent.contact,
               contact.hasPrefix("peer:") else { return }
         let owner = String(contact.dropFirst(5)), from = answer.from ?? contact
@@ -247,6 +257,31 @@ public struct HeldSends: Sendable {
                 replyID: "agent-conversation:" + record.id, at: answer.at, from: from, steeredBy: [from]), dataRoot: dataRoot)
         }
         await Self.settle(record.id, dataRoot: dataRoot)
+        guard let experience = try await ExperienceStore.at(dataRoot).experience(record.id),
+              experience.owes.values.allSatisfy({ $0.phase.isSettled }) else {
+            throw AgentConversationStore.Failure(message: "Held send \(record.id)'s experience is not settled; its outcome is still owed.")
+        }
+        try append(record.id) { current in
+            guard current.unreadable == nil else {
+                throw AgentConversationStore.Failure(message: "Held send \(record.id)'s record is unreadable; its outcome was not recorded.")
+            }
+            return (current.outcome == nil ? HeldSend.Line("outcome") : nil, ())
+        }
+        try archive(record.id)
+    }
+
+    /// Move only records proving both delivery and outcome; addressed reads retain the same record and send lock.
+    private func archive(_ id: String) throws {
+        guard let url = file(id) else { return }
+        try CredentialFileLock.withLock(url) {
+            let record = read(id)
+            guard record.unreadable == nil, record.delivered != nil, record.outcome != nil,
+                  FileManager.default.fileExists(atPath: url.path) else { return }
+            try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.moveItem(at: url, to: archive.appendingPathComponent(url.lastPathComponent))
+            try SwiftNativePersistenceCore.syncDirectory(archive)
+            try SwiftNativePersistenceCore.syncDirectory(folder)
+        }
     }
 
     private static let publication = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
@@ -271,11 +306,12 @@ public struct HeldSends: Sendable {
         for name in names where name.hasSuffix(".jsonl") {
             let record = read(String(name.dropLast(6)))
             guard record.answered != nil, let sent = record.sent, let contact = sent.contact, contact.hasPrefix("peer:") else { continue }
-            // Delivered: only its thread row and settlement may still be owed, and both repeat safely.
-            if record.delivered != nil { try? await outcome(record); continue }
             let owner = String(contact.dropFirst(5)), row = sent.row ?? record.id, once = "reply:" + record.id
+            // The outcome receipt is bookkeeping: an owed outcome never withholds the answer's news.
+            do { try await outcome(record) }
+            catch { nativeLog("Held send %@'s outcome is still owed; its news is not held for it: %@", record.id, error.localizedDescription) }
             do {
-                try await outcome(record)
+                if record.delivered != nil { continue }
                 let current = try AgentConversationStore(dataRoot: dataRoot).records().first { $0.id == row }?.operationID
                 // The person's own send's answer is theirs, in its thread: it reaches them there.
                 if sent.byPerson == true { await Self.delivered([record.id], via: "person", dataRoot: dataRoot); continue }
@@ -289,7 +325,7 @@ public struct HeldSends: Sendable {
                     throw AgentConversationStore.Failure(message: "its news was not recorded")
                 }
             } catch {
-                nativeLog("The answer to held send %@ is not yet delivered; the next claim, wait, wake or launch delivers it: %@", record.id,
+                nativeLog("Held send %@'s delivery is still owed; the next claim, wait, wake or launch revisits it: %@", record.id,
                     error.localizedDescription)
             }
         }

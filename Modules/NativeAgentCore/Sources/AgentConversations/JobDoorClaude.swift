@@ -74,6 +74,7 @@ struct ClaudeCodeJobDoor: JobRunner {
                     model = fields["model"]?.stringValue ?? model
                     if session == nil, let id = fields["session_id"]?.stringValue, !id.isEmpty {
                         session = id
+                        try job.handle(id)
                         out.send(.started(session: id))
                         await JobDoorLive.shared.hold(Self.door + ":" + id, run)
                         out.send(.working(note: "Working in \(folder.path)."))

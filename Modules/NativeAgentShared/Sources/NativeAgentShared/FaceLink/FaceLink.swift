@@ -253,13 +253,12 @@ private struct FaceFrameDecoder {
     private var buffer = Data()
     private var length: Int?
 
-    /// The buffer holds only bytes not yet framed. Removing a prefix from `Data` leaves a slice over the same storage, which then grows
-    /// with every append and never gives the read bytes back; what remains is copied out instead, so the storage is always the remainder.
+    /// Compact only after consuming a prefix, releasing framed bytes without copying a growing incomplete payload on each chunk.
     mutating func append(_ bytes: Data) throws -> [Data] {
         buffer.append(bytes)
         var frames: [Data] = []
         var read = buffer.startIndex
-        defer { buffer = Data(buffer[read...]) }
+        defer { if read != buffer.startIndex { buffer = Data(buffer[read...]) } }
         while true {
             if length == nil {
                 guard buffer.endIndex - read >= 8 else { return frames }

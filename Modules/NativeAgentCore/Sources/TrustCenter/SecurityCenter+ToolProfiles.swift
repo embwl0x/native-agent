@@ -46,6 +46,10 @@ public enum AuthoredToolEffects {
                 "--porcelain", "--porcelain=v1", "--porcelain=v2", "--no-pager", "--no-ext-diff", "--no-textconv",
                 "--staged", "--cached", "--patch", "--no-patch", "--all", "--decorate", "--no-decorate",
                 "--reverse", "--no-merges", "--first-parent", "--", "-n", "-p", "-s", "-b"]
+            // An operand names a revision or a path inside the working tree; git diff compares out-of-tree paths as plain files.
+            guard args.dropFirst().allSatisfy({ arg in
+                arg.hasPrefix("-") || !(arg.hasPrefix("/") || arg.hasPrefix("~") || arg == ".." || arg.hasPrefix("../") || arg.contains("/../"))
+            }) else { return nil }
             guard args.dropFirst().allSatisfy({ arg in
                 !arg.hasPrefix("-") || flags.contains(arg)
                     || arg.dropFirst().allSatisfy(\.isNumber) && arg.count > 1
@@ -82,7 +86,7 @@ public enum AuthoredToolEffects {
         "network.send": ["network_write", "external_send"],
         "apps.call": ["applescript", "system_control"],
         // The stem's file readers open a snapshot copy read-only; reach to the path is the part's declared readPaths.
-        "files.query": ["safe_read"], "files.mime": ["safe_read"],
+        "files.query": ["safe_read"], "files.mime": ["safe_read"], "files.names": ["safe_read"],
         "screen.watch": ["safe_read"], "screen.next": ["safe_read"], "frame.read": ["safe_read"],
         // Program start owns shell admission; later talk stays within it.
         "program.start": ["process_spawn", "shell"], "program.send": ["process_spawn"],

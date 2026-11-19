@@ -75,7 +75,7 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
         guard !atoms.isEmpty else { return ContextTurnExclusion() }
         do {
             // Share the checked read: unavailable owners require a receipt and cannot supply retained truth.
-            let read = try await readPrepared()
+            let read = try await readPrepared(sourceIDs: Set(atoms.map(\.draft.sourceID)))
             let hashes = Dictionary(read.sources.map { ($0.descriptor.id, $0.sourceHash) },
                                     uniquingKeysWith: { first, _ in first })
             return ContextTurnExclusion(atomIDs: Set(atoms.filter {
@@ -92,7 +92,8 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
 }
 
 private extension ResidentWorkContext {
-    func readPrepared() async throws -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
+    func readPrepared(sourceIDs: Set<ContextSourceID>? = nil) async throws
+        -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
         let state = try await desk.liveState()
         let names = try MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory"))
         let identityTerms = Set([names.agent, names.user].compactMap { $0 }.flatMap {
@@ -109,14 +110,15 @@ private extension ResidentWorkContext {
         var sources: [ContextCompiledSource] = []
         var failures: [ContextSourceID: String] = [:]
         for item in orderedItems.prefix(Self.maximumItems) {
+            let locator = "desk/items/\(ContextStableID.digest(parts: [item.handle]))"
+            let sourceID = ContextStableID.source(owner: Self.owner, locator: locator)
+            guard sourceIDs?.contains(sourceID) != false else { continue }
             do {
                 if let source = try Self.prepare(item: item, identityTerms: identityTerms) {
                     sources.append(source)
                 }
             } catch {
-                let locator = "desk/items/\(ContextStableID.digest(parts: [item.handle]))"
-                failures[ContextStableID.source(owner: Self.owner, locator: locator)] =
-                    "Resident work item unavailable: \(error.localizedDescription)"
+                failures[sourceID] = "Resident work item unavailable: \(error.localizedDescription)"
             }
         }
         return (sources, failures)

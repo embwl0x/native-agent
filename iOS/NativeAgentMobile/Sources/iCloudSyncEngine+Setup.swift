@@ -146,7 +146,6 @@ extension iCloudSyncEngine {
 
     func tearDown() {
         ActionResponseWaiters.shared.close()
-        providerSignIns = [:]
         lifecycleGeneration &+= 1
         workOverview = nil
         snapshotReadRevisions.removeValue(forKey: "work_overview.json")

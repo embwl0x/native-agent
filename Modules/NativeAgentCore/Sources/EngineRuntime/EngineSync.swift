@@ -126,9 +126,7 @@ public final class SyncFacade {
         }
         await owner.engine.finishPairingSecretRotation(with: persistedSecret)
         // Unpublished pairing remains owed and visible in the shared assessment until iCloud accepts the key.
-        async let kvsPublished = PairingSecret.publishMaterialToKVS(persistedSecret)
-        async let cloudKitPublished = owner.bridge.publishPairingSecret(persistedSecret)
-        _ = await (kvsPublished, cloudKitPublished)
+        _ = await owner.bridge.publishPairingSecret(persistedSecret)
         secretRead.write {
             pairingError = nil
         }

@@ -11,13 +11,12 @@ import ToolExecution
 import TurnTrace
 import NativeAgentShared
 import AuthoredCapabilities
-// Blueprint: | `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding`, `pending`, `glance`: Bind owner ports without copying authority. |
+// Blueprint: | `AgentWorkspaceBinding.swift` | Workspace ports and shared recent-life reads bind the originating turn without copying authority |
 
 package enum ChatWorkspaceBinding {
     package static func operation(turn: Turn?, invocation: ChatToolInvocation) -> WorkspaceOperation {
         WorkspaceOperation(ports: .init(conversations: Conversations(turn: turn),
-            tools: Tools(invocation: invocation.partInvocation(turn: turn, surface: "workspace"))), turn: turn,
-            insideDispatch: invocation.insideWorkspace)
+            tools: Tools(invocation: invocation.partInvocation(turn: turn, surface: "app"))), turn: turn)
     }
 
     /// Read for a turn's facts: announced only at delivery (`announceDelivered`).
@@ -38,10 +37,10 @@ package enum ChatWorkspaceBinding {
         await AgentScreen.glance(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, turn: at, message: message)
     }
 
-    package static func readElsewhere(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, at: Date,
-                                      live: [String]) async -> AgentScreen.ElsewhereReading? {
+    package static func readElsewhere(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String?,
+                                     at: Date) async -> AgentScreen.ElsewhereReading? {
         await AgentScreen.readElsewhere(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, turn: at,
-                                live: live, since: nil)
+                                since: nil)
     }
 
     package static func breath(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, peer: Bool, since: Date?,

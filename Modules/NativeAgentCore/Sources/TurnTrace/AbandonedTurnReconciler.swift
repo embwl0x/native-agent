@@ -43,7 +43,6 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public var fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling?
     public let capabilityProfile: String?
     public var peerSources: [String]?
-    /// The steering peers the person's card answered in this run: a resume continues under that one card, never a second.
     public var answeredPeers: [String]?
     /// What the agent attached to this reply with `reply.attach`, in order: a resume chooses them again, each behind the attachment fence once more.
     public var replyChoices: [String]?

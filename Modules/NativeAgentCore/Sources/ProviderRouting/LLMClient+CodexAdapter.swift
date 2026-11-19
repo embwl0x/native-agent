@@ -173,7 +173,7 @@ public struct CodexProcessInvocation: Sendable {
         exited: @escaping @Sendable (Int32, String?) -> Void
     ) throws {
         let proc = ManagedProcess()
-        var environment = environment ?? ProcessInfo.processInfo.environment
+        var environment = environment ?? ManagedProcess.agentEnvironment()
         environment["PATH"] = CodexExecutable.augmentedPath(environment["PATH"])
         proc.executableURL = try CodexExecutable.resolveCodexExecutable(
             environment: environment, program: executable)
@@ -284,7 +284,7 @@ public final class CodexProcess: LLMTransport {
     }
 
     private func childEnvironment(authPath: URL) -> [String: String] {
-        var environment = processEnvironment
+        var environment = ManagedProcess.agentEnvironment(processEnvironment)
         environment["CODEX_HOME"] = ChatGPTTransport.codexHomeForChild(authPath: authPath).path
         if let dataRootOverride { environment["NATIVE_AGENT_DATA_ROOT"] = dataRootOverride.path }
         return environment
@@ -574,10 +574,9 @@ public final class CodexProcess: LLMTransport {
                     case .failed(let detail):
                         continuation.finish(throwing: LLMError.underlying(message: "Codex stdout capture failed: \(detail)"))
                     case .eof:
-                        // An allowed silent answer needs the process's successful exit as well as EOF.
                         if !out.undecodable.isEmpty {
                             continuation.finish(throwing: CodexOutputEncodingFailure(stdout: out, stderr: stderr.finish()))
-                        } else if out.text.contains(where: { !$0.isWhitespace }) || inv.call?.allowsSilentCompletion != true {
+                        } else if out.text.contains(where: { !$0.isWhitespace }) {
                             continuation.finish()
                         }
                     }

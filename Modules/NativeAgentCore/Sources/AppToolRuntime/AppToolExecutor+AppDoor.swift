@@ -22,7 +22,7 @@ import TrustCenter
 import Senses
 import PersonaEngine
 import Desk
-// Blueprint: | `AppToolExecutor+AppDoor.swift` | `app`, `visible`, `undo`; App dispatch, version recovery and action-owned undo |
+// Blueprint: | `AppToolExecutor+AppDoor.swift` | Home items, page dispatch, complete route corrections, version recovery and undo |
 /// The app door adds no gate: registry admission and folded re-entry retain the complete chain.
 /// It refuses user-only actions below Full Mac, stale versions and undeclared arguments.
 extension AppToolExecutor {
@@ -102,7 +102,7 @@ extension AppToolExecutor {
             "kind": .string(kind), "instruction": .string(instruction),
             "next_call": next.map { .object(["tool": .string("app"), "input": .object($0)]) } ?? .null,
         ])
-        return failure(reason, detail, extra: extra)
+        return ChatToolOutcome.refusedBeforeRunning(code: reason, detail: detail, extra: extra)
     }
     /// The producer supplies the resource, cause and recovery; typed owner evidence survives intact.
     static func ownedFailure(_ error: Error, code: String, owner: String, instruction: String,
@@ -129,13 +129,13 @@ extension AppToolExecutor {
         return failure(reason, detail, extra: extra)
     }
     @MainActor
-    func runRecordRead(input: [String: JSONValue]) async -> JSONValue {
+    func runRecordRead(input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        return await Self.readRecord(input, root: root)
+        return await Self.readRecord(input, root: root, turn: turn)
     }
 
     /// Store lookup, reads and JSON parsing run away from the UI actor; the store alone owns the SQL and event fold.
-    @concurrent private static func readRecord(_ input: [String: JSONValue], root: URL) async -> JSONValue {
+    @concurrent private static func readRecord(_ input: [String: JSONValue], root: URL, turn: Turn) async -> JSONValue {
         guard case .string(let grain)? = input["of"], ["experiences", "details"].contains(grain) else {
             return failure("invalid_args", "record.read requires of:experiences or of:details.")
         }
@@ -177,7 +177,11 @@ extension AppToolExecutor {
                 let page = try await store.recordedExperiences(id: input["id"]?.stringValue, idPrefix: input["id_prefix"]?.stringValue,
                     kind: kind, openOnly: openOnly, limit: limit)
                 try Task.checkCancellation()
-                let items = try page.items.map { experience -> JSONValue in
+                let items = try page.items.compactMap { experience -> JSONValue? in
+                    guard turn.peerSteering?.isTainted != true || ChatToolSessionInjection.currentSession(turn: turn).map({ session in
+                        experience.addressedTo.contains("conversation:" + session) || experience.owes.values.contains { $0.to == "conversation:" + session }
+                            || experience.evidence.contains(.init(source: "conversation", id: session))
+                    }) == true else { return nil }
                     guard case .object(var fields) = try JSONValue.fromEncodable(experience) else { throw CocoaError(.coderInvalidValue) }
                     fields["open"] = .bool(experience.isOpen)
                     fields["face"] = try JSONValue.fromEncodable(experience.face)
@@ -185,9 +189,9 @@ extension AppToolExecutor {
                     fields["happening"] = try JSONValue.fromEncodable(experience.happening)
                     return .object(fields)
                 }
-                // A record that will not fold is named with its cause beside the ones that do.
                 let unreadable: [JSONValue] = page.unreadable.map { record in
-                    .object(["id": .string(record.id), "event": .int(record.seq), "error": .string(record.words)])
+                    if turn.peerSteering?.isTainted == true { return .object(["error": .string("The unreadable experience's conversation could not be verified.")]) }
+                    return .object(["id": .string(record.id), "event": .int(record.seq), "error": .string(record.words)])
                 }
                 return .object(["status": .string(unreadable.isEmpty ? "ok" : "partial"), "of": .string(grain),
                     "matched_total": .int(Int64(page.total)), "returned": .int(Int64(items.count)),
@@ -215,9 +219,17 @@ extension AppToolExecutor {
                     guard detail.row.count <= ExperienceStore.maxRowBytes else {
                         throw ExperienceStore.DetailError.tooLarge(detail.kind, detail.row.count)
                     }
-                    fields["row"] = try JSONValue.parse(detail.row)
+                    let row = try JSONValue.parse(detail.row)
+                    guard turn.peerSteering?.isTainted != true || ChatToolSessionInjection.currentSession(turn: turn).map({
+                        row.objectValue?["sessionId"] == .string($0)
+                    }) == true else { continue }
+                    fields["row"] = row
                     items.append(.object(fields))
                 } catch {
+                    if turn.peerSteering?.isTainted == true {
+                        gaps.append(.object(["error": .string("The unreadable detail's conversation could not be verified.")]))
+                        continue
+                    }
                     fields["error"] = .string(error.localizedDescription)
                     fields["remedy"] = Repair.remedy(owner: "experiences/experiences.sqlite",
                         nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("doctor.run")])]), tap: nil)
@@ -270,10 +282,11 @@ extension AppToolExecutor {
             try Task.checkCancellation()
             if let owed, owed.owes["deliver"]?.phase.isSettled == false,
                owed.evidence.contains(where: { $0.source == "codex-completion-lifecycle" }) {
-                return Self.doorRefusal("delivery_unavailable", "The reply's experience still shows delivery owed, "
+                return Self.failure("delivery_unavailable", "The reply's experience still shows delivery owed, "
                     + "but its delivery owner could not confirm an open reply for \(id). Nothing was let go.",
-                    remedy: "inspect", "Read the retained delivery before repairing its record; do not resend the reply.",
-                    next: ["action": .string("agent.jobs")])
+                    extra: ["remedy": .object(["kind": .string("inspect"),
+                        "instruction": .string("Read the retained delivery before repairing its record; do not resend the reply."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("agent.jobs")])])])])
             }
             // Release obsolete reply debt through its redelivery checkpoint so recovery cannot deliver it again.
             if let owed, id.hasPrefix(Experience.answer(run: "")),
@@ -286,14 +299,17 @@ extension AppToolExecutor {
                 return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
             }
             if let owed, owed.owes["decide"]?.phase.isSettled == false {
-                return Self.doorRefusal("person_decides", """
+                return Self.failure("person_decides", """
                     \(id) waits on the person's decision; it is theirs to answer, not yours to let go. Nothing was let go.
                     """,
-                    remedy: "none", "Wait on it with desk.wait, or ask the person.")
+                    extra: ["remedy": .object(["kind": .string("none"),
+                        "instruction": .string("Wait on it with desk.wait, or ask the person."), "next_call": .null])])
             }
             guard let owed, owed.owes["repair"]?.phase.isSettled == false else {
-                return Self.doorRefusal("not_owed", "Nothing open that you owe has id \(id). Nothing was let go.",
-                    remedy: "inspect", "Read the OWED lines on your home for the ids still owed.", next: ["page": .string("home")])
+                return Self.failure("not_owed", "Nothing open that you owe has id \(id). Nothing was let go.",
+                    extra: ["remedy": .object(["kind": .string("inspect"),
+                        "instruction": .string("Read the OWED lines on your home for the ids still owed."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("home")])])])])
             }
             try await store.append([.claim(.init(claim: "let go: " + reason, evidence: [])),
                                     .letGo(key: "repair", reason: .abandoned)], to: id)
@@ -301,10 +317,10 @@ extension AppToolExecutor {
         } catch is CancellationError {
             return ChatToolOutcome.failure(error: CancellationError(), tool: "app", effects: .unknown)
         } catch {
-            return Self.doorRefusal("unreadable", "Reply or repair settlement could not complete: \(error.localizedDescription) "
+            return Self.failure("unreadable", "Reply or repair settlement could not complete: \(error.localizedDescription) "
                 + "Read its current state before trying again.",
-                owner: "reply delivery lifecycle / experiences/experiences.sqlite", next: ["action": .string("doctor.run")],
-                extra: ["effects": .string("unknown")])
+                extra: ["effects": .string("unknown"), "remedy": Repair.remedy(owner: "reply delivery lifecycle / experiences/experiences.sqlite",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("doctor.run")])]), tap: nil)])
         }
     }
     /// Every open repair whose operation starts with the prefix goes through the one-id path, so each keeps that path's checks.
@@ -325,8 +341,9 @@ extension AppToolExecutor {
         } catch is CancellationError {
             return ChatToolOutcome.failure(error: CancellationError(), tool: "app", effects: ToolFailureError.Effects.none)
         } catch {
-            return Self.doorRefusal("unreadable", "Open repairs could not be read: \(error.localizedDescription) Nothing was let go.",
-                owner: "experiences/experiences.sqlite", next: ["action": .string("doctor.run")], extra: ["effects": .string("none")])
+            return Self.failure("unreadable", "Open repairs could not be read: \(error.localizedDescription) Nothing was let go.",
+                extra: ["effects": .string("none"), "remedy": Repair.remedy(owner: "experiences/experiences.sqlite",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("doctor.run")])]), tap: nil)])
         }
         guard !ids.isEmpty else {
             return Self.doorRefusal("not_owed", "No open repair's operation starts with \(prefix). Nothing was let go.",
@@ -356,46 +373,17 @@ extension AppToolExecutor {
             return .object(["status": .string("ok"), "detail": .string("The saved turn was reconciled.")])
         } catch { return ChatToolOutcome.failure(error: error) }
     }
-    /// Read-only actions named as pages/items run directly; changes return a corrected call because they require explicit execution.
-    func runCorrectedRead(_ correction: JSONValue, input: [String: JSONValue], surface: String, inProcess: Bool, turn: Turn,
-        execution: AppActionExecution) async throws -> JSONValue {
-        // Parts cannot turn reads into actions here; the host already checked the one declared-read correction.
-        if let part = turn.partID, part != "app-script" { return correction }
-        let reply = ToolResult(correction)
-        guard case .object(let remedy)? = reply.remedy,
-              case .object(let next)? = remedy["next_call"], case .object(var call)? = next["input"],
-              call["preview"] != .bool(true), case .string(let id)? = call["action"], let action = try AppActions.action(id,
-                  turn: turn) else { return correction }
-        // A misplaced find argument supplies memory.recall's absent query. Both forms here name an optional query, which the door's binding of
-        // a missing required argument never reaches, and neither arrives as an args key.
-        let takesQuery = action.argSpecs.flatMap(\.names).contains("query")
-        if takesQuery, call["args"] == nil || call["args"] == .object([:]), case .string(let words)? = input["find"],
-           !words.trimmingCharacters(in: .whitespaces).isEmpty {
-            call["args"] = .object(["query": .string(words)])
-        }
-        // {"chat.search": "words"}: a bare string is the action's query when it takes one.
-        if case .string(let text)? = call["args"] {
-            guard action.argSpecs.flatMap(\.names).contains("query") else { return correction }
-            call["args"] = .object(["query": .string(text)])
-        }
-        guard call["args"] == nil || { if case .object = call["args"] { return true } else { return false } }(),
-              action.readOnly(args: { if case .object(let args)? = call["args"] { return args } else { return [:] } }()) else { return correction }
-        for (key, value) in input where key.hasPrefix("__") { call[key] = value }
-        var value = AgentWorkspace.resolvedRead(try await runAppDoor(input: call, surface: surface, inProcess: inProcess, turn: turn, execution: execution),
-            as: id)
-        if case .object(var result) = value {
-            result["argument_notes"] = .array((result["argument_notes"]?.arrayValue ?? [])
-                + [.string("Ran as {action:\"\(id)\"}; it is an action, not a page or item.")])
-            result["resolved"] = .string(id)
-            value = .object(result)
-        }
-        return value
-    }
     static func doorActionCorrection(_ name: String, input: [String: JSONValue], turn: Turn) async throws -> JSONValue? {
         let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let args = if case .object(let args)? = input["args"] { args } else { [String: JSONValue]() }
         guard let action = try AppActions.action(key, turn: turn) ?? AppActions.pagePrefixedAction(key, turn: turn) else { return nil }
         var call = ["action": JSONValue.string(action.id), "args": input["args"] ?? .object(args)]
+        if action.argSpecs.flatMap(\.names).contains("query") {
+            if call["args"] == .object([:]), case .string(let words)? = input["find"], !words.trimmingCharacters(in: .whitespaces).isEmpty {
+                call["args"] = .object(["query": .string(words)])
+            }
+            if case .string(let words)? = call["args"] { call["args"] = .object(["query": .string(words)]) }
+        }
         for key in ["preview", "expected_version"] { if let value = input[key] { call[key] = value } }
         TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T16"), "site": .string(
             "AppToolExecutor+AppDoor.swift:doorActionCorrection")]), turn: turn)
@@ -418,8 +406,9 @@ extension AppToolExecutor {
     /// Every page words not_found consistently with its page/name/recovery read; unrelated failures retain their own cause.
     static func doorItemRead(_ result: JSONValue, page: QuietToolPage, item: String) -> JSONValue {
         guard !item.isEmpty, case .object(let fields) = result, fields["status"] == .string("not_found") else { return result }
-        return doorRefusal("unknown_item", "Nothing named \(item) is on the \(page.title) page now; app {page:\"\(page.id)\"} lists what is.",
-            remedy: "read_page", "Read the page without item; nothing was done.", next: ["page": .string(page.id)])
+        return failure("unknown_item", "Nothing named \(item) is on the \(page.title) page now; app {page:\"\(page.id)\"} lists what is.",
+            extra: ["remedy": .object(["kind": .string("read_page"), "instruction": .string("Read the page without item; nothing was done."),
+                "next_call": .object(["tool": .string("app"), "input": .object(["page": .string(page.id)])])])])
     }
     /// Note buttons share door action ids; viewing is an item read, and unnamed buttons retain inbox.act.
     static func doorButtons(_ note: JSONValue) -> JSONValue {
@@ -470,8 +459,19 @@ extension AppToolExecutor {
         } else { form = nil }
         let result: JSONValue
         do {
-            result = try await runAppDoorCall(input: input, resolvedAction: resolved, surface: surface, inProcess: inProcess,
-                turn: turn, execution: execution)
+            if execution.argumentPreflightOnly {
+                guard let resolved else {
+                    return Self.doorRefusal("unknown_action", "No action is called \(Self.doorText(input["action"])). Nothing ran.",
+                        remedy: "find", "Find the action's current name and argument schema before calling it.",
+                        next: ["find": input["action"] ?? .string("")])
+                }
+                // Admission never opens a corrected read or dispatches a scalar-list batch.
+                result = try await doorDo(resolved.action.id, resolved: resolved, input: input, surface: surface,
+                    inProcess: inProcess, turn: turn, execution: execution)
+            } else {
+                result = try await runAppDoorCall(input: input, resolvedAction: resolved, surface: surface, inProcess: inProcess,
+                    turn: turn, execution: execution)
+            }
         } catch is CancellationError { throw CancellationError() }
         catch { result = ChatToolOutcome.failure(error: error, tool: "app") }
         guard let resolved, let form else { return result }
@@ -536,8 +536,6 @@ extension AppToolExecutor {
         // A bare item names its unique owner; ambiguity is explicit, including a home room. With an action, the action runs instead.
         if action.isEmpty, Self.doorText(input["page"]).isEmpty, case .string? = input["item"], !Self.doorText(input["item"]).isEmpty {
             let named = Self.doorText(input["item"])
-            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let scope = input["__session_id"]?.scalarText ?? turn.verifiedSessionID ?? ""
             var owners = Dictionary(uniqueKeysWithValues: Self.doorItemReads.filter {
                 $0.value[named.lowercased()] != nil
             }.map { ($0.key, named.lowercased()) })
@@ -599,7 +597,7 @@ extension AppToolExecutor {
         if !stray.isEmpty {
             if stray.count == 1, action.isEmpty, let key = stray.first, let value = input[key],
                let correction = try await Self.doorActionCorrection(key, input: input.merging(["args": value]) { _, value in value }, turn: turn) {
-                return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
+                return correction
             }
             return Self.doorRefusal("unknown_key",
                 "app takes no \(stray.joined(separator: ", ")). Its keys are page, item, action, args, actions, preview, "
@@ -614,7 +612,8 @@ extension AppToolExecutor {
             guard case .array(let list) = entries,
                   beside.keys.allSatisfy({ $0.hasPrefix("__") || ["preview", "expected_version", "because"].contains($0)
                       || ToolNameAliases.appDeedKeys.contains($0) }) else {
-                let advice = try Self.doorBatchAdvice(entries, input: input)
+                let found = try Self.doorBatchAdvice(entries, input: input)
+                let advice = found.objectValue.map { JSONValue.object(MacInjectionArgRedaction.redacted(tool: "app", input: $0, turn: turn)) } ?? found
                 return Self.doorRefusal("invalid_actions",
                     "actions is a list of app calls ({action, args}, {page[, item]} or {item}, each may add expect, as and cleanup) "
                     + "and takes only preview, expected_version, because, then_say and with beside it. Nothing was run.",
@@ -640,8 +639,7 @@ extension AppToolExecutor {
         // A screen name given as an action opens the same item its DO list names.
         if !action.isEmpty, resolvedAction == nil,
            input[Self.doorScriptKey] != .bool(true),
-           await AgentScreen.classify(workspace: workspace, action, dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-                                    scope: input["__session_id"]?.scalarText ?? turn.verifiedSessionID ?? "") != .unknown {
+           await AgentScreen.classify(workspace: workspace, action, dataRoot: root, scope: scope) != .unknown {
             var item = input.filter { !["action", "page", "item"].contains($0.key) }
             item["item"] = .string(action)
             return try await runAppDoor(input: item, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
@@ -671,7 +669,7 @@ extension AppToolExecutor {
         var item = Self.doorText(input["item"])
         let pageOwner = await doorPage(page)
         if !page.isEmpty, item.isEmpty, pageOwner == nil, let correction = try await Self.doorActionCorrection(page, input: input, turn: turn) {
-            return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
+            return correction
         }
         // A guide names its action, and the action its page: guide:<id> reads with or without page, and from a page that is not the action's own (a room,
         // Senses) it reads from the action's.
@@ -683,7 +681,7 @@ extension AppToolExecutor {
             return try await runAppDoor(input: call, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
         }
         if page.isEmpty, !item.isEmpty, let correction = try await Self.doorActionCorrection(item, input: input, turn: turn) {
-            return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
+            return correction
         }
         // An item with no page is a name or ref from home or one of its rooms.
         let homeItem = Self.opensHomeItem(input)
@@ -716,21 +714,20 @@ extension AppToolExecutor {
                 remedy: "correct_arguments",
                 "Call app {item} again without preview or expected_version; open its room first to see what it does.")
         }
-        if !find.isEmpty && !homeItem { return try await doorFind(find, turn: turn, execution: execution) }
+        if !find.isEmpty { return try await doorFind(find, turn: turn, execution: execution) }
         if homeItem || page.lowercased() == "home" {
             if input[Self.doorScriptKey] != .bool(true), !scope.isEmpty {
                 try await AgentWorkspaceNavigation.shared.rememberDoorPage(workspace: workspace, nil, dataRoot: root, scope: scope)
             }
             var call: [String: JSONValue] = [:]
-            if !item.isEmpty { call["action"] = .string(item) } else if !find.isEmpty { call["query"] = .string(find) }
+            if !item.isEmpty { call["action"] = .string(item) }
             if case .object(let args)? = input["args"] {
                 if let stray = args.keys.sorted().first(where: { !["text", "fields", "conversation", "expects_reply"].contains($0) }) {
-                    return Self.doorRefusal("unknown_arg",
-                        "A home item takes text, fields, or an agent conversation label and expects_reply in args, not \(stray). Nothing was read or done.",
-                        remedy: "correct_arguments", """
-                            Call app again with args {text, conversation?, expects_reply?} for an agent message, {fields} for a form, or none.
-                            """,
-                        extra: ["argument_path": .string("args.\(stray)")])
+                    return Self.failure("unknown_arg",
+                        "A home item takes text, or an agent conversation label and expects_reply in args, not \(stray). Nothing was read or done.",
+                        extra: ["argument_path": .string("args.\(stray)"), "remedy": .object(["kind": .string("correct_arguments"), "instruction": .string("""
+                            Call app again with args {text, conversation?, expects_reply?} for an agent message, or none. Use an app action for named fields.
+                            """), "next_call": .null])])
                 }
                 for (key, value) in args where value != .null { call[key] = value }
             }

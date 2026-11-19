@@ -81,9 +81,8 @@ extension OwnedProgram {
             /// Nil means the argument list is computed, so its fields cannot be inferred.
             public let given: [Argument]?
         }
-        /// The callable `app({…})` request's own keys. With no `args`, every other key is the action's argument; beside `args`, another key is
-        /// refused. The prelude reads a live call by these same keys.
-        public static let requestKeys = ["action", "args", "preview", "expected_version"]
+        public static let optionKeys = ["preview", "expected_version", "because"]
+        public static let requestKeys = ["action", "args"] + optionKeys
         public var literal: [Literal] = []
         public var refusals: [String] = []
         public var warnings: [String] = []
@@ -349,6 +348,11 @@ extension OwnedProgram {
             guard case .object(let fields) = request else { unknownShape("app(request)", line); return }
             if fields["action"] != nil { doorAction(request, line: line); return }
             guard let batch = fields["actions"] else { return }
+            let extra = fields.keys.filter { $0 != "actions" && !Calls.optionKeys.contains($0) }.sorted()
+            if !extra.isEmpty {
+                result.refusals.append("invalid_actions at line \(line): app batch does not take \(extra.joined(separator: ", ")) beside actions.")
+                return
+            }
             guard case .array(let requests) = batch else { unknownShape("app actions", line); return }
             // An entry is read as a lone request is: an action is a call; a page, item or find entry is a read.
             for request in requests {

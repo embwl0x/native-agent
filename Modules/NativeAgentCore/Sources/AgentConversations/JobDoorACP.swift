@@ -9,17 +9,19 @@ import os
 /// nativeagent-link server: the job's result comes back through the job, not as a message to the agent. The prompt has no deadline.
 struct ACPJobDoor: JobRunner {
     let dataRoot: URL
+    /// The app assembly checks the saved commission's authority and wraps the approved program as it wraps an ACP message.
+    let launch: @Sendable (_ job: String, _ executable: String, _ arguments: [String]) async throws -> [String]
     static let door = "acp"
 
     func serves(_ contact: AgentPeerContact) -> Bool { contact.transport == .acp && contact.ability == nil }
 
-    func start(_ job: JobStart) async throws -> AsyncThrowingStream<JobEvent, Error> { try open(job, resuming: nil) }
+    func start(_ job: JobStart) async throws -> AsyncThrowingStream<JobEvent, Error> { try await open(job, resuming: nil) }
 
-    func resume(_ job: JobStart, session: String) async throws -> AsyncThrowingStream<JobEvent, Error> { try open(job, resuming: session) }
+    func resume(_ job: JobStart, session: String) async throws -> AsyncThrowingStream<JobEvent, Error> { try await open(job, resuming: session) }
 
     func cancel(session: String) async throws { await JobDoorLive.shared.stop(Self.door + ":" + session) }
 
-    private func open(_ job: JobStart, resuming: String?) throws -> AsyncThrowingStream<JobEvent, Error> {
+    private func open(_ job: JobStart, resuming: String?) async throws -> AsyncThrowingStream<JobEvent, Error> {
         let name = job.contact.name
         let record = try JobDoors.Record.read(job, dataRoot: dataRoot)
         let (_, row) = try JobDoors.recipe(job.contact)
@@ -36,18 +38,20 @@ struct ACPJobDoor: JobRunner {
         }
         do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         catch { throw JobRefusal("\(folder.path) could not be made: \(error.localizedDescription). Nothing ran.") }
+        _ = try AgentJobs.place(.string(folder.path), dataRoot: dataRoot).get()
+        let command = try await launch(job.job, approved.path, line.arguments)
         let (stream, continuation) = AsyncThrowingStream<JobEvent, Error>.makeStream()
         let out = JobDoorOut(continuation, contact: job.contact)
         let run = JobDoorRun()
         run.drive {
-            await drive(job, resuming: resuming, line: line, approved: approved, environment: environment, folder: folder, record: record, out: out,
-                        run: run)
+            await drive(job, command: command, resuming: resuming, line: line, approved: approved, environment: environment, folder: folder,
+                        record: record, out: out, run: run)
         }
         continuation.onTermination = { _ in run.cancel() }
         return stream
     }
 
-    private func drive(_ job: JobStart, resuming: String?, line: AgentHostACP, approved: AgentACPExecutable, environment: [String: String],
+    private func drive(_ job: JobStart, command: [String], resuming: String?, line: AgentHostACP, approved: AgentACPExecutable, environment: [String: String],
                        folder: URL, record: JobDoors.Record, out: JobDoorOut, run: JobDoorRun) async {
         let name = job.contact.name
         let client = AgentACPClient(dataRoot: dataRoot)
@@ -55,7 +59,7 @@ struct ACPJobDoor: JobRunner {
         let outcome: JobOutcome
         var deliverable: JobDeliverable?
         do {
-            let reply = try await client.turn(executable: approved.path, arguments: line.arguments, directory: folder, environment: environment,
+            let reply = try await client.turn(executable: command[0], arguments: Array(command.dropFirst()), directory: folder, environment: environment,
                 message: resuming == nil ? job.brief : JobDoors.resumed(job.brief), peerCredential: "", mcpServers: [], line: line,
                 conversationID: resuming, approvedExecutable: approved, capped: false,
                 permission: { request in
@@ -63,6 +67,7 @@ struct ACPJobDoor: JobRunner {
                 },
                 update: { event in if let note = Self.note(event) { out.send(.working(note: note)) } },
                 sessionOpened: { session in
+                    try job.handle(session)
                     guard opened.first(session) else { return }
                     out.send(.started(session: session))
                     await JobDoorLive.shared.hold(Self.door + ":" + session, run)

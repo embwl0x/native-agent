@@ -117,9 +117,12 @@ public enum MacInjectionArgRedaction {
             if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) {
                 out["script"] = .string(appDoorScriptPlaceholder)
             }
-            if case .array(let entries)? = input["actions"] {
+            switch input["actions"] {
+            case .array(let entries)?:
                 out["actions"] = .array(entries.map { if case .object(let call) = $0 { .object(redacted(tool: "app", input: call, turn: turn,
                     catalog: catalog)) } else { $0 } })
+            case .object(let call)?: out["actions"] = .object(redacted(tool: "app", input: call, turn: turn, catalog: catalog))
+            default: break
             }
             if let action = input["action"]?.stringValue, let reason = argumentProtectionReason(action, turn: turn, catalog: catalog), input["args"] != nil {
                 out["args"] = .object(withheld(reason))
@@ -143,6 +146,9 @@ public enum MacInjectionArgRedaction {
                 let foldedTool = ToolNameAliases.ranTool("app", input: input)
                 out["args"] = .object(foldedTool == "app" ? safeArgs : redacted(tool: foldedTool, input: safeArgs, turn: turn, catalog: catalog))
             }
+            if input["actions"] ?? .null != .null, input["action"]?.stringValue == nil, out["args"] ?? .null != .null {
+                out.removeValue(forKey: "args")
+            }
             return out
         }
         guard let keys = secretKeysByTool[normalized(tool)] else {
@@ -152,7 +158,7 @@ public enum MacInjectionArgRedaction {
         let canonical: [String: JSONValue]
         if let id = ToolNameAliases.appAction(tool, input: input), let binding = AppActionBinding.declaredBinding(id) {
             do {
-                canonical = binding.arguments(try binding.boundArguments(ToolNameAliases.doorArgs(tool, input, reportShim: false)))
+                canonical = binding.arguments(try binding.boundArguments(ToolNameAliases.doorArgs(tool, input)))
             } catch { return withheld("The action's arguments could not be bound: \(error.localizedDescription)") }
         } else { canonical = input }
         var out = redacting(keys, in: canonical)

@@ -18,15 +18,6 @@ enum ContextFillPresentation {
         let fillFraction: Double
     }
 
-    /// Zero means the catalog states no window size, never a measured size.
-    static func window(_ budget: Int) -> String? {
-        budget > 0 ? NumberFormatter.localizedString(from: NSNumber(value: budget), number: .decimal) : nil
-    }
-
-    static func roundedPercent(_ value: Double) -> String {
-        guard value.isFinite else { return "unavailable" }
-        return String(format: "%.0f%%", value.rounded())
-    }
 
     /// Use the owner's measured or estimated share rather than inventing usage locally.
     static func usage(_ status: SessionContextStatus) -> Usage {

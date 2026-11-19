@@ -5,6 +5,12 @@ import Foundation
 
 /// A child whose process group is established by posix_spawn, before any child code runs. The waitable leader reserves the PID/PGID until settlement ends.
 public final class ManagedProcess: @unchecked Sendable {
+    /// Child processes receive user identity, locale, executable lookup and Docker daemon selectors, never app credentials.
+    public static func agentEnvironment(_ source: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        let names: Set<String> = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "PATH", "DOCKER_HOST", "DOCKER_CONTEXT"]
+        return source.filter { names.contains($0.key) || $0.key.hasPrefix("LC_") }
+    }
+
     /// These are the two process QoS classes accepted by Darwin's spawn API.
     public enum Priority: Sendable, Equatable { case utility, background }
     public var executableURL: URL?
@@ -67,7 +73,7 @@ public final class ManagedProcess: @unchecked Sendable {
         guard state.withLock({ $0.group == nil }) else { throw POSIXError(.EALREADY) }
         let group = try OwnedProcessGroup.spawn(executable: executableURL.path,
             arguments: arguments ?? [], directory: currentDirectoryURL,
-            environment: environment ?? ProcessInfo.processInfo.environment,
+            environment: environment ?? Self.agentEnvironment(),
             input: standardInput, output: standardOutput, errors: standardError,
             qualityOfService: qualityOfService, directoryDescriptor: currentDirectoryDescriptor,
             inheritedDescriptor: inheritedDescriptor)

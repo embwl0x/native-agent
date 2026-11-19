@@ -4,7 +4,6 @@ import Foundation
 
 /// Read-only view of the running bridge. No probing, persisted mirror, or sync authority.
 public struct ICloudBridgeHealthSnapshot: Sendable {
-    public enum Transport: Sendable { case cloudKit, iCloudDrive }
     public enum Health: Sendable {
         case unmeasured, available, signedOut, notEntitled, quotaExceeded
         case accountFailure(code: Int, detail: String)
@@ -13,19 +12,15 @@ public struct ICloudBridgeHealthSnapshot: Sendable {
         case pairedElsewhere
     }
 
-    public let transport: Transport
     public let health: Health
-    public let documentsURL: URL?
     public let sendMeasured: Bool
     public let sendFailures: [String: Health]
     /// Phones paired with this Mac, as the pairing owner reads them; nil when that read failed. With none, phone sync was never set up here.
     public let pairedPhones: Int?
 
-    public init(transport: Transport, health: Health, documentsURL: URL? = nil,
+    public init(health: Health,
                 sendMeasured: Bool = false, sendFailures: [String: Health] = [:], pairedPhones: Int? = nil) {
-        self.transport = transport
         self.health = health
-        self.documentsURL = documentsURL
         self.sendMeasured = sendMeasured
         self.sendFailures = sendFailures
         self.pairedPhones = pairedPhones

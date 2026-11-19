@@ -6,6 +6,8 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSync
 import ToolExecution
+import Experiences
+import TurnTrace
 // Blueprint: | `EngineDoctor+StatusChecks.swift` | `DoctorFacade`; Native Desk and Activity evidence with authored narration |
 
 private struct DiagnosticNarration: Codable, Sendable {
@@ -72,7 +74,7 @@ extension DoctorFacade {
                 "kind": .string("desk"), "pendingApprovals": .int(Int64(pendingApprovals)),
                 "waiting": .object(group(waiting)), "blocked": .object(blockedFacts), "contradictions": .object(group(contradictions))
             ]), safeDetail: safeDetail)
-            let severity = contradictions.isEmpty ? "ok" : "warn"
+            let severity = contradictions.isEmpty && blocked.isEmpty ? "ok" : "warn"
             return (CheckResult(source: "desk/desk_ops_base.json and desk/desk_ops.jsonl", id: id, title: title, status: severity, detail: narration.detail,
                                 harm: severity == "warn" ? "The named Desk work cannot move forward or is marked finished while work remains." : nil,
                                 repair: contradictions.isEmpty ? nil
@@ -125,8 +127,20 @@ extension DoctorFacade {
     private static func activityCheck(root: URL, safeDetail: (String) -> String) async -> CheckResult {
         let id = "status.activity"
         let title = "Recent activity"
+        var source = "activity/events.jsonl"
         do {
             let readout = try await RuntimeReadouts.getActivityReadout(root: root)
+            source = "experiences/experiences.sqlite"
+            let now = Date()
+            let failedTurns = try await TurnTracePersistLane(dataRootOverride: root).events(
+                .init(kinds: ["turn.failed"], from: now.addingTimeInterval(-ExperienceStore.detailHorizon), through: now))
+            // A failed turn is a fault while its experience still owes something; once settled it is history, stated as a fact.
+            let failedIDs = Set(failedTurns.events.map(\.turnId))
+            var owing: [Experience] = []
+            if !failedIDs.isEmpty {
+                owing = try await ExperienceStore.at(root).projection().filter { $0.isOpen && failedIDs.contains($0.id) }
+            }
+            let newestFailure = failedTurns.events.map(\.ts).max()
             let cutoff = Date().addingTimeInterval(-15 * 60)
             // A later receipt or an age cutoff cannot reconcile an unknown effect.
             let reconciliation = readout.records.filter(\.needsReconciliation)
@@ -144,27 +158,36 @@ extension DoctorFacade {
                     .object(["createdAt": .string($0.event.createdAt), "title": .string(safeDetail($0.event.title))])
                 })
             ]), safeDetail: safeDetail)
-            return CheckResult(source: "activity/events.jsonl",
-                               id: id, title: title, status: malformed > 0 ? "fail" : reconciliation.isEmpty ? "ok" : "unmeasured",
-                               detail: narration.detail,
-                               harm: malformed > 0 ? "Parts of the activity history cannot be reviewed." : nil,
-                               human_action: malformed > 0 ? ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(
+            let turnDetail = " \(failedIDs.count) failed turn(s) in the retained detail horizon"
+                + (newestFailure.map { ", newest at \(NativeTimestampFormat.plainZulu($0))" } ?? "") + "; \(owing.count) still owe(s) something; "
+                + "\(failedTurns.unreadable) unreadable trace row(s)."
+            let failed = malformed > 0 || failedTurns.unreadable > 0 || !owing.isEmpty
+            return CheckResult(source: "activity/events.jsonl and experiences/experiences.sqlite",
+                               id: id, title: title, status: failed ? "fail" : reconciliation.isEmpty ? "ok" : "unmeasured",
+                               detail: narration.detail + turnDetail,
+                               harm: malformed > 0 ? "Parts of the activity history cannot be reviewed."
+                                   : owing.isEmpty ? nil : "A failed turn still owes what it was asked for.",
+                               human_action: !owing.isEmpty && malformed == 0
+                                   ? "Open each failed turn's conversation and ask again or stop it; the row clears when nothing it owes is open."
+                                   : malformed > 0 ? ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(
                                    dataRoot: root),
                                    shape: """
                                        Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. \
                                        Preserve unknown outcomes and reconciliation evidence.
                                        """) : nil)
         } catch {
-            return CheckResult(source: "activity/events.jsonl",
+            return CheckResult(source: source,
                                id: id, title: title, status: "fail",
-                               detail: "The activity log could not be read: \(safeDetail(error.localizedDescription)).",
+                               detail: "\(source) could not be read: \(safeDetail(error.localizedDescription)).",
                                harm: "Recent work and its outcomes cannot be reviewed.",
-                               human_action: ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(dataRoot: root),
-                                   shape: """
+                               human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent(source),
+                                   shape: source == "experiences/experiences.sqlite"
+                                   ? "Preserve original experiences, trace details, evidence and obligation phases in the SQLite experience store."
+                                   : """
                                        Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. \
                                        Preserve unknown outcomes and reconciliation evidence.
                                        """) + """
-                                        Open Status and refresh Recent activity once; if the log is still unavailable, inspect activity/events.jsonl without \
+                                        Open Status and refresh Recent activity once; if the record is still unavailable, inspect \(source) without \
                                        replacing its bytes.
                                        """)
         }

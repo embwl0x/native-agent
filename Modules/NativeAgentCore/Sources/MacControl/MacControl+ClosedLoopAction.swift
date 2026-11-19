@@ -460,10 +460,10 @@ extension SwiftNativeMacControl {
         // Identity comes from the retained observation; effect evidence starts NOW. Earlier batch steps must never prove this step's consequence. Identity
         // lookup is uncapped; effects use the same presentation cap on both sides so omitted controls cannot look like removals.
         let effectAffordanceCap = body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacPerceptionCompiler.maxAffordances
-        let effectPercept = MacPerceptionCompiler.compile(snapshot: identityScoped.snapshot,
+        let effectPercept = frame.completeWindow ? identityPercept : MacPerceptionCompiler.compile(snapshot: identityScoped.snapshot,
             secretContext: MacScreenViewTextRedaction.nodeSecretContext(identityScoped.snapshot.nodes),
             app: identityScoped.app, windowTitle: identityScoped.rootTitle, focusPath: identityScoped.focusPath,
-            maxAffordances: effectAffordanceCap, uncapped: frame.completeWindow)
+            maxAffordances: effectAffordanceCap)
         let effectBefore = MacLookFrame(frameId: frame.frameId, capturedAt: started,
             appName: frame.appName, bundleId: frame.bundleId, windowTitle: identityRead.rootTitle,
             entries: MacLookFrame.entries(from: effectPercept), pid: framePid,
@@ -507,7 +507,10 @@ extension SwiftNativeMacControl {
         switch verb {
         case .focus: heldEffect = .focus
         case .select: heldEffect = .selected
-        case .type where typeMode == .replace && placement == nil: heldEffect = .text(text)
+        case .type where typeMode == .replace && placement == nil
+            && turn.macContinuation?.isPending != true
+            && MacActClosedLoop.replacesTextValue(role: target.role)
+            && (!background || body["keystrokes"] != .bool(true)): heldEffect = .text(text)
         default: heldEffect = nil
         }
         let held = heldEffect.map {
@@ -569,6 +572,7 @@ extension SwiftNativeMacControl {
             ? MacActClosedLoop.clampedWaitMs(MacActClosedLoop.navigationWaitMs)
             : waitMs
         var read: MacAXRead?
+        var postEffect: (percept: MacLookPercept, diff: MacActClosedLoop.EffectDiff, caps: MacLookCompileCaps)?
         var seam: [String: JSONValue] = [:]
         var postAnchor: MacAnchoredRead?
         var menuLeftOpen: Bool?
@@ -644,19 +648,20 @@ extension SwiftNativeMacControl {
             (read, seam, postAnchor) = await self.lookSnapshot(
                 limits: limits, scope: MacLookScope.parse(body["scope"]?.stringValue) ?? .page,
                 anchorPid: framePid, anchorWindow: frame.windowIdentity, completeWindow: frame.completeWindow, context: context)
-            var passDiff: MacActClosedLoop.EffectDiff?
+            postEffect = nil
             if let read, seam["window_minimized"] != .bool(true) {
                 let percept = MacPerceptionCompiler.compile(snapshot: read.snapshot,
                     secretContext: MacScreenViewTextRedaction.nodeSecretContext(read.snapshot.nodes),
                     app: read.app, windowTitle: read.rootTitle, focusPath: read.focusPath,
                     maxAffordances: effectAffordanceCap, uncapped: frame.completeWindow)
-                passDiff = MacActClosedLoop.diff(before: effectBefore, after: percept, afterWindowTitle: read.rootTitle,
-                    afterCaps: MacLookCompileCaps(truncated: percept.truncated,
-                        maxAffordances: frame.completeWindow ? nil : effectAffordanceCap,
-                        maxNodes: frame.completeWindow ? nil : limits.maxNodes, maxDepth: frame.completeWindow ? nil : limits.maxDepth))
+                let caps = MacLookCompileCaps(truncated: percept.truncated,
+                    maxAffordances: frame.completeWindow ? nil : effectAffordanceCap,
+                    maxNodes: frame.completeWindow ? nil : limits.maxNodes, maxDepth: frame.completeWindow ? nil : limits.maxDepth)
+                let diff = MacActClosedLoop.diff(before: effectBefore, after: percept, afterWindowTitle: read.rootTitle, afterCaps: caps)
+                postEffect = (percept, diff, caps)
             }
             settledTarget = self.accessibilityActSource(context: context).reread(performed.target, context: context)
-            settledVerdict = verdict(passDiff, selected: read?.snapshot.nodes.first { $0.path == live.path }?.attributes.selected, read: read)
+            settledVerdict = verdict(postEffect?.diff, selected: read?.snapshot.nodes.first { $0.path == live.path }?.attributes.selected, read: read)
             return settledVerdict.status == "acted" || menuLeftOpen != nil
         }
         observation?.stop()
@@ -729,7 +734,7 @@ extension SwiftNativeMacControl {
         }
 
 
-        guard let read, seam["window_minimized"] != .bool(true) else {
+        guard let read, let postEffect, seam["window_minimized"] != .bool(true) else {
             // An absent or minimized window cannot supply a fresh frame; invalidate it and name the app/window identity failure.
             await lookFrameStore.invalidate()
             let (percept, note): (String, String) = {
@@ -799,30 +804,8 @@ extension SwiftNativeMacControl {
             )
         }
 
-        let after = MacPerceptionCompiler.compile(
-            snapshot: read.snapshot,
-            secretContext: MacScreenViewTextRedaction.nodeSecretContext(read.snapshot.nodes),
-            app: read.app,
-            windowTitle: read.rootTitle,
-            // Anchor focus to the same root and epoch as the post-act walk.
-            focusPath: read.focusPath,
-            maxAffordances: body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacPerceptionCompiler.maxAffordances,
-            uncapped: frame.completeWindow
-        )
-        // Record compile bounds so census comparison cannot mistake truncation for navigation.
-        let afterCaps = MacLookCompileCaps(
-            truncated: after.truncated,
-            maxAffordances: frame.completeWindow ? nil : body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:))
-                ?? MacPerceptionCompiler.maxAffordances,
-            maxNodes: frame.completeWindow ? nil : limits.maxNodes,
-            maxDepth: frame.completeWindow ? nil : limits.maxDepth
-        )
-        let diff = MacActClosedLoop.diff(
-            before: effectBefore,
-            after: after,
-            afterWindowTitle: read.rootTitle,
-            afterCaps: afterCaps
-        )
+        let after = postEffect.percept
+        let diff = postEffect.diff
         for (key, value) in MacActReceiptRendering.effectDiffJSON(diff, valueChars: limits.valueChars) {
             effect[key] = value
         }
@@ -859,7 +842,7 @@ extension SwiftNativeMacControl {
             windowTitle: read.rootTitle,
             // Retain the acted-on window and refresh its identity so moves and retitles carry forward without switching surfaces.
             windowIdentity: read.windowIdentity ?? frame.windowIdentity,
-            caps: afterCaps,
+            caps: postEffect.caps,
             completeWindow: frame.completeWindow
         ), context: context)
         output["frame_id"] = .string(newFrameId)

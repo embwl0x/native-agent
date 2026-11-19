@@ -27,25 +27,6 @@ public struct DelegationBackgroundWork: Sendable {
 
     public init(port: any DelegationBackgroundWorkPort) { self.port = port }
 
-    fileprivate func reconcileClosedReplyFindings(dataRoot: URL, configRoot: URL) async throws {
-        let closed = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items.filter {
-            $0.project == BodyQueue.project && $0.status.isTerminal && $0.closedAt != nil
-                && ($0.findingKey?.hasPrefix("delivery-residue|") == true
-                    || $0.findingKey?.hasPrefix("delivery-failed-before-answer|") == true)
-        }
-        guard !closed.isEmpty else { return }
-        for item in closed {
-            let ids = Set(item.refs.compactMap { ref -> String? in
-                guard case .trace(let id, "reply_delivery") = ref.kind else { return nil }
-                return id
-            })
-            if !ids.isEmpty {
-                try await port.letGoReplies(deliveryIDs: ids, outcome: item.summary ?? "",
-                    dataRoot: dataRoot, configRoot: configRoot)
-            }
-        }
-    }
-
     private static func replyRefs(_ jobs: [DelegationReadout]) throws -> [DeskRef] {
         let ids = try jobs.map { job in
             guard let id = job.completionDeliveryID, !id.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
@@ -113,7 +94,7 @@ public struct DelegationBackgroundWork: Sendable {
         let root = configRoot ?? InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         let deferral = DelegationDeferralState()
         let underlying = DelegationOutcomeLoop(
-            wake: .every(6 * 60 * 60),
+            wake: .onChange,
             cursorPath: DelegationOutcomeLoop.defaultCursorPath(dataRoot: dataRoot),
             readJobsWithAvailability: {
                 do { try await fileFailedHumanReplies(dataRoot: dataRoot) }
@@ -253,7 +234,6 @@ public struct DelegationBackgroundWork: Sendable {
             work: self,
             port: port,
             dataRoot: dataRoot,
-            configRoot: root,
             deferral: deferral,
             watchedPaths: [
                 AgentConversationStore(dataRoot: dataRoot).fileURL,
@@ -303,17 +283,13 @@ public struct DelegationBackgroundWork: Sendable {
     /// The job owns the outcome; a matter owns what the person has been told about it.
     public func fileDelegationOutcomeNotice(dataRoot: URL, card: DelegationOutcomeCard, read: DelegationJobsRead) async -> Bool {
         do {
-            if card.resolved {
-                try await BodyNotice.resolve(key: card.cardId, from: "delegation_outcome", dataRoot: dataRoot)
-                return true
-            }
             if card.outcome == .succeeded, card.severity == "info" {
                 guard read.allStoresReadable else { return false }
                 try await BodyNotice.resolve(key: card.cardId, from: "delegation_outcome", dataRoot: dataRoot)
                 return try await fileDelegationRollup(dataRoot: dataRoot, card: card, jobs: read.jobs, adverse: false)
             }
             if card.outcome == .failed || card.outcome == .unknown,
-               card.severityOverride == nil, card.cardId == "delegation-outcome:\(card.jobKey)" {
+               card.cardId == "delegation-outcome:\(card.jobKey)" {
                 guard read.allStoresReadable else { return false }
                 try await BodyNotice.resolve(key: card.cardId, from: "delegation_outcome", dataRoot: dataRoot)
                 return try await fileDelegationRollup(dataRoot: dataRoot, card: card, jobs: read.jobs, adverse: true)
@@ -447,31 +423,17 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     let work: DelegationBackgroundWork
     let port: any DelegationBackgroundWorkPort
     let dataRoot: URL
-    let configRoot: URL
     let deferral: DelegationDeferralState
     let watchedPaths: [URL]
 
     var loopId: String { underlying.loopId }
     var wake: OrganWake { underlying.wake }
-    // Reconciliation admits contact work under the checked provider guard.
-    // Retained contact turns own their execution lifetime and cancellation.
-    var tickTimeoutOverride: TimeInterval? {
-        let config = ProviderStreamGuardConfig.fromEnvironment()
-        do { try config.validate(); return config.wallTimeout + 60 }
-        // No provider tick is admitted below; the scheduler retains its own
-        // envelope for reporting this configuration failure.
-        catch { return nil }
-    }
-
     func shutdown() async { await port.stopAgentConversations() }
 
+    // Reconciliation admits contact work under the checked provider guard.
     func tickOutcome() async -> LoopTickOutcome {
         do { try ProviderStreamGuardConfig.fromEnvironment().validate() }
         catch { return .failed(error: error.localizedDescription) }
-        do { try await work.reconcileClosedReplyFindings(dataRoot: dataRoot, configRoot: configRoot) }
-        catch { return .failed(error: """
-            Reply let-go settlement failed: \(error.localizedDescription). Repair the reply or Desk records before reconciliation.
-            """) }
         if await deferral.takeReplyReconciliation() {
             do { try await port.reconcileReplyDeliveries(dataRoot: dataRoot) }
             catch {
@@ -487,7 +449,6 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                 ))
             }
         } catch {
-            // Inbox cleanup failure must not block outcome delivery; retry at the next event or integrity tick.
             FileHandle.standardError.write(Data(
                 "DelegationOutcomeLoop: stale adverse notice reconciliation failed: \(error)\n".utf8
             ))

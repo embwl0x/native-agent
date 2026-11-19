@@ -5,7 +5,14 @@ import Foundation
 public enum TurnSecretRedactor {
     // Pagination cursors are inputs, not credentials.
     private static let credentialName = #"(?!(?:next|pagination)_token(?![\w-]))"#
-        + #"(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)"#
+        + #"(?:[\w-]*(?:password|passwd|passphrase|token|secret(?:[_-]?key|hex)?|cookies?)"#
+        + #"|(?:[\w-]*[_-])?(?:(?:api|access|private)[_-]?key)|authorization)"#
+
+    private static let namedValueGuard = #"(?!(?:https?|ftp)://)(?!(?:Bearer|Basic)\s)"#
+    private static let quotedValue = #""(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)"#
+    /// Eight or more characters with a digit or a lower-to-upper turn: an issued value, not a word. Patterns compile case-insensitive, so the turn is
+    /// matched case-sensitively here.
+    private static let provenValue = #"(?=[^\s"']{8,})(?=[^\s"']*(?:[0-9]|(?-i:[a-z][A-Z])))[^\s"']+"#
 
     public static func isCredentialName(_ name: String) -> Bool {
         name.range(of: "^" + credentialName + "$", options: [.regularExpression, .caseInsensitive]) != nil
@@ -21,14 +28,13 @@ public enum TurnSecretRedactor {
             // dashed hex) is the record's own identifier, never a token's secret.
             ("TELEGRAM_TOKEN", #"(?:bot\d+|(?<!\d\.)\b\d{6,})(?::|%3[Aa])"#
                 + #"(?![0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{30,}"#, [.caseInsensitive]),
-            // Assignments and credential fields are secrets; provider-label prose needs a shaped value.
-            (
-                "NAMED_SECRET",
-                // URLs are prose; credential-shaped query values still match.
-                #"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|key|token|secret|password|passwd|openai|anthropic|github)"#
-                    + #"(?![A-Za-z0-9])\s*[=:]\s*(?!(?:https?|ftp)://)[^\s"']{8,}"#,
-                [.caseInsensitive]
-            ),
+            // An assignment to a credential name is a secret at any length (`password=hunter2`); a colon value or a provider label's value
+            // must prove itself, so prose keeps its words ("Key: yes", "token: 42"). Quoted values are cut at any length. URLs are prose, and an
+            // auth scheme word is not the value: the Bearer and Basic shapes take the whole header.
+            ("NAMED_SECRET", #"(?<![\w-])"# + credentialName + #"(?![A-Za-z0-9])(?:\s*=\s*"# + namedValueGuard + #"(?:"# + quotedValue
+                + #"|[^\s"']+)|\s*:\s*"# + namedValueGuard + #"(?:"# + quotedValue + "|" + provenValue + "))", [.caseInsensitive]),
+            ("NAMED_SECRET", #"(?<![\w-])(?:[A-Za-z0-9]+[_-]){0,3}(?:key|openai|anthropic|github)(?![A-Za-z0-9])\s*[=:]\s*"#
+                + namedValueGuard + #"(?:"# + quotedValue + "|" + provenValue + ")", [.caseInsensitive]),
             ("BEARER_TOKEN", #"\bBearer\s+[A-Za-z0-9._~+/=-]+"#, [.caseInsensitive]),
         ]
         let patterns = specs.map { kind, pattern, options in
@@ -37,7 +43,7 @@ public enum TurnSecretRedactor {
             }
             return (kind, expression)
         }
-        return Array(patterns.prefix(2)) + credentialPatterns.filter { $0.0 != "BEARER_TOKEN" } + Array(patterns.suffix(3))
+        return Array(patterns.prefix(2)) + credentialPatterns.filter { $0.0 != "BEARER_TOKEN" } + Array(patterns.suffix(4))
     }()
 
     /// Receipt and display boundaries share token recognition; callers own replacement policy.
@@ -49,11 +55,26 @@ public enum TurnSecretRedactor {
                 [.dotMatchesLineSeparators]
             ),
             ("GITHUB_TOKEN", "\\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\\b", []),
+            ("PGP_BLOCK", #"-----BEGIN PGP (?:MESSAGE|PRIVATE KEY BLOCK)-----.*?-----END PGP (?:MESSAGE|PRIVATE KEY BLOCK)-----"#,
+                [.dotMatchesLineSeparators]),
+            ("AWS_ACCESS_KEY", #"\bAKIA[A-Z0-9]{16}\b"#, []),
+            // Base64 proves itself by a digit, +, /, = or a lower-to-upper turn; "Basic training" is prose.
+            ("BASIC_AUTH", #"\bBasic\s+(?=[A-Za-z0-9+/]*(?:[0-9+/=]|(?-i:[a-z][A-Z])))[A-Za-z0-9+/]{8,}={0,2}"#, []),
+            ("AUTHENTICATED_URL", #"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@[^\s/]+"#, []),
+            ("COOKIE", #"\b(?:Set-Cookie|Cookie)\s*:\s*[^\r\n]+"#, []),
+            ("HUGGINGFACE_TOKEN", #"\bhf_[A-Za-z0-9]{20,}\b"#, []),
+            ("GITLAB_TOKEN", #"\bglpat-[A-Za-z0-9_-]{20,}\b"#, []),
+            ("GOOGLE_OAUTH_TOKEN", #"\bya29\.[A-Za-z0-9_-]+"#, []),
+            ("STRIPE_WEBHOOK_SECRET", #"\bwhsec_[A-Za-z0-9]{16,}\b"#, []),
+            ("XAI_KEY", #"\bxai-[A-Za-z0-9_-]{20,}\b"#, []),
+            ("GROQ_KEY", #"\bgsk_[A-Za-z0-9_-]{20,}\b"#, []),
+            ("NPM_TOKEN", #"\bnpm_[A-Za-z0-9]{20,}\b"#, []),
+            ("SENDGRID_KEY", #"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"#, []),
             ("JWT", "\\beyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}", []),
             ("OPENAI_KEY", "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", []),
             ("ANTHROPIC_KEY", "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", []),
             ("META_KEY", "\\bLLM_[0-9]+_[A-Za-z0-9._~+/=-]+", []),
-            ("STRIPE_KEY", "\\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\\b", []),
+            ("STRIPE_KEY", "\\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\\b", []),
             ("SLACK_TOKEN", "\\bxox[baprs]-[A-Za-z0-9-]{20,}|\\bxapp-[A-Za-z0-9-]{20,}\\b", []),
             ("GOOGLE_API_KEY", "\\bAIza[0-9A-Za-z_-]{25,}\\b", []),
             ("BEARER_TOKEN", "\\bBearer\\s+[A-Za-z0-9._~+/=-]{20,}\\b", [.caseInsensitive]),
@@ -71,21 +92,25 @@ public enum TurnSecretRedactor {
         let bytes = Array(value.utf8)
         for i in bytes.indices {
             let byte = bytes[i]
-            if byte >= 128 || byte == 45 || byte == 95 || byte == 46 { return true }
+            if byte >= 128 || byte == 45 || byte == 95 || byte == 46 || byte == 58 { return true }
             let lower = byte | 32
             if lower == 98, i + 5 < bytes.count,
                (bytes[i + 1] | 32) == 101, (bytes[i + 2] | 32) == 97, (bytes[i + 3] | 32) == 114,
                (bytes[i + 4] | 32) == 101, (bytes[i + 5] | 32) == 114 { return true }
             if lower == 97, i + 3 < bytes.count,
                (bytes[i + 1] | 32) == 105, (bytes[i + 2] | 32) == 122, (bytes[i + 3] | 32) == 97 { return true }
+            if lower == 97, i + 3 < bytes.count,
+               (bytes[i + 1] | 32) == 107, (bytes[i + 2] | 32) == 105, (bytes[i + 3] | 32) == 97 { return true }
+            if lower == 98, i + 4 < bytes.count,
+               (bytes[i + 1] | 32) == 97, (bytes[i + 2] | 32) == 115,
+               (bytes[i + 3] | 32) == 105, (bytes[i + 4] | 32) == 99 { return true }
         }
         return false
     }
 
     /// `<credential name> = <value>` with the name captured separately, so the label survives and only a value that PROVES itself a secret is cut.
     private static let displayNamedSecretPattern: NSRegularExpression = {
-        let pattern = #"((?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}"#
-            + #"(?:api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd)(?![A-Za-z0-9])["']?\s*[=:]\s*["']?)([^\s"']+)"#
+        let pattern = #"((?<![\w-])"# + credentialName + #"(?![A-Za-z0-9])["']?\s*[=:]\s*["']?)([^\s"']+)"#
         guard let expression = try? NSRegularExpression(
             pattern: pattern, options: [.caseInsensitive]
         ) else {

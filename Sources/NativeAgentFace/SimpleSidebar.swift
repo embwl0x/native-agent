@@ -60,6 +60,13 @@ struct SimpleSidebar: View {
         .frame(width: Self.width + NativeAgentShellLayout.railPlateInset)
         .frame(maxHeight: .infinity)
         .faceObservation(.key(.layout))
+        .onChange(of: agentsOpen) { _, open in
+            guard open else { return }
+            Task {
+                do { try await appModel.client.act(.refresh(.page("connectors"))).checkedAcknowledgement() }
+                catch { appModel.systemToasts.push(error: error.localizedDescription) }
+            }
+        }
     }
 
     /// Show Chat on the conversation, or on an agent's or helper's thread.

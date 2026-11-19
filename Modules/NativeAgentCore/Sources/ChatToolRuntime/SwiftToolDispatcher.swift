@@ -47,7 +47,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// Local durable enqueue only: return the accepted request ID after writing, without executing a provider or waiting for a bot run. Supplied by the
     /// runner's app assembly; nil reports unavailable rather than fake success.
     let standingBotSession: BotRunnerSession?
-    let standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)?
+    let standingBotRunEnqueue: (@Sendable (UUID, String?, Turn) throws -> BotRunReceipt)?
     /// Exact semantic-memory owner for this dispatcher body. Alternate roots must never fall through to the process-wide production singleton.
     let memoryV2: SwiftNativeMemoryV2
     let knowledgeGraphPath: URL
@@ -87,7 +87,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         appTools: (any ChatToolExecuting)? = nil,
         agentBridgeConfigRoot: URL? = nil,
         a2aPushConfiguration: (@Sendable (AgentPeerContact) async throws -> JSONValue)? = nil,
-        standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)? = nil,
+        standingBotRunEnqueue: (@Sendable (UUID, String?, Turn) throws -> BotRunReceipt)? = nil,
         standingBotSession: BotRunnerSession? = nil
     ) {
         _ = Self.builtInsRegistered

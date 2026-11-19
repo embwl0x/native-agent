@@ -10,7 +10,7 @@ import BackgroundLoops
 import DoctorChecks
 import BackgroundWork
 import Synchronization
-// Blueprint: | `ContactAddressBook.swift` | ContactListFacade owns checked address-book doors and their LatestRead publication and contact-change watch |
+// Blueprint: | `ContactAddressBook.swift` | ContactListFacade owns checked address-book doors and their LatestRead publication |
 
 /// Share one checked row per door across surfaces without merging its grant or elevation verdict.
 @MainActor @Observable
@@ -21,10 +21,8 @@ public final class ContactListFacade {
     public private(set) var loadError: String?
     public var rows: [AgentContactRow] { doors.filter(\.primary) }
     @ObservationIgnored private lazy var latest = LatestRead()
-    @ObservationIgnored private var watchTask: Task<Void, Never>?
 
     public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }
-    deinit { watchTask?.cancel() }
 
     @discardableResult
     public func refresh() async throws -> [AgentContactRow] {
@@ -56,38 +54,11 @@ public final class ContactListFacade {
             case .success(let next):
                 doors = next.doors
                 loadError = nil
+                NotificationCenter.default.post(name: ContactThreadReadouts.contactsDidChange, object: dataRoot)
             case .failure(let error):
                 loadError = error.localizedDescription
             }
         }).get()
     }
 
-    public func watch() {
-        guard watchTask == nil else { return }
-        let root = dataRoot
-        watchTask = Task { [weak self] in
-            let events = FileChangeEvents(paths: ["agents/peers.json", "agents/conversations.json",
-                "agents/discovery.json", "chat/sessions.json"].map { root.appendingPathComponent($0) }
-                + [AgentLocalHealth.url(root)], emitInitial: true)
-            let dot = NotificationCenter.default.addObserver(forName: ChatGPTDotIPCTransport.didChange,
-                object: nil, queue: nil) { [weak self] _ in
-                Task { @MainActor [weak self] in _ = try? await self?.refresh() }
-            }
-            var askedDot = false
-            await withTaskCancellationHandler {
-                for await _ in events.stream {
-                    if Task.isCancelled { break }
-                    _ = try? await self?.refresh()
-                    if !askedDot, self?.doors.contains(where: { $0.contact.map(ChatGPTDotIPCTransport.owns) == true }) == true {
-                        askedDot = true
-                        await Task.detached(priority: .userInitiated) {
-                            _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
-                        }.value
-                        _ = try? await self?.refresh()
-                    }
-                }
-            } onCancel: { events.cancel() }
-            NotificationCenter.default.removeObserver(dot)
-        }
-    }
 }

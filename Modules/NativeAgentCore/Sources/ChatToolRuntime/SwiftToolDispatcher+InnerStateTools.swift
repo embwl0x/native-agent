@@ -126,7 +126,7 @@ extension SwiftToolDispatcher {
 
         var now: [String: JSONValue] = [:]
         now["felt"] = reading.fingerprint.map(JSONValue.string) ?? .null
-        now["about"] = reading.fingerprintSubject.map(JSONValue.string) ?? .null
+        now["about"] = reading.fingerprintSubject.map { .string(innerStateSafeText($0, limit: CognitiveInnerStateReading.subjectLabelCharacters)) } ?? .null
         func registerJSON(_ chosen: CognitiveChosenRegister) -> JSONValue {
             .object([
                 "name": .string(innerStateSafeText(chosen.choice.name, limit: 80)),
@@ -168,7 +168,7 @@ extension SwiftToolDispatcher {
                         (reading.generatedAt.timeIntervalSince(node.when) / 3600 * 10).rounded() / 10),
                     // Which list it came from: `felt` = among the window's strongest, `recent` = among the newest. Different claims.
                     "selection": .string(node.selection.rawValue),
-                    "subject": .string(node.subject),
+                    "subject": .string(innerStateSafeText(node.subject, limit: CognitiveInnerStateReading.subjectLabelCharacters)),
                     "valence": .double(node.valence),
                     "arousal": .double(node.arousal),
                     "warmth": .double(node.warmth),
@@ -176,7 +176,7 @@ extension SwiftToolDispatcher {
             }),
             "expectations": .array(reading.expectations.map { expectation in
                 .object([
-                    "label": .string(expectation.label),
+                    "label": .string(innerStateSafeText(expectation.label, limit: CognitiveInnerStateReading.subjectLabelCharacters)),
                     "due": .string(iso.string(from: expectation.due)),
                     "valence_sign": .int(Int64(expectation.valenceSign)),
                 ])
@@ -188,7 +188,7 @@ extension SwiftToolDispatcher {
             // An absent forward-facing stance renders as null, never an invented "nothing planned" verdict.
             "toward": reading.toward.map { toward in
                 .object([
-                    "label": .string(toward.label),
+                    "label": .string(innerStateSafeText(toward.label, limit: CognitiveInnerStateReading.subjectLabelCharacters)),
                     "source": .string(toward.sourceKind),
                     "valence_sign": .int(Int64(toward.valenceSign)),
                     "due": .string(iso.string(from: toward.due)),
@@ -201,7 +201,7 @@ extension SwiftToolDispatcher {
                 "id": .string(care.id.uuidString),
                 "about": .string(innerStateSafeText(care.about, limit: CognitiveCare.aboutCharacters)),
                 "depth": .string(care.depth),
-                "with": .array(care.with.map(JSONValue.string)),
+                "with": .array(care.with.map { .string(innerStateSafeText($0, limit: 160)) }),
                 "felt": care.felt.map { .string(innerStateSafeText($0, limit: CognitiveCare.feltCharacters)) } ?? .null,
                 "charge": .double((care.charge * 100).rounded() / 100),
                 "open": care.open.map { .string(innerStateSafeText($0, limit: CognitiveCare.openCharacters)) } ?? .null,
@@ -214,12 +214,12 @@ extension SwiftToolDispatcher {
             let lines = reading.growthWeek.isEmpty
                 ? ["No changes recorded in the last 7 days."]
                 : reading.growthWeek
-            out["growth_week"] = .array(lines.map(JSONValue.string))
+            out["growth_week"] = .array(lines.map { .string(innerStateSafeText($0, limit: 400)) })
             // The raw care history stays distinct from the agent's own telling of it.
             out["care_history"] = .array(reading.story.map { .string(innerStateSafeText($0, limit: 400)) })
         }
         let knowledge = reading.selfKnowledge
-        out["self_night"] = knowledge.map { .string($0.night) } ?? .null
+        out["self_night"] = knowledge.map { .string(innerStateSafeText($0.night, limit: 160)) } ?? .null
         out["self_unavailable"] = reading.selfKnowledgeIssue.map { .string(innerStateSafeText($0, limit: 320)) } ?? .null
         out["people_unavailable"] = reading.carePeopleIssue.map { .string(innerStateSafeText($0, limit: 320)) } ?? .null
         if reading.detail == .full {

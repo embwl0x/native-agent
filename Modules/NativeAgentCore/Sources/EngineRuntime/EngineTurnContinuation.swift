@@ -131,25 +131,33 @@ public struct TurnContinuationRuntime: Sendable {
     public func reconcileReplyMirror() async throws {
         let lifecycle = Self.mirrorLifecycle(dataRoot: dataRoot)
         _ = try await lifecycle.reconcileInterruptedClaims()
+        var failures: [String] = []
         for row in try await lifecycle.reconciliationRows() where (row.status == "owed" || row.status == "sent_unconfirmed") && !row.routeSettled {
-            guard let response = row.response else { continue }
-            guard let route = row.route else {
-                if let session = response.sessionId {
-                    try await Self.retainMirrorIntent(sessionId: session, runId: response.runId, dataRoot: dataRoot, requiresAnchor: false)
+            do {
+                try Task.checkCancellation()
+                guard let response = row.response else { continue }
+                guard let route = row.route else {
+                    if let session = response.sessionId {
+                        try await Self.retainMirrorIntent(sessionId: session, runId: response.runId, dataRoot: dataRoot, requiresAnchor: false)
+                    }
+                    continue
                 }
-                continue
-            }
-            guard let surface = route.sourceKey else { continue }
-            let text = "[\(Self.mirrorDoors[surface] ?? surface)]\n" + response.output
-            let turn = Turn(run: response.runId, session: response.sessionId)
-                .with(\.envelope, .native("reply_mirror:" + row.id, surface: surface))
-                .with(\.verifiedSessionID, response.sessionId)
-            _ = await AgentBridgeCompletionRouter.deliver(turn: turn, deliveryId: row.id, requestDigest: row.digest,
-                text: text, attachments: response.attachments ?? [], route: route,
-                sender: makeSender(surface == "chat", route.correlationId, { config, chatID in
-                    TelegramPollLoop.inboundAuthorizationDecision(allowedChatIds: config.allowedChatIds,
-                        allowedUserIds: config.allowedUserIds, chatId: chatID, fromUserId: chatID > 0 ? chatID : nil) == .allowed
-                }), lifecycle: lifecycle, notifyRequestedResult: surface == "slack")
+                guard let surface = route.sourceKey else { continue }
+                let text = "[\(Self.mirrorDoors[surface] ?? surface)]\n" + response.output
+                let turn = Turn(run: response.runId, session: response.sessionId)
+                    .with(\.envelope, .native("reply_mirror:" + row.id, surface: surface))
+                    .with(\.verifiedSessionID, response.sessionId)
+                _ = await AgentBridgeCompletionRouter.deliver(turn: turn, deliveryId: row.id, requestDigest: row.digest,
+                    text: text, attachments: response.attachments ?? [], route: route,
+                    sender: makeSender(surface == "chat", route.correlationId, { config, chatID in
+                        TelegramPollLoop.inboundAuthorizationDecision(allowedChatIds: config.allowedChatIds,
+                            allowedUserIds: config.allowedUserIds, chatId: chatID, fromUserId: chatID > 0 ? chatID : nil) == .allowed
+                    }), lifecycle: lifecycle, notifyRequestedResult: surface == "slack")
+            } catch is CancellationError { throw CancellationError() }
+            catch { failures.append("Reply mirror \(row.id): \(error.localizedDescription)") }
+        }
+        guard failures.isEmpty else {
+            throw NSError(domain: "NativeAgent.ReplyMirror", code: 1, userInfo: [NSLocalizedDescriptionKey: failures.joined(separator: "; ")])
         }
     }
 
@@ -251,7 +259,7 @@ public struct TurnContinuationRuntime: Sendable {
         do { entry = try ShelfStore(dataRoot: dataRoot).entry(request) }
         catch StandingBotsError.notFound { return .unknown("helper request \(requestID) has no queued request, live claim, or result") }
         guard entry.botId == botID, entry.id == request else { throw DeskContinuationError.unsafe }
-        guard entry.runtimeStatus == .completed, !entry.uncertainties.contains("Run receipt pending finalization.") else {
+        guard entry.runtimeStatus == .completed else {
             return .unknown("helper request \(requestID) ended \(entry.runtimeStatus.rawValue)")
         }
         return .settled("helper request \(requestID) completed")
@@ -397,7 +405,7 @@ public struct TurnContinuationRuntime: Sendable {
         try await runApprovalAdmission(sessionID: sessionID, envelope: envelope, prompt: prompt, turn: turn) { turn in
             // Admitted, the follow-up is the card's resumed work: a failure from here is owed, never a second run of the turn. Stop still stops it.
             func owe(_ what: String, _ error: any Error, lever: String) {
-                RepairOwed.owe(dataRoot, id: "card-followup:" + turn.run, kind: .message, operation: "card.followup:" + turn.run,
+                RepairOwed.owe(dataRoot, id: "card-followup:" + turn.run, kind: .message, steeredBy: turn.steeringStamp(), operation: "card.followup:" + turn.run,
                     owner: sessionID, words: what + error.localizedDescription, lever: lever)
             }
             let response: ChatResponse

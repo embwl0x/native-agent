@@ -63,12 +63,14 @@ as their own call (origin self, their posture's gates, the part-wake run path),
 with no model call. Then:
 
 - **It finished and needs nothing**: a note on the step "Ran <time>: <one-line
-  result>", `until` settles as for `say` (once closes; standing stays).
+  result>", and `until` settles: once closes; standing stays.
 - **It asks for them**: any receipt or nested result has `effects:"unknown"`,
   the result carries `needs_me: "<why>"` (an ability that
-  gathers and wants their judgment says so), or the run failed, was refused, or
+  gathers and wants their judgment says so), the run only looked (every call in
+  its receipt is a plain read and none is one of their abilities: a look never
+  finishes an intention, an act does), or the run failed, was refused, or
   waits on the person → the step's `moment` happening is posted with the
-  run's receipt beside it as `already_looked`, and the thought starts from what
+  run's receipt beside it as `already_looked at <time>`, and the thought starts from what
   the habit found instead of redoing it.
 
 `say` and `action` together: the action runs first; the words are said when it
@@ -101,7 +103,7 @@ without running the habit or speaking again, then mark them settled.
 Changed or already closed steps are left alone. Standing and rhythms remain open;
 their next occurrence is still owned by `IntentionClock`. An until condition
 in words still needs judgment: they reads it when the moment comes, and the
-after-turn judgment closes the step once it is met. An unfinished/refused/needs-me result
+after-turn judgment can close the step with quoted evidence that it is met. An unfinished/refused/needs-me result
 rides the step's moment as `already_looked` text. What comes out is the
 display-only planned call and the routine thought merely to decide to run it.
 
@@ -178,11 +180,9 @@ post-dream wake and quit join, the compile-only save context and its prompt.
 No new candidate ledgers, tapes or `practice.night` rows are written.
 Existing files are left untouched and unread.
 
-Existing abilities' embedded `compiled` provenance and tape fixtures still
-have validation, admission and display readers. Those protections remain:
-revising such an ability inherits its provenance and omitted fixtures, and
-its exact version must replay before admission. This is no second
-crystallizer; there is no producer of new compiled candidates.
+Tape fixtures retain validation, admission and display readers. A revision
+inherits omitted fixtures, and its exact version must replay before admission.
+The `compiled` manifest field has no reader or producer.
 
 ## What this changes for them
 

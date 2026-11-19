@@ -2,7 +2,7 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `AgentA2APushReceiver.swift` | `AgentA2APushReceiver`, `receive`, `consume`; Push hints wake canonical task reads. |
 
-/// Pushes only wake the bounded mailbox; GetTask remains authoritative.
+/// Pushes only wake the per-contact bounded mailbox; GetTask remains authoritative.
 public actor AgentA2APushReceiver {
     public static let shared = AgentA2APushReceiver()
     private var hints: [(peer: String, task: String, pending: Bool)] = []
@@ -39,7 +39,10 @@ public actor AgentA2APushReceiver {
         guard let taskID else { return } // A direct message has no GetTask route.
         hints.removeAll { $0.peer == peerID && $0.task == taskID }
         hints.append((peerID, taskID, true))
-        if hints.count > 128 { hints.removeFirst(hints.count - 128) }
+        if hints.filter({ $0.peer == peerID }).count > 128,
+           let oldest = hints.firstIndex(where: { $0.peer == peerID }) {
+            hints.remove(at: oldest)
+        }
         invalidator?.wake(peerID, taskID)
     }
 

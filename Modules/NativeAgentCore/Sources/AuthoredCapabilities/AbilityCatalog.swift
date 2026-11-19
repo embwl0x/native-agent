@@ -45,7 +45,6 @@ extension AbilityStore {
             if file.kind != .part { return .object(row) }
             // Read from the selected version's own code and header each time, never stored: a page is not a call.
             row["callable"] = .bool(Self.answersCalls(file.body, header: file.part))
-            row.removeValue(forKey: "candidateReview")
             row.removeValue(forKey: "keepReview")
             var reviewFile = file
             if let next = catalog.retained[.next]?[file.id], let digest = identity(next) {
@@ -121,9 +120,7 @@ extension AbilityStore {
                 } else if let current { file = current }
                 else if let next { file = next; slot = .next }
                 else {
-                    let script = input["script"]?.objectValue
-                    file = try File(id: id, kind: kind, metadata: ["record": .object(input)], body: script?["source"]?.stringValue ?? input["body"]?.stringValue
-                        ?? "",
+                    file = try File(id: id, kind: kind, metadata: ["record": .object(input)], body: input["body"]?.stringValue ?? "",
                                 pathExtension: "js")
                 }
                 var row = Self.storedRecord(input, kind: kind)
@@ -148,12 +145,12 @@ extension AbilityStore {
             try writeState(stats)
         }
     }
+    /// Proof-derived status is projected on read; it is not authored record identity.
     static func storedRecord(_ input: [String: JSONValue], kind: Kind) -> [String: JSONValue] {
-        var row = input.filter { !statistics.contains($0.key) && !obsolete.contains($0.key)
-            && !partKeys.contains($0.key) && !["kind", "permissions", "bundledDefault", "body", "run_counts", "callable"].contains($0.key)
+        input.filter { !statistics.contains($0.key) && !projections.contains($0.key)
+            && !partKeys.contains($0.key)
+            && !["kind", "permissions", "bundledDefault", "body", "run_counts", "callable", "validationStatus"].contains($0.key)
             && (kind == .sense || $0.key != "version") }
-        if var script = row["script"]?.objectValue { script.removeValue(forKey: "source"); row["script"] = .object(script) }
-        return row
     }
     /// Retained and bundled senses share SenseRecord's numeric Codable date projection.
     public static func senseRecord(_ input: [String: JSONValue]) throws -> [String: JSONValue] {
@@ -208,7 +205,6 @@ extension AbilityStore {
             if row["status"] == .string("on"), row["unavailableReason"] != nil { row["status"] = .string("unavailable") }
             row = try Self.senseRecord(row)
         }
-        if var script = row["script"]?.objectValue { script["source"] = .string(file.body); row["script"] = .object(script) }
         return row
     }
     /// Reapply today's content policy to retained evidence without rewriting its accounting or truncating the reached-call labels.

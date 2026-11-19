@@ -200,7 +200,8 @@ function face(input) {
             if (p.lastWorkedAt !== null) rows.push({id: "pursuit-last", title: "Last worked", at: p.lastWorkedAt});
             if (p.score !== null) rows.push({id: "pursuit-score", title: "Score", value: p.score.toFixed(2)});
         }
-        s.notes.forEach((note, i) => rows.push({id: "note:" + i, title: note.text, at: note.at}));
+        s.notes.forEach((note, i) => rows.push(row({id: "note:" + i, title: note.text, at: note.at,
+            detail: note.author === null ? null : "By " + note.author})));
         const pieces = new Map(s.pieces.map(piece => [piece.id, piece]));
         for (const ref of s.refs.slice().sort((a, b) => a.priority - b.priority)) {
             const id = "ref:" + ref.id, piece = pieces.get(ref.id);
@@ -402,7 +403,8 @@ function face(input) {
         for (const [id, title, source] of [["work-now", "Other work now", input.overview.now], ["attention", "Needs you", input.overview.needsYou],
             ["recent-work", "Recently done", input.overview.recentlyDone]]) {
             const rows = source.rows.filter(r => r.kind !== "execution" && (r.kind !== "desk" || !onBoard.has(r.ref))).map(r => row({id: r.id,
-                title: r.title, detail: r.summary, value: r.state, at: r.at,
+                title: r.title, detail: id === "attention" && gone.inbox !== null && ["approval","inbox"].includes(r.kind)
+                    ? r.summary + " · " + gone.inbox : r.summary, value: r.state, at: r.at,
                 tone: id === "attention" ? "attention" : id === "recent-work" ? "done" : "plain", open: open(r.id)}));
             if (rows.length || source.omitted > 0) overview[id] = row({id, title, style: "timeline",
                 footer: source.omitted > 0 ? source.omitted + " more items remain in the board, Activity and history." : null, rows});
@@ -426,7 +428,7 @@ function face(input) {
         sections.push({id: "empty-board", style: "note", rows: [{id: "empty", title: "No items on the board."}]});
     }
     if (board.parked) sections.push(board.parked);
-    const gaps = [gone.desk, gone.jobs, gone.reminders, gone.helpers, gone.liveUpdates, gone.schedule]
+    const gaps = [gone.desk, gone.jobs, gone.reminders, gone.helpers, gone.liveUpdates, gone.schedule, gone.contacts, gone.inbox]
         .filter(gap => gap !== null).concat(gone.overview);
     if (input.activity.state === "unavailable") gaps.push("Live activity: " + input.activity.reason);
     if (!input.loaded) gaps.push("The Desk has not been read.");
@@ -507,6 +509,31 @@ function face(input) {
             .filter(Boolean).join(" · ");
         packed(live.map(itemRow).concat(byDay("marks:", marks.filter(terminal))), 256).forEach((rows, index) => sections.push({
             id: index ? "my-marks-" + index : "my-marks", title: index ? "My own upkeep, older" : title, style: "list", rows, folded: true}));
+    }
+    if (input.table) {
+        const t = input.table, key = "piece:" + t.ref;
+        if (sections.length >= 64) sections.pop();
+        const layTable = section => selected === null ? sections.unshift(section) : sections.push(section);
+        if (t.reason) layTable({id: key, title: "The table", style: "note", rows: [{id: key, title: t.reason, tone: "attention"}]});
+        else {
+            const boundary = t.source_boundary ? t.source_boundary + "\n" : "";
+            const reading = utf8Fit(boundary + "The table, version " + t.version + ". Elements and live facts:\n"
+                + t.elements.map(e => JSON.stringify(e)).join("\n"), 16 * 1024 - 160);
+            const tools = sections.find(section => section.id === "desk-tools");
+            if (tools) tools.rows.push({id: key, title: "Pop out the table", actions: keyActions(key, () => "Pop out the table")});
+            const live = input.items.filter(item => !terminal(item)), seen = new Set();
+            const choices = live.map(item => ({id: "item:" + item.handle, label: line(item.title, 110) || item.handle,
+                detail: "desk." + item.alias, item: item.handle}))
+                .concat(live.flatMap(item => item.pieces).filter(piece => {
+                    if (piece.state !== "ready" || seen.has(piece.ref)) return false;
+                    seen.add(piece.ref); return true;
+                }).map(piece => ({id: "piece:" + piece.ref, label: piece.title || "Untitled piece", detail: WHAT[piece.what], piece: "make:" + piece.ref})))
+                .slice(0, 200);
+            layTable({id: key, title: "The table", block: {kind: "leaf", key, leaf: "board", ref: t.ref, revision: t.version,
+                cards: Object.fromEntries(t.card_pairs), choices,
+                alt: reading.text + "\nRaw points: make.read {ref:\"table\"} gives the file path." + (reading.cut
+                    ? "\nReading cut; make.read {ref:" + JSON.stringify(t.ref) + "} gives the complete board file." : "")}});
+        }
     }
     // What the Desk has open, for the ask bar and the agent's page read. A title is one line there, so its line breaks become spaces.
     const opened = selected !== null && selected.kind === "item" && selected.found

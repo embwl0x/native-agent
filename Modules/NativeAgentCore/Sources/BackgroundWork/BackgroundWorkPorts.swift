@@ -100,7 +100,6 @@ public enum BackupTrigger: String, Codable, Sendable {
 }
 
 public protocol DelegationBackgroundWorkPort: BackgroundWorkNotificationPort {
-    func letGoReplies(deliveryIDs: Set<String>, outcome: String, dataRoot: URL, configRoot: URL) async throws
     func reconcileReplyDeliveries(dataRoot: URL) async throws
     func retryRequestedResults(dataRoot: URL) async throws
     var agentSubject: String { get }

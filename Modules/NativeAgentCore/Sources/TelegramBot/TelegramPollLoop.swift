@@ -21,8 +21,6 @@ import Experiences
 public struct TelegramPollLoop: LoopRunner {
     public let loopId: String = "telegram_poll"
     public let wake: OrganWake
-    /// Bounds long-poll intake; tracked conversation tasks own their work.
-    public var tickTimeoutOverride: TimeInterval? { 3600 }
     let token: String
     let allowedChatIds: Set<Int64>
     let allowedUserIds: Set<Int64>
@@ -54,6 +52,17 @@ public struct TelegramPollLoop: LoopRunner {
         else {
             return .notAllowlisted
         }
+        return .allowed
+    }
+
+    static func controlAuthorizationDecision(
+        allowedChatIds: Set<Int64>, allowedUserIds: Set<Int64>, chatId: Int, fromUserId: Int?
+    ) -> InboundAuthorizationDecision {
+        let admission = inboundAuthorizationDecision(allowedChatIds: allowedChatIds, allowedUserIds: allowedUserIds,
+            chatId: chatId, fromUserId: fromUserId)
+        guard admission == .allowed else { return admission }
+        guard let fromUserId,
+              allowedUserIds.contains(Int64(fromUserId)) || (chatId > 0 && chatId == fromUserId) else { return .notAllowlisted }
         return .allowed
     }
 
@@ -654,7 +663,7 @@ public struct TelegramPollLoop: LoopRunner {
                 await recordBlocked(reason: "empty_or_non_text", update: update, message: msg, text: msg.text)
                 break updateProcessing
             }
-            if text.hasPrefix("/") {
+            if text.hasPrefix("/"), msg.chatId < 0 || TelegramCommandRegistry.parse(text: text) != nil {
                 // Accept bare commands or a verified @ThisBot suffix before applying the mention filter.
                 if let addressedBot = TelegramCommandRegistry.addressedBotUsername(text: text) {
                     guard let ownUsername = await resolveBotUsername() else {

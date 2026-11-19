@@ -50,7 +50,8 @@ public final class ContactThreadReadouts {
     @ObservationIgnored private var helpersWatch: Task<Void, Never>?
     @ObservationIgnored private let helpersRead = LatestRead()
     @ObservationIgnored private weak var helperEngine: NativeAgentEngine?
-    public static let helpersDidChange = Notification.Name("NativeAgent.helpersReadoutDidChange")
+    public nonisolated static let helpersDidChange = Notification.Name("NativeAgent.helpersReadoutDidChange")
+    public nonisolated static let contactsDidChange = Notification.Name("NativeAgent.contactsReadoutDidChange")
 
     private nonisolated let contactOwner: ContactListFacade
 
@@ -62,6 +63,14 @@ public final class ContactThreadReadouts {
     /// Both shells share this engine’s projection and watches.
     public func start() {
         if contactsWatch == nil { restartContacts() }
+    }
+
+    /// An explicit refresh rereads credentials as well as the thread projection that holds send restrictions.
+    public func refreshContacts() async throws {
+        loaded = false
+        contactRefreshError = nil
+        restartContacts()
+        try await prepareContactsForCapture()
     }
 
     /// Captures join the contact owner's first read instead of drawing its uninitialized catalog.
@@ -103,7 +112,7 @@ public final class ContactThreadReadouts {
             if contactsWatch != nil, oldValue.map(\.id) != helpers.map(\.id) { restartContacts() }
         }
     }
-    public private(set) var helperRuns: [UUID: AgentContactThreads.HelperResults] = [:]
+    public private(set) var helperRuns: [UUID: Result<AgentContactThreads.HelperResults, WireFailure>] = [:]
     /// False until the first read lands, so an empty list isn't claimed early.
     public private(set) var loaded = false
     /// Each checked source retains its own failure until that source reads successfully.
@@ -175,7 +184,7 @@ public final class ContactThreadReadouts {
     }
 
     private typealias Snapshot = AgentContactThreads.Snapshot
-    private typealias ContactRead = (Snapshot, AgentContactThreads.Delta?, [UUID: AgentContactThreads.HelperResults]?)
+    private typealias ContactRead = (Snapshot, AgentContactThreads.Delta?, [UUID: Result<AgentContactThreads.HelperResults, WireFailure>]?)
 
     public nonisolated static func key(_ helper: UUID) -> String { AgentContactThreads.key(helper) }
 
@@ -195,21 +204,49 @@ public final class ContactThreadReadouts {
 
     public func partial(for id: String) -> String? { slot(id).partial }
 
+    func mobileThreads() throws -> [MobileAgentThread] {
+        if let issue = contactRefreshError { throw PartCallError(code: "contacts_unavailable", message: issue) }
+        guard loaded else { throw PartCallError(code: "contacts_unread", message: "Agent conversations are still being read.") }
+        return try AgentContactThreads.mobileThreads(snapshot: Snapshot(contacts: contacts, lines: lines, waiting: waiting,
+            status: status, flights: flights, helpers: helpers, running: running, otherRooms: otherRooms))
+    }
+
     /// Owner changes refresh conversations; live-hub partials re-read only flights.
     private static func watch(root: URL, helpers ids: [UUID], projection: @MainActor () -> ContactThreadReadouts?) async {
-        let paths = ["agents/peers.json", "agents/conversations.json", "chat/sessions.json", "bots/definitions",
+        var last: Snapshot
+        do {
+            guard let owner = projection() else { return }
+            last = Snapshot(contacts: owner.contacts, lines: owner.lines, waiting: owner.waiting, status: owner.status,
+                            flights: owner.flights, helpers: owner.helpers, running: owner.running, otherRooms: owner.otherRooms)
+        }
+        let paths = ["agents/peers.json", "agents/conversations.json", "agents/discovery.json", "agents/recipes/", "chat/sessions.json", "bots/definitions",
                      "bots/shelf-index.json", "bots/run-queue.json", "agents/conversation-live.json",
                      "agents/local-health.json", "agents/reply-reads.json"]
             + ids.map { "bots/\($0.uuidString)/run.lock" }
         let liveFile = root.appendingPathComponent("agents/conversation-live.json").standardizedFileURL
-        let events = FileChangeEvents(paths: paths.map { root.appendingPathComponent($0) }, emitInitial: true)
+        let events = await EventDeadlinePhysiology.readEvents(paths: paths.map { root.appendingPathComponent($0) }.filter { $0 != liveFile },
+            directoryFiles: { directory in
+                if directory.standardizedFileURL == root.appendingPathComponent("bots/definitions", isDirectory: true).standardizedFileURL {
+                    return try BotDefinitionStore(dataRoot: root).definitionFiles()
+                }
+                return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" }
+            })
+        let liveEvents = await EventDeadlinePhysiology.readEvents(paths: [liveFile])
         let (ticks, tick) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
-        // Clear pending changes before reading so new events remain visible.
-        let pending = OSAllocatedUnfairLock(initialState: (full: false, live: false))
+        let pending = OSAllocatedUnfairLock(initialState: (full: true, live: false, doors: true))
         let files = Task {
-            for await url in events.stream {
-                pending.withLock { if url == liveFile { $0.live = true } else { $0.full = true } }
-                tick.yield()
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    for await _ in events.stream {
+                        pending.withLock { $0.full = true; $0.doors = true }
+                        tick.yield()
+                    }
+                }
+                for await _ in liveEvents.stream {
+                    pending.withLock { $0.live = true }
+                    tick.yield()
+                }
+                group.cancelAll()
             }
         }
         let experienceChanges = Task {
@@ -219,36 +256,28 @@ public final class ContactThreadReadouts {
             }
         }
         let ended = NotificationCenter.default.addObserver(forName: BotRunQueue.didChange, object: nil, queue: nil) { _ in
-            pending.withLock { $0.full = true }
+            pending.withLock { $0.full = true; $0.doors = true }
             tick.yield()
         }
         let helpersChanged = NotificationCenter.default.addObserver(forName: Self.helpersDidChange, object: nil, queue: nil) { _ in
-            pending.withLock { $0.full = true }
+            pending.withLock { $0.full = true; $0.doors = true }
             tick.yield()
         }
         let dotChanged = NotificationCenter.default.addObserver(forName: ChatGPTDotIPCTransport.didChange, object: nil, queue: nil) { _ in
-            pending.withLock { $0.full = true }
+            pending.withLock { $0.full = true; $0.doors = true }
             tick.yield()
         }
-        var last: Snapshot
-        do {
-            guard let owner = projection() else { return }
-            last = Snapshot(contacts: owner.contacts, lines: owner.lines, waiting: owner.waiting, status: owner.status,
-                            flights: owner.flights, helpers: owner.helpers, running: owner.running, otherRooms: owner.otherRooms)
-        }
+        tick.yield()
         await withTaskCancellationHandler {
             for await _ in ticks {
                 guard let owner = projection() else { break }
                 guard !Task.isCancelled else { break }
                 guard pending.withLock({ $0.full || $0.live }) else { continue }
-                // One message writes several files; let the burst land first.
-                if owner.loaded { try? await Task.sleep(for: .milliseconds(150)) }
-                guard !Task.isCancelled else { break }
                 let first = !owner.loaded
                 let retry = owner.contactRefreshError != nil
-                let full = pending.withLock { state in
-                    defer { state = (false, false) }
-                    return state.full || first || retry
+                let (full, doors) = pending.withLock { state in
+                    defer { state = (false, false, false) }
+                    return (state.full || first || retry, state.doors || first || retry)
                 }
                 let result = await owner.contactRead.read {
                     do { return Result<ContactRead, Error>.success(try await Task.detached(priority: .userInitiated) { [last, contactOwner = owner
@@ -257,18 +286,23 @@ public final class ContactThreadReadouts {
                         if !full, let flights = try AgentContactThreads.readFlights(root: root, last: last) {
                             var next = last
                             next.flights = flights
-                            return (next, AgentContactThreads.changes(from: last, to: next), Optional<[UUID: AgentContactThreads.HelperResults]>.none)
+                            let unread: [UUID: Result<AgentContactThreads.HelperResults, WireFailure>]? = nil
+                            return (next, AgentContactThreads.changes(from: last, to: next), unread)
                         }
-                        if try AgentPeerStore(dataRoot: root).list().contains(where: ChatGPTDotIPCTransport.owns) {
-                            _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
-                        }
-                        let snapshot = try await AgentContactThreads.read(root: root, contacts: contactOwner, includeHelpers: false)
+                        let snapshot = try await AgentContactThreads.read(root: root, contacts: contactOwner,
+                            includeHelpers: false, refreshDoors: doors || !full)
                         let next = snapshot
                         let delta = AgentContactThreads.changes(from: last, to: next)
-                        var runs: [UUID: AgentContactThreads.HelperResults] = [:]
+                        var runs: [UUID: Result<AgentContactThreads.HelperResults, WireFailure>] = [:]
                         for helper in helpers {
-                            runs[helper.id] = try await AgentContactThreads.helperResults(helper, root: root,
-                                representedResults: Set((next.lines[Self.key(helper.id)] ?? []).compactMap(\.resultID)))
+                            do {
+                                runs[helper.id] = .success(try await AgentContactThreads.helperResults(helper, root: root,
+                                    representedResults: Set((next.lines[Self.key(helper.id)] ?? []).compactMap(\.resultID))))
+                            } catch {
+                                runs[helper.id] = .failure(WireFailure(code: "helper_history_unavailable",
+                                    message: "Could not read results for helper \(helper.definition.name) (\(helper.id.uuidString)).",
+                                    cause: error.localizedDescription, effects: .none))
+                            }
                         }
                         return (next, delta, runs)
                     }.value) }
@@ -276,6 +310,7 @@ public final class ContactThreadReadouts {
                 } publish: { result in
                     switch result {
                     case .success(let (next, delta, runs)):
+                    let changed = delta != nil || runs.map { owner.helperRuns != $0 } == true || !owner.loaded || owner.contactRefreshError != nil
                     if let delta {
                         if let value = delta.otherRooms { owner.otherRooms = value }
                         if let value = delta.contacts { owner.contacts = value }
@@ -292,16 +327,22 @@ public final class ContactThreadReadouts {
                     if let runs, owner.helperRuns != runs { owner.helperRuns = runs }
                     if !owner.loaded { owner.loaded = true }
                     owner.contactRefreshError = nil
+                    if changed { NotificationCenter.default.post(name: Self.contactsDidChange, object: root) }
                     case .failure(let error):
-                        owner.contactRefreshError = UserFacingError.message(error, action: "refresh conversations")
+                        let problem = UserFacingError.message(error, action: "refresh conversations")
+                        guard owner.contactRefreshError != problem else { return }
+                        owner.contactRefreshError = problem
+                        NotificationCenter.default.post(name: Self.contactsDidChange, object: root)
                     }
                 }
                 if case .success(let (next, _, _)) = result {
                     last = next
                 }
             }
-        } onCancel: { events.cancel(); tick.finish() }
+        } onCancel: { tick.finish() }
         files.cancel()
+        await events.cancel()
+        await liveEvents.cancel()
         experienceChanges.cancel()
         NotificationCenter.default.removeObserver(ended)
         NotificationCenter.default.removeObserver(helpersChanged)

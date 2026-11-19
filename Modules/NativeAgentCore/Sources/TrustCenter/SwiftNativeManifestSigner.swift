@@ -96,6 +96,10 @@ public actor SwiftNativeManifestSigner {
 
     /// Bootstrap only missing signing authority; exact regular 0600 bytes remain unavailable and byte-preserved when invalid.
     public func loadOrCreateSigningKey() throws -> Data {
+        try checkedSigningKey()
+    }
+
+    package nonisolated func checkedSigningKey() throws -> Data {
         do {
             return try CheckedFixedSizeSecretFile.loadOrCreate(at: keyPath, byteCount: 32) {
                 let key = SymmetricKey(size: .bits256)

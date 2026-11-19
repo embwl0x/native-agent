@@ -78,7 +78,7 @@ public actor MemoryStorage {
 
     // MARK: - Hard memory bound
 
-    /// Evict under the canonical write transaction; capacity forgetting creates no rejection tombstones.
+    /// Archive active overflow under the canonical write transaction without rejection tombstones.
     @discardableResult
     static func pruneMemoriesToBound(
         in db: Database,
@@ -86,14 +86,17 @@ public actor MemoryStorage {
         preservingIDs: Set<String> = []
     ) throws -> [StoredMemory] {
         let boundedLimit = max(1, limit)
-        let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memories") ?? 0
+        guard let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memories WHERE status = 'active'") else {
+            throw MemoryStorageError.databaseUnavailable("active memory count is missing")
+        }
         let overflow = count - boundedLimit
         guard overflow > 0 else { return [] }
-        // Corrections, supersession history and pending replacement targets are not capacity victims; refuse admission if disposable capacity is insufficient.
+        // Lineage, pending admissions and their replacement targets stay intact; refuse if disposable capacity is insufficient.
         let rows = try Row.fetchAll(db, sql: """
             SELECT * FROM memories
-            WHERE json_extract(metadata_json, '$.superseded_by') IS NULL
+            WHERE status = 'active' AND json_extract(metadata_json, '$.superseded_by') IS NULL
               AND json_extract(metadata_json, '$.corrected_by') IS NULL
+              AND json_extract(metadata_json, '$.\(pendingAdmissionKey)') IS NOT 1
               AND id NOT IN (SELECT json_extract(owed.value, '$.id')
                              FROM memories p, json_each(p.metadata_json, '$.\(pendingSupersedesKey)') owed
                              WHERE json_extract(owed.value, '$.id') IS NOT NULL)
@@ -113,25 +116,20 @@ public actor MemoryStorage {
         let evicted = Array(ordered.filter { !preservingIDs.contains($0.id) }.prefix(overflow))
         guard evicted.count == overflow else { throw MemoryStorageError.capacityExceeded }
         // Admission must not trade protected tissue for a lower-priority row.
-        if evicted.contains(where: { retentionEvictionRank($0) == 4 }),
-           rows.contains(where: {
-               preservingIDs.contains($0.id) && retentionEvictionRank($0) < 4
-           }) {
-            throw MemoryStorageError.capacityExceeded
+        if evicted.contains(where: { retentionEvictionRank($0) == 4 }) {
+            for id in preservingIDs {
+                guard let admitted = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory) else {
+                    throw MemoryStorageError.databaseUnavailable("admitted memory is missing")
+                }
+                if retentionEvictionRank(admitted) < 4 { throw MemoryStorageError.capacityExceeded }
+            }
         }
-        guard !evicted.isEmpty else { return [] }
-        let placeholders = Array(repeating: "?", count: evicted.count).joined(separator: ",")
-        try db.execute(
-            sql: "DELETE FROM memories WHERE id IN (\(placeholders))",
-            arguments: StatementArguments(evicted.map(\.id))
-        )
-        return evicted
+        return try evicted.map { try Self.archiveMemory($0, reason: "capacity", in: db) }
     }
 
-    /// Evict excluded and archived rows before temporary/stale facts, then ordinary facts. Protect pinned and identity rows until no other class remains;
+    /// Archive active excluded rows before temporary/stale facts, then ordinary facts. Pinned, identity and correction rows yield last;
     /// oldest protected rows still yield when the hard cap requires it.
     private static func retentionEvictionRank(_ memory: StoredMemory) -> Int {
-        if memory.status != "active" { return 0 }
         let lifecycle = MemoryLifecycle.normalized(memory.lifecycle)
         if MemoryLifecycle.recallExcluded.contains(lifecycle) { return 1 }
         if lifecycle == MemoryLifecycle.temporary
@@ -142,7 +140,7 @@ public actor MemoryStorage {
         if case .object(let metadata)? = memory.metadata {
             if case .bool(true)? = metadata["pinned"] { return 4 }
             if case .string(let kind)? = metadata["kind"],
-               kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "identity" {
+               ["identity", "correction"].contains(kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
                 return 4
             }
         }
@@ -154,9 +152,7 @@ public actor MemoryStorage {
         invalidateRecallCache()
         for persona in Set(evicted.map(\.personaId)) { pokeUserMDRegen(persona: persona) }
         for memory in evicted {
-            pokeSpotlight(memory)
-            pokeKnowledgeGraph(memory.id)
-            await pokeDerivedState(memory, deleted: true)
+            await pokeProjectionHooks(memory)
         }
     }
 
@@ -179,6 +175,7 @@ public actor MemoryStorage {
                 ORDER BY rowid
             """, arguments: [preserveID, memory.id]).map(Self.decodeMemory)
             if let row = try Self.admissionDuplicate(of: memory, among: rows, in: db) {
+                try Self.recordCorrectionOccurrence(metadata: memory.metadata, rowID: memory.id, createdAt: memory.createdAt, on: row.id, in: db)
                 var saved = try Self.foldDuplicate(memory, into: row, in: db)
                 let demoted = try superseding.filter { $0.targetId != saved.id }
                     .map { try Self.demoteSuperseded($0, by: &saved, in: db) }
@@ -352,8 +349,6 @@ public actor MemoryStorage {
         try db.execute(sql: """
             UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?
         """, arguments: [Self.encodeMetadata(row.metadata), row.observedAt, row.updatedAt, row.id])
-        try Self.recordCorrectionOccurrence(metadata: memory.metadata, rowID: memory.id, createdAt: memory.createdAt,
-                                           on: row.id, in: db)
         if carryingHistory, memory.id != row.id {
             // Move the full record, never the bounded metadata preview. The same origin already on the survivor remains one occurrence.
             if try Row.fetchOne(db, sql: """
@@ -497,6 +492,7 @@ public actor MemoryStorage {
                         AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL) ORDER BY rowid
                     """, arguments: [id]).map(Self.decodeMemory)
                 if let duplicate = try Self.admissionDuplicate(of: owed, among: others, in: db) {
+                    try Self.recordCorrectionOccurrence(metadata: owed.metadata, rowID: owed.id, createdAt: owed.createdAt, on: duplicate.id, in: db)
                     folded = try Self.foldDuplicate(owed, into: duplicate, in: db, carryingHistory: true)
                     reason = "folded into \(duplicate.id), a duplicate found when its owed vector landed"
                 }
@@ -530,14 +526,7 @@ public actor MemoryStorage {
                     .map(Self.decodeMemory)
                 return (.landed, [landed].compactMap { $0 } + demoted)
             }
-            var metadata: [String: JSONValue] = [:]
-            if case .object(let current)? = owed.metadata { metadata = current }
-            metadata["archived_reason"] = .string(reason)
-            try db.execute(sql: """
-                UPDATE memories SET status = 'archived', updated_at = ?, metadata_json = ? WHERE id = ?
-                """, arguments: [Self.nowISO8601(), Self.encodeMetadata(.object(metadata)), id])
-            let archived = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
-                .map(Self.decodeMemory)
+            let archived = try Self.archiveMemory(owed, reason: reason, in: db)
             return (.archived(reason: reason), [archived, folded].compactMap { $0 } + demoted)
         }
         guard !changed.isEmpty else { return outcome }
@@ -547,6 +536,19 @@ public actor MemoryStorage {
             await pokeProjectionHooks(row)
         }
         return outcome
+    }
+
+    private static func archiveMemory(_ memory: StoredMemory, reason: String, in db: Database) throws -> StoredMemory {
+        var metadata: [String: JSONValue] = [:]
+        if case .object(let current)? = memory.metadata { metadata = current }
+        metadata["archived_reason"] = .string(reason)
+        try db.execute(sql: """
+            UPDATE memories SET status = 'archived', updated_at = ?, metadata_json = ? WHERE id = ?
+            """, arguments: [Self.nowISO8601(), Self.encodeMetadata(.object(metadata)), memory.id])
+        guard let archived = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [memory.id]).map(Self.decodeMemory) else {
+            throw MemoryStorageError.databaseUnavailable("archived memory is missing")
+        }
+        return archived
     }
 
     public func memories(ids: [String]) async throws -> [StoredMemory] {
@@ -573,12 +575,12 @@ public actor MemoryStorage {
         context: MemoryWriteContext
     ) async throws -> (memory: StoredMemory, changed: Bool)? {
         let turnProvenance = try MemorySenseProvenance.stamping(nil, reads: context.senseReads)
-        let (updated, changed, demoted) = try await dbPool.write { db -> (StoredMemory?, Bool, [StoredMemory]) in
+        let (updated, changed, demoted, evicted) = try await dbPool.write { db -> (StoredMemory?, Bool, [StoredMemory], [StoredMemory]) in
             guard var existing = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory) else {
-                return (nil, false, [])
+                return (nil, false, [], [])
             }
-            if let expectedContent, existing.content != expectedContent { return (nil, false, []) }
-            if let onlyIf, !onlyIf(existing) { return (nil, false, []) }
+            if let expectedContent, existing.content != expectedContent { return (nil, false, [], []) }
+            if let onlyIf, !onlyIf(existing) { return (nil, false, [], []) }
             let prior = existing
             let priorMetadata = existing.metadata
             let contentChanged = patch.content.map { $0 != existing.content } == true
@@ -643,7 +645,7 @@ public actor MemoryStorage {
             var demoted: [StoredMemory] = []
             let admittingOwedVector = existing.status == "active" && existing.embedding != nil
                 && Self.metadataFlag(priorMetadata, Self.pendingAdmissionKey)
-            if Self.unchanged(prior, existing) { return (prior, false, []) }
+            if Self.unchanged(prior, existing) { return (prior, false, [], []) }
             if patch.content != nil || patch.embedding != nil || admittingOwedVector {
                 try Self.requireNotTombstoned(existing, in: db)
             }
@@ -682,8 +684,12 @@ public actor MemoryStorage {
                 Self.encodeMetadata(existing.metadata),
                 existing.id
             ])
+            var evicted: [StoredMemory] = []
+            if prior.status != "active", existing.status == "active" {
+                evicted = try Self.pruneMemoriesToBound(in: db, limit: memoryLimit, preservingIDs: [existing.id])
+            }
             return (try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [existing.id]).map(Self.decodeMemory),
-                    true, demoted)
+                    true, demoted, evicted)
         }
         guard let updated else { return nil }
         guard changed else { return (updated, false) }
@@ -692,6 +698,7 @@ public actor MemoryStorage {
             pokeUserMDRegen(persona: u.personaId)
             await pokeProjectionHooks(u)
         }
+        await handleBoundEvictions(evicted)
         return (updated, true)
     }
 
@@ -816,7 +823,7 @@ public actor MemoryStorage {
             || (record.status == "archived" && MemoryLifecycle.isRecallEligible(lifecycle))
     }
 
-    /// Check disclosure over small ordered projections; decode full rows only for this page, within the same SQLite read transaction.
+    /// Check disclosure over small ordered projections; read content without vectors only for this page, within the same SQLite read transaction.
     public func curationPage(
         archived: Bool, kind: String?, pinned: Bool? = nil, surface: String, persona: String?, newestFirst: Bool,
         afterKey: (String, String)?, offset: Int, limit: Int
@@ -824,9 +831,10 @@ public actor MemoryStorage {
         try await dbPool.read { db in
             let direction = newestFirst ? "DESC" : "ASC"
             let order = "created_at COLLATE memory_curation_order \(direction), id COLLATE memory_curation_order \(direction)"
+            let pinFilter = pinned == true ? "WHERE json_type(metadata_json, '$.pinned') = 'true'" : ""
             let cursor = try Row.fetchCursor(db, sql: """
                 SELECT id, persona_id, created_at, status, lifecycle, metadata_json, valid_to
-                FROM memories ORDER BY \(order)
+                FROM memories \(pinFilter) ORDER BY \(order)
                 """)
             var ids: [String] = []
             var total = 0
@@ -863,9 +871,12 @@ public actor MemoryStorage {
                 if index >= start, ids.count < limit { ids.append(record.id) }
             }
             let records = try ids.isEmpty ? [] : Row.fetchAll(db,
-                sql: "SELECT * FROM memories WHERE id IN (\(ids.map { _ in "?" }.joined(separator: ","))) ORDER BY \(order)",
+                sql: """
+                    SELECT \(Self.memoryProjectionColumns) FROM memories
+                    WHERE id IN (\(ids.map { _ in "?" }.joined(separator: ","))) ORDER BY \(order)
+                    """,
                 arguments: StatementArguments(ids)
-            ).map(Self.decodeMemory).map(MemoryRecord.init(stored:))
+            ).map(Self.decodeMemoryProjection).map(MemoryRecord.init(stored:))
             return (records, total, start + records.count)
         }
     }

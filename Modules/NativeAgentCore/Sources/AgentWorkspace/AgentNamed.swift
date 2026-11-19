@@ -18,7 +18,7 @@ final class AgentNamed: @unchecked Sendable {
     private let drawn = AgentRoomCache<Bool>()
 
     func keep(_ root: URL, _ names: [String: AgentWorkspaceAction], room: String, scope: String) {
-        let items = names.filter { room != "windows" && $0.key.split(separator: ".").last.flatMap { Int($0) } != nil }
+        let items = names.filter { $0.key.split(separator: ".").last.flatMap { Int($0) } != nil }
         cache.keep(root, items, room: room)
         cache.keep(root, names.filter { items[$0.key] == nil }, room: scope + "\u{0}" + room, scope: scope)
     }

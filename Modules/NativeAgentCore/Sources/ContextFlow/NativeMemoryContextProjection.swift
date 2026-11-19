@@ -242,6 +242,9 @@ private extension MemoryContext {
         let roots = try MemoryRoot.ordered(MemoryRoot.roots(in: record.extras).map { MemoryDataProvenance.presented($0, trust: trust) })
         guard let first = roots.first else { throw MemoryRoot.Unreadable("memory \(recordID) has no roots") }
         let createdAt = try NativeContextProjectionText.requiredDate(first.at, owner: "memory \(recordID) first known")
+        // Returning from an archive encodes it again without changing when it was first known.
+        let recallSeedAt = try NativeContextProjectionText.requiredDate(
+            record.extras?.objectValue?[MemoryBringBack.originKey] == nil ? first.at : record.createdAt, owner: "memory \(recordID) recall encoding")
         let tags = normalizedTags(record.tags)
         let provenanceJSON = try String(decoding: canonicalEncoder.encode(roots), as: UTF8.self)
         let body = presentationBody(
@@ -350,6 +353,7 @@ private extension MemoryContext {
             String(decayState.bitPattern),
             String(updatedAt.timeIntervalSince1970.bitPattern),
             String(createdAt.timeIntervalSince1970.bitPattern),
+            String(recallSeedAt.timeIntervalSince1970.bitPattern),
             tags.joined(separator: "\u{1f}"),
             provenanceJSON,
             record.validFrom ?? "",
@@ -380,7 +384,8 @@ private extension MemoryContext {
             authority: authority,
             confidence: confidence,
             // A closed truth interval expires the atom from automatic context.
-            freshness: ContextFreshness(updatedAt: updatedAt, expiresAt: parseDate(record.validTo), createdAt: createdAt),
+            freshness: ContextFreshness(updatedAt: updatedAt, expiresAt: parseDate(record.validTo),
+                createdAt: createdAt, recallSeedAt: recallSeedAt),
             privacy: descriptor.privacy,
             permittedSurfaces: descriptor.permittedSurfaces,
             injectionPolicy: .adaptive,

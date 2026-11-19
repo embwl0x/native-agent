@@ -14,11 +14,6 @@ public enum DeskRefAction: Equatable, Sendable {
         case .copy(_, let label): return label
         }
     }
-
-    public var opensExternally: Bool {
-        if case .open = self { return true }
-        return false
-    }
 }
 
 public enum DeskRefAffordance {

@@ -16,7 +16,7 @@ import MacIntegration
 import CognitiveSubstrate
 import ChatToolRuntime
 import ToolRegistry
-// Blueprint: | `ChatOrchestrationClient+MessagePersistence.swift` | `SwiftNativeChatOrchestrationClient`; Exact-row durable persistence and index publication |
+// Blueprint: | `ChatOrchestrationClient+MessagePersistence.swift` | Canonical transcript persistence records explicit turn steering on every message |
 
 extension SwiftNativeChatOrchestrationClient {
     static func reportTranscriptWriteFailure(
@@ -420,13 +420,12 @@ extension SwiftNativeChatOrchestrationClient {
         ]
         if !partial { record["threadKind"] = .string(sessionKind.rawValue) }
         if let runId { record["runId"] = .string(runId) }
-        var metadata: [String: JSONValue] = [:]
+        var metadata: [String: JSONValue] = ["untrusted_sources": .array(turn.steeringStamp().map(JSONValue.string))]
         if partial {
             let cancelled = responseOutcomeStatus == "cancelled"
             record["cancelled"] = .bool(cancelled)
             metadata["partial"] = .bool(true)
             metadata["cancelled"] = .bool(cancelled)
-            metadata["untrusted_sources"] = .array((turn.peerSteering?.checkpointSources ?? []).map(JSONValue.string))
             if let responseFailure { metadata["error"] = .string(responseFailure) }
             // The saved words are an incomplete reply whose turn ended stopped or failed; recovery reads that ending, never a completed answer.
             metadata["completionState"] = .string("incomplete")
@@ -477,9 +476,6 @@ extension SwiftNativeChatOrchestrationClient {
         }
         if providerRefusal { metadata["provider_refusal"] = .bool(true) }
         if providerRefusalDraft { metadata["provider_refusal_draft"] = .bool(true) }
-        if let sources = turn.peerSteering?.checkpointSources, !sources.isEmpty {
-            metadata["untrusted_sources"] = .array(sources.map(JSONValue.string))
-        }
         // Only user rows carry external origin; assistant replies belong to the agent, not the originating bridge.
         let originProvenance = role == "user"
             ? turn.origin
@@ -949,8 +945,15 @@ extension SwiftNativeChatOrchestrationClient {
             let id = envelope?.verifiedUserId {
             (try? AgentPeerStore(dataRoot: dataRoot).list())?.first(where: { $0.id == id })?.name
         } else { nil }
+        let callerName = contactName.flatMap { name in
+            envelope?.verifiedUserId.flatMap { id -> String? in
+                let prefix = ChatSessionRetention.contactSessionPrefix(owner: id)
+                guard sessionId.hasPrefix(prefix) else { return nil }
+                return ContactCaller(conversation: String(sessionId.dropFirst(prefix.count)), peer: id)?.name(contact: name)
+            }
+        }
         let title = normalizedRole == "user"
-            ? (contactName ?? Self.peerBridgeTitle(content: content, source: source) ?? Self.titleText(content))
+            ? (callerName ?? contactName ?? Self.peerBridgeTitle(content: content, source: source) ?? Self.titleText(content))
             : nil
         let sourceKey = Self.sessionSourceKey(source: source, turn: turn)
         // Continuity is person-bound, never inferred from a title, allowlist,

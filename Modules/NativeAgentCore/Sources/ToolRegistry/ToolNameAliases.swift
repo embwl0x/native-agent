@@ -1,7 +1,6 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import TurnTrace
 import NativeAgentShared
 
 // Blueprint: | `ToolNameAliases.swift` | `ToolNameAliases`: one public argument/schema projection |
@@ -146,12 +145,12 @@ public enum ToolNameAliases {
         return call
     }
 
-    public static func doorArgs(_ tool: String, _ input: [String: JSONValue], reportShim: Bool = false) -> [String: JSONValue] {
-        renamed(input, doorArgNames[tool] ?? [:], reportShim: reportShim)
+    public static func doorArgs(_ tool: String, _ input: [String: JSONValue]) -> [String: JSONValue] {
+        renamed(input, doorArgNames[tool] ?? [:])
     }
 
-    public static func hostArgs(_ tool: String, _ args: [String: JSONValue], reportShim: Bool = false) -> [String: JSONValue] {
-        renamed(args, Dictionary(uniqueKeysWithValues: (doorArgNames[tool] ?? [:]).map { ($0.value, $0.key) }), reportShim: reportShim)
+    public static func hostArgs(_ tool: String, _ args: [String: JSONValue]) -> [String: JSONValue] {
+        renamed(args, Dictionary(uniqueKeysWithValues: (doorArgNames[tool] ?? [:]).map { ($0.value, $0.key) }))
     }
 
     /// Project the current executor schema, including its root form constraints. Argument names change only at this object level, never inside its data.
@@ -176,38 +175,15 @@ public enum ToolNameAliases {
         return .object(fields)
     }
 
-    private static func renamed(_ fields: [String: JSONValue], _ names: [String: String], reportShim: Bool = false) -> [String: JSONValue] {
+    private static func renamed(_ fields: [String: JSONValue], _ names: [String: String]) -> [String: JSONValue] {
         guard !names.isEmpty else { return fields }
         var result: [String: JSONValue] = [:]
         for key in fields.keys.sorted() {
             let name = names[key] ?? key
-            let path = name.split(separator: ".").map(String.init)
-            if name != key, path.count == 2 {
-                var nested: [String: JSONValue]
-                switch result[path[0]] ?? fields[path[0]] {
-                case .object(let given)?: nested = given
-                case nil, .null?: nested = [:]
-                default: result[key] = fields[key]; continue
-                }
-                if let existing = nested[path[1]], existing != .null, existing != fields[key] {
-                    result[key] = fields[key]; continue
-                }
-                nested[path[1]] = fields[key]
-                result[path[0]] = .object(nested)
-                continue
-            }
             // Keep conflicting spellings visible for validation, never pick one arbitrarily.
             if name != key, let existing = fields[name], names[name] == nil, existing != .null, existing != fields[key] {
                 result[key] = fields[key]
-            } else if names.values.contains(where: { $0.hasPrefix(name + ".") }),
-                      case .object(let nested)? = result[name], case .object(let given)? = fields[key] {
-                result[name] = .object(given.merging(nested) { _, value in value })
             } else if fields[key] != .null || result[name] == nil { result[name] = fields[key] }
-        }
-        if reportShim, result != fields {
-            // Pure name normalization holds no turn; this diagnostic uses trace-only correlation.
-            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T05"), "site": .string("ToolNameAliases.swift:renamed")]),
-                turn: nil)
         }
         return result
     }

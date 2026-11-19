@@ -68,14 +68,6 @@ public enum ProviderModelChoice {
         }
         return nil
     }
-
-    public static func isUsable(
-        provider: String?,
-        model: String?,
-        reasoningEffort: String?
-    ) -> Bool {
-        rejection(provider: provider, model: model, reasoningEffort: reasoningEffort) == nil
-    }
 }
 
 // MARK: - Subsystem #14: ProviderRouting

@@ -406,12 +406,17 @@ extension EngineDoctorRuntime {
                 harm: "The agent cannot search the web until the configured service answers.")
         }
     }
-    /// Quarantine is an admission fact, not damage to undo.
+    /// Quarantine keeps unsafe abilities from running and names the unavailable tools.
     private func toolsDoctorCoverageCheck(_ tools: [DoctorToolSnapshot]) -> CheckResult {
+        let unavailable = tools.filter { $0.status.lowercased() == "unavailable" }
+        if !unavailable.isEmpty {
+            return CheckResult(source: "abilities/", id: "live.tools", title: "Tool Registry", status: "fail",
+                detail: "Tool registry has \(unavailable.count) unavailable row(s): " + unavailable.prefix(3).map(\.name).joined(separator: ", "))
+        }
         let quarantined = tools.filter { $0.status.lowercased() == "quarantined" }
         let active = tools.filter { $0.status.lowercased() == "active" }.count
         let scope = "; registry read only, with no tool invoked, so execution is unmeasured."
-        // An empty promoted-tool registry is healthy.
+        // An empty registry is a fact: nothing is owed until she builds one.
         if tools.isEmpty {
             return CheckResult(source: "abilities/",
                 id: "live.tools", title: "Tool Registry", status: "ok",
@@ -424,8 +429,10 @@ extension EngineDoctorRuntime {
             let named = quarantined.prefix(3).map(\.name).joined(separator: ", ")
             let more = quarantined.count > 3 ? ", …" : ""
             return CheckResult(source: "abilities/",
-                id: "live.tools", title: "Tool Registry", status: "ok",
-                detail: census + "; \(quarantined.count) quarantined: \(named)\(more)" + scope
+                id: "live.tools", title: "Tool Registry", status: "warn",
+                detail: census + "; \(quarantined.count) quarantined: \(named)\(more)" + scope,
+                harm: "A quarantined ability cannot run until it is repaired.",
+                human_action: "Repair or remove each quarantined ability (\(named)\(more)); the row clears when none is quarantined."
             )
         }
         return CheckResult(source: "abilities/",
@@ -534,9 +541,9 @@ extension EngineDoctorRuntime {
         await port.doctorBridgeSnapshots()
     }
 
-    public func doctorAgentConnectionsCheck() async -> CheckResult {
+    public func doctorAgentConnectionsCheck(refresh: Bool = false) async -> CheckResult {
         let root = dataRoot
-        await AgentContactHealth.shared.refresh(dataRoot: root)
+        if refresh { await AgentContactHealth.shared.refresh(dataRoot: root) }
         var source = "agents/peers.json"
         do {
             let peers = try AgentPeerStore(dataRoot: root).list()

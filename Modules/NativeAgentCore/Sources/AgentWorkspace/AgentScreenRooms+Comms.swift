@@ -2,11 +2,9 @@ import Foundation
 import MacIntegration
 import PersistenceCore
 import Transcripts
-// Blueprint: | `AgentScreenRooms+Comms.swift` | `AgentScreen`: `sendTrouble`, `roomCounts`, `notConnected` |
+// Blueprint: | `AgentScreenRooms+Comms.swift` | `AgentScreen`: communication rooms, bound rows and existing app compose/edit actions |
 
-/// Comms items open by stable name, reuse the owner's read and expose verbs without reading on home.
 extension AgentScreen {
-    // MARK: Places
 
     static let commsDestinations: [AgentWorkspaceDestination] = [
         .init(id: "notes", title: "Notes", summary: "Apple Notes: recent notes, find, read, add.",
@@ -26,10 +24,8 @@ extension AgentScreen {
             "mail.N.archive", "archive it", "mail.archive"), ("mail.N.mark-read", "mark it read", "mail.mark_read")],
         "notes": [("notes.N.append", "add to it (text)", "notes.update")],
     ]
-    /// Bind numbers to message/contact identity, never row position; references from prior reads must still select the same item.
     static let numbersNote = "numbers stay with each item, gaps are normal"
 
-    /// Warn on failed sends only while no newer inbound evidence is available at render.
     static func sendTrouble(workspace: WorkspaceOperation, agents: [String], dataRoot: URL, now: Date) throws -> [String: String] {
         guard !agents.isEmpty else { return [:] }
         do { return try checkedSendTrouble(workspace: workspace, agents: agents, dataRoot: dataRoot, now: now) }
@@ -66,9 +62,7 @@ extension AgentScreen {
         return out
     }
 
-    // MARK: Counts and connections, for every text room
 
-    /// Use owner totals when supplied; otherwise disclose the listed rows and partial-page count.
     static func roomCounts(_ content: [String: JSONValue], fine: Bool, status: String, listed: Int, unreadRows: Int, page: Int) -> [String] {
         guard fine else { return [status] }
         func int(_ value: JSONValue?) -> Int? { if case .int(let n)? = value { Int(n) } else { nil } }
@@ -83,7 +77,6 @@ extension AgentScreen {
         return parts
     }
 
-    /// Normalize connection presentation without changing the owner's availability verdict.
     static func notConnected(_ row: [String: JSONValue]) -> Bool {
         row["connected"] == .bool(false)
             || ["reason", "failure_code", "error_code", "status"].contains { key in
@@ -91,9 +84,7 @@ extension AgentScreen {
             }
     }
 
-    // MARK: Lists
 
-    /// Stable row names reopen the selected owner item.
     static func commsProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         func rows(_ key: String) -> [[String: JSONValue]] {
             guard case .object(let root) = result, case .array(let list)? = root[key] else { return [] }
@@ -104,13 +95,11 @@ extension AgentScreen {
         } else { result }
         switch tool {
         case "notes.search":
-            // The header carries complete counts; partial reads retain their repair notice.
             let noteContent: JSONValue = if case .object(let root) = content {
                 .object(root.filter { $0.key != "message" || root["status"] == .string("partial") })
             } else { content }
             return .init(title: "Notes", content: noteContent, items: rows("notes").compactMap { row in
                 guard let name = text(row["name"]) else { return nil }
-                // By the note's own id: two notes can share a title.
                 guard case .string(let id)? = row["id"], nonEmpty(id) != nil, id != "missing value" else {
                     return .init(title: name, content: .object([
                         "status": .string("unavailable"), "reason": .string("note_identity_unavailable"),
@@ -128,12 +117,11 @@ extension AgentScreen {
             }, actions: [
                 .init(label: "Find a note", action: .perform(tool: "notes.search", input: [:], title: "Find a note", textField: "query", isEffect: false),
                     needsText: true),
-                .init(label: "New note", action: .configure(tool: "notes.create", input: [:], title: "New note")),
+                .init(label: "New note", action: .open(.record(tool: "app", input: ["find": .string("notes.create"), "args": .object([:])], title: "New note"))),
             ])
         case "contacts_search":
             return .init(title: "Contacts", content: content, items: rows("contacts").compactMap { row in
                 guard let id = text(row["identifier"]), let name = text(row["name"]) ?? text(row["organizationName"]) else { return nil }
-                // Keep card contents behind explicit selection.
                 let phones = values(row["phones"]).count, emails = values(row["emails"]).count
                 let holds = phones + emails == 0 ? "no phone or email"
                     : [phones > 0 ? "\(phones) phone\(phones == 1 ? "" : "s")" : nil, emails > 0 ? "\(emails) email\(emails == 1 ? "" : "s")" : nil]
@@ -147,13 +135,11 @@ extension AgentScreen {
         }
     }
 
-    // MARK: Rooms
 
     static func noteAppend(id: String, title: String) -> AgentWorkspaceAction {
         .perform(tool: "notes.update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true)
     }
 
-    /// Preserve list and item room names; leave the current frame when no room applies.
     static func commsRoom(workspace: WorkspaceOperation, _ location: AgentWorkspaceLocation, value: JSONValue?, projection: WorkspacePage?, dataRoot: URL,
         scope: String,
         issue: String?) async -> String? {
@@ -170,18 +156,16 @@ extension AgentScreen {
             case "contacts_search": input["identifier"] != nil
             default: false
             }
-            // Keep the connector owner's fix visible.
             if notConnected(object) {
                 return screen([family.uppercased(), "not connected"], [[failureFace(value)]],
                               verbs: [], back: "Back: home.", verbWidth: 24, omitEmptyHeader: true)
             }
             if let issue { return screen([family.uppercased(), text(object["status"]) ?? "failed"], [[issue]], verbs: []) }
             guard single else {
-                let status = issue == nil ? (text(object["status"]) ?? "ok") : "failed"
+                let status = text(object["status"]) ?? "ok"
                 return textRoom(workspace: workspace, family, place: location, projection: projection,
                                 status: .string(status), dataRoot: dataRoot, scope: scope, now: now)
             }
-            // The item's name is the one its list row minted: a next page of the same message or thread keeps it.
             let identity = input.filter { !["body_offset", "text_offset", "before_message_id", "limit", "position"].contains($0.key) }
             let itemKey = key(.record(tool: tool, input: identity, title: title)) ?? title
             let name = family
@@ -249,7 +233,6 @@ extension AgentScreen {
             case "notes.search":
                 guard let note = rowsOf("notes").first else { return nil }
                 header += [text(note["folder"]), when(text(note["modified_at"]), now: now)].compactMap { $0 }.filter { !$0.isEmpty }
-                // The Notes reader already elides the stored title line and returns raw offsets.
                 let body = if case .string(let value)? = note["body"] ?? note["body_preview"] { value } else { "" }
                 let (lines, used) = bodyLines(body)
                 let start = int(note["body_offset"]) ?? 0
@@ -257,7 +240,6 @@ extension AgentScreen {
                 if let total = int(object["total"]), total > 1 {
                     sections.append(["\(total) notes have this title; this is one · notes.find (text) to pick another"])
                 }
-                // Only by the note's id: a title can belong to two notes.
                 if let id = text(note["id"]) {
                     let next = start + body.prefix(used).utf16.count
                     if let total = int(note["body_total"]), next < total {
@@ -278,11 +260,10 @@ extension AgentScreen {
                         title: "Text " + title, textField: "body", isEffect: true))
                 }
                 if let email = values(card["emails"], labels: false).first {
-                    verb("email", "sends an email now (form)", .configure(tool: "mail.send", input: ["to": .string(email)], title: "Email " + title))
+                    verbs.append(("app {action:\"mail.send\", args:{to:\"\(email)\",subject,body}}", "send an email"))
                 }
                 if let id = text(card["identifier"]) {
-                    verb("edit", "add a number or email (form)", .configure(tool: "contacts_create_or_update", input: ["identifier": .string(id)],
-                        title: "Edit " + title))
+                    verbs.append(("app {action:\"contacts.save\", args:{identifier:\"\(id)\",…}}", "add a number or email"))
                 }
             default: return nil
             }
@@ -293,7 +274,6 @@ extension AgentScreen {
         } catch { return nameFailure(error) }
     }
 
-    /// After restart, rebuild mail verbs from the selected item's read; other items redraw their own verbs.
     static func commsTarget(workspace: WorkspaceOperation, _ raw: String, dataRoot: URL) -> Target? {
         do {
             let selection = raw.split(whereSeparator: { $0.isWhitespace || $0 == "," }).map(String.init)
@@ -325,7 +305,7 @@ extension AgentScreen {
             if tool == "notes.search", parts[2] == "append", case .string(let id)? = input["id"] {
                 return .action(noteAppend(id: id, title: title))
             }
-            return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
+            return .action(.open(place))
         } catch { return .page(nameFailure(error)) }
     }
 
@@ -375,7 +355,6 @@ extension AgentScreen {
         return screen(["MAIL BATCH", text(root["status"]) ?? "unknown"], sections, verbs: verbs, back: "Back: mail.", verbWidth: 24, omitEmptyHeader: true)
     }
 
-    // MARK: Home's mail line
 
     private static func mailAttachmentLines(_ row: [String: JSONValue]) -> [String] {
         guard case .array(let attachments)? = row["attachments"] else { return text(row["attachments_status"]).map { [$0] } ?? [] }
@@ -387,9 +366,7 @@ extension AgentScreen {
         }
     }
 
-    // MARK: Pieces
 
-    /// Bound message pages to 30 lines and 2400 characters; prefer whole paragraphs and defuse each line.
     private static func bodyLines(_ body: String) -> (lines: [String], used: Int) {
         let cap = 2400
         var lines: [String] = [], used = 0, shown = 0
@@ -410,7 +387,6 @@ extension AgentScreen {
         return (lines, min(used, body.count))
     }
 
-    /// Reconstruct `body_tables` only where consecutive body lines exactly match the table's cells in order; preserve all unmatched body text.
     static func tabled(_ lines: [String], _ tables: JSONValue?) -> [String] {
         guard case .array(let list)? = tables else { return lines }
         func norm(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
@@ -476,7 +452,6 @@ extension AgentScreen {
     }
 }
 
-/// Root-scoped in-memory badges let Home display read age without integration reads.
 package final class AgentReadBadges: @unchecked Sendable {
     package static let shared = AgentReadBadges()
     private let lock = NSLock()
@@ -504,16 +479,5 @@ package final class AgentReadBadges: @unchecked Sendable {
         guard case .int(let total)? = row["inbox_total"] else { return }
         let words = if case .int(let unread)? = row["inbox_unread"] { "\(unread) unread of \(total)" } else { "\(total)" }
         note("mail", words, dataRoot: dataRoot)
-    }
-
-    func pulse(dataRoot: URL, now: Date) -> String {
-        guard let last = latest("mail", dataRoot: dataRoot) else { return "mail" }
-        return "mail " + last.words + " (\(AgentScreen.age(now.timeIntervalSince(last.at))) ago)"
-    }
-
-    func notable(workspace: WorkspaceOperation, dataRoot: URL, now: Date) -> String? {
-        guard AgentWorkspaceReadiness.allows(workspace: workspace, tool: "mail.search"),
-              let previews = latest("mail.previews", dataRoot: dataRoot), !previews.words.isEmpty else { return nil }
-        return "Last Mail read (\(AgentScreen.age(now.timeIntervalSince(previews.at))) ago); up to 4 previews, not a current inbox scan: " + previews.words
     }
 }

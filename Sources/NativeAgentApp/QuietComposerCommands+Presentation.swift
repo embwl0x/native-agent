@@ -44,7 +44,6 @@ extension QuietComposerCommands {
         "knowledge": (.memories, "knowledge"), "dreams": (.personality, "dreams"),
         "cognition": (.diagnostics, "Cognition"), "inspector": (.diagnostics, "Inspector"),
     ]
-    static let cardNames = ChatComposerCard.allCases.map(\.rawValue)
 
     @MainActor
     struct Routing {
@@ -109,7 +108,7 @@ extension AppModel: QuietComposerCommandPort {
     }
     func startQuietSpeech(_ text: String) async -> String? {
         let voice = VoiceOutputController.sharedMessagePlayback
-        await voice.speak(text: text, policy: engine.trust.policy,
+        await voice.speak(text: text, dataRoot: engine.dataRoot, policy: engine.trust.policy,
                           loadPolicy: { try await self.engine.trust.load() }, ownerID: "agent.speak")
         return voice.consumeError(ownerID: "agent.speak")
     }
@@ -161,8 +160,6 @@ extension QuietComposerCommands.Routing {
     var isBotConversation: Bool { botContract != nil }
     var providerGroups: [ChatComposerModelGroup] { residentPresentation?.providerGroups ?? [] }
     var efforts: [ReasoningEffortOption] { presentation?.efforts ?? [] }
-    var effortIndex: Int? { efforts.firstIndex { $0.id == routeChoice?.reasoningEffort } }
-    var selectedModelSupportsFast: Bool { residentPresentation?.supportsFast == true }
 
 
     var modelWord: String {
@@ -191,10 +188,6 @@ extension QuietComposerCommands.Routing {
         appModel.face.slot(.settings).select("trust.word", as: SettingsFace.self) { $0?.trust.word } ?? "Trust unavailable"
     }
 
-    var activeTrustPreset: MobileTrustAction.Preset? {
-        let raw = appModel.face.slot(.settings).select("trust.activePreset", as: SettingsFace.self) { $0?.trust.activePreset }
-        return raw.flatMap(MobileTrustAction.Preset.init(rawValue:))
-    }
 
 
     /// The provider save owner serializes the complete choice and returns its receipt.
@@ -221,12 +214,5 @@ extension QuietComposerCommands.Routing {
         }
     }
 
-    func setEffort(index: Int) {
-        guard let presentation = residentPresentation, presentation.efforts.indices.contains(index) else { return }
-        let effort = presentation.efforts[index].id
-        guard effort != appModel.chatReasoningEffort else { return }
-        appModel.chatReasoningEffort = effort
-        appModel.enqueueChatBrainDefaultsSave()
-    }
 
 }

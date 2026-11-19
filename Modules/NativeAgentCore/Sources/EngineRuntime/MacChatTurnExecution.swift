@@ -563,13 +563,11 @@ public extension NativeAgentEngine {
 extension NativeAgentEngine {
     /// Reduce notices and tool activity into the existing lifecycle without a second event bus or payload store.
     func receiveChatTurnActivity(_ activity: MacChatTurnActivity, port: any MacChatTurnPresentationPort) {
-        guard port.applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
+        _ = port.applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
             identity: activity.identity,
             kind: .activity(activity),
             occurredAt: activity.occurredAt
-        )) != nil else { return }
-
-        port.presentMacChatTurn(.activity(activity))
+        ))
     }
 
     /// Streamed bytes move the card even before they are words; a writing call names itself there.

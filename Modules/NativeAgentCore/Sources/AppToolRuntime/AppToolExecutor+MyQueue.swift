@@ -106,9 +106,9 @@ extension AppToolExecutor {
                 fields["confirmation"] = .string("\(id) is already \(change)\(when)." + outcome)
                 return .object(fields)
             }
-            return Self.doorRefusal(done ? "already_done" : "already_dropped",
-                "\(id) is already \(change)\(when)." + outcome, remedy: "none",
-                "Read the saved completion evidence; this step needs no further closure.", extra: fields)
+            return Self.failure(done ? "already_done" : "already_dropped", "\(id) is already \(change)\(when)." + outcome,
+                extra: fields.merging(["remedy": .object(["kind": .string("none"),
+                    "instruction": .string("Read the saved completion evidence; this step needs no further closure."), "next_call": .null])]) { _, value in value })
         }
         func terminalStep(_ id: String, alias: String, in state: DeskState) async throws -> JSONValue? {
             if let item = state.items.first(where: { $0.alias == alias || $0.handle == id }) {
@@ -153,7 +153,9 @@ extension AppToolExecutor {
                 case .time(let date): return "at " + MyQueue.shown(date)
                 case .words(let words): return words
             } }())
-            if let say = entry.step.say { fields["say"] = .string(say) }
+            if let say = entry.step.say { fields["say"] = .string(say); if entry.step.action == nil, change != "done", change != "dropped" {
+                fields["at_its_moment"] = .string(MyQueue.spoken(entry) == nil ? "comes back to you with these words to say"
+                    : "said to the person, then it comes back to you") } }
             fields["habit"] = entry.step.action ?? .null
             return .object(fields)
         }
@@ -168,9 +170,6 @@ extension AppToolExecutor {
                     let state = try await store.liveState()
                     guard let entry = MyQueue.entries(state).first(where: { $0.item.alias == alias || $0.item.handle == id }) else {
                         return try await missingStep(id, alias: alias, in: state)
-                    }
-                    if let conflict = try await store.runHold(entry.item.handle) {
-                        return conflict.refusal(entry.name)
                     }
                     editing = entry
                     // Parse the requested fields using add's grammar, keeping omitted fields exact below.
@@ -270,6 +269,7 @@ extension AppToolExecutor {
                                                             replyRoute: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata(),
                                                             rhythm: rhythm, until: until.stored, say: text("say"))
                 if let editing {
+                    if let conflict = try await store.runHold(editing.item.handle) { return conflict.refusal(editing.name) }
                     var step = editing.step
                     if named.contains("action") { step.action = proposed.action }
                     if named.contains("say") { step.say = proposed.say }
@@ -307,8 +307,9 @@ extension AppToolExecutor {
                     let alias = id.lowercased().hasPrefix("desk.") ? String(id.dropFirst(5)) : id
                     if let terminal = try await terminalStep(id, alias: alias, in: state) { return terminal }
                 }
-                return Self.doorRefusal("queue_changed", "The queued step changed before this operation; nothing changed.",
-                    remedy: "fix_args", "Read its current Desk record before changing it.")
+                return Self.failure("queue_changed", "The queued step changed before this operation; nothing changed.",
+                    extra: ["remedy": .object(["kind": .string("fix_args"),
+                        "instruction": .string("Read its current Desk record before changing it."), "next_call": .null])])
             } catch {
                 return Self.ownedFailure(error, code: "queue_failed", owner: "MY QUEUE",
                     instruction: "Read the Desk and resolve the reported storage error before another change.",

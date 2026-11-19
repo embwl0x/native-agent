@@ -153,18 +153,6 @@ extension RuntimeReadouts {
         try InstalledSkillInventory.entries(dataRoot: dataRoot, includingSource: includingSource)
     }
 
-    /// Require a bare array; nil means unreadable and preserves proven rows, while `[]` is checked absence or emptiness.
-    public static func runs(dataRoot: URL) async -> [RunRecord]? {
-        let path = dataRoot
-            .appendingPathComponent("runs", isDirectory: true)
-            .appendingPathComponent("runs.json")
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        guard let data = try? Data(contentsOf: path) else { return nil }
-        guard var rows = try? RunLedger.records(from: data) else { return nil }
-        rows.sort { $0.createdAt > $1.createdAt }
-        return Array(rows.prefix(200))
-    }
-
     /// Retain tail coverage: missing is empty, malformed or unreadable evidence fails even with valid siblings, and consumers decide blank-row policy.
     public static func tailJSONL<T: Decodable>(path: URL, limit: Int) async ->
         (rows: [T], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool, failure: String?) {

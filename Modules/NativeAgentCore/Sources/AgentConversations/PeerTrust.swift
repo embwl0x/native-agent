@@ -40,15 +40,9 @@ public enum PeerTrust {
     private static func helperTrust(_ sources: [String], dataRoot: URL, peers: [AgentPeerContact]?) -> PeerDataTaint.TrustRead {
         var principals: [String: String] = [:], names: [String: String] = [:]
         var trusted = Set<String>()
-        var credentials: [String: Result<String?, Error>] = [:]
+        var credentials: [AgentPeerCredentials.CredentialRead]?
         var helpers: [UUID: Bool] = [:]
         var availability: [String: Result<Bool, ToolFailureError>] = [:]
-        func credential(_ id: String) throws -> String? {
-            if let held = credentials[id] { return try held.get() }
-            let read = Result { try AgentPeerCredentials.read(peerID: id) }
-            credentials[id] = read
-            return try read.get()
-        }
         for source in Set(sources) {
             // Supplying the contacts to the resolver prevents another store read. A failed contact read retains the locator.
             let resolved = peers.map { principal(source, dataRoot: dataRoot, peers: $0) } ?? source.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -75,7 +69,9 @@ public enum PeerTrust {
                 let read: Result<Bool, ToolFailureError>
                 if let held = availability[peer.id] { read = held }
                 else {
-                    read = AgentPeerCredentials.availability(peer, peers: peers, readCredential: credential)
+                    let reads = credentials ?? AgentPeerCredentials.credentialReads(peers)
+                    credentials = reads
+                    read = AgentPeerCredentials.availability(peer, reads: reads)
                     availability[peer.id] = read
                 }
                 switch read {

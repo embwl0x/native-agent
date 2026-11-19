@@ -205,7 +205,7 @@ struct BodyFacePresentation: QuietToolPresentationPort {
                 await model.engine.pages.flush()
             }
             let preparationPage = QuietPages.drawOnly.contains(where: { $0.id == target.id }) ? target.id : nativePage ?? target.id
-            try await model.engine.faceActs.preparePageCapture(page: preparationPage, tab: tab)
+            try await model.engine.faceActs.preparePageCapture(page: preparationPage, tab: tab, reader: reader, renderer: connection)
             if rail == .chat, !QuietPages.drawOnly.contains(where: { $0.id == target.id }) {
                 _ = try await BodySettingsPreferences.refreshPreferences(engine: model.engine,
                     keys: [WorkPaneState.widthKey, WorkPaneState.sidebarsHiddenKey])
@@ -235,7 +235,10 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             }
             result = await Self.save(target, tab: tabKey, root: model.engine.dataRoot, image: image, png: png, sink: imageSink)
         } catch { result = AppToolExecutor.failure("render_failed", error.localizedDescription) }
-        await settle { await transcripts.close() }
+        await settle {
+            await model.engine.pages.release(reader: reader)
+            await transcripts.close()
+        }
         guard let selected, case .object(var fields) = result else { return result }
         // The selection is the Desk's own and stays, so the reply names it, and a Desk on screen shows it open too.
         fields["item"] = .string(asked)

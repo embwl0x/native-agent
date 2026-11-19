@@ -47,14 +47,13 @@ public enum DeskMovementPresentation {
             deferred: DeskSequencing.isDeferred(item, now: now), updatedAt: item.updatedAt, evidence: evidence, now: now)
     }
 }
-/// Whether any Desk item is moving right now, whether the board reading behind it is stale, and when either changes.
+/// Whether any Desk item is moving, whether its board reading is stale, and when either changes.
 public enum DeskLiveActivityPresentation {
     public static let defaultActiveWindow: TimeInterval = DeskActivityState.movementWindow
     public static let staleAfter: TimeInterval = 5 * 60
     private static let boundaryEpsilon: TimeInterval = 0.001
     public struct Content: Sendable, Equatable {
         public let isStale: Bool
-        /// Sleep to the next stale-snapshot or expired-movement boundary instead of polling.
         public let nextRefreshAt: Date?
     }
     public enum State: Sendable, Equatable {
@@ -98,7 +97,7 @@ public enum DeskLiveActivityPresentation {
         let limit = max(0, staleLimit)
         let stale = max(0, now.timeIntervalSince(generatedAt)) > limit
         var boundaries = moving.compactMap { updated -> Date? in
-            let expiry = updated.addingTimeInterval(window + boundaryEpsilon)
+            let expiry = updated.addingTimeInterval(window)
             return expiry > now ? expiry : nil
         }
         if !stale {

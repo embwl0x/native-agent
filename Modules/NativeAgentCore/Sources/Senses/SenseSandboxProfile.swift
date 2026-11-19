@@ -5,22 +5,45 @@ import PersistenceCore
 
 /// Supply code and material over the supervised plug so the sandbox needs no direct source access.
 public enum SenseSandboxProfile {
+    public static var credentialRoots: [URL] {
+        [".ssh", ".aws", ".gnupg", ".codex", "Library/Keychains"]
+            .map { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent($0) }
+    }
+
+    /// Filesystem identity fences alternate spellings; a path stat cannot resolve is judged by its nearest resolvable ancestor.
+    public static func containsResolved(_ candidate: URL, roots: [URL]) throws -> Bool {
+        let identities = try roots.compactMap { root -> stat? in
+            var info = stat()
+            guard stat(root.path, &info) == 0 else {
+                let code = errno
+                if code == ENOENT || code == ENOTDIR { return nil }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: root.path])
+            }
+            return info
+        }
+        var ancestor = candidate
+        while true {
+            var info = stat()
+            // A spelling stat cannot resolve cannot be opened either; its nearest resolvable ancestor decides.
+            if stat(ancestor.path, &info) == 0,
+               identities.contains(where: { $0.st_dev == info.st_dev && $0.st_ino == info.st_ino }) { return true }
+            let parent = ancestor.deletingLastPathComponent()
+            if parent.path == ancestor.path { return false }
+            ancestor = parent
+        }
+    }
+
     private static func exclusions(dataRoot: URL, personaRoot: URL) -> (roots: [URL], deliveryWorkspace: URL) {
-        ([dataRoot, personaRoot] + [".ssh", ".aws", ".gnupg", ".codex", "Library/Keychains"]
-            .map { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent($0) }, NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot))
+        ([dataRoot, personaRoot] + credentialRoots, NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot))
     }
 
     /// App delivery may reach the workspace, but the helper must not directly reach it or other private roots.
     public static func requirePublicPath(_ path: String, dataRoot: URL, personaRoot: URL) throws {
         let candidate = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-            .standardizedFileURL.resolvingSymlinksInPath().path
-        func under(_ root: URL) -> Bool {
-            let root = root.standardizedFileURL.resolvingSymlinksInPath().path
-            return NativeAgentWorkspaceRoot.relativePath(candidate, under: root) != nil
-        }
+            .standardizedFileURL.resolvingSymlinksInPath()
         let policy = exclusions(dataRoot: dataRoot, personaRoot: personaRoot)
-        if under(policy.deliveryWorkspace) { return }
-        guard !policy.roots.contains(where: under) else {
+        if try containsResolved(candidate, roots: [policy.deliveryWorkspace]) { return }
+        guard try !containsResolved(candidate, roots: policy.roots) else {
             throw SenseFailure(code: "source_denied", message: "Sense material cannot come from private app stores, persona or credentials.")
         }
     }

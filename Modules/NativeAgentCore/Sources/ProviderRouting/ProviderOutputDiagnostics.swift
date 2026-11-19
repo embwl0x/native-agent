@@ -52,7 +52,7 @@ public enum ProviderOutputDiagnostics {
             try FileManager.default.removeItem(at: diagnostic.url)
         }
         Logger(subsystem: "NativeAgent", category: "Cutoff")
-            .error("cutoff \(reason, privacy: .public) chars=\(raw.count, privacy: .public) raw=\(file.path, privacy: .public)")
+            .error("cutoff \(safeReason, privacy: .public) chars=\(raw.count, privacy: .public) raw=\(file.path, privacy: .public)")
         return file
     }
 }

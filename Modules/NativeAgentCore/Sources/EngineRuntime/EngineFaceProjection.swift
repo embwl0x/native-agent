@@ -17,10 +17,10 @@ enum EngineFaceProjection {
     @concurrent static func prepareCapture(_ key: FaceKey, engine: NativeAgentEngine) async throws {
         switch key {
         case .knowledgeGraph:
-            let read = await MainActor.run { (engine.memory.graphSnapshot, engine.memory.graphLoadError) }
+            let read = await MainActor.run { (engine.memory.graphSnapshot, engine.memory.graphLoadError ?? engine.memory.graphObservationError) }
             if let issue = read.1 { throw EngineFaceActs.failure("graph_unavailable", issue) }
-            guard let snapshot = read.0 else { throw EngineFaceActs.failure("graph_unavailable", "The graph owner supplied no checked snapshot.") }
-            await engine.face.post(graphFace(snapshot, state: .ready), at: key)
+            guard read.0 != nil else { throw EngineFaceActs.failure("graph_unavailable", "The graph owner supplied no checked snapshot.") }
+            await postGraph(engine: engine)
         case .dreamDiary:
             let diary = try await engine.cognitionView.dreamDiary(limit: 60)
             await engine.face.post(diaryFace(diary, issue: nil), at: key)
@@ -97,22 +97,18 @@ enum EngineFaceProjection {
                 await engine.face.post(LayoutFace(availability: availability), at: .layout)
             }
         case .knowledgeGraph, .graphNeighborhood:
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await engine.memory.watchGraphChanges() }
-                await watch(read: { (engine.memory.graphSnapshot, engine.memory.graphLoadError, engine.memory.graphObservationError) }) { input in
-                    let state = readState(issue: input.1 ?? input.2, ready: input.0 != nil, owner: "knowledge graph")
-                    if case .graphNeighborhood(let id) = key {
-                        let detail = input.0?.neighborhood(entityID: id)
-                        let state = state == .ready && detail == nil
-                            ? .unavailable(EngineFaceActs.failure("graph_entity_missing", "That entity is absent from the checked graph.")) : state
-                        await engine.face.post(FaceGraphNeighborhood(entity: id,
-                            entities: detail.map { $0.neighbors.values.sorted { $0.id < $1.id }.map(entity) } ?? [],
-                            edges: detail?.edges.map(edge) ?? [], state: state), at: key)
-                    } else {
-                        await engine.face.post(graphFace(input.0, state: state), at: key)
-                    }
+            await watch(read: { (engine.memory.graphSnapshot, engine.memory.graphLoadError, engine.memory.graphObservationError) }) { input in
+                let state = readState(issue: input.1 ?? input.2, ready: input.0 != nil, owner: "knowledge graph")
+                if case .graphNeighborhood(let id) = key {
+                    let detail = input.0?.neighborhood(entityID: id)
+                    let state = state == .ready && detail == nil
+                        ? .unavailable(EngineFaceActs.failure("graph_entity_missing", "That entity is absent from the checked graph.")) : state
+                    await engine.face.post(FaceGraphNeighborhood(entity: id,
+                        entities: detail.map { $0.neighbors.values.sorted { $0.id < $1.id }.map(entity) } ?? [],
+                        edges: detail?.edges.map(edge) ?? [], state: state), at: key)
+                } else {
+                    await postGraph(engine: engine)
                 }
-                group.cancelAll()
             }
         case .dreamDiary:
             await engine.cognitionView.refreshDiary()
@@ -243,7 +239,7 @@ enum EngineFaceProjection {
         let state = FaceReadState.waiting(on: "body owner")
         switch key {
         case .knowledgeGraph:
-            await engine.face.post(KnowledgeGraphFace(entities: [], edges: [], totalEntities: nil, totalEdges: nil, state: state), at: key)
+            await postGraph(engine: engine)
         case .graphNeighborhood(let entity):
             await engine.face.post(FaceGraphNeighborhood(entity: entity, entities: [], edges: [], state: state), at: key)
         case .dreamDiary:
@@ -459,6 +455,19 @@ enum EngineFaceProjection {
         if let issue { return .unavailable(EngineFaceActs.failure("owner_read_unavailable", NativeAppSecretRedactor.redactText(issue))) }
         return ready ? .ready : .waiting(on: owner)
     }
+    @MainActor static func postGraph(engine: NativeAgentEngine) async {
+        let snapshot = engine.memory.graphSnapshot
+        let state = readState(issue: engine.memory.graphLoadError ?? engine.memory.graphObservationError,
+                              ready: snapshot != nil, owner: "knowledge graph")
+        let drawing = await Task.detached { graphFace(snapshot, state: state) }.value
+        guard snapshot?.canvasEntities == engine.memory.graphSnapshot?.canvasEntities,
+              snapshot?.canvasEdges == engine.memory.graphSnapshot?.canvasEdges,
+              readState(issue: engine.memory.graphLoadError ?? engine.memory.graphObservationError,
+                        ready: engine.memory.graphSnapshot != nil, owner: "knowledge graph") == state else { return }
+        // The feed compares its retained value before posting; it owns the last delivered canvas.
+        await engine.face.post(drawing, at: .knowledgeGraph)
+    }
+
     private static func graphFace(_ snapshot: CanonicalAgentGraphReadout?, state: FaceReadState) -> KnowledgeGraphFace {
         KnowledgeGraphFace(entities: snapshot?.canvasEntities.map(entity) ?? [], edges: snapshot?.canvasEdges.map(edge) ?? [],
             totalEntities: snapshot.map { $0.canvasEntities.count }, totalEdges: snapshot.map { $0.canvasEdges.count }, state: state)

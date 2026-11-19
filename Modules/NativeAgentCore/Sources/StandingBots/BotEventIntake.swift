@@ -20,15 +20,7 @@ public enum BotEventIntake {
     ) async throws {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let summary = "Slack message in \(channelId): " + String(trimmed.prefix(200))
-        let event = BotIncomingEvent(
-            id: eventId,
-            source: .slack,
-            target: channelId,
-            summary: summary,
-            detail: "From \(userId) in \(channelId):\n" + trimmed,
-            verifiedUserID: userId
-        )
+        let event = BotIncomingEvent(id: eventId, source: .slack, target: channelId, text: trimmed, verifiedUserID: userId)
         _ = try await router(dataRoot: dataRoot, isAutonomyEnabled: isAutonomyEnabled).deliver(event, scope: BotRunScope())
     }
 }

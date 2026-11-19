@@ -181,8 +181,9 @@ public enum SenseDoor {
             // Preserve raw payload representation and presentation; provenance belongs outside it.
             let result = try await source.rawResult(operation: operation)
             guard isSuccessfulRaw(result) else {
-                if case .fileKind = corner { return rawView(result, reason: "today's reader refused this read") }
-                return signedRaw(result, line: "raw view · \(record.id) reader refused this read")
+                let verdict = result.objectValue?["status"] == .string("refused") ? "refused this read" : "failed on this read"
+                if case .fileKind = corner { return rawView(result, reason: "today's reader " + verdict) }
+                return signedRaw(result, line: "raw view · \(record.id) reader " + verdict)
             }
             let page = try await source.page(for: corner, address: address, operation: operation)
             if case .site = corner, case .string(let requested)? = input["__sense_address"], requested.hasPrefix("site:"),

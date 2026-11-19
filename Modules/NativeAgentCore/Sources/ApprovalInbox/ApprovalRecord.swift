@@ -34,7 +34,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var action: String
     public var risk: String
     public var reason: String
-    public var status: String            // "pending" | "resolved" | "denied" | "canceled" | "orphaned"
+    public var status: String            // "pending" | "resolved"
     public var payload: JSONValue
     private var recordedPayloadPreview: String
     /// Render retained history without rewriting it to add missing-history wording.
@@ -69,6 +69,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     }
     public var resolvedAt: String?
     public var decision: String?
+    public var scope: String? = nil
     public var decidedBy: String?
     public var resolutionProvenance: ApprovalResolutionProvenance?
     public var remoteResolvable: Bool
@@ -105,11 +106,17 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     }
 
     public var matter: Matter {
-        Matter(id: id, form: .ask, from: "approval", title: NativeAppSecretRedactor.redactText(title),
+        let peer = payload.objectValue?["peer"]?.objectValue
+        let peerCard = peer?["sources"]?.arrayValue?.contains { source in
+            source.stringValue.map { !CapabilityLifecycle.ownerTrusts($0) } == true && peer?["elevated"]?.arrayValue?.contains(source) == false
+        } == true
+        return Matter(id: id, form: .ask, from: "approval", title: NativeAppSecretRedactor.redactText(title),
                summary: NativeAppSecretRedactor.redactText(readableAsk), words: NativeAppSecretRedactor.redactText(payloadPreview),
                symbol: "checkmark.shield.fill", badge: "APPROVAL", open: "approval:" + id,
                choices: payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? []
-                   : [.init(id: "approve", label: "Approve", role: .primary), .init(id: "reject", label: "Reject", role: .destructive)],
+                   : [.init(id: "approve", label: peerCard ? "Just this" : "Approve", role: .primary)]
+                     + (peerCard ? [.init(id: "approve_task", label: "For this task")] : [])
+                     + [.init(id: "reject", label: "Reject", role: .destructive)],
                evidence: [.init(source: Matter.approvals, id: id)])
     }
 
@@ -162,9 +169,6 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         if decision != nil {
             obligation.phase = .accepted
             obligation.evidence = ref
-        } else if status != "pending" {
-            obligation.phase = .letGo
-            obligation.reason = .expired
         }
         var fields: [String: JSONValue] = if case .object(let fields)? = executedAction { fields } else { [:] }
         if fields["detail"] == nil, let executionDetail { fields["detail"] = .string(executionDetail) }
@@ -199,7 +203,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
             case .timeout: outcomeLead = "Unknown: the approved action timed out; completion is unconfirmed"
             case .unknown: outcomeLead = "Unknown: the approved action's completion is unconfirmed"
             }
-        default: outcomeLead = status == "orphaned" ? "Expired" : nil
+        default: outcomeLead = nil
         }
         // A settled card's record names the card, who decided it, and what changed, in that order, whoever reads it.
         var receipt: String
@@ -216,6 +220,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
            !reply.carriesFailureEvidence { applied = true } else { applied = false }
         let tone: PartFace.Tone = executionResultClass.isFailure ? .failed
             : decision == nil || (decision == "approved" && executionResultClass == .unknown) ? .attention : .done
+        let matter = self.matter
         let rowDetail = [matter.summary, resolutionProvenance?.messageAttribution].compactMap { $0 }.joined(separator: "\n")
         let row = PartFace.Row(id: id, title: matter.title, detail: NativeAppSecretRedactor.redactText(rowDetail), value: matter.badge, at: createdAt,
                                symbol: matter.symbol, tone: tone,
@@ -359,7 +364,7 @@ extension ApprovalRecord {
                 guard case .object = value else { return nil }
             }
         }
-        if status == "pending" || status == "orphaned" {
+        if status == "pending" {
             guard obj["decision"] == .null, obj["resolvedAt"] == .null,
                   obj["decidedBy"] == nil, obj["resolutionProvenance"] == nil else { return nil }
         } else {
@@ -370,8 +375,6 @@ extension ApprovalRecord {
                   let provenanceJSON = obj["resolutionProvenance"],
                   let provenance = ApprovalResolutionProvenance(json: provenanceJSON),
                   provenance.decidedBy == decider else { return nil }
-            if status == "denied", decision != "denied" { return nil }
-            if status == "canceled", decision != "canceled" { return nil }
         }
         self.id = savedID
         self.recordedTitle = title
@@ -385,6 +388,7 @@ extension ApprovalRecord {
         self.lastRequestedAt = obj["lastRequestedAt"]?.stringValue
         self.resolvedAt = obj["resolvedAt"]?.stringValue
         self.decision = obj["decision"]?.stringValue
+        self.scope = obj["scope"]?.stringValue
         self.decidedBy = obj["decidedBy"]?.stringValue
         self.resolutionProvenance = obj["resolutionProvenance"].flatMap(ApprovalResolutionProvenance.init(json:))
         self.remoteResolvable = remoteResolvable
@@ -417,6 +421,7 @@ extension ApprovalRecord {
         }
         obj["resolvedAt"] = resolvedAt.map(JSONValue.string) ?? .null
         obj["decision"] = decision.map(JSONValue.string) ?? .null
+        obj["scope"] = scope.map(JSONValue.string)
         if let decidedBy {
             obj["decidedBy"] = .string(decidedBy)
         }

@@ -352,7 +352,7 @@ extension SchedulerJobNormalizer {
     /// A once input is an at moment, not a recurring rhythm.
     public static let rhythmKinds: Set<String> = ["every", "hourly", "daily", "weekly", "monthly", "cron"]
     /// A when that names one moment is that moment, whether its kind says once, repeats at, or is left out.
-    public static let momentKinds: Set<String> = ["once", "at"]
+    public static let momentKinds: Set<String> = ["once", "at", "in"]
 
     /// Keep the public timing schema beside the rhythm parser so they cannot drift.
     public static let intentionWhenSchema: JSONValue = {

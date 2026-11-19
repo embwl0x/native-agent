@@ -704,6 +704,10 @@ extension AppToolExecutor {
             turnSessionId: Self.interactionText(input["__session_id"]), turn: turn
         )
         if let refusal = Self.composerFailure(outcome, verb: verb) { return refusal }
+        if verb == "show_pane", Self.interactionText(input["value"]) == "table" {
+            return .object(["status": .string(outcome.status), "target": .string("table"), "verb": .string(verb),
+                            "changed": .bool(outcome.changed), "detail": .string(outcome.detail)])
+        }
         // Receipt state comes from the live composer owner so tool results agree with chat page reads.
         var body = await appModel.composerState(sessionId: sessionId, turn: turn)
         body["status"] = .string(outcome.status)

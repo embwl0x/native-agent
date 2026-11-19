@@ -681,6 +681,7 @@ actor SenseHelperProcess {
               current.id == record.id, current.version == record.version else { return }
         var news = news
         news.observationID = isSite ? sourceTab : sourceFile
+        news.watch = observationGeneration.uuidString
         guard await SenseNewsBoard.shared.post(news) else {
             try Task.checkCancellation()
             throw SenseFailure(code: "news_not_kept", message: "Sense news was not accepted by private news storage.")

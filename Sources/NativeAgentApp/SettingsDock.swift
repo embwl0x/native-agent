@@ -36,7 +36,6 @@ final class SettingsDock {
         let id = UUID()
         target = (id, capability, face)
         let workspace = NSWorkspace.shared.notificationCenter
-        observe(NSApplication.didBecomeActiveNotification, center: .default)
         observe(SystemPermissionPreflight.permissionDidChange, center: .default)
         observe(NSWorkspace.didActivateApplicationNotification, center: workspace)
         let quit = workspace.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in

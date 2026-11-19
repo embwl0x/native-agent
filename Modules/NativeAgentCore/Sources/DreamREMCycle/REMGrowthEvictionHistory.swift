@@ -111,11 +111,6 @@ public enum REMGrowthEvictionHistory {
         try read(fileURL(dataRoot: dataRoot))
     }
 
-    /// Expansion returns retained writing regardless of eviction state.
-    public static func record(id: String, dataRoot: URL) throws -> REMGrowthEvictionRecord? {
-        try loadAll(dataRoot: dataRoot).last { $0.id == id }
-    }
-
     /// Reconcile pending history on every pass before size checks can skip repair.
     /// A missing passage alone cannot prove eviction; require the matching graph node as independent corroboration.
     /// Keep present passages and uncorroborated absence pending; mark proven interrupted splices reconciled.

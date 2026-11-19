@@ -34,7 +34,8 @@ function run(input) {
         did.push(row("thinking","Thinking: "+ratio(input.thinking.today)+" model calls a turn today (week "+ratio(input.thinking.week)+")","",["thinking"]));
     }
     const moments = ["available","partial"].includes(input.moments.state) ? input.moments.rows.slice().sort((a,b)=>a.at-b.at) : [];
-    if (moments.length) did.push(row("kept","I kept "+spelled(moments.length).toLowerCase()+" "+(moments.length === 1 ? "moment" : "moments")+" today",
+    if (moments.length) did.push(row("kept","I kept "+spelled(input.moments.total).toLowerCase()
+        +" "+(input.moments.total === 1 ? "moment" : "moments")+" today",
         "",moments.map(m=>m.key),moments.slice(-6).map(m=>"“"+m.quote+"”")));
     // The native DreamNight reading owns which dream, its title, mood and time.
     const dreamAvailable = ["available","partial"].includes(input.dream.state);
@@ -241,6 +242,7 @@ function face(input) {
     }
     function at(keys,newest=false) {
         const times=keys.map(key=>(facts.get(key)||{}).at).filter(Number.isFinite);
+        if (keys.some(key=>key.startsWith("moment:")) && Number.isFinite(input.moments.firstAt)) times.push(input.moments.firstAt);
         if (!times.length) return undefined;
         return new Date((newest ? Math.max(...times) : Math.min(...times))*1000).toISOString();
     }

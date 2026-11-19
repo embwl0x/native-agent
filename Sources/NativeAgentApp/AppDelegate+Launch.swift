@@ -235,8 +235,8 @@ extension AppDelegate {
         restartQuit.withLock { $0 = false }
     }
 
-    /// A quit holds for the turns in flight at entry until each one ends (its own liveness, no clock), then the retained sleep joins every
-    /// tracked turn before its final snapshot. The async hold and termination drain share one joinable settlement.
+    /// Ordinary quit raises each captured turn's Stop and holds for settlement, then the retained sleep joins every tracked turn before its
+    /// final snapshot. The async hold and termination drain share one joinable settlement, with no clock.
     /// A quit asked again while one is held joins it: the pending termination is answered once, when that one settlement ends.
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -258,11 +258,19 @@ extension AppDelegate {
         let waitsForTurns = !runs.isEmpty && !Self.restartQuit.withLock({ $0 })
         Self.quitWaitingForTurns = true
         if waitsForTurns {
-            ModuleLog.app("[quit] holding quit for %d in-flight turn(s) until each ends", runs.count)
+            ModuleLog.app("[quit] stopping %d in-flight turn(s) and holding quit for settlement", runs.count)
         }
         Task.detached {
             await Self.closeFaceProcess()
             if waitsForTurns {
+                for turn in NativeAgentEngine.live.turns.inFlightTurns() where runs.contains(turn.runId) {
+                    do {
+                        try await NativeAgentEngine.live.turns.runtime.stop(sessionId: turn.sessionId, runId: turn.runId)
+                    } catch {
+                        ModuleLog.app("[quit] Stop for run %@ in session %@ could not be saved: %@",
+                            turn.runId, turn.sessionId, error.localizedDescription)
+                    }
+                }
                 await NativeAgentEngine.waitForInFlightTurnsBeforeQuit(runs,
                     isRestarting: { Self.restartQuit.withLock { $0 } })
             }
@@ -293,10 +301,7 @@ extension AppDelegate {
         // Close ingress now, but defer Browser IPC's full stop until admitted operations join the retained quit settlement.
         NativeAgentA2AGRPCListener.shared.stop()
         ClaudeBridgeRuntime.shared.stop()
-        MainActor.assumeIsolated {
-            // Stop phone ingress and snapshot observations before drains so late actions cannot start snapshot work during termination.
-            NativeAgentEngine.liveDeviceSync.bridge.tearDown()
-        }
+        NativeAgentEngine.liveDeviceSync.bridge.tearDown()
     }
 
     /// The held quit already slept and retired resident work before it answered, so termination only closes ingress.

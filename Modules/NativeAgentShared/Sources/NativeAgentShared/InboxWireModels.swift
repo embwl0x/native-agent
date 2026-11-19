@@ -4,7 +4,7 @@ import Foundation
 /// The signed Mac inbox route's vocabulary, also used by phone controls.
 public enum InboxActionVocabulary {
     public static let nativeActionIDs: Set<String> = [
-        "read", "archive", "dismiss", "act", "approve", "reject", "open_approvals"
+        "read", "archive", "dismiss", "act", "approve", "approve_task", "reject", "open_approvals"
     ]
     public static let supportedActionIDs = nativeActionIDs.union(["reply", "deny", "repair"])
     /// Verbs the inbox owns for every card it shows: a card never declares them.

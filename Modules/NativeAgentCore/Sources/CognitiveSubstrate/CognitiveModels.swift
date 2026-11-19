@@ -183,9 +183,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     public var soundRutTurnsSinceSurfaced: Int
     /// One early repeat is allowed per signature; a new signature re-arms it.
     public var soundRutEarlyRepeatSpent: Bool
-    /// Accepted capsules carrying the allowed contradicting second word, and when it last appeared. These measure presentation without gating it.
-    public var ambivalenceCount: Int
-    public var lastAmbivalenceAt: Date?
     /// When the unbidden-recall line last spoke, and how many accepted turns ago — the two halves of "at most once every `remindedOfMinTurns` turns". `nil`
     /// last-surfaced means it has never spoken, which is eligible.
     public var remindedOfLastSurfacedAt: Date?
@@ -221,8 +218,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         soundRutLastSurfacedAt: Date? = nil,
         soundRutTurnsSinceSurfaced: Int = 0,
         soundRutEarlyRepeatSpent: Bool = false,
-        ambivalenceCount: Int = 0,
-        lastAmbivalenceAt: Date? = nil,
         remindedOfLastSurfacedAt: Date? = nil,
         remindedOfTurnsSinceSurfaced: Int = 0,
         remindedOfSurfaced: [String: Date] = [:],
@@ -237,8 +232,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.soundRutLastSurfacedAt = soundRutLastSurfacedAt
         self.soundRutTurnsSinceSurfaced = max(0, soundRutTurnsSinceSurfaced)
         self.soundRutEarlyRepeatSpent = soundRutEarlyRepeatSpent
-        self.ambivalenceCount = max(0, ambivalenceCount)
-        self.lastAmbivalenceAt = lastAmbivalenceAt
         self.remindedOfLastSurfacedAt = remindedOfLastSurfacedAt
         self.remindedOfTurnsSinceSurfaced = max(0, remindedOfTurnsSinceSurfaced)
         self.remindedOfSurfaced = remindedOfSurfaced
@@ -257,6 +250,7 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public let snapshot: CognitiveSubstrateSnapshot
     public let workspace: CognitiveWorkspaceSnapshot
     public let associations: [CognitiveAssociationEdge]
+    public let associationMissingEndpointCount: Int
     public let affect: CognitiveAffectState
     public let mood: CognitiveMoodReading
     public let soundLandingScores: [UUID: Double]
@@ -280,6 +274,7 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         snapshot: CognitiveSubstrateSnapshot,
         workspace: CognitiveWorkspaceSnapshot,
         associations: [CognitiveAssociationEdge],
+        associationMissingEndpointCount: Int,
         affect: CognitiveAffectState = CognitiveAffectState(),
         mood: CognitiveMoodReading = CognitiveMoodReading(valence: 0, basis: 0),
         soundLandingScores: [UUID: Double] = [:],
@@ -304,6 +299,7 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         self.snapshot = snapshot
         self.workspace = workspace
         self.associations = associations
+        self.associationMissingEndpointCount = associationMissingEndpointCount
         self.affect = affect
         self.mood = mood
         self.soundLandingScores = soundLandingScores

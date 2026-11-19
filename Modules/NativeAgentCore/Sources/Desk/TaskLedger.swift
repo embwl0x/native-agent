@@ -383,11 +383,6 @@ public struct SwiftNativeTaskLedger: Sendable {
         }
         next.fileEventCount += 1
         next.integrity = next.integrity.appendingRows(1)
-        // Terminate torn last lines before appending so malformed bytes remain visible.
-        if next.integrity.trailingPartialLine {
-            next.integrity.malformedLineCount += 1
-            next.integrity.trailingPartialLine = false
-        }
         try await compactIfNeededUnlocked(feed: next)
     }
 
@@ -395,8 +390,6 @@ public struct SwiftNativeTaskLedger: Sendable {
     /// Prefix-drop protects interrupted compaction against loss and duplicate application.
     private func compactIfNeededUnlocked(feed: TaskLedgerFeed) async throws {
         guard feed.compactionRowCount >= Self.opsCompactionThreshold else { return }
-        // Refuse compaction if any row cannot be folded, preserving newer writers' event kinds.
-        guard SnapshotTailOpLog.mayCompact(feed.integrity, feed: Self.logLabel, path: eventsPath) else { return }
         // Exclude the retained tail from the base so replay cannot apply it twice.
         guard feed.events.count > Self.compactionKeepTail else { return }
         let prefix = Array(feed.events.dropLast(Self.compactionKeepTail))
@@ -517,11 +510,6 @@ public struct SwiftNativeTaskLedger: Sendable {
     }
 
     // MARK: - Compaction
-
-    /// Fold in append order; deletion is final, while a first event may found a task without explicit creation.
-    public static func compact(_ events: [TaskLedgerEvent]) -> [TaskLedgerTaskState] {
-        compact(base: nil, events)
-    }
 
     /// Seed from the base and apply only following events so trimming cannot erase task identity or ownership.
     static func compact(base: TaskLedgerCompactionBase?, _ events: [TaskLedgerEvent]) -> [TaskLedgerTaskState] {

@@ -211,7 +211,7 @@ final class BodyCardActions {
                     }) { await self?.verifyPending() }
                 }
             } catch {
-                if !Task.isCancelled { SystemToastCenter.shared.push(error: error.localizedDescription, autoDismissAfter: nil) }
+                if !Task.isCancelled { SystemToastCenter.shared.push(error: error.localizedDescription) }
             }
             await engine.face.detachSink(sink.epoch)
         }
@@ -220,7 +220,7 @@ final class BodyCardActions {
     private func verifyPending() async {
         for identity in pending.values {
             do { _ = try await verify(identity, returned: false) }
-            catch { SystemToastCenter.shared.push(error: error.localizedDescription, autoDismissAfter: nil) }
+            catch { SystemToastCenter.shared.push(error: error.localizedDescription) }
         }
     }
 }

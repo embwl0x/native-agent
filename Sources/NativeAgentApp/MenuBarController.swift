@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Carbon.HIToolbox
+import NativeAgentShared
 
 // Blueprint: | `MenuBarController.swift` | `GlobalHotkey`: Carbon summon registration and tap/hold push-to-talk state with cancellable voice lifecycle |
 
@@ -54,13 +55,13 @@ final class GlobalHotkey: NSObject {
         var ref: EventHotKeyRef?
         let err = RegisterEventHotKey(keyCode, mods, hotKeyID, GetApplicationEventTarget(), 0, &ref)
         guard err == noErr else {
-            print("[GlobalHotkey] RegisterEventHotKey failed: \(err)")
+            ModuleLog.app("[GlobalHotkey] RegisterEventHotKey failed: %d", err)
             return
         }
         hotKeyRef = ref
         installEventHandler()
         isRegistered = true
-        print("[GlobalHotkey] Registered ⌘⇧J global hotkey")
+        ModuleLog.app("[GlobalHotkey] Registered ⌘⇧J global hotkey")
     }
 
     func unregister() {

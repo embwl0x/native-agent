@@ -109,8 +109,6 @@ extension ChatStore {
                 correlationID: msg.correlationID,
                 reason: msg.metadata?["reason"] ?? msg.text
             ))
-        } else {
-            receiveTerminalReply(msg)
         }
     }
 

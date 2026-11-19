@@ -1,13 +1,11 @@
 /* NativeAgent ability
 {"id":"native-morning-brief","kind":"ability","version":1,
  "reach":{"capabilities":["model"]},"face":{"page":"inbox"},
- "record":{"description":"Compose the morning brief and its inbox card from checked native source packets. Return inactive schedule defaults on operation defaults. Publication, consent, claims and delivery belong to the native scheduler.","actions":["calendar.upcoming","mail.recent"],"inputSchema":{"type":"object","required":["operation"],"properties":{"operation":{"type":"string","enum":["defaults","brief"]}}}}}
+ "record":{"description":"Compose the morning brief and propose its inbox card from checked native source packets.",
+ "actions":["calendar.upcoming","mail.recent"],
+ "inputSchema":{"type":"object","required":["operation"],"properties":{"operation":{"type":"string","enum":["brief"]}}}}}
 */
 function run(input) {
-    if (input.operation === "defaults") return {
-        inbox:[{name:"morning_brief",kind:"time",enabled:false,config:{hour:8,minute:0,notify:true},description:"My own built-in daily brief at the set hour. A helper that sends a brief is separate and listed on Helpers."}],
-        notify:{morning_brief:true}
-    };
     const current = Date.parse(input.now), yesterday = Date.parse(input.yesterday), label = input.dayLabel;
     const desk = input.desk, log = input.worklog, inbox = input.inbox, sessions = input.sessions;
     const plural = (n, one, many) => n === 1 ? one : many;

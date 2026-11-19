@@ -291,7 +291,7 @@ public enum MacMenuBar {
             let preferred = available.filter(prefer)
             let choices = preferred.isEmpty ? available : preferred
             // Rank enabled and chord-matching commands before collapsing duplicates; unpublished copies stay distinct.
-            if choices.count == 1 || choices.allSatisfy({ $0.commandKey != nil }) {
+            if choices.count == 1 || choices.first?.commandKey.map({ key in choices.allSatisfy { $0.commandKey == key } }) == true {
                 return Array(choices.prefix(1))
             }
             return choices

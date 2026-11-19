@@ -291,8 +291,8 @@ extension KnowledgeGraphStore {
                 // The audience decision and graph rows share this read transaction; a concurrent privacy edit cannot split them.
                 let disclosure: KnowledgeGraphMemoryDisclosure?
                 if let surface {
-                    let records = try Row.fetchAll(db, sql: "SELECT * FROM memories")
-                        .map(MemoryStorage.decodeMemory).map(MemoryRecord.init(stored:))
+                    let records = try Row.fetchAll(db, sql: "SELECT \(MemoryStorage.memoryProjectionColumns) FROM memories")
+                        .map(MemoryStorage.decodeMemoryProjection).map(MemoryRecord.init(stored:))
                     disclosure = KnowledgeGraphMemoryDisclosure(
                         records: records, surface: surface, personaID: personaID)
                 } else {

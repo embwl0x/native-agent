@@ -28,7 +28,7 @@ not people.
 **One current fact, with its record intact.** Repeated evidence belongs to the existing
 fact. A correction closes the old fact's interval and leaves it out of current recall;
 the old record is protected from capacity eviction. Disuse fades recall without deleting;
-the [storage cap](data-bounds.md) can evict other rows. Derived knowledge is rebuilt from
+the [active storage cap](data-bounds.md) archives other active rows, retaining their record. Derived knowledge is rebuilt from
 the record, never by bulk merging, archiving or swapping memory rows.
 
 **A moment is not a memory row.** What happened between you that moved their is a care's story

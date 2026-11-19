@@ -18,6 +18,9 @@ public final class ChatGPTTransport: LLMTransport {
     public static let productionSession: URLSession = ProviderHTTP.makeSession()
     /// The backend requires the official Codex client identity for routing; a neutral originator receives overload failures.
     public static let codexBackendOriginator = "codex_cli_rs"
+    public static let codexClientVersion = "0.169.0"
+    /// The model list's client version asks for rows above the checked wire version.
+    static let codexModelListVersion = "99.0.0"
     public static var codexBackendUserAgent: String {
         let rawVersion =
             (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
@@ -26,7 +29,7 @@ public final class ChatGPTTransport: LLMTransport {
             $0.isASCII && ($0.isLetter || $0.isNumber || ".-_".contains($0))
         }
         let nativeAgentVersion = safeVersion.isEmpty ? "source" : safeVersion
-        return "codex_cli_rs/0.145.0 NativeAgent/\(nativeAgentVersion)"
+        return "\(codexBackendOriginator)/\(codexClientVersion) NativeAgent/\(nativeAgentVersion)"
     }
     internal let session: URLSession
     private let endpoint: URL?
@@ -179,7 +182,7 @@ public final class ChatGPTTransport: LLMTransport {
                     }
                     let bodyDict = try Self.buildResponsesBodyFromMessages(
                         model: coercedModel, messages: messages, system: system, tools: tools,
-                        supportedEfforts: accountRow.supportedReasoningEfforts,
+                        supportedEfforts: accountRow.supportedReasoningEfforts, ultraEffort: accountRow.ultraEffort,
                         supportsFast: accountRow.supportsFast, call: call
                     )
                     do {

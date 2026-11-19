@@ -14,7 +14,7 @@ public struct AgentContactRow: Identifiable, Sendable {
     public var lastExchange: String?
     /// Share home health vocabulary so every surface agrees.
     public var health: AgentLocalHealth?
-    /// Read Keychain once per row, never on redraw.
+    /// Derived from the listing's call-scoped credential reads.
     public var credentialAvailable = true
     public var credentialFailure: ToolFailureError?
     public var elevationFailure: ToolFailureError?
@@ -81,7 +81,6 @@ public struct AgentContactRow: Identifiable, Sendable {
 
     /// Reuse canonical identities without merging door grants.
     public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], dataRoot: URL, everyDoor: Bool = false) throws -> [Self] {
-        Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         let identity = try AgentContactIdentity(dataRoot: dataRoot, peers: peers)
         let health = try AgentContactHealth.read(dataRoot: dataRoot)
         let all = rows(peers: peers, candidates: candidates, everyDoor: true).map { row in
@@ -112,8 +111,9 @@ public struct AgentContactRow: Identifiable, Sendable {
     /// Group doors by contact without merging their Trust grants.
     public static func rows(peers: [AgentPeerContact], installed: [AgentHostRow], everyDoor: Bool = false) -> [Self] {
         let configured = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
+        let credentials = AgentPeerCredentials.credentialReads(peers)
         return peers.filter { peer in everyDoor || !peers.contains { $0.id == peer.who } }.map { peer in
-            let availability = AgentPeerCredentials.availability(peer, peers: peers)
+            let availability = AgentPeerCredentials.availability(peer, reads: credentials)
             let available: Bool
             let failure: ToolFailureError?
             switch availability {

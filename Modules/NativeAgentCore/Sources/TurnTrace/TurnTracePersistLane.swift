@@ -46,19 +46,17 @@ public struct TurnTracePersistLane: Sendable {
         for (event, seq) in zip(events, written) { if let seq { feed(event); noteDeed(event); postCompletionIfNeeded(event, seq: seq) } }
     }
 
-    /// The newest successful standalone receipt of a kind: its id and time. A reading in memory, fed as receipts are written and read from the
-    /// record once per kind per launch, so a turn that asks never queries the record.
-    public func newestSuccessfulReceipt(kind: String) async throws -> (id: String, at: Date)? {
+    public func newestSuccessfulDispatch() async throws -> (id: String, at: Date)? {
         let key = resolvedDataRoot().standardizedFileURL.path
-        if let known = Self.receipts.withLock({ $0[key]?[kind] }) { return known.value }
+        if let known = Self.receipts.withLock({ $0[key] }) { return known.value }
         var newest: (id: String, at: Date)?
         var before: Int64?
         while newest == nil {
-            let page = try await store.details(.init(sources: [Self.source], subjects: [""], kinds: [kind], before: before, limit: 128,
+            let page = try await store.details(.init(sources: [Self.source], kinds: [Self.dispatchKind], before: before, limit: 128,
                                                      newestFirst: true))
             for detail in page {
                 guard let event = TurnTraceEvent(detail: detail) else {
-                    throw PersistenceCoreError.ioFailure("The \(kind) receipt \(detail.seq) is unreadable; the newest successful one cannot be known.")
+                    throw PersistenceCoreError.ioFailure("Dispatch receipt \(detail.seq) is unreadable; the newest successful one cannot be known.")
                 }
                 if let found = Self.success(event) { newest = found; break }
             }
@@ -68,9 +66,9 @@ public struct TurnTracePersistLane: Sendable {
         // A receipt written while this read ran is already in memory; the newer of the two stands.
         let read = newest
         return Self.receipts.withLock { state in
-            let fed = state[key]?[kind]?.value
+            let fed = state[key]?.value
             let kept = [read, fed].compactMap { $0 }.max { $0.at < $1.at }
-            state[key, default: [:]][kind] = Known(value: kept)
+            state[key] = Known(value: kept)
             return kept
         }
     }
@@ -86,6 +84,15 @@ public struct TurnTracePersistLane: Sendable {
                                                    "$.payload.receipt.resultClass": .string("succeeded"), "$.payload.receipt.preview": .bool(false)]
         static let lacking = ["$.payload.parentId", "$.payload.automaticOrigin"]
         static let bearing = ["$.payload.receipt.model"]
+
+        static func query(doing done: String? = nil) throws -> ExperienceStore.DetailQuery {
+            var query = ExperienceStore.DetailQuery(sources: [TurnTracePersistLane.source], kinds: ["tool.dispatch"])
+            var held = holding
+            if let done { held[action] = .string(done) }
+            query.holding = try held.mapValues { try $0.serialize(pretty: false) }
+            (query.lacking, query.bearing) = (lacking, bearing)
+            return query
+        }
 
         /// The same conditions read off one row in memory as SQLite reads them off the record: `holding` is JSON equality, `lacking` absence,
         /// `bearing` text.
@@ -108,8 +115,7 @@ public struct TurnTracePersistLane: Sendable {
         if let known = Self.done.withLock({ state in state[key].flatMap { $0.read ? $0.verbs : nil } }) { return known }
         let recorded: [String], failure: (any Error)?
         do {
-            recorded = try store.recordedDetailValues(.init(sources: [Self.source], kinds: ["tool.dispatch"]), at: Deed.action,
-                holding: try Deed.holding.mapValues { try $0.serialize(pretty: false) }, lacking: Deed.lacking, bearing: Deed.bearing)
+            recorded = try store.recordedDetailValues(try Deed.query(), at: Deed.action)
             failure = nil
         } catch {
             recorded = []
@@ -127,6 +133,61 @@ public struct TurnTracePersistLane: Sendable {
         return verbs
     }
 
+    public func gaveBack(action: String) async throws -> [JSONValue] {
+        guard try doneVerbs().contains(action) else { return [] }
+        var query = try Deed.query(doing: action)
+        (query.limit, query.newestFirst) = (48, true)
+        var shapes: [(with: [String], shape: JSONValue, from: Int)] = []
+        for detail in try await store.details(query) {
+            let payload = try JSONValue.parse(detail.row).objectValue?["payload"]?.objectValue
+            guard let call = payload?["args"]?.stringValue.flatMap({ try? JSONValue.parse(Data($0.utf8)) })?.objectValue,
+                  let result = payload?["result"]?.stringValue.flatMap({ try? JSONValue.parse(Data($0.utf8)) }),
+                  result.objectValue?["result_handle"] == nil, result.objectValue?["full_result_retained"] == nil else { continue }
+            let with = call["args"]?.objectValue?.keys.sorted() ?? []
+            if let at = shapes.firstIndex(where: { $0.with == with }) {
+                shapes[at] = (with, Self.merged(shapes[at].shape, Self.skeleton(result)), shapes[at].from + 1)
+            } else if shapes.count < 3 { shapes.append((with, Self.skeleton(result), 1)) }
+        }
+        return shapes.map { .object(["with": .array($0.with.map(JSONValue.string)), "shape": $0.shape, "from_calls": .int(Int64($0.from))]) }
+    }
+
+    private static func merged(_ a: JSONValue, _ b: JSONValue) -> JSONValue {
+        switch (a, b) {
+        case (.object(let x), .object(let y)):
+            var out: [String: JSONValue] = [:]
+            for key in Set(x.keys.map(plain)).union(y.keys.map(plain)) {
+                let (l, r) = (x[key] ?? x[key + "?"], y[key] ?? y[key + "?"])
+                let both = x[key] != nil && y[key] != nil
+                out[both ? key : key + "?"] = l.flatMap { l in r.map { merged(l, $0) } } ?? l ?? r
+            }
+            return .object(out)
+        case (.array(let x), .array(let y)):
+            return .array(x.first.flatMap { l in y.first.map { [merged(l, $0)] } } ?? (x.isEmpty ? y : x))
+        case (.string(let x), .string(let y)):
+            return .string(Set(x.split(separator: "|") + y.split(separator: "|")).sorted().joined(separator: "|"))
+        default: return a == b ? a : .string("mixed")
+        }
+    }
+    private static func plain(_ key: String) -> String { key.hasSuffix("?") ? String(key.dropLast()) : key }
+
+    private static func skeleton(_ value: JSONValue, depth: Int = 0) -> JSONValue {
+        switch value {
+        case .object(let fields):
+            guard depth < 4 else { return .string("object") }
+            let kept = fields.filter { !$0.key.hasPrefix("__") }.sorted { $0.key < $1.key }
+            var shape = Dictionary(uniqueKeysWithValues: kept.prefix(40).map { ($0.key, skeleton($0.value, depth: depth + 1)) })
+            if kept.count > 40 { shape["…"] = .string("more") }
+            return .object(shape)
+        case .array(let items):
+            guard depth < 4 else { return .string("array") }
+            return .array(items.first.map { [skeleton($0, depth: depth + 1)] } ?? [])
+        case .string: return .string("string")
+        case .int, .double: return .string("number")
+        case .bool: return .string("bool")
+        case .null: return .string("null")
+        }
+    }
+
     /// A deed written is in the agent's done set from that write on; a root not yet read keeps it for its first read.
     private func noteDeed(_ event: TurnTraceEvent) {
         guard event.kind == "tool.dispatch", let verb = Deed.doneVerb(in: event.row) else { return }
@@ -138,21 +199,21 @@ public struct TurnTracePersistLane: Sendable {
     private static let done = OSAllocatedUnfairLock<[String: Done]>(initialState: [:])
 
     private struct Known: Sendable { let value: (id: String, at: Date)? }
-    private static let receipts = OSAllocatedUnfairLock<[String: [String: Known]]>(initialState: [:])
+    private static let receipts = OSAllocatedUnfairLock<[String: Known]>(initialState: [:])
+    private static let dispatchKind = "dispatch"
 
     private static func success(_ event: TurnTraceEvent) -> (id: String, at: Date)? {
-        guard event.turnId == "unknown", event.diagnostic["status"] == .string("ok"), case .string(let id)? = event.diagnostic["id"],
+        guard event.kind == dispatchKind, event.diagnostic["status"] == .string("ok"), case .string(let id)? = event.diagnostic["id"],
               case .string(let raw)? = event.diagnostic["createdAt"], let at = TurnTraceEvent.parseISO8601(raw) else { return nil }
         return (id, at)
     }
 
-    /// A written receipt updates a reading already in memory; a kind not yet read stays unread until asked.
     private func feed(_ event: TurnTraceEvent) {
         guard let found = Self.success(event) else { return }
         let key = resolvedDataRoot().standardizedFileURL.path
         Self.receipts.withLock { state in
-            guard let known = state[key]?[event.kind] else { return }
-            if (known.value?.at ?? .distantPast) <= found.at { state[key]?[event.kind] = Known(value: found) }
+            if let at = state[key]?.value?.at, at > found.at { return }
+            state[key] = Known(value: found)
         }
     }
 

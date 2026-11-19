@@ -23,10 +23,9 @@ enum TurnToolResultPointers {
             for blockIndex in blocks.indices {
                 guard case .toolResult(let id, let body, let isError) = blocks[blockIndex] else { continue }
                 let view = await ProviderToolResultPage.project(toolName: "tool_result", content: body,
-                    sessionId: turn.resultRecoveryScope?.sessionId, turnId: turn.id,
+                    dataRoot: dataRoot, turn: turn,
                     originalResultClass: .unknown,
-                    appDoor: true, inlineLimit: 0, includeSections: false,
-                    contextResult: .init(dataRoot: dataRoot, callID: id))
+                    appDoor: true, inlineLimit: 0, includeSections: false)
                 if view.failed { throw ToolFailureError(view.content, effects: .unknown) }
                 let pointer = view.content
                 guard pointer.count < body.count else { continue }

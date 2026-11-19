@@ -4,48 +4,7 @@ import UIKit
 
 // Blueprint: | `MobileTranscriptFragments.swift` | One layout fragment per drawn paragraph kind, and the delegate that picks them and hides closed folds |
 
-/// Read paragraph geometry once, cache decoration paths and resolve dynamic colors at draw time.
-class TranscriptFragment: NSTextLayoutFragment {
-    final lazy var paragraphAttributes: [NSAttributedString.Key: Any] = {
-        guard let paragraph = self.textElement as? NSTextParagraph, paragraph.attributedString.length > 0 else { return [:] }
-        return paragraph.attributedString.attributes(at: 0, effectiveRange: nil)
-    }()
-    final lazy var topGap: CGFloat = (self.paragraphAttributes[TranscriptKey.topGap] as? NSNumber).map { CGFloat($0.doubleValue) } ?? 0
-    private var cachedPath: CGPath?
-    private var cachedRect = CGRect.null
-
-    override var topMargin: CGFloat { topGap }
-
-    /// Where the text actually sits, in this fragment's own drawing space (y down), from the laid-out lines. Null before layout.
-    final var inkRect: CGRect {
-        var rect = CGRect.null
-        for line in textLineFragments {
-            let text = line.attributedString.string as NSString
-            let range = line.characterRange
-            var end = range.upperBound
-            while end > range.lowerBound, let scalar = UnicodeScalar(text.character(at: end - 1)),
-                  CharacterSet.whitespacesAndNewlines.contains(scalar) || scalar == "\u{2028}" { end -= 1 }
-            guard end > range.lowerBound else { continue }
-            let origin = line.typographicBounds.origin
-            let start = origin.x + line.locationForCharacter(at: range.lowerBound).x
-            let finish = origin.x + line.locationForCharacter(at: end).x
-            rect = rect.union(CGRect(x: start, y: line.typographicBounds.minY, width: max(0, finish - start),
-                                     height: line.typographicBounds.height))
-        }
-        return rect
-    }
-
-    /// The x where the first line's text starts, in fragment space.
-    final var textStartX: CGFloat? {
-        guard let line = textLineFragments.first else { return nil }
-        return line.typographicBounds.minX + line.locationForCharacter(at: line.characterRange.lowerBound).x
-    }
-
-    /// The text container's width, which the column decorations span.
-    final var containerWidth: CGFloat {
-        textLayoutManager?.textContainer?.size.width ?? layoutFragmentFrame.width
-    }
-
+extension TranscriptFragment {
     final func fillBackground(_ rect: CGRect, color: UIColor, stroke: UIColor? = nil, at point: CGPoint, in context: CGContext,
                               shape: (CGRect) -> CGPath) {
         guard rect.width > 0, rect.height > 0 else { return }
@@ -179,30 +138,6 @@ final class TranscriptFoldFragment: TranscriptFragment {
         context.strokePath()
         context.restoreGState()
         super.draw(at: point, in: context)
-    }
-}
-
-enum TranscriptShapes {
-    /// Corners in a y-down fragment space: top is minY.
-    static func rounded(_ rect: CGRect, topLeft: CGFloat, topRight: CGFloat, bottomRight: CGFloat, bottomLeft: CGFloat) -> CGPath {
-        let limit = min(rect.width, rect.height) / 2
-        let tl = min(topLeft, limit), tr = min(topRight, limit), br = min(bottomRight, limit), bl = min(bottomLeft, limit)
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: rect.minX + tl, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.maxX - tr, y: rect.minY))
-        path.addArc(tangent1End: CGPoint(x: rect.maxX, y: rect.minY), tangent2End: CGPoint(x: rect.maxX, y: rect.minY + tr), radius: tr)
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - br))
-        path.addArc(tangent1End: CGPoint(x: rect.maxX, y: rect.maxY), tangent2End: CGPoint(x: rect.maxX - br, y: rect.maxY), radius: br)
-        path.addLine(to: CGPoint(x: rect.minX + bl, y: rect.maxY))
-        path.addArc(tangent1End: CGPoint(x: rect.minX, y: rect.maxY), tangent2End: CGPoint(x: rect.minX, y: rect.maxY - bl), radius: bl)
-        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + tl))
-        path.addArc(tangent1End: CGPoint(x: rect.minX, y: rect.minY), tangent2End: CGPoint(x: rect.minX + tl, y: rect.minY), radius: tl)
-        path.closeSubpath()
-        return path
-    }
-
-    static func rounded(_ rect: CGRect, radius: CGFloat) -> CGPath {
-        rounded(rect, topLeft: radius, topRight: radius, bottomRight: radius, bottomLeft: radius)
     }
 }
 

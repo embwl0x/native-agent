@@ -142,7 +142,7 @@ extension SwiftToolDispatcher {
         }
         do {
             let result = try await ProcessExecution().run(executable: node.path, arguments: [helper.path],
-                currentDirectory: dataRoot, environment: environment, standardInput: bytes,
+                currentDirectory: dataRoot, environment: ManagedProcess.agentEnvironment(environment), standardInput: bytes,
                 timeoutSeconds: 166, outputByteLimit: nil, life: life)
             let receipt = result.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
             guard result.exitCode == 0, let receipt else {

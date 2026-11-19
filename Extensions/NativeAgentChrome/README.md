@@ -1,5 +1,9 @@
 # NativeAgent Chrome surface
 
+Native-host removal failures remain in `chrome.status` as `app_listener_error`
+and mark the Chrome relay pulse failed. Listener and extension staging cleanup
+failures retain both the original cause and the cleanup cause.
+
 The Chrome `NativeAgent` tab group is the resident agent's workspace and ownership state.
 Every other tab belongs to the person. Activation, the person's trusted pointer/keyboard/wheel/touch
 input, or an address-bar navigation ungroups one of their tabs immediately and
@@ -52,7 +56,7 @@ reach declares `computer_files` and `Google/Chrome/Default/History` only,
 independent of extension connection or profile. The extension has no history
 action or `history` permission. The part reads through the stem's
 `host.files.query`, which queries a private read-only copy of the file and its
-`-wal`/`-shm` and bounds rows and time (two seconds per query).
+`-wal`/`-shm` and bounds returned rows; SQLite completion/error or Stop ends the query.
 Results name `source: "sqlite_snapshot"`. Top-domain counts aggregate all
 qualifying visits since `since` before limiting returned domains; there is no
 candidate-URL count cap. Search matches title or URL ignoring case and

@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import os
-// Blueprint: | `ForPerson.swift` | `Matter`, `Door`, `ForPerson`: the person's matters, deliveries, reading and inbox wire |
+// Blueprint: | `ForPerson.swift` | Person matters, deliveries and inbox wire preserve supplied birth steering |
 
 /// Something for the person (step 4 §2.4): one experience addressed to `person`. Its row is its face on every door; an ask owes the person's `decide`; each
 /// of the person's doors owes `deliver:<door>`.
@@ -57,11 +57,11 @@ public struct Matter: Sendable, Equatable {
     public static func messages(_ session: String) -> String { conversations + session }
 
     /// Its birth, the one shape every owner writes (an owner that births inside its own record chain uses this, never its own shape).
-    public func born(doors: [Door]) -> Experience {
+    public func born(doors: [Door], steeredBy: [String] = ["unrecorded"]) -> Experience {
         var owes = Dictionary(uniqueKeysWithValues: doors.map { ($0.key, Experience.Obligation(to: $0.address)) })
         if form == .ask { owes["decide"] = .init(to: ForPerson.person) }
         return Experience(id: id, kind: form == .ask ? .decision : .message, evidence: evidence,
-                          face: face(at: NativeTimestampFormat.fractionalZulu(Date())), addressedTo: [ForPerson.person], owes: owes)
+                          face: face(at: NativeTimestampFormat.fractionalZulu(Date())), addressedTo: [ForPerson.person], owes: owes, steeredBy: steeredBy)
     }
 
     func face(at: String) -> Experience.Face {
@@ -231,7 +231,7 @@ public actor ForPerson {
     /// Births the matter with its doors (fixed at birth), or refreshes the face of the one already told. A matter the person or its owner settled is not
     /// told again: a new happening mints a new id.
     @discardableResult
-    public func tell(_ matter: Matter, doors: [Door]) async throws -> Filed {
+    public func tell(_ matter: Matter, doors: [Door], steeredBy: [String] = ["unrecorded"]) async throws -> Filed {
         if let open = matter.open, !PartFace.isLink(open) {
             throw ToolFailureError("A matter's row leads only to a face link (chat:, page:, approval:, card:, dream:, url:https://, url:http://); "
                 + "\(open) is none.",
@@ -241,7 +241,7 @@ public actor ForPerson {
         let filed = OSAllocatedUnfairLock(initialState: Filed.unchanged)
         try await write(matter.id) { store in
             guard let current = try await store.experience(matter.id) else {
-                try await store.begin(matter.born(doors: doors))
+                try await store.begin(matter.born(doors: doors, steeredBy: steeredBy))
                 filed.withLock { $0 = .born }
                 return
             }

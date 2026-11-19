@@ -46,18 +46,3 @@ enum TrustPolicyPresetAction {
         return .applied(policy)
     }
 }
-
-enum TrustPolicyPresetActionPresentation {
-    static func statusText(for outcome: TrustPolicyPresetAction.Outcome) -> String {
-        switch outcome {
-        case .confirmationRequired:
-            return "Full Mac access needs confirmation."
-        case .applied:
-            return "Trust preset applied."
-        case .failed(let detail):
-            return detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "Trust preset could not be applied."
-                : detail
-        }
-    }
-}

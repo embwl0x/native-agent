@@ -5,31 +5,6 @@ import UIKit
 
 // Blueprint: | `MobileTranscriptStyle.swift` | Phone paragraph preparation on the Shared press, UIKit tokens and action links |
 
-enum TranscriptParagraph: String {
-    case user, reply, heading, quote, listItem, code, foldHeadline, foldDetail, gap, attachment
-
-    init(_ kind: TranscriptBlock.Kind) {
-        switch kind {
-        case .user: self = .user
-        case .reply: self = .reply
-        case .heading: self = .heading
-        case .quote: self = .quote
-        case .listItem: self = .listItem
-        case .code: self = .code
-        case .foldHeadline: self = .foldHeadline
-        case .foldDetail: self = .foldDetail
-        case .gap: self = .gap
-        case .attachment: self = .attachment
-        }
-    }
-
-    static func of(_ paragraph: NSTextParagraph) -> TranscriptParagraph? {
-        let text = paragraph.attributedString
-        guard text.length > 0, let raw = text.attribute(TranscriptKey.kind, at: 0, effectiveRange: nil) as? String else { return nil }
-        return TranscriptParagraph(rawValue: raw)
-    }
-}
-
 /// The phone's tokens as the document lays them out: the 740 pt room column inside the page inset, bubbles, code insets and gaps.
 enum TranscriptMetrics {
     static let column = NativeAgentMobileTheme.Layout.roomColumn

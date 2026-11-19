@@ -160,9 +160,6 @@ public enum DeskSequencing {
         let ordered = ready.sorted { a, b in
             let ra = statusRank(a.status), rb = statusRank(b.status)
             if ra != rb { return ra < rb }
-            let ba = plans[a.handle]?.effectiveBlockers.count ?? 0
-            let bb = plans[b.handle]?.effectiveBlockers.count ?? 0
-            if ba != bb { return ba < bb }
             if a.openedAt != b.openedAt { return a.openedAt < b.openedAt }
             let sa = SwiftNativeDeskStore.aliasSeq(a.alias), sb = SwiftNativeDeskStore.aliasSeq(b.alias)
             if sa != sb { return sa < sb }

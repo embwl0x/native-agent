@@ -22,7 +22,7 @@ import ToolRegistry
 import StandingBots
 import ChatToolParsing
 import NativeAgentShared
-// Blueprint: | `ChatOrchestrationClient+StructuredChat.swift` | Session-owned delivery, accepted input, the turn's one request evidence and canonical settlement |
+// Blueprint: | `ChatOrchestrationClient+StructuredChat.swift` | Structured turns record heard words, speaker, door and birth steering before execution |
 
 extension SwiftNativeChatOrchestrationClient {
 
@@ -113,13 +113,15 @@ extension SwiftNativeChatOrchestrationClient {
             origin = try await consumeEnqueuedMessage(sessionId: resolvedSession, runId: runId)
         }
         let heard = Experience(id: heardID, kind: .heard,
-            evidence: origin.map { [Self.transcriptRef(resolvedSession, $0.messageId)] } ?? [],
-            addressedTo: ["her"], owes: ["answer": .init(to: "conversation:" + resolvedSession)])
+            evidence: (origin.map { [Self.transcriptRef(resolvedSession, $0.messageId)] } ?? [])
+                + [.init(source: "door", id: turn.arrivalSurface(authorizing: surface))],
+            addressedTo: ["her"], owes: ["answer": .init(to: "conversation:" + resolvedSession)],
+            steeredBy: turn.steeringStamp())
         let correlation = turn.replyRoute?.correlationId
         ExperienceStore.record(dataRoot, heardID) { store in
             if heardID == boundTurnId {
                 try await store.begin(heard)
-                try await store.append([.face(Self.face(message, attachments))], to: heardID)
+                try await store.append([.face(Self.face(message, attachments, from: turn.originPrincipal))], to: heardID)
             }
             try await store.append([.progress("working"),
                 .evidence(.init(source: "run", id: runId)),
@@ -611,10 +613,8 @@ extension SwiftNativeChatOrchestrationClient {
         ) else {
             return context
         }
-        var projectedContext = SwiftNativeTurnEngine.contextByAppendingRuntimeContext(
-            context,
-            runtimeContext: runtimeContext
-        )
+        var projectedContext = context
+        projectedContext.innerStream.append(runtimeContext)
         projectedContext.cognitiveRuntimeContext = runtimeContext
         projectedContext.cognitiveFeelingFrame = projection?.capsule?.feelingFrame
         // Projection bookkeeping commits only after the provider accepts this material.

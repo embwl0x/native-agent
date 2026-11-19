@@ -82,9 +82,13 @@ package struct SessionHistoryTail: Sendable {
         return checkpoints
     }
 
-    package static func halfBudgetCharacters(windowTokens: Int, outputTokens: Int) -> Int {
-        max(1, Int(Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens))
-            * ContextBudgetPolicy.transcriptCharactersPerToken / 2))
+    package static func halfBudgetCharacters(windowTokens: Int, outputTokens: Int, charactersPerToken: Double) throws -> Int {
+        guard charactersPerToken.isFinite, charactersPerToken > 0,
+              let characters = Int(exactly: (Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens))
+                * charactersPerToken / 2).rounded(.down)) else {
+            throw SessionTranscriptError(errorDescription: "The measured half-budget character count is not representable.")
+        }
+        return max(1, characters)
     }
 
     /// Skip checkpoints whose remaining row bodies cannot fit, without constructing their messages or measuring requests.

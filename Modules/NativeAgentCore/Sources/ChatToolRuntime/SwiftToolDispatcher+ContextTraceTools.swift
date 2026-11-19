@@ -1,4 +1,5 @@
 import AgentWorkspace
+import ChatTurnContracts
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -95,6 +96,9 @@ extension SwiftToolDispatcher {
         try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["recent_trace_summary"]).turnSchemas()
             .compactMap { $0 }.first)
         if input["view"]?.stringValue == "model_calls" {
+            guard turn.peerSteering?.isTainted != true else {
+                throw AutonomyGateError.toolDenied(reason: "model_calls reads every conversation; a turn an untrusted agent steers reads only its own.")
+            }
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls()
         }
         let usage = input["view"]?.stringValue == "usage"
@@ -141,7 +145,6 @@ extension SwiftToolDispatcher {
             guard let text = input["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
             return text
         }()
-        // scope:all is the agent's whole life: every conversation and what ran outside any (no session filter is injected for it).
         switch input["scope"] {
         case nil, .null?, .string("conversation")?: break
         case .string("all")? where normalizedSessionFilter == nil: break
@@ -182,7 +185,9 @@ extension SwiftToolDispatcher {
             snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(now: anchorDate ?? now,
                 history: receiptID != nil || completedTurns != nil || turnID?.isEmpty == false,
                 since: since ?? (receiptID != nil ? Date.distantPast : nil),
-                holding: receiptID != nil ? ["tool.dispatch"] : [])
+                holding: receiptID != nil ? ["tool.dispatch"] : [],
+                kindContains: receiptID == nil && completedTurns == nil && normalizedSessionFilter == nil && turnID?.isEmpty != false
+                    ? kindFilter : nil)
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -204,7 +209,9 @@ extension SwiftToolDispatcher {
             sessionTurnIDs = []
         }
 
-        var events = snapshot.events.sorted(by: { $0.ts > $1.ts })
+        var events = snapshot.events.filter { event in
+            turn.peerSteering?.isTainted != true || ChatToolSessionInjection.currentSession(turn: turn).map { event.sessionId == $0 } == true
+        }.sorted(by: { $0.ts > $1.ts })
         if let anchorDate { events = events.filter { $0.ts <= anchorDate } }
         var completedIDs: [String] = []
         if let completedTurns {

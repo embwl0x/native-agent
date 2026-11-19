@@ -118,8 +118,6 @@ public enum DeskPaletteCommandApplication {
         case refused(String)
     }
 
-    public static let actionInFlightMessage = "Another Desk action is still in progress."
-
     public static func resolve(
         verb: DeskPaletteQuery.Verb,
         handle rawHandle: String,

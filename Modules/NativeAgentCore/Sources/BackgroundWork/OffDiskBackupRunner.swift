@@ -42,7 +42,6 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
     let dataRoot: URL
 
     var loopId: String { "offdisk_backup" }
-    var tickTimeoutOverride: TimeInterval? { 15 * 60 }
     /// It copies the agent's persona, memory and profile; before setup there is nothing of the agent to keep, and no iCloud prompt comes first.
     var needsAgent: Bool { true }
 

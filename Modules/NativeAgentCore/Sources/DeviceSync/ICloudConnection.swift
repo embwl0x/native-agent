@@ -13,7 +13,7 @@ import OSLog
 // Blueprint: | `ICloudConnection.swift` | Checked CloudKit/account setup; push and lifecycle events own drains. |
 extension iCloudBridge {
     public func setup() {
-        // Idempotent setup prevents duplicate KVS observers.
+        // Idempotent setup prevents duplicate observers.
         guard !isSetUp else { return }
         isSetUp = true
         if pairedPhonesSubscription == nil {
@@ -61,77 +61,7 @@ extension iCloudBridge {
             let failure = await sync.engine.start()
             guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
             if let failure { syncStatus = failure }
-            NotificationCenter.default.addObserver(
-                self, selector: #selector(kvsDidChange(_:)),
-                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification, object: nil)
-            Task { [weak self] in
-                let synchronized = await Task.detached(priority: .utility) {
-                    NSUbiquitousKeyValueStore.default.synchronize()
-                }.value
-                guard let self, generation == self.setupGeneration, self.isSetUp else { return }
-                if !synchronized {
-                    self.syncStatus = "iCloud KVS setup synchronization was not accepted; its remote state is unconfirmed."
-                }
-            }
         }
-    }
-    /// Apply a container lookup only while its setup still owns the lifecycle.
-    @MainActor
-    func applyContainerResult(_ containerURL: URL?, generation: Int) async {
-        // Ignore a stale resolve from a superseded setup()/tearDown().
-        guard generation == setupGeneration, isSetUp else { return }
-        guard let containerURL else {
-            // Reset isSetUp so the caller can retry later once iCloud signs in.
-            isSetUp = false
-            available = false
-            syncStatus = "iCloud container unavailable — sign into iCloud in System Settings"
-            doctorTransportHealth = .unavailable(syncStatus)
-            OrganPulse.recordOff("snapshot_integrity", because: "iCloud Drive unavailable")
-            return
-        }
-        let docsURL = containerURL.appendingPathComponent("Documents")
-        driveURL = docsURL
-        let loaded = await VolumeIO.result { [docsURL] in
-            Self.createDriveDirectories(docsURL: docsURL)
-            return try Self.loadProcessedMessageIDs(docsURL: docsURL)
-        }
-        // Only the current setup may publish the completed file batch.
-        guard generation == setupGeneration, isSetUp else { return }
-        let ids: [String]
-        switch loaded {
-        case .success(let value): ids = value
-        case .failure(let error):
-            available = false
-            syncStatus = "Retained Drive replay evidence is unavailable: \(error.localizedDescription). Restore its processed-message store before resuming."
-            return
-        }
-        // Restore insertion order so eviction remains oldest-first.
-        seenMessageIDs = []
-        seenMessageIDsOrdered = []
-        for id in ids where seenMessageIDs.insert(id).inserted {
-            seenMessageIDsOrdered.append(id)
-        }
-        // Restore consumed CloudKit IDs before receiving so a restart cannot redeliver them.
-        guard loadCKSeenIDs() else { return }
-        trimSeenMessageIDsIfNeeded()
-        let failure = await sync.engine.start(docsURL: docsURL)
-        guard generation == setupGeneration, isSetUp else { return }
-        available = failure == nil
-        syncStatus = failure ?? "iCloud readiness not checked"
-        doctorTransportHealth = failure.map { .unavailable($0) } ?? .unmeasured
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(kvsDidChange(_:)),
-            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-            object: nil
-        )
-        let synchronized = await Task.detached(priority: .utility) {
-            NSUbiquitousKeyValueStore.default.synchronize()
-        }.value
-        // Teardown can retire this setup during the final KVS suspension too.
-        guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
-        if !synchronized { syncStatus = "iCloud KVS setup synchronization was not accepted; its remote state is unconfirmed." }
-        startMetadataQuery(docsURL: docsURL)
     }
     /// Publication reports acceptance of the requested groups, not readiness.
     func notePublication(_ failures: [NAMobileSnapshotGroup: DeviceSyncError]?) {
@@ -336,12 +266,5 @@ extension iCloudBridge {
             cloudKitPushUnavailable = false
         }
         _ = await drainDeviceTransport(trigger: .cloudKitPush)
-    }
-    nonisolated private static func createDriveDirectories(docsURL: URL) {
-        let fm = FileManager.default
-        for folder in [DriveFolder.outboxMac, DriveFolder.outboxIos, DriveFolder.processing, DriveFolder.processed] {
-            let url = docsURL.appendingPathComponent(folder)
-            try? fm.createDirectory(at: url, withIntermediateDirectories: true)
-        }
     }
 }

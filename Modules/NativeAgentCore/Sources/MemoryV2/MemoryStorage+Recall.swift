@@ -37,8 +37,8 @@ extension MemoryStorage {
         recallRead.write { recallCache = nil }
     }
 
-    /// Cache by canonical corpus generation, reading epoch and generation before candidates; a racing write may cause a miss but cannot relabel an old
-    /// snapshot.
+    /// Cache by active epoch and canonical corpus generation. A miss reads the epoch, generation and candidates in one snapshot; the query is checked
+    /// against the epoch of the candidates it is given.
     func recallCandidates(
         queryEpoch: MemoryEmbeddingEpoch?
     ) async throws -> [RecallCandidate] {
@@ -48,44 +48,46 @@ extension MemoryStorage {
                 let version = try Self.recallJudgmentGeneration(in: db)
                 return (epoch, version)
             }
-            if let activeEpoch, queryEpoch?.rawValue != activeEpoch {
-                throw MemoryStorageError.embeddingEpochMismatch(
-                    expected: activeEpoch, actual: queryEpoch?.rawValue
-                )
-            }
-            if let cache = recallCache,
+            let found = if let cache = recallCache,
                cache.corpusGeneration == corpusGeneration,
                cache.embeddingEpoch == activeEpoch {
-                return cache
-            }
-            // One rowid-ordered query preserves equal-score tie-breaking, dedup preference, and BM25 document indices across query-planner choices.
-            let candidates = try await dbPool.read { db -> [RecallCandidate] in
-                var sql = """
-                    SELECT * FROM memories
-                    WHERE embedding IS NOT NULL
-                      AND status = 'active'
-                      AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                """
-                var arguments: StatementArguments = []
-                if let activeEpoch {
-                    sql += " AND embedding_epoch = ?"
-                    arguments = [activeEpoch]
-                }
-                sql += " ORDER BY rowid"
-                let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
-                return try rows.map { row in
-                    let m = try Self.decodeMemory(row)
-                    return RecallCandidate(
-                        memory: m,
-                        lexicalDocument: MemoryRecallScoring.LexicalDocument(m.content)
+                cache
+            } else {
+                // One rowid-ordered query preserves equal-score tie-breaking, dedup preference, and BM25 document indices across query-planner choices.
+                try await dbPool.read { db -> RecallCache in
+                    let activeEpoch = try Self.embeddingEpochState(in: db).activeEpoch
+                    let corpusGeneration = try Self.recallJudgmentGeneration(in: db)
+                    var sql = """
+                        SELECT * FROM memories
+                        WHERE embedding IS NOT NULL
+                          AND status = 'active'
+                          AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
+                    """
+                    var arguments: StatementArguments = []
+                    if let activeEpoch {
+                        sql += " AND embedding_epoch = ?"
+                        arguments = [activeEpoch]
+                    }
+                    sql += " ORDER BY rowid"
+                    let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
+                    let candidates = try rows.map { row in
+                        let m = try Self.decodeMemory(row)
+                        return RecallCandidate(
+                            memory: m,
+                            lexicalDocument: MemoryRecallScoring.LexicalDocument(m.content)
+                        )
+                    }
+                    return RecallCache(
+                        candidates: candidates,
+                        corpusGeneration: corpusGeneration,
+                        embeddingEpoch: activeEpoch
                     )
                 }
             }
-            return RecallCache(
-                candidates: candidates,
-                corpusGeneration: corpusGeneration,
-                embeddingEpoch: activeEpoch
-            )
+            if let epoch = found.embeddingEpoch, queryEpoch?.rawValue != epoch {
+                throw MemoryStorageError.embeddingEpochMismatch(expected: epoch, actual: queryEpoch?.rawValue)
+            }
+            return found
         } publish: { snapshot in
             // Bound resident decoded vectors; larger corpora are read per invocation.
             recallCache = snapshot.candidates.count <= 50_000 ? snapshot : nil

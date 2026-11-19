@@ -81,7 +81,7 @@ extension SwiftToolDispatcher {
             let items = matches.dropFirst(deskOffset).prefix(limit).map(\.item)
             deskResult = .object([
                 "status": .string("ok"), "source": .string("canonical_current_desk"),
-                "as_of": .string(state.generatedTs),
+                "last_change": .string(state.generatedTs),
                 "matched_count": .int(Int64(matches.count)),
                 "has_more": .bool(deskOffset + limit < matches.count),
                 "offset": .int(Int64(deskOffset)),

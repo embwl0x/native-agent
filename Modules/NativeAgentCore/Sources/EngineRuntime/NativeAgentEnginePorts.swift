@@ -5,7 +5,6 @@ import AttentionRouting
 import BackgroundWork
 import Desk
 import NativeAgentCore
-import TriggerScheduler
 import Connectors
 import Browser
 import Agents
@@ -102,10 +101,6 @@ extension CognitionHost {
         DeskPursuitChoice.score(for: item, now: now)?.total
     }
 
-    public func archiveSupersededMorningBriefs(dataRoot: URL) async {
-        await TriggerNotificationInbox.archiveSupersededMorningBriefs(dataRoot: dataRoot)
-    }
-
 }
 
 public struct EngineStudioWanderClient: StudioWanderClientPort {
@@ -139,12 +134,15 @@ extension AttentionRouter {
 }
 
 extension NativeAgentEnginePorts {
-    private static let appPorts = OSAllocatedUnfairLock<(@Sendable (URL) -> Self)?>(initialState: nil)
+    private struct AppPorts: Sendable {
+        let make: @Sendable (URL) -> NativeAgentEnginePorts
+    }
+    private static let appPorts = OSAllocatedUnfairLock<AppPorts?>(initialState: nil)
 
     public static func installAppPorts(_ factory: @escaping @Sendable (URL) -> Self) {
         appPorts.withLock {
             precondition($0 == nil, "App ports are already installed")
-            $0 = factory
+            $0 = AppPorts(make: factory)
         }
     }
 
@@ -153,7 +151,7 @@ extension NativeAgentEnginePorts {
             guard let appPorts = $0 else { preconditionFailure("Install app ports before constructing the engine") }
             return appPorts
         }
-        return factory(dataRoot)
+        return factory.make(dataRoot)
     }
 }
 

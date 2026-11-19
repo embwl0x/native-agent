@@ -87,6 +87,21 @@ extension MemoryStorage {
     }
 
     static func decodeMemory(_ row: Row) throws -> StoredMemory {
+        var memory = try decodeMemoryProjection(row)
+        memory.embedding = try decodeEmbedding(row.decode(forColumn: "embedding"))
+        memory.embeddingEpoch = try row.decode(forColumn: "embedding_epoch")
+        memory.useCount = try row.decode(forColumn: "use_count") ?? 0
+        memory.lastUsedAt = try row.decode(forColumn: "last_used_at")
+        return memory
+    }
+
+    /// Outward records and person facts consume canonical content and evidence without loading semantic vectors or recall usage.
+    static let memoryProjectionColumns = """
+        id, content, persona_id, source, confidence, created_at, updated_at, status, lifecycle,
+        valid_from, valid_to, observed_at, evidence_json, metadata_json
+        """
+
+    static func decodeMemoryProjection(_ row: Row) throws -> StoredMemory {
         let memory = try StoredMemory(
             id: row.decode(forColumn: "id"),
             content: row.decode(forColumn: "content"),
@@ -95,17 +110,13 @@ extension MemoryStorage {
             confidence: row.decode(forColumn: "confidence") ?? 1.0,
             createdAt: row.decode(forColumn: "created_at"),
             updatedAt: row.decode(forColumn: "updated_at"),
-            embedding: decodeEmbedding(row.decode(forColumn: "embedding")),
-            embeddingEpoch: row.decode(forColumn: "embedding_epoch"),
             status: row.decode(forColumn: "status"),
             lifecycle: row.decode(forColumn: "lifecycle") ?? MemoryLifecycle.confirmed,
             validFrom: row.decode(forColumn: "valid_from"),
             validTo: row.decode(forColumn: "valid_to"),
             observedAt: row.decode(forColumn: "observed_at"),
             evidence: decodeMetadata(row.decode(forColumn: "evidence_json")),
-            metadata: decodeMetadata(row.decode(forColumn: "metadata_json")),
-            useCount: row.decode(forColumn: "use_count") ?? 0,
-            lastUsedAt: row.decode(forColumn: "last_used_at")
+            metadata: decodeMetadata(row.decode(forColumn: "metadata_json"))
         )
         do { try validateTemporalEvidence(memory) }
         catch { throw MemoryStorageError.databaseUnavailable("""

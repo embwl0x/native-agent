@@ -20,7 +20,6 @@ public enum BotRunLimits {
         return value.doubleValue * 60
     }
     public static let maximumTokens = 32_000
-    public static let maximumSeconds: TimeInterval = 120
 }
 
 /// Share calendar math between cadence and scheduler; cron follows the Mac's local civil clock.
@@ -32,11 +31,8 @@ public enum BotCadence: Codable, Equatable, Sendable {
 
 public struct BotBudget: Codable, Equatable, Sendable {
     public var tokens: Int
-    /// Crossing records "still finishing"; it does not cancel the helper's work.
-    public var seconds: TimeInterval
-    public init(tokens: Int, seconds: TimeInterval) {
+    public init(tokens: Int) {
         self.tokens = tokens
-        self.seconds = seconds
     }
 }
 

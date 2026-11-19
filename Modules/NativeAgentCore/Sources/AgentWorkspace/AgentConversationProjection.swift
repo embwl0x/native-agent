@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Experiences
 import ChatToolParsing
 import NativeAgentCore
 import NativeAgentShared
@@ -409,20 +410,24 @@ extension ContactThread {
     }
 
     public typealias Writer = @Sendable (URL, Entry) async throws -> Void
-    private static let writer = OSAllocatedUnfairLock<Writer?>(initialState: nil)
+    private struct Installed: Sendable { let write: Writer }
+    private static let writer = OSAllocatedUnfairLock<Installed?>(initialState: nil)
 
     /// The engine root, which owns the chat client that appends to a session.
-    public static func installWriter(_ write: @escaping Writer) { writer.withLock { $0 = write } }
+    public static func installWriter(_ write: @escaping Writer) { writer.withLock { $0 = Installed(write: write) } }
 
-    /// Keep the send record even when transcript append fails; log that failure.
+    /// Keep the send record even when transcript append fails; owe its repair.
     public static func write(_ entry: Entry, dataRoot: URL) async {
-        do { try await attempt(entry, dataRoot: dataRoot) }
-        catch { nativeLog("ContactThread: a message with \(entry.owner) was not saved to its session: \(error)") }
+        _ = try? await RepairOwed.attempt(dataRoot, operation: "contacts.thread_append:" + entry.session,
+            owner: dataRoot.appendingPathComponent("chat/messages/\(entry.session).jsonl").path,
+            words: { "A message with \(entry.owner) was kept in its send record but not saved to its conversation: \($0.localizedDescription)" }) {
+            try await attempt(entry, dataRoot: dataRoot)
+        }
     }
 
     /// The caller must report append failure.
     public static func attempt(_ entry: Entry, dataRoot: URL) async throws {
-        guard let write = writer.withLock({ $0 }) else {
+        guard let write = writer.withLock({ $0 })?.write else {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "no conversation writer is installed yet"])
         }
         try await SessionConversation.declare(entry.session, kind: .agent,

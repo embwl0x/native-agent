@@ -30,8 +30,8 @@ extension SwiftNativeTurnEngine {
             defer { afterReplyFlights[id] = nil }
             await settled.park()
             if started.withLock({ $0 }) { await work() }
-            // Private predictions settle exactly once, including abandonment when the reply cannot be saved.
-            if let finish = completion.withLock({ $0 }) { await finish() }
+            // Dispatch closes after private work, including abandonment when the reply cannot be saved.
+            if let finish = completion.withLock({ $0 }) { await finish.run() }
         }
         return held
     }
@@ -40,14 +40,20 @@ extension SwiftNativeTurnEngine {
 public final class AfterReply: Sendable {
     fileprivate let started = OSAllocatedUnfairLock(initialState: false)
     fileprivate let settled = ScopedWaiter()
-    fileprivate let completion = OSAllocatedUnfairLock<(@Sendable () async -> Void)?>(initialState: nil)
-    func onSettled(_ finish: @escaping @Sendable () async -> Void) {
-        completion.withLock { $0 = finish }
+    fileprivate struct Completion: Sendable {
+        let run: @Sendable () async -> Void
     }
-    private let recording = OSAllocatedUnfairLock<(@Sendable () async -> Void)?>(initialState: nil)
+    fileprivate let completion = OSAllocatedUnfairLock<Completion?>(initialState: nil)
+    func onSettled(_ finish: @escaping @Sendable () async -> Void) {
+        completion.withLock { $0 = Completion(run: finish) }
+    }
+    private struct Recording: Sendable {
+        let run: @Sendable () async -> Void
+    }
+    private let recording = OSAllocatedUnfairLock<Recording?>(initialState: nil)
     var recordsMemory: Bool { recording.withLock { $0 != nil } }
     func beforeStart(_ record: @escaping @Sendable () async -> Void) {
-        recording.withLock { $0 = record }
+        recording.withLock { $0 = Recording(run: record) }
     }
     public func start() async {
         guard started.withLock({ started in
@@ -55,7 +61,7 @@ public final class AfterReply: Sendable {
             started = true
             return true
         }) else { return }
-        if let record = recording.withLock({ $0 }) { await record() }
+        if let record = recording.withLock({ $0 }) { await record.run() }
         settled.resume()
     }
     deinit { settled.resume() }

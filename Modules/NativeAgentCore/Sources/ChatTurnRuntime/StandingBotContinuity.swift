@@ -93,7 +93,7 @@ public enum StandingBotContinuity {
             }
             return try await holding(work.with(\.botAncestry, scope.entering(bot.id).ancestry).with(\.botOptions, options)) { work in
                 if admitted {
-                    return try await BotRunnerDeadline.settled(seconds: bot.budget.seconds, onDeadline: {}, body: { try await run(turn, work) })
+                    return try await run(turn, work)
                 }
                 // A helper's loop is its own work in its own conversation; it never joins another turn.
                 return try await TurnAdmission.shared.runAlone(dataRoot: dataRoot, sessionID: bot.sessionID, turn: turn,

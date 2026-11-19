@@ -33,7 +33,7 @@ public struct OrganPulse: Sendable, Equatable {
     public static func record(_ organ: String, _ outcome: Outcome, note: String = "", yield: Int? = nil, cadence: TimeInterval? = nil) {
         let at = Date()
         let pulse = OrganPulse(organ: organ, at: at, outcome: outcome, note: note, yield: yield, cadence: cadence)
-        sink.withLock { $0 }?(pulse)
+        sink.withLock { $0 }?.receive(pulse)
     }
 
     /// Starts a `.held` note when the organ's clock stopped on purpose: such a pulse declares no cadence, is never overdue and is never felt. Same words as
@@ -63,10 +63,13 @@ public struct OrganPulse: Sendable, Equatable {
     }
 
     public static func install(_ receive: @escaping @Sendable (OrganPulse) -> Void) {
-        sink.withLock { $0 = receive }
+        sink.withLock { $0 = Sink(receive: receive) }
     }
 
-    private static let sink = Mutex<(@Sendable (OrganPulse) -> Void)?>(nil)
+    private struct Sink: Sendable {
+        let receive: @Sendable (OrganPulse) -> Void
+    }
+    private static let sink = Mutex<Sink?>(nil)
 }
 
 /// One organ's record: its last beats, oldest first, and what they predict. Profile and deviation are derived from the beats on every read and never stored.

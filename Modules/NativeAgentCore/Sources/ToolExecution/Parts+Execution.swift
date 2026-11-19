@@ -346,11 +346,13 @@ extension Parts {
             program = candidate.owned
         }
         let dataRoot = root
+        let readPaths = Self.strings(Self.fields(Self.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([]))
         let broker = program.isResident && !preview
             ? try await OwnedProgramRunner.holding(program, dataRoot: dataRoot,
-                make: { ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot, held: AbilityStore(dataRoot: dataRoot)) },
+                make: { ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot,
+                    readPaths: readPaths, held: AbilityStore(dataRoot: dataRoot)) },
                 end: { _ = await $0.close() })
-            : ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot)
+            : ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot, readPaths: readPaths)
         // A verb the part answers as a read runs read-confined; the declaration is enforced here, not trusted.
         let answered = Self.fields(Self.fields(Self.fields(candidate.manifest)["answers"] ?? .null)[Self.string(Self.fields(input), "verb") ?? ""] ?? .null)
         let profile = ToolHost(base: host, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: invocation.openScreenWatch,

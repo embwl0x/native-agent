@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import NativeAgentShared
+import SwiftUI
 // Blueprint: | `ShellFaceCalls.swift` | Scene, Desk, Work pane and clipboard reverse presentations |
 
 @MainActor enum ShellFaceCalls {
@@ -19,6 +20,12 @@ import NativeAgentShared
                 _ = try await DeskWindowPresentation.shared.present(request)
                 return .acknowledged
             case .showWorkPane(let name, let reference, let turn):
+                if name == "table" {
+                    TrustFaceWindows.show("table", title: "The table", frame: ("TableWindow", TableBoardTools.windowMinimumSize),
+                        content: FacePageView(page: "desk", only: "piece:" + BoardDocument.tableRef)
+                            .environment(appModel).macFaceStyle())
+                    return .acknowledged
+                }
                 let tab: WorkPaneTab
                 switch name {
                 case "steps": tab = .steps

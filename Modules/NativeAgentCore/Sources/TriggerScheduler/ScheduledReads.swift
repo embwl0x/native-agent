@@ -24,7 +24,7 @@ public enum ScheduledReads {
         if kind == "connector_action" {
             let action = SchedulerJobNormalizer.string(payload["actionId"]) ?? ""
             let read = payload["input"]?.objectValue ?? [:]
-            if let refusal = SwiftNativeTriggerScheduler.watchRefusal(action: action, input: read, turn: nil) {
+            if let refusal = SchedulerJobNormalizer.watchRefusal(action: action, input: read, turn: nil) {
                 throw TriggerSchedulerError.schedulerInvalid(refusal, path: "$.payload.actionId")
             }
             payload = ["actionId": .string(action), "input": .object(read)]
@@ -41,9 +41,8 @@ public enum ScheduledReads {
         guard try await clock.times(owner: owner).allSatisfy({ $0.id != id }) else {
             throw TriggerSchedulerError.schedulerInvalid("A scheduled read with id \(id) already exists; cancel it first or choose another id", path: "$.id")
         }
-        // The schedule entry this watch is: a read made for an earlier entry under the same id never becomes its baseline.
         let made = UUID().uuidString.lowercased()
-        if owner == "watch" { payload["made"] = .string(made) }
+        payload["made"] = .string(made)
         let time = OneClock.Time(id: id, rhythm: when.rhythm, next: when.next, payload: .object(payload))
         try await clock.declare(time)
         var receipt: [String: JSONValue] = ["status": .string("completed"), "read": try row(time)]
@@ -96,14 +95,13 @@ public enum ScheduledReads {
         return .object(["status": .string("completed"), "withdrawn": withdrawn])
     }
 
-    /// A watch keeps the row keys its last read saw beside its time, so only rows new since then become news. A watch no longer on the clock (a single
-    /// moment already delivered, or cancelled) never reads again, so nothing is kept for it; nor for a watch made again under the same id since the
-    /// delivered read (`made` differs).
-    public static func remember(seen: [String], watch delivered: OneClock.Time, dataRoot: URL) async throws {
+    public static func remember(seen: [String], read delivered: OneClock.Time, dataRoot: URL) async throws {
         let made = delivered.payload?.objectValue?["made"]
         _ = try await OneClock.at(dataRoot).revise(delivered.id) { time in
-            guard time.owner == "watch", time.payload?.objectValue?["made"] == made else { return nil }
+            guard owners.values.contains(time.owner), time.owner == delivered.owner,
+                  time.payload?.objectValue?["made"] == made else { return nil }
             var payload = try checkedPayload(time)
+            guard payload["seen"] != .array(seen.map(JSONValue.string)) else { return nil }
             payload["seen"] = .array(seen.map(JSONValue.string))
             return .object(payload)
         }
@@ -142,20 +140,20 @@ public enum ScheduledReads {
         }
     }
 
-    private static func checkedPayload(_ time: OneClock.Time) throws -> [String: JSONValue] {
+    public static func checkedPayload(_ time: OneClock.Time) throws -> [String: JSONValue] {
         guard let kind = owners.first(where: { $0.value == time.owner })?.key,
               case .object(let payload)? = time.payload,
               case .string? = payload["name"] else {
             throw TriggerSchedulerError.persistenceFailure("Scheduled read \(time.id) has no valid saved payload and name; repair clock/times.json.")
         }
         if let seen = payload["seen"] {
-            guard time.owner == "watch", case .array(let keys) = seen,
+            guard case .array(let keys) = seen,
                   keys.allSatisfy({ if case .string = $0 { return true }; return false }) else {
                 throw TriggerSchedulerError.persistenceFailure("Scheduled read \(time.id) has invalid saved seen keys; repair clock/times.json.")
             }
         }
         if let made = payload["made"] {
-            guard time.owner == "watch", case .string = made else {
+            guard case .string = made else {
                 throw TriggerSchedulerError.persistenceFailure("Scheduled read \(time.id) has an invalid saved made mark; repair clock/times.json.")
             }
         }

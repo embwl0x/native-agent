@@ -60,7 +60,7 @@ extension ChatStore {
         replacementAssistantMessageID: UUID? = nil,
         onFailure: (() -> Void)? = nil,
         emitHaptic: Bool = true,
-        queuedSendID: UUID? = nil,
+        queuedSendID requested: UUID? = nil,
         steer: Bool = false
     ) -> Bool {
         guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession, admitChatMutation() else { return false }
@@ -68,8 +68,8 @@ extension ChatStore {
             errorBanner = "Connect this iPhone to a Mac before submitting."
             return false
         }
-        if let queuedSendID,
-           queuedSends.first(where: { $0.id == queuedSendID })?.pairingFingerprint != pairing {
+        if let requested,
+           queuedSends.first(where: { $0.id == requested })?.pairingFingerprint != pairing {
             errorBanner = "This saved message belongs to another pairing. Submit it as a new message to send it here."
             return false
         }
@@ -90,8 +90,10 @@ extension ChatStore {
             return true
         }
         // Every send, including Regenerate, retains its payload before admission.
-        var queuedSendID = queuedSendID
-        if queuedSendID == nil {
+        let queuedSendID: UUID
+        if let requested {
+            queuedSendID = requested
+        } else {
             let retained = QueuedChatSend(
                 id: UUID(), sessionID: selectedSessionID, text: text,
                 controls: controls, attachments: attachments, createdAt: Date(), pairingFingerprint: pairing,
@@ -110,7 +112,7 @@ extension ChatStore {
                 ChatAttachmentSummary($0, fallbackName: $0.type == "image" ? "Photo" : "Attachment")
             }
             let userMsg = ChatMessage(
-                id: queuedSendID ?? UUID(), role: .user, text: text, attachments: summaries)
+                id: queuedSendID, role: .user, text: text, attachments: summaries)
             // Animate send appends only; session/transcript replacement must remain instant.
             withAnimation(AppMotion.entranceSystem) {
                 if !messages.contains(where: { $0.id == userMsg.id }) {
@@ -149,7 +151,7 @@ extension ChatStore {
         }
         let targetSessionID = selectedSessionID
         // Mint the run identity before transport awaits so Stop can name this send.
-        let correlationID = queuedSendID?.uuidString ?? UUID().uuidString
+        let correlationID = queuedSendID.uuidString
         for index in messages.indices where messages[index].id == appendedUserId || messages[index].id == placeholderId {
             messages[index].runId = correlationID
             messages[index].awaitingMacTranscript = true
@@ -191,7 +193,6 @@ extension ChatStore {
                     expectedPairing: pairing,
                     onPrepared: { [self] message in
                         try await storage.flush()
-                        guard let queuedSendID else { return }
                         guard let index = queuedSends.firstIndex(where: { $0.id == queuedSendID }) else {
                             throw CancellationError()
                         }
@@ -234,18 +235,10 @@ extension ChatStore {
                 closePendingExchange(correlationID)
                 // A cancelled send leaves loading cleanup to its cancellation owner.
                 guard !Task.isCancelled else { return }
-                if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
+                if messages.contains(where: { $0.id == placeholderId }) {
                     // Failed sends preserve reused bubbles and their retained retry context.
-                    if queuedSendID != nil {
-                        // Retry retains the transcript, full attachments and exact signed handoff.
-                        transportPausedQueueSessionKeys.insert(queueSessionKey(targetSessionID))
-                        failPlaceholder(id: placeholderId, text: "Send failed — retry when ready.")
-                    } else if reusePlaceholderId == nil {
-                        messages.remove(at: idx)
-                        if let appendedUserId, let userIdx = messages.firstIndex(where: { $0.id == appendedUserId }) {
-                            messages.remove(at: userIdx)
-                        }
-                    }
+                    transportPausedQueueSessionKeys.insert(queueSessionKey(targetSessionID))
+                    failPlaceholder(id: placeholderId, text: "Send failed — retry when ready.")
                     errorBanner = "Send failed: \(error.localizedDescription)"
                     onFailure?()
                 }

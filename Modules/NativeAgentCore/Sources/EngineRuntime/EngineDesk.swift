@@ -3,20 +3,20 @@ import NativeAgentCore
 import StandingBots
 import BackgroundWork
 import BackgroundLoops
-import TrustCenter
 import ChatTurnRuntime
 import ChatTurnContracts
 import ChatToolRuntime
 import ChatToolParsing
 import ApprovalTransactions
+import TrustCenter
 import AppToolRuntime
+import AuthoredCapabilities
 import AgentConversations
 import Desk
 import Foundation
 import OSLog
 import Observation
 import PersistenceCore
-import Research
 import TriggerScheduler
 import ApprovalInbox
 import NativeAgentShared
@@ -34,33 +34,9 @@ public final class DeskFacade {
     private nonisolated let approvals: ApprovalsFacade
     private nonisolated let bots: BotRunnerScheduler
 
-    public private(set) var workflows: [WorkflowRecord] = []
-    public private(set) var workflowsReadError: String?
-    public private(set) var hasLoadedWorkflows = false
-    @ObservationIgnored var capabilitiesDidChange: (@MainActor @Sendable () async -> Void)?
-
     public private(set) var times: [OneClock.Time] = []
     public private(set) var timesFeedState: ClockFeedState?
     @ObservationIgnored private lazy var timesRead = LatestRead()
-    public private(set) var researchRuns: [ResearchLabRun] = []
-    @ObservationIgnored private lazy var researchRead = LatestRead()
-    public private(set) var researchRunsLoaded = false
-    public private(set) var researchRunsError: String?
-    @ObservationIgnored private let workflowsRead = LatestRead()
-
-    public func refreshWorkflows() async throws {
-        let result: Result<[WorkflowRecord], Error> = await workflowsRead.read({
-            do { return .success(try await SavedWorkflows(root: dataRoot).listWorkflowRecords()) }
-            catch { return .failure(error) }
-        }, publish: { result in
-            switch result {
-            case .success(let rows): workflows = rows; workflowsReadError = nil; hasLoadedWorkflows = true
-            case .failure(let error): workflowsReadError = error.localizedDescription
-            }
-        })
-        await capabilitiesDidChange?()
-        _ = try result.get()
-    }
 
     public nonisolated init(dataRoot: URL, inbox: InboxFacade, approvals: ApprovalsFacade, bots: BotRunnerScheduler) {
         self.dataRoot = dataRoot
@@ -95,16 +71,13 @@ public final class DeskFacade {
     public private(set) var liveUpdateError: String?
     @ObservationIgnored private lazy var boardRead = LatestRead()
     @ObservationIgnored private var refreshTask: Task<DeskPageSnapshot, Never>?
+    @ObservationIgnored private var deadlineTask: Task<Void, Never>?
     @ObservationIgnored private var watcher: FileChangeWatcher?
     @ObservationIgnored private var busTask: Task<Void, Never>?
     @ObservationIgnored private var experienceTask: Task<Void, Never>?
     @ObservationIgnored private var inboxTask: Task<Void, Never>?
     @ObservationIgnored private var clockTask: Task<Void, Never>?
-    @ObservationIgnored private var deadlineTask: Task<Void, Never>?
     @ObservationIgnored private var watchedPaths: Set<URL> = []
-    @ObservationIgnored private lazy var debouncer = StoreReloadDebouncer { [weak self] in
-        _ = await self?.refresh()
-    }
 
     /// Source changes replace one retained revision for every surface, including offscreen pages.
     public func loadBoard() async -> DeskBoardRead {
@@ -178,15 +151,13 @@ public final class DeskFacade {
         experienceTask?.cancel()
         inboxTask?.cancel()
         clockTask?.cancel()
-        deadlineTask?.cancel()
         refreshTask?.cancel()
+        deadlineTask?.cancel()
     }
 
     // MARK: the clock
 
-    /// The clock's owners the Desk draws on its timer: inbox briefs, part schedules and scheduled reads. A helper's time is drawn with
-    /// its helper; a moment with its MY QUEUE step.
-    nonisolated static let timerOwners = [SwiftNativeTriggerScheduler.clockOwner, "part", "watch", "scan"]
+    nonisolated static let timerOwners = ["part", "watch", "scan"]
 
     /// What is on the one clock for the Desk's timer, read from the clock itself; an unreadable clock is unavailable, never an empty timer.
     @discardableResult
@@ -206,29 +177,6 @@ public final class DeskFacade {
             return .unavailable(error.localizedDescription)
         }
     }
-
-    // MARK: research
-
-    /// Share receipt history and read outcome across research surfaces.
-    public func refreshResearchRuns() async {
-        let _: Result<[ResearchLabRun], Error> = await researchRead.read({
-            do { return .success(try await self.listResearchRuns()) }
-            catch { return .failure(error) }
-        }, publish: { result in
-            researchRunsLoaded = true
-            switch result {
-            case .success(let rows): researchRuns = rows; researchRunsError = nil
-            case .failure(let error):
-                let detail = UserFacingError.cause(error, action: "list research runs")
-                researchRunsError = detail.count > 240 ? String(detail.prefix(240)) + "…" : detail
-            }
-        })
-    }
-
-    /// Damaged research history fails its read without replacing retained rows or original bytes.
-    public nonisolated func listResearchRuns() async throws -> [ResearchLabRun] {
-        try await SwiftNativeResearchClient(dataRoot: dataRoot).researchLabRuns()
-    }
 }
 
 extension DeskFacade {
@@ -245,8 +193,6 @@ extension DeskFacade {
             dataRoot.appendingPathComponent("bots/definitions", isDirectory: true),
             dataRoot.appendingPathComponent("bots/missed-runs.json"),
             DeskNagConfigStore(dataRoot: dataRoot).configPath,
-            dataRoot.appendingPathComponent("experiences/experiences.sqlite"),
-            dataRoot.appendingPathComponent("experiences/experiences.sqlite-wal"),
             dataRoot.appendingPathComponent("trust/policy.json"),
         ]
     }
@@ -320,23 +266,18 @@ extension DeskFacade {
             snapshot.nagConfigError = "Reminder settings are unavailable: \(error.localizedDescription). "
                 + "Repair the saved reminder settings before changing them."
         }
-        let hour: StudioWanderLane.ThoughtReading?
         do {
-            hour = try await Self.residentHour(dataRoot: dataRoot)
+            let hour = try await Self.residentHour(dataRoot: dataRoot)
             snapshot.wanderHour = DeskWanderHourPresentation.state(installed: true, entry: hour)
         } catch {
-            hour = nil
             snapshot.wanderHour = .line(text: "My hour’s thought record is unavailable.", symbol: "exclamationmark.triangle")
         }
-        let hourExpiry = hour.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
-            .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: snapshot.now) }
         snapshot.plan = DeskSequencing.compute(DeskState(items: snapshot.boardItems, generatedTs: ""), now: snapshot.now)
-        snapshot.rows = DeskPageContent.project(snapshot: snapshot, now: snapshot.now, nags: snapshot.nagConfig,
-            timedBots: snapshot.timedBots, jobStamps: snapshot.times.map { NativeTimestampFormat.fractionalZulu($0.next) }, hourExpiry: hourExpiry)
+        snapshot.rows = DeskPageContent.project(snapshot: snapshot, now: snapshot.now)
         return snapshot
     }
 
-    public func signalRefresh() async { await debouncer.signal() }
+    public func signalRefresh() async { _ = await refresh() }
 
     private func bindLiveUpdates() async {
         if inboxTask == nil {
@@ -350,7 +291,7 @@ extension DeskFacade {
         }
         if clockTask == nil {
             let changes = EventDeadlinePhysiology.storeAndFileEvents(paths: [], notifications: [
-                .NSSystemClockDidChange, .NSSystemTimeZoneDidChange,
+                .NSSystemClockDidChange, .NSSystemTimeZoneDidChange, .NSCalendarDayChanged,
             ])
             clockTask = Task { [weak self] in
                 for await _ in changes {
@@ -386,7 +327,6 @@ extension DeskFacade {
             watcher = await FileChangeWatcher.armed(paths: paths) { [weak self] _ in
                 Task { await self?.signalRefresh() }
             }
-            await debouncer.setVisible(true)
         } catch {
             liveUpdateError = UserFacingError.message(error, action: "turn on Desk live updates")
         }
@@ -417,10 +357,14 @@ public struct DeskToolDispatchRouter: Sendable {
     }
 
     public func run(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
+        let act = tool == "desk_note"
+            ? PersonAct(by: .tap(door: "mac", device: nil, chat: nil, page: "desk", row: input["handle"]?.stringValue ?? tool),
+                        tool: tool, input: input) : nil
+        let turn = Turn(session: Happening.stream).with(\.verifiedSessionID, Happening.stream).with(\.personAct, act)
         // Desk clicks share chat’s Trust gates; only this boundary supplies their approval filer.
         return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(
             envelope: .personOnMac("mac_ui:desk:" + tool, surface: Self.surface),
-            approvalFiler: DeskClickApprovalFiler(dataRoot: dataRoot)) { door in
+            approvalFiler: DeskClickApprovalFiler(dataRoot: dataRoot), turn: turn) { door in
             try await door.perform(tool, input)
         }
     }
@@ -516,7 +460,7 @@ public actor PursuitVeto {
         }
     }
 
-    public static let rationale = "Vetoed by the person on the Desk."
+    public static let rationale = "Vetoed on the Desk."
     private static let logger = Logger(subsystem: "com.nativeagent.app", category: "pursuit-veto")
 
     private let store: SwiftNativeDeskStore
@@ -575,7 +519,7 @@ extension NativeAgentEngine {
             summary: String(objective.prefix(600)))
         let receipt = await AgentJobs.commission(["agent": .string(AgentJob.own), "brief": .string(objective), "desk": .string(item.handle)],
             session: nil, surface: "desk", ceiling: .denied(reason: "a Desk task starts a line of the agent's own, never another agent"),
-            limits: (peers: [], elevated: [], fileAccess: nil), dataRoot: root, register: AppToolExecutor.jobRegistrar(dataRoot: root))
+            limits: (peers: [], elevated: [], fileAccess: .init()), dataRoot: root, register: AppToolExecutor.jobRegistrar(dataRoot: root))
         guard receipt.objectValue?["status"] == .string("accepted"), let job = receipt.objectValue?["job"]?.stringValue else {
             let why = receipt.objectValue?["detail"]?.stringValue ?? "its line did not start"
             throw ToolFailureError("Desk item \(item.alias) was kept, but no line took it: \(why)", effects: .occurred,

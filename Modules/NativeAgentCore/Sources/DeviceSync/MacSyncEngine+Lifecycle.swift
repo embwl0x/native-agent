@@ -9,7 +9,7 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Lifecycle.swift` | `MacSyncEngine`, `start`, `stop`; Transport-selected roots; one snapshot lifecycle. |
+// Blueprint: | `MacSyncEngine+Lifecycle.swift` | `MacSyncEngine`, `start`, `stop`; Local CloudKit projection roots; one snapshot lifecycle. |
 
 extension MacSyncEngine {
     /// Writer admission cannot prove repair; only its next health reading proves the postcondition.
@@ -60,11 +60,11 @@ extension MacSyncEngine {
 
     // MARK: - Start
 
-    /// Drive and CloudKit supply different roots; nil means start succeeded or was superseded, never readiness.
+    /// CloudKit uses local projections; nil means start succeeded or was superseded, never readiness.
     @discardableResult
-    func start(docsURL driveDocsURL: URL? = nil) async -> String? {
+    func start() async -> String? {
         guard !Task.isCancelled else { return nil }
-        let docsURL = driveDocsURL ?? PersistenceCore.defaultDataRoot()
+        let docsURL = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("mobile_snapshot_cache", isDirectory: true)
         if isActive, activeDocsURL == docsURL {
             return nil
@@ -75,73 +75,25 @@ extension MacSyncEngine {
         snapshotLifecycleGeneration &+= 1
         let generation = snapshotLifecycleGeneration
         activeDocsURL = docsURL
-        inboxDir = driveDocsURL?.appendingPathComponent(Folder.inbox)
-        // Replay state must be restored before either inbox admits work.
+        // Replay state must be restored before CloudKit actions admit work.
         guard await restoreState(generation: generation) else {
             return generation == snapshotLifecycleGeneration && !Task.isCancelled ? syncError : nil
         }
         snapshotDir = docsURL.appendingPathComponent(Folder.snapshots, isDirectory: true)
-        if driveDocsURL != nil {
-            let secret: Data
-            do {
-                if pairingSecretRotationInProgress { _ = try pairingSecret() }
-                let cached = _pairingSecret
-                let publicationOwed = sync.bridge.pairingPublicationOwed
-                let loaded = try await sync.storage.perform {
-                    if let cached { return cached }
-                    return try publicationOwed ? PairingSecret.requireExistingSecret() : PairingSecret.loadOrGenerateSecret()
-                }
-                guard generation == snapshotLifecycleGeneration else { return nil }
-                if pairingSecretRotationInProgress { _ = try pairingSecret() }
-                secret = _pairingSecret ?? loaded
-                _pairingSecret = secret
-            } catch {
-                guard generation == snapshotLifecycleGeneration else { return nil }
-                syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
-                return syncError
-            }
-            // Match the phone's pairing-scoped cache so another pairing's snapshots cannot enter it.
-            let fingerprint = SHA256.hash(data: secret).prefix(8)
-                .map { String(format: "%02x", $0) }.joined()
-            snapshotDir = docsURL.appendingPathComponent(Folder.snapshots)
-                .appendingPathComponent("pairings", isDirectory: true)
-                .appendingPathComponent(fingerprint, isDirectory: true)
-        }
         responsesDir = docsURL.appendingPathComponent(Folder.responses)
         transactionDir = docsURL.appendingPathComponent(Folder.transactions)
-        let inboxRejectedDir = driveDocsURL?.appendingPathComponent(Folder.inboxRejected)
 
-        let directories = [snapshotDir, inboxDir, inboxRejectedDir, responsesDir, transactionDir].compactMap({ $0 })
+        let directories = [snapshotDir, responsesDir, transactionDir].compactMap({ $0 })
         if let failure = await createDirectories(directories, generation: generation) { return failure }
         guard generation == snapshotLifecycleGeneration else { return nil }
 
         isActive = true
 
-        if driveDocsURL != nil {
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(kvsDidChange(_:)),
-                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-                object: nil
-            )
-            Task { [weak self] in
-                let synchronized = await Task.detached(priority: .utility) {
-                    NSUbiquitousKeyValueStore.default.synchronize()
-                }.value
-                guard let self, generation == self.snapshotLifecycleGeneration, self.isActive else { return }
-                if !synchronized { self.syncError = "iCloud KVS setup synchronization was not accepted; its remote state is unconfirmed." }
-            }
-        } else {
-            await startArchiveRetentionWatcher()
-            guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-            reconcileArchiveRetention(pruneFirst: true)
-        }
-
         // Exact file observation owns reconciliation, armed before first read.
         await startSnapshotIntegrityObservation()
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
         startPresenceBeat()
-        startCognitionSnapshotObservation()
+        await startCognitionSnapshotObservation()
         await startHelpersSnapshotObservation()
         await startConnectorsSnapshotObservation()
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
@@ -149,11 +101,9 @@ extension MacSyncEngine {
         startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
 
-        if driveDocsURL != nil { startInboxQuery(docsURL: docsURL) }
-
         await writeSnapshots(forceHeavy: true)
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-        if driveDocsURL == nil, let snapshotDir {
+        if let snapshotDir {
             let failures = await sync.bridge.publishMobileSnapshotStatus(
                 groups: Set(NAMobileSnapshotGroup.allCases),
                 snapshotDirectory: snapshotDir,
@@ -164,11 +114,6 @@ extension MacSyncEngine {
         }
         requestSnapshotIntegrityPass(retrySkipped: true)
 
-        if driveDocsURL != nil {
-            await startArchiveRetentionWatcher()
-            guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-            reconcileArchiveRetention(pruneFirst: true)
-        }
         return nil
     }
 
@@ -188,7 +133,6 @@ extension MacSyncEngine {
     func stop() {
         snapshotLifecycleGeneration &+= 1
         isActive = false
-        inboxProcessingQueued = false
         // Passive stop closes admission by generation; accepted actions and turns retain their settlement owners.
         workActivityObservationTask?.cancel()
         workActivityObservationTask = nil
@@ -234,16 +178,8 @@ extension MacSyncEngine {
         snapshotWriteQueuedNeedsChatTranscripts = false
         // Clear retired roots so post-stop calls cannot write to a superseded container, even beyond generation fences.
         snapshotDir = nil
-        inboxDir = nil
         responsesDir = nil
         transactionDir = nil
-        pruneDeadlineTask?.cancel()
-        pruneDeadlineTask = nil
-        let archiveWatcher = archiveRetentionWatcher
-        archiveRetentionWatcher = nil
-        if let archiveWatcher { Task.detached(priority: .utility) { archiveWatcher.cancel() } }
-        inboxQuery?.stop()
-        inboxQuery = nil
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -356,7 +292,6 @@ extension MacSyncEngine {
         }
     }
 
-    /// Integrity repair verifies exact phone-readable files before cached digests may suppress event-driven publication.
     private func runSnapshotIntegrityPass(retrySkipped: Bool) async {
         guard isActive, let snapshotDir else { return }
         let lifecycleGeneration = snapshotLifecycleGeneration
@@ -421,13 +356,24 @@ extension MacSyncEngine {
         }
     }
 
-    private func startCognitionSnapshotObservation() {
+    private func startCognitionSnapshotObservation() async {
         cognitionSnapshotObservationTask?.cancel()
         let changes = sync.mindChanges()
+        let generation = snapshotLifecycleGeneration
+        let snapshot = await sync.cognition?.organismSnapshot()
+        guard isActive, generation == snapshotLifecycleGeneration else { return }
         cognitionSnapshotObservationTask = Task { [weak self] in
+            var previous = snapshot.map(Self.organismLivingStatusSnapshot(from:)) ?? Self.noMindLivingStatus()
+            previous.generatedAt = .distantPast
             for await change in changes {
-                guard !Task.isCancelled, let self, self.isActive else { return }
+                guard !Task.isCancelled, let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
                 guard Self.shouldWriteSnapshot(for: change) else { continue }
+                let snapshot = await self.sync.cognition?.organismSnapshot()
+                guard !Task.isCancelled, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
+                var current = snapshot.map(Self.organismLivingStatusSnapshot(from:)) ?? Self.noMindLivingStatus()
+                current.generatedAt = .distantPast
+                guard current != previous else { continue }
+                previous = current
                 await self.writeSnapshots()
             }
         }
@@ -542,51 +488,6 @@ extension MacSyncEngine {
             || change.reason == "residual_repair:completed"
     }
 
-    /// Arm exact files before reads and retain the directory watch during discovery so downloads and in-place changes cannot be lost.
-    @discardableResult
-    func startArchiveRetentionWatcher(transactionDirectories: [URL] = []) async -> Bool {
-        let generation = snapshotLifecycleGeneration
-        let dataRoot = sync.dataRoot
-        let inboxDirectory = inboxDir
-        let responsesDirectory = responsesDir
-        let transactionDirectory = transactionDir
-        let paths: [URL]
-        let transactionFiles: [URL]
-        do {
-            paths = try await sync.storage.perform {
-                try MacSyncArchiveRetentionWatchPaths.resolve(
-                    inboxDirectory: inboxDirectory,
-                    responsesDirectory: responsesDirectory,
-                    transactionDirectory: transactionDirectory,
-                    dataRoot: dataRoot
-                )
-            }
-            transactionFiles = try await sync.storage.perform {
-                try transactionDirectories.flatMap { directory in
-                    try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-                }.filter { $0.pathExtension == "json" }
-            }
-        } catch {
-            if !Task.isCancelled, isActive, generation == snapshotLifecycleGeneration {
-                syncError = "Archive retention unavailable: \(error.localizedDescription). Restore access to the named sync directory."
-            }
-            return false
-        }
-        let watcher = await FileChangeWatcher.armed(paths: paths + transactionFiles) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
-                self.reconcileArchiveRetention(pruneFirst: true)
-            }
-        }
-        guard !Task.isCancelled, isActive, generation == snapshotLifecycleGeneration else {
-            await Task.detached(priority: .utility) { watcher.cancel() }.value
-            return false
-        }
-        let previous = archiveRetentionWatcher
-        archiveRetentionWatcher = watcher
-        if let previous { await Task.detached(priority: .utility) { previous.cancel() }.value }
-        return !Task.isCancelled && isActive && generation == snapshotLifecycleGeneration
-    }
 }
 
 /// Activity edges and the renewal deadline share one publication owner; incoming reads have a separate lifetime.

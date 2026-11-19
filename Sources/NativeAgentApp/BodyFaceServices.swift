@@ -129,6 +129,13 @@ final class BodyFaceServices {
     private func desk(_ request: DeskCommandRequest) async throws -> PartFace.Value {
         guard let asked = request.handle else { throw Self.failure("desk_item_required", "Choose a Desk item for this command.") }
         switch request.command {
+        case "table.put", "table.cross", "table.remove", "open_piece":
+            let opening = request.command == "open_piece"
+            let call = PartFace.Call(opening ? "pane.show" : request.command,
+                opening ? ["view": .string("make"), "ref": .string(asked)] : request.arguments)
+            let outcome = try await engine.tools.personTap(call, PartFaces.Tap(page: "desk", row: asked, action: call.action,
+                door: "mac", device: nil, chat: nil, decided: true))
+            return try outcome.wireValue()
         case "validate":
             guard request.arguments.isEmpty else { throw Self.failure("desk_command_invalid", "Reading a Desk item takes only its handle.") }
             _ = try await deskItem(asked)

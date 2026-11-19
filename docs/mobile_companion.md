@@ -56,6 +56,9 @@ and REM settings. The Mac still publishes an empty training-proposal tombstone
 for older phones.
 
 Chat supports sessions, streaming replies, queued sends and attachments.
+The Mac's phone-turn forwarder discards incoming attachment paths and refuses
+attachments with empty byte payloads with an explanation. The Mac stores received
+bytes under its data root's `chat/attachments` and records that file in the row.
 The text composer sends on Return after text composition has finished; Return
 while the keyboard holds marked text belongs to the input method.
 Composer height measurements belong to the text and its current UIKit font;
@@ -85,8 +88,8 @@ or serialization. Tool-input JSON uses the same recognizer with secret-named
 argument values withheld while preserving JSON syntax. Unreadable input is a
 named gap on that row, not a failure of its siblings. Row, session and run
 identities remain unchanged. This is a projection: saved Mac transcripts are
-never rewritten. Outgoing replies, cumulative deltas and KVS notices use the
-same text policy before signing (and before notice clipping). Existing retained
+never rewritten. Outgoing replies and cumulative deltas use the
+same text policy before signing. Existing retained
 signed publications whose bytes would change remain unresolved through the
 publication owner's conflict result; they are never silently repaired or resent
 with their original secret-bearing body.
@@ -184,7 +187,7 @@ suffix. More → Power user → Diagnostics draws the Mac's diagnostics face, th
 iPhone's recent push receipts, unverified Mac records and connection. A run row opens
 its saved detail, whose raw prompts/requests remain behind disclosures. Turn Inspector reads
 only timing/count summaries and carries no prompts.
-The [Share extension](ios-sharing.md) adds items from other apps to Chat.
+On a paired iPhone, the [Share extension](ios-sharing.md) adds items from other apps to Chat.
 Native Shortcuts offer Ask, Remember, Approve, Status, Quick Ask and Talk; see
 [Siri and notification actions](siri-notification-actions.md#iphone-and-ipad).
 
@@ -337,6 +340,12 @@ reading of any age (one more than 15 minutes in the future is still refused as
 `clock_ahead`); its own timestamp orders it in history and marks it historical.
 Every other phone envelope, places included, keeps the 24-hour request window,
 so a request is never acted on late.
+
+The authenticated Mac receiver posts a `world` happening on door `phone` for the first reading and each newer changed value of charging, focus,
+headphones, network kind and motion activity, and for first place observations and changed place membership. Setup, battery percentages and
+unchanged re-reports stay silent; `unknown` is no reading for every source (for motion, an `unknown` flag is dropped before comparing), so a reading that is only `unknown` neither posts nor becomes the value the next reading is compared with. A motion-proved departure keeps its existing presence happening instead of a second phone post. Each key holds
+source, value and reading time; stale readings carry their time and unknown current state under the same 15-minute freshness rule.
+These changes reach attention's `weigh`, without publishing Live sense news.
 
 Places share names and arrival/departure times, plus an initial **at**
 observation when the phone is first seen inside a place. A first outside fix
@@ -509,15 +518,15 @@ configuration is covered in [Release setup](release_setup.md).
 ## Transport architecture
 
 The shared `CloudKitDeviceTransport` owns CloudKit private-database transport.
-The Mac retains Drive readers for unresolved saved data. The phone uses only
-CloudKit; its unreachable Drive setup, query, reply archive, snapshot reader
-entry and action-file publisher are removed. Saved Drive files stay untouched
-and are not recovered at launch. Selection
+Mac and phone use CloudKit for device transport. The Mac has no Drive transport
+or key-value store paths; the phone retains its KVS progress/notice readers and
+message-nudge observer. Saved Drive files stay untouched and are not recovered
+at launch. Selection
 requires `NATIVE_AGENT_DEVICE_SYNC=cloudkit`, or the build's
 `NativeAgentDeviceSync=cloudkit` Info.plist value when no override is supplied.
 Missing, misspelled or retired selections fail explicitly. A failed CloudKit
-entitlement/container preflight reports its construction cause and refuses setup; it never starts the
-retained Drive transport. The shared factory alone constructs a CloudKit transport, after
+entitlement/container preflight reports its construction cause and refuses setup.
+The shared factory alone constructs a CloudKit transport, after
 `DeviceCloudKitPreflight` admits the service and exact container entitlements.
 
 The signed bundle supplies `NativeAgentICloudContainerID` and
@@ -528,9 +537,8 @@ environment override or hardcoded runtime default; source-build defaults live in
 the xcconfig files. Invalid configuration refuses transport, message metadata or
 background registration at its caller and reports the build repair. Doctor
 reports an invalid container as a builder-owned failure before checking transport
-health. KVS carries current progress/notices and delivery nudges; it is not a
-selectable message/action transport. Retained Drive readers are not a supported
-alternate selection.
+health. The Mac publishes chat, cumulative text, pairing and snapshots through
+CloudKit. It sends no KVS progress, notices, snapshot signals or delivery nudges.
 
 CloudKit pulls keep traversal cursors only within the current paginated call,
 stopping at the durable server-date watermark. Mac-only retention queries one
@@ -576,11 +584,6 @@ and disables choices with unknown reasoning controls. Missing notes do not
 establish capabilities. Work and Memory and mind tier-only choices inherit Chat's
 other fields; partial or conflicting overrides remain unavailable on the Mac
 with the repair cause rather than executing Chat's tuple.
-
-The Mac's Drive inbox authenticates envelopes before claiming their filenames. An
-existing processing claim is preserved: identical authenticated bytes coalesce;
-conflicting or invalid incoming bytes are preserved under their digest in
-`processed`, with conflicts reported. A queued handler keeps its claimed path.
 
 The phone's CloudKit ingress uses one verification and consumer boundary.
 Accepted phone requests, action responses, notifications and chat
@@ -698,6 +701,8 @@ Cancellation changes only a cancellation error's presentation; a concurrent Mac
 failure retains its cause. A Retry while that control is busy reports the open
 wait and its Cancel lever instead of silently dropping the tap.
 
+Work Live Activities use the fixed title "Working on your message" on the Lock
+Screen and Dynamic Island; their title contains no message text.
 Work snapshots carry the producer's latest 64 activity rows. A held phone or OS
 activity omitted from that window is reconciled by exact experience identity
 through the signed action owner, including after suspension. The response uses
@@ -763,11 +768,9 @@ polling or dropping it. The foreground/talk phone's 30-second contact loop reads
 Mac presence independently of message reads. The Mac's separate metadata drain follows
 receive/status events and completion, without a 30-second throttle.
 A missing or unreadable peer message establishes no disconnection and completes
-no delivery. A build signed with the key-value store entitlement sends KVS wake
-hints once after transport acceptance or a durable Drive commit; a build without
-it sends none, and its iPhone transport fact says the phone is woken by CloudKit
-push only; the one worker awaits each real synchronize return, with no delayed
-1/3-second nudges. Local synchronization never proves recipient acceptance.
+no delivery. The Mac wakes the phone through CloudKit push; the phone also
+reads iCloud whenever its app opens. Transport acceptance does not prove
+recipient acceptance.
 
 The Mac records payload-free `phone.pickup` (signed-envelope send time, Mac
 forwarder arrival and correlation) and `phone.deltaAccepted` (sequence accepted
@@ -780,16 +783,18 @@ delivery. Terminal delivery still uses the existing receipt journal.
 Every nonempty text delta immediately produces a full-text replacement. There
 is no time or character threshold before publication; the transport mailbox
 conflates unsent snapshots. This applies to resident and helper phone turns
-and to the anchored conversation relayed from other doors. Final replies keep
-the words already streamed before tool calls and take precedence over pending
-snapshots. See the [turn timeline](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool).
+and to runs admitted by the relay from other doors. The relay checks that the
+run's session is the anchor on its first event and keeps that decision through
+the terminal event, which clears the relay's run state on either decision.
+Final replies keep the words already streamed before tool calls and take
+precedence over pending snapshots. See the [turn timeline](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool).
 The session delivery owner attaches the forwarder's mounted stream without a
 caller-supplied sink. Approval and other continuations resolve the saved phone
 route through that same owner; their snapshots and terminal reply both carry
 `live=true` and the new turn's run id as correlation, so the phone settles the
 bubble that streamed. The original request correlation remains for recovery of
 that original run. Unavailable live delivery never discards the saved transcript.
-Resident turns begun on the Mac also carry their existing writing movement
+Admitted resident turns begun on the Mac also carry their writing movement
 through `ChatLiveTap` and the live relay as `kind: writing`, correlated by run.
 Each changed writing line takes a fresh message id for its immutable CloudKit
 record; consecutive equal lines coalesce in the relay's per-run state. A line
@@ -834,6 +839,10 @@ correlation. Transport wake nudges use the same retained, conflated mechanism ou
 path; text deltas never schedule the Drive retry-nudge plan.
 
 ## Remote actions and snapshots
+
+Completed `chat_history_page`, `faceRead` and `workActivityState` reads return
+their requested data without forcing a complete heavy snapshot pass. Other
+completed CloudKit actions retain their snapshot readback.
 
 The phone sends signed `NativeAgentShared.InboxAction` envelopes and waits for Mac responses.
 Current action payloads use `sessionId`, `runId`, `eventId`, `direction`,
@@ -892,9 +901,9 @@ direction, canonical `msgId` and 64-character lowercase SHA-256 `actionDigest`.
 Replay compares both bindings and the action name. Unbound or unreadable rows
 remain intact and unavailable: they cannot authorize execution, supply a replay
 result, be overwritten by a new reservation, or establish terminal retention.
-Both transports use the same replay response owner when an already-dispatched
-action has no recoverable signed result. Stale pending Drive recovery uses that
-owner too; missing results carry `unknown_outcome`, never a confirmed failure.
+CloudKit action replay uses the retained response owner when an already-dispatched
+action has no recoverable signed result; missing results carry `unknown_outcome`,
+never a confirmed failure.
 The phone saves that response as `outcome_unknown`, retains the original pending
 signed envelope until terminal settlement, and presents it as **not confirmed**.
 The phone requires the signed response's current `msgId`, `transactionId` and
@@ -912,8 +921,9 @@ Mac Tools; a confirmed Mac refusal remains `macRejected`. Settings likewise say
 an unconfirmed save could not be confirmed, never that it was not changed.
 Absent response files remain optional; present unreadable, malformed, unverifiable
 or uncorrelated evidence raises a checked error and remains retained. Previous-pairing
-settlement must save its orphan receipt or report that failure. Malformed KVS progress
-reports its key and decode failure through the bridge's existing sync status.
+settlement must save its orphan receipt or report that failure. The phone's retained KVS
+progress reader reports its key and decode failure through the bridge's existing sync status;
+the Mac no longer writes that input.
 Response arrivals settle their exact mailbox identity. Launch recovery belongs to
 the action mailbox, with a five-second inherited wait ceiling and at most 64 ledger
 entries decoded. A damaged entry reports its own gap while siblings proceed; excess
@@ -930,7 +940,7 @@ With NativeAgent open on the phone, `setting.get {setting:"phone.settings"}`
 returns the phone's own directory; its returned ids reach the same owners as
 the native controls. Signed `PhoneRequest` kinds `settings.read` and
 `settings.write` carry these operations. Enabling senses, saved place sharing
-or Lock Screen task names uses the existing phone request sheet for consent;
+or work Live Activities uses the existing phone request sheet for consent;
 appearance and lowering do not. Requested inspection includes disabled saved
 place names and switches, but never their coordinates. No value is copied into Mac defaults. The current phone waits for the person
 or owned action completion, with cancellation; no local expiry infers its outcome.
@@ -975,8 +985,10 @@ required by installed phone builds 61/63. Telegram preserves
 the actual successful-poll evidence while retaining `observedAt` for equal state. The first state is dated
 at its launch read; a changed state advances time by at least one encoded unit
 (milliseconds for overview, seconds for organism's Date codec), even across a clock correction.
-The writer compares the complete canonical sorted-key payload bytes; it has no
-clock-exclusion map. An unchanged payload writes no snapshot, digest metadata or
+The writer compares digests of the complete canonical sorted-key payload; equal
+digests skip file reads. The armed file observer reconciles wire integrity and
+invalidates damaged files' digests before repair. There is no clock-exclusion map.
+An unchanged payload writes no snapshot, digest metadata or
 transport notice during an ordinary pass; integrity repair and requested
 republication keep their explicit demand. Valid committed state retains its producer clocks;
 repair reads the stored change clock independently of the full payload. An equal
@@ -1118,9 +1130,8 @@ Pairing invalidation clears the phone's in-memory faces with its other
 projections. The new pairing supplies its own faces; a missing delivery never
 authorizes showing the previous pairing's pages.
 The file publishes alone in the `faces` group, CloudKit status
-`mobile_snapshot_faces_v1`. The Mac never names this group in the KVS ping:
-phones before faces ignore the new group. Phones that support faces fetch that group with
-each ping and observe its record.
+`mobile_snapshot_faces_v1`. Phones that support faces observe its CloudKit record;
+phones before faces ignore the group.
 Face publication notifications enter the existing work-activity coalescer even
 while a snapshot writer is occupied, so a change after face capture queues a
 trailing pass rather than waiting for unrelated work.
@@ -1137,6 +1148,10 @@ If even these unavailable entries cannot fit, the file fails with its actual siz
 The shared codec still checks its 800 KiB status and 8 MiB uncompressed envelope
 limits. An encoding, envelope, write or publication failure retains its own cause
 through the existing skip accounting.
+Trust reads and run encoding keep their actual failure in that accounting.
+Action response preparation reports its cause without acknowledging or rerunning
+the action. Source-key cancellation returns a failed session lookup's cause;
+progress delivery and asset/status secret reads report their causes to transport health.
 Unchanged unresolved failure maps preserve `snapshot_skips.json` and its
 `_observedAt`; only a changed failure or proven recovery changes that file.
 
@@ -1282,10 +1297,13 @@ Notification taps persist one destination with its screen and applicable chat,
 Desk or directed-task identity. ContentView consumes it once and hands the
 identity to the destination view, including on cold launch.
 
-Mac and phone notices use NativeAgentShared's `SystemToastCenter`, with separate
+Mac and phone toasts use NativeAgentShared's `SystemToastCenter`, with separate
 queue instances and platform rendering. Replacing an ID cancels its prior timer;
 invalid durations replace the Mac notice with a sticky error and leave the phone
 notice sticky. Severity defaults are 3/5/8/3 seconds.
+Mac body toasts use those defaults; the window mirrors their IDs and removals
+without its own expiry. Turn activity notices stay in the turn's lifecycle
+presentation. Mac toast capsules render independently in one vertical stack.
 
 ## Source map
 

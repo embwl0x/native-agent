@@ -92,6 +92,13 @@ extension ContextSQLiteStore {
         }
     }
 
+    func degradedSourceIDs() async throws -> Set<ContextSourceID> {
+        try await dbPool.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT id FROM context_sources WHERE health = 'degraded'")
+                .map(ContextSourceID.init(rawValue:)))
+        }
+    }
+
     public func healthSnapshot() async throws -> ContextStoreHealthSnapshot {
         try await dbPool.read { db in
             let activeGenerationID = try Int64.fetchOne(

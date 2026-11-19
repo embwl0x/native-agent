@@ -1,4 +1,4 @@
-// Project accepted facts into canonical graph tables; `embedding_text` is part of the shared search/tool payload contract.
+// Project accepted facts into canonical graph tables.
 
 import CryptoKit
 import Foundation
@@ -354,7 +354,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         let title = "\(factTitleLabel(kind)): \(clip(compact, limit: 96))"
         let summary = "Memory fact: \(clip(compact, limit: 700))"
         var metadata: [String: JSONValue] = [
-            "embedding_text": .string("\(kind): \(clip(compact, limit: 260))"),
             "memory_id": .string(memoryID),
             "last_memory_id": .string(memoryID),
             "indexer": .string(indexVersion),
@@ -503,7 +502,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             guard !overflow else {
                 throw MemoryStorageError.databaseUnavailable("kg_entities mention_count overflow for row \(id)")
             }
-            metadata["embedding_text"] = .string("\(type): \(name)")
             metadata["last_memory_id"] = .string(fact.id)
             if let source = fact.source { metadata["last_memory_source"] = .string(source) }
             metadata["indexer"] = .string(indexVersion)
@@ -531,7 +529,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
 
         let id = try uniqueEntityID(db)
         var metadata: [String: JSONValue] = [
-            "embedding_text": .string("\(type): \(name)"),
             "last_memory_id": .string(fact.id),
             "last_memory_source": fact.source.map(JSONValue.string) ?? .null,
             "indexer": .string(indexVersion),

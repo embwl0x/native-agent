@@ -1844,8 +1844,8 @@ their cues and be switched off when done. Outreach, with its gates, quiet
 hours and once-per-care cadence unless something moved, is mechanism 5's
 threshold, and the person silencing one care's cue is the dismissal that
 should raise the criterion for that kind. App-arrival notice is built:
-`AgentPeerDiscovery` records the first scan silently, then emits `app.installed`
-for a newly seen bundle/version; the shipped resident `notice.js` part filters
+`AgentDiscoverySession` records the first scan silently, then emits `app.installed`
+for a newly seen bundle/version except the running app's own bundle id; the shipped resident `notice.js` part filters
 nonscriptable apps and offers once per bundle/version. This is novelty against
 the recorded baseline; the broader relevance and habituation proposals below
 remain research. The person's rule that care is fine but never automatic

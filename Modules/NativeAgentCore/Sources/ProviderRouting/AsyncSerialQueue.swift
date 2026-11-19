@@ -4,35 +4,26 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `AsyncSerialQueue.swift` | FIFO completion and caller cancellation for shared single-use OAuth token refreshes |
+// Blueprint: | `AsyncSerialQueue.swift` | FIFO completion of shared single-use OAuth token refreshes; a stopped caller returns while its refresh settles |
 /// Refreshes run FIFO through completion so a single-use token rotates once.
 actor AsyncSerialQueue {
     private var tail: Task<Void, Never> = Task {}
 
     func run<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) async throws -> T {
         let prev = tail
-        let me = Task { () -> Result<T, Error> in
+        let me = Task {
             await prev.value
-            do {
-                // A canceled queued refresh must not run; waiting for its predecessor does not observe cancellation.
-                try Task.checkCancellation()
-                let v = try await body()
-                return .success(v)
-            } catch {
-                return .failure(error)
+            return try await body()
+        }
+        tail = Task { _ = await me.result }
+        let waiter = OSAllocatedUnfairLock<CheckedContinuation<T, Error>?>(initialState: nil)
+        let take: @Sendable () -> CheckedContinuation<T, Error>? = { waiter.withLock { held in defer { held = nil }; return held } }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                waiter.withLock { $0 = continuation }
+                if Task.isCancelled { take()?.resume(throwing: CancellationError()) }
+                Task { let result = await me.result; take()?.resume(with: result) }
             }
-        }
-        // Erase the result to keep the shared tail Task<Void, Never>.
-        tail = Task { _ = await me.value }
-        // Caller cancellation must reach the queued refresh.
-        let result = await withTaskCancellationHandler {
-            await me.value
-        } onCancel: {
-            me.cancel()
-        }
-        switch result {
-        case .success(let v): return v
-        case .failure(let e): throw e
-        }
+        } onCancel: { take()?.resume(throwing: CancellationError()) }
     }
 }

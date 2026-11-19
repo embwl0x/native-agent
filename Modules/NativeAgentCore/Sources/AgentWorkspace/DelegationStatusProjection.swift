@@ -29,12 +29,6 @@ public struct DelegationStatusProjector: Sendable {
         self.configRoot = configRoot ?? InstallPaths.current.bridgeConfigRoot
     }
 
-    /// Read stores independently so an absent or unreadable store cannot hide readable siblings.
-    public func recentJobs(now: Date, limit: Int = DelegationStatusProjector.defaultLimit) -> [DelegationReadout] {
-        let bounded = max(1, min(limit, Self.maxLimit))
-        return readSnapshot(now: now, limit: bounded).jobs
-    }
-
     /// One disk read reports jobs and availability; only absent or fully readable stores count as readable.
     public func recentJobsWithAvailability(
         now: Date,

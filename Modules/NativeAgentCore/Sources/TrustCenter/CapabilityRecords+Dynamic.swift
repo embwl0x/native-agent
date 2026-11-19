@@ -6,8 +6,6 @@ import PersonaEngine
 import ToolRegistry
 // Blueprint: | `CapabilityRecords+Dynamic.swift` | Owner-derived capability rows preserve missing evidence. |
 
-// Aggregate owner projections without altering extra fields; SavedWorkflows alone validates and mutates its registry.
-
 // MARK: - Helpers (file-local)
 
 private func capabilityStatus(_ row: JSONRow) throws -> JSONValue {
@@ -97,7 +95,7 @@ public func capabilityRecordsFull(
     }
 
     let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot)
-    for skill in skills.prefix(230) {
+    for skill in skills {
         var rec: [String: JSONValue] = [:]
         let sid = skill.id
         rec["id"] = .string("skill:\(sid)")
@@ -117,7 +115,7 @@ public func capabilityRecordsFull(
     }
 
     let tools = try await listTools(dataRoot: dataRoot)
-    for tool in tools.prefix(150) {
+    for tool in tools {
         let row = try JSONRow(.object(tool))
         var rec = capabilityTrustMetadata(tool)
         let tid = try row.string("id")
@@ -143,7 +141,7 @@ public func capabilityRecordsFull(
     }
 
     let actionStatuses = try await connectorActionStatuses()
-    for action in connectorActionDescriptors().prefix(200) {
+    for action in connectorActionDescriptors() {
         var rec: [String: JSONValue] = [:]
         rec["id"] = .string("connector_action:\(action.id)")
         rec["sourceId"] = .string(action.id)

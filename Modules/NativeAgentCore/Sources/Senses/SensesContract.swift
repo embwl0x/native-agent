@@ -136,11 +136,14 @@ public struct SenseNews: Codable, Sendable, Hashable {
     public var observationID: String?
     /// Source change identity must not depend on clipped or redacted summaries.
     public var changeID: String?
+    public var watch: String?
 
-    public init(senseID: String, version: Int, address: String, summary: String, at: Date, observationID: String? = nil, changeID: String? = nil) {
+    public init(senseID: String, version: Int, address: String, summary: String, at: Date,
+                observationID: String? = nil, changeID: String? = nil, watch: String? = nil) {
         self.senseID = senseID; self.version = version; self.address = address; self.summary = summary; self.at = at
         self.observationID = observationID
         self.changeID = changeID
+        self.watch = watch
     }
 }
 

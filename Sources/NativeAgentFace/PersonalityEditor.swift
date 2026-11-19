@@ -78,7 +78,7 @@ struct PersonalityEditor: View {
                 throw WireFailure(code: "name_invalid", message: issue, cause: nil, effects: .none, fields: ["agentName": issue])
             }
             if input.checking { return await readStarter(agent: agent, user: user, notes: notes) }
-            let reply = try await appModel.protectedFormAct(.createStarterPersona(.init(agentName: agent, personaType: "ai", userName: user)))
+            let reply = try await appModel.protectedFormAct(.onboarding(.complete(agentName: agent, personaType: "ai", userName: user)))
             guard case .result(.object(let fields)) = reply, case .bool(let ok)? = fields["ok"] else {
                 throw WireFailure(code: "starter_unconfirmed", message: "The identity owner did not confirm creation.", cause: nil, effects: .unknown)
             }

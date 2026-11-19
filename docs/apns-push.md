@@ -130,6 +130,8 @@ at configuration, registration and send time. No `prod`, `sandbox`, `auto`, case
 conversion or invented environment is accepted. Push registration requires the
 current `deviceId`, `environment` and `bundleId` fields. Work Live Activity pushes
 are separate from ordinary events and retain their existing opt-in behavior.
+Their content and start-alert title is "Working on your message", containing no
+message text.
 Optional-wake token reads use one checked mode for all callers.
 Unreadable/malformed store contents fail that read; an invalid device row reports
 its own unavailable cause and leaves valid sibling targets eligible. There is no

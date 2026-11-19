@@ -7,6 +7,7 @@ import Privacy
 // Blueprint: | `MacSyncEngine+LiveTurns.swift` | `MacSyncEngine`: `startLiveTurnRelay`, `stopLiveTurnRelay` |
 
 private struct LiveTurnMovement: Sendable {
+    let admitted: Bool
     var deltas = ICloudTextDeltaCoalescer()
     var writing: String?
 }
@@ -26,49 +27,52 @@ extension MacSyncEngine {
         let dataRoot = sync.dataRoot
         ChatLiveTap.observe { event in
             hop.async {
-                guard event.surface != "ios",
-                      ConversationAnchor.currentSessionId(dataRoot: dataRoot) == event.sessionId else { return }
+                guard event.surface != "ios" else { return }
+                let run = event.runId, movement = event.runId + " " + event.sessionId
+                let admitted = mailbox.withLock { $0.turns[movement]?.admitted }
+                    ?? (ConversationAnchor.currentSessionId(dataRoot: dataRoot) == event.sessionId)
                 let queued = mailbox.withLock { state -> Bool in
-                    let run = event.runId
+                    if state.turns[movement] == nil {
+                        state.turns[movement] = LiveTurnMovement(admitted: admitted)
+                    }
                     let text: String
                     let kind: String?
                     let sequence: Int?
                     switch event.kind {
                     case .writing(let line):
-                        guard state.turns[run]?.writing != line else { return false }
-                        state.turns[run, default: LiveTurnMovement()].writing = line
+                        guard admitted, state.turns[movement]?.writing != line else { return false }
+                        state.turns[movement]?.writing = line
                         text = line
                         kind = "writing"
                         sequence = nil
                     case .delta(let delta):
-                        guard let flush = state.turns[run, default: LiveTurnMovement()].deltas.push(
-                                delta: delta
-                              ) else { return false }
-                        state.turns[run]?.writing = nil
+                        guard admitted, let flush = state.turns[movement]?.deltas.push(delta: delta) else { return false }
+                        state.turns[movement]?.writing = nil
                         text = flush.text
                         kind = "text_delta"
                         sequence = flush.sequence
                     case .answered(let answer):
-                        state.turns.removeValue(forKey: run)
+                        state.turns.removeValue(forKey: movement)
                         text = answer
                         kind = "final"
                         sequence = nil
                     case .incomplete(let answer, _):
-                        state.turns.removeValue(forKey: run)
+                        state.turns.removeValue(forKey: movement)
                         text = answer
                         kind = "incomplete"
                         sequence = nil
                     case .failed:
-                        state.turns.removeValue(forKey: run)
+                        state.turns.removeValue(forKey: movement)
                         text = event.savedPartial ?? ""
                         kind = "error"
                         sequence = nil
                     case .cancelled:
-                        state.turns.removeValue(forKey: run)
+                        state.turns.removeValue(forKey: movement)
                         text = event.savedPartial ?? ""
                         kind = "cancelled"
                         sequence = nil
                     }
+                    guard admitted else { return false }
                     var metadata = ["live": "true", "transport": "icloud", "source": "mac"]
                     metadata["kind"] = kind
                     if case .failed(let failure) = event.kind {

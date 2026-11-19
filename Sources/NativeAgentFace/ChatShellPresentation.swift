@@ -65,11 +65,7 @@ enum ChatShellCopy {
         "Tell me about yourself",
     ]
 
-    static let errorStuckLink = "Still stuck? Settings"
-
     static func workingRowTitle(agentName: String) -> String { agentName + " with agents" }
     static let conversationsTitle = "Chats"
     static let briefsRowTitle = "Morning briefs"
 }
-
-/// Keep raw JSON in Diagnostics; expandable activity sentences let normal chat explain actual tool use.

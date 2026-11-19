@@ -24,7 +24,6 @@
 # Public releases (NATIVEAGENT_ICLOUD_BUILD other than personal) build only
 # from reviewed public source. A private invocation prepares a source export
 # and stops; --publish-appcast requires already published public source.
-#   NATIVEAGENT_PUBLIC_EXPORT_DIR   — where to put the export (default: mktemp)
 # For ad-hoc local proof (no Developer ID signing), select it explicitly:
 #   NATIVEAGENT_SIGNING_MODE=adhoc ./script/release.sh --dry-run
 set -euo pipefail
@@ -106,8 +105,6 @@ fi
 RELEASE_ENV_SURFACE=(
   NATIVEAGENT_DEVELOPER_ID
   NATIVEAGENT_TEAM_ID
-  NATIVEAGENT_APPLE_ID
-  NATIVEAGENT_NOTARIZATION_PASSWORD
   NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE
   NATIVEAGENT_SPARKLE_ED_PRIV_KEY
   NATIVEAGENT_SPARKLE_PUBLIC_KEY
@@ -267,7 +264,6 @@ NATIVEAGENT_ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.gi
 NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
 NATIVEAGENT_RELEASE_PAGE_URL="${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}"
-export NATIVEAGENT_RELEASE_PAGE_URL
 
 # Stamp SUFeedURL and the updater claim only for publication in this run; never synthesize a URL.
 if [[ "$PUBLISH_APPCAST" == "true" ]]; then
@@ -277,20 +273,9 @@ else
   NATIVEAGENT_UPDATE_FEED_PUBLISHED=false
   SPARKLE_FEED_URL_STAMP=""
 fi
-export NATIVEAGENT_DEVELOPER_ID
-export NATIVEAGENT_TEAM_ID
-export NATIVEAGENT_APPLE_ID
-export NATIVEAGENT_NOTARIZATION_PASSWORD
-export NATIVEAGENT_SPARKLE_ED_PRIV_KEY
-export NATIVEAGENT_SPARKLE_PUBLIC_KEY
-export NATIVEAGENT_PROVISIONING_PROFILE
-export NATIVEAGENT_APPCAST_URL
-export NATIVEAGENT_DMG_DOWNLOAD_URL
-export NATIVEAGENT_RELEASE_PAGE_URL
-export NATIVEAGENT_MAC_BUNDLE_ID
-export NATIVEAGENT_ICLOUD_CONTAINER_ID
-export NATIVEAGENT_MOBILE_SOURCE_KEY
-export NATIVEAGENT_BACKGROUND_TASK_PREFIX
+export NATIVEAGENT_DEVELOPER_ID NATIVEAGENT_TEAM_ID NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVEAGENT_SPARKLE_PUBLIC_KEY \
+  NATIVEAGENT_PROVISIONING_PROFILE NATIVEAGENT_APPCAST_URL NATIVEAGENT_DMG_DOWNLOAD_URL NATIVEAGENT_RELEASE_PAGE_URL \
+  NATIVEAGENT_MAC_BUNDLE_ID NATIVEAGENT_ICLOUD_CONTAINER_ID NATIVEAGENT_MOBILE_SOURCE_KEY NATIVEAGENT_BACKGROUND_TASK_PREFIX
 
 # Distribution transport modes:
 #   personal      — development/personal KVS + Drive + CloudKit profile
@@ -366,11 +351,6 @@ if [[ "$PUBLISH_APPCAST" == true ]]; then
   "$ROOT/script/publish_github_release.sh" --preflight-source
 fi
 
-# Notarize via a stored keychain profile (xcrun notarytool store-credentials)
-# instead of an app-specific password in the environment — keeps the secret out
-# of env/logs. When set, APPLE_ID/NOTARIZATION_PASSWORD are not required.
-NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE="${NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE:-}"
-# Signing entitlements: explicit override wins; else picked by ICLOUD_BUILD.
 NATIVEAGENT_RELEASE_ENTITLEMENTS="${NATIVEAGENT_RELEASE_ENTITLEMENTS:-}"
 GENERATED_PUBLIC_CLOUDKIT_ENTITLEMENTS=""
 RELEASE_WIDGET_WORK=""
@@ -429,7 +409,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
     fi
     if [[ -n "$NATIVEAGENT_PROVISIONING_PROFILE" ]]; then
       echo "[release] public build: ignoring NATIVEAGENT_PROVISIONING_PROFILE — a no-iCloud public" >&2
-      echo "[release] artifact embeds no provisioning profile (gpt-5.5 MED)." >&2
+      echo "[release] artifact embeds no provisioning profile." >&2
       NATIVEAGENT_PROVISIONING_PROFILE=""
     fi
   elif [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" == "cloudkit" ]]; then
@@ -469,6 +449,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
   REQUIRED_VARS=(
     NATIVEAGENT_DEVELOPER_ID
     NATIVEAGENT_TEAM_ID
+    NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE
     NATIVEAGENT_SPARKLE_ED_PRIV_KEY
     NATIVEAGENT_SPARKLE_PUBLIC_KEY
   )
@@ -480,10 +461,6 @@ if [[ "$DRY_RUN" == "false" ]]; then
   # container); the no-iCloud public build ships without one.
   if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "none" ]]; then
     REQUIRED_VARS+=( NATIVEAGENT_PROVISIONING_PROFILE )
-  fi
-  # Notary creds: a stored keychain profile replaces the apple-id/password pair.
-  if [[ -z "$NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE" ]]; then
-    REQUIRED_VARS+=( NATIVEAGENT_APPLE_ID NATIVEAGENT_NOTARIZATION_PASSWORD )
   fi
   missing=()
   for var in "${REQUIRED_VARS[@]}"; do
@@ -502,8 +479,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
     echo "" >&2
     echo "  NATIVEAGENT_DEVELOPER_ID      — Developer ID Application: Developer Name (XXXXXXXXXX)" >&2
     echo "  NATIVEAGENT_TEAM_ID           — 10-char Apple Team ID" >&2
-    echo "  NATIVEAGENT_APPLE_ID          — Apple ID email for notarization" >&2
-    echo "  NATIVEAGENT_NOTARIZATION_PASSWORD — app-specific password from appleid.apple.com" >&2
+    echo "  NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE — required stored notarytool profile" >&2
     echo "  NATIVEAGENT_SPARKLE_ED_PRIV_KEY   — path to Sparkle EdDSA private key file" >&2
     echo "  NATIVEAGENT_SPARKLE_PUBLIC_KEY    — Sparkle EdDSA public key string for SUPublicEDKey" >&2
     echo "  NATIVEAGENT_PROVISIONING_PROFILE  — Developer ID provisioning profile matching NativeAgent.entitlements" >&2
@@ -899,12 +875,7 @@ echo "==> Creating notarization zip..."
 rm -f "$STAGE_DIR/$APP_NAME.app.zip"
 ditto -c -k --keepParent "$BUNDLE" "$STAGE_DIR/$APP_NAME.app.zip"
 
-# Notary auth: keychain profile (secret stays in keychain) or apple-id/password.
-if [[ -n "$NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE" ]]; then
-  NOTARY_AUTH=( --keychain-profile "$NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE" )
-else
-  NOTARY_AUTH=( --apple-id "$NATIVEAGENT_APPLE_ID" --password "$NATIVEAGENT_NOTARIZATION_PASSWORD" --team-id "$NATIVEAGENT_TEAM_ID" )
-fi
+NOTARY_AUTH=( --keychain-profile "$NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE" )
 
 echo "==> Submitting for notarization (this may take several minutes)..."
 xcrun notarytool submit "$STAGE_DIR/$APP_NAME.app.zip" \

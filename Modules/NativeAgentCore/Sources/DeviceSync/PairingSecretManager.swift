@@ -6,12 +6,6 @@ import PersistenceCore
 
 // Blueprint: | `PairingSecretManager.swift` | `PairingSecret`; Device-only secret, explicit rotation and readback. |
 
-private enum PairingKVSPublishResult: Sendable {
-    case skippedCurrent
-    case versionExhausted
-    case published(version: Int, synced: Bool)
-}
-
 public enum PairingSecret {
     private static let secretService = "NativeAgent.icloud-pairing"
 
@@ -83,75 +77,11 @@ public enum PairingSecret {
         }
     }
 
-    // Monotonic pairing_secret_version lets the phone detect stale cached authority and fetch the Mac's exact secret.
+    // The unsigned resync hint's shared wire schema requires the last published version, including zero before publication.
     private static let secretVersionKey = "NativeAgent.pairing.secretVersionLocal"
-    private static let synchronizationCheckpointKey = "NativeAgent.pairing.synchronizationCheckpoint"
 
     static func currentSecretVersion() -> Int {
         UserDefaults.standard.integer(forKey: secretVersionKey)
-    }
-
-    /// Publish even during signature-mismatch repair; only the caller decides when secretVersion must advance.
-    @discardableResult
-    public static func publishMaterialToKVS(forceBumpVersion: Bool = false) async -> Bool {
-        let secret: Data
-        do {
-            secret = try loadOrGenerateSecret()
-        } catch {
-            nativeLog("[PairingBootstrap] Pairing unavailable; refusing KVS publish: \(error.localizedDescription)")
-            return false
-        }
-        return await publishMaterialToKVS(secret, forceBumpVersion: forceBumpVersion)
-    }
-
-    @discardableResult
-    public static func publishMaterialToKVS(
-        _ secret: Data,
-        forceBumpVersion: Bool = false
-    ) async -> Bool {
-        guard secret.count == 32 else { return false }
-        let secretB64 = secret.base64EncodedString()
-        let secretDigest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
-        // KVS reads include local unsynchronized writes; only a post-sync checkpoint proves publication.
-        let result = await Task.detached(priority: .utility) {
-            let kvs = NSUbiquitousKeyValueStore.default
-            let defaults = UserDefaults.standard
-            let existingB64 = kvs.string(forKey: "NativeAgent.pairing.hmacSecret") ?? ""
-            let version = currentSecretVersion()
-            let checkpoint = defaults.dictionary(forKey: synchronizationCheckpointKey)
-            if !forceBumpVersion, existingB64 == secretB64, version > 0,
-               kvs.longLong(forKey: "NativeAgent.pairing.secretVersion") == Int64(version),
-               checkpoint?["digest"] as? String == secretDigest,
-               checkpoint?["version"] as? Int == version {
-                return PairingKVSPublishResult.skippedCurrent
-            }
-            let (nextVersion, overflow) = version.addingReportingOverflow(1)
-            guard !overflow else { return PairingKVSPublishResult.versionExhausted }
-            defaults.removeObject(forKey: synchronizationCheckpointKey)
-            kvs.set(secretB64, forKey: "NativeAgent.pairing.hmacSecret")
-            kvs.set(Int64(nextVersion), forKey: "NativeAgent.pairing.secretVersion")
-            let synced = kvs.synchronize()
-            if synced {
-                defaults.set(nextVersion, forKey: secretVersionKey)
-                defaults.set(["digest": secretDigest, "version": nextVersion] as [String: Any], forKey: synchronizationCheckpointKey)
-            }
-            return PairingKVSPublishResult.published(version: nextVersion, synced: synced)
-        }.value
-
-        switch result {
-        case .skippedCurrent:
-            nativeLog("[PairingBootstrap] KVS already has current HMAC secret — skipping publish")
-            return true
-        case .versionExhausted:
-            nativeLog("[PairingBootstrap] Pairing version exhausted; material and checkpoint left unchanged")
-            return false
-        case .published(let nextVersion, let synced):
-            nativeLog(
-                "[PairingBootstrap] Published HMAC pairing_secret_version=%d to KVS (synchronize=%@)",
-                nextVersion, synced ? "ok" : "deferred"
-            )
-            return synced
-        }
     }
 
     @discardableResult

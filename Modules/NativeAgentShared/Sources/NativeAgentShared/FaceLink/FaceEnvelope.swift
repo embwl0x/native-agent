@@ -101,10 +101,8 @@ public enum FaceAct: Codable, Sendable {
     case disconnectConnector(id: String)
     case saveConnectorCredentials(ConnectorCredentialWrite)
     case configureTelegram(TelegramConfigurationWrite)
-    case saveSlackIngress(SlackIngressWrite)
     case testTelegram
     case clearTelegramLogs
-    case repairTelegram(inbox: String?)
     case removePhonePairing(id: String)
     case importGrokCredentials(GrokCredentialWrite)
     case setUpChrome
@@ -120,7 +118,6 @@ public enum FaceAct: Codable, Sendable {
     case saveMacIntegrationPreset(String)
     case saveMacControlPolicy(MacControlPolicyWrite)
     case saveMultimodalPolicy(MultimodalPolicyWrite)
-    case authorizeSafePolicy
     case refreshPrivacyInventory
     case checkMail
     case requestMacOSAccess(targets: [String], card: CardIdentity?)
@@ -131,7 +128,6 @@ public enum FaceAct: Codable, Sendable {
     case excludeActivityApp(bundleID: String, confirmed: Bool)
     case removeActivityExclusion(bundleID: String)
     case wipeActivity(confirmed: Bool)
-    case setInboxTrigger(name: String, enabled: Bool)
     case createBackup(reason: String)
     case restoreBackup(id: String, confirmed: Bool)
     case createProductionExport(support: Bool)
@@ -153,7 +149,6 @@ public enum FaceAct: Codable, Sendable {
     case savePersonaProfile(PersonalityProfile)
     case savePersonaName(String)
     case savePersonaDocument(id: String, content: String, append: Bool, expectedContent: String? = nil)
-    case createStarterPersona(StarterPersonaRequest)
     case onboarding(OnboardingAct)
     case cognition(CognitionAct)
     case runDream
@@ -222,7 +217,6 @@ public enum CognitionAct: Codable, Sendable {
     case setCapsuleEnabled(Bool)
     case setBackgroundEnabled(Bool)
     case setReflectionBudget(Int)
-    case setLane(name: String, enabled: Bool)
 }
 
 public enum VoiceAct: Codable, Sendable {

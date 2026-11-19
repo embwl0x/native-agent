@@ -11,7 +11,7 @@ import Privacy
 import StandingBots
 import TurnTrace
 import MacControl
-// Blueprint: | `AgentConversationSession.swift` | Conversation admission, approval replay, inline observation and one send settlement. |
+// Blueprint: | `AgentConversationSession.swift` | Contact dispatch and queued continuation preserve turn steering at message birth |
 
 /// Approval execution retains the original exchange and all ordinary gates.
 public enum AgentConversationApproval {
@@ -89,14 +89,17 @@ package enum AgentConversationSession {
         input: [String: JSONValue], surface: String,
                          scope: String, dataRoot: URL, reservation: String? = nil,
                          perform: @escaping Dispatch) async throws -> JSONValue {
-        // A job is the agent's commission, not a conversation: reading or stopping one names it in `job`, as agent.apply and agent.discard do.
         if tool == "agent_read" || tool == "agent_cancel", let id = input["job"]?.stringValue {
             return try await AgentJobs.answer(tool: tool, id: id, agent: input["agent"]?.stringValue, dataRoot: dataRoot)
         }
-        if tool == "agent_read" || tool == "agent_cancel", input["agent"]?.stringValue == nil {
-            throw ToolFailureError("Name the agent whose conversation this is, or job for a job's id.", argumentPath: "agent", effects: .none)
-        }
         var input = input
+        if tool == "agent_read" || tool == "agent_cancel", input["agent"]?.stringValue == nil {
+            guard tool == "agent_read", let id = input["conversation_id"]?.stringValue, let row = AgentConversationStore.conversation(id, scope: scope,
+                in: try AgentConversationStore(dataRoot: dataRoot).records()) else {
+                throw ToolFailureError("Name the agent whose conversation this is, or job for a job's id.", argumentPath: "agent", effects: .none)
+            }
+            input["agent"] = .string(row.agent)
+        }
         if tool == "agent_message" {
             try AgentMessageFiles.requireSupported(conversation: conversation, input, dataRoot: dataRoot)
             if try AgentMessageFiles.paths(input["files"]).isEmpty { input.removeValue(forKey: "files") }
@@ -230,7 +233,7 @@ package enum AgentConversationSession {
             args.removeValue(forKey: "limit"); args.removeValue(forKey: "offset")
         }
         // Resolve thread IDs to the same visible conversation, queue and history as names.
-        if !dot, tool == "agent_message", label == nil, !fresh, let conversation = string(args["conversation_id"]),
+        if !dot, tool == "agent_message" || tool == "agent_read", label == nil, !fresh, let conversation = string(args["conversation_id"]),
            string(args["message_id"]) == nil, string(args["task_id"]) == nil {
             let rows = (try? records.get()) ?? []
             label = rows.filter { $0.agent == agent && $0.conversationID == conversation }
@@ -243,6 +246,10 @@ package enum AgentConversationSession {
             "include_artifacts", "status_timestamp_after", "limit", "offset"]
         if !dot, reservation == nil, args.contains(where: { advanced.contains($0.key) && $0.value != .string("")
             && !(tool == "agent_read" && label != nil && ["limit", "offset"].contains($0.key)) }) {
+            if tool == "agent_read", label != nil, let row = try pinned.record ?? store.find(scopeSessionID: scope, agent: agent, label: label, in: records.get()),
+               [nil, row.conversationID].contains(string(args["conversation_id"])) {
+                args["conversation_id"] = row.conversationID.map(JSONValue.string); label = nil
+            }
             guard label == nil, !fresh, historyBefore == nil, historyExchange == nil else { throw AgentConversationStore.Failure(
                 message: "Choose either a conversation name or exact protocol identifiers, not both.") }
             if tool == "agent_message" {
@@ -254,7 +261,7 @@ package enum AgentConversationSession {
             }
             let exact = try await perform(tool, args, turn, conversation, mac)
             if tool == "agent_read" {
-                consumeRead(exact, peer: peer, message: string(args["message_id"]), scope: scope, conversation: conversation, dataRoot: dataRoot)
+                consumeRead(exact, turn: turn, peer: peer, message: string(args["message_id"]), scope: scope, conversation: conversation, dataRoot: dataRoot)
             }
             return exact
         }
@@ -320,7 +327,7 @@ package enum AgentConversationSession {
             let refreshed = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform)
             let readView = AgentConversationView.view(refreshed, details: args["details"] == .bool(true), read: true, dataRoot: dataRoot,
                         historyBefore: historyBefore, historyExchange: historyExchange, includeHistory: conversation.returnsHistory)
-            consumeRead(readView, peer: peer, message: string(refreshed.readInput?["message_id"]), scope: scope, conversation: conversation,
+            consumeRead(readView, turn: turn, peer: peer, message: string(refreshed.readInput?["message_id"]), scope: scope, conversation: conversation,
                             dataRoot: dataRoot)
             return readView
         }
@@ -379,7 +386,7 @@ package enum AgentConversationSession {
                                   personInitiated: turn.personInitiatedSend?.matches(args) == true,
                                   supersedeWaiting: supersedeWaiting,
                                   expectsReply: expectsValue != .bool(false),
-                                  reservation: reservation, messageID: messageID)
+                                  reservation: reservation, messageID: messageID, steeredBy: turn.steeringStamp())
         if let messageID { args["message_id"] = .string(messageID) }
         // A routine has one conversation, whichever chat asks; the send derives it, so none is carried.
         if let conversation = row.conversationID, !conversation.isEmpty,
@@ -426,7 +433,7 @@ package enum AgentConversationSession {
             label: nil, record: nil, fresh: true, sourceSurface: surface,
             fingerprint: peer.map(AgentConversationStore.routeFingerprint), replyRoute: replyRoute,
             message: string(args["text"]), personInitiated: turn.personInitiatedSend?.matches(args) == true,
-            expectsReply: args["expects_reply"] != .bool(false), messageID: messageID)
+            expectsReply: args["expects_reply"] != .bool(false), messageID: messageID, steeredBy: turn.steeringStamp())
         // An approval replay may run outside this send's live task context.
         var args = args
         if peer?.transport == .grokBot, let messageID { args["message_id"] = .string(messageID) }
@@ -465,7 +472,7 @@ package enum AgentConversationSession {
                 running.unwatch(row.id)
                 watching = false
             } } catch {
-                throw await oweSettlement(error, stage: "release inline waiter", original: original,
+                throw await oweSettlement(error, turn: turn, stage: "release inline waiter", original: original,
                     row: row, store: store, dataRoot: dataRoot)
             }
         }
@@ -484,7 +491,7 @@ package enum AgentConversationSession {
         // Adopt the accepted operation immediately; an explicit inline wait observes this owner without racing its admission.
         if reservation == nil, let peer, liveReply || peer.ability != nil || [.acp, .mcpHost, .nativeAgent].contains(peer.transport) {
             AgentConversationWatches.begin(row: row.id, operation: row.operationID)
-            var running: [String: JSONValue] = ["status": .string("running"), "sent": .null, "completed": .bool(false),
+            var running: [String: JSONValue] = ["status": .string("waiting"), "sent": .null, "completed": .bool(false),
                 "background_send": .bool(true), "delivery": .string("unconfirmed")]
             if let conversation = row.conversationID { running["conversation_id"] = .string(conversation) }
             AgentConversationRunning.shared.conclude(row: row.id, operation: row.operationID) {
@@ -499,12 +506,12 @@ package enum AgentConversationSession {
             do {
                 shown = try store.update(id: row.id, operationID: row.operationID) {
                     guard $0.phase == "sending" else { return }
-                    $0.receipt = .object(running); $0.readInput = nil
+                    $0.receipt = .object(running)
                     $0.phase = "waiting"
                     $0.automaticRead = false; $0.nextReadAt = nil; $0.selected = true; $0.shownInline = nil
                 }
             } catch {
-                throw await oweSettlement(error, stage: "publish waiting", original: .object(running),
+                throw await oweSettlement(error, turn: turn, stage: "publish waiting", original: .object(running),
                     row: row, store: store, dataRoot: dataRoot)
             }
             let current: AgentConversationRecord
@@ -528,7 +535,7 @@ package enum AgentConversationSession {
         do {
             try await waitInline(row: row, store: store, until: deadline)
         } catch {
-            throw await oweSettlement(error, stage: "read inline reply", original: receipt,
+            throw await oweSettlement(error, turn: turn, stage: "read inline reply", original: receipt,
                 row: row, store: store, dataRoot: dataRoot)
         }
         store.held.carry(row.operationID)
@@ -621,7 +628,7 @@ package enum AgentConversationSession {
                             nativeLog("Conversation retention reread failed: %@", error.localizedDescription)
                         }
                     }
-                    let failure = await oweSettlement(retentionError, stage: "retain reply", original: receipt,
+                    let failure = await oweSettlement(retentionError, turn: turn, stage: "retain reply", original: receipt,
                         row: row, store: store, dataRoot: dataRoot)
                     await hub.settle(live, state: "failed", note: failure.localizedDescription)
                     return .failure(failure)
@@ -654,7 +661,7 @@ package enum AgentConversationSession {
                     }
                 }
                 } catch let storageError {
-                    return .failure(await oweSettlement(storageError, stage: "settle failure or Stop",
+                    return .failure(await oweSettlement(storageError, turn: turn, stage: "settle failure or Stop",
                         original: operationEvidence(outcome), row: row, store: store, dataRoot: dataRoot))
                 }
                 if stopped.stop?.state == "stopped" {
@@ -681,7 +688,7 @@ package enum AgentConversationSession {
                     perform: dispatch)
             }
         } catch {
-            throw await oweSettlement(error, stage: "read queued work", original: .object(["operation": operationEvidence(outcome),
+            throw await oweSettlement(error, turn: turn, stage: "read queued work", original: .object(["operation": operationEvidence(outcome),
                 "settlement": operationEvidence(result)]),
                 row: row, store: store, dataRoot: dataRoot)
         }
@@ -742,13 +749,13 @@ package enum AgentConversationSession {
     }
 
     /// The send is never replayed to repair storage. Keep its original result and the exact failing transition in the existing repair-owed owner.
-    private static func oweSettlement(_ error: Error, stage: String, original: JSONValue,
+    private static func oweSettlement(_ error: Error, turn: Turn, stage: String, original: JSONValue,
                                       row: AgentConversationRecord, store: AgentConversationStore, dataRoot: URL) async -> ToolFailureError {
         let words = "Conversation \(row.id), operation \(row.operationID), \(stage): " + error.localizedDescription
             + ". Original operation outcome: " + NativeAgentSecretRedactor.redactText(String(describing: original))
         let next = ToolFailureError.call("app", ["action": .string("agent.read"),
             "args": .object(["agent": .string(row.agent), "conversation": .string(row.id)])])
-        await RepairOwed.owe(dataRoot, id: row.operationID + ":" + stage, kind: .message,
+        await RepairOwed.owe(dataRoot, id: row.operationID + ":" + stage, kind: .message, steeredBy: turn.steeringStamp(),
             operation: "agent.settlement:" + row.operationID + ":" + stage, owner: store.fileURL.path,
             words: words, lever: "Repair conversation storage, then reconcile this exact operation; never resend it to repair bookkeeping.",
             nextCall: next).value

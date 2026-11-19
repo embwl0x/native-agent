@@ -20,8 +20,16 @@ struct AgentA2AGRPCEndpoint: Lf_A2a_V1_A2AService.StreamingServiceProtocol {
             guard values.count <= 1 else { throw RPCError(code: .unauthenticated, message: "Unauthorized") }
             headers[key] = values.first
         }
-        let (admission, principal) = AgentContactRoutes.admit(headers: headers, liveToken: liveToken,
-            dataRoot: dataRoot, readCredential: readCredential)
+        let admission: BridgeAuthDecision
+        let principal: AgentBridgePrincipal
+        do {
+            (admission, principal) = try AgentContactRoutes.admit(headers: headers, liveToken: liveToken,
+                dataRoot: dataRoot, readCredential: readCredential)
+        } catch {
+            nativeLog("A2A caller identity store could not be read: %@", error.localizedDescription)
+            throw RPCError(code: .unavailable,
+                message: "The saved contacts could not be read. Repair agents/peers.json before using the bridge.")
+        }
         switch admission {
         case .serverStopping: throw RPCError(code: .unavailable, message: "Server stopping")
         case .unauthorized: throw RPCError(code: .unauthenticated, message: "Unauthorized")

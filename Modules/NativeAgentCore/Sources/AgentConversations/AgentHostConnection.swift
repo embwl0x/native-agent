@@ -214,8 +214,11 @@ public enum AgentHostConnection {
         let location = row.format == .codexTOML ? row.expandedConfigPath : AgentHostDirectory.expand(row.messagingPermissionsPath!)
         let removal = row.format == .codexTOML ? "Disconnect removes this entry and its messaging allowance."
             : "Disconnect removes only allowances added here; existing Ask/Deny rules are never overridden."
+        let tools = row.format == .codexTOML
+            ? "this connection's MCP tools: agent_message, agent_reply and agent_desk (Desk reads still require your Desk switch)"
+            : "only this connection's agent_message and agent_reply MCP tools"
         return """
-            \nMessaging permissions (\(location)): allow only this connection's agent_message and agent_reply MCP tools, so this agent can message \
+            \nMessaging permissions (\(location)): allow \(tools), so this agent can message \
             \(agentName) without being asked each time. \(removal)
             """
     }
@@ -258,8 +261,7 @@ public enum AgentHostConnection {
         -> (contact: AgentPeerContact, outcome: AgentHostConfigWriter.Outcome, permissionsChanged: Bool) {
         let configuration = AgentHostConfigWriter.Operation()
         // Both doors hold the settings path through mint, splice, receipts and save.
-        return try CredentialFileLock.withLock(URL(fileURLWithPath: proposal.row.expandedConfigPath.isEmpty
-            ? backupRecordURL(row: proposal.row, store: store).path : proposal.row.expandedConfigPath)) {
+        return try CredentialFileLock.withLock(configurationLock(row: proposal.row, store: store)) {
             var proposal = proposal
             proposal.existing = try store.list().first {
                 if let existing = proposal.existing { return $0.endpoint == existing.endpoint && $0.id == existing.id }
@@ -316,10 +318,13 @@ public enum AgentHostConnection {
                     return (contact, AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false), false)
                 }
                 if var contact = proposal.existing {
+                    let saved = try AgentPeerCredentials.read(peerID: contact.id)
                     contact.acpExecutable = proposal.executable
                     contact.approvedExecutablePath = proposal.executable?.path
                     contact.acpWorkingDirectory = proposal.workingDirectory.path
+                    contact.credentialKey = AgentPeerContact.credentialKey(for: contact.id)
                     contact = try store.upsert(contact, resetProof: true)
+                    if saved == nil { try AgentPeerCredentials.write(try mintKey(), peerID: contact.id) }
                     return (contact, AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false), false)
                 }
             } else if var contact = proposal.existing {
@@ -336,6 +341,7 @@ public enum AgentHostConnection {
                     permissionsChanged = try ensureMessagingPermissions(configuration: configuration, contact: contact, store: store)
                     let outcome = try writeEntry(configuration: .init(repairingPeer: contact.id), proposal, secret: secret, store: store)
                     if saved != nil, outcome.backupPath != nil { contact = try store.upsert(contact, resetProof: true) }
+                    if ChatGPTDotIPCTransport.owns(contact) { ChatGPTDotIPCTransport.reconnect() }
                     return (contact, outcome, permissionsChanged)
                 }
                 catch {
@@ -370,6 +376,7 @@ public enum AgentHostConnection {
                 do {
                     let permissionsChanged = try ensureMessagingPermissions(configuration: configuration, contact: contact, store: store)
                     _ = try store.upsert(contact)
+                    if ChatGPTDotIPCTransport.owns(contact) { ChatGPTDotIPCTransport.reconnect() }
                     return (contact, outcome, permissionsChanged)
                 }
                 catch {
@@ -432,7 +439,7 @@ public enum AgentHostConnection {
             let proposal = try propose(name: name, store: store, dataRoot: dataRoot, workspace: workspace)
             host = proposal.existing.map { "peer:" + $0.id } ?? proposal.row.id
             checked = "agents/recipes/\(proposal.row.id).json host.configPath=\(proposal.row.expandedConfigPath), host.format=\(proposal.row.format.rawValue)"
-            return try CredentialFileLock.withLock(URL(fileURLWithPath: proposal.row.expandedConfigPath)) {
+            return try CredentialFileLock.withLock(configurationLock(row: proposal.row, store: store)) {
                 let secret: String
                 if let peer = proposal.existing {
                     guard let saved = try AgentPeerCredentials.read(peerID: peer.id) else {
@@ -495,6 +502,7 @@ public enum AgentHostConnection {
             let repaired = try AgentHostConfigWriter.ensureEnvironment(configuration: configuration, path: proposal.row.expandedConfigPath,
                 descriptorPath: proposal.descriptorPath, peerID: contact.id, secret: secret)
             let settled = saved == nil ? try store.upsert(contact, resetProof: true) : contact
+            if ChatGPTDotIPCTransport.owns(settled) { ChatGPTDotIPCTransport.reconnect() }
             return (settled, repaired || saved == nil)
         } catch {
             if saved == nil { try? AgentPeerCredentials.delete(peerID: contact.id) }
@@ -529,8 +537,7 @@ public enum AgentHostConnection {
             try AgentDiscoveryOffer.write(offers, root)
         }
         // Revoking our credential never depends on proving ownership of another application's bytes. Keep the contact for cleanup recovery.
-        return try CredentialFileLock.withLock(URL(fileURLWithPath: row.expandedConfigPath.isEmpty
-            ? backupRecordURL(row: row, store: store).path : row.expandedConfigPath)) {
+        return try CredentialFileLock.withLock(configurationLock(row: row, store: store)) {
             try AgentPeerCredentials.delete(peerID: contact.id)
             let operation = "peer.cleanup:" + contact.id
             let outcome: AgentHostConfigWriter.Outcome
@@ -584,6 +591,13 @@ public enum AgentHostConnection {
     private static func permissionRecord(_ contact: AgentPeerContact, _ store: AgentPeerStore) -> URL {
         // Receipt namespaces stay stable across host types.
         store.fileURL.deletingLastPathComponent().appendingPathComponent("antigravity-\(contact.id)-permission-backups.json")
+    }
+
+    private static func configurationLock(row: AgentHostRow, store: AgentPeerStore) -> URL {
+        let identity = row.expandedConfigPath.isEmpty ? row.id
+            : URL(fileURLWithPath: row.expandedConfigPath).standardizedFileURL.resolvingSymlinksInPath().path
+        let key = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
+        return store.fileURL.deletingLastPathComponent().appendingPathComponent("host-config-" + key)
     }
 
     private static func backupRecordURL(row: AgentHostRow, store: AgentPeerStore) -> URL {

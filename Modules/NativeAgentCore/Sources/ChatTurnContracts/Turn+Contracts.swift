@@ -144,6 +144,17 @@ extension Turn {
         get { self[PeerSteeringPart.self] }
         set { self[PeerSteeringPart.self] = newValue }
     }
+    public func steeringStamp(sources: [String] = []) -> [String] {
+        var sources = sources + (peerSteering?.checkpointSources ?? []) + (peerSteering?.elevatedSources ?? [])
+            + (origin?.peerSources ?? []) + (origin?.elevatedPeerSources ?? [])
+        let agents = [origin?.agent, envelope?.agent].compactMap { $0 }.filter { $0 != "self" }
+        sources += agents.map { $0.isEmpty ? "another agent" : $0 }
+        if originPrincipal.hasPrefix("agent:") { sources.append(String(originPrincipal.dropFirst(6))) }
+        if [origin?.surface, envelope?.surface].compactMap({ $0 }).contains(where: { $0.hasSuffix("-bridge") }) {
+            sources.append(envelope?.verifiedUserId.map { "peer:" + $0 } ?? agents.first ?? "another agent")
+        }
+        return Array(Set(sources.map { $0.isEmpty ? "unknown" : $0 })).sorted()
+    }
     /// Where the turn's tool notices go.
     public var notices: (@Sendable (String, String) async -> Void)? {
         get { self[NoticesPart.self] }

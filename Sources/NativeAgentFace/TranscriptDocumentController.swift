@@ -21,7 +21,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
     struct Live {
         let messageID: String
         var pacer = ChatStreamPacer()
-        var target: String
         var glyphs: String
         var cuts: [String: [TranscriptRevealCut]]
         var revealed = 0
@@ -80,10 +79,8 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
     /// Where laying out the whole document has reached, as a character offset; nil once every paragraph has its real position.
     private var layoutOffset: Int?
     private var layoutPassOwed = false
-    private var layoutStarted = CACurrentMediaTime()
     private var selfMoving = false
     private var liveScrolling = false
-    private var openingStarted = CACurrentMediaTime()
     private var firstPaintOwed = true
     private var completeDocument = false
     private var completeRequested = false
@@ -244,7 +241,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
                         model.waitingForCompleteDocument = false
                     }
                 }
-                transcriptLog("reader.act.failed reader=%@", reader.uuidString)
             }
         }
         actTask = task
@@ -257,7 +253,7 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
 
     private func submitReader() {
         guard !quiet, appModel != nil, !sessionID.isEmpty, !readerRequested, clip.bounds.height > 0, textView.frame.width > 0 else { return }
-        let font = TranscriptRenderer(width: pressWidth, scale: scale).font(ShellType.captionSize)
+        let font = NSFont.systemFont(ofSize: (ShellType.captionSize * scale).rounded(), weight: .regular)
         let line = max(1, font.ascender - font.descender + font.leading)
         guard let count = Int(exactly: ceil(clip.bounds.height / line)) else {
             model.pressIssue = "The transcript viewport has an invalid height. Resize the window."
@@ -288,7 +284,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
         heldHeight = nil
         layoutOffset = nil
         liveScrolling = false
-        openingStarted = CACurrentMediaTime()
         firstPaintOwed = true
         completeDocument = false
         completeRequested = false
@@ -378,11 +373,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
         return documentEnd(last) - readingBottom <= 1 || textView.frame.height - readingBottom <= 1
     }
 
-    private var endStatus: String {
-        guard let reached = reachesEnd else { return "unknown" }
-        return reached ? "yes" : "no"
-    }
-
     private func scroll(toOriginY y: CGFloat) {
         let clamped = min(max(y, -scrollView.contentInsets.top), maxOriginY)
         clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: clamped))
@@ -410,12 +400,7 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
 
     private func readerDidMove() {
         guard let reached = reachesEnd else { didMove(); return }
-        let wasFollowing = following
         following = reached
-        if following != wasFollowing {
-            transcriptLog("reader.scroll session=%@ following=%@ elapsed_ms=%.1f", String(sessionID.suffix(12)), following ? "yes" : "no",
-                          (CACurrentMediaTime() - openingStarted) * 1_000)
-        }
         if following, !liveScrolling { landAtEnd() }
         if readingTop <= clip.bounds.height { requestCompleteDocument() }
         didMove()
@@ -486,7 +471,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
     /// turn of the run loop, in its default mode so a scroll or a key always goes first.
     private func layOutDocument(fromBlock block: Int) {
         guard let start = starts().indices.contains(block) ? start(block) : starts().last else { return }
-        if layoutOffset == nil { layoutStarted = CACurrentMediaTime() }
         layoutOffset = min(layoutOffset ?? start, start)
         advanceDocumentLayout()
     }
@@ -500,10 +484,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
             return CACurrentMediaTime() < deadline
         }
         layoutOffset = reached > offset && reached < storage.length ? reached : nil
-        guard layoutOffset == nil else { return }
-        transcriptLog("layout.done session=%@ blocks=%ld usage=%.0f end=%.0f view=%.0f elapsed_ms=%.1f", String(sessionID.suffix(12)), shown.blocks.count,
-                      layout.usageBoundsForTextContainer.height, lastFragmentFrame(ensuringLayout: false).map { documentEnd($0) } ?? 0,
-                      textView.frame.height, (CACurrentMediaTime() - layoutStarted) * 1_000)
     }
 
     private func continueDocumentLayout() {
@@ -555,10 +535,7 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
             while let end = measuredEnd(), hold(end: end) {
                 changed = true
                 passes += 1
-                guard passes < 8 else {
-                    transcriptLog("end.unsettled session=%@ end=%.0f", String(sessionID.suffix(12)), end)
-                    break
-                }
+                guard passes < 8 else { break }
                 layout.textViewportLayoutController.layoutViewport()
             }
             guard changed else { return }
@@ -635,9 +612,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
             pendingOpen = false
             following = true
             landAtEnd()
-            transcriptLog("open session=%@ blocks=%ld clip=%.0f document=%.0f reachesEnd=%@ elapsed_ms=%.1f", String(sessionID.suffix(12)),
-                          shown.blocks.count, clip.bounds.height, textView.frame.height, endStatus,
-                          (CACurrentMediaTime() - openingStarted) * 1_000)
         }
         if let asked = pendingReveal { reveal(asked) }
         didMove()
@@ -655,10 +629,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
         noteFirstRender()
         guard firstPaintOwed, !pendingOpen, !shown.blocks.isEmpty, let script = appliedScript else { return }
         firstPaintOwed = false
-        let end = lastFragmentFrame(ensuringLayout: false).map { documentEnd($0) - readingBottom <= 1 ? "yes" : "no" }
-        transcriptLog("first.paint session=%@ reader=%@ script=%@ blocks=%ld elapsed_ms=%.1f reachesEnd=%@",
-                      String(sessionID.suffix(12)), readerID.uuidString, script.uuidString, shown.blocks.count,
-                      (CACurrentMediaTime() - openingStarted) * 1_000, end ?? "unknown")
         send(.transcriptReceipt(reader: readerID, receipt: .painted(script: script)))
     }
 
@@ -756,9 +726,10 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
                     separator: NSAttributedString(paragraph.separator, including: TranscriptAttributes.self),
                     hidden: NSAttributedString(paragraph.hidden, including: TranscriptAttributes.self))
             }
+            let previousReveal = live?.cuts.keys.map { $0 } ?? []
             if let line = packet.live {
                 if live?.messageID != line.rowID {
-                    live = Live(messageID: line.rowID, target: line.text, glyphs: line.glyphs, cuts: line.cuts, streaming: line.streaming)
+                    live = Live(messageID: line.rowID, glyphs: line.glyphs, cuts: line.cuts, streaming: line.streaming)
                 } else if var live {
                     retarget(&live, line)
                     live.cuts = line.cuts
@@ -798,15 +769,12 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
                 continueDocumentLayout()
                 for key in gone { native[key] = nil; hiddenLive.remove(key) }
                 attachments.forget(gone)
-                transcriptLog("press.apply session=%@ reader=%@ script=%@ base=%@ edits=%ld removed=%ld inserted=%ld complete=%@",
-                    sessionID, id.uuidString, packet.id.uuidString, packet.base?.uuidString ?? "nil",
-                    changed.count, changed.reduce(0) { $0 + $1.removed }, changed.reduce(0) { $0 + $1.inserted.count },
-                    packet.complete ? "yes" : "no")
             }
             appliedScript = packet.id
             completeDocument = packet.complete
             model.waitingForScript = false
             send(.transcriptReceipt(reader: id, receipt: .applied(script: packet.id)))
+            applyReveal(including: previousReveal)
             paceLive()
             if pendingOpen { open() }
             placeHostedViews()
@@ -999,7 +967,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
             live.pacer = ChatStreamPacer()
             live.revealed = line.glyphs.utf8.count
         }
-        live.target = line.text
         live.glyphs = line.glyphs
     }
 
@@ -1063,9 +1030,9 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
     }
 
     /// One storage splice appends prepared glyphs, retaining intervening text when it crosses paragraphs.
-    private func applyReveal() {
+    private func applyReveal(including previousReveal: [String] = []) {
         var edits: [RevealEdit] = []
-        for key in Set(live?.cuts.keys.map { $0 } ?? []).union(hiddenLive) {
+        for key in Set(live?.cuts.keys.map { $0 } ?? []).union(previousReveal).union(hiddenLive) {
             guard let position = index[key], lengths.indices.contains(position), shown.blocks.indices.contains(position),
                   let paragraph = native[key] else { continue }
             let wasHidden = hiddenLive.contains(key)
@@ -1150,7 +1117,6 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
 
     /// A fold headline's link toggles its run; every other link opens as the system opens it.
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
-        transcriptLog("link.press at=%ld fold=%@", charIndex, TranscriptFoldLink.group(link) ?? "-")
         guard let group = TranscriptFoldLink.group(link) else { return false }
         setFold(group, open: !folds.openFolds.contains(group))
         return true
@@ -1319,7 +1285,7 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
     }
 
     private func setHover(_ hover: TranscriptHover?, code: TranscriptCodeCopy?) {
-        if hover == nil { hoverReach = nil }
+        if hover == nil { hoverReach = nil; model.barHovered = false }
         if model.hover != hover { model.hover = hover }
         if model.codeCopy != code { model.codeCopy = code }
     }

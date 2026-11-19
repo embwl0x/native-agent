@@ -52,8 +52,10 @@ marked as app or script paths.
   subjects), never a second record-sum. The record (`Experiences`) holds what
   happened and what each thought attended; the field holds what gathers.
 - **The agent thinks when its mind is worth a thought:** a message opens a
-  turn, an owed happening opens a thought at once, and the field ignites a
-  thought where drive reaches one. Nothing else opens one: no tick, no timer,
+  turn, an owed happening opens a thought at once (an owed queue moment whose
+  thought failed is offered again on the one clock: 1, 2, 4… then every 30
+  minutes), and the field ignites a thought where drive reaches one. Nothing
+  else opens one: no tick, no timer,
   no rest streak, no pacing
   ([Subconscious](SUBCONSCIOUS.md#attention)).
 - **Canonical memory and persona stay separate:** cognitive references,

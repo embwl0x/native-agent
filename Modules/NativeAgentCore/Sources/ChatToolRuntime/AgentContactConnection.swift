@@ -1,4 +1,5 @@
 import AgentWorkspace
+import AgentConversations
 import AuthoredCapabilities
 #if canImport(AppKit)
 import AppKit
@@ -39,8 +40,9 @@ extension SwiftToolDispatcher {
     static func checkedPeerReadout(_ id: String, store: AgentPeerStore) -> (contact: JSONValue, fields: [String: JSONValue]) {
         do {
             let snapshot = try checkedPeerSnapshot(id, store: store)
-            let state = try currentPeerState(snapshot.contact, peers: snapshot.peers)
-            let contact = peerProjection(snapshot.contact, peers: snapshot.peers)
+            let credentials = AgentPeerCredentials.credentialReads(snapshot.peers)
+            let state = try currentPeerState(snapshot.contact, credentials: credentials)
+            let contact = peerProjection(snapshot.contact, credentials: credentials)
             let detail = state == .unavailable ? state.detail : AgentContactHealth.checkIn(snapshot.contact)?.detail ?? state.detail
             return (contact, ["state": .string(state.rawValue), "state_detail": .string(detail), "contact": contact])
         } catch {

@@ -10,20 +10,13 @@ public enum MoonshotModelCatalog {
 
     /// The cache owns credential binding and publication; Moonshot owns the wire format.
     static let cache = ModelCatalogCache(
+        route: "moonshot",
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
         readCache: { try readDecodedCache(dataRoot: $0) },
         credential: .apiKey(providerConfigFile: "moonshot.json"),
         fetchLive: { ModelCatalogFetch(models: try await fetchLiveModels(key: $0, session: $1), isComplete: true) }
     )
-
-    public static func models(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        session: URLSession = ProviderHTTP.session,
-        refresh: Bool = false
-    ) async -> [ProviderModelInfo] {
-        await cache.models(dataRoot: dataRoot, session: session, refresh: refresh)
-    }
 
     /// Discovery provenance must say whether the network was reached.
     public static func modelsWithFreshness(
@@ -102,13 +95,12 @@ public enum MoonshotModelCatalog {
         }
     }
 
-    /// The live catalog states no reasoning contract: a model's controls are its declared row's. An id with no row has unknown controls.
     public static func defaultReasoningEffort(for modelID: String) -> String? {
-        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.defaultReasoningEffort
+        FirstPartyModelDiscovery.nearestSibling(of: modelID, route: "moonshot")?.defaultReasoningEffort
     }
 
     public static func supportedReasoningEfforts(for modelID: String) -> [String]? {
-        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.supportedReasoningEfforts
+        FirstPartyModelDiscovery.nearestSibling(of: modelID, route: "moonshot")?.supportedReasoningEfforts
     }
 
     private static func controlsNote(for modelID: String) -> String? {

@@ -26,12 +26,6 @@ enum TodayMetrics {
     static let contentWidth: CGFloat = 920
     static let cardRadius: CGFloat = 12
     static let topPadding = NativeAgentSpacing.pageTop
-    /// Share row height so body length cannot disrupt timeline alignment.
-    static let rowContentHeight: CGFloat = 38
-    /// Title-only rows need no empty body line.
-    static let rowContentHeightSingle: CGFloat = 18
-    /// Bound words before rendering so truncation does not cut them mid-word.
-    static let rowLineLimit = 96
 }
 
 // MARK: - The full queues

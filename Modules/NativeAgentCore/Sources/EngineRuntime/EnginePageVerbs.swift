@@ -33,10 +33,13 @@ struct PageKeyAction {
 extension NativeAgentEngine {
     /// The page buttons' host (`upkeep`) runs a verb the agent's pages declare (`AppActions.agentPageVerbs`) with its page owner's code, for
     /// the person's tap and the agent's call alike; who may run it was decided at the door. An owner's no comes back as its code and words.
-    @MainActor public func pageVerb(_ verb: String, input: [String: JSONValue]) async -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
+    @MainActor public func pageVerb(_ verb: String, input: [String: JSONValue], surface: String?) async
+        -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
         let effect: HostVerbEffect
         do {
-            guard let prepared = try await preparePageVerb(verb, input) else { return (false, "No upkeep button is called \(verb).", [:]) }
+            guard let prepared = try await preparePageVerb(verb, input, surface: surface) else {
+                return (false, "No upkeep button is called \(verb).", [:])
+            }
             effect = prepared
         } catch {
             var refusal = Self.prepareRefusal(error, verb: verb).objectValue ?? [:]
@@ -55,21 +58,21 @@ extension NativeAgentEngine {
 
     /// The gate's check before any card: the page verb's own `prepare`, its effect not run. Nil when every lookup holds, and for a verb that
     /// is not a page's.
-    @MainActor public func pageVerbFence(_ verb: String, input: [String: JSONValue]) async -> JSONValue? {
+    @MainActor public func pageVerbFence(_ verb: String, input: [String: JSONValue], surface: String?) async -> JSONValue? {
         do {
-            _ = try await preparePageVerb(verb, input)
+            _ = try await preparePageVerb(verb, input, surface: surface)
             return nil
         } catch { return Self.prepareRefusal(error, verb: verb) }
     }
 
     /// The page verbs' one switch: every lookup a verb needs (the value, item, review or helper it names, read now) throws its owner's
     /// refusal, or the verb's effect comes back to run. Nil for a verb that is not a page's.
-    @MainActor func preparePageVerb(_ verb: String, _ input: [String: JSONValue]) async throws -> HostVerbEffect? {
+    @MainActor func preparePageVerb(_ verb: String, _ input: [String: JSONValue], surface: String?) async throws -> HostVerbEffect? {
         switch verb {
         case "desk_refresh": return { [self] in await deskRefresh() }
         case "desk_remind": return try await deskRemind(input)
         case "desk_veto": return try await deskVeto(input)
-        case "memories_search": return try memoriesSearch(input)
+        case "memories_search": return try memoriesSearch(input, surface: surface)
         case "memories_refresh": return { [self] in try await memoriesRefresh() }
         case "memories_bring_back": return try await memoriesBringBack(input)
         case "graph_refresh":

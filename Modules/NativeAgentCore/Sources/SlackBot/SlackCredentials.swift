@@ -38,24 +38,11 @@ public enum SlackCredentials {
                 if let reference = try committedReference(dataRoot: dataRoot) {
                     return try grant(reference, dataRoot: dataRoot, allowMissing: allowMissingGrant && token == .app)[token.rawValue]
                 }
-                _ = try readMetadata(at: TransportAllowlist.slackMetadataPath(dataRoot: dataRoot))
-                return try readLegacy(token, dataRoot: dataRoot)
+                if try readMetadata(at: TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)) != nil,
+                   !(allowMissingGrant && token == .app) { throw Failure.unavailable }
+                return nil
             }
         }
-    }
-
-    /// Only installed-app inventory can establish absence in the data-protected Keychain.
-    private static func readLegacy(_ token: Token, dataRoot: URL) throws -> String? {
-        var request = query()
-        request[kSecAttrAccount as String] = rootAccount(dataRoot: dataRoot) + ":" + token.rawValue
-        request[kSecReturnData as String] = true
-        request[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(request as CFDictionary, &result)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data,
-              let value = String(data: data, encoding: .utf8), !value.isEmpty else { throw Failure.unavailable }
-        return value
     }
 
     /// One metadata/token snapshot, using the same lock order as save and revoke.

@@ -78,7 +78,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             .object([
                 "title": .string(Self.approvalTitle(
                     act: words.act,
-                    requester: Self.peerRequesterName(
+                    requester: try Self.peerRequesterName(
                         surface: surface,
                         peerID: origin["userId"]?.stringValue,
                         dataRoot: dataRoot
@@ -97,10 +97,10 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         return outcome.record
     }
 
-    public static func peerRequesterName(surface: String, peerID: String?, dataRoot: URL) -> String? {
+    public static func peerRequesterName(surface: String, peerID: String?, dataRoot: URL) throws -> String? {
         guard PeerTurnEffectPolicy.isPeerBridge(surface: surface),
               let peerID, !peerID.isEmpty,
-              let peer = try? AgentPeerStore(dataRoot: dataRoot).list()
+              let peer = try AgentPeerStore(dataRoot: dataRoot).list()
                 .first(where: { $0.id == peerID })
         else { return nil }
         let name = peer.name.trimmingCharacters(in: .whitespacesAndNewlines)

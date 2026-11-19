@@ -42,7 +42,7 @@ public struct TurnTraceRecentReader: Sendable {
     /// `now`'s whole day (with history, of every retained day through it), as a day's evidence read before. Holding selects kinds or turn ids
     /// after coverage is checked; `kinds` narrows the query itself. Trace names a turn's subject in the record.
     public func read(now: Date = Date(), history: Bool = false, since: Date? = nil, holding marks: [String] = [],
-                     trace: String? = nil, kinds: [String]? = nil) async throws -> Snapshot {
+                     trace: String? = nil, kinds: [String]? = nil, kindContains: String? = nil) async throws -> Snapshot {
         if let trace, NativeAgentChatSessionID.normalizedPathComponent(trace) != trace {
             throw PersistenceCoreError.ioFailure("trace must name a turn id in the record.")
         }
@@ -56,8 +56,10 @@ public struct TurnTraceRecentReader: Sendable {
             }
             through = dayEnd.addingTimeInterval(-0.001)
         }
-        let read = try await lane.events(.init(subjects: trace.map { [$0] }, kinds: kinds, from: from, through: through, limit: limit,
-                                               newestFirst: limit != nil))
+        var query = ExperienceStore.DetailQuery(subjects: trace.map { [$0] }, kinds: kinds, from: from, through: through, limit: limit,
+                                                newestFirst: limit != nil)
+        query.kindContains = kindContains
+        let read = try await lane.events(query)
         let first = try await lane.events(.init(through: now, limit: 1))
         let ordered = limit == nil ? read.events : Array(read.events.reversed())
         let events = ordered.filter { marks.isEmpty || marks.contains($0.kind) || marks.contains($0.turnId) }
@@ -230,7 +232,9 @@ public struct TurnTraceRecentReader: Sendable {
     public func usage(since: Date, now: Date = Date(), by: String = "model") async throws -> JSONValue {
         let evidence = try await traceEvidence(now: now, since: since)
         let snapshot = evidence.turns
-        let metrics = ["inputTokens", "cacheReadInputTokens", "outputTokens", "durationMs"]
+        let metrics = ["inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "cacheWriteInputTokens",
+                       "cacheWrite5mInputTokens", "cacheWrite1hInputTokens", "cacheWrite30mInputTokens", "cacheWrite12hInputTokens",
+                       "outputTokens", "durationMs"]
         let zero = Dictionary(uniqueKeysWithValues: (["calls"] + metrics).map { ($0, Int64(0)) })
         var totals = zero
         var groups: [String: [String: Int64]] = [:]
@@ -278,7 +282,8 @@ public struct TurnTraceRecentReader: Sendable {
             "limit_reached": .bool(snapshot.limitReached),
             "measurement": .string("""
                 Exact checked sums of recorded llm.call details, including standalone calls. missing_fields counts absent or null measurements; invalid \
-                domains or overflowing totals fail explicitly. Input and cached input are separate counters. Retention and read damage limit coverage.
+                domains or overflowing totals fail explicitly. Lifetime splits overlap their creation/write totals. Anthropic input excludes cache \
+                reads and creation; OpenAI input includes cached tokens. Retention and read damage limit coverage.
                 """),
             "totals": .object(counts(totals, missing: totalMissing)),
             "groups": .array(groups.sorted { $0.key < $1.key }.map { key, values in

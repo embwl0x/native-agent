@@ -61,7 +61,7 @@ struct AttentionState {
     var released = ScopedWaiter()
     /// An unfinished landing/record/claim stays this batch's work; a later admission finishes it before landing anything else.
     var batch: AttentionBatch?
-    /// Failed thoughts return their original payload as well as their drive. These are unsettled returns, not a second field snapshot.
+    /// Unsettled returns keep their original payload; failed thoughts return zero drive.
     var returns: [AttentionReturn] = []
 }
 
@@ -83,6 +83,7 @@ struct AttentionCrossing {
 
 struct AttentionReturn {
     let attended: Attended
+    let drive: Double
     let at: Date
     let once = "attention.restore:" + UUID().uuidString
     var restored = false
@@ -246,8 +247,16 @@ extension NativeCognitionRuntime: AttentionIntake {
                 break weighing
             case .worth(let worth, let said):
                 attentionSucceeded("weigh", subject: experience.id)
-                // A watch's news is worth its own match, never less than the one that opens a thought: the agent set the watch to see it.
-                weighed.append((experience, happening, care, happening.watchNews ? max(worth, 1) : worth, felt, said))
+                var firstWatchNews = happening.watchNews
+                if firstWatchNews, let watch = happening.watch {
+                    firstWatchNews = !weighed.contains { $0.happening.subject == happening.subject && $0.happening.watch == watch }
+                    do {
+                        if firstWatchNews {
+                            firstWatchNews = !(try await ExperienceStore.at(dataRoot).weighed(watch: watch, subject: happening.subject))
+                        }
+                    } catch { attentionFailed("weighed", subject: experience.id, error: error); continue }
+                }
+                weighed.append((experience, happening, care, firstWatchNews ? max(worth, 1) : worth, felt, said))
             }
         }
         guard !weighed.isEmpty else { return }
@@ -383,11 +392,12 @@ extension NativeCognitionRuntime: AttentionIntake {
         var remaining = attention.returns.count
         while remaining > 0, var returned = attention.returns.first {
             remaining -= 1
-            guard let node = returned.attended.node, let drive = returned.attended.drive else {
+            guard let node = returned.attended.node, returned.attended.drive != nil else {
                 attentionFailed("return", subject: returned.once,
-                    error: PersistenceCoreError.ioFailure("A failed thought's return has no node or drive"))
+                    error: PersistenceCoreError.ioFailure("An attention return has no node or drive"))
                 return false
             }
+            let drive = returned.drive
             if !returned.restored {
                 do {
                     if try await substrate.restoreDrive(node.key, drive) {
@@ -427,10 +437,10 @@ extension NativeCognitionRuntime: AttentionIntake {
               row: Data(try JSONValue.object(row).serialize(pretty: false).utf8), once: once)
     }
 
-    /// A failed thought returns exactly what it drained, after the current batch finishes.
-    public func restoreDrive(_ attended: Attended) async {
+    /// Return the original payload and the specified drive, zero on failure, after the current batch finishes.
+    public func restoreDrive(_ attended: Attended, returning drive: Double) async {
         guard attended.node != nil, attended.drive != nil else { return }
-        attention.returns.append(AttentionReturn(attended: attended, at: now()))
+        attention.returns.append(AttentionReturn(attended: attended, drive: drive, at: now()))
         guard await enterAttention() else { return }
         defer { leaveAttention() }
         _ = await finishAttention()

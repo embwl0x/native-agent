@@ -89,13 +89,7 @@ extension iCloudBridge {
         }
     }
 
-    nonisolated static func isTerminalChatTransaction(_ data: Data) throws -> Bool {
-        let row = try JSONDecoder().decode(ChatRecord.self, from: data)
-        guard row.direction == "mac_to_ios" || row.hasAdmission else { return false }
-        return ["completed", "failed_before_answer", "failed"].contains(row.state)
-    }
-
-    /// Both transports reserve the same canonical envelope before a turn starts.
+    /// Reserve the authenticated CloudKit envelope before a turn starts.
     nonisolated static func reserveChat(_ message: BridgeMessage, dataRoot: URL, canDispatch: Bool) async -> ChatAdmission {
         do {
             let digest = MacSyncSnapshotIntegrity.digest(try message.canonicalBodyForSigning())

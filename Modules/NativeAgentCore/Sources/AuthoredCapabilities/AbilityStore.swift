@@ -26,9 +26,8 @@ public struct AbilityStore: Sendable {
     nonisolated(unsafe) private static var depth = 0
     static let statistics: Set<String> = ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun",
         "lastCleanVersion", "runs", "corrections", "unavailableReason", "trial", "trials"]
-    static let obsolete: Set<String> = ["versionOwners", "bodyPath", "activePath", "proposalPath", "quarantinePath",
-        "rollbackCounterparts", "versionValidation", "builtIn", "registryPath", "sourceRoot", "versions", "previousVersion",
-        "failuresInARow", "lastCleanDigest", "seeded", "validation_evidence", "candidate_validation_evidence", "candidateReview", "keepReview"]
+    static let projections: Set<String> = ["activePath", "proposalPath", "versions", "previousVersion",
+        "validation_evidence", "candidate_validation_evidence", "keepReview"]
     static let pending: Set<String> = ["candidateDigest", "candidatePrior", "candidateSelection", "candidateValidation", "candidateOrigin", "validationErrors"]
     public init(dataRoot: URL) { self.dataRoot = dataRoot.standardizedFileURL }
     /// Catalog identity includes external edits and replacements, but not run accounting.
@@ -182,7 +181,7 @@ public struct AbilityStore: Sendable {
             }
             // The owner also checks a seed's candidate and seal here: changed authored bytes never become replaceable seeds.
             let same = try samePart(current)
-            guard Self.isSeed(current) || same, Self.seedIdentity(current) != Self.seedIdentity(file) else { return nil }
+            guard Self.isSeed(current) || same, !Self.isSeed(current) || Self.seedIdentity(current) != Self.seedIdentity(file) else { return nil }
             try CapabilityLifecycle.requireWrite(turn: turn)
             // Off is the ability's, not the bundle version's: it stays off, by whoever switched it.
             var file = file

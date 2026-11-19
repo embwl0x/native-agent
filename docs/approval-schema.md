@@ -1,13 +1,13 @@
 # NativeAgent Approval Action Schema
 
-Signed iOS action envelopes reach the in-process Swift runtime through iCloud
-Drive or the CloudKit device transport. `MacSyncEngine` owns transport
+Signed iOS action envelopes reach the in-process Swift runtime through the
+CloudKit device transport. `MacSyncEngine` owns transport
 validation and transaction recovery; `MacSyncActionRouter` dispatches actions.
 
 ## Inbox action envelope (iOS → Mac)
 
-The Drive lane writes `inbox/<msgId>.json` under the configured iCloud container.
-The current sender produces:
+The phone sends the envelope in a signed CloudKit `BridgeMessage` with
+`kind: icloud_action`. The current sender produces:
 
 ```json
 {
@@ -68,13 +68,12 @@ The chat autonomy gate validates its timeout before filing a request. A timeout
 must be finite, nonnegative and representable as UInt64 nanoseconds; unsupported
 values throw `AutonomyGateError.invalidApprovalTimeout` without creating a card.
 
-The Drive lane authenticates before consulting the transaction ledger.
-Unsigned or invalidly signed files are quarantined without reserving message,
+The CloudKit action receiver authenticates before consulting the transaction ledger.
+Unsigned or invalidly signed envelopes are refused without reserving message,
 response or transaction identities. A matching completed transaction returns
 retained evidence without executing again, even after the freshness window.
 Conflicting identities and unreadable ledger records fail closed.
-Freshness rejection handles only timestamps; Drive archives rejected work only
-after its signed refusal is durable. Unavailable pairing material stays retryable.
+Freshness rejection handles only timestamps. Unavailable pairing material stays retryable.
 
 Approval actions also pass `PairedPhoneStore` device authorization. A pending
 phone does not gain approval authority until paired on the Mac. Resolution
@@ -209,8 +208,10 @@ omitted access modes in retained cards remain readable. Inline replay requires
 the recorded originating envelope and `originTurnId`. Direct card filing requires
 the held turn and envelope and uses them for continuation stamping and the transcript
 row. Both card writers share that stamp; the phone signature witness binds the
-originating act along with the envelope and replay input. The envelope codec
-retains `declaredRemote` as provenance (a Boolean or absent), never a saved
+originating act along with the envelope and replay input. Minting and verification
+read existing pairing material only; neither creates it. Key-read failures throw:
+minting stops card filing, and continuation retains the cause on the retryable card.
+The envelope codec retains `declaredRemote` as provenance (a Boolean or absent), never a saved
 signature verdict; malformed remoteness makes the envelope unavailable. A missing act or
 origin refuses continuation with the card left retryable; there is no reconstruction
 from the answering turn. Only the matching act in the same session can receive
@@ -237,8 +238,15 @@ originating conversation. Existing records are neither repaired nor rewritten
 to invent that evidence. These are additive optional fields; existing phone
 decoders and their five mode IDs stay unchanged. Approval person origins use
 `chat` for the Mac and `ios` for the phone; `app` is not an origin alias.
-Expiry settlement joins the approval's queued experience projection, whose owner
-reports persistence gaps while the unmet obligation remains owed.
+Pending approvals have no age deadline. When an authored body's live host-call
+subscription ends, only card IDs recorded at filing for its exact payload
+`hostCallID` are resolved with decision `canceled`; a concurrent answer keeps its
+decision. Calls that filed no cards perform no cleanup store read. Cleanup
+failures owe `RepairOwed` for the exact card and preserve the call's own outcome.
+Cards without that host-call identity, including durable proposals and ordinary
+nonblocking chat approvals, stay pending until answered or explicitly cancelled.
+Decision settlement joins the approval's queued experience projection, whose
+owner reports persistence gaps while the unmet obligation remains owed.
 Mac Control permission descriptors read the checked saved Trust authority.
 Unreadable or invalid policy makes the existing card unavailable with the
 policy path and owner repair instruction; it never appears as a saved Safe
@@ -246,7 +254,9 @@ or Workspace posture. Cards cannot change the person's Trust posture.
 
 Approval payload `peer` and authored-run `steer` records require both `sources`
 and `elevated` arrays of nonempty principal strings. Valid empty arrays record
-an unsteered run; missing or malformed records refuse restoration. Inline
+an unsteered run; absent or malformed records refuse restoration. Both peer-card answers save `decision: "approved"`.
+**Just this** runs one call; **For this task** saves `scope: "task"`, elevating only untrusted, unelevated carried peers when restored. Absent scope means Just this;
+Approve alone means Just this; after-card peers keep their floor. Inline
 continuations likewise require recorded `peerSources` and
 `elevatedPeerSources`. A refusal preserves the saved work and its unresolved
 obligations, reports the unavailable provenance, and runs no continuation;
@@ -276,19 +286,34 @@ authority. Conversation approval waits read that inbox using their conversation'
 data root. Continuation ownership lives in the approval row alone; transcript
 receipt metadata does not claim it. The empty retired approval-store importer
 has been removed.
+Stored approval statuses are `pending` and `resolved`; a resolved row carries
+its separate `approved`, `denied` or `canceled` decision. Other status spellings
+are malformed evidence. Remote resolution requires the filer's explicit flag
+or the action's declared owner-review authority; there is no action-name allowlist.
+An unreadable peer-contact store fails filing before a card can lose its
+requester's attribution. Missing REM proposal identity or reviewed text and an
+empty kind-backfill proposal list settle as refused with no effects, through
+the execution owner's retained receipt. Storage and execution failures remain
+owed to their owners. Inline presentation carries only live card kinds and
+retry controls; it has no separate confirmation/work kind or Stop field.
 Chat replay accepts only `chat_tool_approval` payloads with canonical origin
 strings. Retired skill-proposal, external-send, nextgen and self-evolution
 executor branches are removed after retained-data and saved-caller inventory.
 
-Drive responses use `responses/<msgId>.json` and the
-`inbox_response_<msgId>` KVS signal. Response bodies are string-to-string
+CloudKit responses use `kind: icloud_action_response`; the Mac also retains a
+local `responses/<msgId>.json` readback. Response bodies are string-to-string
 objects, signed with the pairing secret. iOS verifies responses before using
 them. An approval decision and the action's execution result are separate
 evidence.
 
 `ApprovalRequest.Outcome` interprets consent for turn, inline and phone cards.
-Only undecided pending rows offer consent; explicit decisions, expiry (including
-orphaned requests) and unavailable evidence remain distinct from execution results.
+Only undecided pending rows offer consent; explicit decisions and unavailable
+evidence remain distinct from execution results.
+Consent reads the approval owner's exact decision values `approved`, `denied`
+and `canceled`. Other spellings are
+not normalized or interpreted as equivalent decisions or statuses.
+Trust presets are named by their own ids (`safe`, `work_mode`, `builder`,
+`full_mac`); a permission level alone does not identify a complete preset.
 
 Injection and ordinary effects share the inbox's locked spend-map algorithm,
 with separate files, schemas and marker fields. Live inboxes and restore select

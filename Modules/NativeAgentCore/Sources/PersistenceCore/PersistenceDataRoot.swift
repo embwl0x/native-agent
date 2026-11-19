@@ -17,7 +17,7 @@ private let processDataRoot = resolveDefaultDataRoot()
 
 /// A new install starts the shape a lived-in one has, so nothing can behave differently for being first.
 public func makeConversationFolders(dataRoot: URL) throws {
-    for folder in ["chat/messages", "chat/archive/messages"] {
+    for folder in ["chat/messages", "chat/archive/messages", "chat/session_state"] {
         try FileManager.default.createDirectory(at: dataRoot.appendingPathComponent(folder, isDirectory: true), withIntermediateDirectories: true)
     }
 }

@@ -10,7 +10,14 @@ extension MacSyncEngine {
         workActivityObservationTask?.cancel()
         let generation = snapshotLifecycleGeneration
         workActivityObservationTask = Task {
+            var previous: [Experience]?
             for await _ in await ExperienceStore.at(sync.dataRoot).changes() {
+                guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
+                do {
+                    let current = try await ExperienceStore.at(sync.dataRoot).projection().map(\.mobile)
+                    guard current != previous else { continue }
+                    previous = current
+                } catch { previous = nil }
                 guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
                 await writeSnapshots()
             }
@@ -38,7 +45,7 @@ extension MacSyncEngine {
         return MobileWorkActivity(id: "turn:" + experience.id,
             sessionID: destination.hasPrefix("conversation:") ? String(destination.dropFirst(13)) : nil,
             startedAt: started, content: .init(
-                title: String((experience.face?.words ?? "Conversation").prefix(96)), state: state,
+                title: "Working on your message", state: state,
                 status: status, updatedAt: DeskActivityState.movementDate(experience.updatedAt) ?? started, sequence: experience.sequence))
     }
 

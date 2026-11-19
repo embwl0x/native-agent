@@ -39,12 +39,12 @@ extension CognitiveSubstrate {
         let frozenPresentationState = capsulePresentationState
         let frozenSuppressions = associationSuppressions
         let peerIds = Set(field.peekNodes().compactMap { Self.peerIdentity(metadata: $0.metadata, dataRoot: conversationDataRoot) })
-        let frozenTrustedPeers = Set(peerIds.filter { dependencies.peerTrusted($0) })
+        let frozenTrustedPeers = dependencies.trustedPeers(Array(peerIds))
         var copiedField = field
         let settledNodes = frozenConfiguration.enabled
             ? copiedField.snapshot(at: fixedAt, configuration: frozenConfiguration) : []
         let associations = frozenConfiguration.enabled
-            ? copiedField.associationEdges(at: fixedAt, configuration: frozenConfiguration) : []
+            ? copiedField.associationEdges(at: fixedAt, configuration: frozenConfiguration) : (edges: [], missingEndpointCount: 0)
         let snapshot = CognitiveSubstrateSnapshot(
             generatedAt: fixedAt,
             enabled: frozenConfiguration.enabled,
@@ -70,7 +70,8 @@ extension CognitiveSubstrate {
             personalityDynamics: frozenDynamics,
             snapshot: snapshot,
             workspace: workspace,
-            associations: associations,
+            associations: associations.edges,
+            associationMissingEndpointCount: associations.missingEndpointCount,
             affect: fixedAffect,
             mood: fixedMood,
             soundLandingScores: frozenSoundLandingScores,

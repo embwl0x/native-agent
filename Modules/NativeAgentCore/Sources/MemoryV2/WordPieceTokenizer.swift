@@ -42,21 +42,24 @@ public final class WordPieceTokenizer: Sendable {
     public func encode(_ text: String, maxLength: Int) -> (inputIds: [Int], attentionMask: [Int], isComplete: Bool) {
         let maxLength = max(0, maxLength)
         let bodyMax = max(0, maxLength - 2)
-        var s = text.lowercased()
+        var s = String(String.UnicodeScalarView(text.unicodeScalars.compactMap { scalar in
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) { return UnicodeScalar(0x20) }
+            if scalar.value == 0 || scalar.value == 0xFFFD { return nil }
+            switch scalar.properties.generalCategory {
+            case .control, .format, .privateUse, .surrogate, .unassigned: return nil
+            default: return scalar
+            }
+        })).lowercased()
         s = (s as NSString).precomposedStringWithCanonicalMapping
         s = String(String.UnicodeScalarView(s.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
             $0.properties.generalCategory != .nonspacingMark
-        }))
-        s = String(String.UnicodeScalarView(s.unicodeScalars.compactMap { scalar in
-            if CharacterSet.whitespacesAndNewlines.contains(scalar) { return UnicodeScalar(0x20) }
-            return scalar.value >= 0x20 && scalar.value != 0x7F ? scalar : nil
         }))
 
         var ids: [Int] = []
         func appendWord(_ word: String) {
             guard !word.isEmpty else { return }
             // An unmatched suffix invalidates the whole word, replacing all pieces with UNK.
-            let pieces = word.count > 100 ? [unkID] : wordpieceGreedy(word)
+            let pieces = word.unicodeScalars.count > 100 ? [unkID] : wordpieceGreedy(word)
             ids.append(contentsOf: pieces.prefix(bodyMax + 1 - ids.count))
         }
         var word = ""
@@ -106,14 +109,14 @@ public final class WordPieceTokenizer: Sendable {
     }
 
     private func wordpieceGreedy(_ word: String) -> [Int] {
-        let chars = Array(word)
+        let chars = Array(word.unicodeScalars)
         var subTokens: [Int] = []
         var start = 0
         while start < chars.count {
             var end = chars.count
             var match: Int? = nil
             while start < end {
-                var piece = String(chars[start..<end])
+                var piece = String(String.UnicodeScalarView(chars[start..<end]))
                 if start > 0 { piece = "##" + piece }
                 if let id = vocab[piece] {
                     match = id

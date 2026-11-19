@@ -314,7 +314,6 @@ struct QuietPage: Sendable, Equatable {
 
 enum QuietPages {
     static let all = QuietToolPage.all.map(QuietPage.init)
-    static var ids: [String] { QuietToolPage.ids }
     /// The draw-only page that pictures Simple on Control's Settings tab.
     static let simpleSettings = "simple_settings_menu"
     static let drawOnly: [QuietPage] = [

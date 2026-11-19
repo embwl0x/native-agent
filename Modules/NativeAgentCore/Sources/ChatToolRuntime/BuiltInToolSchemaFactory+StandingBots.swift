@@ -65,9 +65,8 @@ extension BuiltInToolSchemaFactory {
                     ("interval", object([("seconds", numSchema(minimum: standingBotMinimumInterval))], required: ["seconds"])),
                     ("cron", object([("expression", ToolSchema.strSchema())], required: ["expression"]))])
             ])),
-            ("budget", object([("tokens", ToolSchema.intSchema("Whole-turn output token allowance; measured conservatively across requests.", minimum: 1)),
-                ("seconds", ToolSchema.obj([("type", .string("number")), ("exclusiveMinimum", .int(0)), ("description",
-                    .string("Maximum run duration."))]))], required: ["tokens", "seconds"])),
+            ("budget", object([("tokens", ToolSchema.intSchema("Whole-turn output token allowance; measured conservatively across requests.", minimum: 1))],
+                required: ["tokens"])),
             ("daily_token_ceiling", ToolSchema.intSchema("Daily allowance for this bot. Each run reserves its full token limit.", minimum: 1)),
             ("event_trigger", eventTrigger),
             ("notify_condition", ToolSchema.strSchema("""

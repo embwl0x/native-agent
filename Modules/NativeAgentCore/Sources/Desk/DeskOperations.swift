@@ -181,7 +181,6 @@ public struct DeskOp: Sendable, Equatable {
         if obj["progress"] != nil && progress == nil { return nil }
         switch token {
         case "create_item":
-            if obj["pursuit"] != nil && pursuit == nil { return nil }
             guard let alias = obj["alias"]?.stringValue,
                   let kindRaw = obj["kind"]?.stringValue, let kind = DeskKind(rawValue: kindRaw),
                   let project = obj["project"]?.stringValue,

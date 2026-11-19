@@ -57,7 +57,6 @@ public protocol DeviceSyncHost: Sendable {
     func getRunsStrict() async -> [RunRecord]?
     func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows
     func cancelChatSession(sessionId: String, runIDs: [String]) async throws
-    @MainActor func providerSignInStates() -> [String: [String: String]]
     func saveSurfaceSelection(
         surface: String,
         model: String,

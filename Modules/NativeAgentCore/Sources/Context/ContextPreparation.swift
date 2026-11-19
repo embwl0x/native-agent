@@ -18,17 +18,6 @@ public protocol ContextRequiredDocumentMirrorProviding: Sendable {
     func refreshContextSources(in registry: ContextSourceRegistry) async throws
 }
 
-public protocol ContextMarkdownCompiling: Sendable {
-    func compile(
-        sourceData: Data,
-        descriptor: ContextSourceDescriptor,
-        previous: ContextCompiledSource?,
-        updatedAt: Date
-    ) async throws -> ContextCompiledSource
-}
-
-extension ContextMarkdownCompiler: ContextMarkdownCompiling {}
-
 public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
     public let mode: ContextFlowMode
     public let started: Bool
@@ -83,7 +72,6 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     public let arena: ContextArena
     public let registry: ContextSourceRegistry
 
-    let compiler: any ContextMarkdownCompiling
     let selector: ContextSelector
     let mirrorProvider: any ContextRequiredDocumentMirrorProviding
     let compiledProjectionProviders: [any ContextCompiledProjectionProvider]
@@ -92,8 +80,6 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     var started = false { didSet { if started != oldValue { arena.healthEvents.signal() } } }
     var lastReconciledAt: Date? { didSet { if lastReconciledAt != oldValue { arena.healthEvents.signal() } } }
     var lastError: String? { didSet { if lastError != oldValue { arena.healthEvents.signal() } } }
-    /// Current preparation availability, separate from retained leased bytes and maintenance diagnostics.
-    var reconciliationFailure: String?
     var feedbackRestoreFailure: String? = "Context feedback has not been restored."
     // Prune after successful commits, bounded by the maintenance interval.
     var lastPruneAt: Date?
@@ -127,11 +113,7 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     var compileDone = ScopedWaiter()
     /// Housekeeping rebuilds a turn requested or launch started; no turn awaits it.
     private var backgroundReconciliation: Task<Void, Never>?
-    var degradedSourceIDs: Set<ContextSourceID> = [] {
-        didSet { if degradedSourceIDs != oldValue { arena.healthEvents.signal() } }
-    }
     enum SourceReadOwner: Hashable {
-        case registered
         case projection(String)
     }
     /// Last committed source reads, including failures before any source row exists.
@@ -148,7 +130,6 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
         store: ContextSQLiteStore,
         arena: ContextArena,
         registry: ContextSourceRegistry,
-        compiler: any ContextMarkdownCompiling,
         mirrorProvider: any ContextRequiredDocumentMirrorProviding,
         compiledProjectionProviders: [any ContextCompiledProjectionProvider] = [],
         selector: ContextSelector = ContextSelector(),
@@ -159,7 +140,6 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
         self.store = store
         self.arena = arena
         self.registry = registry
-        self.compiler = compiler
         self.mirrorProvider = mirrorProvider
         self.compiledProjectionProviders = compiledProjectionProviders
         self.selector = selector
@@ -251,12 +231,11 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
         await refreshWatchedDirectories()
     }
 
-    public func applyMemoryPressure(_ pressure: ContextArenaPressure) async throws -> ContextArenaTrimReceipt {
-        let receipt = try arena.applyMemoryPressure(pressure)
+    public func applyMemoryPressure(_ pressure: ContextArenaPressure) async throws {
+        try arena.applyMemoryPressure(pressure)
         if pressure == .normal {
             await reconcileAll(reason: "pressure_normal")
         }
-        return receipt
     }
 
     public func acquireSnapshot() throws -> ContextGenerationLease {

@@ -69,7 +69,7 @@ extension NativeCognitionRuntime {
     private static func whyLane(_ payload: JSONValue) -> String? {
         guard case .object(let fields) = payload,
               case .string(let lane)? = fields["lane"],
-              ["cue", "memory", "outreach", "expansion", "interpretation"].contains(lane) else { return nil }
+              ["cue", "memory", "outreach", "interpretation"].contains(lane) else { return nil }
         return lane
     }
 

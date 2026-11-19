@@ -155,9 +155,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let maximumCharacterBudget: Int
     /// Reserve ranked-context room so accumulated mandatory corrections cannot crowd out relevant memory and tasks.
     public let postMandatoryCharacterReserve: Int
-    /// Every caller declares which persona documents its stable prompt carries verbatim so dynamic context does not duplicate them.
-    public let stableSegmentCarriesRequiredDocuments: Bool
-    /// The ordered person picture; [] withholds generated facts when recall is disabled or a separately reported read is unavailable.
+    /// The ordered pinned person picture; [] also withholds generated facts when recall is disabled or a separately reported read is unavailable.
     public let userMemoryCore: [String]
     public let memoryRecallEnabled: Bool
     /// Publish expansion pointers for every body the caller truncates; zero means whole-body rendering without truncation pointers.
@@ -188,7 +186,6 @@ public struct ContextTurnRequest: Sendable, Equatable {
         characterBudget: Int = 6_000,
         maximumCharacterBudget: Int? = nil,
         postMandatoryCharacterReserve: Int = 0,
-        stableSegmentCarriesRequiredDocuments: Bool,
         userMemoryCore: [String],
         memoryRecallEnabled: Bool = true,
         packetAtomExpandThresholdChars: Int = 0,
@@ -218,7 +215,6 @@ public struct ContextTurnRequest: Sendable, Equatable {
             maximumCharacterBudget ?? self.characterBudget
         )
         self.postMandatoryCharacterReserve = max(0, postMandatoryCharacterReserve)
-        self.stableSegmentCarriesRequiredDocuments = stableSegmentCarriesRequiredDocuments
         self.userMemoryCore = userMemoryCore
         self.memoryRecallEnabled = memoryRecallEnabled
         self.packetAtomExpandThresholdChars = max(0, packetAtomExpandThresholdChars)
@@ -254,7 +250,6 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         [String]
     ) async -> Void)?
     private let feedbackLock = NSLock()
-    private var outcomeRecorded = false
     private var deliveryRecorded = false
     private let deliveryHandler: (@Sendable ([ContextPacketItem]) async -> Void)?
     private let verifier: (@Sendable ([ContextStoredAtom]) async -> ContextTurnExclusion)?
@@ -351,20 +346,6 @@ public final class ContextPreparedTurn: @unchecked Sendable {
             return first
         }
         if first { await deliveryHandler?(packet.selectedItems) }
-    }
-
-    public func recordOutcome(_ outcome: ContextTurnOutcome) async {
-        let shouldRecord = feedbackLock.withLock {
-            let value = !outcomeRecorded
-            outcomeRecorded = true
-            return value
-        }
-        guard shouldRecord else { return }
-        await feedbackHandler?(
-            .outcome(outcome),
-            packet.receipt.selectedAtomIDs,
-            [packet.receipt.id]
-        )
     }
 
     deinit {

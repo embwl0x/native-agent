@@ -70,10 +70,6 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func regenerateAssistantMessage(_ message: ChatMessage) async {
-        await regenerateChatResponse(message, parent: nil)
-    }
 
     func regenerateChatResponse(_ message: ChatMessage, parent: Turn?) async {
         if message.metadata?.providerRefusal == true {
@@ -269,7 +265,7 @@ extension AppModel {
             if case .failure(let error) = result {
                 let line = "Your chat is ready, but its shared conversation couldn't be updated. Other surfaces may still open the previous conversation."
                 setFailureStatus(line, cause: error)
-                systemToasts.push(error: UserFacingError.forAgent(line, cause: error.localizedDescription), autoDismissAfter: nil)
+                systemToasts.push(error: UserFacingError.forAgent(line, cause: error.localizedDescription))
             }
         }
     }

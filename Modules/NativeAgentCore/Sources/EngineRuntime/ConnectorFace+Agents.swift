@@ -19,23 +19,21 @@ import TrustCenter
 extension NativeAgentEngine {
     /// The contact owner's files whose change re-reads the Connectors page.
     var agentFacePaths: [URL] {
-        ["agents/peers.json", "agents/conversations.json", "agents/discovery.json", "agents/local-health.json", "chat/sessions.json"]
+        ["agents/peers.json", "agents/conversations.json", "agents/discovery.json", "agents/recipes/", "agents/local-health.json", "chat/sessions.json"]
             .map { dataRoot.appendingPathComponent($0) }
     }
 
     /// The contact owner's change signals beyond its files: a direct chat's transport reports a reply or a status change.
-    static let agentFaceNotifications = [ChatGPTDotIPCTransport.didChange]
+    static let agentFaceNotifications = [ChatGPTDotIPCTransport.didChange, ContactThreadReadouts.contactsDidChange]
 
     /// Reads the contact owner's doors, one connector row each with its unfinished setup behind it, and its conversations as their own
     /// section; offscreen and page reads never start discovery.
     @concurrent func agentFace() async -> (rows: [PartFace.Row], sections: [PartFace.Section]) {
-        let root = dataRoot, owner = contacts
+        let root = dataRoot
         let threads: [MobileAgentThread]?
         let threadsFailure: String?
         do {
-            threads = try await Task.detached(priority: .utility) {
-                try await AgentContactThreads.mobileThreads(root: root, contacts: owner)
-            }.value
+            threads = try await contactThreads.mobileThreads()
             threadsFailure = nil
         } catch {
             threads = nil
@@ -136,10 +134,7 @@ extension NativeAgentEngine {
 
     /// One conversation's lines as a document: who said what and when, oldest first, as the contact owner reads them now.
     @MainActor func agentThreadDocument(_ agent: String) async throws -> String {
-        let root = dataRoot, owner = contacts
-        let threads = try await Task.detached(priority: .utility) {
-            try await AgentContactThreads.mobileThreads(root: root, contacts: owner)
-        }.value
+        let threads = try contactThreads.mobileThreads()
         guard let thread = threads.first(where: { $0.agent.id == agent }) else {
             throw PartCallError(code: "stale_row", message: "That conversation is no longer listed. Read Connectors again.")
         }
@@ -152,9 +147,9 @@ extension NativeAgentEngine {
         return lines.joined(separator: "\n\n")
     }
 
-    /// `agent.refresh`: the contact owner reads the address book again.
+    /// `agent.refresh`: the thread owner rereads the address book and publishes its conversations together.
     @MainActor func agentsRefresh() async throws -> String? {
-        try await contacts.refresh()
+        try await contactThreads.refreshContacts()
         return nil
     }
 

@@ -15,7 +15,6 @@ struct TurnTraceScanSummary: Sendable {
     let eventsRead: Int
     let unreadableRows: Int
     let observedDays: Int
-    let earlierHistoryExcluded: Bool
 
     var isEmptyFeed: Bool { eventsRead == 0 && unreadableRows == 0 }
 
@@ -27,9 +26,6 @@ struct TurnTraceScanSummary: Sendable {
 
     var coverageParts: [String] {
         var parts: [String] = []
-        if earlierHistoryExcluded {
-            parts.append("earlier launch history is outside the queried window")
-        }
         if unreadableRows > 0 {
             parts.append("\(unreadableRows) record row(s) could not decode as trace events")
         }
@@ -42,81 +38,46 @@ struct TurnTraceScanSummary: Sendable {
 }
 
 // MARK: - DoctorMeasurementWindow
-// Only this process's valid launch stamp can establish its measurement window.
+// The running build is measured from its first launch, across its relaunches; a replaced build's rows describe another build.
 
 struct DoctorMeasurementWindow: Sendable {
-    /// Older rows describe a different build and cannot enter this window.
     let floor: Date
     let describedAs: String
 }
 
 enum DoctorWindowFloor {
-    static func resolve(
-        root: URL,
-        now: Date
-    ) -> DoctorMeasurementWindow? {
-        guard let stamp = launchStamp(root: root, identity: .current), stamp <= now else {
-            return nil
-        }
+    /// Nil when the launch stamp does not name the running build, so no window can be certified for it.
+    static func resolve(root: URL, now: Date) -> DoctorMeasurementWindow? {
+        let identity = NativeAgentBuildIdentity.current
+        guard let data = try? Data(contentsOf: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename)),
+              let stamp = try? JSONSerialization.jsonObject(with: data) as? [String: Any], identity.sameBuild(as: stamp),
+              let first = (stamp["firstLaunchedAt"] ?? stamp["writtenAt"]) as? String,
+              let launched = TurnTraceEvent.parseISO8601(first), launched <= now else { return nil }
+        let floor = max(launched, now.addingTimeInterval(-ExperienceStore.detailHorizon))
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
-        return DoctorMeasurementWindow(
-            floor: stamp,
-            describedAs: "since this build launched at \(formatter.string(from: stamp))"
-        )
-    }
-
-    /// Require this process's current-build stamp; an earlier launch cannot establish the running build's floor.
-    private static func launchStamp(root: URL, identity: NativeAgentBuildIdentity) -> Date? {
-        launchStamp(path: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename), identity: identity)
-    }
-
-    private static func launchStamp(path: URL, identity: NativeAgentBuildIdentity) -> Date? {
-        guard identity.unavailableReason == nil else { return nil }
-        guard let data = try? Data(contentsOf: path),
-              let value = try? JSONValue.parse(data),
-              case .object(let object) = value,
-              let writtenAt = object["writtenAt"]?.stringValue,
-              let stamp = TurnTraceEvent.parseISO8601(writtenAt)
-        else { return nil }
-        // Refuse stamps from other launches, including when this launch failed to write its own.
-        guard object["build"]?.stringValue == identity.build,
-              object["version"]?.stringValue == identity.version,
-              object["pid"] == .int(Int64(ProcessInfo.processInfo.processIdentifier))
-        else { return nil }
-        // Archives may lack revision identity, but both sides must agree; missing evidence cannot certify a known revision.
-        guard object["sourceRevision"]?.stringValue?.lowercased() == identity.sourceRevision?.lowercased() else { return nil }
-        return stamp
+        return DoctorMeasurementWindow(floor: floor, describedAs: "since this build first launched at \(formatter.string(from: floor))")
     }
 }
 
 enum TurnTraceWindowReader {
     static let source = "experiences/experiences.sqlite"
 
-    /// Keep the launch floor and the same newest calendar-day window; deliver record order without a row-count tail.
+    /// Query event timestamps from the window's floor; deliver record order without a row-count tail.
     static func scan(
         root: URL,
         now: Date,
         floor: Date,
         kinds: Set<String>,
-        maximumDays: Int = 7,
         handle: (TurnTraceEvent) -> Void
     ) async throws -> TurnTraceScanSummary {
-        let calendar = TurnTracePersistLane.dayCalendar
-        guard let oldestDay = calendar.date(byAdding: .day, value: 1 - max(1, maximumDays), to: calendar.startOfDay(for: now)) else {
-            throw WindowError.invalidCalendarWindow
-        }
-        let from = max(floor, oldestDay)
         let read = try await TurnTracePersistLane(dataRootOverride: root).events(
-            ExperienceStore.DetailQuery(kinds: kinds.sorted(), from: from, through: now)
+            ExperienceStore.DetailQuery(kinds: kinds.sorted(), from: floor, through: now)
         )
         for event in read.events { handle(event) }
-        return TurnTraceScanSummary(from: from, through: now, eventsRead: read.events.count, unreadableRows: read.unreadable,
-            observedDays: Set(read.events.map { TurnTracePersistLane.dayString(from: $0.ts) }).count,
-            earlierHistoryExcluded: from > floor)
+        return TurnTraceScanSummary(from: floor, through: now, eventsRead: read.events.count, unreadableRows: read.unreadable,
+            observedDays: Set(read.events.map { TurnTracePersistLane.dayString(from: $0.ts) }).count)
     }
-
-    private enum WindowError: Error { case invalidCalendarWindow }
 }
 
 // MARK: - JSONValue numeric accessors

@@ -123,6 +123,7 @@ extension NativeCognitionRuntime {
             substrate: cognition.snapshot,
             workspace: cognition.workspace,
             associations: cognition.associations,
+            associationMissingEndpointCount: cognition.associationMissingEndpointCount,
             receiptRead: await substrate.receiptReadSnapshot(),
             organism: organism.snapshot,
             capsulePreviewInfo: lastInjectedCapsule.map {

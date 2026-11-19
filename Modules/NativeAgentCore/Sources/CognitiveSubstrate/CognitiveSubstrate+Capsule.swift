@@ -184,8 +184,6 @@ extension CognitiveSubstrate {
         if let frame = candidateLines.first(where: { $0.hasPrefix(CognitiveFeelingFrame.header) }),
            !shown.contains(frame) {
             next.fingerprintFamily = expected.fingerprintFamily
-            next.ambivalenceCount = expected.ambivalenceCount
-            next.lastAmbivalenceAt = expected.lastAmbivalenceAt
         }
         // A care the agent meant to bring up whose line was never read is still owed.
         if !shown.contains(careIntentionPrefix) {
@@ -297,10 +295,6 @@ extension CognitiveSubstrate {
             request: request, read: frozenRead, dreamFeeling: dreamFeeling,
             leadWord: fingerprint?.leadWord, counterWord: fingerprint?.counterWord,
             presentationState: &presentationState)
-        if Self.frameCognitionAvailable(frozenRead), fingerprint?.counterWord != nil {
-            presentationState.ambivalenceCount = min(presentationState.ambivalenceCount, Int.max - 1) + 1
-            presentationState.lastAmbivalenceAt = now
-        }
         var remindedSpoken: String?
         if let remindedOf,
            let line = remindedOfCapsuleLine(for: remindedOf, at: now) {
@@ -498,12 +492,7 @@ extension CognitiveSubstrate {
             "updatedAt": .double(now.timeIntervalSince1970),
             "soundRutTurnsSinceSurfaced": .int(Int64(capsulePresentationState.soundRutTurnsSinceSurfaced)),
             "remindedOfTurnsSinceSurfaced": .int(Int64(capsulePresentationState.remindedOfTurnsSinceSurfaced)),
-            // Content-free presentation counters survive relaunch so ambivalence frequency remains measurable.
-            "ambivalenceCount": .int(Int64(capsulePresentationState.ambivalenceCount)),
         ]
-        if let lastAmbivalenceAt = capsulePresentationState.lastAmbivalenceAt {
-            object["lastAmbivalenceAt"] = .double(lastAmbivalenceAt.timeIntervalSince1970)
-        }
         if let remindedOfLastSurfacedAt = capsulePresentationState.remindedOfLastSurfacedAt {
             object["remindedOfLastSurfacedAt"] = .double(remindedOfLastSurfacedAt.timeIntervalSince1970)
         }
@@ -585,9 +574,6 @@ extension CognitiveSubstrate {
             max(0, Int(exactly: (object["soundRutTurnsSinceSurfaced"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0).rounded(.towardZero)) ?? 0),
             Self.soundRutTurnCounterCap
         )
-        capsulePresentationState.ambivalenceCount = max(0, Int(exactly: (object["ambivalenceCount"]?.numberValue(coercingStrings: false, finiteOnly: false)
-            ?? 0).rounded(.towardZero)) ?? 0)
-        capsulePresentationState.lastAmbivalenceAt = dateValue(object["lastAmbivalenceAt"])
         capsulePresentationState.remindedOfLastSurfacedAt = dateValue(object["remindedOfLastSurfacedAt"])
         capsulePresentationState.remindedOfTurnsSinceSurfaced = min(Self.soundRutTurnCounterCap,
             max(0, Int(exactly: (object["remindedOfTurnsSinceSurfaced"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0).rounded(.towardZero))

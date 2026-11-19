@@ -37,7 +37,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     public static let performanceMode = "performance"
 
     private struct State {
-        var coreMLProvider: (any EmbeddingProvider)?
+        var coreMLProvider: CoreMLEmbeddingProvider?
         var lastUsedAt: Date?
         var lastLoadedAt: Date?
         var lastUnloadedAt: Date?
@@ -74,22 +74,31 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     public var embeddingEpoch: MemoryEmbeddingEpoch {
-        let config = Self.readBackend(dataRoot: dataRoot)
-        if config == Self.failClosedBackend { return FailClosedEmbeddingProvider().embeddingEpoch }
-        if config == Self.mockBackend { return mock.embeddingEpoch }
-        if let loaded = lock.withLock({ state.coreMLProvider }) {
-            return loaded.embeddingEpoch
+        get throws {
+            let (loaded, generation) = lock.withLock { (state.coreMLProvider, state.loadGeneration) }
+            do {
+                let config = try Self.readBackendChecked(dataRoot: dataRoot)
+                if config == Self.mockBackend { return mock.embeddingEpoch }
+                if let loaded { return loaded.embeddingEpoch }
+                return try CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: dataRoot)
+            } catch {
+                lock.withLock {
+                    // A cold probe cannot invalidate a provider loaded while it was reading.
+                    guard state.loadGeneration == generation, state.coreMLProvider == nil else { return }
+                    state.lastLoadError = String(describing: error)
+                }
+                throw error
+            }
         }
-        return (try? CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: dataRoot))
-            ?? FailClosedEmbeddingProvider().embeddingEpoch
     }
 
     /// Read the serving space without hashing or loading.
     var residentEmbeddingEpoch: MemoryEmbeddingEpoch? {
-        let backend = Self.readBackend(dataRoot: dataRoot)
-        guard backend != Self.failClosedBackend else { return nil }
-        if backend == Self.mockBackend { return mock.embeddingEpoch }
-        return lock.withLock { state.coreMLProvider?.embeddingEpoch }
+        get throws {
+            let backend = try Self.readBackendChecked(dataRoot: dataRoot)
+            if backend == Self.mockBackend { return mock.embeddingEpoch }
+            return lock.withLock { state.coreMLProvider?.embeddingEpoch }
+        }
     }
 
     /// CoreML failures throw: synthetic vectors would corrupt semantic retrieval and deduplication. Only explicit config/embeddings.json `mock` selection
@@ -114,17 +123,14 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         guard let provider = lock.withLock({ state.coreMLProvider }) else { return nil }
         noteUse()
         if requireFullText {
-            guard let complete = provider as? CoreMLEmbeddingProvider else {
-                throw MemoryV2Error.underlying("Resident memory model cannot embed complete texts.")
-            }
-            guard let vectors = try await complete.embedCompleteTexts(texts) else { return nil }
-            return MemoryEmbeddingBatch(epoch: complete.embeddingEpoch, vectors: vectors)
+            guard let vectors = try await provider.embedCompleteTexts(texts) else { return nil }
+            return MemoryEmbeddingBatch(epoch: provider.embeddingEpoch, vectors: vectors)
         }
         return try await provider.embedWithEpoch(texts)
     }
 
     func coversCompleteTextsIfResident(_ texts: [String]) -> Bool? {
-        guard let provider = lock.withLock({ state.coreMLProvider }) as? CoreMLEmbeddingProvider else { return nil }
+        guard let provider = lock.withLock({ state.coreMLProvider }) else { return nil }
         return provider.coversCompleteTexts(texts)
     }
 
@@ -158,7 +164,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             return mock
         }
 
-        // Only load failures unload the provider and stamp lastLoadError; prediction failures preserve the loaded model.
+        // Prediction failures preserve the loaded model; loading owns its failure record.
         let provider: any EmbeddingProvider
         do {
             provider = try loadCoreMLProvider(config: config)
@@ -282,7 +288,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             return (state.coreMLProvider, state.loadGeneration)
         }
         if let existing { return existing }
-        let provider: any EmbeddingProvider
+        let provider: CoreMLEmbeddingProvider
         do {
             provider = try CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot)
         } catch {
@@ -438,7 +444,7 @@ extension SwiftNativeMemoryV2 {
     public func indexedActionVectors(_ texts: [String]) async throws -> (epoch: MemoryEmbeddingEpoch, vectors: [[Float]?], unembeddable: [Int: String]) {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        guard let epoch = residentEmbeddingEpoch() else {
+        guard let epoch = try residentEmbeddingEpoch() else {
             requestActionIndexUpdate()
             throw MemoryV2Error.underlying(actionIndexFailure ?? "Action search awaits the memory search model; an index update was requested.")
         }
@@ -470,7 +476,7 @@ extension SwiftNativeMemoryV2 {
         let disk = storage
         try checkEmbeddingConvergence()
         let fill = Task.detached(priority: .utility) {
-            let epoch = embedder.embeddingEpoch
+            let epoch = try embedder.embeddingEpoch
             let byHash = Dictionary(texts.map { (Self.actionTextHash($0), $0) }, uniquingKeysWith: { first, _ in first })
             let dimensions = embedder.dimensions
             let indexed = try await disk.actionEmbeddings(epoch: epoch).filter { $0.value.count == dimensions }
@@ -487,7 +493,7 @@ extension SwiftNativeMemoryV2 {
                 }
                 let batch = try await embedder.embedItemsWithEpoch(texts)
                 try await self.checkEmbeddingConvergence()
-                guard batch.epoch == epoch, embedder.embeddingEpoch == epoch else {
+                guard batch.epoch == epoch, try embedder.embeddingEpoch == epoch else {
                     await self.requestActionIndexUpdate()
                     throw MemoryV2Error.underlying("The MemoryV2 action index changed epoch while updating.")
                 }
@@ -543,6 +549,7 @@ extension SwiftNativeMemoryV2 {
                 """)
         } catch {
             nativeLog("[embedding-warmup] FAILED: \(error.localizedDescription)")
+            OrganPulse.record("embedding_warmup", error is CancellationError ? .stopped : .failed, note: error.localizedDescription)
         }
     }
 

@@ -130,11 +130,11 @@ public final class MindLifetime: @unchecked Sendable {
         })
     }
 
-    /// Everything the start attached is stopped and joined, in reverse: attention and the nerve detach, the stream's thoughts, returns and night
-    /// (with its dream) stop and settle, the sources and clock deliveries detach, then the mind sleeps (saving what it holds) and is removed. What
-    /// is posted meanwhile stays recorded and owed; clock times stay pending for the next mind.
     private func drain() async -> NativeCognitionSleepOutcome {
-        guard let mind = lock.withLock({ present }) else { return .noMind }
+        guard let mind = lock.withLock({
+            defer { present = nil }
+            return present
+        }) else { return .noMind }
         Attention.install(nil)
         BackgroundLoopLifetimes.shared.receiveOrganPulses()
         await mind.stream.close()
@@ -143,7 +143,6 @@ public final class MindLifetime: @unchecked Sendable {
         // Entries filed while no mind runs stay durable in the journal; there is no mind to tell.
         await journal.install { _ in }
         lock.withLock {
-            present = nil
             relay?.cancel()
             relay = nil
         }
@@ -151,8 +150,6 @@ public final class MindLifetime: @unchecked Sendable {
         return slept
     }
 
-    /// The mind's sources: source-driven part work and presence, foreground-app perception, and the one clock's deliveries for parts, watches,
-    /// scans and inbox briefs. Helpers run unattended only while a mind runs (the engine's helper autonomy reads this owner).
     private func attachSources() async {
         let root = dataRoot
         let first = lock.withLock { () -> Bool in

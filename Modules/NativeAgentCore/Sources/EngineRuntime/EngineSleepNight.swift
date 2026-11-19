@@ -100,6 +100,11 @@ extension EngineSleep {
         }
         for (part, count) in unattributed { folded[part, default: [:]]["unattributed"] = count }
         let settled = foldReady && failed.isEmpty
+        // Stop keeps committed accounting but cannot certify rest or advance the night cursor; prepared inputs remain for reconciliation.
+        guard !Task.isCancelled else {
+            found.gaps.append(Self.gap("night", reason: "The night stopped before its completion record; rest and the night cursor remain unchanged."))
+            return Self.night(found, since: since, through: through, closed: closed, folded: folded, attend: false)
+        }
         let row: JSONValue = .object([
             "since": .string(NativeTimestampFormat.plainZulu(since)),
             "through": .string(NativeTimestampFormat.plainZulu(settled ? through : since)),

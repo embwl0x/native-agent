@@ -270,53 +270,76 @@ extension AgentConversationStore {
             let held = rows.filter { $0.agent == agent && ($0.exchanges ?? []).contains(where: waiting) }
             guard !held.isEmpty else { return ([], 0) }
             guard agent.hasPrefix("peer:") else { throw Failure(message: "A held send requires its exact contact identity.") }
-            // Each conversation's caller is read once per drain.
+            let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+            func owe(_ row: AgentConversationRecord, _ exchange: AgentConversationExchange, _ error: Error) {
+                RepairOwed.owe(root, id: exchange.id, kind: .message,
+                    evidence: [.init(source: "agents/conversations", id: row.id)],
+                    operation: "agent.held.drain:" + exchange.id, owner: fileURL.path,
+                    words: "Held message \(exchange.id) remains undelivered: " + error.localizedDescription,
+                    lever: "Repair this send's named payload, caller evidence or response capacity; do not resend it.")
+            }
+            // Reuse checked caller reachability within this drain.
             var reached: [String: Bool] = [:]
-            let pending = try held.filter { row in
+            let pending = held.filter { row in
                 let key = row.conversationID ?? ""
                 if let known = reached[key] { return known }
-                let found = try Self.reaches(row.conversationID, caller: caller, peerID: String(agent.dropFirst(5)))
-                reached[key] = found
-                return found
+                do {
+                    let found = try Self.reaches(row.conversationID, caller: caller, peerID: String(agent.dropFirst(5)))
+                    reached[key] = found
+                    return found
+                } catch {
+                    for exchange in row.exchanges ?? [] where waiting(exchange) { owe(row, exchange, error) }
+                    return false
+                }
             }
-            guard !pending.isEmpty else { return ([], 0) }
-            let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+            let remaining = pending.reduce(0) { count, row in
+                count + (row.exchanges ?? []).filter { waiting($0) && self.held.read($0.id).withdrawn == nil }.count
+            }
+            guard !pending.isEmpty else { return ([], remaining) }
             let lines = try ContactThread.lines(dataRoot: root, owner: String(agent.dropFirst(5)))
             // A message the agent withdrew is not handed out.
-            let all = try pending.flatMap { row in
-                try (row.exchanges ?? []).filter { waiting($0) && self.held.read($0.id).withdrawn == nil }.map { exchange in
-                    let messages = lines.filter { $0.sendID == exchange.id && $0.mine }
-                    guard messages.count == 1, let message = messages.first else {
-                        throw Failure(message: """
-                            Held message \(exchange.id) has no unique canonical payload; repair its contact transcript before delivery. Nothing was \
-                            drained.
-                            """)
+            let all = pending.flatMap { row in
+                (row.exchanges ?? []).filter { waiting($0) && self.held.read($0.id).withdrawn == nil }.compactMap { exchange -> Held? in
+                    do {
+                        let messages = lines.filter { $0.sendID == exchange.id && $0.mine }
+                        guard messages.count == 1, let message = messages.first else {
+                            throw Failure(message: "Held message \(exchange.id) has no unique canonical payload; repair its contact transcript.")
+                        }
+                        // A lost send record still owes an answer; its row keeps reply_to until that record is repaired.
+                        let recorded = self.held.file(exchange.id).map { FileManager.default.fileExists(atPath: $0.path) } == true
+                        let replyTo = recorded || row.awaitsReply ? exchange.id : nil
+                        return Held(row: row.id, exchange: exchange.id, at: exchange.sentAt,
+                            text: try Self.heldText(message), conversation: row.conversationID, name: row.label, replyTo: replyTo)
+                    } catch {
+                        owe(row, exchange, error)
+                        return nil
                     }
-                    // A send awaiting its answer carries its reply_to, by its record or, when the record is lost, by its row: a lost record is
-                    // still owed, and the answer naming it is refused until it is repaired, never taken as ordinary work.
-                    let recorded = self.held.file(exchange.id).map { FileManager.default.fileExists(atPath: $0.path) } == true
-                    let replyTo = recorded || row.awaitsReply ? exchange.id : nil
-                    return Held(row: row.id, exchange: exchange.id, at: exchange.sentAt,
-                        text: try Self.heldText(message), conversation: row.conversationID, name: row.label, replyTo: replyTo)
                 }
             }.sorted { $0.at < $1.at }
             var taken: [Held] = []
             for item in all {
-                guard fits(taken + [item]) else {
-                    if taken.isEmpty { throw Failure(
-                        message: "Held message \(item.exchange) exceeds this host's response capacity. It remains held in full; nothing was drained.") }
-                    break
+                guard fits([item]) else {
+                    if let row = pending.first(where: { $0.id == item.row }),
+                       let exchange = row.exchanges?.first(where: { $0.id == item.exchange }) {
+                        owe(row, exchange, Failure(message: "The full message exceeds this host's response capacity."))
+                    }
+                    continue
                 }
+                guard fits(taken + [item]) else { break }
                 taken.append(item)
             }
-            guard !taken.isEmpty else { return ([], all.count) }
+            guard !taken.isEmpty else { return ([], remaining) }
             Self.mark(taken, in: &rows, from: waiting) { exchange, receipt in
                 exchange.status = "delivering"
                 exchange.settledAt = Date()
                 receipt?["status"] = .string("delivering")
             }
             try save(rows)
-            return (taken, all.count - taken.count)
+            for item in taken {
+                RepairOwed.settle(root, operation: "agent.held.drain:" + item.exchange,
+                    evidence: .init(source: "agents/conversations", id: item.row))
+            }
+            return (taken, remaining - taken.count)
         }
     }
 
@@ -365,6 +388,7 @@ extension AgentConversationStore {
                 receipt?["status"] = .string(exchange.status)
                 guard written else { return }
                 receipt?["delivered"] = .bool(true)
+                receipt?["delivery"] = .string("delivered")
                 receipt?["accepted"] = .bool(true)
                 receipt?["delivered_at"] = .string(ISO8601DateFormatter().string(from: now))
                 receipt?["detail"] = .string(
@@ -462,7 +486,6 @@ extension AgentConversationStore {
                 let next = ["waiting", "attention", "ready"].contains(row.phase) && row.personInitiated != true ? notice(row) : nil
                 guard row.notice != next, next == nil || row.notice?.event != next?.event else { continue }
                 rows[index].notice = next
-                rows[index].nextReadAt = nil
                 changed += 1
             }
             if changed > 0 { try save(rows) }

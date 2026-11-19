@@ -86,12 +86,12 @@ enum ResearchHTMLExtraction {
         }
         while i < n {
             try Task.checkCancellation()
-            if chars[i] != "<" {
+            if chars[i] != "<" || i + 1 == n || !(chars[i + 1].isLetter || "/!?".contains(chars[i + 1])) {
                 let start = i
-                while i < n && chars[i] != "<" {
+                repeat {
                     if i.isMultiple(of: 1_024) { try Task.checkCancellation() }
                     i += 1
-                }
+                } while i < n && chars[i] != "<"
                 let node = Node("text")
                 let decoded = try decode(String(chars[start..<i]))
                 // Source wrapping is whitespace, not a paragraph boundary. Keep boundary spaces so adjacent inline elements join naturally.

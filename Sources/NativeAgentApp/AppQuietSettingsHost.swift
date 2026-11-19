@@ -8,9 +8,7 @@ import NativeAgentShared
 import ProviderRouting
 import Research
 import TrustCenter
-import TriggerScheduler
 import MemoryV2
-import Onboarding
 import DeviceSync
 import EngineRuntime
 // Blueprint: | `AppQuietSettingsHost.swift` | Owner-declared settings; phone rows use signed requests, with no Mac copies |
@@ -119,9 +117,8 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 write: { _, value, _ in
                     let enabled = try QuietSettings.boolValue(value, "Show the tour")
                     UserDefaults.standard.set(enabled, forKey: "nativeagent.showTour")
-                    if enabled {
-                        if let presentation = self.presentation { try await presentation.present(.replayTour) }
-                        else { OnboardingTourReplay.shared.requestReplay() }
+                    if enabled, let presentation = self.presentation {
+                        try await presentation.present(.replayTour)
                     }
                 }
             ).watchingDefaults("nativeagent.showTour"),
@@ -430,17 +427,6 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
             throw QuietSettingError.unavailable(detail)
         case .failed(let detail): throw QuietSettingError.unavailable(detail)
         }
-    }
-
-    // The Settings face and this door read and switch triggers through the one inbox owner.
-    func inboxTriggers() async throws -> [QuietInboxTrigger] {
-        try await appModel.engine.inbox.triggers().map {
-            QuietInboxTrigger(
-                name: $0.name, enabled: $0.enabled)
-        }
-    }
-    func setInboxTrigger(_ name: String, enabled: Bool) async throws {
-        try await appModel.engine.inbox.setTrigger(name, enabled: enabled)
     }
 
     // Activity capture's breadth and keeping, read and saved through the one activity owner; each save is read back.

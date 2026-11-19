@@ -70,18 +70,16 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
         let task = Task.detached(priority: .utility) {
             var events = initial
             var watched = Set(paths)
+            var emittedIdentity: [String: [Int64]]?
             defer { events.cancel(); pair.continuation.finish() }
-            func unavailable(_ error: Error) async {
-                let failure = (error as? SenseFailure) ?? SenseFailure(code: "source_unavailable", message: error.localizedDescription)
-                pair.continuation.yield(.unavailable(failure))
+            func unavailable(_ error: Error) {
+                pair.continuation.yield(.unavailable((error as? SenseFailure) ?? .init(code: "source_unavailable", message: error.localizedDescription)))
             }
             guard await events.waitUntilArmed() else {
-                if !Task.isCancelled {
-                    await unavailable(SenseFailure(code: "source_unavailable", message: "File observation could not be armed for \(path)."))
-                }
+                guard !Task.isCancelled else { return }
+                unavailable(SenseFailure(code: "source_unavailable", message: "File observation could not be armed for \(path)."))
                 return
             }
-            guard !Task.isCancelled else { return }
             while !Task.isCancelled {
                 do {
                     let material = try await self.material(for: corner, address: address, operation: operation)
@@ -99,22 +97,24 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
                         guard !Task.isCancelled else { next.cancel(); return }
                         events.cancel(); events = next; watched = Set(nextPaths)
                     }
-                    // Check identity only after read admission; a failed read cannot prove deletion.
                     let identity = try Self.fileIdentity(root)
-                    pair.continuation.yield(.changed(material, files: identity))
+                    if identity != emittedIdentity {
+                        emittedIdentity = identity
+                        pair.continuation.yield(.changed(material, files: identity))
+                    }
                 } catch {
                     guard !Task.isCancelled else { return }
+                    emittedIdentity = nil
                     if let failure = error as? SenseFailure, failure.code == "source_absent" {
                         pair.continuation.yield(.absent)
                     } else {
-                        await unavailable(error)
+                        unavailable(error)
                     }
                 }
-                // Only a source edge admits repair after failure; without one, the unavailable watch waits without a timer or reread.
                 var iterator = events.stream.makeAsyncIterator()
                 guard await iterator.next() != nil else {
                     if !Task.isCancelled {
-                        await unavailable(SenseFailure(
+                        unavailable(SenseFailure(
                             code: "source_unavailable",
                             message: "File observation ended for \(path); a part/catalog change can register it again."
                         ))

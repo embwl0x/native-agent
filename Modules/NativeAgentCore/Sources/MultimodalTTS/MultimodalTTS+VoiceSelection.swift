@@ -40,8 +40,7 @@ public enum VoiceOutputModeSelection {
 
 extension SwiftOpenAITTSClient {
     /// Cloud read-aloud uses only Chat's provider and its catalog speech model.
-    public static func synthesizeChat(text: String, voice: @Sendable () -> String) async throws -> (audio: Data, unread: Int) {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+    public static func synthesizeChat(text: String, dataRoot: URL, voice: @Sendable () -> String) async throws -> (audio: Data, unread: Int) {
         let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
         // An unreadable route is its own failure, never evidence about that route's voice.
         let snapshot = try await router.checkedRoutingSnapshot()
@@ -50,7 +49,7 @@ extension SwiftOpenAITTSClient {
               let model = FirstPartyModelCatalog.speechModel(forProviderID: chatProvider) else {
             throw MultimodalTTSError.routeHasNoSpeech(route: "Chat's provider")
         }
-        return try await SwiftOpenAITTSClient(model: model)
+        return try await SwiftOpenAITTSClient(model: model, dataRoot: dataRoot)
             .synthesize(text: text, voice: voice(), format: "mp3")
     }
 }
@@ -141,6 +140,7 @@ public final class VoiceOutputController: NSObject {
     /// (dictation stopping playback must not be undone by a read that finishes after it).
     public func speak(
         text: String,
+        dataRoot: URL,
         policy: TrustPolicy?,
         loadPolicy: @MainActor () async throws -> TrustPolicy,
         ownerID: String? = nil
@@ -150,12 +150,13 @@ public final class VoiceOutputController: NSObject {
         let generation = speechGeneration
         let resolution = await VoiceOutputModeSelection.resolve(policy: policy, loadPolicy: loadPolicy, failureCause: failureCause)
         guard generation == speechGeneration else { return }
-        await speak(text: text, resolution: resolution, ownerID: ownerID)
+        await speak(text: text, dataRoot: dataRoot, resolution: resolution, ownerID: ownerID)
     }
 
     /// Speak on the route the Trust policy selects. An unreadable policy says so on the owning surface and reads nothing.
     public func speak(
         text: String,
+        dataRoot: URL,
         resolution: VoiceOutputModeResolution,
         ownerID: String? = nil
     ) async {
@@ -174,7 +175,7 @@ public final class VoiceOutputController: NSObject {
             errorOwnerID = nil
             isSpeaking = true
             if resolution == .openAI {
-                await speakOpenAI(text: text)
+                await speakOpenAI(text: text, dataRoot: dataRoot)
             } else {
                 speakLocal(text: text)
             }
@@ -233,13 +234,13 @@ public final class VoiceOutputController: NSObject {
         localSynthesizer().speak(utterance)
     }
 
-    private func speakOpenAI(text: String) async {
+    private func speakOpenAI(text: String, dataRoot: URL) async {
         // Snapshot the current generation; if stop()/speak() runs during the network await, it bumps speechGeneration and we must not clobber the new state
         // when we resume.
         let generation = speechGeneration
         let synthesis = Task {
             try Task.checkCancellation()
-            return try await SwiftOpenAITTSClient.synthesizeChat(text: text, voice: { VoicePreference.cloudVoice() })
+            return try await SwiftOpenAITTSClient.synthesizeChat(text: text, dataRoot: dataRoot, voice: { VoicePreference.cloudVoice() })
         }
         pendingSynthesis = synthesis
         defer {

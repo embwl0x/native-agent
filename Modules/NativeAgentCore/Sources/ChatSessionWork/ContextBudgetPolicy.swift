@@ -14,7 +14,7 @@ public enum ContextBudgetPolicy {
 
     /// Share transcript-size approximation across request sizing and status; model spelling cannot establish a tokenizer.
     /// The prompt-budget ratio is a separate safety margin.
-    package static let transcriptCharactersPerToken = 3.5
+    package static let transcriptCharactersPerToken = 2.5
 
     /// History fitting uses the input budget; current input may use the physical limit.
     package static func inputTokens(windowTokens: Int, outputTokens: Int) -> Int {

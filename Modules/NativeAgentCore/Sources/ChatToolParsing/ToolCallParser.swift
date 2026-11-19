@@ -38,13 +38,14 @@ package struct ToolCallProtocolViolation: Equatable {
     }
 
     let kind: Kind
+    var marker = ""
 
     package var traceType: String { kind.rawValue }
 
     package var modelFeedback: String {
         if kind == .malformedToolUseMarker {
-            return "Broken call text; no call from this reply ran. Correct it using this conversation's call format. "
-                + "A literal </ inside a JSON string ends the call early: write it as <\\/."
+            return "Broken call text (\(marker)); no call from this reply ran. If you meant a call, correct it in this conversation's call format; "
+                + "a literal </ inside a JSON string ends the call early: write it as <\\/. If you were writing about calls, put the markup inside backticks."
         }
         return """
             The call was formatted as Markdown; no call from this reply ran. Use this conversation's executable call format.
@@ -256,13 +257,13 @@ package enum ToolCallParser {
         let unquoted = unquotedProtocolText(raw)
         // Remove complete calls before looking for orphan tags or placeholders. Their arguments may legitimately contain these strings.
         let remainder = stripToolUseMarkers(unquoted)
-        if regexMatches(orphanRegex, in: remainder)
-            || (!unquoted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && stripProtocolDebris(unquoted).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            || (!parseInvoke && regexMatches(invokeStartRegex, in: unquoted))
-            || (!calls.isEmpty && executableCalls(calls).isEmpty) {
-            return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
-        }
+        let stray: String? = if regexMatches(orphanRegex, in: remainder) { "a stray call tag or placeholder outside a complete call" }
+            else if !unquoted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && stripProtocolDebris(unquoted).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { "call markup with no words or call around it" }
+            else if !parseInvoke && regexMatches(invokeStartRegex, in: unquoted) { "invoke markup, which this conversation does not run" }
+            else if !calls.isEmpty && executableCalls(calls).isEmpty { "a call no tool here can run" }
+            else { nil }
+        if let stray { return ToolCallProtocolViolation(kind: .malformedToolUseMarker, marker: stray) }
 
         if regexMatches(formattedMarkerRegex, in: blankingArguments(unquoted)) {
             return ToolCallProtocolViolation(kind: .formattedToolUseMarker)
@@ -279,15 +280,17 @@ package enum ToolCallParser {
         for m in invokeRegex.matches(in: raw, range: NSRange(location: 0, length: ns.length))
             where !quoted.contains(where: { NSLocationInRange(m.range.location, $0) }) {
             if invokeParameters(in: ns.substring(with: m.range(at: 2))) == nil {
-                return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
+                return ToolCallProtocolViolation(kind: .malformedToolUseMarker, marker: "an invoke block whose parameters do not parse")
             }
         }
         for (m, call) in framedMarkers(in: raw) where !quoted.contains(where: { NSLocationInRange(m.range.location, $0) }) {
             // Only the text protocol runs invoke markup; on any other wire it is a call that will not run.
-            if !parseInvoke, m.range(at: 5).location != NSNotFound { return ToolCallProtocolViolation(kind: .malformedToolUseMarker) }
+            if !parseInvoke, m.range(at: 5).location != NSNotFound {
+                return ToolCallProtocolViolation(kind: .malformedToolUseMarker, marker: "invoke markup, which this conversation does not run")
+            }
             guard toolNames.contains(call.name) else { continue }
             if markerObject(call.body.trimmingCharacters(in: .whitespacesAndNewlines)) != nil { continue }
-            return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
+            return ToolCallProtocolViolation(kind: .malformedToolUseMarker, marker: "a call marker whose body is not a JSON object")
         }
         return nil
     }

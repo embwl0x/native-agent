@@ -87,14 +87,11 @@ public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
 public enum DreamREMCycleError: Error, LocalizedError {
     case underlying(String)
     case remDecodeFailure(String)
-    case oversizedConversationInput
     /// Keep a stable disabled-cycle identifier with its refusal detail.
     case cycleDisabled(error: String, detail: String)
 
     public var errorDescription: String? {
         switch self {
-        case .oversizedConversationInput:
-            return "dream/rem: oversized_conversation_input — no complete exchange fits the dream input budget; the watermark was preserved."
         case .underlying(let m), .remDecodeFailure(let m): return "dream/rem: \(m)"
         case .cycleDisabled(_, let detail): return "dream/rem: \(detail)"
         }
@@ -154,7 +151,7 @@ public enum DreamREMSchedule {
 
     public static func todayKey(
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = localCalendar()
     ) -> String {
         let c = calendar.dateComponents([.year, .month, .day], from: now)
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
@@ -298,8 +295,6 @@ public struct FileBackedDreamDiary: Sendable {
         public let storageUnreadable: Bool
         public let failures: [String: String]
         public var unreadableEntries: Int { failures.count }
-
-        public var isComplete: Bool { !storageUnreadable && unreadableEntries == 0 }
     }
 
     /// Carry unreadable items beside readable siblings.

@@ -610,12 +610,12 @@ actor ChromeControlChannel {
         let started = row.dispatch.cancel()
         if started {
             cancelAction(id, context: context)
-            // Dispatched work settles from its reply or connection loss; other actions also retain their request deadline.
-            return
+            // Reads can end here; navigation preserves uncertainty. Other dispatched effects retain their own settlement.
+            if row.expectedAction.mayChangeExternalState && row.expectedAction != .navigate { return }
         }
         pending.removeValue(forKey: id)
         row.timeout?.cancel()
-        complete(row.response, .failure(CancellationError()))
+        complete(row.response, .failure(row.unconfirmedFailure(CancellationError())))
     }
 
     private func connectionEnded(error: Error) {

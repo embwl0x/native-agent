@@ -149,11 +149,11 @@ extension NativeOAuthFlow {
     private static func slackAuthTest(token: String) async throws -> [String: Any] {
         var req = URLRequest(url: SlackWebAPI.apiURL("auth.test"))
         req.httpMethod = "POST"
-        req.timeoutInterval = 20
+        req.timeoutInterval = .infinity
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = Data("{}".utf8)
-        let obj = try await SlackWebAPI.response(for: req, session: .shared)
+        let obj = try await SlackWebAPI.response(for: req, session: ProviderHTTP.session)
         guard obj["error"] as? String != "non_json_response" else {
             throw NSError(domain: "NativeAgentSlack", code: -1, userInfo: [
                 NSLocalizedDescriptionKey: "Slack auth.test returned non-JSON."

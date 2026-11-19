@@ -4,7 +4,7 @@ import NativeAgentShared
 import Experiences
 import NativeAgentCore
 // Blueprint: | `AgentContactState.swift` | `AgentPeerStore`, `AgentLocalHealth`, `not_reached`: contact identity and exact health evidence |
-// Only ACP/MCP schemes get protocol labels; local observations use 600-second freshness and 300-second refresh spacing.
+// Only ACP/MCP schemes get protocol labels; local observations use 600-second freshness.
 // Unsent not_reached evidence stays retained without claiming a broken reply route.
 
 /// Identity merges only through explicit association, never a product, vendor or host name.
@@ -40,10 +40,10 @@ public struct AgentContactIdentity: Sendable {
     public func canonical(_ agent: String) -> String { aliases[agent] ?? agent }
     public func members(_ agent: String) -> [String] {
         let brain = canonical(agent)
-        return Array(Set([agent] + aliases.keys.filter { aliases[$0] == brain })).sorted()
+        return Array(Set([agent, brain] + aliases.keys.filter { aliases[$0] == brain })).sorted()
     }
     public func owners(_ owner: String) -> [String] {
-        members(aliases["peer:" + owner] == nil ? owner : "peer:" + owner).map {
+        members(peers.contains { $0["id"] == owner } ? "peer:" + owner : owner).map {
             $0.hasPrefix("peer:") ? String($0.dropFirst(5)) : $0
         }
     }
@@ -51,19 +51,13 @@ public struct AgentContactIdentity: Sendable {
 
 /// Cheap local observations, never transport authority or proof a model will answer.
 public struct AgentLocalHealth: Codable, Sendable, Equatable {
-    public static let refreshInterval: TimeInterval = 300
     public static func isRecent(_ at: Date) -> Bool { Date().timeIntervalSince(at) < 600 }
     private var observedStatus: String?
     private var observedDetail: String
     private var presence: String? = nil
     private var presenceWords: String? = nil
-    private var presenceAt: Date? = nil
-    public var presenceStatus: String? {
-        presence == "recent_activity" && !Self.isRecent(presenceAt ?? .distantPast) ? "waiting" : presence
-    }
-    public var presenceDetail: String? {
-        presence == "recent_activity" && presenceStatus == "waiting" ? "No recent activity from Claude's bridge." : presenceWords
-    }
+    public var presenceStatus: String? { presence }
+    public var presenceDetail: String? { presenceWords }
     private var installed: Bool? = nil
     private var authenticationRequired: Bool? = nil
     private var availability: String {
@@ -105,7 +99,6 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     public mutating func present(_ presence: Self) {
         self.presence = presence.status
         presenceWords = presence.detail
-        presenceAt = presence.checkedAt
     }
 
     public mutating func retainReplyEvidence() {
@@ -144,7 +137,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     /// Unverified routes need a new send as proof; only broken reply paths count as problems.
     public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(observedStatus ?? availability) }
     /// Presence words, overlaid live at every read: a state, never a problem.
-    public static let presenceStatuses: Set<String> = ["recent_activity", "waiting", "inbound_only", "live"]
+    public static let presenceStatuses: Set<String> = ["waiting", "inbound_only", "live"]
     public var problem: String? {
         current && !(["ready", "installed", "live", "unchecked"] + Self.presenceStatuses).contains(observedStatus ?? availability)
             ? observedDetail + (repairDetail.map { " " + $0 } ?? "") : nil
@@ -170,12 +163,6 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         AgentConversationRecord.sendEvidence(receipt)["needs_authentication"] == .bool(true)
     }
 
-    public static func nextRefresh(_ root: URL, now: Date) -> Date {
-        let observations = read(root).values
-        let last = observations.filter { !$0.sticky }.map(\.checkedAt).min()
-            ?? (observations.isEmpty ? .distantPast : now)
-        return max(now.addingTimeInterval(30), last.addingTimeInterval(refreshInterval))
-    }
 }
 
 /// Declines and disconnects survive program updates; discovery and disconnect share a file lock.
@@ -207,10 +194,6 @@ public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
     }
 
     public var open: Bool { offeredAt != nil && declinedAt == nil && connectedAt == nil }
-    /// Home's PEOPLE line. An `app:` id is an app no recipe knows: nothing to connect.
-    public static func line(id: String, name: String) -> String {
-        id.hasPrefix("app:") ? "Found \(name) (no recipe yet) — want me to look?" : "Found \(name) — connect?"
-    }
 }
 
 /// Fetches without read evidence stay unknown.

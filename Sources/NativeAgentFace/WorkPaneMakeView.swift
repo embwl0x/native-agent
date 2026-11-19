@@ -197,7 +197,7 @@ private struct GrantedMakePreview: View {
     let preview: MakePreviewFace
     @Environment(\.quietCaptureSession) private var capture
     @State private var resources: [FaceResourceAccess.Opened] = []
-    @State private var image: Data?
+    @State private var image: NSImage?
     @State private var issue: String?
     var body: some View {
         Group {
@@ -215,8 +215,8 @@ private struct GrantedMakePreview: View {
                     MakeMockupView(file: file, folder: folder, revision: 0)
                 } else { FaceReadStatus(state: preview.state) }
             } else if let issue { Text(issue).foregroundStyle(.red).textSelection(.enabled) }
-            else if let image, let decoded = NSImage(data: image) {
-                Image(nsImage: decoded).resizable().scaledToFit().padding(12)
+            else if let image {
+                Image(nsImage: image).resizable().scaledToFit().padding(12)
             } else if let file = resources.first?.url {
                 if preview.kind == "web", let folder = resources.dropFirst().first?.url {
                     MakeMockupView(file: file, folder: folder, revision: 0)
@@ -241,10 +241,10 @@ private struct GrantedMakePreview: View {
                 do {
                     for grant in preview.resources { opened.append(try await FaceResourceAccess.resolve(grant)) }
                     if preview.isPicture, let file = opened.first {
-                        image = try await FaceResourceAccess.bytes(file.url)
-                        guard image.flatMap(NSImage.init(data:)) != nil else {
+                        guard let decoded = NSImage(data: try await FaceResourceAccess.bytes(file.url)) else {
                             throw PartCallError(code: "image_decode_failed", message: "The granted image could not be decoded.")
                         }
+                        image = decoded
                     }
                     try Task.checkCancellation()
                     resources = opened

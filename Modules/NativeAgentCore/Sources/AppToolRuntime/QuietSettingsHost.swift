@@ -65,8 +65,6 @@ public protocol QuietSettingsHost: AnyObject {
     func savePersonalityName(_ name: String) async -> String?
     func saveSearchServiceURL(_ url: String) async throws
     func findSearchService(context: QuietSettingWrite) async throws -> String
-    func inboxTriggers() async throws -> [QuietInboxTrigger]
-    func setInboxTrigger(_ name: String, enabled: Bool) async throws
     /// Platform-owned lower-only rows retain Core's lowerOnly/narrowOnly direction rules.
     func lowerOnlyRows(forPage page: String?) throws -> [QuietSetting]
 }
@@ -74,15 +72,6 @@ public protocol QuietSettingsHost: AnyObject {
 /// Each inner-life lane uses its own runtime setter, shared by Settings and Cognition.
 public enum QuietCognitionLane: Sendable {
     case capsule, background, reflection, organism
-}
-
-public struct QuietInboxTrigger: Sendable {
-    public let name: String
-    public let enabled: Bool
-    public init(name: String, enabled: Bool) {
-        self.name = name
-        self.enabled = enabled
-    }
 }
 
 /// Providers and composer share each account's offered models and declared thinking levels.

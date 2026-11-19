@@ -64,7 +64,7 @@ public enum InboxCardActions {
             try await setReading(id: id, action: endpointAction, dataRoot: root)
             return
         }
-        if endpointAction == "approve" || endpointAction == "reject" {
+        if ["approve", "approve_task", "reject"].contains(endpointAction) {
             do {
                 try await effects.resolveApproval(id: id, decision: endpointAction, dataRootOverride: dataRootOverride, turn: turn)
             } catch ApprovalInboxError.alreadyResolved(let resolvedID, let status) {
@@ -171,7 +171,7 @@ public enum InboxCardActions {
     }
 
     // Only these exact producers author a message in the agent's voice.
-    static let agentVoiceCardSources: Set<String> = ["trigger:morning_brief", "idle_checkin"]
+    static let agentVoiceCardSources: Set<String> = ["idle_checkin"]
 
     static func isAgentVoiceCard(_ item: InboxItemRecord) -> Bool {
         agentVoiceCardSources.contains(item.source.trimmingCharacters(in: .whitespacesAndNewlines))

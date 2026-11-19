@@ -22,7 +22,7 @@ import TrustCenter
 import Senses
 import PersonaEngine
 import Desk
-// Blueprint: | `AppDoorActions.swift` | Shared admission, previews and typed receipts; accepted matters supply the call's knock count |
+// Blueprint: | `AppDoorActions.swift` | Shared admission, previews, route corrections and typed receipts; accepted matters supply knock count |
 extension AppToolExecutor {
     @concurrent private static func doorUndoLayout(root: URL) async -> JSONValue {
         SurfaceLayoutStore.read(dataRoot: root)
@@ -51,17 +51,21 @@ extension AppToolExecutor {
             let outcome = await Self.doorUndoLayout(root: root)
             guard case .object(let read) = outcome, let previous = read["previous"] else {
                 if !ChatToolOutcome.outputLooksSuccessful(outcome) { return outcome }
-                return Self.doorRefusal("undo_unavailable", "The previous layout could not be read. Nothing was written.",
-                    remedy: "inspect", "Read the layout and its retained history; do not invent the previous layout.", next: ["action": .string("layout.read")])
+                return Self.failure("undo_unavailable", "The previous layout could not be read. Nothing was written.",
+                    extra: ["remedy": .object(["kind": .string("inspect"),
+                        "instruction": .string("Read the layout and its retained history; do not invent the previous layout."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("layout.read")])])])])
             }
             args = ["layout": previous, "layout_version": receipt["version"] ?? .null]
         case "agent.recipe_write":
             let outcome = await Self.doorUndoRecipe(host: receipt["host"]?.scalarText)
             guard case .object(let read) = outcome, let previous = read["previous"] else {
                 if !ChatToolOutcome.outputLooksSuccessful(outcome) { return outcome }
-                return Self.doorRefusal("undo_unavailable", "The previous recipe could not be read. Nothing was written.",
-                    remedy: "inspect", "Read this recipe and its retained history; do not invent the previous recipe.",
-                    next: ["action": .string("agent.recipe"), "args": .object(["host": receipt["host"] ?? .null])])
+                return Self.failure("undo_unavailable", "The previous recipe could not be read. Nothing was written.",
+                    extra: ["remedy": .object(["kind": .string("inspect"),
+                        "instruction": .string("Read this recipe and its retained history; do not invent the previous recipe."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("agent.recipe"),
+                            "args": .object(["host": receipt["host"] ?? .null])])])])])
             }
             args = ["host": receipt["host"] ?? .null, "recipe": previous]
         case "setting.set":
@@ -72,8 +76,9 @@ extension AppToolExecutor {
                 extra: ["remedy": Repair.terminal(instruction: "This receipt has no inverse. Inspect the affected state before choosing a new change.")])
         }
         guard let perform = execution.perform else {
-            return Self.doorRefusal("door_unavailable", "Use app from a chat turn. Nothing was written.",
-                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
+            return Self.failure("door_unavailable", "Use app from a chat turn. Nothing was written.",
+                extra: ["remedy": .object(["kind": .string("correct_arguments"),
+                    "instruction": .string("Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id."), "next_call": .null])])
         }
         // Re-enter the original action's gates; only its owner applies the receipt.
         return try await perform("app", ["action": .string(action), "args": .object(args),
@@ -154,10 +159,10 @@ extension AppToolExecutor {
             }
             let qualified = Self.doorText(input["page"]) + "." + id
             if let correction = try await Self.doorActionCorrection(qualified, input: input, turn: turn) {
-                return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
+                return correction
             }
             if let correction = try await Self.doorActionCorrection(id, input: input, turn: turn) {
-                return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
+                return correction
             }
             let advice = try await AppActions.callAdvice(id, input: input, pages: doorPageIndex, dataRoot: root,
                                                         memory: await actionIndex, turn: turn)
@@ -175,10 +180,12 @@ extension AppToolExecutor {
                 next: next,
                 extra: ["requested": .string(id), "try_instead": advice])
         }
-        // Who decides it: the person for a lever, the agent otherwise; a lever the person decided is still theirs.
+        let ownsLever = if action.lever?.asks == true {
+            try await SwiftNativeTrustCenter(dataRoot: root).agentOwnsLevers(turn: turn)
+        } else { false }
         var receipt: [String: JSONValue] = [
             "action": .string(action.id), "page": .string(action.page), "label": .string(action.label),
-            "owner": .string(action.lever?.holds(input["args"]?.objectValue ?? [:]) == true || PermissionLaw.personDecided(tool: "app", input: [
+            "owner": .string((action.lever?.holds(input["args"]?.objectValue ?? [:]) == true && !ownsLever) || PermissionLaw.personDecided(tool: "app", input: [
                 "action": .string(action.id), "args": input["args"] ?? .object([:])], turn: turn) ? "person" : "agent"),
             "execution": .string("not_run"),
         ]
@@ -218,11 +225,26 @@ extension AppToolExecutor {
                 instruction: "Repair this action's registered schema before calling it again.", recovery: .repair)
         }
         if !woken {
-            do { try ToolArguments.admit(validationArgs, schema: schema, path: "args") }
+            do {
+                if execution.argumentPreflightOnly, action.isFold || read,
+                   let (key, values) = Self.doorPlural(action, args, discovery: discovery) {
+                    for value in values {
+                        let scalar = Self.normalizedCallArguments(action, args.merging([key: value]) { $1 },
+                            schema: schema, recordShims: false)
+                        try ToolArguments.admit(Self.doorValidationArgs(action, scalar), schema: schema, path: "args")
+                    }
+                } else { try ToolArguments.admit(validationArgs, schema: schema, path: "args") }
+            }
             catch let error as ToolFailureError {
                 if error.code == "tool_schema_unavailable" { throw error }
                 return badArgs("bad_input", error.localizedDescription, error.argumentPath ?? "args")
             }
+        }
+        if execution.argumentPreflightOnly {
+            receipt["status"] = .string("preview")
+            receipt["effects"] = .string("none")
+            receipt["preview_scope"] = .string("public_arguments")
+            return .object(receipt)
         }
         // Validate before an owner-only preview can claim a callable target.
         let ownerRemedy: JSONValue = {
@@ -245,14 +267,12 @@ extension AppToolExecutor {
             }
             return Repair.why(owner: action.id, tap: tap)
         }()
-        // A lever runs only as the person's own decision of this exact call (their tap, or the card they approved); here nothing else passes,
-        // at any posture, and the agent's call of it becomes their card or names where they do it.
         let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": input["args"] ?? .object([:])],
             turn: turn)
         // A lever's preview is the gate's own check: it reads on to the owner's checks of what the call names, so a call that cannot run is
         // refused in its owner's words first; one that can is the card's to decide, or the person's own to do (below, after the checks).
         let ownersOnly = action.lever.map { $0.holds(input["args"]?.objectValue ?? [:]) && !decided && !$0.asks } ?? false
-        if let lever = action.lever, lever.holds(input["args"]?.objectValue ?? [:]), !decided, input["preview"] != .bool(true) {
+        if let lever = action.lever, lever.holds(input["args"]?.objectValue ?? [:]), !decided, !ownsLever, input["preview"] != .bool(true) {
             let why = lever.why
             receipt["owner"] = .string("person")
             receipt["why"] = .string(why)

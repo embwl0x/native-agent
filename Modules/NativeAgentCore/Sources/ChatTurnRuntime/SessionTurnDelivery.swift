@@ -85,10 +85,11 @@ public enum SessionTurnDelivery {
 
     @concurrent private static func conversationDestination(sessionID: String, dataRoot: URL) async throws
         -> (required: Bool, route: ChatToolSessionContext.ReplyRoute?) {
-        let kind = try SessionConversation.checkedKind(sessionID, dataRoot: dataRoot)
-        if kind == .builder || kind == .agent || kind == .ephemeral { return (false, nil) }
+        if !owesLiveDelivery(try SessionConversation.checkedKind(sessionID, dataRoot: dataRoot)) { return (false, nil) }
         return (true, try await HumanConversationReader.readForSessionDelivery(sessionID: sessionID, dataRoot: dataRoot))
     }
+
+    private static func owesLiveDelivery(_ kind: ChatThreadKind?) -> Bool { !(kind == .builder || kind == .agent || kind == .ephemeral) }
 
     static func open(dataRoot: URL, sessionID: String, runID: String, surface: String, turn: Turn) async -> Recipient? {
         let (mounted, resolver) = state.withLock {
@@ -119,7 +120,7 @@ public enum SessionTurnDelivery {
             recipient = nil
             unavailable = TurnTraceRedactor.redactText(String(describing: error))
         }
-        if recipient == nil && needsDelivery {
+        if recipient == nil && needsDelivery && owesLiveDelivery(SessionConversation.kind(sessionID, dataRoot: dataRoot)) {
             RepairOwed.owe(dataRoot, id: "session-delivery:" + sessionID + ":" + runID, kind: .run,
                 operation: "session.delivery:" + sessionID + ":" + runID, owner: "Conversation delivery",
                 words: "Live delivery is still owed for run \(runID) in conversation \(sessionID). "

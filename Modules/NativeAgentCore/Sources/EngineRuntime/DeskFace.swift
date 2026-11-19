@@ -28,25 +28,29 @@ extension NativeAgentEngine {
         guard let board = snapshot.board else {
             throw PartCallError(code: "desk_unavailable", message: "The Desk has not returned a board reading.")
         }
-        // The pieces read the Make shelf, which starts the first time the Desk holds one; its changes refresh this page.
-        let made = Set(snapshot.items.flatMap(\.refs).compactMap { DeskPiece.makeRef($0) })
         let pieces = await MainActor.run { [make] in
-            if !made.isEmpty { make.start() }
+            make.start()
             return DeskPieceShelf(loaded: make.loaded, fault: make.fault,
-                                  metadata: made.reduce(into: [String: MakeStudio.Meta]()) { $0[$1] = make.meta($1) })
+                                  metadata: Dictionary(uniqueKeysWithValues: make.allMetadata.map { ($0.ref, $0) }))
         }
+        var names: [String: String] = [:], answers: [String: [PartFace.Action]] = [:]
+        var contactsIssue: String?, inboxIssue: String?
+        do { names = try AgentPeerStore(dataRoot: dataRoot).list().reduce(into: [:]) { $0["peer:" + $1.id] = $1.name } }
+        catch { contactsIssue = "Contacts could not be read: " + error.localizedDescription }
+        do { answers = try await inboxAnswers() }
+        catch { inboxIssue = "Answers could not be read: " + error.localizedDescription }
         var facts = deskFacts(snapshot, pieces: pieces, liveError: state.liveError, scheduleError: state.scheduleError,
-                              scheduleRead: state.scheduleRead, scheduleCurrent: state.scheduleCurrent)
+                              scheduleRead: state.scheduleRead, scheduleCurrent: state.scheduleCurrent,
+                              contactsIssue: contactsIssue, inboxIssue: inboxIssue)
         facts["night"] = .object(await nextNightReading())
+        facts["table"] = pieces.standingTable(snapshot.board?.deskState?.items, dataRoot: dataRoot)
         facts["selected"] = deskSelectedFacts(snapshot, selected: state.selected, pieces: pieces)
         facts["keys"] = deskKeys(snapshot, selected: state.selected)
         // A contact is shown by name. A row's words (its title and summary) may hold `peer:<id>`, written when the work was filed; the page
         // reads the name the contact has now. Ids, handles and calls keep the identifier.
-        let names = ((try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []).reduce(into: [String: String]()) { $0["peer:" + $1.id] = $1.name }
         if !names.isEmpty { facts = facts.mapValues { Self.named($0, names) } }
         // The board revision orders reads; a selection or a clock edge changes the facts at one revision, and the face is drawn again.
-        // A row that needs the person carries its Inbox row's own answers; an unreadable Inbox leaves the row its open link only.
-        let answers = (try? await inboxAnswers()) ?? [:]
+        // A row that needs the person carries its Inbox row's own answers; unread answers carry their cause in the packet.
         let levers = deskLevers(snapshot, selected: state.selected, answers: answers)
         return PartFaces.Packet(facts: .object(facts), epoch: board.revision, levers: levers.page, keyLevers: levers.keyed)
     }
@@ -213,6 +217,8 @@ extension NativeAgentEngine {
             if !entry.isEmpty { keys[id] = .object(entry) }
         }
         key("desk:refresh", [.calls("refresh", "desk.refresh")])
+        key("piece:" + BoardDocument.tableRef, [PageKeyAction(id: "pop-out", doors: ["mac"],
+            call: PartFace.Call("pane.show", ["view": .string("table")]))])
         key("desk:find-item", [.mac("find-item", opens: DeskMacPlace.findItem.link)])
         key("desk:new-task", [.mac("new-task", opens: DeskMacPlace.newTask.link)])
         key("desk:research", [.mac("research", opens: DeskMacPlace.research.link)])
@@ -285,7 +291,7 @@ extension NativeAgentEngine {
 
     /// The Desk's measured facts: the board's items with what groups them, live activity, the overview, work lines, timers and named gaps.
     private func deskFacts(_ snapshot: DeskPageSnapshot, pieces: DeskPieceShelf, liveError: String?, scheduleError: String?,
-                           scheduleRead: Bool, scheduleCurrent: Bool) -> [String: JSONValue] {
+                           scheduleRead: Bool, scheduleCurrent: Bool, contactsIssue: String?, inboxIssue: String?) -> [String: JSONValue] {
         let now = snapshot.now
         let evidence = DeskMovementPresentation.evidence(snapshot.agentJobs.items)
         let studio = MakeStudio(dataRoot: dataRoot)
@@ -368,6 +374,7 @@ extension NativeAgentEngine {
                 "desk": faceText(snapshot.deskUnavailable), "jobs": faceText(snapshot.agentJobs.unavailableReason),
                 "reminders": faceText(snapshot.nagConfigError), "helpers": faceText(snapshot.botScheduleError),
                 "liveUpdates": faceText(liveError), "schedule": faceText(scheduleError),
+                "contacts": faceText(contactsIssue), "inbox": faceText(inboxIssue),
                 "overview": .array((snapshot.overview?.unavailable ?? []).map(JSONValue.string)),
             ]),
             "scheduleRead": .bool(scheduleRead),
@@ -388,10 +395,7 @@ extension NativeAgentEngine {
     static func timerName(_ time: OneClock.Time) -> String {
         let payload = time.payload?.objectValue ?? [:]
         switch time.owner {
-        case "sleep": return "The night: today's dream"
-        case "rem": return "Weekly REM"
         case "part": return "\(payload["part"]?.stringValue ?? time.id) wakes on \(payload["signal"]?.stringValue ?? "its schedule")"
-        case SwiftNativeTriggerScheduler.clockOwner: return "Inbox trigger \(payload["name"]?.stringValue ?? time.id)"
         default: return payload["name"]?.stringValue ?? time.id
         }
     }

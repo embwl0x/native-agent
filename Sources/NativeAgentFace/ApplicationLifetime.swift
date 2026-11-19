@@ -131,7 +131,8 @@ final class ApplicationLifetime {
         }
         if let session = target.session {
             try FaceWindowReply.check(await appModel.client.act(.selectConversation(session: session, userInitiated: false)))
-            appModel.activeChatSessionId = session
+            appModel.chatSelectionGeneration = UUID()
+            appModel.commitChatSessionSelection(session)
             appModel.pendingChatMessageID = target.message
         }
         let destination: NativeAgentNavigationDestination
@@ -275,16 +276,11 @@ final class ApplicationLifetime {
             while let next = owed {
                 owed = nil
                 guard wants(next.turn) else { continue }
-                let place = "page=" + next.destination.page + " item=" + (next.destination.item ?? "")
                 do {
-                    let reply = try await ApplicationLifetime.shared.navigate(.init(destination: next.destination, policy: .quiet),
-                                                                              wanted: { self.wants(next.turn) })
-                    if case .navigation(let receipt) = reply {
-                        transcriptLog.append { "face.follow " + place + " disposition=" + receipt.disposition.rawValue }
-                    }
+                    _ = try await ApplicationLifetime.shared.navigate(.init(destination: next.destination, policy: .quiet),
+                                                                     wanted: { self.wants(next.turn) })
                 } catch {
-                    let reason = error.localizedDescription
-                    transcriptLog.append { "face.follow.unshown " + place + " reason=" + reason }
+                    ApplicationLifetime.shared.appModel?.setFailureStatus(error, action: "follow the turn's attention")
                 }
             }
             moving = false

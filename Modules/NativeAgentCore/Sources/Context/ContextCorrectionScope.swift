@@ -37,35 +37,6 @@ public enum ContextCorrectionScope {
         "desk_handle",
     ]
 
-    /// Build-specific topic tokens match whole words through the shared tokenizer. Interpersonal terms such as "design", "preference" and "personal" are
-    /// excluded.
-    public static let engineeringTopicTokens: Set<String> = [
-        "backlog", "branch", "build", "builds", "ci", "codex", "commit",
-        "compile", "delegation", "deploy", "deployment", "desk", "diff",
-        "dmg", "eval", "evals", "git", "install", "installation", "lint",
-        "merge", "migration", "nativeagent", "onboarding", "orchestration",
-        "packaging", "refactor", "regression", "release", "releases", "repo",
-        "repository", "schema", "ship", "shipping", "star", "swift", "test",
-        "tests", "testing", "verification", "worker", "workers", "workshop",
-        "worktree",
-    ]
-
-    /// Exclude instruction, preference and correction labels: interpersonal memories use them too.
-    public static let engineeringRecordLabels: Set<String> = ["project"]
-
-    /// Nil means no engineering marker: the atom stays global.
-    static func engineeringTopicLabels(for atom: ContextAtomDraft) -> [String]? {
-        var labels: [String] = []
-        for tag in atom.triggers where !Set(words(tag)).isDisjoint(with: engineeringTopicTokens) {
-            labels.append(tag)
-        }
-        let recordLabels = atom.entities
-            .filter { $0.kind == "memory_record" && engineeringRecordLabels.contains($0.label.lowercased()) }
-            .map(\.label)
-        labels.append(contentsOf: recordLabels)
-        return labels.isEmpty ? nil : labels
-    }
-
     public static func applies(
         _ atom: ContextAtomDraft, message: String, recentTurns: [String],
         subjectEntities: Set<ContextEntity> = []
@@ -81,14 +52,9 @@ public enum ContextCorrectionScope {
             return mentions(titles, message: message, recentTurns: recentTurns)
                 || mentions(titles, message: subjectWords, recentTurns: [])
         }
-        // Engineering metadata requires evidence from this turn even on an otherwise unscoped atom.
-        guard let scopingKind = scopingEntityKind(for: atom) else {
-            return engineeringTopicsApply(atom, message: message + "\n" + subjectWords, recentTurns: recentTurns)
-        }
+        guard let scopingKind = scopingEntityKind(for: atom) else { return true }
         let topics = scopingTopics(atom, kind: scopingKind)
-        guard !topics.isEmpty else {
-            return engineeringTopicsApply(atom, message: message + "\n" + subjectWords, recentTurns: recentTurns)
-        }
+        guard !topics.isEmpty else { return true }
         // Inner-life questions admit personal corrections without a literal topic match.
         if scopingKind == entityKind,
            isPersonalTask(message),
@@ -111,17 +77,6 @@ public enum ContextCorrectionScope {
     public static func hasTopics(_ atom: ContextAtomDraft) -> Bool {
         guard let kind = scopingEntityKind(for: atom) else { return false }
         return !scopingTopics(atom, kind: kind).isEmpty
-    }
-
-    /// Engineering metadata requires the turn to name its subject; a broad label counts only without a more specific subject.
-    private static func engineeringTopicsApply(
-        _ atom: ContextAtomDraft, message: String, recentTurns: [String]
-    ) -> Bool {
-        guard let labels = engineeringTopicLabels(for: atom) else { return true }
-        let subjects = labels.filter {
-            !["project", "nativeagent", "codex", "worker", "workers"].contains(words($0).joined(separator: " "))
-        }
-        return mentions(subjects.isEmpty ? labels : subjects, message: message, recentTurns: recentTurns)
     }
 
     /// Share contiguous-word matching between engineering and topic admission.

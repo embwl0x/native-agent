@@ -122,7 +122,7 @@ public struct LoopStatus: Sendable, Equatable {
     /// Running registration does not prove body execution; expose the actual execution gate separately.
     public let executing: Bool
     public let executionStartedAt: Date?
-    public let executionTimeout: TimeInterval
+    public let waitingOn: String?
     /// Nil distinguishes non-event-driven loops from broken listeners.
     public let eventListener: LoopEventListenerHealth?
 
@@ -144,7 +144,7 @@ public struct LoopStatus: Sendable, Equatable {
         disabledReason: String? = nil,
         executing: Bool = false,
         executionStartedAt: Date? = nil,
-        executionTimeout: TimeInterval = 300,
+        waitingOn: String? = nil,
         eventListener: LoopEventListenerHealth? = nil,
         lastResult: String? = nil,
         lastSuccessfulWorkAt: Date? = nil,
@@ -160,7 +160,7 @@ public struct LoopStatus: Sendable, Equatable {
         self.disabledReason = disabledReason
         self.executing = executing
         self.executionStartedAt = executionStartedAt
-        self.executionTimeout = executionTimeout
+        self.waitingOn = waitingOn
         self.eventListener = eventListener
         self.lastResult = lastResult
         self.lastSuccessfulWorkAt = lastSuccessfulWorkAt

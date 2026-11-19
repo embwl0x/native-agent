@@ -9,7 +9,8 @@ import PersistenceCore
 /// Task ownership, continuation and stream recovery stay with A2A.
 enum AgentA2AGRPC {
     static func send(_ request: AgentA2AWire.Request, bearerToken: String?,
-                     timeout: TimeInterval, liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?) async throws -> AgentPeerHTTP.Response {
+                     timeout: TimeInterval, liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?,
+                     taskOpened: @escaping @Sendable (String) throws -> Void) async throws -> AgentPeerHTTP.Response {
         try AgentPeerHTTP.validateURL(request.url)
         guard let method = request.grpcMethod, let host = request.url.host,
               request.url.query == nil, ["", "/"].contains(request.url.path),
@@ -50,7 +51,8 @@ enum AgentA2AGRPC {
                         Lf_A2a_V1_SendMessageRequest.self,
                         Lf_A2a_V1_SendMessageResponse.self)
                 case "SendStreamingMessage":
-                    return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SendMessageRequest.self, request, bearerToken, liveFeed)
+                    return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SendMessageRequest.self,
+                        request, bearerToken, liveFeed, taskOpened)
                 case "GetTask":
                     return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_GetTaskRequest.self, Lf_A2a_V1_Task.self)
                 case "ListTasks":
@@ -67,7 +69,8 @@ enum AgentA2AGRPC {
                         Lf_A2a_V1_SubscribeToTaskRequest.self,
                         request,
                         bearerToken,
-                        liveFeed)
+                        liveFeed,
+                        taskOpened)
                 case "CreateTaskPushNotificationConfig":
                     return try await unary(
                         client,
@@ -146,7 +149,8 @@ enum AgentA2AGRPC {
         _ client: GRPCClient<HTTP2ClientTransport.TransportServices>, _ method: String,
         _ json: String, _ metadata: Metadata, _ options: CallOptions, _ input: Input.Type,
         _ request: AgentA2AWire.Request, _ bearerToken: String?,
-        _ liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
+        _ liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?,
+        _ taskOpened: @escaping @Sendable (String) throws -> Void
     ) async throws -> AgentPeerHTTP.Response {
         guard let interface = request.streamInterface else { throw AgentPeerHTTP.TransportError.invalidRequest }
         return try await client.serverStreaming(request: ClientRequest(message: Input(jsonString: json), metadata: metadata),
@@ -154,7 +158,7 @@ enum AgentA2AGRPC {
             deserializer: ProtobufDeserializer<Lf_A2a_V1_StreamResponse>(), options: options) { response in
                 var received = false
                 var accumulator = AgentA2AStream.Accumulator(interface: interface, requestID: request.requestID,
-                    expectedTaskID: request.expectedTaskID, bearerToken: bearerToken)
+                    expectedTaskID: request.expectedTaskID, bearerToken: bearerToken, taskOpened: taskOpened)
                 do {
                     // Pull one event at a time; HTTP/2 applies receive backpressure.
                     for try await message in response.messages {

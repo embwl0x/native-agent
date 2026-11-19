@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import AgentConversations
 import BackgroundLoops
 import ChatTurnRuntime
 import Cognition
@@ -149,6 +150,9 @@ public actor EngineFaceActs: FaceActHandler {
             let connection = sink
             guard observationKeys[id] == nil, platformObservations[id] == nil else {
                 throw Self.failure("observation_exists", "That observation is already open.")
+            }
+            if demand == .key(.page("connectors")) {
+                await AgentContactHealth.shared.refresh(dataRoot: engine.dataRoot)
             }
             if !EngineFaceProjection.owns(demand) {
                 guard let platform else { throw Self.failure("body_adapter_unavailable", "The body presentation adapter has not been installed.") }
@@ -327,7 +331,7 @@ public actor EngineFaceActs: FaceActHandler {
             return .acknowledged
         case .forgetMemory(let id):
             try await engine.memory.delete(id: id)
-            return .acknowledged
+            return .committed(.init(identities: [id], value: .null, revision: nil, effects: .known, publicationFailure: nil))
         case .resolveMemoryProposal(let id, let decision):
             switch decision {
             case .accept: _ = try await engine.memory.accept(proposalID: id)
@@ -395,16 +399,10 @@ public actor EngineFaceActs: FaceActHandler {
             return .result(.object(["requestedBackend": .string(saved.requestedBackend), "effectiveBackend": .string(saved.effectiveBackend),
                 "model": .string(saved.modelId), "dimensions": .int(Int64(saved.dimensions)),
                 "loadError": saved.lastLoadError.map(PartFace.Value.string) ?? .null]))
-        case .setInboxTrigger(let name, let enabled):
-            try await engine.inbox.setTrigger(name, enabled: enabled)
-            return .acknowledged
         case .testProvider(let request):
             return try await testProvider(request)
         case .disconnectProvider(let id):
             return try await disconnectProvider(id)
-        case .repairTelegram(let inbox):
-            let result = try await TelegramUpdateInbox.repair(dataRoot: engine.dataRoot, inbox: inbox ?? "")
-            return .result(PartFace.Value(result))
         case .clearTelegramLogs:
             let result = try await engine.telegram.clearTelegramDiagnostics(manager: .shared)
             return .committed(.init(identities: ["telegram"], value: .object(["removedRows": .int(Int64(result.removedRowCount)),
@@ -416,8 +414,6 @@ public actor EngineFaceActs: FaceActHandler {
             guard let platform else { throw Self.failure("body_adapter_unavailable", "The body greeting owner has not been installed.") }
             return try await platform.handle(act)
         case .onboarding(let request): return try await onboarding(request)
-        case .createStarterPersona(let request):
-            return try await onboarding(.complete(agentName: request.agentName, personaType: request.personaType, userName: request.userName))
         case .createBackup(let reason): return try await createBackup(reason)
         case .saveChatChoice(let request): return try await saveChatChoice(request)
         case .saveProviderConnection(let request): return try await saveProviderConnection(request)
@@ -429,7 +425,6 @@ public actor EngineFaceActs: FaceActHandler {
         case .disconnectConnector(let id): return try await disconnectConnector(id)
         case .saveConnectorCredentials(let request): return try await saveConnectorCredentials(request)
         case .configureTelegram(let request): return try await configureTelegram(request)
-        case .saveSlackIngress(let request): return try await saveSlackIngress(request)
         case .testTelegram: return try await testTelegram()
         case .removePhonePairing(let id): return try await removePhonePairing(id)
         case .applyTrustPreset(let request): return try await applyTrustPreset(request)
@@ -444,7 +439,6 @@ public actor EngineFaceActs: FaceActHandler {
         case .saveMacControlPolicy(let request): return try await saveMacControlPolicy(request)
         case .saveMultimodalPolicy(let request):
             return try await savePolicyBlock("multimodalPolicy", fields: request.fields, revision: request.expectedRevision)
-        case .authorizeSafePolicy: return await trustReply(try await SwiftNativeTrustCenter(dataRoot: engine.dataRoot).reauthorizeSafePolicy())
         case .refreshPrivacyInventory: await engine.trust.refreshPrivacyMap(); return .acknowledged
         case .checkMail: await engine.macIntegration.checkMail(); return .acknowledged
         case .setActivityPolicy(let request): return try await saveActivityPolicy(request)
@@ -512,6 +506,7 @@ public actor EngineFaceActs: FaceActHandler {
         switch scope {
         case .page(let page):
             if page == "trust" { await engine.macIntegration.refresh(refreshWatches: false) }
+            if page == "connectors" { await AgentContactHealth.shared.refresh(dataRoot: engine.dataRoot) }
             guard let snapshot = await engine.pages.refresh(page: page) else { throw Self.failure("unknown_page", "That page is not registered.") }
             if let error = snapshot.error { throw error }
         case .session(let session):

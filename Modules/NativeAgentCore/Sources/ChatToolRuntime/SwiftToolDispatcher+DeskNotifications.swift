@@ -126,7 +126,7 @@ extension SwiftToolDispatcher {
             if preview {
                 try read.validate(proposal)
                 return .object(["status": .string("ok"), "effects": .string("none"),
-                    "as_of": .string(read.state.generatedTs), "evaluated_at": .double(read.now.timeIntervalSince1970),
+                    "last_change": .string(read.state.generatedTs), "evaluated_at": .double(read.now.timeIntervalSince1970),
                     "proposal": try .fromEncodable(proposal)])
             }
             let next = try await read.commit(proposal, dataRoot: dataRoot)

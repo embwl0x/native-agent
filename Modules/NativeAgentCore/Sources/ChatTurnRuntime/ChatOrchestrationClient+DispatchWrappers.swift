@@ -24,8 +24,8 @@ import StandingBots
 // Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's own turn deciding what is theirs; audit failures owe repairs |
 
 /// Carry request ceilings to Trust's canonical refusal before any inner work.
-final class FileAccessGatedDispatcher: ExpansionToolDispatchClient, PreApprovalToolValidating, Sendable {
-    private let inner: any ExpansionToolDispatchClient
+final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValidating, Sendable {
+    private let inner: any ToolDispatchClient
     private let fileAccess: String
     private let dataRoot: URL
 
@@ -81,7 +81,7 @@ final class FileAccessGatedDispatcher: ExpansionToolDispatchClient, PreApprovalT
         return savedMode == .readOnly ? "auto" : saved
     }
 
-    init(inner: any ExpansionToolDispatchClient, fileAccess: String, dataRoot: URL) {
+    init(inner: any ToolDispatchClient, fileAccess: String, dataRoot: URL) {
         self.inner = inner
         self.fileAccess = fileAccess
         self.dataRoot = dataRoot
@@ -100,12 +100,6 @@ final class FileAccessGatedDispatcher: ExpansionToolDispatchClient, PreApprovalT
             refusal["checker"] = .string("request_file_access")
             return await ChatToolDispatchTracer.traceUndispatched(turn: turn, tool: tool, input: input, surface: surface,
                 result: .object(refusal), dataRoot: dataRoot)
-        }
-    }
-
-    func readAhead(surface: String, session: String?, turn: Turn, work: ChatTurnWork) async -> JSONValue? {
-        await holding(turn.with(\.fileAccess, fileAccess)) { turn in
-            await inner.readAhead(surface: surface, session: session, turn: turn, work: work)
         }
     }
 
@@ -323,6 +317,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 context: .init(turn: turn,
                     effectOptions: .init(admissionOnly: work.admissionOnly),
                     effectExecutor: work.authoredCall.map { .init(tool: $0.tool, perform: $0.perform) }))
+            let outcome: Result<JSONValue, Error>
             do {
                 var result = try await holding(turn.with(\.hostCallID, id)) { turn in
                     try await dispatchNormalized(tool: tool, input: input, surface: surface, turn: turn, work: work)
@@ -353,19 +348,13 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                                 nextCall: .object(["tool": .string("app"), "input": .object([
                                     "action": .string("files.read"), "args": .object(["path": .string(securityCenter.dataRoot
                                         .appendingPathComponent("workflows/approvals/requests.json").path)])])]))])
-                        : .object(["status": .string("failed"), "reason": .string(event.record.status == "orphaned" ? "approval_expired" : "declined"),
+                        : .object(["status": .string("failed"), "reason": .string("declined"),
                             "detail": .string("""
                                 workflows/approvals/requests.json card \(approval): status=\(event.record.status), \
                                 decision=\(event.record.decision ?? "unanswered"). Nothing ran; the part is no longer waiting.
                                 """), "effects": .string("none")])
-                    if event.record.status == "orphaned", case .object(var fields) = result {
-                        fields["remedy"] = .object(["kind": .string("correct_arguments"),
-                            "instruction": .string("This card expired; revise or withdraw the work, or request it again if still needed."),
-                            "next_call": .object(["tool": .string(tool), "input": .object(input)])])
-                        result = .object(fields)
-                    }
                 }
-                await ApprovalLifecycleBus.shared.finish(id)
+                // The call ends only after any interaction it waits on; its cards are released after that, never before.
                 if let need = InlineInteractionNeed.interaction(in: result) {
                     guard let wait = work.waitForInteraction else {
                         throw ToolFailureError("Card \(need.id) cannot resume because the originating conversation is not bound to this call.",
@@ -379,11 +368,25 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                     }
                     result = await wait(need, tool, input)
                 }
-                return result
+                outcome = .success(result)
             } catch {
-                await ApprovalLifecycleBus.shared.finish(id)
-                throw error
+                outcome = .failure(error)
             }
+            await settle { [dataRoot = securityCenter.dataRoot] in
+                let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+                for cardID in await ApprovalLifecycleBus.shared.finish(id) {
+                    do { try await inbox.resolve(cardID, decision: .canceled, decidedBy: "host call ended") }
+                    // A concurrent answer owns the decision; ending its call cannot replace it.
+                    catch ApprovalInboxError.alreadyResolved { continue }
+                    catch {
+                        await RepairOwed.owe(dataRoot, id: "approval.host_end:" + cardID, kind: .decision,
+                            operation: "approval.host_end:" + cardID, owner: inbox.approvalsPath.path,
+                            words: "Host call \(id) ended; card \(cardID) could not be cancelled: \(error.localizedDescription)",
+                            lever: "Repair the approval store, then cancel this exact card only if it is still pending; preserve any answer.").value
+                    }
+                }
+            }
+            return try outcome.get()
         }
     }
 
@@ -558,8 +561,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             decision = autonomyDecision
             securityAsked = false
         }
-        // Peer turns ask for person-owned elevation; Trust denial stands, verified
-        // replay answers the same card, and Full Mac preserves an allowed connect.
         let peerReasonMayReplace: Bool
         if case .deny = decision { peerReasonMayReplace = false } else { peerReasonMayReplace = true }
         let protectedAction = try PeerTurnEffectPolicy.requiresPeerApproval(tool, input: input, turn: turn)
@@ -575,11 +576,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         let peerApproval = PeerDataTaintDispatcher.peerApproval(turn: turn, surface: surface,
             protectedAction: protectedAction, peerName: peerDisplayName(peerID: peerTurnID))
         let requester = peerApproval.requester
-        // A person-approved command elevates its steering peers for this turn.
-        if approvedReplayAuthorizes || injectionReplayApprovalID != nil, let taint, requester != nil {
-            for source in taint.checkpointSources where !PeerDataTaint.ownerTrusts(source) { taint.elevate(peer: source) }
-            if let peerTurnID { taint.elevate(peer: "peer:" + peerTurnID) }
-        }
         if !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
            peerReasonMayReplace, requester != nil {
             if fullMacOn, peerApproval.required {
@@ -623,7 +619,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         // another agent's steering or a peer's request keeps its card.
         var theirs = false
         if case .requireApproval = autonomyDecision, !securityAsked, requester == nil,
-           try PermissionLaw.lever(tool: tool, input: input, turn: turn)?.asks == true { theirs = true }
+           try PermissionLaw.lever(tool: tool, input: input, turn: turn)?.asks == true {
+            let owns = try await SwiftNativeTrustCenter(dataRoot: securityCenter.dataRoot).agentOwnsLevers(turn: turn)
+            theirs = !owns
+        }
         // The person's ask, once it decides this call: their act for this exact call, as their card's Approve would be; and the cards it
         // settled that were waiting for this call.
         var wordTurn: Turn?

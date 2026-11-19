@@ -32,12 +32,16 @@ final class ShareComposeModel: ObservableObject {
     @Published var saved = false
     private let context: NSExtensionContext?
     private let id = UUID()
-    private let pairingFingerprint = SharedChatInbox.identityDefaults?.string(forKey: SharedChatInbox.identityPairingKey)
+    fileprivate let pairingFingerprint = SharedChatInbox.identityDefaults?.string(forKey: SharedChatInbox.identityPairingKey)
 
     init(context: NSExtensionContext?) { self.context = context }
 
     func load() async {
         defer { loading = false }
+        guard pairingFingerprint != nil else {
+            error = "This iPhone is not paired with a Mac yet."
+            return
+        }
         do {
             name = try SharedChatInbox.agentName()
             let items = context?.inputItems as? [NSExtensionItem] ?? []
@@ -129,7 +133,7 @@ private struct ShareComposeView: View {
                         Text("Open NativeAgent to send your share. It will appear in Chat.")
                     } else if model.loading {
                         ProgressView("Loading shared item…")
-                    } else {
+                    } else if model.pairingFingerprint != nil {
                         TextField("Add a note (optional)", text: $model.note, axis: .vertical)
                             .lineLimit(3...6).font(.system(.body, weight: .regular)).mobileCard()
                         if !model.text.isEmpty {
@@ -160,7 +164,7 @@ private struct ShareComposeView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(model.saved ? "Done" : "Cancel") { model.finish() }
                 }
-                if !model.saved {
+                if !model.saved, model.pairingFingerprint != nil {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Save") { model.save() }
                             .buttonStyle(.glassProminent)

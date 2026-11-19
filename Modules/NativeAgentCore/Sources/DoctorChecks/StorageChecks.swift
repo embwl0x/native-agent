@@ -30,46 +30,6 @@ private enum DoctorJSONInspection {
 
 }
 
-let STORAGE_SUBDIRS: [String] = [
-    "runs", "memory",
-    "chat", "chat/messages", "chat/session_state",
-    "context", "context/cache", "context/feedback",
-    "improvements",
-    "logs",
-    "scheduler",
-    "config",
-    "telegram",
-    "codex_home",
-    "work_journal",
-    "activity",
-    "trust",
-    "backups",
-    "release",
-    "connectors",
-    "abilities", "skills", "skills/runs",
-    "tools",
-    "workflows", "workflows/approvals",
-    "research/lab",
-    "traces",
-    "catalog", "catalog/quarantine", "catalog/sources", "catalog/trust",
-    "native_power", "native_power/actions",
-    "native_power/browser", "native_power/browser/screenshots", "native_power/browser/sources",
-    "native_power/intents",
-    "connectors/actions",
-    "improvements/gauntlet",
-    "nextgen", "nextgen/actions", "nextgen/remote",
-    "production", "production/exports", "production/support",
-]
-
-func ensureDirs(_ root: URL) throws {
-    let fm = FileManager.default
-    try fm.createDirectory(at: root, withIntermediateDirectories: true)
-    for name in STORAGE_SUBDIRS {
-        let path = root.appendingPathComponent(name)
-        try fm.createDirectory(at: path, withIntermediateDirectories: true)
-    }
-}
-
 /// Probe scaffold writability without changing existing contents or unrelated directories.
 public struct StorageCheck: DoctorCheck {
     public let id: String = "storage"
@@ -83,7 +43,7 @@ public struct StorageCheck: DoctorCheck {
     public func run() async -> CheckResult {
         let fm = FileManager.default
         do {
-            try ensureDirs(root)
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
             let probe = root.appendingPathComponent(".doctor_probe_\(UUID().uuidString.lowercased())")
             try Data().write(to: probe, options: [.atomic])
             try fm.removeItem(at: probe)

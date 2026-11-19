@@ -51,7 +51,10 @@ extension AppToolExecutor {
             callTurn, callExecution in
             var call = call
             if let session { call["__session_id"] = session }
-            do { return try await perform("app", call, callTurn, callExecution) } catch { return ChatToolOutcome.failure(error: error, tool: "app") }
+            do {
+                return try await SwiftNativeTurnEngine.followDeterminedRead(try await perform("app", call, callTurn, callExecution), isError: false,
+                    asked: "app", input: call, turn: callTurn) { input, _ in try await perform("app", input, callTurn, callExecution) }.0
+            } catch { return ChatToolOutcome.failure(error: error, tool: "app") }
         }
     }
     /// After failure only proven reads proceed; paths and arguments may name effects, so they wait with changes.
@@ -109,7 +112,7 @@ extension AppToolExecutor {
             }
         }
         // Several changes that are all the person's to decide, asked together, are one ask: one card for the list, never a card each.
-        if let together = await doorAsksTogether(entries, base: base, turn: turn, execution: execution) { return together }
+        if let together = try await doorAsksTogether(entries, base: base, turn: turn, execution: execution) { return together }
         let named = Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) })
         let snapshot = execution.notesSnapshot ?? DoorNotesSnapshot()
         var batchExecution = execution
@@ -147,9 +150,10 @@ extension AppToolExecutor {
                     // Suggest only the refused entry: earlier entries may already have changed something, so the deed's closing words are not carried.
                     let advice = try Self.doorBatchAdvice(entry, input: base.filter { !ToolNameAliases.appDeedKeys.contains($0.key) }
                         .merging(["actions": entry]) { _, entry in entry })
-                    let reply = ToolResult(Self.doorRefusal("invalid_actions", "Each entry is one app call, an object. Nothing ran.",
-                        remedy: "correct_arguments", "Write this entry using try_instead's declared shape; earlier entries keep their receipts.",
-                        next: advice.objectValue, extra: ["try_instead": advice]))
+                    let reply = ToolResult(Self.failure("invalid_actions", "Each entry is one app call, an object. Nothing ran.",
+                        extra: ["try_instead": advice, "remedy": .object(["kind": .string("correct_arguments"),
+                            "instruction": .string("Write this entry using try_instead's declared shape; earlier entries keep their receipts."),
+                            "next_call": advice.objectValue.map { .object(["tool": .string("app"), "input": .object($0)]) } ?? .null])]))
                     receipts.append(reply)
                     receiptSteps.append(index + 1)
                     if barrier == nil { barrier = (index + 1, "app", reply) }
@@ -175,9 +179,11 @@ extension AppToolExecutor {
                     catch let unfound as DoorUnfound {
                         nextIndex = index + 1
                         if barrier != nil { notRun.append((index + 1, name, "found_not_there")); continue }
-                        let reply = ToolResult(Self.doorRefusal("found_not_there",
+                        let reply = ToolResult(Self.failure("found_not_there",
                             "{found: \"\(unfound.reference)\"} is not there: \(unfound.why). Step \(index + 1) was not run.",
-                            remedy: "correct_arguments", "Name an earlier step that came back and a place in what it returned; earlier steps keep their receipts."))
+                            extra: ["remedy": .object(["kind": .string("correct_arguments"),
+                                "instruction": .string("Name an earlier step that came back and a place in what it returned; earlier steps keep their receipts."),
+                                "next_call": .null])]))
                         receipts.append(reply)
                         receiptSteps.append(index + 1)
                         barrier = (index + 1, name, reply)
@@ -201,7 +207,10 @@ extension AppToolExecutor {
                     break
                 }
                 let receipt: JSONValue
-                do { receipt = try await perform("app", call, turn, batchExecution) }
+                do {
+                    receipt = try await SwiftNativeTurnEngine.followDeterminedRead(try await perform("app", call, turn, batchExecution), isError: false,
+                        asked: "app", input: call, turn: turn) { input, _ in try await perform("app", input, turn, batchExecution) }.0
+                }
                 catch is CancellationError {
                     stopped = true
                     receipt = ChatToolOutcome.failure(error: CancellationError(), tool: "app")
@@ -263,27 +272,36 @@ extension AppToolExecutor {
             let speaking = receipts.first { ChatToolOutcome.isWaitingApproval($0.payload) || $0.isWaitingInteraction }
                 ?? (receipts.allSatisfy { ChatToolOutcome.neverRan($0.payload) }
                     ? receipts.first { InlineInteractionNeed.isWaiting($0.payload) } : nil)
-            let (landed, partial, unresolved) = receipts.enumerated().reduce(into: (0, 0, 0)) { count, step in
+            let (landed, partial, unresolved, previews) = receipts.enumerated().reduce(into: (0, 0, 0, 0)) { count, step in
                 let reply = step.element
                 // A step that came back otherwise than said landed only in part, for the deed.
                 // This exact status-key check excludes state and unnormalized spellings; reply.status includes both.
                 if step.offset == surprise?.receipt || reply.payload.objectValue?["status"] == .string("partial") || (reply.hasReadEvidence() && !reply
-                    .hasReadEvidence(completeOnly: true)) { count.1 += 1 }
+                    .hasReadEvidence(completeOnly: true) && (reply.payload.objectValue?["has_more"] != .bool(true)
+                    || reply.payload.objectValue?["truncated"] == .bool(true))) { count.1 += 1 }
                 else if reply.outcome == .succeeded { count.0 += 1 }
+                // A preview is its step's own completed word, not an unknown outcome.
+                else if reply.payload.objectValue?["status"] == .string("preview") { count.3 += 1 }
                 else if reply.outcome == .unknown { count.2 += 1 }
             }
+            let first = zip(receiptSteps, receipts).first { $0.0 < barrier?.index ?? Int.max && Self.doorNotAdmitted($0.1) }.map { step, reply in
+                let why = ChatToolOutcome.explanation(reply.payload) ?? "its receipt gives no reason"
+                return "Step \(step) (\(label(step, Self.doorText(entries[step - 1].objectValue?["action"])))) did not run: " + why
+                    + (why.hasSuffix(".") ? " " : ". ") } ?? ""
             var result: [String: JSONValue] = [
-                "status": .string(stopped ? "partial" : landed == receipts.count ? "ok" : landed > 0 || partial > 0 ? "partial" : unresolved > 0
+                "status": .string(stopped ? (receipts.isEmpty ? "canceled" : "partial")
+                    : landed == receipts.count ? "ok" : previews == receipts.count ? "preview"
+                    : landed > 0 || partial > 0 || previews > 0 ? "partial" : unresolved > 0
                     // Every step refused before it ran is the batch refused, the word each receipt says.
                     ? "outcome_unknown" : receipts.allSatisfy { $0.outcome == .refused } ? "refused" : "failed"),
-                "detail": .string("\(landed) of \(receipts.count) landed fully; \(partial) partially; each receipt, in order, says what happened."),
+                "detail": .string(first + "\(landed) of \(receipts.count) landed fully; \(partial) partially; each receipt, in order, says what happened."),
                 "receipts": .array(shown),
             ]
             if stopped {
                 result["outcome"] = .string("canceled")
                 result["unrun"] = .array(notRun.map { entries[$0.index - 1] } + entries.dropFirst(nextIndex))
             }
-            result["remedy"] = landed == 0 && partial == 0 ? .object(["kind": .string("per_receipt"),
+            result["remedy"] = landed == 0 && partial == 0 && previews == 0 ? .object(["kind": .string("per_receipt"),
                 "instruction": .string("Each receipt says why it did not land and what to do next."), "next_call": .null]) : nil
             // A step that ran and failed is the batch's word over any card beside it: the deed is its worst real step.
             let realFailure = receipts.contains { $0.outcome.isFailure && !Self.doorNotAdmitted($0) }
@@ -304,10 +322,9 @@ extension AppToolExecutor {
                         "at \(miss.place) expected \(Self.doorShown(miss.expected)), found \(miss.found.map(Self.doorShown) ?? "nothing")"
                     }.joined(separator: "; ") + "."
                 } else { "Step \(barrier.index) (\(label(barrier.index, barrier.action))) \(state): \(reason)" + (reason.hasSuffix(".") ? "" : ".") }
-                result["detail"] = .string(stop
+                result["detail"] = .string(first + stop
                     + " Not run after it: " + (notRun.isEmpty ? "none." : notRun.map { label($0.index, $0.action) }.joined(separator: ", ") + ".")
                     + " Ran after it: " + (readsAfter.isEmpty ? "none." : readsAfter.joined(separator: ", ") + "."))
-                // Where the deed stopped and why, in one place; failed_step is kept for a step that failed or waits.
                 let because = surprise != nil ? "surprise" : state == "failed" ? "failed" : state == "was refused" ? "refused" : "waiting"
                 var stoppedAt: [String: JSONValue] = ["step": .int(Int64(barrier.index)), "because": .string(because)]
                 stoppedAt["as"] = named[barrier.index].map(JSONValue.string)
@@ -413,10 +430,11 @@ extension AppToolExecutor {
     /// (read as the door reads it, after the call's own reading), a step that takes a found value or any other change runs as a list always
     /// has: each ask then stops it on its own card.
     @MainActor
-    func doorAsksTogether(_ entries: [JSONValue], base: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue? {
+    func doorAsksTogether(_ entries: [JSONValue], base: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue? {
         guard entries.count >= 2, base["action"] == nil,
               !PermissionLaw.personDecided(tool: "app", input: ["actions": .array(entries)], turn: turn) else { return nil }
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        if try await SwiftNativeTrustCenter(dataRoot: root).agentOwnsLevers(turn: turn) { return nil }
         var asks: [(step: Int, words: String)] = []
         var already: [(step: Int, words: String)] = []
         for (index, entry) in entries.enumerated() {
@@ -435,7 +453,7 @@ extension AppToolExecutor {
             let args = call["args"]?.objectValue ?? [:]
             if action.readOnly(args: args) { continue }
             guard !Self.doorCarriesFound(.object(args)),
-                  let ask = await doorAsk(action, args: args, root: root, turn: turn, execution: execution) else { return nil }
+                  let ask = try await doorAsk(action, args: args, root: root, turn: turn, execution: execution) else { return nil }
             switch ask {
             case .ask(let words): asks.append((step: index + 1, words: words))
             case .already(let words): already.append((step: index + 1, words: words))
@@ -460,7 +478,8 @@ extension AppToolExecutor {
     /// The person's words for one change that is theirs to decide and that a card can carry, `already` when the change is already as
     /// asked, or nil when the change is neither (an ordinary change the list runs as its own).
     @MainActor
-    private func doorAsk(_ action: AppAction, args: [String: JSONValue], root: URL, turn: Turn, execution: AppActionExecution) async -> DoorAsk? {
+    private func doorAsk(_ action: AppAction, args: [String: JSONValue], root: URL, turn: Turn, execution: AppActionExecution) async throws -> DoorAsk? {
+        if try await SwiftNativeTrustCenter(dataRoot: root).agentOwnsLevers(turn: turn) { return nil }
         if action.id == "setting.set" {
             let id = Self.doorText(args["setting"])
             let value = args["value"] ?? .null
@@ -477,7 +496,6 @@ extension AppToolExecutor {
                   refused["status"] == .string("needs_person") else { return nil }
             return .ask("changing \(label) to \(wanted)")
         }
-        // A lever a card can carry, which the gate asks for at every posture that allows an ask.
         guard let lever = action.lever, lever.asks, lever.holds(args),
               !PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": .object(args)], turn: turn),
               let posture = await Self.freshQuietPosture(dataRoot: root), posture.changesAllowed else { return nil }

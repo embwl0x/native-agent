@@ -20,7 +20,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import TurnTrace
-// Blueprint: | `AgentContactACP.swift` | Approve current executable identity before peer launch. |
+// Blueprint: | `AgentContactACP.swift` | Checked ACP sends retain sessions before prompting; session reads replay without a prompt. |
 extension SwiftToolDispatcher {
     /// In-place and version-folder updates require approval of the currently installed executable.
     private static func followACPUpdate(_ contact: AgentPeerContact, installed: String?, environment: [String: String],
@@ -56,7 +56,7 @@ extension SwiftToolDispatcher {
     }
     /// Full Mac runs peer programs directly; other allowed postures use the builder sandbox and cannot read bridge credentials. Denied or locked-down launches
     /// must return a refusal without running anything.
-    func agentProgramLaunch(_ permission: DrivenAgentLaunchPermission) async
+    package static func agentProgramLaunch(_ permission: DrivenAgentLaunchPermission, dataRoot: URL) async
         -> (launch: AgentPeerDiscovery.Launch, refused: [String: JSONValue]) {
         func refused(_ status: String, _ detail: String, reason: String? = nil) -> (launch: AgentPeerDiscovery.Launch, refused: [String: JSONValue]) {
             var receipt: [String: JSONValue] = ["status": .string(status), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail)]
@@ -76,7 +76,7 @@ extension SwiftToolDispatcher {
             : Self.builderSandboxProfile(dataRoot: dataRoot)) + "\n(deny file-read* (subpath \"\(bridgeDir)\"))"
         return (.run { executable, arguments in ["/usr/bin/sandbox-exec", "-p", profile, executable] + arguments }, [:])
     }
-    func hostACPRun(turn: Turn, invocation: ChatToolInvocation, contact: AgentPeerContact, message: String, conversationID: String?, store: AgentPeerStore,
+    func hostACPRun(turn: Turn, invocation: ChatToolInvocation, contact: AgentPeerContact, message: String?, conversationID: String?, store: AgentPeerStore,
                             surface: String) async throws -> JSONValue {
         guard usesCanonicalBody, try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed else {
             return builderFullMacRequired(invocation: invocation, tool: "agent_message")
@@ -102,8 +102,8 @@ extension SwiftToolDispatcher {
                 instruction: "Report the missing contact helper to the person.", tap: "Tell the person: this copy of NativeAgent is missing nativeagent-link.")
         }
         guard let secret = try AgentPeerCredentials.read(peerID: contact.id) else {
-            return missing("agent_credential_missing", "Keychain has no credential for contact peer:\(contact.id).",
-                instruction: "Reconnect this contact to create its missing credential.",
+            return missing("agent_credential_missing", "This install's Keychain has no credential for contact peer:\(contact.id).",
+                instruction: "Run agent.connect for this contact to create its missing install-scoped credential, then send the message again.",
                 call: ToolFailureError.call("app", ["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + contact.id)])]))
         }
         let row = recipe.host
@@ -157,7 +157,7 @@ extension SwiftToolDispatcher {
                 .object(["name": .string($0.key), "value": .string($0.value)])
             })])
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let rule = await agentProgramLaunch(launchPermission)
+        let rule = await Self.agentProgramLaunch(launchPermission, dataRoot: dataRoot)
         guard case .run(let wrap) = rule.launch else {
             await AgentACPConnections.shared.revoke(peer: contact.id)
             return .object(rule.refused)
@@ -211,7 +211,11 @@ extension SwiftToolDispatcher {
                         .drivenAgentLaunchPermission(origin: origin, turn: turn)
                     if case .denied = permissionAfterResponse { return false }
                     return allowed && stillConnected && (!automaticallyAllowed || permissionAfterResponse == .fullMac)
-                }, update: Self.acpLiveUpdate(invocation.liveTarget))
+                }, update: Self.acpLiveUpdate(invocation.liveTarget), sessionOpened: { session in
+                    if !dryRun, let target = invocation.liveTarget {
+                        try AgentConversationStore(dataRoot: target.dataRoot).handle(target, conversationID: session)
+                    }
+                })
             // A cancelled turn (agent_cancel's session/cancel) keeps its session: ACP ends the prompt and the conversation continues from there.
             guard await AgentACPConnections.shared.finish(acquired, peer: contact.id,
                 conversation: dryRun ? nil : reply.sessionID) else { throw AgentACPClient.Failure.interrupted }
@@ -244,17 +248,21 @@ extension SwiftToolDispatcher {
                 if let note = reply.modeNote { result["mode_note"] = .string(note) }
                 return .object(result)
             }
-            store.recordProof(peerID: contact.id, inbound: reply.completed && !reply.text.isEmpty, outbound: true)
+            store.recordProof(peerID: contact.id, inbound: message != nil && reply.completed && !reply.text.isEmpty, outbound: message != nil)
             // Only a send that never launched proves the route unavailable; an unanswered delivered prompt remains the peer's turn.
-            if reply.completed && !reply.text.isEmpty {
+            if message != nil && reply.completed && !reply.text.isEmpty {
                 store.recordRoundTrip(peerID: contact.id, executable: approved.path,
                     version: approved.version, workspace: directory.path, recipe: recipe)
             }
-            var result: [String: JSONValue] = ["status": .string(reply.completed ? "replied" : reply.stopReason),
+            var result: [String: JSONValue] = ["status": .string(message == nil || reply.completed ? "replied" : reply.stopReason),
                 "agent": .string("peer:" + contact.id), "transport": .string("acp"),
                 "conversation_id": .string(reply.sessionID), "continued": .bool(reply.continued),
-                "sent": .bool(true), "completed": .bool(reply.completed), "reply": .string(reply.text),
+                "sent": message == nil ? .null : .bool(true), "completed": .bool(reply.completed), "reply": .string(reply.text),
                 "untrusted_remote_data": .bool(!reply.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)]
+            if message == nil {
+                result["prompt"] = reply.prompt.map(JSONValue.string)
+                result["detail"] = .string("This was read back from \(contact.name)'s session after the app restarted and may be cut short.")
+            }
             // A session that could not run in the recipe's mode says which it ran in, and when that one asks less.
             if let note = reply.modeNote { result["mode_note"] = .string(note) }
             return Self.peerRedact(.object(result), token: secret)
@@ -280,9 +288,14 @@ extension SwiftToolDispatcher {
                 }
                 return Self.peerRedact(.object(result), token: secret)
             }
-            if let failure = error as? AgentACPClient.Failure, failure == .sessionUnavailable || failure == .busy {
-                return .object(["status": .string(failure == .busy ? "busy" : "session_unavailable"), "sent": .bool(false), "completed": .bool(false),
-                    "detail": .string(failure.localizedDescription)])
+            let failure = error as? AgentACPClient.Failure
+            let declined = (error as? ToolFailureError)?.code == AgentACPClient.Failure.busy.rawValue
+            if failure == .sessionUnavailable || failure == .busy || declined {
+                let detail = error.localizedDescription + (failure == .sessionUnavailable ? "" :
+                    " This call sent nothing. Earlier deliveries still stand.")
+                return Self.peerRedact(.object(["status": .string(failure == .sessionUnavailable ? "session_unavailable" : "busy"),
+                    "agent": .string("peer:" + contact.id), "sent": .bool(false), "completed": .bool(false),
+                    "detail": .string(detail), "untrusted_remote_data": .bool(declined)]), token: secret)
             }
             // The agent is not signed in to its own service (classified where its error is read). The conversation stays; signing in continues it.
             if (error as? AgentACPClient.Failure) == .signInRequired {
@@ -347,11 +360,11 @@ extension SwiftToolDispatcher {
                 if let session { result["conversation_id"] = .string(session) }
                 return withSaid(result)
             }
-            // The turn ended (Stop, the app quitting, the agent's program exiting or breaking the protocol); the thread does not keep waiting.
-            var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : quit ? "interrupted" : "outcome_unknown"),
-                "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false), "terminal": .bool(true),
-                "detail": .string(Task.isCancelled ? "The conversation was stopped." : quit ? AgentConversationSession.restartDetail(contact.name) :
+            var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : quit ? "waiting" : "outcome_unknown"),
+                "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false), "terminal": .bool(!quit),
+                "detail": .string(Task.isCancelled ? "The conversation was stopped." :
                     (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")]
+            if quit { result["background_send"] = .bool(true) }
             if let session { result["conversation_id"] = .string(session) }
             return withSaid(result)
         }

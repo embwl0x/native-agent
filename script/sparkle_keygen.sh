@@ -7,7 +7,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KEY_DIR="$HOME/.config/nativeagent"
 PRIV_KEY="$KEY_DIR/sparkle_ed_priv.key"
-PUB_KEY_FILE="$KEY_DIR/sparkle_ed_pub.key"
 
 mkdir -p "$KEY_DIR"
 chmod 700 "$KEY_DIR"
@@ -41,9 +40,7 @@ if [[ -n "$SPARKLE_GENKEYS" ]]; then
   exit 0
 fi
 
-echo "  Sparkle generate_keys not found (build Sparkle first via: swift build)."
-echo ""
 echo "ERROR: Sparkle release keys must be generated with Sparkle's generate_keys tool." >&2
 echo "OpenSSL PEM Ed25519 keys are not accepted by Sparkle sign_update --ed-key-file." >&2
-echo "Run swift build so Sparkle is checked out, then re-run this script." >&2
+echo "Build the release app to resolve Sparkle, then re-run this script." >&2
 exit 1

@@ -16,10 +16,6 @@ import Synchronization
 // Blueprint: | `EngineDoctorRepairs.swift` | Owner repairs with receipts; search stays on its configured endpoint |
 
 extension EngineDoctorRuntime {
-    public func doctorRecordRepair(checkID: String, receipt: String, status: String) async throws {
-        nativeLog("[Doctor repair] %@: %@; recheck=%@", checkID, receipt, status)
-    }
-
     public func doctorLiveRepair(for check: CheckResult, scope: DoctorRepairScope) async -> DoctorExecutableRepair? {
         do { return try await checkedDoctorRepair(for: check, scope: scope) }
         catch { return DoctorExecutableRepair(checkID: check.id) { throw error } }

@@ -147,7 +147,8 @@ extension NativeAgentEngine {
                 text: text.utf8.count <= PartFace.Block.inlineByteLimit ? text : nil, copy: true,
                 read: .init("dream.entry", ["date": .string(item)]), revision: try collectionRevision(text)))])
         }
-        let diary = try await cognitionView.dreamDiary(limit: Int.max)
+        let gate = try await cognitionView.dreamGateChecked()
+        let diary = try await cognitionView.readDreamDiary(limit: Int.max, enabled: gate.dreamEnabled)
         let revision = try collectionRevision(diary.entries.map { [$0.date, $0.modifiedAt] })
         let cursor = try collectionCursor(request, revision: revision, ids: diary.entries.map(\.date))
         let entries = Array(diary.entries.dropFirst(cursor).prefix(256))
@@ -182,7 +183,7 @@ extension NativeAgentEngine {
             guard let text = entry.content else {
                 throw PartCallError(code: "dream_entry_unavailable", message: "The diary owner supplied no text for this entry.")
             }
-            return text
+            return NativeAppSecretRedactor.redactText(text)
         }
         if page == "knowledge", item.hasPrefix("summary:") {
             let id = String(item.dropFirst("summary:".count))
@@ -192,7 +193,7 @@ extension NativeAgentEngine {
             guard let entity = reading.0?.canvasEntities.first(where: { $0.id == id }), let summary = entity.summary else {
                 throw PartCallError(code: "graph_summary_unavailable", message: "The checked graph supplied no summary for this entity.")
             }
-            return summary
+            return NativeAppSecretRedactor.redactText(summary)
         }
         throw PartCallError(code: "collection_document_invalid", message: "Choose a diary entry or an entity summary first.")
     }
@@ -209,13 +210,11 @@ extension NativeAgentEngine {
             FaceGraphEntity(id: entity.id, name: NativeAppSecretRedactor.redactText(entity.name), kind: entity.type,
                 detail: entity.summary.map(NativeAppSecretRedactor.redactText), weight: nil, lastSeen: entity.lastSeenDate)
         }
-        let allEdges = snapshot.canvasEdges.map {
-            FaceGraphEdge(from: $0.from, to: $0.to, kind: NativeAppSecretRedactor.redactText($0.kind), weight: $0.weight)
-        }
-        await face.post(KnowledgeGraphFace(entities: entities, edges: allEdges, totalEntities: entities.count,
-            totalEdges: allEdges.count, state: .ready), at: .knowledgeGraph)
+        await EngineFaceProjection.postGraph(engine: self)
         if item == "entities" {
-            let revision = try collectionRevision([JSONValue.fromEncodable(entities), JSONValue.fromEncodable(allEdges)])
+            // The list's identity is its own first packet, never an encoding of the whole graph.
+            let revision = try collectionRevision(GraphCollectionFace.list(entities: entities, total: entities.count,
+                revision: "", itemPrefix: "entity:"))
             let cursor = try collectionCursor(request, revision: revision, ids: entities.map(\.id))
             var face = try GraphCollectionFace.list(entities: entities, total: entities.count, cursor: cursor, revision: revision,
                 itemPrefix: "entity:")
@@ -244,7 +243,8 @@ extension NativeAgentEngine {
         let edges = snapshot.canvasEdges.filter { $0.from == entityID || $0.to == entityID }.map {
             FaceGraphEdge(from: $0.from, to: $0.to, kind: NativeAppSecretRedactor.redactText($0.kind), weight: $0.weight)
         }
-        let revision = try collectionRevision(edges)
+        let revision = try collectionRevision(GraphCollectionFace.detail(entity: entity, entities: entities, edges: edges,
+            state: .ready, itemPrefix: "entity:"))
         let cursor = try collectionCursor(request, revision: revision, ids: edges.indices.map { "edge:\($0)" })
         var face = try GraphCollectionFace.detail(entity: entity, entities: entities, edges: edges, state: .ready,
             relationshipCursor: cursor, revision: revision, itemPrefix: "entity:")

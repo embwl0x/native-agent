@@ -40,7 +40,6 @@ extension AppModel {
             let issue: WireFailure?
             switch (act, reply) {
             case (_, .committed(let receipt)): issue = receipt.publicationFailure
-            case (.remember, .acknowledged), (.commitNote, .acknowledged), (.writeScratch, .acknowledged): issue = nil
             case (.pinConversation, .result(.object(let fields))), (.unpinConversation, .result(.object(let fields))):
                 guard case .bool? = fields["changed"] else { throw chatProtocolFailure("the saved pin result.") }
                 if fields["shared"] == .bool(false) {
@@ -63,7 +62,9 @@ extension AppModel {
 
     @discardableResult
     func clearActiveChatMessages(sessionId: String? = nil) async -> AppMutationResult {
-        await performChatMutation(.clearConversation(session: sessionId ?? activeChatSessionId), success: "Chat messages cleared")
+        let result = await performChatMutation(.clearConversation(session: sessionId ?? activeChatSessionId), success: "Chat messages cleared")
+        if !result.succeeded { systemToasts.push(error: statusText) }
+        return result
     }
 
     @discardableResult
@@ -85,49 +86,6 @@ extension AppModel {
             setFailureStatus(error, action: "archive this chat")
             return .failure(statusText, cause: error.localizedDescription)
         }
-    }
-
-    func regenerateAssistantMessage(message: String, session: String, choice: RetryChoice = .restartConfirmed) async {
-        do {
-            let reply = try await chatAct(.regenerate(session: session, message: message, choice: choice))
-            if choice == .continueFromResults {
-                guard try acceptedConversation(reply) == session else { throw chatProtocolFailure("the continued conversation identity.") }
-            } else {
-                guard case .result(.object(let result)) = reply, result["session"] == .string(session),
-                      case .string? = result["turn"] else { throw chatProtocolFailure("the regenerated turn's result.") }
-            }
-        } catch { setFailureStatus(error, action: "try that again") }
-    }
-
-    /// Keep an existing edit while the body reconstructs the rejected input.
-    func prepareRejectedTurnDraft(message: String, session: String) async {
-        let before = readFaceComposer(session: session)
-        do {
-            guard case .result(.string(let text)) = try await chatAct(.prepareRetryDraft(session: session, message: message)) else {
-                throw chatProtocolFailure("a retry-draft result.")
-            }
-            guard before.text.isEmpty else {
-                throw WireFailure(code: "composer_draft_occupied", message: "The person's existing draft is preserved.", cause: nil, effects: .none)
-            }
-            let result = editFaceComposer(.init(session: session, text: text, attachments: before.attachments, expectedRevision: before.revision,
-                expectedEditedAt: before.editedAt, existingAttachmentIDs: before.attachments.map(\.id)))
-            guard result.disposition == .applied else {
-                throw WireFailure(code: "composer_changed", message: "The draft changed while the retry was prepared. The draft is preserved.",
-                                  cause: nil, effects: .none)
-            }
-        } catch { setFailureStatus(error, action: "prepare the retry draft") }
-    }
-
-    func addMemoryFact(_ text: String) async -> AppMutationResult {
-        await performChatMutation(.remember(text: text), success: "Memory saved")
-    }
-
-    func addNote(_ text: String) async -> AppMutationResult {
-        await performChatMutation(.commitNote(text: text), success: "Note committed")
-    }
-
-    func writeScratch(key: String, value: String, sessionId: String? = nil) async -> AppMutationResult {
-        await performChatMutation(.writeScratch(session: sessionId ?? activeChatSessionId, key: key, value: value), success: "Scratch note saved")
     }
 
     func startActiveChatTurn(

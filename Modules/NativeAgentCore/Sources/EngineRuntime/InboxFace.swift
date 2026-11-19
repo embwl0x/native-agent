@@ -161,7 +161,7 @@ extension NativeAgentEngine {
         }
         var title = row.title
         var detail = [row.detail, face.words].compactMap { $0 }.filter { !$0.isEmpty }
-        if detail.count == 2, detail[0] == detail[1] { detail.removeLast() }
+        if detail.count == 2, detail[1].hasPrefix(detail[0]) { detail.removeFirst() }
         let card = face.from == InlineInteractionDelivery.source || matter.evidence.contains { $0.source == Matter.approvals }
         if card, matter.owes["decide"] != nil {
             let words = face.words.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -207,7 +207,7 @@ extension NativeAgentEngine {
                          call: call, aside: aside ? true : nil)
         }
         var detail = [row.detail, face.words].compactMap { $0 }.filter { !$0.isEmpty }
-        if detail.count == 2, detail[0] == detail[1] { detail.removeLast() }
+        if detail.count == 2, detail[1].hasPrefix(detail[0]) { detail.removeFirst() }
         let files = face.artifacts.filter { $0.source == Matter.files }.map(\.id)
         if !files.isEmpty { detail.append("Files: " + files.joined(separator: "\n")) }
         return .init(id: matter.id, title: row.title, detail: detail.joined(separator: "\n\n"),
@@ -225,6 +225,7 @@ extension NativeAgentEngine {
         let request = matter.hasPrefix("interaction:")
         switch id {
         case "approve" where approval: return .init("inbox.approve", row)
+        case "approve_task" where approval: return .init("inbox.act", row.merging(["action": .string(id)]) { $1 })
         case "reject" where approval: return .init("inbox.deny", row)
         case "reject" where request: return .init("inbox.not_now", row)
         case "act" where request: return .init("inbox.open_on_mac", row)

@@ -77,6 +77,7 @@ extension NativeAgentEngine {
                               detail: state.embeddingsError ?? "The embedding runtime has not loaded.", tone: .failed, open: "page:memories"))
         }
         do {
+            try await memory.checkPageObservation(.settings)
             let proposals = try await memory.proposals(status: "pending")
             rows.append(.init(id: "memory-proposals", title: "Memory suggestions", value: String(proposals.count), open: "page:memory_proposals"))
         } catch is CancellationError { throw CancellationError() }

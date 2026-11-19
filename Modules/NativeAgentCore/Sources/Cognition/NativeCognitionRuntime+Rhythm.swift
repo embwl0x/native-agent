@@ -151,7 +151,7 @@ extension NativeCognitionRuntime {
 
     /// The record owns night identity; part accounting and dream consumption have independent cursors.
     public func restReading(at: Date) async throws -> JSONValue {
-        let last = try await ExperienceStore.at(dataRoot).details(.init(sources: [Attention.detailSource], subjects: ["night", "sleep"],
+        let last = try await ExperienceStore.at(dataRoot).details(.init(sources: [Attention.detailSource], subjects: ["sleep"],
             kinds: [Attention.nightKind], limit: 1, newestFirst: true)).first?.at
         let presence = PersonPresence.read(dataRoot: dataRoot, now: at).transition
         let value = try loadRhythm()

@@ -38,11 +38,8 @@ extension SwiftToolDispatcher {
     ]
 
 
-    /// Read-only Mac perception under the Accessibility category. `mac_view` also reports the separate Screen Recording grant for its image.
+    /// Read-only Mac perception under the Accessibility category.
     static let fullMacAccessibilityReadToolNames: [String] = [
-        "mac_view", "mac_attention",
-        // mac_look shares the Accessibility read gate and needs no additional grant.
-        "mac_look",
         // screen and wait are pure perception; they hold and expire nothing.
         "screen", "wait",
     ]
@@ -66,21 +63,14 @@ extension SwiftToolDispatcher {
     /// Local activity reads require capture and separate agent admission, checked at discovery and dispatch.
     static let activityQueryToolNames: [String] = ["activity_query"]
 
-    /// Injection requires a body-bound capability and refuses read_only access. Approved replay or checked Full Mac supplies it; mac_wake belongs here because
-    /// it posts HID input before reading.
+    /// Injection requires a body-bound capability and refuses read_only access. Approved replay or checked Full Mac supplies it.
     static let fullMacAccessibilityInjectionToolNames: [String] = [
-        "mac_wake",
         // act drives the closed loop; go launches or activates, so both require injection admission.
         "act", "go",
     ]
 
     /// Four-verb membership controls visibility; earlier dispatch cases retain their composed execution owner.
     static let fourVerbToolNames: [String] = ["screen", "act", "go", "wait"]
-
-    /// Share one internal-name set across prompts, visibility and stale-call refusal so conversational exclusions cannot drift.
-    package static let internalMacToolNames: Set<String> = Set(fullMacAccessibilityReadToolNames
-            + fullMacAccessibilityInjectionToolNames)
-            .subtracting(fourVerbToolNames)
 
     /// Ordinary turns carry only app; an absent exclusion never grants visibility to an internal executor.
     package static func isModelHidden(_ name: String) -> Bool {

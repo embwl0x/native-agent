@@ -73,7 +73,10 @@ private func macSettleLoop(_ what: String, signals: MacWaitSignals, patience: Do
         }
         if Task.isCancelled { break }
         let remaining = deadline.timeIntervalSinceNow
-        if remaining <= 0 { end = .patience; return end }
+        if remaining <= 0 {
+            if atPatience || !signals.consume() { end = .patience; return end }
+            continue
+        }
         _ = await signals.waitForSignal(seconds: remaining)
     }
     return end

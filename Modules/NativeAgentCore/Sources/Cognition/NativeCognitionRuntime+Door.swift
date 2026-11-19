@@ -81,7 +81,6 @@ extension NativeCognitionRuntime {
         guard !isFlushedForTermination, !Task.isCancelled else { return }
         await reconcilePendingApprovalExpectationsAtBootstrap()
         await restoreProviderLifecycleEvidence()
-        await host.archiveSupersededMorningBriefs(dataRoot: dataRoot)
         await finishOwedCarriedSettlements()
         await startPursuitRefresh()
         await refreshOrganismBodySchema(reason: "bootstrap")
@@ -434,6 +433,7 @@ extension NativeCognitionRuntime {
         guard let momentID, let cognitiveStore, let interpretation,
               var row = await readMoment(momentID), row.meaning != nil, row.state == .meant,
               let record = row.input?.deferred else { return false }
+        if let seq = row.foldSeq, row.input?.folded == seq { return true }
         let seq: UInt64
         if row.foldSeq == nil, context.caring != nil, row.input?.turn?.turnId?.isEmpty != false {
             await noteMomentReadFailed(momentID, why: "The caring appraisal has no heard turn identity.")

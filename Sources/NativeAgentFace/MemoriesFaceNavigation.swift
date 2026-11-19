@@ -120,7 +120,7 @@ struct FaceDocumentReadout: View {
         Task {
             defer { forgetting = false }
             do {
-                try await appModel.client.act(.forgetMemory(id: id)).checkedAcknowledgement()
+                _ = try await appModel.client.act(.forgetMemory(id: id)).checkedCommit()
                 dismiss()
             } catch { failure = error.localizedDescription }
         }

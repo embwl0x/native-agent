@@ -42,6 +42,7 @@ public enum OpenRouterModelCatalog {
 
     /// The cache owns credential binding and publication; OpenRouter owns the wire format.
     static let cache = ModelCatalogCache(
+        route: "openrouter",
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
         readCache: { try readDecodedCache(dataRoot: $0) },

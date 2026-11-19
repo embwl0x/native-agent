@@ -103,7 +103,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
     /// Omission means no attempts; a present collection must decode whole to preserve accounting.
     static func readAttempts(_ object: [String: JSONValue]) -> [DeskWorkAttempt]? {
         if case .object(let pursuit)? = object["pursuit"], pursuit["reservations"] != nil { return nil }
-        guard let attempts = DeskJSON.collection(object["workAttempts"], decode: Self.fromJSON),
+        guard let attempts = deskStoredCollection(object["workAttempts"], decode: Self.fromJSON),
               Set(attempts.map(\.attemptId)).count == attempts.count else { return nil }
         return attempts
     }

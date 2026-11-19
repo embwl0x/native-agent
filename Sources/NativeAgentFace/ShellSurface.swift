@@ -110,11 +110,16 @@ extension ShellRailRow {
 /// The words a page is named by in the rail and its surface's tabs: an app page by its rail title, a page of the agent's own by its
 /// face's title, or by its id with why it has none.
 @MainActor struct ShellPageWords {
-    private let own: [QuietPage]
+    private let titles: [String: String]
     private let catalog: PartFaceCatalog?
 
     init(_ appModel: AppModel, pages: [ShellRailRow]) {
-        own = QuietPages.own(appModel, ids: Set(pages.compactMap { row -> String? in if case .page(let id) = row { id } else { nil } }))
+        titles = Dictionary(uniqueKeysWithValues: pages.compactMap { row -> (String, String)? in
+            guard case .page(let id) = row,
+                  let title = appModel.face.slot(.pageTitle(id)).value(as: PageTitleFace.self)?.title,
+                  !title.isEmpty else { return nil }
+            return (id, title)
+        })
         catalog = appModel.face.slot(PageFaceKey.catalog).value(as: PartFaceCatalog.self)
     }
 
@@ -122,12 +127,25 @@ extension ShellRailRow {
         switch row {
         case .item(let item): return item.shellRailTitle
         case .page(let page):
-            if let title = own.first(where: { $0.id == page })?.title { return title }
+            if catalog?.claims[page] != nil { return titles[page] ?? page }
             if catalog?.failure != nil { return "\(page) · unavailable" }
             if catalog == nil { return "\(page) · waiting" }
             return "\(page) · unclaimed"
         // The divider is no page and names none.
         case .divider: return ""
+        }
+    }
+}
+
+/// Each mounted label holds its small title slot independently of the page's content reader.
+struct ShellPageWordObservation: ViewModifier {
+    let pages: [ShellRailRow]
+    func body(content: Content) -> some View {
+        content.background {
+            ForEach(pages.compactMap { row -> String? in if case .page(let id) = row { id } else { nil } }, id: \.self) { id in
+                Color.clear.frame(width: 0, height: 0)
+                    .modifier(FaceObservation(demand: .key(.pageTitle(id))))
+            }
         }
     }
 }
@@ -164,6 +182,7 @@ struct ShellSurfaceTabs: View {
                     ShellTab(key: page, title: words.title(page), identifier: page.identifier,
                              needsYou: waiting && page == .item(.activity))
                 }, selection: Binding(get: { shown }, set: { select($0) }))
+                .modifier(ShellPageWordObservation(pages: pages))
                 .padding(.top, NativeAgentSpacing.md)
                 .padding(.horizontal, NativeAgentSpacing.pageInset)
                 .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)

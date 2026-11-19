@@ -526,7 +526,7 @@ extension SwiftToolDispatcher {
     /// History-lookup provenance keeps newer echoes from displacing original work; other activity in that turn does not erase its provenance.
     private static func workContextActivityRank(_ tools: Set<String>) -> Int {
         let historyTools: Set<String> = [
-            "workspace", "work_context", "artifact_find", "search_chat_history", "session_search",
+            "work_context", "artifact_find", "search_chat_history", "session_search",
             "read_chat_message", "recall_memory", "recall_search", "context_lookup", "studio_recall"
         ]
         if !tools.isDisjoint(with: historyTools) { return 2 }

@@ -21,6 +21,7 @@ import Desk
 import MacControl
 import Privacy
 import Studio
+import TrustCenter
 // Blueprint: | `EngineTools.swift` | `PartDoor`, `withPartDoor`; gated native calls and owner-supplied page outcomes |
 
 /// A native operation holds its turn and dependencies, including in callbacks it keeps.
@@ -239,9 +240,7 @@ public final class ToolsFacade {
         let tools = engine.toolDispatchClient(enforceAppAutonomy: false, actionExecution: execution)
         return try await tools.withAuthoredProgramHost(surface: surface, turn: turn, execution: execution) { turn, execution in
             guard let host = execution.host else { throw PartError.invalid("The part door has no host.") }
-            return try await ProviderToolResultPage.holding(turn: turn, sessionId: turn.verifiedSessionID ?? turn.session) { turn in
-                try await operation(PartDoor(turn: turn, host: host, dispatch: perform, execution: execution))
-            }
+            return try await operation(PartDoor(turn: turn, host: host, dispatch: perform, execution: execution))
         }
     }
 
@@ -391,30 +390,30 @@ public final class ToolsFacade {
     }
 
     /// Keep UI visibility separate from exact Parts keep eligibility.
-    public nonisolated func keepRefusal(_ tool: ToolRecord, turn: Turn?) -> String? {
+    public nonisolated func keepRefusal(_ tool: ToolRecord, fullMac: Bool = false, ownerAuthorized: Bool = true, turn: Turn?) -> String? {
         guard tool.candidateDigest != nil || ["draft", "disabled"].contains(tool.status) else {
             return tool.status == "active" ? "\(tool.name) is already on." : "Save a version of \(tool.name) before keeping it."
         }
         if (tool.candidateDigest ?? tool.codeFingerprint) != nil, tool.reviewedKeepDigest == nil {
             return "Refresh Tools to read the exact version before keeping it."
         }
-        let outcome = Parts(root: dataRoot).keepEligibility(tool, fullMac: false, ownerAuthorized: true, turn: turn)
+        let outcome = Parts(root: dataRoot).keepEligibility(tool, fullMac: fullMac, ownerAuthorized: ownerAuthorized, turn: turn)
         return outcome.ok ? nil : outcome.text
     }
 
-    /// Keep the rehearsed waiting version or re-enable it, then verify authored fields through readback.
-    public nonisolated func keep(id: String, version: String?) async throws -> ToolRecord {
-        let outcome = try await withPartDoor(envelope: .personOnMac("mac_ui:ability.keep:" + id)) { door in
-            await Parts(root: dataRoot).enable(id, version: version, fullMac: false, ownerAuthorized: true, invocation: door.invocation)
+    public nonisolated func keep(id: String, version: String?, byPerson: Bool, turn: Turn) async throws -> ToolRecord {
+        guard let envelope = turn.envelope else { throw PartError.invalid("The ability keep has no admitted surface; nothing changed.") }
+        let fullMac = if byPerson { false } else { try await SwiftNativeTrustCenter(dataRoot: dataRoot).agentOwnsLevers(turn: turn) }
+        let outcome = try await withPartDoor(envelope: envelope, fileAccess: turn.fileAccess ?? "auto", turn: turn) { door in
+            await Parts(root: dataRoot).enable(id, version: version, fullMac: fullMac, ownerAuthorized: byPerson, invocation: door.invocation)
         }
         guard outcome.ok else { throw PartError.invalid(outcome.text) }
         return try await readBack(id)
     }
 
-    /// Owner-disabled parts stay off until the owner re-enables them.
-    public nonisolated func switchOff(id: String, reason: String) async throws -> ToolRecord {
-        let turn = Turn().with(\.envelope, .personOnMac("mac_ui:ability.disable:" + id))
-        let outcome = Parts(root: dataRoot).disable(id, reason: reason, fullMac: false, ownerAuthorized: true, turn: turn)
+    public nonisolated func switchOff(id: String, reason: String, byPerson: Bool, turn: Turn) async throws -> ToolRecord {
+        let fullMac = if byPerson { false } else { try await SwiftNativeTrustCenter(dataRoot: dataRoot).agentOwnsLevers(turn: turn) }
+        let outcome = Parts(root: dataRoot).disable(id, reason: reason, fullMac: fullMac, ownerAuthorized: byPerson, turn: turn)
         guard outcome.ok else { throw PartError.invalid(outcome.text) }
         return try await readBack(id)
     }

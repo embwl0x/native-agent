@@ -43,11 +43,12 @@ extension AdaptiveMemoryPromoter {
         return nil
     }
 
-    enum OwedCause: String, Codable, Sendable { case provider, desk, record, memory, profile, embedding, trust }
+    enum OwedCause: String, Codable, Sendable { case provider, judgment, desk, record, memory, profile, embedding, trust }
 
     struct OwedBasis: Codable, Equatable, Sendable {
         var route: String? = nil
         var answered: String? = nil
+        var build: String? = nil
         var desk: String? = nil
         var record: String? = nil
         var memory: String? = nil
@@ -65,6 +66,8 @@ extension AdaptiveMemoryPromoter {
             switch cause {
             case .provider:
                 return (now.route != nil && now.route != basis.route) || (now.answered != nil && now.answered != basis.answered)
+            case .judgment:
+                return (now.route != nil && now.route != basis.route) || (now.build != nil && now.build != basis.build)
             case .desk: return now.desk != basis.desk
             case .record: return now.record != basis.record
             case .memory: return now.memory != basis.memory
@@ -119,6 +122,12 @@ extension AdaptiveMemoryPromoter {
         case .provider:
             basis.route = await memoryManager?.judgmentRouteKey()
             if let route = basis.route { basis.answered = try await door.routeAnswer(route) }
+        case .judgment:
+            basis.route = await memoryManager?.judgmentRouteKey()
+            let identity = NativeAgentBuildIdentity.current
+            if let content = identity.sourceContentID {
+                basis.build = MemoryManagerLane.fingerprint([identity.version, identity.build, content])
+            }
         case .desk:
             let store = SwiftNativeDeskStore(dataRoot: door.dataRoot)
             basis.desk = try signature([store.opsPath, store.basePath, store.archivePath])

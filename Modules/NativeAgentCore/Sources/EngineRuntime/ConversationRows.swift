@@ -13,6 +13,11 @@ import ChatSessionWork
 
 /// Hide machine ids and routing prefixes: they do not provide meaningful conversation titles.
 public enum ChatShellConversationRow {
+    public static func contact(for session: NativeAgentShared.ChatSession, doors: @autoclosure () -> [AgentContactRow]) -> AgentContactRow? {
+        guard SessionConversation.kind(session) == .agent else { return nil }
+        return doors().first { row in row.contact.map { session.id.hasPrefix(ContactThread.prefix(owner: $0.id)) } == true }
+    }
+
     public static let bridgePrefix = BridgeRoutingPrefix.prefix
     public static let titleLimit = 30
 
@@ -255,7 +260,7 @@ public final class ChatShellOpeningLine {
             .appendingPathComponent("\(safeID).jsonl")
         let handle: FileHandle
         do { handle = try FileHandle(forReadingFrom: url) }
-        catch let error as CocoaError where error.isFileAbsent { return OpeningLine() }
+        catch let error as CocoaError where error.isFileAbsent { return OpeningLine(issue: "The conversation transcript is missing.") }
         defer { try? handle.close() }
 
         var firstBridge: String? = nil
@@ -289,6 +294,9 @@ public final class ChatShellOpeningLine {
             }
         }
         projection.line = firstBridge
+        if rows >= rowBudget || read >= byteCeiling {
+            projection.issue = "The opening speech could not be determined within 200 rows or 1 MiB."
+        }
         return projection
     }
 
@@ -432,36 +440,5 @@ public enum OtherRunningChats {
             let rhsOrder = knownOrder[rhs] ?? Int.max
             return lhsOrder == rhsOrder ? (lhs < rhs) : (lhsOrder < rhsOrder)
         }
-    }
-}
-
-/// Derive trouble from loaded transcripts so a second counter cannot drift.
-public enum ChatShellTroubleState {
-    /// Cancellation takes precedence over partial/error flags because Stop is not failure.
-    /// Persisted `mechanicalKind: systemRow` rows also indicate failed turns.
-    public static func isFailed(_ message: ChatMessage) -> Bool {
-        if message.metadata?.cancelled == true { return false }
-        return message.metadata?.error?.isEmpty == false
-            || message.metadata?.partial == true
-            || message.metadata?.mechanicalKind == "systemRow"
-    }
-
-    /// A pending user turn or clean assistant reply ends the trailing-failure run.
-    public static func consecutiveFailures(_ messages: [ChatMessage]) -> Int {
-        var count = 0
-        var sawAssistant = false
-        for message in messages.reversed() {
-            let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if role == "user", !sawAssistant { break }
-            guard role == "assistant" else { continue }
-            sawAssistant = true
-            guard isFailed(message) else { break }
-            count += 1
-        }
-        return count
-    }
-
-    public static func showsStuckLink(_ messages: [ChatMessage]) -> Bool {
-        consecutiveFailures(messages) >= 2
     }
 }

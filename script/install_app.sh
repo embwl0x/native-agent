@@ -60,9 +60,6 @@ FORCE_CHECKOUT_SWITCH="${FORCE_CHECKOUT_SWITCH:-0}"
 nativeagent_require_installed_checkout "$APP_DEST" "$ROOT" "$FORCE_CHECKOUT_SWITCH" \
   "[install_app.sh]" "Reinstalling would repoint the live app's data root and bounce it."
 
-# Rotate logs in the checkout's live data directory.
-DATA="$ROOT/data"
-
 # 0. Initialize persona/ and data/ for first-time cloners.
 "$ROOT/script/init_persona.sh"
 
@@ -70,7 +67,7 @@ DATA="$ROOT/data"
 "$ROOT/script/build_and_run.sh" --build-only
 
 # 2. Stage fresh bundle — copy to temp then mv for atomic swap
-mkdir -p "$HOME/Applications" "$DATA/logs"
+mkdir -p "$HOME/Applications"
 DIST_BUNDLE="$ROOT/dist/$APP_NAME.app"
 # The helper and its kit are one release; refuse an incomplete builder result
 # before staging or touching the running installation.
@@ -86,8 +83,9 @@ APP_OLD="${APP_DEST}.old.$$"
 trap '
     if [ -d "$APP_OLD" ] && [ ! -d "$APP_DEST" ]; then
         echo "[install_app.sh] installation incomplete; previous artifact retained at $APP_OLD. Fix the selected install forward." >&2
+    else
+        rm -rf "$TEMP_BUNDLE" || true
     fi
-    rm -rf "$TEMP_BUNDLE" || true
 ' EXIT
 trap 'exit 1' INT TERM HUP
 rm -rf "$TEMP_BUNDLE"
@@ -220,19 +218,6 @@ mv "$TEMP_BUNDLE" "$APP_DEST"
 # the selected app proves its authenticated runtime identity and chat readiness.
 trap - EXIT ERR INT TERM HUP
 
-# Rotate logs over 5 MB, keeping three copies.
-_rotate_log() {
-  local log="$1"
-  if [[ -f "$log" ]] && [[ $(stat -f%z "$log" 2>/dev/null || echo 0) -gt $((5 * 1024 * 1024)) ]]; then
-    [ -f "${log}.2" ] && rm -f "${log}.3" && mv -f "${log}.2" "${log}.3"
-    [ -f "${log}.1" ] && mv -f "${log}.1" "${log}.2"
-    mv "$log" "${log}.1"
-    echo "  rotated $(basename "$log") (>5 MB) → $(basename "$log").1"
-  fi
-}
-_rotate_log "$DATA/logs/daemon.err.log"
-_rotate_log "$DATA/logs/daemon.out.log"
-
 # 6. Launch
 # Register the bundle and issue one checked LaunchServices request.
 # Bundle launches preserve macOS Accessibility/TCC attribution.
@@ -278,14 +263,13 @@ if [[ "$INSTALL_READY" == "1" ]]; then
   # Resolve the authenticated bridge address and token from its descriptor.
   if [ -n "${NA_INSTALL_RECEIPT:-}" ] && command -v jq >/dev/null 2>&1 \
       && source "$ROOT/script/lib/nativeagent_bridge.sh" && nativeagent_bridge_resolve; then
-    _na_sha=$(git -C "$(cd "$(dirname "$0")/.." && pwd)" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
     # Send the receipt synchronously before the installer exits.
     curl -sS --max-time 30 -X POST "$BASE_URL/claude/message" \
       -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-      -d "$(jq -n --arg t "[install_app.sh] Install receipt, posted by the install script itself, not by a person: build $_na_sha is running as pid $APP_PID." --arg s install_app.sh '{text:$t,sender:$s}')" \
+      -d "$(jq -n --arg t "[install_app.sh] Install receipt, posted by the install script itself, not by a person: \
+build $INSTALL_SOURCE_REVISION is running as pid $APP_PID." --arg s install_app.sh '{text:$t,sender:$s}')" \
       >/dev/null 2>&1 || true
   fi
-  trap - EXIT ERR INT TERM HUP
   rm -rf "$APP_OLD" 2>/dev/null || true
   exit 0
 fi
@@ -293,5 +277,4 @@ fi
 echo "[install_app.sh] replacement failed authenticated readiness verification." >&2
 echo "[install_app.sh] selected app retained at $APP_DEST; launch/readiness evidence is above. Fix this build forward." >&2
 [[ ! -d "$APP_OLD" ]] || echo "[install_app.sh] previous artifact retained for diagnosis at $APP_OLD (not launched)." >&2
-trap - EXIT ERR INT TERM HUP
 exit 1

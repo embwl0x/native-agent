@@ -93,7 +93,7 @@ public enum DoctorLoopHealth {
 
     /// Half-interval slack with a 60-second floor prevents normal jitter and long ticks from flapping health.
     public static func overdueTolerance(for observation: LoopStatus) -> TimeInterval {
-        // An active event tick retains the watchdog's slack; idle event organs have no overdue check.
+        // Change-woken organs have no periodic overdue check.
         guard let period = observation.wake?.period else { return 60 }
         return max(period / 2, 60)
     }
@@ -169,6 +169,7 @@ public enum DoctorLoopHealth {
         now: Date
     ) -> (level: LoopHealthLevel, detail: String)? {
         guard observation.running else { return nil }
+        guard !observation.executing else { return nil }
         guard observation.lastRun != nil else { return nil }
         guard !lastOutcomeWasLegitimateSkip(observation) else { return nil }
         guard let threshold = dormancyThreshold(for: observation) else { return nil }
@@ -212,6 +213,8 @@ public enum DoctorLoopHealth {
             // No error can also mean no active scheduler or a starved deadline; silence is not health.
             return scheduleVerdict(for: observation, now: now)
         }
+        // An active retry has no new outcome; its recorded failure still determines health.
+        let activeTick = observation.executing ? scheduleVerdict(for: observation, now: now).detail + " " : ""
         let window = graceWindow(for: observation)
         let cutoff = now.addingTimeInterval(-window)
         let recentFailures = (recentFailureDates[observation.name] ?? [])
@@ -225,7 +228,7 @@ public enum DoctorLoopHealth {
             return LoopHealthVerdict(
                 loopId: observation.name,
                 level: .fail,
-                detail: """
+                detail: activeTick + """
                     Failing persistently (at least \(recentFailures) failures in \(describeAge(window))); last tick \(age) ago; last failure: \
                     \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))).
                     """
@@ -235,8 +238,8 @@ public enum DoctorLoopHealth {
             loopId: observation.name,
             level: .warn,
             // Before any tick, the registration error explains why the loop cannot run.
-            detail: observation.lastRun == nil ? "Cannot run: \(lastError)."
-                : "Last tick failed \(age) ago: \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))."
+            detail: activeTick + (observation.lastRun == nil ? "Cannot run: \(lastError)."
+                : "Last tick failed \(age) ago: \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))).")
         )
     }
 
@@ -263,16 +266,10 @@ public enum DoctorLoopHealth {
             return verdict(.warn, "Configured wake unavailable; \(lastTickPhrase)")
         }
         if observation.executing {
-            let age = observation.executionStartedAt
-                .map { max(0, now.timeIntervalSince($0)) }
-            if let age, age > observation.executionTimeout + overdueTolerance(for: observation) {
-                return verdict(
-                    .fail,
-                    "Active tick exceeded its \(describeAge(observation.executionTimeout)) watchdog; \(lastTickPhrase)"
-                )
-            }
-            let agePhrase = age.map { " for \(describeAge($0))" } ?? ""
-            return verdict(.ok, "Active tick in progress\(agePhrase).")
+            let start = observation.executionStartedAt
+                .map { " since \(ISO8601DateFormatter().string(from: $0))" } ?? "; start time unavailable"
+            let wait = observation.waitingOn.map { "; waiting on \($0)" } ?? "; wait description unavailable"
+            return verdict(.ok, "Active tick in progress\(start)\(wait).")
         }
         if wake.period == nil {
             if let skip = deliberateSkipVerdict(for: observation) { return verdict(skip.level, skip.detail) }

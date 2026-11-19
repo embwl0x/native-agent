@@ -3,14 +3,12 @@ import MacIntegration
 import PersistenceCore
 import ChatSessionWork
 import ChatToolParsing
-// Blueprint: | `AgentWorkspaceMail.swift` | `AgentWorkspaceMail`: retain partial account coverage and continuation |
+// Blueprint: | `AgentWorkspaceMail.swift` | Bound mail.N references, current Mail coverage and existing app compose actions |
 
 extension AgentWorkspace {
-    /// Door verbs whose rows the workspace names (mail.N) for later calls, and the verbs that take those names.
     package static let namesRows: Set<String> = ["mail.recent", "mail.search", "mail.senders"]
     package static let takesNames: Set<String> = ["mail.read", "mail.triage"]
 
-    /// Bind observed workspace names once; caller-supplied locator fields may never override the selected message. Invalid names stay as refused items.
     package static func bindMail(workspace: WorkspaceOperation, _ input: [String: JSONValue], dataRoot: URL) -> [String: JSONValue] {
         let batch = input["items"] != nil
         let items: [JSONValue]
@@ -36,9 +34,9 @@ extension AgentWorkspace {
                   case .record("mail.recent", let locator, _) = place else {
                 var refused = row
                 refused["binding_error"] = .string(Set(row.keys).isSubset(of: edits)
-                    ? "name must be a currently observed mail.N workspace name; refresh page:mail to obtain one."
+                    ? "name must be a currently observed mail.N home item name; refresh page:mail to obtain one."
                     : """
-                        A workspace name cannot be combined with exact locator fields. Omit name to use message_id, expected_message_id and expected_account, \
+                        A home item name cannot be combined with exact locator fields. Omit name to use message_id, expected_message_id and expected_account, \
                         or use only the observed mail.N name plus edits.
                         """)
                 return .object(refused)
@@ -53,14 +51,11 @@ extension AgentWorkspace {
     }
 }
 
-/// Reads use exact inbox identity, with the RFC identifier when available. Replies require that identifier; display text never selects a recipient.
 enum AgentWorkspaceMail {
-    /// Every action carries the read's one locator (`MailReadLocator.fields`), the mailbox under its own name `scope`, which each action declares.
     static func itemActions(input: [String: JSONValue], title: String) -> [String: AgentWorkspaceAction] {
         var bound = input.filter { MailReadLocator.fields.contains($0.key) }
         bound["scope"] = input["scope"] ?? input["mailbox"] ?? .string("inbox")
         guard bound["message_id"] != nil, case .string(let id)? = bound["expected_message_id"], !id.isEmpty else { return [:] }
-        // Every message action, delete included, reaches inbox mail only, so a message read in another mailbox offers none.
         var actions: [String: AgentWorkspaceAction] = [:]
         if bound["scope"] == .string("inbox") {
             actions["delete"] = .perform(tool: "mail.delete", input: bound, title: "Delete " + title, textField: nil, isEffect: true)
@@ -78,8 +73,8 @@ enum AgentWorkspaceMail {
         let open = AgentWorkspaceButton(label: "Open Mail view", action: .perform(tool: "go", input: ["name": .string("Mail")], title: "Mail view",
             textField: nil, isEffect: true))
         var actions: [AgentWorkspaceButton] = [open,
-            .init(label: "Find email", action: .configure(tool: "mail.search", input: [:], title: "Find email")),
-            .init(label: "Compose email", action: .configure(tool: "mail.send", input: [:], title: "Compose email"))]
+            .init(label: "Find email", action: .open(.record(tool: "app", input: ["find": .string("mail.search"), "args": .object([:])], title: "Find email"))),
+            .init(label: "Compose email", action: .open(.record(tool: "app", input: ["find": .string("mail.send"), "args": .object([:])], title: "Compose email")))]
         guard case .object(var content) = result, case .array(let rows)? = content["messages"] else {
             return .init(title: "Mail", content: result, items: [], actions: actions)
         }
@@ -110,10 +105,8 @@ enum AgentWorkspaceMail {
                readable {
                 var bound: [String: JSONValue] = ["message_id": .int(locator.id), "expected_message_id": .string(locator.messageID)]
                 bound["scope"] = object["scope"] ?? content["scope"] ?? .string("inbox")
-                // Account identity prevents same-address cross-account targeting.
                 if let account = locator.account { bound["expected_account"] = .string(account) }
                 if let accountID = locator.accountID { bound["expected_account_id"] = .string(accountID) }
-                // Inbox position is a navigation hint; message identity still decides.
                 if let position = locator.position { bound["position"] = .int(Int64(position)) }
                 if input["message_id"] == .int(locator.id), input["expected_message_id"] == .string(locator.messageID), content["detail"] == .bool(true) {
                     if object["truncated"] == .bool(true), case .int(let end)? = object["body_end"], end > 0, end <= 2_000_000 {
@@ -123,7 +116,7 @@ enum AgentWorkspaceMail {
                     let actions = itemActions(input: bound, title: title)
                     if let reply = actions["reply"], case .perform(let tool, let input, let title, _, _)? = actions["reply-all"] {
                         rowActions.append(.init(label: "Reply to sender", action: reply, needsText: true))
-                        rowActions.append(.init(label: "Reply to all", action: .configure(tool: tool, input: input, title: title)))
+                        rowActions.append(.init(label: "Reply to all", action: .open(.record(tool: "app", input: ["find": .string(tool), "args": .object(input)], title: title))))
                     }
                 } else if input["message_id"] == nil {
                     rowActions.append(.init(label: "Read message", action: .open(.record(tool: "mail.recent", input: bound, title: title))))

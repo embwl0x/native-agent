@@ -10,8 +10,9 @@ import ProviderRouting
 import Senses
 import Transcripts
 import TurnTrace
+import TrustCenter
 import NativeAgentShared
-// Blueprint: | `TurnPart.swift` | `TurnPart`; Source-bound helper and bounded throwing-program recovery |
+// Blueprint: | `TurnPart.swift` | Source-bound helper, sealed first installation and bounded throwing-program recovery |
 
 /// The part steps events and returns effects without running its own loop; the stem executes them.
 /// Resume and repair replay the same event log, matching effect identities rather than positions.
@@ -44,15 +45,15 @@ struct TurnPart {
     private var rounds = 0
     private var seen: [String: Int] = [:]
     private var file: AbilityStore.File
+    var version: String { file.bodyDigest }
     private let seed: AbilityStore.File
     private var failed: Set<String> = []
     /// Exclusive source-bound opened program; each event gets fresh frozen input.
     private var helper: OwnedProgramRunner.Held?
     private var arrivals: [Happening] = []
     private var heals = 0
-    /// A helper failure can happen before the seed ever executes. Allow one
-    /// fresh seed lease, independently of defective source recovery.
-    private var seedHelperRetried = false
+    /// A helper failure does not prove its source defective. Each source gets one fresh lease per turn.
+    private var helperRetried: Set<String> = []
 
     /// The installed current version runs. Only an absent current slot admits
     /// seed installation; a failed read or write ends with its storage cause.
@@ -61,8 +62,8 @@ struct TurnPart {
         self.deadlines = deadlines
         self.dataRoot = dataRoot; self.surface = surface; self.stop = stop; self.log = log
         gathered = context.turnReach; tools = context.toolSchemas.map(\.name)
-        seed = try AbilityStore.decode(Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/abilities/turn.js"))
         let store = AbilityStore(dataRoot: dataRoot)
+        seed = try AbilityStore.decode(Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/abilities/turn.js"))
         if let chosen = try Self.read(store, .current) {
             file = chosen
         } else {
@@ -78,8 +79,13 @@ struct TurnPart {
             let installed = try await asStem(turn: turn) { turn in
                 try AbilityStore.withLock {
                     if let latest = try Self.read(store, .current) { return (file: latest, written: false) }
-                    try store.write(seed, turn: turn)
-                    return (file: seed, written: true)
+                    let seed = try Self.sealedSeed(seed, store: store)
+                    try store.installSeed(seed, turn: turn) { _ in false }
+                    guard let selected = try Self.read(store, .current) else {
+                        throw store.repairFailure(source: store.root.appendingPathComponent("turn.js"),
+                            detail: "A retained ability occupies the turn id; the shipped turn was not installed.")
+                    }
+                    return (file: selected, written: true)
                 }
             }
             if installed.written {
@@ -97,6 +103,12 @@ struct TurnPart {
                     """)
             throw store.repairFailure(source: owner, detail: words)
         }
+    }
+
+    private static func sealedSeed(_ seed: AbilityStore.File, store: AbilityStore) throws -> AbilityStore.File {
+        guard case .int(let version)? = seed.metadata["version"] else { throw CocoaError(.fileReadCorruptFile) }
+        return try OwnedProgramStore(root: store.root).bundledSeed(OwnedProgramStore.turnSeed(seed), version: version,
+            key: SwiftNativeManifestSigner(dataRoot: store.dataRoot).checkedSigningKey())
     }
 
     /// Each event is one step. A program/helper fault heals and replays the
@@ -448,8 +460,7 @@ struct TurnPart {
         if event["type"] == .string("model"), calls.isEmpty, case .string(let text)? = event["text"] { answered += text }
     }
 
-    /// Each selected source gets one helper attempt. Every non-Stop failure
-    /// reaches the same bounded turn-program recovery, regardless of origin.
+    /// Non-Stop failures reach bounded recovery, retaining whether the helper or the program failed.
     private mutating func run(_ input: JSONValue, host: Reach) async throws -> [String: JSONValue] {
         let runner = OwnedProgramRunner(dataRoot: dataRoot)
         let program = OwnedProgram(kind: .turn, id: file.id, version: file.bodyDigest, source: file.body, entry: .run, resident: true)
@@ -519,8 +530,8 @@ struct TurnPart {
     /// Choose an unfailed previous version, otherwise the seed, and preserve a failed previous slot for repair evidence.
     private mutating func heal(_ fault: Fault, turn: Turn) async throws -> Bool {
         let broken = file
-        let retrySeedHelper = broken.bodyDigest == seed.bodyDigest && fault.helperFailure && !seedHelperRetried
-        if !retrySeedHelper { failed.insert(broken.bodyDigest) }
+        let retryHelper = fault.helperFailure && !helperRetried.contains(broken.bodyDigest)
+        if !retryHelper { failed.insert(broken.bodyDigest) }
         helper = nil; heals += 1
         let store = AbilityStore(dataRoot: dataRoot), seed = seed, failed = failed
         let outcome = try await Self.asStem(turn: turn) { (turn: Turn) throws -> (file: AbilityStore.File, swapped: Bool, kept: String, freshHelper: Bool) in
@@ -536,8 +547,8 @@ struct TurnPart {
                     }
                     return (current, false, "", false)
                 }
-                // Even a fresh seed lease admits checked current bytes; concurrent writes win and storage failures stay failures.
-                if retrySeedHelper { return (current, false, "", true) }
+                // A fresh lease admits checked current bytes; concurrent writes win and storage failures stay failures.
+                if retryHelper { return (current, false, "", true) }
                 // Only a turn-program/helper fault reaches this read. An unreadable
                 // previous slot is a storage error, never permission to seed.
                 let previous = try Self.read(store, .previous)
@@ -550,15 +561,16 @@ struct TurnPart {
                         try store.swap(id: Self.id, turn: turn)
                     } else if failed.contains(seed.bodyDigest) {
                         throw TurnEngineError.turnPartFailed("No unfailed turn program remains after \(fault.code): \(fault.why)")
-                    } else if let previous {
-                        chosen = seed
-                        kept = "abilities/turn.prev.js still holds \(Self.name(previous, seed: seed))."
-                        try store.write(seed, turn: turn)
                     } else {
-                        chosen = seed
-                        kept = "\(Self.name(broken, seed: seed)) is kept as abilities/turn.prev.js."
-                        try store.write(seed, slot: .previous, turn: turn)
-                        try store.swap(id: Self.id, turn: turn)
+                        chosen = try Self.sealedSeed(seed, store: store)
+                        if let previous {
+                            kept = "abilities/turn.prev.js still holds \(Self.name(previous, seed: seed))."
+                            try store.write(chosen, turn: turn)
+                        } else {
+                            kept = "\(Self.name(broken, seed: seed)) is kept as abilities/turn.prev.js."
+                            try store.write(chosen, slot: .previous, turn: turn)
+                            try store.swap(id: Self.id, turn: turn)
+                        }
                     }
                     return (chosen, true, kept, false)
                 } catch {
@@ -568,12 +580,13 @@ struct TurnPart {
             }
         }
         file = outcome.file
-        if outcome.freshHelper { seedHelperRetried = true }
+        if outcome.freshHelper { helperRetried.insert(broken.bodyDigest) }
         // A heal away from the version under trial is that trial's set aside, closed at the source.
         var trial: (closed: JSONValue?, failure: String?) = (nil, nil)
         if outcome.swapped {
+            let cause = fault.helperFailure ? "The turn helper failed" : "The turn program threw"
             trial = await Self.setTrialAside(store, version: broken.bodyDigest, why: """
-                The turn program threw (\(fault.code)) and the stem swapped back to \(Self.name(file, seed: seed)) (\(file.bodyDigest.prefix(12))).
+                \(cause) (\(fault.code)) and the stem swapped back to \(Self.name(file, seed: seed)) (\(file.bodyDigest.prefix(12))).
                 """, turn: turn)
         }
         var recovered: [String: JSONValue] = [
@@ -581,16 +594,16 @@ struct TurnPart {
             "fromDigest": .string(broken.bodyDigest), "sourceDigest": .string(file.bodyDigest),
             "program": .string(file.bodyDigest == seed.bodyDigest ? "seed" : outcome.swapped ? "previous" : "current"),
             "swapped": .bool(outcome.swapped),
-            "freshHelper": .bool(outcome.freshHelper),
+            "freshHelper": .bool(outcome.freshHelper), "helperFailure": .bool(fault.helperFailure),
         ]
         if let closed = trial.closed { recovered["trial"] = closed }
         if let failure = trial.failure { recovered["trial_error"] = .string(failure) }
         TurnTraceBus.fireFromContext(kind: "turn.part.recovered", surface: surface, payload: .object(recovered), turn: turn)
         if outcome.freshHelper {
             arrivals.append(Happening(.body, subject: "turn", door: "stem", who: "self",
-                words: "Your seed turn helper failed (\(fault.code)); the stem replayed the turn through the seed with a fresh helper lease. "
+                words: "Your turn helper failed (\(fault.code)); the stem replayed \(Self.name(file, seed: seed)) with a fresh helper lease. "
                     + "The helper cause still needs repair.",
-                once: "turn-heal:seed-helper:" + broken.bodyDigest, shows: fault.why))
+                once: "turn-heal:helper:" + broken.bodyDigest, shows: fault.why))
         }
         if outcome.swapped {
             let from = Self.name(broken, seed: seed), to = Self.name(file, seed: seed)
@@ -694,8 +707,6 @@ struct TurnPart {
     }
 }
 
-/// The agent's turn program weighs what nobody asked about: `weigh(h, felt)` in its installed `turn.js`, run on CPU outside any turn through the same
-/// source-bound helper its turns lease. Launch never grows it: a program without `weigh` leaves the world waiting unweighed until the agent grows one.
 public enum TurnWeigh {
     public enum Weighed: Sendable, Equatable {
         /// Its worth (0…1 is one thought's share), and whatever else its weigh returned beside the number.

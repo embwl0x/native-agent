@@ -78,7 +78,8 @@ public struct DeskItem: Sendable, Equatable {
     }
     /// A step filed in a peer's turn keeps the peer's id in its stored title; a reader names the peer by the contact it is now.
     public func displayTitle(peerName: (String) -> String?) -> String {
-        guard let step, title == step.title, !step.peers.isEmpty || !step.elevated.isEmpty else { return title }
+        guard let step, title == step.withheldTitle || title == step.ownTitle else { return title }
+        guard step.title == step.withheldTitle else { return step.ownTitle }
         let names = (step.peers + step.elevated).map { peerName($0) ?? "an agent no longer in contacts" }
         return "A step from \(names.joined(separator: ", "))'s turn"
     }

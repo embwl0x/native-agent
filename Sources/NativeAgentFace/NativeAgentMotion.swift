@@ -31,10 +31,7 @@ enum NativeAgentMotion {
     }
     /// Opacity stays animated when Reduce Motion removes layout interpolation.
     static var arrivalFade: AnyTransition { .opacity.animation(arrivalCurve) }
-    /// Reply phases share the arrival rhythm so transitions stay coherent.
-    static var replyDissolve: AnyTransition { arrivalFade }
     static let breatheDuration = standardDuration * 5
-    static let breathe = Animation.easeInOut(duration: breatheDuration)
     /// Read the clock through TimelineView; repeatForever can crash during repeating motion.
     static func loopPhase(at date: Date, period: TimeInterval) -> CGFloat {
         CGFloat(date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period) / period)
@@ -46,29 +43,16 @@ enum NativeAgentMotion {
 
     static var fade: AnyTransition { .opacity.animation(crossfade) }
 
-    /// New content fades in ease-out over the old fading out ease-in, keeping shared text bright.
-    static var dissolve: AnyTransition {
-        .asymmetric(insertion: fade, removal: .opacity.animation(.easeIn(duration: standardDuration)))
-    }
 
     /// Remove the old page immediately so translucent text layers never overlap.
     static var fadeIn: AnyTransition { .asymmetric(insertion: fade, removal: .identity) }
 
-    /// Remove the old row before inserting the new one so their text never overlaps.
-    static var fadeThrough: AnyTransition {
-        .asymmetric(
-            insertion: .opacity.animation(.easeOut(duration: quickDuration).delay(quickDuration)),
-            removal: .opacity.animation(.easeOut(duration: quickDuration)))
-    }
 
     static func reveal(reduceMotion: Bool = reducesMotion, anchor: UnitPoint = .top) -> AnyTransition {
         reduceMotion ? fade : .opacity.combined(with: .scale(scale: 0.97, anchor: anchor))
             .animation(spring)
     }
 
-    static var arrival: AnyTransition {
-        reducesMotion ? arrivalFade : .opacity.combined(with: .offset(y: 6))
-    }
 }
 
 private struct MotionArrival: ViewModifier {

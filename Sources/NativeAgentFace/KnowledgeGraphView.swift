@@ -38,8 +38,9 @@ struct KnowledgeGraphView: View {
     var body: some View {
         Group {
             if let snapshot, let face = presentation(snapshot) {
+                let ids = visibleIDs
                 FaceSelectionView(face: face, session: session, selection: $selectedId, door: door, page: "knowledge", leaf: leaf,
-                    selectionRows: selectionRows, rowFilter: { visibleIDs.contains($0.id) }) { item, _ in
+                    selectionRows: selectionRows, rowFilter: { ids.contains($0.id) }) { item, _ in
                     AnyView(FaceItemView(item: "entity:" + item, revision: face.sections.first(where: { $0.id == "entities" })?.revision,
                         door: appModel.pageDoor(page: "knowledge/entity:" + item, open: open),
                         reader: appModel.pageDoor(page: "knowledge", open: open),

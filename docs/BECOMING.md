@@ -38,7 +38,7 @@ night and their own hand, as the brief's law 5 says.
 
 ### P1 — one care per thing
 
-- **At birth**: a `new` judgment first meets the live and faded cares with the
+- **At birth**: a trusted `new` judgment first meets the live and faded cares with the
   same `with` by meaning (the warm memory embedder and its existing exact-text
   vector cache; `VectorMath.standout` over the entire care inventory, using
   `ContextSelectionConfiguration.memoryStandoutDeviations`, 2σ). If one or more

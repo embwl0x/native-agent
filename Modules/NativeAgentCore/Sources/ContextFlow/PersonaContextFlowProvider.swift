@@ -8,7 +8,7 @@ import PersonaEngine
 import PersistenceCore
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `PersonaContextFlowProvider.swift` | `PersonaContextFlowProvider`: one persona/mirror compiler batch with provenance |
+// Blueprint: | `PersonaContextFlowProvider.swift` | `PersonaContextFlowProvider`: persona mirrors and file watches with provenance |
 
 actor PersonaContextFlowProvider: ContextRequiredDocumentMirrorProviding {
     private struct Build: Sendable {
@@ -127,7 +127,7 @@ actor PersonaContextFlowProvider: ContextRequiredDocumentMirrorProviding {
                     ContextSecretContentPolicy.containsSecretLikeContent($0)
                 }
         }) else {
-            throw ContextMarkdownCompilerError.secretLikeContent
+            throw RequiredDocumentMirrorError.secretLikeContent
         }
         let canonicalDocuments = canonical.documents
             .filter { !$0.surfaceOverride }
@@ -165,7 +165,7 @@ actor PersonaContextFlowProvider: ContextRequiredDocumentMirrorProviding {
             )
             guard !ContextSecretContentPolicy.containsSecretLikeContent(renderedPrompt),
                   !ContextSecretContentPolicy.containsSecretLikeContent(surfaceGuidance) else {
-                throw ContextMarkdownCompilerError.secretLikeContent
+                throw RequiredDocumentMirrorError.secretLikeContent
             }
             let key = try StablePromptKernelKey(
                 personaID: contextPersonaID,

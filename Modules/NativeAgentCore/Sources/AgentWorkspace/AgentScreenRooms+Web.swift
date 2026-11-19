@@ -3,9 +3,8 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import ChromeControl
-// Blueprint: | `AgentScreenRooms+Web.swift` | `AgentScreen`, `tabName`, `tabTitle`, `webTabCell`: source-label lookup |
+// Blueprint: | `AgentScreenRooms+Web.swift` | `AgentScreen`: browser rooms and direct named tab reads/actions |
 
-/// Root-and-session-scoped browser reads supply home, tab rooms and label-to-node lookup without another tool call.
 public enum ChromePageMirror {
     public struct Option: Sendable, Equatable {
         public let label: String, value: String
@@ -14,11 +13,9 @@ public enum ChromePageMirror {
 
     public struct Row: Sendable, Equatable {
         public let node: String, role: String, label: String
-        /// The number actually shown in the page, including inline link references. A retained internal node without a visible reference has no row number.
         public let number: String?
         public let acts: Set<String>
         public let options: [Option]
-        /// Why the captured row cannot act, from the same evidence as its displayed read.
         public let actionBlock: ActionBlock?
         public init(node: String, role: String, label: String, acts: Set<String>, options: [Option], number: String? = nil,
                     actionBlock: ActionBlock? = nil) {
@@ -50,7 +47,6 @@ public enum ChromePageMirror {
     }
     private static let state = OSAllocatedUnfairLock(initialState: State())
 
-    /// Keep only pages this chat has read. This cache is evidence, not tab ownership.
     public static func publish(_ page: Page, dataRoot: URL, session: String?) {
         let who = dataRoot.standardizedFileURL.path + "\u{0}" + (session ?? "")
         state.withLock { state in
@@ -66,7 +62,6 @@ public enum ChromePageMirror {
         }
     }
 
-    /// Use only explicit or chat-local tab evidence so another chat cannot supply the selected page.
     public static func page(tab: Int64?, dataRoot: URL, session: String?) -> Page? {
         let who = dataRoot.standardizedFileURL.path + "\u{0}" + (session ?? "")
         return state.withLock { state in
@@ -82,13 +77,11 @@ public enum ChromePageMirror {
         }
     }
 
-    /// Only an explicit close removes a tab's saved page from home.
     public static func tabClosed(_ id: Int64) {
         forget(tab: id)
         state.withLock { state in if state.closed.count > 256 { state.closed = [] }; state.closed.insert(id) }
     }
     public static func isClosed(_ id: Int64) -> Bool { state.withLock { state in state.closed.contains(id) } }
-    /// Chrome can reuse a tab ID after restart; live evidence must refresh its saved identity.
     public static func tabLive(_ id: Int64) { state.withLock { state in _ = state.closed.remove(id) } }
 
     public enum Match: Equatable {
@@ -96,18 +89,15 @@ public enum ChromePageMirror {
         public var row: Row? { if case .row(let row) = self { row } else { nil } }
     }
 
-    /// Accessible labels belong to their control, never nearby text; stale row numbers must reacquire a unique role/label/neighbour match.
     public static func find(_ target: String, wants: Set<String>, in page: Page, seen: Page? = nil) -> Match {
         func one(_ rows: [Row]) -> Match? { rows.count == 1 ? .row(rows[0]) : rows.count > 1 ? .ambiguous(rows) : nil }
-        // Empty wants asks whether the row was observed, independently of its actions.
         func accepts(_ row: Row) -> Bool { wants.isEmpty || !wants.isDisjoint(with: row.acts) }
         let raw = target.trimmingCharacters(in: .whitespacesAndNewlines)
-        let digits = raw
-        if !digits.isEmpty, digits.allSatisfy(\.isNumber) {
+        if !raw.isEmpty, raw.allSatisfy(\.isNumber) {
             guard let seen, seen.snapshotID != page.snapshotID else {
-                return page.rows.first { $0.number == digits && accepts($0) }.map(Match.row) ?? .none
+                return page.rows.first { $0.number == raw && accepts($0) }.map(Match.row) ?? .none
             }
-            guard let at = seen.rows.firstIndex(where: { $0.number == digits && accepts($0) }) else { return .none }
+            guard let at = seen.rows.firstIndex(where: { $0.number == raw && accepts($0) }) else { return .none }
             let old = seen.rows[at]
             func label(_ rows: [Row], _ i: Int) -> String? { rows.indices.contains(i) ? norm(rows[i].label) : nil }
             let same = page.rows.indices.filter { accepts(page.rows[$0]) && page.rows[$0].role == old.role && norm(page.rows[$0]
@@ -124,7 +114,6 @@ public enum ChromePageMirror {
         return .none
     }
 
-    /// Name ambiguous candidates in refusals so the agent can select explicitly.
     public static func named(_ rows: [Row]) -> String {
         rows.prefix(6).map { ($0.number.map { "row " + $0 + " " } ?? "") + "\"" + $0.label.prefix(40) + "\"" }
             .joined(separator: ", ") + (rows.count > 6 ? " and \(rows.count - 6) more" : "")
@@ -136,9 +125,7 @@ public enum ChromePageMirror {
     }
 }
 
-/// Home reads the mirror; opening tab.N refreshes its page through the workspace owner.
 extension AgentScreen {
-    /// Tab numbers start at 1 per chat, increase only and are never reused.
     static func tabName(workspace: WorkspaceOperation, _ tab: Int64, dataRoot: URL, scope: String) -> String {
         do {
             return "tab.\(try withNames(workspace: workspace, dataRoot) { try $0.number("tab:" + scope, id: String(tab)) { [String(tab)] } })"
@@ -157,7 +144,6 @@ extension AgentScreen {
             + age(now.timeIntervalSince(page.at))
     }
 
-    /// Use the drawing chat's scope even outside a bound turn.
     static func webTarget(workspace: WorkspaceOperation, _ name: String, verb: String?, dataRoot: URL, scope: String) -> Target? {
         do {
             if name == "browser", verb == "go" {
@@ -171,8 +157,7 @@ extension AgentScreen {
             case nil:
                 let place = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot",
                     input: bound.merging(["scope": .string("main_content")]) { a, _ in a }, title: "Browser tab")
-                return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
-            // The browser owner refuses tabs the user takes over.
+                return .action(.open(place))
             case "go": return .action(.perform(tool: "browser.chrome_navigate", input: bound, title: "Go to an address", textField: "url", isEffect: true))
             case "click": return .action(.perform(tool: "browser.chrome_click", input: bound, title: "Click in " + name, textField: "node_id", isEffect: true))
             case "fill": return .action(.perform(tool: "browser.chrome_fill", input: bound, title: "Fill in " + name, textField: "fields", isEffect: true))
@@ -184,7 +169,6 @@ extension AgentScreen {
         } catch { return .page(nameFailure(error)) }
     }
 
-    /// Retain the last-read page evidence alongside its tab title and actions.
     static func tabRoom(workspace: WorkspaceOperation, _ input: [String: JSONValue], dataRoot: URL, scope: String, issue: String?, now: Date) -> String {
         let tab: Int64? = if case .int(let value)? = input["tab_id"] { value } else { nil }
         guard let page = ChromePageMirror.page(tab: tab, dataRoot: dataRoot, session: scope) else {

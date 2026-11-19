@@ -7,8 +7,6 @@ import PersistenceCore
 /// Frozen source packets feed derived faces through the owner's current gates; views read the face feed. A row
 /// does what its call says, through the door, for the person and the agent alike; no page answers its own rows.
 public actor PartFaces {
-    private var registrationFinished = false
-    private var registrationWaiters: [CheckedContinuation<Void, Never>] = []
     public typealias Call = @Sendable (_ id: String, _ input: JSONValue, _ version: String) async -> PartCallResult<PartFace>
     /// How a row's call runs when the person taps it: through the person's door, as `tap` names it, the person's own decision (`decided`)
     /// when the stem composed the call. Its reply retains the owner's words, effects and field settlement.
@@ -46,7 +44,22 @@ public actor PartFaces {
     }
     private var inverses: [UndoKey: Inverse] = [:]
 
-    public func releaseRenderer(_ renderer: UUID) { inverses = inverses.filter { $0.key.renderer != renderer } }
+    public func releaseRenderer(_ renderer: UUID) async {
+        inverses = inverses.filter { $0.key.renderer != renderer }
+        publication.yield(.releaseRenderer(renderer))
+        await flush()
+    }
+
+    /// Window readers hold delivery, while every door keeps reading the actor's admitted snapshots.
+    public func observe(page: String, reader: UUID, renderer: UUID, titleOnly: Bool = false) async {
+        publication.yield(.observe(page, snapshots[page], reader, renderer, titleOnly))
+        await flush()
+    }
+
+    public func release(reader: UUID) async {
+        publication.yield(.release(reader))
+        await flush()
+    }
     /// How the stem's own page (a lever page: Settings, Trust, Providers, Connectors, Inbox, Capabilities, Helpers) reads itself: its face and the
     /// record position it read (or the moment it read, for a page over no record).
     public typealias Read = @Sendable () async throws -> (face: PartFace, epoch: UInt64)
@@ -105,6 +118,9 @@ public actor PartFaces {
 
     private enum Publication: Sendable {
         case snapshot(String, PartFaceSnapshot)
+        case observe(String, PartFaceSnapshot?, UUID, UUID, Bool)
+        case release(UUID)
+        case releaseRenderer(UUID)
         case catalog(PartFaceCatalog)
         case flush(CheckedContinuation<Bool, Never>)
     }
@@ -117,11 +133,33 @@ public actor PartFaces {
         let (values, publication) = AsyncStream.makeStream(of: Publication.self)
         self.publication = publication
         publishing = Task.detached {
+            var readers: [UUID: (renderer: UUID, slots: Set<FaceKey>)] = [:]
             for await value in values {
                 switch value {
                 case .snapshot(let id, let snapshot):
-                    if let feed { await feed.post(snapshot, at: key(id)) }
+                    if let feed, key(id) != .page(id) || readers.values.contains(where: { $0.slots.contains(key(id)) }) {
+                        await feed.post(snapshot, at: key(id))
+                    }
+                    if let feed, readers.values.contains(where: { $0.slots.contains(.pageTitle(id)) }) {
+                        await feed.post(PageTitleFace(title: snapshot.face?.title), at: .pageTitle(id))
+                    }
                     NotificationCenter.default.post(name: .pageFacePublished, object: id)
+                case .observe(let id, let snapshot, let reader, let renderer, let titleOnly):
+                    let slot: FaceKey = titleOnly ? .pageTitle(id) : key(id)
+                    readers[reader, default: (renderer: renderer, slots: [])].slots.insert(slot)
+                    if let feed, let snapshot {
+                        if titleOnly { await feed.post(PageTitleFace(title: snapshot.face?.title), at: slot) }
+                        else { await feed.post(snapshot, at: slot) }
+                    }
+                case .release(let identity), .releaseRenderer(let identity):
+                    let released = readers.filter {
+                        if case .release = value { return $0.key == identity }
+                        return $0.value.renderer == identity
+                    }
+                    for reader in released.keys { readers.removeValue(forKey: reader) }
+                    for slot in Set(released.values.flatMap(\.slots)) where !readers.values.contains(where: { $0.slots.contains(slot) }) {
+                        if let feed { await feed.remove(slot) }
+                    }
                 case .catalog(let catalog):
                     if let feed { await feed.post(catalog, at: PageFaceKey.catalog) }
                     NotificationCenter.default.post(name: .pageCatalogPublished, object: nil)
@@ -329,19 +367,6 @@ public actor PartFaces {
         if let part = packets[id]?.part { return .part(part) }
         if let source = sources[id], !source.native { return .part(source.part) }
         return nil
-    }
-
-    /// The owner's whole page list has been registered; every caller waiting on it goes on.
-    public func finishRegistration() {
-        registrationFinished = true
-        for waiter in registrationWaiters { waiter.resume() }
-        registrationWaiters = []
-    }
-
-    /// Returns once the owner has registered its pages, so a window opening beside a starting body is not told a page is unknown.
-    public func registration() async {
-        guard !registrationFinished else { return }
-        await withCheckedContinuation { registrationWaiters.append($0) }
     }
 
     /// Read a registered page again and publish it (a page another owner pushes through `sourceChanged` returns its last snapshot).
@@ -799,6 +824,10 @@ public actor PartFaces {
         guard !secret.isEmpty else { throw PartCallError(code: "secret_required", message: "Enter a secret.") }
         let existing = try Keyring.entry(name)
         if existing?.value != secret {
+            if let existing, !existing.hosts.isEmpty || !existing.programs.isEmpty {
+                throw PartCallError(code: "secret_has_destinations",
+                    message: "Secret \(name) has granted destinations. Replace it on its key card (card.request with replace: true).")
+            }
             var entry = existing ?? Keyring.Entry(value: secret, hosts: [], programs: [], renewal: nil, at: Date())
             entry.value = secret
             entry.renewal = nil

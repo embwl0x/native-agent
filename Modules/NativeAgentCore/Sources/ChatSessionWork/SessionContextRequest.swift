@@ -4,7 +4,7 @@ import NativeAgentShared
 import PersistenceCore
 import MemoryV2
 import ProviderRouting
-// Blueprint: | `SessionContextRequest.swift` | SessionContextRequest owner. |
+// Blueprint: | `SessionContextRequest.swift` | Request sizing and replay inputs; current public evidence stays separate from live private context |
 
 public struct SessionContextRequest: Sendable {
     public let characters: Int
@@ -69,11 +69,12 @@ package enum SessionRequestMessages {
         package let currentUserIndex: Int
     }
     /// Public moment context leads user words; live assembly adds private choices after capturing this evidence.
-    package static func seed(history: [LLMMessage], block: String,
+    package static func seed(history: [LLMMessage], block: String, liveBlocks: [LLMContentBlock]? = nil,
         model: String, provider: String?, userText: String, images: [LLMContentBlock]) -> Seed {
         let sent = SentTurnContext(block: block, model: model, provider: provider, userText: userText)
         var blocks: [LLMContentBlock] = []
-        if !sent.block.isEmpty { blocks.append(.text(sent.block)) }
+        if let liveBlocks { blocks += liveBlocks }
+        else if !sent.block.isEmpty { blocks.append(.text(sent.block)) }
         blocks += images.isEmpty ? [.text(userText)] : LLMMessage.userWithImages(userText, images: images).content
         var messages = history
         let index: Int
@@ -136,7 +137,8 @@ package struct SessionContextPlan: Codable, Sendable {
         let inputBudget = Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens)) * charactersPerToken
         if Double(built.characters) > inputBudget {
             let tail = SessionHistoryTail(admission, rowCharacters: history.rowCharacters)
-            let halfBudget = SessionHistoryTail.halfBudgetCharacters(windowTokens: windowTokens, outputTokens: outputTokens)
+            let halfBudget = try SessionHistoryTail.halfBudgetCharacters(windowTokens: windowTokens, outputTokens: outputTokens,
+                charactersPerToken: charactersPerToken)
             let fixed = built.characters - history.characters
             for checkpoint in tail.fittingCheckpoints(halfBudgetCharacters: halfBudget,
                 maximumRetainedCharacters: inputBudget - Double(fixed)) {

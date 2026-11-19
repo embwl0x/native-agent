@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `LoopContracts.swift` | LoopRunner and event/deadline contracts, registrations, outcomes, backoff policy and bounded tick execution |
+// Blueprint: | `LoopContracts.swift` | LoopRunner and event/deadline contracts, registrations, outcomes and backoff policy |
 
 /// Returning from tick is not success proof; tickOutcome preserves the worker’s real outcome for state and receipts.
 public enum LoopTickOutcome: Sendable, Equatable {
@@ -91,8 +91,6 @@ public struct LoopFailureBackoffPolicy: Sendable, Equatable {
     }
 }
 
-/// Require honest tickOutcome evidence; tick only discards that result and must not be reimplemented.
-/// Observe cancellation promptly: timeout bounds the caller’s wait, while uncooperative work can outlive stop.
 /// What wakes an organ of the body. A rhythm is its nature (a daily backup, a weekly Doctor run, a presence heartbeat). An organ that runs on change
 /// has no clock: its events, its own next meaningful deadline and launch are its only wakes, so a missed event is a defect fixed where it was lost,
 /// never covered by a slow repair pass.
@@ -110,12 +108,12 @@ public enum OrganWake: Sendable, Equatable {
 public protocol LoopRunner: Sendable {
     var loopId: String { get }
     var wake: OrganWake { get }
-    /// A nil timeout override uses the scheduler’s 300-second default.
-    var tickTimeoutOverride: TimeInterval? { get }
+    /// The event that ends the tick's wait and the person's cancellation lever.
+    var waitingOn: String { get }
     /// True for a pass that works on the agent's persona, memory, mind or growth. Before setup finishes there is no agent, so the scheduler does not
     /// start it: its tick reads "not needed" and records no failure.
     var needsAgent: Bool { get }
-    /// Require explicit outcomes; no default completion can stand in for work.
+    /// Return the worker's outcome on its own terminal event or cancellation; elapsed time decides nothing.
     func tickOutcome() async -> LoopTickOutcome
     /// Do not reimplement tick: its sole purpose is to discard the required tickOutcome result.
     func tick() async
@@ -124,7 +122,7 @@ public protocol LoopRunner: Sendable {
 }
 
 public extension LoopRunner {
-    var tickTimeoutOverride: TimeInterval? { nil }
+    var waitingOn: String { "\(loopId) tick to return; cancel by switching the loop off or quitting NativeAgent" }
     var needsAgent: Bool { false }
 
     func tick() async {
@@ -166,31 +164,6 @@ public protocol EventDeadlineLoopRunner: LoopRunner {
 
 public extension EventDeadlineLoopRunner {
     var eventCoalescingDelay: TimeInterval { 0.25 }
-}
-
-public struct TickTimeoutError: Error, Equatable {
-    public init() {}
-}
-
-/// Timeout cancels the tick and bounds only its caller’s wait; physical work remains alive until it observes cancellation.
-public func tickWithTimeoutOutcome(
-    _ operation: @escaping @Sendable () async -> LoopTickOutcome,
-    timeout: TimeInterval
-) async throws -> LoopTickOutcome {
-    let result = await raceAgainstTimeout(nanoseconds: timeoutNanoseconds(timeout)) {
-        await operation()
-    }
-
-    switch result {
-    case .value(let outcome):
-        return outcome
-    case .failure(let error):
-        return .failed(error: error)
-    case .timedOut:
-        throw TickTimeoutError()
-    case .cancelled:
-        throw CancellationError()
-    }
 }
 
 internal func timeoutNanoseconds(_ seconds: TimeInterval) -> UInt64 {

@@ -122,6 +122,7 @@ clamped sample. Only a checked missing rhythm file permits the cold start;
 permission and decode failures preserve the original bytes and owe repair.
 
 EnginePartWake passes presence and Workspace sleep/wake edges to cognition.
+Each Workspace edge also posts one `world` happening on door `mac`, keyed by awake state and callback time, for attention's `weigh`.
 Mac-input and phone-sense changes read the same `PersonPresence` owner before
 updating rhythm. Waking restores that owner's current presence rather than
 carrying sleep's cleared presence into the new awake interval. An unknown
@@ -189,8 +190,9 @@ usually up by 7:08 AM, fairly sure"). Never in front of their every turn
 ### The night reads the same day
 
 The night sense reads the current hour's observed active share from this owner, beside known absence and elapsed time since a recorded night.
-It posts a happening; their turn program judges its worth. Admission and completed part accounting witness rest independently of the dream's
-consumption cursor. Rhythm breaks still never wake their. [Attention](SUBCONSCIOUS.md#attention) owns the night sense and admission contract.
+It posts a happening; their turn program judges its worth. Completed part accounting witnesses rest;
+night admission, a cancelled night and the dream consumption cursor do not reset it. Rhythm breaks still never wake their.
+[Attention](SUBCONSCIOUS.md#attention) owns the night sense and admission contract.
 
 ## Privacy
 

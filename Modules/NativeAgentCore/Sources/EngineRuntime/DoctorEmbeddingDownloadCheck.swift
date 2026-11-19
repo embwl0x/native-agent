@@ -67,7 +67,7 @@ public enum DoctorEmbeddingDownloadCheck {
             }
             do {
                 let state = try await SwiftNativeMemoryV2.shared.memoryEmbeddingEpochState()
-                guard let epoch = await SwiftNativeMemoryV2.shared.embeddingEpoch() else {
+                guard let epoch = try await SwiftNativeMemoryV2.shared.embeddingEpoch() else {
                     return (CheckResult(source: "extras/coreml and memory/memory.sqlite: embedding epoch", id: id, title: title, status: "unmeasured",
                                        detail: "The installed memory model's embedding epoch is unavailable."), false, false)
                 }
@@ -95,7 +95,7 @@ public enum DoctorEmbeddingDownloadCheck {
         }
         let phase = download.phase
         if download.running {
-            return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "ok",
+            return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "unmeasured",
                                detail: "The memory model transfer is running: \(phase)."), false, false)
         }
         let work = dataRoot.appendingPathComponent("extras/.coreml-download/\(descriptor.sha256)")

@@ -214,15 +214,15 @@ public enum MacContactsExecutor {
         if !organization.isEmpty { mutable.organizationName = organization }
         // Phones and emails extend existing values without replacing them.
         func digits(_ text: String) -> String { text.filter(\.isNumber) }
-        let havePhones = Set(mutable.phoneNumbers.map { digits($0.value.stringValue) })
-        mutable.phoneNumbers += phones.filter { !havePhones.contains(digits($0.value)) }.map { entry in
+        var havePhones = Set(mutable.phoneNumbers.map { digits($0.value.stringValue) })
+        mutable.phoneNumbers += phones.filter { havePhones.insert(digits($0.value)).inserted }.map { entry in
             CNLabeledValue(
                 label: contactLabel(forPhone: entry.label),
                 value: CNPhoneNumber(stringValue: entry.value)
             )
         }
-        let haveEmails = Set(mutable.emailAddresses.map { ($0.value as String).lowercased() })
-        mutable.emailAddresses += emails.filter { !haveEmails.contains($0.value.lowercased()) }.map { entry in
+        var haveEmails = Set(mutable.emailAddresses.map { ($0.value as String).lowercased() })
+        mutable.emailAddresses += emails.filter { haveEmails.insert($0.value.lowercased()).inserted }.map { entry in
             CNLabeledValue(
                 label: contactLabel(forEmail: entry.label),
                 value: entry.value as NSString

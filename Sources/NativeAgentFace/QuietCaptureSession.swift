@@ -140,7 +140,10 @@ final class QuietCaptureSession {
                 try Task.checkCancellation()
             }
             guard let first = held.resources.first else {
-                if preview.text != nil { return held }
+                if let text = preview.text {
+                    if preview.kind == BoardDocument.type { held.board = try BoardDocument(text) }
+                    return held
+                }
                 throw Self.failure("The Make preview has no granted resource or prepared text.")
             }
             switch preview.kind {

@@ -26,14 +26,6 @@ extension HazeColor {
 
     var swatch: Color { Color(hex: shades[0]) }
 
-    /// Deepen root ink in light rooms so the dark swatch retains contrast.
-    func windowTint(dark: Bool) -> Color {
-        guard !dark else { return base }
-        let deep = NSColor(Color(hex: shades[1]))
-        return Color(nsColor: NSColor(srgbRed: deep.redComponent * 0.7,
-                                     green: deep.greenComponent * 0.7,
-                                     blue: deep.blueComponent * 0.7, alpha: 1))
-    }
 
     /// Use deep shades under white labels for at least 5:1 contrast; base teal and amber reach only 3.1:1.
     /// Tracks need base shades in dark rooms (at least 3.4:1) and deep shades in light rooms (over 4.5:1).

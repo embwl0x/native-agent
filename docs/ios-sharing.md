@@ -4,6 +4,9 @@ Share text, a URL, an image or a PDF from another app using **Share to
 NativeAgent**. The compose sheet uses **Share to [agent name]**, from the name
 in the current pairing's shared identity, or NativeAgent before one is available.
 
+The iPhone needs a saved Mac pairing. Without one, the sheet says the iPhone
+is not paired with a Mac yet and leaves **Cancel** available.
+
 Add an optional note, tap **Save**, then **Done**, and open NativeAgent. The app
 selects Chat and imports the item into the selected conversation's durable send
 queue. A paused queue stays paused. The extension saves locally; it does not

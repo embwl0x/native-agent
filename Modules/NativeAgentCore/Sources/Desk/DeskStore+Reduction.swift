@@ -5,12 +5,6 @@ import PersistenceCore
 extension SwiftNativeDeskStore {
     // MARK: - Compaction (pure fold — rebuild MUST equal in-memory fold)
 
-    /// Apply ops in append order; orphan mutations cannot recreate archived items.
-    /// Retain orphaned-parent items so malformed hierarchy never loses live work.
-    public static func compact(_ ops: [DeskOp]) -> DeskState {
-        compact(base: nil, ops)
-    }
-
     /// Seed from the base and apply only its following tail so compacted work survives truncation.
     static func compact(base: DeskCompactionBase?, _ ops: [DeskOp]) -> DeskState {
         var byHandle: [String: DeskItem] = [:]

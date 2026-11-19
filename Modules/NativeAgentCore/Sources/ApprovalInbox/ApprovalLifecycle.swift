@@ -40,9 +40,11 @@ public actor ApprovalLifecycleBus {
         }
     }
     private var continuations: [UUID: (host: Bool, reply: AsyncStream<ApprovalLifecycleEvent>.Continuation, context: HostContext?)] = [:]
+    private var filedCards: [UUID: Set<String>] = [:] // Held until finish, even if Stop terminates the stream first.
 
     public func events(forHostCall hostID: UUID? = nil, context: HostContext? = nil) -> AsyncStream<ApprovalLifecycleEvent> {
         let id = hostID ?? UUID()
+        if hostID != nil { filedCards[id] = [] }
         let pair = AsyncStream<ApprovalLifecycleEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(64)
         )
@@ -54,6 +56,9 @@ public actor ApprovalLifecycleBus {
     }
 
     public func publish(_ event: ApprovalLifecycleEvent) {
+        if event.phase == .requested, let id = hostCallID(event.record) {
+            filedCards[id]?.insert(event.record.id)
+        }
         if event.phase == .resolved || event.phase == .executed {
             if SwiftNativeApprovalInbox.terminalApprovalStatuses.contains(event.record.status),
                let id = hostCallID(event.record) { continuations[id]?.reply.yield(event) }
@@ -67,7 +72,10 @@ public actor ApprovalLifecycleBus {
         continuations.removeValue(forKey: id)?.reply.finish()
     }
 
-    public func finish(_ id: UUID) { removeContinuation(id) }
+    public func finish(_ id: UUID) -> Set<String> {
+        removeContinuation(id)
+        return filedCards.removeValue(forKey: id) ?? []
+    }
 
     public func awaitsHostReply(_ record: ApprovalRecord) -> Bool {
         guard let id = hostCallID(record) else { return false }

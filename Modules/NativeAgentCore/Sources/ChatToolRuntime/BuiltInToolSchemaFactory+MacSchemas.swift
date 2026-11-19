@@ -436,10 +436,10 @@ extension BuiltInToolSchemaFactory {
                     toolClass: .read, reach: .person, capabilities: ["tool_call"],
                     description: """
                         Read this Mac's system, named disk capacity (disk: Data at /System/Volumes/Data; system_disk: sealed System at /), memory, \
-                        top five CPU/memory processes, battery, network, local/public IP, connected macOS VPN services, Wi-Fi SSID and whether the \
+                        top five CPU/memory processes, battery, local network addresses, connected macOS VPN services, Wi-Fi SSID and whether the \
                         person is here directly; unavailable fields are labeled. With person:true, only read whether the person is here: {here, \
-                        idle_seconds} from their own input (yours never counts), away after 300 seconds idle, here null while unknown. Public IP \
-                        uses a 3-second HTTPS lookup. Only when requested, speed_test:true measures upload/download and responsiveness with \
+                        idle_seconds} from their own input (yours never counts), away after 300 seconds idle, here null while unknown. Ordinary \
+                        system reads send no network probes. Only when requested, speed_test:true measures upload/download and responsiveness with \
                         networkQuality, limited to 20 seconds and using internet bandwidth. With app, only read that installed app's bundle version \
                         by exact name or full .app path from the Mac's app index. With check_updates:true, only list available macOS software \
                         updates, read-only with a 30-second deadline; this does not check NativeAgent or App Store apps. Use app, check_updates or \
@@ -472,7 +472,8 @@ extension BuiltInToolSchemaFactory {
                         that are themselves a secret — a password, an API key, a one-time code, a card number, a recovery phrase — come back as \
                         \"[redacted: <reason>]\" and are listed under `redactions`; that is redaction, not an empty clipboard, and re-reading will \
                         not reveal them. Non-text contents (an image, a file, an app's own flavor) are reported by type and size under `types` — \
-                        the bytes are never returned. Available only when Full Mac is active with the Accessibility category enabled.
+                        the bytes are never returned. Concealed or transient clipboard content returns no text or text length, with a note saying why. \
+                        Available only when Full Mac is active with the Accessibility category enabled.
                         """,
                     parametersJSON: ToolSchema.params(
                         properties: [
@@ -536,35 +537,6 @@ extension BuiltInToolSchemaFactory {
                                 use the failure’s cause and remedy. Ignored with path, which reads the file.
                                 """)),
                         ] + ToolSchema.senseViewProperties,
-                        required: []
-                    )
-                ),
-                // Prefer addressable marks; coordinates serve targets without semantic marks.
-                requestedSchema(
-                    name: "mac_view",
-                    toolClass: .read, reach: .person, capabilities: ["tool_call"],
-                    description: """
-                        Read a bounded accessibility view and screenshot of the frontmost window. marks numbers selected clickable/scrollable \
-                        elements with role, label, value, state, frame and element path; text contains selected reading-order text. Caps: 60 marks, \
-                        80 text items, plus node/depth/image limits; this is not complete window coverage. Read structure first, image for spatial \
-                        context. Read-only. Marks belong to the latest view; after possible change, read mac.view again. Requires Full Mac \
-                        Accessibility; screenshot also needs macOS Screen Recording. Without that grant, the legend remains and the missing image \
-                        is reported.
-                        """,
-                    parametersJSON: ToolSchema.params(
-                        properties: [
-                            ("max_marks", ToolSchema.intSchema("""
-                                Maximum number of elements to number. Clamped to the view's own cap (60); omit for the default.
-                                """)),
-                            ("max_text_items", ToolSchema.intSchema("""
-                                Maximum lines of on-screen text to return. Clamped to the view's own cap (80); omit for the default.
-                                """)),
-                            ("max_image_bytes", ToolSchema.intSchema("""
-                                Maximum encoded PNG size. The image is downscaled to fit; clamped to the view's own cap. Omit for the default.
-                                """)),
-                            ("max_nodes", ToolSchema.intSchema("Maximum number of AX nodes to consider when choosing marks. Clamped to the reader's own cap.")),
-                            ("max_depth", ToolSchema.intSchema("Maximum AX tree depth to descend. Clamped to the reader's own cap.")),
-                        ],
                         required: []
                     )
                 ),
@@ -642,64 +614,6 @@ extension BuiltInToolSchemaFactory {
                                 Optional: a contact's name (as app agent.message takes it). Wait for its reply instead of watching the screen.
                                 """)),
                             ("conversation", ToolSchema.strSchema("Optional, with agent: the conversation name; omit for its current one.")),
-                        ],
-                        required: []
-                    )
-                ),
-                requestedSchema(
-                    name: "mac_look",
-                    toolClass: .read, reach: .person, capabilities: ["tool_call"],
-                    description: """
-                        Read the frontmost window’s accessibility view. glance: one-line app/window, control count, focus, modal and first buttons. \
-                        look: window, focus, modal, landmarks and bounded labeled controls with handles, roles, values and element paths. stare: \
-                        bounded raw AX tree. Unlabeled controls are counted by role. Node/depth/affordance caps limit coverage; handles belong to \
-                        the returned frame_id, so read again after possible change. Read-only; requires macOS Accessibility and Full Mac \
-                        Accessibility.
-                        """,
-                    parametersJSON: ToolSchema.params(
-                        properties: [
-                            ("grade", ToolSchema.enumStringSchema(["glance", "look", "stare"], "How hard to look. Defaults to look.")),
-                            ("max_affordances", ToolSchema.intSchema("""
-                                Maximum labeled interactive controls to return. Clamped to the compiler's own cap (60); omit for the default.
-                                """)),
-                            ("max_nodes", ToolSchema.intSchema("Maximum number of AX nodes to walk. Clamped to the reader's own cap.")),
-                            ("max_depth", ToolSchema.intSchema("Maximum AX tree depth to descend. Clamped to the reader's own cap.")),
-                            ("scope", ToolSchema.enumStringSchema(
-                                ["page", "chrome", "both"],
-                                """
-                                    For a browser or Electron window: `page` (the default) spends the whole walk on the web page and collapses the \
-                                    browser's own toolbar and bookmarks bar to one summary line; `chrome` looks at the browser's controls instead; \
-                                    `both` walks the whole window in one pass, where the page competes with the chrome for the node budget. Ignored \
-                                    for a window with no web area — the result always says which scope it used.
-                                    """
-                            )),
-                        ],
-                        required: []
-                    )
-                ),
-                requestedSchema(
-                    name: "mac_attention",
-                    toolClass: .read, reach: .person, capabilities: ["tool_call"],
-                    description: """
-                        Pay continuous, explicit attention to this Mac without a polling loop or another model. `start` installs a passive, \
-                        on-device event observer for a bounded time and returns a fresh fused screen view. `next` waits efficiently for physical \
-                        pointer/keyboard/scroll activity or an app change (up to wait_ms), then returns one fresh fused view; keyboard content is \
-                        never captured, only an activity pulse. Physical user input always wins: it immediately invalidates the old view and motor \
-                        tools refuse with yielded_to_user until you call `next` and re-observe. `status` reports the live session; `stop` removes \
-                        every observer and forgets the ephemeral state. While active, pass the returned attention.session and \
-                        attention.user_sequence as attention_session and attention_user_sequence on every Mac motor action. Read-only perception \
-                        under the Full Mac Accessibility gate; the screenshot half also needs Screen Recording permission.
-                        """,
-                    parametersJSON: ToolSchema.params(
-                        properties: [
-                            ("mode", ToolSchema.enumStringSchema(["start", "next", "status", "stop"], "Attention operation. Defaults to status.")),
-                            ("session", ToolSchema.strSchema("Session id returned by start. Required for next.")),
-                            ("after_sequence", ToolSchema.intSchema("For next: wait only for activity newer than this attention sequence.")),
-                            ("wait_ms", ToolSchema.intSchema("For next: event-driven wait before refreshing anyway, 0-15000ms. Defaults to 1500.")),
-                            ("duration_seconds", ToolSchema.intSchema("For start: bounded observer lifetime, 15-1800 seconds. Defaults to 300.")),
-                            ("max_marks", ToolSchema.intSchema("Maximum numbered elements, with the same cap as mac.view.")),
-                            ("max_text_items", ToolSchema.intSchema("Maximum visible text items, with the same cap as mac.view.")),
-                            ("max_image_bytes", ToolSchema.intSchema("Maximum encoded PNG bytes, with the same cap as mac.view.")),
                         ],
                         required: []
                     )
@@ -791,8 +705,9 @@ extension BuiltInToolSchemaFactory {
                         chords, {verb,target,text,mode}, or {verb,handle,frame_id}; handle steps re-resolve the recorded identity live, stopping \
                         when it disappears or changes; each reads/verifies afresh, stops on first failure and returns a receipt line. A trailing ? \
                         skips an absent optional target. Example: app:'TextEdit', front:true, steps:['Format > Make Plain \
-                        Text','OK?','cmd+s',{verb:'type',target:'Save As',text:'hello.txt'},'cmd+d','return'] (cmd+d selects Desktop in a save \
-                        dialog). Named controls use accessibility; unlabeled visual regions accept physical gestures only. For points, use \
+                        Text','OK?','cmd+s',{verb:'type',target:'Save As',text:'~/Desktop/hello.txt'},'Save'] (a whole path typed into a save \
+                        panel's name field places the folder and names the file; the file on disk is the proof it saved). Named controls use \
+                        accessibility; unlabeled visual regions accept physical gestures only. For points, use \
                         at:{x,y}, or drag from:{x,y} to:{x,y}, in the delivered image’s pixels; image defaults to this conversation’s latest screen \
                         image. The receipt reports the mapped screen point; repeat/to_app do not apply to point acts. Named type defaults to \
                         replace; append preserves verified prior text and inserts exactly text at its verified end (include newlines). Unverifiable \
@@ -1004,35 +919,6 @@ extension BuiltInToolSchemaFactory {
                                 """)),
                         ],
                         required: ["name"]
-                    )
-                ),
-                requestedSchema(
-                    name: "mac_wake",
-                    toolClass: .write, reach: .person,
-                    description: """
-                        Wake the screen: if this Mac is showing a screensaver or the display has gone to sleep, nudge it away and hand back a fresh \
-                        view of the real desktop underneath, in one call.It posts the smallest possible input — a one-point mouse move plus a bare \
-                        Shift tap, neither of which can click, type text, or authenticate — and then returns exactly what mac.view returns \
-                        (`marks`, `text`, the annotated image, and a `view` id you can act on), plus a `wake` block saying whether the screen \
-                        really came back. If the saver/login layer remains, it reports that observed obstruction without guessing why. Requires \
-                        Full Mac and Accessibility access; waking the display raises no routine card.
-                        """,
-                    parametersJSON: ToolSchema.params(
-                        properties: [
-                            ("key_tap", ToolSchema.boolSchema("""
-                                Also tap the left shift key, which types nothing but wakes some sleeping displays a mouse move alone does not. On \
-                                by default; pass key_tap:false to omit the Shift tap.
-                                """)),
-                            ("settle_ms", ToolSchema.intSchema("""
-                                How long to wait after the nudge before capturing, 0-3000ms. Defaults to 700, which is enough for the screensaver \
-                                to finish tearing down. Raise it if the returned view still shows the saver.
-                                """)),
-                            ("attention_session", ToolSchema.strSchema("Required while mac_attention is active: its current conversation id.")),
-                            ("attention_user_sequence", ToolSchema.intSchema("""
-                                Required while mac_attention is active: the user_sequence from its latest observed fused view.
-                                """)),
-                        ],
-                        required: []
                     )
                 ),
             ])

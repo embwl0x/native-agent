@@ -7,7 +7,6 @@ import DeviceSync
 import MemoryV2
 import ProviderRouting
 import MacControl
-import TriggerScheduler
 import Privacy
 import SchedulerExecution
 import Foundation
@@ -46,11 +45,7 @@ import Connectors
 import Browser
 import DoctorChecks
 import TelegramBot
-#if canImport(BackgroundTasks)
-import BackgroundTasks
-import BackgroundTasks
-// Blueprint: | `NativeAgentApp.swift` | Engine launch and app hosts; one delivery watch with launch, network and configured-door wakes |
-#endif
+// Blueprint: | `NativeAgentApp.swift` | App lifecycle, runtime composition and clean system delivery-repair births |
 
 @MainActor
 final class NativeAgentHotkeyBootstrap {
@@ -219,14 +214,6 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
 
     var voiceName: String { AgentVoice.live.name }
     var agentSubject: String { AgentVoice.live.subject }
-
-    var triggerNotifier: TriggerNotifier {
-        { @Sendable note, notify in
-            await TriggerNotificationDelivery.notify(note, notify: notify, delivery: NativeAgentEngine.liveDeviceSync,
-                router: { .shared }, turn: nil)
-        }
-    }
-
 
 }
 
@@ -582,7 +569,7 @@ extension AttentionRouter {
                 let failed = Experience(id: id, kind: .message, cause: ["attention.delivery." + phase],
                     face: face, addressedTo: ["person", "self"], owes: ["repair": .init(to: "self")],
                     claims: RepairDebt(owner: owner, operation: operation, lever: words).claims
-                        + [.init(claim: "Delivery attempt failed; effects unknown.", evidence: [])])
+                        + [.init(claim: "Delivery attempt failed; effects unknown.", evidence: [])], steeredBy: [])
                 _ = try await store.begin(failed)
             }
         }.value

@@ -145,8 +145,7 @@ extension AppActions {
                 let member = node.id, tool = node.tool
                 let declaredRead = if case .object(let schema)? = try? JSONValue.parse(tool.schema.parametersJSON) { schema["readOnly"] == .bool(
                     true) } else { false }
-                // readOnly describes intent, never authority. The complete permission/dependency closure must also be read-only; both watches and expansion
-                // consume this canonical binding.
+                // readOnly describes intent, never authority. Watches consume the complete permission/dependency closure's canonical binding.
                 // An answered verb's declared read is enforced at its run (read-confined); its other classes only raise the closure's.
                 let answered = tool.answer
                 let read = answered.map { _ in tool.schema.toolClass == .read } ?? (!cyclic && reach == .read && dependenciesRead

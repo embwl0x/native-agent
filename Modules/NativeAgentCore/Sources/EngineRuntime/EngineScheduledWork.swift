@@ -14,7 +14,6 @@ import ChatToolRuntime
 import ChatTurnRuntime
 import Cognition
 import Desk
-import DoctorChecks
 import DreamREMCycle
 import Experiences
 import MemoryV2
@@ -24,70 +23,30 @@ import StandingBots
 import TelegramBot
 import ToolExecution
 import TriggerScheduler
-// Blueprint: | `EngineScheduledWork.swift` | Attention's night and the clock's part schedules, watches, scans, inbox briefs and helpers |
+// Blueprint: | `EngineScheduledWork.swift` | Attention's night and the clock's part schedules, watches, scans and helpers |
 
 extension NativeAgentEngine {
-    public static func makeNativeTriggerScheduler(dataRoot: URL) -> SwiftNativeTriggerScheduler {
-        let standardized = dataRoot.standardizedFileURL
-        let isLiveRoot = standardized
-            == PersistenceCore.defaultDataRoot().standardizedFileURL
-        let notifier: TriggerNotifier? = isLiveRoot
-            ? NativeAgentEngine.live.ports.backgroundWork.triggerNotifier
-            : nil
-        return SwiftNativeTriggerScheduler(
-            root: standardized,
-            notifier: notifier,
-            morningBriefPart: { input in
-                if !isLiveRoot, input.objectValue?["operation"] == .string("brief") {
-                    throw TriggerSchedulerError.persistenceFailure("A secondary root cannot spend the live morning-brief model route.")
-                }
-                let engine = NativeAgentEngine.forRoot(standardized)
-                // The clock is not a requester: her own scheduled work runs at her own standing (Trust decides), like her own thoughts.
-                return try await engine.tools.withPartDoor(envelope: .native("trigger:morning_brief"), fileAccess: "auto") { door in
-                    switch await Parts(root: standardized).call(id: "native-morning-brief", input: input, invocation: door.invocation, as: JSONValue.self) {
-                    case .success(let value): return value
-                    case .failure(let error): throw error
-                    }
-                }
-            }
-        )
-    }
-
-    /// What the clock's dream, REM, watch and scan deliveries leave behind, told through this root's attention router.
     public static func clockWork(dataRoot: URL) -> ClockWork {
         ClockWork(root: dataRoot, attentionRouter: { NativeAgentEngine.forRoot(dataRoot).ports.backgroundWork.attention })
     }
 
-    /// Asked times belong to their declaring owners. The night belongs to attention. Once per process: the night's old times are withdrawn, helpers
-    /// attach and part times are followed; the deliveries themselves are the mind's (`handleClockOwners`).
+    /// Asked times belong to their declaring owners. The night belongs to attention. Helpers attach and part times are followed;
+    /// the deliveries themselves are the mind's (`handleClockOwners`).
     static func registerClockOwners(dataRoot: URL) async {
         let root = dataRoot.standardizedFileURL
-        let clock = OneClock.at(root)
-        do {
-            try await clock.withdraw("sleep:night")
-            try await clock.withdraw("rem:weekly")
-            try await clock.withdraw("wander:hour")
-        } catch {
-            await DoctorReadout.recordReadings([CheckResult(source: "clock/times.json", id: "night.withdraw", title: "Night times",
-                status: "fail", detail: error.localizedDescription)], dataRoot: root)
-        }
-        _ = await NativeAgentEngine.live.bots.attach(carryingOver: false)
+        await NativeAgentEngine.live.bots.attach()
         await handleClockOwners(dataRoot: root)
+        let changes = NotificationCenter.default.notifications(named: AbilityStore.didChange)
         await declarePartTimes(dataRoot: root)
         Task.detached(priority: .utility) {
             // A part header's schedule:<cron> is a part time; editing the part moves it, removing the wake withdraws it.
-            for await _ in NotificationCenter.default.notifications(named: AbilityStore.didChange) { await declarePartTimes(dataRoot: root) }
-        }
-        do { try await makeNativeTriggerScheduler(dataRoot: root).declareTimes() }
-        catch {
-            await DoctorReadout.recordReadings([CheckResult(source: "triggers/trigger_config.json", id: "clock.briefs", title: "Inbox brief times",
-                status: "fail", detail: "Inbox trigger times are not on the clock: \(error.localizedDescription)")], dataRoot: root)
+            for await _ in changes { await declarePartTimes(dataRoot: root) }
         }
     }
 
     /// The clock owners a running mind takes delivery for. While no mind runs their times stay pending, and are delivered once when the next mind
     /// handles them; the mind's own queue moments (`MyQueueReady.owner`) are handled by the runtime when it opens.
-    static let mindClockOwners = ["part", "watch", "scan", SwiftNativeTriggerScheduler.clockOwner]
+    static let mindClockOwners = ["part", "watch", "scan"]
 
     static func releaseClockOwners(dataRoot: URL) async {
         let clock = OneClock.at(dataRoot.standardizedFileURL)
@@ -107,13 +66,6 @@ extension NativeAgentEngine {
         }
         await clock.handle("watch") { time, _ in await watch(time, dataRoot: root) }
         await clock.handle("scan") { time, _ in await scan(time, dataRoot: root) }
-        await clock.handle(SwiftNativeTriggerScheduler.clockOwner) { time, occurrence in
-            guard let name = time.payload?.objectValue?["name"]?.stringValue else {
-                ModuleLog.app("[clock] %@ carries no trigger name; nothing was published", time.id)
-                return
-            }
-            await makeNativeTriggerScheduler(dataRoot: root).deliver(name: name, occurrence: occurrence)
-        }
     }
 
     // MARK: - The night and REM
@@ -153,7 +105,10 @@ extension NativeAgentEngine {
     private static func dreamTheNight(dataRoot root: URL, parent: Turn, beganAt: Date) async {
         let detail: String
         do {
-            let response = try await runDream(dataRoot: root, force: false, parent: parent, beganAt: beganAt)
+            var response: [String: Any]
+            repeat {
+                response = try await runDream(dataRoot: root, force: false, parent: parent, beganAt: beganAt)
+            } while response["remedy"] == nil && response["moreMessagesRemain"] as? Bool == true && response["entriesWritten"] as? Int ?? 0 > 0
             guard response["remedy"] == nil, (response["skipReason"] as? String) == "already_running" else { return }
             detail = "another dream run held the reservation while the night began"
         } catch DreamREMCycleError.cycleDisabled(_, _) {
@@ -189,7 +144,7 @@ extension NativeAgentEngine {
             let output = try await read(action: action, input: payload["input"]?.objectValue ?? [:])
             let seen = payload["seen"]?.arrayValue?.compactMap(\.stringValue)
             let read = try await ClockWork.watch(id: time.id, name: name, actionId: action, seen: seen, output: output)
-            try await ScheduledReads.remember(seen: read.seen, watch: time, dataRoot: root)
+            try await ScheduledReads.remember(seen: read.seen, read: time, dataRoot: root)
             await RepairOwed.settle(root, operation: operation, evidence: .init(source: "clock", id: time.id)).value
         } catch {
             await RepairOwed.owe(root, id: "watch-read:" + time.id + ":" + UUID().uuidString, kind: .run, operation: operation,
@@ -199,11 +154,14 @@ extension NativeAgentEngine {
     }
 
     private static func scan(_ time: OneClock.Time, dataRoot root: URL) async {
-        var payload = time.payload?.objectValue ?? [:]
-        payload["name"] = nil
         let operation = "clock:" + time.id
         do {
-            _ = try await clockWork(dataRoot: root).scan(payload: payload)
+            var payload = try ScheduledReads.checkedPayload(time)
+            let seen = payload.removeValue(forKey: "seen")?.arrayValue?.compactMap(\.stringValue) ?? []
+            payload["name"] = nil
+            payload["made"] = nil
+            let posted = try await clockWork(dataRoot: root).scan(id: time.id, payload: payload, seen: seen)
+            try await ScheduledReads.remember(seen: posted, read: time, dataRoot: root)
             await RepairOwed.settle(root, operation: operation, evidence: .init(source: "clock", id: time.id)).value
         } catch {
             await RepairOwed.owe(root, id: "scan:" + time.id + ":" + UUID().uuidString, kind: .run, operation: operation,
@@ -215,7 +173,7 @@ extension NativeAgentEngine {
     /// A watch's read: its action through the app door, as any of the agent's calls, held to a read. Throws what refused or failed it.
     private static func read(action: String, input: [String: JSONValue]) async throws -> JSONValue {
         try await NativeAgentEngine.live.tools.withPartDoor(envelope: .native("scheduler:watch:" + action)) { door in
-            if let refusal = SwiftNativeTriggerScheduler.watchRefusal(action: action, input: input, turn: door.turn) {
+            if let refusal = SchedulerJobNormalizer.watchRefusal(action: action, input: input, turn: door.turn) {
                 throw PartCallError(code: "not_a_read", message: refusal)
             }
             let result = try await door.perform("app", ["action": .string(action), "args": .object(input)])

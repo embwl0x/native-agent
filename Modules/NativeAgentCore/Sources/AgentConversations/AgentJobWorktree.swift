@@ -30,7 +30,8 @@ extension AgentJobs {
     static func worktreeConfigRoot(_ dataRoot: URL) -> URL { InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot) }
 
     private static func git(_ args: [String], _ folder: String) async -> BuilderWorktreeAllocator.GitResult {
-        await BuilderWorktreeAllocator.git(args, cwd: URL(fileURLWithPath: folder, isDirectory: true))
+        await BuilderWorktreeAllocator.git(["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"] + args,
+                                           cwd: URL(fileURLWithPath: folder, isDirectory: true))
     }
 
     // MARK: The cut
@@ -82,15 +83,13 @@ extension AgentJobs {
         }
         let model = job.report?.model?.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ") ?? ""
         let trailer = "Assisted-by: \(job.name):\(model.isEmpty ? "unknown" : model)"
-        // The stem's own commit runs no hooks: it records what the organ left. The agent's merge runs the agent's hooks.
-        let quiet = ["-c", "core.hooksPath=/dev/null"]
-        let status = await git(["status", "--porcelain", "--untracked-files=all"], folder)
+        let status = await git(["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"], folder)
         guard status.status == 0 else { return kept("git status failed: \(BuilderWorktreeAllocator.detail(status)).") }
         if !status.trimmed.isEmpty {
             let add = await git(["add", "-A"], folder)
             guard add.status == 0 else { return kept("git add failed: \(BuilderWorktreeAllocator.detail(add)).") }
             let subject = "\(job.name) for \(job.id): " + String(job.brief.split(whereSeparator: \.isNewline).first?.prefix(72) ?? "")
-            let commit = await git(quiet + ["commit", "--quiet", "--no-verify", "-m", subject, "--trailer", trailer], folder)
+            let commit = await git(["commit", "--quiet", "--no-verify", "-m", subject, "--trailer", trailer], folder)
             guard commit.status == 0 else { return kept("committing what it left uncommitted failed: \(BuilderWorktreeAllocator.detail(commit)).") }
         } else {
             let own = await git(["rev-list", "--count", worktree.base + "..HEAD"], folder)
@@ -99,14 +98,14 @@ extension AgentJobs {
                 let carried = await git(["log", "-1", "--format=%(trailers:key=Assisted-by,valueonly)"], folder)
                 guard carried.status == 0 else { return kept("its last commit could not be read: \(BuilderWorktreeAllocator.detail(carried)).") }
                 if carried.trimmed.isEmpty {
-                    let amend = await git(quiet + ["commit", "--quiet", "--no-verify", "--amend", "--no-edit", "--trailer", trailer], folder)
+                    let amend = await git(["commit", "--quiet", "--no-verify", "--amend", "--no-edit", "--trailer", trailer], folder)
                     guard amend.status == 0 else { return kept("adding \(trailer) to its last commit failed: \(BuilderWorktreeAllocator.detail(amend)).") }
                 }
             }
         }
         let head = await git(["rev-parse", "--verify", "HEAD^{commit}"], folder)
         guard head.status == 0 else { return kept("its branch tip could not be read: \(BuilderWorktreeAllocator.detail(head)).") }
-        let names = await git(["diff", "--name-only", "-z", "--no-renames", worktree.base, head.trimmed], folder)
+        let names = await git(["diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=all", worktree.base, head.trimmed], folder)
         guard names.status == 0 else { return kept("its changed files could not be listed: \(BuilderWorktreeAllocator.detail(names)).") }
         var captured = worktree
         captured.head = head.trimmed
@@ -117,7 +116,8 @@ extension AgentJobs {
             try FileManager.default.createDirectory(at: patch.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
         } catch { return (captured, .init(path: patch.path, refusal: "the patch could not be written: \(error.localizedDescription)")) }
-        let diff = await git(["diff", "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
+        let diff = await git(["diff", "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all",
+                              "--src-prefix=a/", "--dst-prefix=b/",
                               "--output=" + patch.path, worktree.base, head.trimmed], folder)
         guard diff.status == 0 else {
             return (captured, .init(path: patch.path, refusal: "the patch could not be written: \(BuilderWorktreeAllocator.detail(diff))"))

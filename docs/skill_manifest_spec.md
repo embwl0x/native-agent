@@ -61,7 +61,8 @@ the turn ([turn anatomy §6](ANATOMY_OF_A_TURN.md)). Reach: `turn.persona()`,
 `turn` may also define `weigh(h, felt)`: what a happening nobody asked about (`world`) or a care of the agent's moving (`self`) is worth, in
 thoughts (one ignites a thought). The stem runs it on CPU outside any turn, through the same source-bound helper turns lease, with no reach
 (`TurnWeigh`, `ChatTurnRuntime/TurnPart.swift`; the prelude's `run` dispatches `{weigh}`). `h` is the happening (`kind`, `subject`, `door`, `who`,
-`words`, `once`, and for `self` `care`, `moved`, `open`). `felt` is `touch` (the nearest live care: `care`, `id`, `standout`, `bar`, `charge`,
+`words`, `once`, optional `watch` for watch news, and for `self` `care`, `moved`, `open`). `felt` is `touch` (the nearest live care:
+`care`, `id`, `standout`, `bar`, `charge`,
 `depth`, `seed`; `{unavailable}` when nothing can judge; null when no care is live), `yield: {hits, tries}` (thoughts on that node through that
 door within the record's horizon), `presence`, `quiet`, `busy: {open, idleMinutes}`, `mode`, `affect: {arousal, taskPressure, warmth}`, `body:
 {fatigue, curiosity, vigilance, novelty}` or null, and `notebook`. A `night` line from `sense:night` also carries `rest: {awayMinutes, activeShare, hoursSinceNight}`;
@@ -70,14 +71,15 @@ Its `self` kind gathers on subject `hour`; `yield` reads that thought class thro
 The seed gives it worth `2 * curiosity * min(1, (yield.hits + 1) / (yield.tries + 1))`, or zero without curiosity.
 Its ordinary thought carries `attended.hour`, the offered material, alongside its happenings and readings.
 [Subconscious: Attention](SUBCONSCIOUS.md#attention) owns the night policy. It returns a number, or an object whose `worth` is that number and whose other
-fields are recorded beside it in the `attention.weigh` detail. A watch's news (door `sense:<watch>`) lands
-at least one, whatever `weigh` returns, so it always opens its own thought. A program without `weigh` is never upgraded by launch: what it would weigh waits
+fields are recorded beside it in the `attention.weigh` detail. A watch's news (door `sense:<senseID>`) lands
+at least one only for the first weighed news per `watch` on its subject; later news lands what `weigh` returns. News without `watch` keeps the floor.
+An authored program without `weigh` is never upgraded by launch: what it would weigh waits
 unweighed and one `body` happening per program digest tells the agent of the organ to grow, showing the seed's. A `weigh` that throws or returns
 no finite worth leaves the same wait and says so once per program; a helper that cannot run it leaves the wait and logs it. What waited is weighed
 after every thought settles, when admission opens and on waking.
 
 The seed returns zero worth for a judged touch with `standout < bar`; at or above the bar it keeps the charge, yield and felt-state weighting.
-Below-bar happenings remain on the record. The installed turn program changes only by the agent's own hand; a seed change does not replace it.
+Below-bar happenings remain on the record. An authored turn changes only by the agent's own hand; an untouched sealed turn follows the bundle at launch.
 
 The turn program is the one shipped id the agent revises: `ability.save {id:"turn", code | edits, why}` (`Parts+TurnProgram.swift`) under the
 save law, kept and on in one act under Full Mac for the agent's own work and the owner's otherwise, the replaced version kept as `turn.prev.js` for
@@ -116,37 +118,61 @@ settlement remain authoritative.
 
 The turn log keeps events, reach answers, started-effect identities and streamed text for identity-matched resume/replay. Payload hashing supplies identity only for effects without an explicit identity; starts do not store a separate digest. Current selection reads `turn.js`; only a missing current slot installs the shipped seed, and that write must succeed before it runs. An unreadable or wrong-kind current slot ends with its storage cause and repair, without consulting another version.
 
-Every non-Stop failure of the selected turn program or its helper invokes the one exception in [NORTHSTAR clause 2](NORTHSTAR.md#clause-2--no-theater-alive-means-real), including JavaScript exceptions, invalid answers, timeout, startup, resource and transport failures. Recovery consults the previous slot, or selects the shipped seed if no unfailed previous source exists, and replays the same identity-matched log. Each source is attempted once per turn; a helper failure while running the seed admits one extra fresh lease (`freshHelper:true`), through the same checked current-slot admission. A consulted unreadable previous slot or failed recovery write ends with its storage cause; an uncommitted replacement never runs. A concurrent checked current write is adopted without swapping it unless already failed this turn. `turn.part.unavailable` preserves the original helper cause; `turn.part.recovered` names `program` (`previous`, `seed`, or a concurrent `current`) and `sourceDigest`, and `turn.part.helper` proves the selected source ran. The repair arrival tells their which program replaced the failure or which helper lease was renewed. Stop remains cancellation. If every available source fails, recovery ends plainly rather than retrying forever; provider failures keep their own turn path.
+Every non-Stop failure of the selected turn program or its helper invokes the one exception in
+[NORTHSTAR clause 2](NORTHSTAR.md#clause-2--no-theater-alive-means-real), including JavaScript exceptions,
+invalid answers, timeout, startup, resource and transport failures. A helper failure admits one extra fresh lease per source per turn
+(`freshHelper:true`), through checked current-slot admission, without marking the source failed or closing its trial.
+A repeated helper failure or program failure consults the previous slot, or selects the shipped seed if no unfailed previous source exists,
+and replays the same identity-matched log. Each source is otherwise attempted once per turn.
+A consulted unreadable previous slot or failed recovery write ends with its storage cause; an uncommitted replacement never runs.
+A concurrent checked current write is adopted without swapping it unless already failed this turn.
+`turn.part.unavailable` preserves the original helper cause; `turn.part.recovered` names `program` (`previous`, `seed`, or a concurrent `current`)
+and `sourceDigest`, and `turn.part.helper` proves the selected source ran. A trial set aside after repeated helper failure names the helper
+as the cause. The repair arrival tells their which program replaced the failure or which helper lease was renewed. Stop remains cancellation.
+If every available source fails, recovery ends plainly rather than retrying forever; provider failures keep their own turn path.
 
 | Property | Stored form and meaning |
 |---|---|
 | **code** | The file body, outside the JSON comment; JavaScript or retained Markdown guidance. |
-| **reach** | `{capabilities: string[], readPaths: string[], hosts: string[], apps: string[]}`, all arrays default empty. Ordinary abilities consume `capabilities`, including `app_read:<id>`/`app_write:<id>` for app targets; with `computer_files`, `readPaths` bounds an ability's `host.files.query` and `host.files.mime` (a `*` is one path component; a directory covers what is beneath it); `hosts` and `apps` constrain senses only. Retained historical headers and sense reach load into this shape; ability saves take `reach`. Declarations do not grant authority. |
+| **reach** | `{capabilities: string[], readPaths: string[], hosts: string[], apps: string[]}`, all arrays default empty. Ordinary abilities consume `capabilities`, including `app_read:<id>`/`app_write:<id>` for app targets; with `computer_files`, `readPaths` bounds an ability's `host.files.query`, `host.files.mime` and `host.files.names` (a `*` is one path component; a directory covers what is beneath it); `hosts` and `apps` constrain senses only. Retained historical headers and sense reach load into this shape; ability saves take `reach`. Declarations do not grant authority. |
 | **wake** | String array, default `[]` (called only). [Wake signals](#wake-signals) defines names, payloads and delivery. |
 | **face** | `{page?: string, action?: string, projection?: bool}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed door id, never beside `answers`. Unknown pages refuse at save. `projection:true` declares `face(input)`; its typed sections/rows are computed from frozen native sources outside view rendering and published through `LatestRead` (contract below). A projection part that defines no `run(input)` is a page, never a call (below). |
 | **answers** | Door verbs the part answers, by action id: `{description, class, args, irreversible?, screen?, summary?}` each, absent when none. `class` is `read`, `write`, `send` or `destructive`; `args` is the verb's JSON Schema (no argument named `verb`). The door registers each verb on `face.page` with that contract and judges it by its class, its Mac integration switch taken from the part's `app_read:`/`app_write:` reach; a verb a native declaration still holds stays native, and a verb two active parts answer is the first by id. `run(input)` receives `{verb, ...args}`; the part's input schema is derived from the verbs and takes no `params`. A `read` verb runs read-confined: read-only app events, read actions and read primitives only. A class other than the four refuses at admission. A verb a shipped seed answers keeps that seed's class and irreversibility as its floor: a revision may raise them, never lower them; and every revision's keep passes the one keep gate (the person's card below Full Mac, the agent's own keep under Full Mac). |
 | **state** | Abilities use `host.state.get()` → saved JSON (initially `null`) and `host.state.set(value)` → `null`. One durable notebook owner, shared with senses' keyed `state.get/set`, stores it by ability id at `senses/<id>/state.json` under key `part`; it survives helper restarts and app relaunch, and `ability.drop` deletes it with the ability. Values are limited to 16 KiB and the notebook to 64 KiB. Validation and preview use a scratch notebook. Resume replays journaled state results without repeating their operations, then reads and writes durable state normally. State calls do not renew stalled execution. `abilities/state.json` remains lifecycle/run accounting only; there is no authored header `state` key. |
-| **learned** | Optional arbitrary JSON, preserved verbatim; a declared value teaches nothing, and a declared `trial` is refused at save. The stem projects `learned.use`, `learned.versions`, `learned.trial` and `learned.trials` (below). A part's prediction (`applies`, `after`, `record`) is the stem's, never declared: see [Expansion](#expansion-a-part-is-a-prediction). |
+| **learned** | Optional arbitrary JSON, preserved verbatim; a declared value teaches nothing, and a declared `trial` is refused at save. The stem projects `learned.use`, `learned.versions`, `learned.trial` and `learned.trials` (below). The former door-prediction layer is [retired](#expansion-a-part-is-a-prediction). |
 
 `id` and integer `version` identify the part and version.
 
 ### Wake signals
 
+The part wake index reads the catalog once at the mind's start, after registering
+`AbilityStore.didChange`, and rereads only on that notification. Delivered signals,
+queued runs and Desk changes use the held index; Desk changes update their file
+watches separately. An equal index causes no repair settlement; each successful
+catalog read reconciles file watches, rearming ended subscriptions while leaving
+active subscriptions in place.
+A successful changed index settles `parts.index` repair debt: its catalog reads
+and the index is rebuilt. An unreadable catalog leaves the index
+unavailable until an ability-change notification supplies a successful read.
+Each index read logs `[wake] reindexing part wakes` in category `EngineRuntime`.
+
 Accepted: `schedule:<cron>`, `app.installed`, `file.changed:<path>`, `turn.ended`, `message.arrived:slack`, `message.arrived:telegram`, `held`, `resumed`, `person.away`, `person.here`, `network.down`, `network.up`, `chrome.tab_taken`; suffixes are nonempty. Existing files naming another transport still read; new versions must use this set.
 While on and Autonomy allows unattended work, an ability runs as `authored.<id>`, a sense receives an event in its resident slot. Signals bypass params checks, supplying only `input.wake={signal,at,...payload}`:
 
 - `schedule:<cron>`: one time on the one clock per part and schedule (`part:<id>:<cron>`, five-field cron), declared from part headers and
-  withdrawn when the wake is removed (`EngineScheduledWork.declarePartTimes`); each occurrence posts the signal to that part, coalescing like any
+  withdrawn when the wake is removed (`EngineScheduledWork.declarePartTimes`). Schedule registration observes `AbilityStore.didChange` before the
+  first catalog read and reconciles queued changes after that first declaration. Each occurrence posts the signal to that part, coalescing like any
   identical pending signal.
-- `app.installed`: `bundle_id,name,version,path,scriptable`, as data. Once per newly seen bundle/version after the baseline, after Info.plist and its declared scripting dictionary land.
+- `app.installed`: `bundle_id,name,version,path,scriptable`, as data. Once per newly seen bundle/version after the baseline,
+  after Info.plist and its declared scripting dictionary land. The running app's own bundle id produces no signal or happening.
 - `file.changed:`: the signal keeps the declared watched path, including a folder
   (never a child-path signal). `changed:[{path,change}]` names added, edited
   (identity changed) and removed members, recursively within the senses' bounded
   directory manifest. `path` names the changed member when exactly one changed,
   otherwise the watched folder. Directory size/mtime churn alone is not an edit;
   directory additions, removals and replacements are news. A single watched file
-  uses the same change records and keeps its own `path`. Each arrival retains up
-  to 50 records, sorted by path; `changed_more:N` counts records beyond that cap
+  uses the same change records and keeps its own `path`. A healthy watch suppresses sibling activity with unchanged file identity.
+  Each arrival retains up to 50 records, sorted by path; `changed_more:N` counts records beyond that cap
   and is absent when none were omitted. Arrivals for the same watched path and
   provenance coalesce into one waiting wake per part, merging their change lists
   under the same cap and adding omitted counts. Successive changes to a member
@@ -223,7 +249,10 @@ and packet-owned submit calls to that exact receiver with no arguments. The Mac
 mounts it only after capture exclusion is acknowledged; secret bytes stay in its
 transient host and travel through a typed credential act, never ordinary form
 arguments, drafts, records or feedback. The body validates the current form and
-writes its Keychain owner without granting destinations. It supplies only presence
+writes its Keychain owner without granting destinations. For an existing name with
+granted hosts or programs, a changed value refuses with `secret_has_destinations`;
+replace it on its key card (`card.request` with `replace: true`). An unchanged value
+does not write. Existing names without destinations remain writable. It supplies only presence
 (`secretSet`) and the exact owner namespace (`secretPage`); authored faces cannot
 supply either. Page prose says set, not set, or status not read. The phone says this
 opens on the Mac; installed older phones retain the section's update note. Ordinary
@@ -242,9 +271,18 @@ keeps the original operation identity and never resubmits it. A failed read keep
 that hold; successful owner evidence or approval execution/decline settles the
 same operation through the shared session. Consent alone proves no execution.
 Cancel awaits the owner's actual settlement.
-A native leaf is `{kind:"leaf",key,leaf,ref,alt,revision?}`: the owner resolves its resource;
+A native leaf is `{kind:"leaf",key,leaf,ref,alt,revision?,cards?,choices?}`: the owner resolves its resource;
 `alt` is its text representation. A missing grant or unsupported leaf shows its words,
 and never opens another resource. Graph is a leaf; its surrounding list and detail remain faces.
+For the Desk's standing board (`leaf:"board", ref:"table"`), `cards` carries
+live facts keyed by element id alongside the stored document: rendered author
+names, item title, number, state, waits and closure, or piece title, kind and
+newest version. These facts are read joins and never become board fields.
+The same table block may carry `choices`, at most 200 `{id,label,detail,item|piece}`
+objects with unique nonempty ids, nonempty labels, string details and exactly one
+nonempty reference. Open Desk items carry stable handles and visible Desk numbers;
+ready pieces on open items carry `make:<ref>` addresses and their kind. The native
+card picker searches the supplied titles and details without reading stores.
 A graphic on any page is one of three: a count is a row's `value`; progress is a row's `meter`; a chart or
 picture is a piece: make it (an SVG, or HTML and CSS with no script, since previews run no script; a picture
 file), `make.add` it, then lay it as `{kind:"leaf",key:"piece:<any id>",leaf:"web"|"image",ref:<make.add's ref>,
@@ -261,6 +299,9 @@ That demand projection supplies the requested document's text;
 its long body goes to the document reader, never into the retained page or `faces.json`.
 An inline document's text is also readable by its key. Page text names its opening words,
 known byte length or its owed read, the read call and its `page:<page>/<key>` link.
+Native dream entries and graph summaries apply the app secret redactor at their
+document-read boundary. Their inline text and block revision use the same redacted
+string; opening the full document does not expose its unredacted source.
 Unknown kinds draw the update note. Encoding a block section supplies exactly one note row,
 "Update NativeAgent on this iPhone to see this." Installed phones ignore the new block field
 and draw that row; current doors draw the block. Native value copies retain the block.
@@ -370,8 +411,9 @@ its door's page read prints each call. One Trust law judges both (`PermissionLaw
 row the stem composed (a lever, a key lever, a page the stem registered) is the person's own
 decision of that exact call (`PersonAct`), admitted once per run; a row the agent drew on a page
 of its own is the agent's call, so the tap only asks. A lever's verb (`owner: .person(why, asks:)`)
-is never the agent's at any posture: its call raises the person's card, or is refused where no
-card can carry it; a change that widens the agent's own reach is a lever the same way, and
+follows the Trust law: under Full Mac a lever a card can carry is theirs, unless an untrusted voice steers the turn.
+Their ordinary class and reach apply, so destructive acts still ask. Below Full Mac its call raises the person's card;
+Safe refuses. A lever no card can carry stays the person's. A change that widens the agent's own reach is a lever the same way, and
 lowering it stays the agent's. The person's own ask is their act too: in a turn the person started
 at a door that is theirs (`Turn.personsAsk`: their own message, one that joined it while it ran, or
 the one a card's continuation carries on; never a turn a helper, an untrusted agent or the mind's
@@ -380,18 +422,18 @@ them) the agent calls runs as their decision of that exact call (`PersonAct.By.w
 like a card's Approve, with no card and no word matching; a card still waiting for that call is
 settled as decided by their ask, and the consent record and the call's receipt carry their message.
 Safe allows no ask, so no person's ask either; a lever no card can carry stays the person's own act. A lever can name the arguments under which its call only lowers
-(`freely:`): with exactly those arguments the call is the agent's own, and with any other, or with
-them missing, it stays the person's. `sense.switch` is the first: `value: false` turns a sense off
-as the agent's own act; turning one on is the person's consent. An owner of the stem's that needs the person's yes for an exact
+(`freely:`): with exactly those arguments the call is the agent's own at any posture; other or missing arguments retain the lever gate.
+`sense.switch` is the first: `value: false` turns a sense off as the agent's own act; turning one on follows lever ownership.
+An owner of the stem's that needs the person's yes for an exact
 call replies `needs_person`, and the gate puts that call on the person's card; Approve replays it
 as the person's act. The door answers the agent's call of a lever a card can carry the same way, so
-that call is the person's card, unless their own turn's ask decides it, and never a bare refusal; a lever no card can carry is
+an unowned call is the person's card, unless their own turn's ask decides it, and never a bare refusal; a lever no card can carry is
 refused with where the person does it. A list (`app {actions:[…]}`) whose every change is such an
 ask, two or more of them, is one ask: nothing runs, the door replies `needs_person` for the list,
 and the gate puts the list on one card; Approve replays it as the person's decision of each of its
 calls, each admitted once (`PermissionLaw.decidedCalls`), and Decline leaves everything as it was.
-In the person's own turn such a list is theirs whole and runs on their ask; in any other turn it is
-the one card.
+In an owning Full Mac turn the list runs each call through its ordinary gate; otherwise, in the person's own turn such a list
+is theirs whole and runs on their ask, and in any other turn it is the one card.
 A setting's own check reads the decided change itself (`PermissionLaw.personDecided(setting:)`),
 whatever `because` rode beside it.
 
@@ -449,7 +491,14 @@ being a short lowercase id no app page, alias, room or tab uses: its packet is i
 (`host.state`, an object holding its `keys`), read again whenever the part writes it, and
 `layout.write` places it as `page:<id>` on `rail` or `more`. A `face.page` that names an
 app page (with or without projection) is where the part is placed, never a page of its own. Cached Codable `PartFaceSnapshot`s publish
-through `LatestRead`. The Mac draws their page-keyed face-feed slots; the phone
+through `LatestRead`. The Mac holds page-keyed face-feed delivery with its existing
+observe/release pair: mounting first holds delivery before registration, availability
+or snapshot checks, even without a snapshot. Attachment sends any current snapshot;
+owner changes arrive while held. Only unmount or renderer closure releases the reader.
+Final release removes that slot. Captures hold and release their own readers. The Mac
+window's tab/sidebar labels hold only derived `pageTitle` slots, and headers hold
+the page slots they read independently of the selected content tab. Failed first
+readings retain delivery for their failure, native levers and later recovery. The phone
 decodes the same snapshot shape from `faces.json`. Presentation copy and Make
 titles have distinct copy-key and file/revision slots. Agent page text reads the
 engine owner's admitted result without waiting for a display frame. The catalog
@@ -523,6 +572,10 @@ One resident broker holds programs, connections and listeners until closed, off,
 Sense retention uses `SenseRecord.mode`, not `resident`; `sense.make` creates `.onCall` senses.
 
 ### Expansion: a part is a prediction
+
+**Retired 11-15.** This section records the removed practice/prediction layer, not a current contract. No runtime reads or writes `expansion/record.json`, predicts calls, pre-runs reads or prepares acts. Existing bytes stay untouched. Dispatch closure alone moved to `TurnDispatchClosure.withTurn`, with its deferred settlement timing preserved.
+
+<details><summary>Historical Expansion contract (removed)</summary>
 
 Exact call matching and template grouping retain container type, presence and
 empty objects/arrays. `JSONValue` owns leaf traversal and pointer operations;
@@ -644,6 +697,8 @@ stopped turn, or past the provider's inline ceiling (`ProviderToolResultPage`).
 Every delivery passes the whole gate chain as the mind's own call would and
 grants nothing that call would not have.
 
+</details>
+
 ### Secret insertion and redaction
 
 Reach capability names are `app_data_read`, `app_data_write`,
@@ -655,9 +710,17 @@ capability; page membership never expands reach. `computer_files` and
 and write reach adds `files.write/move/copy/trash/patch`. Photos actions are
 not file reach. The save receipt prints the resulting `actions` (including
 code calls and explicit dynamic dependencies).
+`network_public` excludes loopback, unspecified, private, link-local and shared
+addresses, including IPv4-mapped IPv6 forms. Non-loopback addresses in these
+ranges require full `network` reach for network primitives. A public fetch
+refuses any such resolved address even with full `network` reach.
+`network.connect {path}` requires `network` and an exact socket entry in `reach.readPaths`, resolved through symlinks and `~`.
+This includes credential-bearing SSH-agent and Docker sockets. NativeAgent's data root sockets are refused even when declared.
+Loopback reach alone does not admit Unix sockets.
 `model`, `calendar`, `reminders` and `contacts` are reach for the host
 primitives (`host.model.call`, the PIM door aliases), and `network_public` is
-`host.fetch`'s (`network_localhost` for a loopback host; `connector:<id>` still reads, granting nothing; a fetch naming
+`host.fetch`'s (literal fetches without either network reach refuse save;
+`network_localhost` for a loopback host; `connector:<id>` still reads, granting nothing; a fetch naming
 a connector refuses. A fetch waits for its transport result/error or explicit
 cancellation. NativeAgent adds no response or transport timeout and never resends
 a request after credential rejection. Its admitted transport retains settlement,
@@ -740,19 +803,24 @@ its `scope:"current_version"` names the scope of `run_totals` and
 reads the selected file identity's `runs.versions` count. A version with no
 record has zero observed runs; unavailable accounting fails the read rather
 than inventing zero. The list's ambiguous `runs` field is removed.
-Successful runner receipts with explicitly empty `calls`, `effects:none` and
-`notebook_changed:false` write no run accounting: a computation that called
-nothing and changed nothing must not wake readers through `abilities/state.json`.
+Every terminal runner receipt writes run accounting, including a successful
+computation with empty `calls`, `effects:none` and `notebook_changed:false`.
+Its version's count, outcome and `first_seen` are evidence for the night reading.
 The notebook owner compares before writing and emits no change for an identical
 value; its committed-write callback supplies `notebook_changed`, including state
-writes outside the call ledger. Missing evidence never proves a no-op; failures,
-unknown effects, actual calls and changed notebooks retain their accounting.
+writes outside the call ledger.
+Every settled run of a retained version writes run accounting, including a
+successful computation with empty `calls`, `effects:none` and `notebook_changed:false`.
+The notebook owner compares before writing and emits no change for an identical
+value; its committed-write callback supplies `notebook_changed`, including state
+writes outside the call ledger. A computation's accounting does not rewrite its notebook.
 Run accounting retains the terminal refusal's `reason`, `reasons`, `gate_reason`,
 `detail`, `message`, `checker` and `remedy` in `lastRun`, beside status, effects,
 version, calls (metadata only, under the [receipts law](ONE_DOOR.md#authority-and-receipts); a run
 accounted before it is reduced when read) and terminal error/stop evidence. `at` is the start of that run or
 refused attempt, not its accounting-write time; an older settlement cannot replace
-a newer `lastRun`. A successful explicit no-op leaves the retained run untouched.
+a newer `lastRun`.
+a newer `lastRun`. A successful computation updates its retained run like any other completed run.
 A failed notebook operation makes `notebook_changed` null even if its code
 catches the error: a durable write may have renamed the file before failing.
 Run call labels and input previews are redacted before accounting is saved;
@@ -766,6 +834,8 @@ current version's), `surprise` (kinds the stem attributes after a run:
 `corrected`, `slog`), `hours` (UTC hour → runs by the same outcome classes as
 its totals, pruned at 28 days) and `first_seen` (the earliest time the record
 saw it run). Failed is a version's `error + cut`, read, never stored.
+Every settled turn records its turn program's body digest through this same run accounting: completed is `ok`, failed/interrupted is `error`,
+stopped is `cut` (`status: stopped`, `reason: cancelled`), and waiting is `refused`. Its version gets `first_seen`; part-round counting is unchanged.
 `learned.versions` shows the current and previous versions with uses, ok,
 surprise and rounds.
 Each execution's terminal accounting supplies its exact part id and full version key to the turn's round owner, including answered verbs and
@@ -841,14 +911,17 @@ fades nothing.
 
 Their own abilities are in front of their each turn: the turn glance lists callable
 abilities one line each (their own action, `authored.<id>` unless a face names
-it), by find's ranking against the message. Unranked rows
+it), by find's ranking against the message. Parts carrying the store's seed seal
+stay reachable through `find` and `ability.list` and occupy no glance rows or
+autonomous count; their edited parts have no seed seal and remain in the glance. Unranked rows
 put failures first, then the most recently used, then the existing action order.
 An empty message has no ranking; it shows failed and recent abilities first.
 Each description ends at a word boundary within 100 characters, including a
 truncation ellipsis. Explicit zero/one use counts appear only as "never used" or
 "used once"; a missing use counter adds no count label.
 A recorded non-ok last run, classified by `AbilityStore.runOutcome`, is marked
-"failed last run <h:mm a>: <reason>" (at most eight words of reason) only while
+"cancelled last run <h:mm a>: <reason>" for a cut whose recorded reason is
+`cancelled`, otherwise "failed last run <h:mm a>: <reason>" (at most eight words of reason), only while
 its `lastRunVersion` matches the current file's accounting identity. Missing run
 evidence adds no failure; a known failure without a timestamp says "time unknown".
 The census computes `call_fit` on demand; it is not a stored stale verdict, and
@@ -878,7 +951,7 @@ are never memoized. Redaction keys on that state identity rather than serialized
 accounting bytes. Immutable bundled sense defaults are read once per resource
 root; pure tool-name prose folding, ranking's word sets and action-index text
 hashes are reused per exact input text under a lock with a 4096-entry bound. No watcher, notification, timer, background refresh or
-wait decides freshness. `FileSenseRegistry.withStore` keeps its existing logic.
+wait decides freshness. Pure sense queries select helpers from the catalog they read; mutation closures reread committed state.
 
 A skill is built-in guidance from the persona (`skills/bodies/<id>.md`): it is
 found and read through `ability.read` and never runs. An ability with the same
@@ -905,9 +978,9 @@ claiming it, in either spelling.
 
 | Action | Contract |
 |---|---|
-| `ability.save` | `{id, description?, code?, edits?, params?, actions?, fixtures?, name?, triggers?, converts?, create_only?, reach?, wake?, face?, resident?, learned?, choices?, trial?, set_aside?, why?}`. `trial:true` with why makes a revision a trial; `set_aside:true` saves the kept self forward (trials: see `learned.use`). Creates or revises: a new ability needs description and code; a revision inherits everything it does not restate from its latest version; an explicit empty value drops one. Send code or edits, never both. `params` is the description/type map (a leading type word, optionally after `optional`, sets the type; otherwise string; words end at whitespace, commas, colons or parentheses; `?` on the type or the word `optional` marks it optional), `{type, description?}`, or a JSON Schema object (`readOnly:true` declares a read contract); `params` is its sole input-contract argument. Direct app dot/bracket members and reach derive dependencies; `actions` declares indirect calls (literal or computed). Literal calls and declarations are checked before staging; unknown actions and missing dependencies refuse save, while computed names produce warnings and keep runtime checks. Under Full Mac their own save is kept and on in this one act (sealed as kept: its first real run is its proof), with a decided Inbox row; below Full Mac, or when an untrusted agent started the turn, it is a draft. A revision inheriting older `compiled` provenance remains staged until its exact version replays ([compiled from practice](#compiled-from-practice)); no new nightly compiled candidates are produced. A revision may name an existing ability by id or name. New ids are normalized by trimming whitespace, lowercasing, replacing runs outside `a-z`, digits, `-` and `_` with `-`, and trimming edge hyphens; the result must be 2–64 characters, a letter first (`^[a-z][a-z0-9_-]{1,63}$`). |
-| `ability.validate` | A read: `effect:none`, `read_only:true`; a reached rehearsal reports `execution:rehearsed` and `effects:none`. Rehearses its waiting version with the shared helper and intercepted replies, on fixtures or one captured run with `input`. A version compiled from practice replays its tape instead (`candidateValidation` `replayed`). Proves no live behavior; never keeps. |
-| `ability.enable`, `ability.restore` | Keeps its waiting version, or turns it back on: theirs under Full Mac for their own work (sealed as kept when never rehearsed); otherwise, once rehearsed, the owner's card for this exact version (code, fixtures and dependency shapes), approvable on the Mac and the phone, or Keep on the Tools page. Code requires `version` equal to its full digest, captured with the displayed code when the card or row was staged and saved with it; self-improvement cards and approval replay carry that same saved digest. A caller without the exact review offers a read rather than executable approval. A version compiled from practice is kept by no one until its tape replayed (`not_replayed`). Omitting `version` restores only disabled Markdown guidance with no candidate or code fingerprint, checked and written under the ability-store lock. |
+| `ability.save` | `{id, description?, code?, edits?, params?, actions?, fixtures?, name?, triggers?, converts?, create_only?, reach?, wake?, face?, resident?, learned?, choices?, trial?, set_aside?, why?}`. `trial:true` with why makes a revision a trial; `set_aside:true` saves the kept self forward (trials: see `learned.use`). Creates or revises: a new ability needs description and code; a revision inherits everything it does not restate from its latest version; an explicit empty value drops one. Send code or edits, never both. `params` is the description/type map (a leading type word, optionally after `optional`, sets the type; otherwise string; words end at whitespace, commas, colons or parentheses; `?` on the type or the word `optional` marks it optional), `{type, description?}`, or a JSON Schema object (`readOnly:true` declares a read contract); `params` is its sole input-contract argument. Direct app dot/bracket members and reach derive dependencies; `actions` declares indirect calls (literal or computed). Literal calls and declarations are checked before staging; unknown actions and missing dependencies refuse save, while computed names produce warnings and keep runtime checks. Under Full Mac their own save is kept and on in this one act (sealed as kept: its first real run is its proof), with a decided Inbox row; below Full Mac, or when an untrusted agent started the turn, it is a draft. A revision inheriting tape fixtures remains staged until its exact version replays ([tape fixtures](#tape-fixtures)). A revision may name an existing ability by id or name. New ids are normalized by trimming whitespace, lowercasing, replacing runs outside `a-z`, digits, `-` and `_` with `-`, and trimming edge hyphens; the result must be 2–64 characters, a letter first (`^[a-z][a-z0-9_-]{1,63}$`). |
+| `ability.validate` | A read: `effect:none`, `read_only:true`; a reached rehearsal reports `execution:rehearsed` and `effects:none`. Rehearses its waiting version with the shared helper and intercepted replies, on fixtures or one captured run with `input`. A version with tape fixtures replays its recorded calls instead (`candidateValidation` `replayed`). Proves no live behavior; never keeps. |
+| `ability.enable`, `ability.restore` | Keeps its waiting version, or turns it back on: theirs under Full Mac for their own work (sealed as kept when never rehearsed); otherwise, once rehearsed, the owner's card for this exact version (code, fixtures and dependency shapes), approvable on the Mac and the phone, or Keep on the Tools page. Code requires `version` equal to its full digest, captured with the displayed code when the card or row was staged and saved with it; self-improvement cards and approval replay carry that same saved digest. A caller without the exact review offers a read rather than executable approval. A version with tape fixtures is kept by no one until its tape replayed (`not_replayed`). Omitting `version` restores only disabled Markdown guidance with no candidate or code fingerprint, checked and written under the ability-store lock. |
 | `authored.<id>` | Its one run, with input by its params, under one signed admission re-verified on every run. `preview:true` runs its code with every write previewed and says where it would card or hand back. |
 | `ability.resume` | A stopped run_id and bounded answer; optional `id` binds it to that ability, with a mismatch claiming nothing. A rename claims the checkpoint; its bytes are read and verified once. Read/admission failures preserve the claimed evidence; pre-run refusals and busy admission release the original bytes. Completed or deliberately closed runs consume the checkpoint at settlement; cleanup failures stay in `settlement_failures` with cause and remedy. Rechecks selection, host revision and admission and replays prior reads. A woken run resumes with the `input.wake` it stopped on. `preview:true` only reads the checkpoint: it reports the question, input, wake and stopped call, without claiming the run, transferring holds or closing its queued step. |
 | `ability.read` | Every stored kind, including turn and sense: kind, version, declarations, status, retained versions, `run_counts` (all_versions, current_version), evidence and code in pages (`offset`), or one `step`; ordinary abilities also expose waiting/last-clean and converted versions. |
@@ -953,8 +1026,10 @@ indirect actions use `host.call(actionID,args)` or `app.call(actionID,args)`. Li
 dependency derivation as dotted app members. Literal actions in callable requests
 derive dependencies the same way. `app({actions:[…]})` runs in order and returns an
 array of answers, stopping at the first throw; each entry is read as a lone request is
-(an action, `{page, item}` or `{find}`), and action entries keep the batch's options. `app({find:"words"})`
-is `app.find("words")`; `app({action:"find",args:{what:"words"}})` (or `query`)
+(an action, `{page, item}` or `{find}`). Beside `actions`, a script accepts only `preview`, `expected_version` and `because`.
+Other keys raise `AppError` with reason `invalid_actions` before the first entry runs. Saving a literal batch names the same extra keys.
+Action entries inherit the batch's options. An entry can supply its own version or quoted request, and preview on either protects the entry.
+`app({find:"words"})` is `app.find("words")`. `app({action:"find",args:{what:"words"}})` (or `query`)
 reaches that same discovery reader as a registered read action. Item/page
 requests go through `app.read(page,item)`.
 Every action form uses the same invocation, allowlist, declaration and error gates.
@@ -1101,8 +1176,8 @@ failed read or write. A resumed result retains completed effects when queue
 settlement still needs repair.
 
 The admitted entry assembles the native morning brief's checked packet for
-`operation:"brief"` on direct calls and scheduler calls alike. The scheduler
-owns consent, occurrence claims and publication, without a second packet builder.
+`operation:"brief"`, directly or bound to their own queue step. The part returns
+a proposed card; it has no brief clock, defaults seed or trigger config.
 All ability JavaScript exceptions retain their located ability/version message
 in the presented `detail`, their original cause and engine line/source when
 available, and a read/repair call. Missing location evidence is explicit;
@@ -1120,6 +1195,9 @@ function run(input) {
 `app.read`, `find`, `log`, `expect`, `expect_fail`, `decide` and `step` are built in. At most 50 dependencies. Define `function run(input)` or `async function run(input)`, use host/app calls and return JSON.
 A part that is not done returns `{again: <input>, ...what it has so far}`: the stem runs it again on that input through the same admission and gates (each run its own run on its record), until it answers without `again`, a run fails or is refused, Stop, a message arrives in the calling conversation, its runs' ledger reaches 4 MiB, or a run repeats the one before in input and answer; it goes on only inside a conversation turn in flight that the person can Stop. Its one call answers with the last answer and `runs`, its `effects`, `calls` and `changed` covering every run (a later run that cannot start, its input or admission refused, answers as that run's refusal beside what the runs before it did, which is never replayed); handed back early, `again` stays and `handed_back` says why. The combined effect summary preserves `unknown` before `partial` before `occurred`, so a later uncertain run cannot be hidden by an earlier confirmed effect. A call-ledger encoding failure ends carrying with `call_ledger_encoding_failed`, unknown effects and a reconciliation instruction; its completed run has already settled, and no next run starts. It never counts an unreadable ledger as zero bytes. Previews, rehearsal and resume never go on.
 An intentional decline returns `status:"refused"`, a stable `reason`, plain `detail`, receipt-backed `effects` and `remedy`: the fix with an executable `next_call` or person-owned `tap`. A terminal remedy explains why no further call applies. A lawful refusal is an answer; a source fault owes repair (`AbilityStore.runOutcome`).
+Run accounting classifies a runner-marked JavaScript exception as `error` before
+reading its authored `reason`; a thrown `reason:"network"` or `reason:"cancelled"`
+cannot turn that source fault into a network stop or a cut.
 When completed code returns that explicit refusal, the runner promotes its cause,
 checker and remedy to the run receipt before accounting. It counts as refused even
 if it made no calls or notebook changes; `lastRun` and Home retain that refusal.
@@ -1129,7 +1207,11 @@ Authored admission carries the run body through that same chain, including its
 consent audit; it has no separate Security Center evaluation path. A selected
 version is rechecked after admission before its body starts. Refusals before
 runner entry, wake admission and offered-call admission use the ordinary dispatch
-completion writer too. Each retained version's run settles once; outer receipts
+completion writer too. A queued ability wake retains the unattended-work owner's
+refusal through that writer and emits `part.wake` without running its body.
+Only a checked off setting records `autonomy_off` with the enable-Autonomy remedy;
+an unreadable policy retains its read failure and policy-repair remedy instead.
+Held/resumed signals retain their existing hold. Each retained version's run settles once; outer receipts
 carry the runner's `ability_run:{id,version,at}` provenance instead of counting it
 again. This metadata leaves a verb's returned business fields intact and is excluded
 from repeat-answer identity.
@@ -1184,7 +1266,7 @@ claim that the ability is admitted, healthy or has run successfully.
 
 Omitting fixtures captures one bounded rehearsal with supplied input (default `{}`). Page/find/read-only action calls run live through ordinary gates; effects, authored runs and decisions return visible placeholders. Only `host.files.list`, `host.files.count`, `host.files.read` and `host.files.info` primitives read live, under declared reach/admission. Later rehearsals replay the sealed capture. Hand-written fixtures supply `input,calls:[{operation,args,options,result}],answers,expected`; `expected` is the complete returned JSON. Rehearsal never keeps code or proves live effects.
 
-### Compiled from practice
+### Tape fixtures
 
 The nightly compiler, its compile-only save context and tape recording are
 removed ([Habits H4](HABITS.md#h4--one-crystallizer)). The practice note inside
@@ -1192,12 +1274,11 @@ the turn is now the only crystallizer. Ordinary hand-written fixtures still supp
 input and expected, with optional calls and answers, within 16 cases in
 256 KiB; `fixtures:[]` explicitly clears inherited fixtures.
 
-Existing abilities can carry embedded tape fixtures
-`{input, calls:[{operation,args,options,result}], tape:true}` and
-stem-authored `compiled` provenance `{key, principal, examples}`.
-A revision inherits omitted fixtures, conversion sources, provenance and
-the recorded origin. Callers cannot supply tape. Every revision carrying
-`compiled` stays staged until its own exact version replays, including
+Abilities can carry embedded tape fixtures
+`{input, calls:[{operation,args,options,result}], tape:true}`.
+A revision inherits omitted fixtures, conversion sources and recorded origin.
+Callers cannot supply tape. Every revision carrying tape fixtures
+stays staged until its own exact version replays, including
 under Full Mac.
 
 `ability.validate` answers every app call, read, primitive and nested part
@@ -1209,18 +1290,16 @@ recorded calls, no other input or branch. A hand-written fixture carries no
 `tape`, and a candidate never mixes the two.
 
 The seal retains `tape` `{examples, calls, consumed, effects}`.
-`ability.read` still displays `compiled.lifecycle`: `staged`, `verified`,
-`admitted` or `off`; validation evidence is `tape_replay`. The examples'
-steer remains provenance, so keeping another agent's work still requires
+Validation evidence is `tape_replay`. Recorded origin remains provenance,
+so keeping an untrusted agent's work still requires
 the owner's card. Replay earns no live record. Gated live runs project
 execution counts and bounded call scopes in `learned.use`; they do not
-confer autonomous standing. The existing cost/confidence law governs
-Expansion's turn-start and follow-up predictions.
+confer autonomous standing.
 
 ## Execution and ownership
 
 Every ability receives frozen input and only declared action dependencies, with named or positional args. A named method call takes its argument
-object and at most one options object (`preview`, `expected_version`); a supplied nonobject or any surplus argument refuses before execution,
+object and at most one options object (`preview`, `expected_version`, `because`). A supplied nonobject or any surplus argument refuses before execution,
 both in static admission when known and at the live door. Host primitives (`host.model`, `host.fetch`, `host.network`, `host.program`, `host.apps`, `host.files`, `screen.*`, `hand.*`, `host.paths`) require declared reach at the broker.
 
 Apple Event parameters in `host.apps.call` and `sense.apps.read` use four-character
@@ -1245,25 +1324,48 @@ settle}`; an unconfirmed settle is `hold.state:"settle_failed"` with unknown
 effects. What to settle is the part's
 judgment: Music's play stops only if the current track is the one it started.
 
+Ability file reads require `computer_files` and declared `readPaths`. After resolving symlinks and checking that reach, they refuse
+`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.codex`, `~/Library/Keychains` and the data root's `tools/.manifest_signing_key`,
+`providers`, `codex_home` and `codex_child_home`. The agent's own file reads are not fenced this way: they reads what the person can.
+The fence compares device/inode identities of the file and its ancestors with existing protected roots, including alternate path spellings.
+Missing protected roots protect nothing. ENOENT or ENOTDIR at the target or any component walks up to the nearest existing ancestor,
+whose identity and ancestors decide the fence; the reader still owns reporting source absence.
+An unreadable protected root refuses the read with its cause; unresolved candidate components continue through their ancestors.
+The agent's own stores and persona remain readable through declared reach.
+
 `host.files.query({path, sql, params?, limit?})` opens the source read-only and uses SQLite's backup API for one consistent
-private temporary snapshot, including committed WAL pages, then runs one read-only
-statement with the stem's `folded_contains(text_or_blob, needle)` (containment that
+private snapshot, including committed WAL pages (`snapshot: "sqlite_backup"`). A source its app holds under an exclusive
+lock (Chrome's History while Chrome runs) refuses that read; then the file and its journal are cloned with APFS
+`clonefile` (instant, takes no SQLite lock), the database before its journal so SQLite rolls the clone back to its last
+committed state (`snapshot: "file_clone"`); SQLite's header change counter, read before and after the clones, proves
+they are one generation, and a commit in between is reported, never read. A clone that fails names its cause. It then
+runs one read-only statement with the stem's `folded_contains(text_or_blob, needle)` (containment that
 ignores case and diacritics) beside SQLite's own functions: at most `limit` rows
 (1–1000, default 200, `truncated` when more exist). Snapshot and query finish on
-SQLite completion/error or Stop. Busy/locked snapshot acquisition reports its
-actual SQLite failure without sleeping or retrying; sidecars are never copied
-independently. Nil SQLite conversion is a failure, except a genuine zero-byte
+SQLite completion/error or Stop, with no sleeping or retrying. A clone is removed when the query ends; one that
+cannot be removed is named in the result as `snapshot_left`. Nil SQLite conversion is a failure, except a genuine zero-byte
 blob. SQL tail validation completes within the SQL string buffer's lifetime.
 Cells come back as read: text as text, blobs as `{base64}`.
+The argument set is exactly `path`, `sql`, `params` and `limit`; a `seconds` field
+is invalid input. The parameter array must supply one value per SQLite parameter slot.
+Numbered placeholders count through the largest index, including gaps. Omitting `params` supplies zero values.
+A mismatch returns `sqlite_error` before binding or stepping the statement.
+The Mail, Messages and Chrome-history seed parts follow completed query pages
+without a separate read clock; a failed page reports its failure.
 `host.files.mime({path, max_text_bytes?})` reads an `.emlx` or RFC 822 file:
-headers and parts, text parts decoded, attachments as metadata only. Downloaded attachments are sized from file metadata without loading their
-contents; only attachment saving requests those bytes. `max_text_bytes` bounds returned UTF-8 text (1 KiB–16 MiB, default 1 MiB), with
+headers and parts, text parts decoded, attachments as metadata only. An unnamed MIME attachment carries its part number and type with no filename.
+Downloaded attachments are sized from file metadata without loading their
+contents; only attachment saving requests those bytes. Derived attachment directories pass the same reach admission before listing; refused
+directories are skipped and named with their cause in `skipped_directories: [{path, error}]`.
+`max_text_bytes` bounds returned UTF-8 text (1 KiB–16 MiB, default 1 MiB), with
 `partial:true` when cut; the saved message itself and inline MIME content are still parsed whole. What the parts
 read is what the app holds, as a native reader would read it; nothing is redacted.
+`host.files.names({path})` returns `{names}`: a directory's immediate names, sorted, nothing beneath opened (Mail's
+seed finds its newest `V<n>` store this way, with no probe of a version that is not there).
 
 Using `app.step`, `app.decide`, `app.expect` or `app.expect_fail` makes a run strict: calls are journaled, receipts read exactly, writes bound to the page version it read. Dependencies use the same call-fit law above; whole argument/result snapshots, behavioral flags and revision changes alone never refuse a run.
 
-Recorded practice calls also carry `options` (`preview`, `expected_version`)
+Recorded practice calls also carry `options` (`preview`, `expected_version`, `because`)
 beside `args`; replay compares these outer operational choices exactly.
 Versions returned from a prior taped read remain exact and flow into later
 options. Old action tape rows with no recorded options cannot replay. In
@@ -1279,8 +1381,8 @@ Queue closure discards only waiting checkpoints. A claimed
 checkpoint survives hold reads and cleanup until its claimant consumes
 or releases it; ending another hold grants no ownership of the claimed bytes.
 
-Origins ratchet across revisions and restores: an untrusted agent's,
-a pack's or an unrecorded origin cannot become their own by saving it again. A
+Origins ratchet across revisions and restores: an untrusted agent's
+or an unrecorded origin cannot become their own by saving it again. A
 trusted agent that started a turn is its provenance, never an ability's author
 nor the owner: what they switched off (an ability or a sense) is their to turn on
 or drop, and below Full Mac keeping is their card.
@@ -1291,7 +1393,14 @@ version-swap action and repairs go forward. Prior host effects remain real.
 
 Legacy numeric versions must be positive integers before migration prepares
 any slot; invalid versions preserve the old layout and report the cause.
-Launch admits current bundled seeds. A part follows the shipped one while it
+Launch admits current bundled abilities and the turn through one seed path.
+Both launch and missing-turn installation seal the shipped turn candidate;
+throwing-turn recovery retains that sealed seed. An unsealed turn is theirs,
+never replaced at launch, even when its body matches the bundle. Their own turn
+revision removes candidate/proof, including adoption of shipped code and setting
+a trial aside, so later seeds remain beside it. Keeping a matching ability
+through `Parts.admit` instead seals it to follow the bundle.
+A part follows the shipped one while it
 is that part: a seed, or a version they keeps that is the shipped part as launch
 installs it (`OwnedProgramStore.samePart`: the same code, entry,
 actions, reach, residency and header; input schema, name, description, origin, prior
@@ -1301,7 +1410,9 @@ launch replaces a kept current that is the shipped part in place with the
 admitted seed. A followed part follows a changed bundle: the seed owner compares
 its complete authored/sealed identity (body, header version,
 reach/wake/face/residency, manifest and dependency contracts), excluding
-installation timestamps, admission and status bookkeeping. A different part
+installation timestamps, admission and status bookkeeping. The stored record
+excludes `validationStatus`, projected from the proof on read, so that writeback
+does not change seed identity. A different part
 retains the displaced version as previous; the same part with changed
 bookkeeping is replaced in place, so previous stays the last different version.
 Either way the installed off switch stays, including who switched it off and
@@ -1309,25 +1420,35 @@ why. When a followed part changes they are told once per shipped version: a
 `body` happening (`shipped:<id>:<version>`) naming the part and its versions
 from and to. A version they edited is never replaced: launch leaves it and tells
 their once per shipped version, under that same key, that the shipped part is at
-a version theirs does not have, to merge from or leave. First installation skips
+a version theirs does not have, with its description read from the shipped record
+and its source path, to merge from or leave. First installation skips
 an id occupied in another retained slot.
 The unsigned candidate uses that same identity comparison before admission:
-an already-current seed is left alone without signing or proof work. Body,
+an already-current seed is left alone without admission or signing. Body,
 header and live dependency-contract changes still require admission. For an
 update, the executable owner checks the installed candidate and seal under
 the seed selection lock before replacement. Missing authority or changed
 sealed bytes preserve the installed source and report the seed failure through
-Doctor. Ordinary execution still verifies each admitted version on use.
+Doctor. Each resource's launch log reads the seal marker without verifying
+proof and names its installed and bundle program digests with `follows` (sealed),
+`theirs` (authored, same body) or `beside` (authored, different body); a sealed copy
+without its candidate identity logs `unidentified`. Missing or unreadable
+selections carry their cause without an ownership verdict. An unchanged seed pass writes no files; repeated happenings write
+nothing under their existing once key. Persona/guidance, memory, diary, Desk
+and settings never enter this installer. Ordinary execution still verifies
+each admitted ability version on use.
 Launch-time dependency discovery projects the checked file registry before
 the live senses hub is wired; sense execution requires the live hub.
 Doctor's `ability_files` reading reports this launch's current seeds that skipped
 admission and new admissions prepared, or explicitly says the launch pass was
 not observed; successful file reads alone do not claim seed installation.
 Launch does not rewrite or re-sign retained tool and skill records.
-Retained historical candidate script declarations and
-origins remain readable until their owning conversion preserves that evidence.
-Historical steer origins must be arrays of nonempty strings; malformed entries
-remain unrecorded provenance and cannot be filtered into their authorship.
+Part manifests declare `params` and actions at the top level; code lives in
+the program's file body. Origins use `by:"theirs"` or `by:"peer"` with a nonempty
+array of nonempty `peers`. Missing or malformed origins remain unrecorded.
+Removed: nested `script` declarations, `compiled` metadata, pack provenance,
+the `"self"` origin and origins containing `steer` without `by`. No data move
+or migration runs.
 
 ## Conversion census and cutover
 

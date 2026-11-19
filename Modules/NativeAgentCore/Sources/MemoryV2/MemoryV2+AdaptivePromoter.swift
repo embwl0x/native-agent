@@ -279,8 +279,9 @@ public actor AdaptiveMemoryPromoter {
 
     /// Expose interpretation outcomes through mind.why.
     static func whyInterpretation(turn: String, session: String, surface: String,
-                                  route: TurnEnvelope.DeliveryRoute?, outcome: String, heldTurn: Turn?) {
-        let fields: [String: JSONValue] = ["lane": .string("interpretation"), "outcome": .string(outcome)]
+                                  route: TurnEnvelope.DeliveryRoute?, outcome: String, heldTurn: Turn?, careFaults: [String]? = nil) {
+        var fields: [String: JSONValue] = ["lane": .string("interpretation"), "outcome": .string(outcome)]
+        if let careFaults, !careFaults.isEmpty { fields["careFaults"] = .array(careFaults.map(JSONValue.string)) }
         TurnTraceBus.fire(TurnTraceEvent(turnId: turn, kind: "mind.why", sessionId: session, surface: surface,
             destinationId: route?.destinationId, threadId: route?.threadId, payload: .object(fields), turn: heldTurn))
     }

@@ -120,6 +120,7 @@ extension SwiftNativeProviderRouting {
         let chatEffortRaw = Self.stringFrom(surfaceEfforts, key: "chat")
             ?? (chatRoute == "openrouter" ? openRouterCatalog?.first { $0.id == chatModel }?.default_reasoning_effort : nil)
             ?? accountCatalogs[chatRoute ?? ""]?.first { $0.id == chatModel }?.defaultReasoningEffort
+            ?? (chatRoute == "moonshot" ? MoonshotModelCatalog.defaultReasoningEffort(for: chatModel) : nil)
             ?? chatRoute.flatMap { FirstPartyModelCatalog.descriptor(for: chatModel, providerID: $0, dataRoot: dataRoot)?.defaultReasoningEffort }
             ?? ""
         // Validate after group inheritance, so a failed Chat route cannot prevent an independent Work or Memory route from being resolved.

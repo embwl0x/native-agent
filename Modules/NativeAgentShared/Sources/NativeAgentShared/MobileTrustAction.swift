@@ -9,14 +9,6 @@ public enum MobileTrustAction: Sendable {
     public enum Preset: String, CaseIterable, Sendable {
         case safe, workMode = "work_mode", builder, fullMac = "full_mac"
 
-        public init?(permissionLevel: String) {
-            switch permissionLevel {
-            case "strict": self = .safe
-            case "balanced": self = .workMode
-            default: return nil
-            }
-        }
-
         public var title: String {
             switch self {
             case .safe: "Safe"

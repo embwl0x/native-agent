@@ -9,13 +9,6 @@ enum ActivitySection: String, Sendable, Identifiable {
 
     var id: String { rawValue }
 
-    var sheetTitle: String {
-        switch self {
-        case .approvals, .inbox: "Inbox"
-        case .memoryProposals: "Memories to look at"
-        case .cognitionProposals: "REM Replay Lineage"
-        }
-    }
 }
 
 // MARK: - Today face and Activity destinations

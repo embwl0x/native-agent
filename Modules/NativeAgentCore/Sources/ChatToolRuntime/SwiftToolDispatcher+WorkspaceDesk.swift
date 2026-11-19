@@ -68,7 +68,7 @@ extension SwiftToolDispatcher {
         }
         var result: [String: JSONValue] = [
             "status": .string(handle?.isEmpty == false && selected == nil ? "not_found" : "ok"),
-            "source": .string("canonical_current_desk"), "as_of": .string(state.generatedTs),
+            "source": .string("canonical_current_desk"), "last_change": .string(state.generatedTs),
             "request": .object(base), "liveItemCount": .int(Int64(board.items.count)),
             "topLevelItemCount": .int(Int64(board.topLevel.count)), "matched_count": .int(Int64(sorted.count)),
             "count_scope": .string("""
@@ -100,6 +100,7 @@ extension SwiftToolDispatcher {
             result["record"] = .object(record)
             result["notes"] = .array(selected.notes.reversed().dropFirst(noteOffset).prefix(pageSize).map {
                 .object(["timestamp": .string($0.ts), "text": .string(String($0.text.prefix(4_000))),
+                         "author": $0.author.map(JSONValue.string) ?? .null,
                          "truncated": .bool($0.text.count > 4_000)])
             })
             if selected.notes.contains(where: { $0.text.count > 4_000 }) {
@@ -128,8 +129,12 @@ extension SwiftToolDispatcher {
 
     private static func deskReadItem(_ item: DeskItem, state: DeskState, plan: DeskSequencing.ItemPlan?, peerName: (String) -> String?) -> JSONValue {
         var row = workspaceDeskObject(workContextDeskItem(item, state: state, plan: plan, peerName: peerName))
+        row["reply_deliveries"] = .array(item.refs.compactMap {
+            guard case .trace(let id, let kind) = $0.kind, kind == "reply_delivery" else { return nil }
+            return .string(id)
+        })
         if let entry = MyQueue.entry(item) { row["intention"] = MyQueue.readout(entry, in: state, plan: plan) }
-        row["place"] = .string(item.project == MyQueue.project ? "MY QUEUE" : "board")
+        row["place"] = .string(item.project == MyQueue.project && item.step != nil ? "MY QUEUE" : "board")
         return .object(row)
     }
 

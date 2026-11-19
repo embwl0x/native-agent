@@ -1,9 +1,10 @@
 import Foundation
 import ChatToolParsing
+import ChatTurnContracts
 import NativeAgentCore
 import PersistenceCore
 import StandingBots
-// Blueprint: | `BotRunConversation.swift` | `BotRunConversation` enum; `enqueueRequestedCheck`, `dispatch` |
+// Blueprint: | `BotRunConversation.swift` | Helper conversation admission preserves the initiating turn's birth steering |
 
 /// A return address for a deliberately requested check, not a bot scheduler or second conversation. The canonical queue and shelf remain execution truth.
 public enum BotRunConversation {
@@ -17,7 +18,7 @@ public enum BotRunConversation {
         let invocation = ChatToolInvocation()
         let result = try await dispatch(turn: turn, invocation: invocation, input: ["id": .string(botID.uuidString)], surface: "chat",
                                scope: bot.sessionID, dataRoot: dataRoot) { _, _ in
-                let receipt = try BotRunQueue(dataRoot: dataRoot).enqueue(bot: botID, scope: .init(ancestry: invocation.botAncestry))
+                let receipt = try BotRunQueue(dataRoot: dataRoot).enqueue(bot: botID, steeringSources: [], scope: .init(ancestry: invocation.botAncestry))
                 return .object(["status": .string(receipt.accepted ? "queued" : "joined"), "id": .string(botID.uuidString),
                                 "requestId": .string(receipt.runID.uuidString)])
             }
@@ -92,7 +93,7 @@ public enum BotRunConversation {
              "replyTo": route.replyTo, "correlationId": route.correlationId].compactMapValues { $0 }
         }
         let row = try store.begin(scopeSessionID: scope, agent: agent, name: bot.name,
-            label: "Requested check", fresh: false, sourceSurface: surface, fingerprint: nil, replyRoute: replyRoute)
+            label: "Requested check", fresh: false, sourceSurface: surface, fingerprint: nil, replyRoute: replyRoute, steeredBy: turn.peerSteering?.checkpointSources ?? [])
         let result: JSONValue
         do { result = try await perform("bot_run_once", input) }
         catch {

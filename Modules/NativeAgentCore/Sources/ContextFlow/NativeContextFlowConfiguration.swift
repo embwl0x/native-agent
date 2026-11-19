@@ -1,5 +1,4 @@
 import Context
-import CoreFoundation
 import DreamREMCycle
 import Foundation
 import Senses
@@ -9,15 +8,13 @@ import PersonaEngine
 import PersistenceCore
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `NativeContextFlowConfiguration.swift` | `NativeContextFlowConfiguration`: checked modes/budgets; absent defaults; invalid unavailable |
+// Blueprint: | `NativeContextFlowConfiguration.swift` | `NativeContextFlowConfiguration`: checked modes; absent defaults; invalid unavailable |
 
 public struct NativeContextFlowConfiguration: Sendable, Equatable {
     public static let modeEnvironmentKey = "NATIVE_AGENT_CONTEXT_FLOW_MODE"
     public static let modeDefaultsKey = "contextFlowMode"
-    static let budgetDefaultsKey = "contextFlowRAMMiB"
 
     let mode: ContextFlowMode
-    let budget: ContextArenaBudget
 
     public static func initializeMissingInnerLifeMode(defaults: UserDefaults) {
         guard defaults.object(forKey: modeDefaultsKey) == nil else { return }
@@ -46,17 +43,7 @@ public struct NativeContextFlowConfiguration: Sendable, Equatable {
             environmentMode = parsed
         } else { environmentMode = nil }
         let mode: ContextFlowMode = preOnboarding ? .off : (environmentMode ?? savedMode ?? .active)
-        let budget: ContextArenaBudget
-        if let raw = defaults.object(forKey: budgetDefaultsKey) {
-            guard let number = raw as? NSNumber,
-                  CFGetTypeID(number) != CFBooleanGetTypeID(),
-                  let integer = Int(exactly: number.doubleValue),
-                  let parsed = ContextArenaBudget(rawValue: integer) else {
-                throw NativeContextFlowStartupError(detail: "Invalid saved \(budgetDefaultsKey); use 32, 64, 96, 128 or 256 MiB.")
-            }
-            budget = parsed
-        } else { budget = .default }
-        return Self(mode: mode, budget: budget)
+        return Self(mode: mode)
     }
 }
 

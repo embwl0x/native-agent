@@ -473,7 +473,11 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             let menuCommandKey: String? = role == "AXMenuItem" ? {
                 let identifier = MacAXAttributeRead.copyString(element, kAXIdentifierAttribute, context: context) ?? ""
                 let key = MacAXAttributeRead.copyString(element, kAXMenuItemCmdCharAttribute, context: context) ?? ""
-                return identifier.isEmpty && key.isEmpty ? nil : identifier + "|" + key
+                if key.isEmpty { return identifier.isEmpty ? nil : identifier }
+                guard let modifiers = MacAXAttributeRead.copyRaw(element, kAXMenuItemCmdModifiersAttribute, context: context) as? NSNumber else {
+                    return nil
+                }
+                return identifier + "|" + key + "|" + modifiers.stringValue
             }() : nil
             let names = MacAXAttributeRead.copyLabel(element, role: role, context: context, prepare: prepareForRead)
             let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute, context: context)

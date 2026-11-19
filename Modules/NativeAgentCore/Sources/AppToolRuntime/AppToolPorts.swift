@@ -36,7 +36,10 @@ public struct AppActionExecution: Sendable {
     public var host: (any OwnedProgramToolHost)?
     public var openScreenWatch: (@Sendable (MacScreenWatch.Request, Bool, Turn) async throws -> MacScreenWatch)?
     public var undoReceipt: JSONValue?
-    public var argumentPreflightOnly = false
+    public var argumentPreflightOnly: Bool {
+        get { invocation.argumentPreflightOnly }
+        set { invocation.argumentPreflightOnly = newValue }
+    }
     var notesSnapshot: DoorNotesSnapshot?
     public var handsBack = false
     public var wake: JSONValue?

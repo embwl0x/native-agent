@@ -76,12 +76,13 @@ public enum OpenAIExecutionControls {
         return normalized == "default" ? nil : normalized
     }
 
-    /// Account presets max/ultra map to xhigh on direct Responses, which rejects those literal presets. The CLI retains them for its own preset behavior.
+    /// A listed level is sent as it is, except Ultra on the direct ChatGPT wire, which sends the account row's `ultraEffort` as Codex does. The CLI
+    /// resolves Ultra itself.
     public static func wireReasoningEffort(
         model: String,
         requested: String?,
         transport: Transport = .publicAPI,
-        supportedEfforts: [String]? = nil, preview: Bool = false
+        supportedEfforts: [String]? = nil, ultraEffort: String? = nil, preview: Bool = false
     ) throws -> String? {
         guard let selected = try reasoningEffort(
             model: model,
@@ -89,10 +90,7 @@ public enum OpenAIExecutionControls {
             transport: transport,
             supportedEfforts: supportedEfforts, preview: preview
         ) else { return nil }
-        if transport == .chatGPTOAuth,
-           selected == "max" || selected == "ultra" {
-            return "xhigh"
-        }
+        if transport == .chatGPTOAuth, selected == "ultra", let ultraEffort { return ultraEffort }
         return selected
     }
 
@@ -128,14 +126,14 @@ public enum OpenAIExecutionControls {
         to body: inout [String: Any],
         model: String,
         transport: Transport = .publicAPI,
-        supportedEfforts: [String]? = nil,
+        supportedEfforts: [String]? = nil, ultraEffort: String? = nil,
         supportsFast: Bool? = nil, call: LLMCall
     ) throws {
         if let effort = try wireReasoningEffort(
             model: model,
             requested: call.admission?.reasoningEffort,
             transport: transport,
-            supportedEfforts: supportedEfforts, preview: call.preview
+            supportedEfforts: supportedEfforts, ultraEffort: ultraEffort, preview: call.preview
         ) {
             body["reasoning"] = ["effort": effort]
         }

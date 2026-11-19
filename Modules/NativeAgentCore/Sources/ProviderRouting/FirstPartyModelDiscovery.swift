@@ -160,7 +160,7 @@ public enum FirstPartyModelDiscovery {
         return failures.sorted()
     }
 
-    /// Entering Providers asks a connected route only when no list is saved for its current credential. True when anything was asked.
+    /// Entering Providers asks a connected route only when no list under a day old is saved for its current credential. True when anything was asked.
     @concurrent public nonisolated static func fetchMissing(dataRoot: URL, routes: [String]? = nil,
                                                           session: URLSession = ProviderHTTP.session) async -> Bool {
         let missing = missingRoutes(dataRoot: dataRoot).filter { routes?.contains($0) ?? true }
@@ -170,13 +170,14 @@ public enum FirstPartyModelDiscovery {
         return !missing.isEmpty
     }
 
-    /// Connected routes with no complete list for their current credential: what `fetchMissing` asks. Synchronous and network-free.
+    /// Connected routes with no complete list under a day old for their current credential: what `fetchMissing` asks. Synchronous and network-free.
     public static func missingRoutes(dataRoot: URL) -> [String] {
         routeIDs.filter { route in
             guard let cache = caches[route] else { return false }
             do {
                 let read = try cache.boundRead(dataRoot: dataRoot)
-                return read.credential != nil && read.catalog?.isComplete != true
+                let saved = try FileManager.default.attributesOfItem(atPath: cache.cachePath(dataRoot).path)[.modificationDate] as? Date
+                return read.credential != nil && (read.catalog?.isComplete != true || saved.map { -$0.timeIntervalSinceNow >= 86_400 } != false)
             } catch { return true }
         }
     }
@@ -213,6 +214,7 @@ public enum FirstPartyModelDiscovery {
         case "openai": "OpenAI"
         case "xai_oauth_direct": "xAI"
         case "meta": "Meta"
+        case "moonshot": "Moonshot"
         default: "The provider"
         }
     }
@@ -253,6 +255,7 @@ public enum FirstPartyModelDiscovery {
 
     private static func makeCache(_ route: String) -> ModelCatalogCache {
         ModelCatalogCache(
+            route: route,
             cachePath: { $0.appendingPathComponent("providers/\(cacheFileName(route))") },
             endpoint: endpoint(route),
             readCache: { try readDecodedCache(route: route, dataRoot: $0) },
@@ -589,7 +592,7 @@ public enum FirstPartyModelDiscovery {
         if let row = shipped.first(where: { $0.id.lowercased() == id }) ?? shipped.first(where: { sameModel($0.id, id) }) {
             return row.withLimits(id: stated.id, contextLength: stated.contextLength, maxOutputTokens: stated.maxOutputTokens)
         }
-        let sibling = nearestSibling(of: stated, in: shipped, route: route)
+        let sibling = nearestSibling(of: stated.id, line: stated.line, route: route)
         let vocabulary: Set<String> = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
         var efforts = stated.efforts.map { $0.filter(vocabulary.contains) } ?? sibling?.supportedReasoningEfforts ?? []
         var defaultEffort = stated.defaultEffort ?? sibling?.defaultReasoningEffort ?? "default"
@@ -636,21 +639,30 @@ public enum FirstPartyModelDiscovery {
         let version: [Int]
     }
 
-    /// The newest shipped row of the same line and variant whose version is at or below this one, by numeric comparison.
-    private static func nearestSibling(of stated: StatedModel, in shipped: [FirstPartyModelDescriptor],
-                                       route: String) -> FirstPartyModelDescriptor? {
-        guard let wanted = family(of: stated.id, line: stated.line, route: route) else { return nil }
-        var best: (row: FirstPartyModelDescriptor, version: [Int])?
-        for row in shipped {
-            guard let candidate = family(of: row.id, line: nil, route: route), candidate.key == wanted.key,
-                  compare(candidate.version, wanted.version) <= 0 else { continue }
-            if best.map({ compare(candidate.version, $0.version) > 0 }) ?? true { best = (row, candidate.version) }
+    static func nearestSibling(of id: String, line: String? = nil, route: String) -> FirstPartyModelDescriptor? {
+        let shipped = FirstPartyModelCatalog.models(forProviderID: route)
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if route == "moonshot", let exact = shipped.first(where: { $0.id.lowercased() == id }) { return exact }
+        guard let wanted = family(of: id, line: line, route: route) else { return nil }
+        func nearest(_ key: String) -> FirstPartyModelDescriptor? {
+            var best: (row: FirstPartyModelDescriptor, version: [Int])?
+            for row in shipped {
+                guard let candidate = family(of: row.id, line: nil, route: route), candidate.key == key,
+                      compare(candidate.version, wanted.version) <= 0 else { continue }
+                if best.map({ compare(candidate.version, $0.version) > 0 }) ?? true { best = (row, candidate.version) }
+            }
+            return best?.row
         }
-        return best?.row
+        return nearest(wanted.key) ?? (route != "moonshot" && wanted.key.hasSuffix("-pro") ? nearest(String(wanted.key.dropLast(4))) : nil)
     }
 
     private static func family(of id: String, line statedLine: String?, route: String) -> Family? {
         let tokens = id.lowercased().split(separator: "-").map(String.init)
+        if route == "moonshot" {
+            let numbered = tokens.dropFirst(tokens.first == "kimi" ? 1 : 0)
+            guard let head = numbered.first, head.hasPrefix("k"), let version = dotted(String(head.dropFirst())) else { return nil }
+            return Family(key: "kimi|" + numbered.dropFirst().joined(separator: "-"), version: version)
+        }
         guard tokens.count >= 2 else { return nil }
         switch route {
         case "anthropic", "anthropic_oauth_direct":
@@ -663,14 +675,16 @@ public enum FirstPartyModelDiscovery {
             let version = tokens.dropFirst(2).prefix { $0.count <= 3 && $0.allSatisfy(\.isNumber) }.compactMap { Int($0) }
             return version.isEmpty ? nil : Family(key: "claude-" + line, version: version)
         case "openai":
-            // gpt-<version>[-<variant>][-<yyyy>-<mm>-<dd>], keeping the variant.
+            // gpt-<version>[-<variant>][-pro][-<yyyy>-<mm>-<dd>], keeping the variant.
             guard tokens[0] == "gpt", let version = dotted(tokens[1]) else { return nil }
             var rest = Array(tokens.dropFirst(2))
             if rest.count >= 3, rest.suffix(3).map(\.count) == [4, 2, 2], rest.suffix(3).allSatisfy({ $0.allSatisfy(\.isNumber) }) {
                 rest.removeLast(3)
             }
             let variant = rest.joined(separator: "-")
-            guard ["", "sol", "terra", "luna", "astra", "pro", "mini"].contains(variant) else { return nil }
+            guard ["", "sol", "terra", "luna", "astra", "pro", "mini"].contains(variant.hasSuffix("-pro") ? String(variant.dropLast(4)) : variant) else {
+                return nil
+            }
             return Family(key: "gpt-" + variant, version: version)
         case "xai_oauth_direct":
             // grok-<version>… or grok-<line>-<version>…, keeping reasoning, non-reasoning and multi-agent apart.

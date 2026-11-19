@@ -178,7 +178,6 @@ public enum EngineFaceMindProjection {
                 row("arena", "RAM generation", health.activeArenaGenerationID.map(String.init) ?? "None published"),
                 row("sources", "Registered sources", String(health.registeredSourceCount)),
                 row("degraded", "Degraded sources", String(health.degradedSourceCount)),
-                row("bytes", "Arena bytes", String(health.arenaMetrics.residentLogicalBytes)),
                 row("pressure", "Pressure", health.arenaMetrics.pressure.rawValue),
                 row("leases", "Active leases", String(health.arenaMetrics.activeLeaseCount)),
                 row("feedback", "Feedback events", String(health.feedbackEventCount))]

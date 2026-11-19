@@ -26,7 +26,8 @@ extension SwiftNativeApprovalInbox {
             return true
         }
     }
-    /// An unstarted reporting turn is eligible within its existing age window. Started and completed claims never replay; session delivery owns answers.
+    /// An unstarted reporting turn stays owed until claimed, however long ago the card resolved. Started and completed claims never replay; session
+    /// delivery owns answers.
     public nonisolated static func continuationIsPending(_ record: ApprovalRecord, now: Date = Date()) -> Bool {
         guard record.status == "resolved", record.decision != nil,
               hasChatReportingObligation(record) else { return false }
@@ -35,7 +36,7 @@ extension SwiftNativeApprovalInbox {
                   state["started"] == nil, state["done"] == nil else { return false }
         }
         guard let date = record.resolvedAt.flatMap(NativeTimestampFormat.parseISO8601) else { return false }
-        return (0...600).contains(now.timeIntervalSince(date))
+        return now.timeIntervalSince(date) >= 0
     }
     /// Only a conversation that actually asked, or a retained reporting claim, owes a reporting turn. A mirrored card alone does not create one.
     nonisolated static func hasChatReportingObligation(_ record: ApprovalRecord) -> Bool {

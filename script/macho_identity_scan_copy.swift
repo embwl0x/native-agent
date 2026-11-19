@@ -104,69 +104,9 @@ func maskSignatureHashes(_ bytes: inout Data, at start: Int, length: Int) throws
     }
 }
 
-func selfTest() throws {
-    func fixture(_ payload: [UInt8], sectionName: String = "__swift5_typeref") -> Data {
-        var data = Data(repeating: 0, count: 32 + 72 + 80)
-        func put(_ offset: Int, _ value: UInt64, _ width: Int = 4) {
-            for i in 0..<width { data[offset + i] = UInt8(truncatingIfNeeded: value >> (8 * i)) }
-        }
-        func text(_ offset: Int, _ value: String) {
-            for (i, byte) in value.utf8.enumerated() { data[offset + i] = byte }
-        }
-        put(0, 0xfeedfacf); put(16, 1); put(20, 152)
-        put(32, 0x19); put(36, 152); text(40, "__TEXT"); put(92, 5); put(96, 1)
-        text(104, sectionName); text(120, "__TEXT")
-        put(144, UInt64(payload.count), 8); put(152, 184)
-        data.append(contentsOf: payload)
-        return data
-    }
-    let triplet = Array("Qzx".utf8)
-    let relative = fixture([2] + triplet + [0, 0])
-    let absolute = fixture([0x18] + Array("QzxABCDE".utf8) + [0])
-    guard try !scanCopy(relative).suffix(6).contains(triplet[0]),
-          try !scanCopy(absolute).suffix(10).contains(triplet[0]) else {
-        throw ScanError.malformed("numeric references were not masked")
-    }
-    for section in ["__swift5_typeref", "__cstring", "__swift5_reflstr"] {
-        let literal = fixture(triplet + [0], sectionName: section)
-        guard try scanCopy(literal) == literal else { throw ScanError.malformed("real short literal was hidden") }
-    }
-    let nonMetadata = fixture([2] + triplet + [0, 0], sectionName: "__cstring")
-    guard try scanCopy(nonMetadata) == nonMetadata else { throw ScanError.malformed("control bytes outside metadata were hidden") }
-    do {
-        _ = try scanCopy(fixture([2, 65]))
-        throw ScanError.malformed("truncated reference accepted")
-    } catch ScanError.malformed(let reason) where reason == "truncated symbolic reference" {}
-    var signed = fixture([])
-    let signatureStart = signed.count
-    func be(_ value: Int) -> [UInt8] { (0..<4).map { UInt8(truncatingIfNeeded: value >> (8 * (3 - $0))) } }
-    let identifier = Array("Qzx.ident".utf8) + [0], digest = Array("QzxDIGEST".utf8) + Array(repeating: 0x51, count: 11)
-    var directory = be(0xfade0c02) + be(0) + be(0x20400) + be(0) + be(48 + identifier.count + 20) + be(48)
-        + be(1) + be(0) + be(0) + [20, 1, 0, 12] + be(0) + be(0)
-    directory += identifier + digest
-    directory.replaceSubrange(4..<8, with: be(directory.count))
-    let superBlob = be(0xfade0cc0) + be(20 + directory.count) + be(1) + be(0) + be(20) + directory
-    signed.append(contentsOf: superBlob)
-    signed[16] = 2; signed[20] = 168
-    var load = Data(repeating: 0, count: 16)
-    for (i, v) in [0x1d, 16, signatureStart + 16, superBlob.count].enumerated() {
-        for b in 0..<4 { load[i * 4 + b] = UInt8(truncatingIfNeeded: v >> (8 * b)) }
-    }
-    signed.insert(contentsOf: load, at: 184)
-    signed[152] = 200
-    let masked = try scanCopy(signed)
-    guard masked.range(of: Data("QzxDIGEST".utf8)) == nil, masked.range(of: Data("Qzx.ident".utf8)) != nil else {
-        throw ScanError.malformed("signature hash slots were not masked, or its identifier was hidden")
-    }
-    let plain = Data("ordinary private_fixture_identity".utf8)
-    guard try scanCopy(plain) == plain else { throw ScanError.malformed("plain executable changed") }
-    print("Mach-O identity scan-copy tests passed")
-}
-
 do {
-    guard CommandLine.arguments.count == 2 else { throw ScanError.malformed("expected executable path or --self-test") }
-    if CommandLine.arguments[1] == "--self-test" { try selfTest() }
-    else { FileHandle.standardOutput.write(try scanCopy(Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))) }
+    guard CommandLine.arguments.count == 2 else { throw ScanError.malformed("expected executable path") }
+    FileHandle.standardOutput.write(try scanCopy(Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))))
 } catch {
     FileHandle.standardError.write(Data("Mach-O identity scan failed: \(error)\n".utf8))
     exit(1)

@@ -63,14 +63,3 @@ enum ApprovalDecisionToastPresentation {
         center.push(SystemToast(kind: toast.kind, text: toast.text))
     }
 }
-
-extension ApprovalsFacade.Resolution {
-    var visibleMessage: String {
-        switch self {
-        case .applied(let approval): return "Approval recorded as \(approval.decision ?? approval.status)."
-        case .noOpInFlight: return "This approval is already being decided on another screen."
-        case .noOpAlreadyResolved: return "This approval was already decided; no second action was run."
-        case .unavailable(let detail): return "Approval update failed: \(detail)"
-        }
-    }
-}

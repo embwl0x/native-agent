@@ -62,6 +62,7 @@ package actor AgentLineProcess {
                     var rest = chunk[...]
                     while let end = rest.firstIndex(of: 10) {
                         line.append(contentsOf: rest[..<end])
+                        guard line.count <= Self.lineLimit else { throw Failure.tooLarge }
                         if let value = try Self.parse(line) { continuation.yield(value) }
                         line.removeAll(keepingCapacity: true)
                         rest = rest[rest.index(after: end)...]

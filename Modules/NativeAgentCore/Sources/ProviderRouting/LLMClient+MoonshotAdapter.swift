@@ -89,7 +89,7 @@ public final class MoonshotTransport: LLMTransport {
                     applyStreamingLLMHeaders(to: &request)
                     request.httpBody = try JSONSerialization.data(withJSONObject: await self.buildBody(
                         model: model, messages: messages, system: system, tools: tools, stream: true, call: call
-                    ))
+                    ), options: [.sortedKeys])
 
                     let started = DispatchTime.now().uptimeNanoseconds
                     let bytes: ProviderHTTPBytes
@@ -104,7 +104,7 @@ public final class MoonshotTransport: LLMTransport {
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot", retainReasoning: true)
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
-                        request: request, providerID: providerID, model: model, idPrefix: "moonshot_tool",
+                        request: request, providerID: providerID, model: model,
                         started: started, telemetry: telemetry, call: call
                     ) { calls, reasoning in
                         if !calls.isEmpty, !reasoning.isEmpty {
@@ -155,9 +155,8 @@ public final class MoonshotTransport: LLMTransport {
         return try chatCompletionsMessages(from: message, reasoning: reasoning)
     }
 
-    /// The wire form is the model row's declaration; an id with no row sends none.
     private func applyReasoningControls(to body: inout [String: Any], model: String, call: LLMCall) throws {
-        guard let row = FirstPartyModelCatalog.descriptor(for: model, providerID: "moonshot") else {
+        guard let row = FirstPartyModelDiscovery.nearestSibling(of: model, route: providerId) else {
             if call.admission?.reasoningEffort != nil {
                 throw LLMError.providerError(message: "Moonshot Think controls for \(model) are unknown. Choose a supported control in Providers.")
             }

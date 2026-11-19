@@ -7,6 +7,7 @@ import AgentWorkspace
 import AgentConversations
 import AgentLinkTransport
 import ChatToolRuntime
+import ChatToolParsing
 import NativeAgentCore
 import PersistenceCore
 import Privacy
@@ -61,10 +62,10 @@ public struct AgentContactRoutes: Sendable {
     /// Peer bearers admit contacts; explicit identity headers still require the listener bearer.
     public static func admit(headers: [String: String], liveToken: String,
                                dataRoot: URL,
-                               readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> (BridgeAuthDecision,
+                               readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) throws -> (BridgeAuthDecision,
                                    AgentBridgePrincipal) {
         guard !liveToken.isEmpty else { return (.serverStopping, .anonymous) }
-        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: dataRoot, readCredential: readCredential)
+        let principal = try AgentBridgePrincipal.resolve(headers: headers, dataRoot: dataRoot, readCredential: readCredential)
         let decision: BridgeAuthDecision = !AgentBridgePrincipal.claimsIdentity(headers: headers) && principal.peerID != nil
             ? .authorized : BridgeCore.authorize(authorizationHeader: headers["authorization"], liveToken: liveToken)
         return (decision, principal)
@@ -87,7 +88,15 @@ public struct AgentContactRoutes: Sendable {
         guard Self.isContactPath(path) else {
             return false
         }
-        let (admission, principal) = Self.admit(headers: headers, liveToken: token(), dataRoot: dataRoot)
+        let admission: BridgeAuthDecision
+        let principal: AgentBridgePrincipal
+        do { (admission, principal) = try Self.admit(headers: headers, liveToken: token(), dataRoot: dataRoot) }
+        catch {
+            nativeLog("Agent contact identity store could not be read: %@", error.localizedDescription)
+            BridgeCore.writeJSON(conn, status: 503, obj: ["error": "contact_identity_unavailable",
+                "detail": "The saved contacts could not be read. Repair agents/peers.json before using the bridge."])
+            return true
+        }
         switch admission {
         case .serverStopping:
             BridgeCore.writeJSON(conn, status: 503, obj: ["error": "server_stopping"])
@@ -370,8 +379,6 @@ public struct AgentContactRoutes: Sendable {
     private func peerReplyReceipt(requestID: String, sessionID: String, offset: Int = 0, maxChars: Int = 8000,
                                   waitSeconds: Int = 0, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> (receipt: [String: Any],
                                       task: AgentContactTask?) {
-        let protocolSession = NativeAgentMCPWire.validSession(sessionID) || NativeAgentA2AWire.validContext(sessionID)
-        let storedSession = protocolSession ? principal.storedConversation(sessionID) : sessionID
         // Protocol context locates the task; the contact’s canonical session owns its turn.
         let taskID = Self.taskID(requestID: requestID, sessionID: sessionID, principal: principal)
         // Wait only to settlement or the caller’s bound; inability to observe the reply must be explicit.
@@ -390,7 +397,7 @@ public struct AgentContactRoutes: Sendable {
             }
         }
         return await Self.retainedReply(requestID: requestID, sessionID: sessionID,
-            taskID: taskID, receiptSessionID: storedSession, offset: offset, maxChars: maxChars,
+            taskID: taskID, offset: offset, maxChars: maxChars,
             principal: principal, tasks: tasks)
     }
 
@@ -401,17 +408,17 @@ public struct AgentContactRoutes: Sendable {
         return "na3.\(context).\(requestID)"
     }
 
-    static func retainedReply(requestID: String, sessionID: String, taskID: String, receiptSessionID: String,
+    static func retainedReply(requestID: String, sessionID: String, taskID: String,
                               offset: Int, maxChars: Int, principal: AgentBridgePrincipal,
                                       tasks: AgentContactTasks) async -> (receipt: [String: Any], task: AgentContactTask?) {
         do {
             let task = try await tasks.get(taskID, owner: principal.id)
             return (contactReply(task, requestID: requestID, sessionID: sessionID, offset: offset, maxChars: maxChars), task)
         } catch let failure as AgentContactFailure where failure.isMissing {
-            var receipt = ClaudeBridgeMessageRuntime.agentReplyReceipt(requestID: requestID, sessionID: receiptSessionID,
-                offset: offset, maxChars: maxChars, logURL: ClaudeBridgeMessageRuntime.messageReplyURL(), principal: principal.id)
-            if receipt["session_id"] as? String == receiptSessionID { receipt["session_id"] = sessionID }
-            return (receipt, nil)
+            return (["request_id": requestID, "session_id": sessionID, "status": "not_found", "original_outcome": "unknown",
+                "evidence": "no_retained_receipt", "retrieval_result_class": "failed",
+                "coverage": ["complete": true, "scope": "retained_reply_receipts"],
+                "detail": "This contact has no retained reply under these ids. A missing receipt does not prove failure or authorize replay."], nil)
         } catch {
             let detail = (error as? AgentContactFailure)?.message ?? error.localizedDescription
             return (["status": "unavailable", "retrieval_result_class": "failed", "evidence": "canonical_task_unreadable",
@@ -656,8 +663,10 @@ public struct AgentContactRoutes: Sendable {
 
 
 extension AgentContactRoutes {
-    /// A contact the person brought to the table reads the Desk, or a piece on it; one not at the table is told how to get there. The lever is read
-    /// again after the read, under the contact store's lock, by the same write that records the read on the contact: no lever or no record, no words.
+    /// Any saved contact with a table door reads the standing table. The rest of the Desk, and a piece on it, is read by a contact the person
+    /// brought to the table or trusts; one that is not is told how to get there. The contact is read again after the read, under the contact
+    /// store's lock, by the same write that records the read: no place or no record, no words.
+    /// With `do`, a contact the person trusts changes the table: the grant is read again as the change lands.
     static func tableRead(_ arguments: [String: JSONValue], principal: AgentBridgePrincipal, dataRoot: URL) async -> (fields: [String: Any], failed: Bool) {
         let agent = PeerFacingIdentity.agentName
         let notAtTable: (fields: [String: Any], failed: Bool) = (["status": "not_at_table", "detail": """
@@ -681,20 +690,50 @@ extension AgentContactRoutes {
         let found: AgentPeerContact?
         do { found = try store.list().first { $0.id == peerID } }
         catch { return unknown(error) }
-        // Only the person's lever, set on this contact, brings it to the table.
-        guard let contact = found, contact.readsDesk == true, contact.canReadTable else { return notAtTable }
+        guard let contact = found, contact.canReadTable else { return notAtTable }
+        let table = arguments["do"] != nil
+            || arguments["piece"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == BoardDocument.tableRef
+        guard table || contact.atTable else { return notAtTable }
+        if let action = arguments["do"] {
+            let notTrusted = ToolFailureError("Only a contact the person trusts changes the table. Ask \(agent) with agent_message.",
+                effects: .none, code: "not_trusted")
+            let result: JSONValue
+            do {
+                guard contact.elevationAllowed else { throw notTrusted }
+                let by = "peer:" + peerID
+                guard let verb = action.stringValue, ["put", "cross", "remove"].contains(verb) else {
+                    throw ToolFailureError("do must be put, cross or remove. Nothing changed.", effects: .none, code: "invalid_input")
+                }
+                result = try await SwiftToolDispatcher(dataRoot: dataRoot, allowProcessGlobalTools: false)
+                    .tableChange(verb: verb, input: arguments.filter { $0.key != "do" }, by: by, contact: true) { apply in
+                        let entry = AgentTableRead(at: Date(), piece: "table", title: "the table", action: verb)
+                        return try store.recordTableWrite(peerID: peerID, entry, apply: apply) ?? .null
+                    }
+            } catch { result = ChatToolOutcome.failure(error: error, tool: "agent_desk", effects: .unknown) }
+            if result.objectValue?["effects"] == .string("occurred") { return project(result, failed: false) }
+            do {
+                guard let now = try store.list().first(where: { $0.id == peerID }), now.canReadTable else { return notAtTable }
+                guard now.elevationAllowed else {
+                    return project(ChatToolOutcome.failure(error: notTrusted, tool: "agent_desk", effects: .none), failed: true)
+                }
+            } catch { return unknown(error) }
+            if result == .null { return notAtTable }
+            return project(result, failed: ToolResult(result).carriesFailureEvidence)
+        }
         let read: JSONValue
         do { read = try await SwiftToolDispatcher(dataRoot: dataRoot, allowProcessGlobalTools: false).tableRead(input: arguments) }
         catch {
             // A refusal carries no Desk words and is no read, but it goes back only while the contact is still at the table.
             do {
-                guard let now = try store.list().first(where: { $0.id == peerID }), now.readsDesk == true, now.canReadTable else { return notAtTable }
+                guard let now = try store.list().first(where: { $0.id == peerID }), table ? now.canReadTable : now.atTable else {
+                    return notAtTable
+                }
             } catch { return unknown(error) }
             return project(ChatToolOutcome.failure(error: error, tool: "agent_desk", effects: ToolFailureError.Effects.none), failed: true)
         }
         let piece = read.objectValue?["piece"]?.objectValue
         let entry = AgentTableRead(at: Date(), piece: piece?["make_ref"]?.stringValue, title: piece?["title"]?.stringValue)
-        do { guard try store.recordTableRead(peerID: peerID, entry) else { return notAtTable } }
+        do { guard try store.recordTableRead(peerID: peerID, entry, table: table) else { return notAtTable } }
         catch {
             return (["status": "unavailable", "detail": """
                 The read could not be recorded on your contact (\(NativeAgentSecretRedactor.redactText(error.localizedDescription))), so its words \

@@ -484,7 +484,7 @@ release_assert_scanner_canary() {
 release_collect_identity_gate_binaries() {
   local bundle="$1"
   RELEASE_IDENTITY_BINARIES=()
-  local dir="$bundle/Contents/MacOS"
+  local dir="$bundle"
   if [[ ! -d "$dir" ]]; then
     echo "ERROR: A1.1 leak gate has no executable directory to scan: $dir" >&2
     echo "       A missing scan subject is NOT a clean binary. REFUSING TO SHIP." >&2
@@ -494,7 +494,7 @@ release_collect_identity_gate_binaries() {
   status_file="$(mktemp "${TMPDIR:-/tmp}/nativeagent-gate-find.XXXXXX")" || return 2
   while IFS= read -r -d '' f; do
     RELEASE_IDENTITY_BINARIES+=("$f")
-  done < <(find "$dir" -type f -perm -u+x -print0; printf '%s' "$?" > "$status_file")
+  done < <(find "$dir" -type d -name Frameworks -prune -o -type f -path '*/MacOS/*' \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print0; printf '%s' "$?" > "$status_file")
   find_rc="$(cat "$status_file")"
   rm -f "$status_file"
   if [[ "$find_rc" != "0" ]]; then
@@ -515,7 +515,7 @@ release_identity_leak_regex() {
   local denylist_file="${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-}"
   local file_regex=""
 
-  if [[ -n "$denylist_file" && -r "$denylist_file" ]]; then
+  if [[ -n "$denylist_file" ]]; then
     # rc 1 here means a pattern in the denylist is broken. Propagating it (not
     # `|| true`) is the whole point: a scan driven by a rejected regex finds
     # nothing and looks exactly like a clean bundle.
@@ -796,7 +796,7 @@ release_assert_no_leaked_data() {
     release_require_valid_regex "$_PERSONAL_RE" "NATIVEAGENT_PRIVACY_RE" \
       || { echo "ERROR: refusing to run the leak guard behind a broken privacy pattern." >&2; return 1; }
   fi
-  if [[ -f "$_PRIVACY_DENYLIST_FILE" ]]; then
+  if [[ -n "${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-}" || -f "$_PRIVACY_DENYLIST_FILE" ]]; then
     _FILE_PRIVACY_RE="$(release_denylist_regex_from_file "$_PRIVACY_DENYLIST_FILE")" \
       || { echo "ERROR: privacy denylist $_PRIVACY_DENYLIST_FILE is unusable — REFUSING TO SHIP." >&2; return 1; }
     if [[ -n "$_FILE_PRIVACY_RE" ]]; then
@@ -839,12 +839,9 @@ release_assert_no_leaked_data() {
         '*/embedding/vocab.txt' '*/embedding/embedding.mlpackage/*'
     )" || { echo "ERROR: identity resource scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
   else
-    # A silently skipped identity scan is how a leak ships as a green gate.
-    # script/release_github.sh already REQUIRES this input; a direct release.sh
-    # run must at minimum announce that the check did not happen.
     echo "==> WARNING: NATIVEAGENT_LOCAL_IDENTITY_RE is unset — the local-identity"
     echo "    scan of app resources AND of the release executable is SKIPPED."
-    echo "    Set NATIVEAGENT_LOCAL_IDENTITY_RE (script/release_github.sh requires it)"
+    echo "    Set NATIVEAGENT_LOCAL_IDENTITY_RE, NATIVEAGENT_PRIVACY_RE, or NATIVEAGENT_PRIVACY_DENYLIST_FILE"
     echo "    before shipping anything public."
   fi
   # Binary pass included: a credential inside a binary plist / compiled asset is
@@ -863,13 +860,16 @@ release_assert_no_leaked_data() {
     return 1
   fi
   _identity_binary_hits=""
-  if [[ -n "$_PUBLIC_IDENTITY_RE" ]]; then
-    _identity_binary_hits="$(release_scan_binary_for_local_identity "$_EXECUTABLE" "release executable identity" "$_PUBLIC_IDENTITY_RE")" \
-      || { echo "ERROR: identity executable scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
-  fi
   _secret_binary_hits=""
-  _secret_binary_matches="$(release_scan_binary_for_regex "$_EXECUTABLE" "release executable secret value" cs "$_SECRET_VALUE_RE")" \
-    || { echo "ERROR: secret-value executable scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
+  release_collect_identity_gate_binaries "$BUNDLE" || return 1
+  for _EXECUTABLE in "${RELEASE_IDENTITY_BINARIES[@]}"; do
+    if [[ -n "$_PUBLIC_IDENTITY_RE" ]]; then
+      _raw_hits="$(release_scan_binary_for_local_identity "$_EXECUTABLE" "release executable identity" "$_PUBLIC_IDENTITY_RE")" \
+        || { echo "ERROR: identity executable scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
+      [[ -z "$_raw_hits" ]] || _identity_binary_hits+="$_EXECUTABLE"$'\n'
+    fi
+    _secret_binary_matches="$(release_scan_binary_for_regex "$_EXECUTABLE" "release executable secret value" cs "$_SECRET_VALUE_RE")" \
+      || { echo "ERROR: secret-value executable scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
   # Benign-literal allowlist: EXACT full-line matches only, never regex
   # loosening. Each entry is a compiled constant proven non-secret; anything
   # else — including a superstring of an entry — still refuses. Add entries
@@ -879,17 +879,18 @@ release_assert_no_leaked_data() {
   #   alternative.
   #   pooling=attention-mask-mean-or-model-pooled — the same CoreML constant
   #   emitted with its log-field prefix in one string-table line.
-  if [[ -n "$_secret_binary_matches" ]]; then
-    local _allow_rc=0
-    _secret_binary_matches="$(grep -Fxv -e "attention-mask-mean-or-model-pooled" -e "pooling=attention-mask-mean-or-model-pooled" <<<"$_secret_binary_matches")" || _allow_rc=$?
-    if [[ "$_allow_rc" -gt 1 ]]; then
-      echo "ERROR: benign-literal filter FAILED — grep exited $_allow_rc. REFUSING TO SHIP." >&2
-      return 1
+    if [[ -n "$_secret_binary_matches" ]]; then
+      local _allow_rc=0
+      _secret_binary_matches="$(grep -Fxv -e "attention-mask-mean-or-model-pooled" -e "pooling=attention-mask-mean-or-model-pooled" <<<"$_secret_binary_matches")" || _allow_rc=$?
+      if [[ "$_allow_rc" -gt 1 ]]; then
+        echo "ERROR: benign-literal filter FAILED — grep exited $_allow_rc. REFUSING TO SHIP." >&2
+        return 1
+      fi
     fi
-  fi
-  if [[ -n "$_secret_binary_matches" ]]; then
-    _secret_binary_hits="$_EXECUTABLE"
-  fi
+    if [[ -n "$_secret_binary_matches" ]]; then
+      _secret_binary_hits+="$_EXECUTABLE"$'\n'
+    fi
+  done
   if [[ -n "$_personal_hits" || -n "$_identity_text_hits" || -n "$_identity_binary_hits" || -n "$_secret_text_hits" || -n "$_secret_file_hits" || -n "$_secret_binary_hits" ]]; then
     echo "" >&2
     echo "ERROR: release bundle FAILED the personal-data leak guard — REFUSING TO SHIP." >&2

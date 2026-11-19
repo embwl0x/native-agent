@@ -37,7 +37,7 @@ enum SettingsInnerLifeStatus {
         }
 
         guard runtime.enabled else {
-            return State(text: "Off", detail: nil, tone: .neutral)
+            return State(text: "Off", detail: nil, tone: .neutral, recovery: .reapply)
         }
 
         guard let reflectionRoute else {
@@ -65,10 +65,9 @@ enum SettingsInnerLifeStatus {
         let inactiveLanes = inactiveLaneNames(runtime)
         guard inactiveLanes.isEmpty else {
             return State(
-                text: "Not active: " + inactiveLanes.joined(separator: ", ") + ". Try enabling again.",
+                text: "Not active: " + inactiveLanes.joined(separator: ", ") + ".",
                 detail: nil,
-                tone: .warning,
-                recovery: .reapply
+                tone: .warning
             )
         }
 

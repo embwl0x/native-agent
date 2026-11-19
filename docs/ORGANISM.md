@@ -379,6 +379,7 @@ the substrate, so a body consequence cannot feed back into itself.
 
 The [wiring map](COGNITION_WIRING.md#shared-work-slot-admission) owns reflection's
 two-hour background slot, unused-claim release and spent-window retention.
+A held slot paces waking reflection; a dream's reflection still reaches substrate admission.
 
 ### Persistence + decay
 
@@ -392,7 +393,9 @@ so genuine elapsed decay is saved with the values it anchors.
 Only its current schema is accepted: encounter, epoch, lived watermark, field
 identities, outcome weights and current body fields are checked, with no rekeying
 or invented old defaults. The persisted body bits remain the continuity
-representation and transient typed readings rebuild from their sensors. Capability outcome weights
+representation and transient typed readings rebuild from their sensors. Live tool
+capability uses the trace owner's successful `dispatch` receipts, both standalone
+and bound to a turn. Capability outcome weights
 spend the full elapsed interval on their seven-day half-life, independently of
 the 72-hour tissue-decay cap. Dream completion evidence reads only the checked
 `ConversationHistory.dreamConsolidationMark` owner (`lastDreamedAt`);

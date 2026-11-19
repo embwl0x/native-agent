@@ -8,9 +8,10 @@ likewise require a checked complete catalog; an unreadable owner reports
 unavailable rather than removing its actions from a successful inventory.
 
 Capability inventory comes from current features, abilities and connector
-actions. Retired pack records no longer appear as available or
-installed capabilities. Catalog source and trust-root reads use only saved
-typed records; they create no local pack source, root or signing key. Missing
+actions. Exact capability trust checks use the full checked inventory. The trust
+network displays up to 200 records. Retired pack records no longer appear as
+available or installed capabilities. Catalog source and trust-root reads use only
+saved typed records; they create no local pack source, root or signing key. Missing
 lists have no saved rows; unreadable or malformed lists report their named
 failure, preserving their bytes. Source saves take typed name, URL and kind
 strings, update the same name-derived ID, and preserve existing creation and
@@ -140,8 +141,8 @@ or profile. SQLite opens the copy read-only; it is deleted after success or
 failure, and cleanup failures are reported. Results identify `source: "sqlite_snapshot"`.
 Top-domain counts aggregate all qualifying visits since `since` before limiting
 returned domains, without a candidate-URL count cap. Search matches title or URL
-case-insensitively. The existing two-second SQLite progress deadline bounds query
-work, not filesystem I/O. Full Mac and file-read admission remain required;
+case-insensitively. SQLite completion/error or Stop ends snapshot and query work.
+Full Mac and file-read admission remain required;
 the extension has no history action or `history` permission. Capture/read failures
 never select another reader or profile.
 Actions that may start a navigation read the current ready document through
@@ -167,8 +168,7 @@ detail JSON rows. It is read-only, including on missing storage; the
 [experience contract](EXPERIENCE.md#reading-their-own-record) owns its arguments,
 row cap and explicit unreadable-row gaps.
 Retired names are refused with translated `app` calls. There is no tool
-loading/unloading workflow or separate workspace tool; workspace items are
-part of app home.
+loading/unloading workflow. Home and the glance name items opened through `app {item}`.
 
 Action preview follows the [preview contract](ONE_DOOR.md#one-door-every-action).
 `expected_version` guards a read's page version. Home items can act and support neither option.
@@ -246,7 +246,10 @@ connectors and agent communication under the saved policy.
   applying the patch. Shell calls use the owner's conservative literal-command
   certifier: certified reads report `effect:read`, `read_only:true` and pass
   Trust as reads; all other forms remain writes. Read execution shares the
-  Git reader's fixed executable/config/environment and read-only sandbox.
+  Git reader's fixed executable/config/environment and read-only sandbox,
+  adding case-folded denials for the credential fence's resolved roots:
+  home .ssh, .aws, .gnupg, .codex and Library/Keychains, the manifest signing
+  key, and the data root's providers, codex_home and codex_child_home.
   A pre-launch refusal reports `execution:not_run`, `effect:none`.
   Text windows and excerpts require valid UTF-8; invalid source bytes return
   `invalid_utf8`. Explicit `files.read {raw:true}` returns exact bytes as base64,
@@ -263,9 +266,9 @@ connectors and agent communication under the saved policy.
   `matched`, `mismatched`, `absent`, or `unavailable`. Only a kernel ENOENT proves
   absence; unavailable readback retains its error domain/code/message and returns
   `verified:null`, while known matches/contradictions return true/false. Move reads
-  both entries and keeps each result. Append uses the same checked entry read
-  before choosing an existing file or creating a missing one; unreadability stops
-  it before writing.
+  both entries and keeps each result. MacControl append opens the file once,
+  creating it if absent, and checks that the opened file is regular before
+  appending. Explicit replacement uses an atomic write.
   File grep uses only macOS `/usr/bin/grep`, independent of the launch PATH and
   without an extra install. Patterns are POSIX extended regular expressions
   matched byte-wise in the C locale, with no inherited `GREP_OPTIONS`. Recursive
@@ -304,7 +307,10 @@ connectors and agent communication under the saved policy.
   Gaps make coverage incomplete; at most 50 gap details are shown, with the total
   and omitted counts retained. Capture is still capped at 1 MiB, selected matches
   at 50 and displayed text at 30000 characters. Git uses `/usr/bin/git`; missing
-  developer tools report their repair. Repository summaries propagate every
+  developer tools report their repair. `git.diff` and `git.log` retain at most
+  16 MiB per output stream while draining the process; a cut capture reports
+  an incomplete-output failure instead of a successful partial diff or history.
+  Repository summaries propagate every
   failed history read. Only Git's
   explicit porcelain-v2 `branch.oid (initial)` establishes an unborn history,
   reported as `history_state:unborn` with no commits.
@@ -316,7 +322,12 @@ connectors and agent communication under the saved policy.
   Non-search subprocess readers retain strict whole-output UTF-8 decoding.
   Unrepresentable C arguments (embedded NUL, or invalid environment keys) are
   refused before spawn rather than executed with truncated values.
-- **Disk capacity:** `mac.system_info` returns `disk` for the named Data
+- **System information:** ordinary `mac.system_info` reads local facts without
+  pinging an internet host or querying a public-IP service. Network fields use
+  local SystemConfiguration, VPN and Wi-Fi readings; they do not claim internet
+  reachability or a public address. Explicit `speed_test:true` uses internet
+  bandwidth; `check_updates:true` asks Software Update for available updates.
+  `mac.system_info` returns `disk` for the named Data
   volume (`/System/Volumes/Data`) and `system_disk` for the named sealed System
   volume (`/`), each with free, used and total GiB and usage percentage.
   `memory.total_mb` comes from OS physical memory, independent of the current
@@ -332,6 +343,9 @@ connectors and agent communication under the saved policy.
 - **Mac control:** `mac.look`, `mac.act`, `mac.go` and `mac.wait`
   expose perception and action. Perception, document, clipboard, filesystem and
   Spotlight reads bypass motor persistence and replay while retaining policy admission.
+  Clipboard reads with `org.nspasteboard.ConcealedType` or `org.nspasteboard.TransientType`
+  return no text or text length and a note that the clipboard holds concealed content,
+  including metadata-only reads. Ordinary text keeps its line redaction and size limit.
   Interactive AX reads and mutations share capability-based renderer preparation,
   checked capability readback and event-backed content readiness; passive reads
   never write mode flags. See [renderer perception](USER_GUIDE.md#turn-on-mac-computer-control-and-the-activity-watcher)
@@ -368,6 +382,8 @@ connectors and agent communication under the saved policy.
   when a bounded read can obtain them. Nothing is launched or opened.
   These are empty observations, not action preconditions: acts still require
   their target and window, with the existing menu/key handling for windowless apps.
+  Explicit menu-path acts on named background apps use that app's native menu
+  press, including when it has no window; they do not require raising it first.
   Ambiguity, permission, lock, minimized-window and read-budget failures remain explicit.
   Bare-name action misses retain an auxiliary menu read's failure text and its
   original detail in `menu_lookup_failure`; unreadable menus do not establish
@@ -383,9 +399,19 @@ connectors and agent communication under the saved policy.
   Accessibility and Screen Recording grants
   remain macOS decisions. An attempted AX mutation with a failed reply returns
   its readback and never advances to another mutation mechanism.
-  Background typing selects another writer only when the previous writer was
-  proven unsupported before a write; selection-probe failures and every failed
-  text or selection write stop with readback, including single-line replacement.
+  Page compilation indexes ancestry once per reading and shares each caption
+  scope's static-text runs within the pass that assigns checkbox labels.
+  Toolbar caption matching groups nodes by parent once per reading and reads
+  only a checkable control's siblings.
+  A missing ancestry-index entry reports a screen-page compiler fault instead
+  of being treated as an empty ancestor list.
+  Ordinary AX typing uses whole-value replacement for single-line fields and
+  selection insertion for multiline editors, in front and background alike.
+  Only whole-value replacement can be already held; existing text never skips
+  an insertion. Foreground replacement reports `method: ax_set_value`, with no
+  background delivery route.
+  Selection-probe failures and every failed text or selection write stop with
+  readback; no other writer runs after a refused write.
   Live captured-window continuations retain native AX identity, so a replacement
   window at the same position cannot inherit captured marks or paths.
   Delivered window/region and desktop image points retain their capture-start time,
@@ -449,14 +475,18 @@ connectors and agent communication under the saved policy.
   and masks it completely; caption and geometry failures still withhold pixels.
   Text roles with an unreadable subrole contribute no value to text looks,
   including values read as another control's caption or a native selector label.
-  Window OCR runs on every look under caption redaction, without the whole-window
-  walk; when a picture is released it uses the same mask union and omits any
-  intersecting row. Unproven capture geometry or OCR positions withhold all recognized
-  text for that capture with a named cause, retaining the AX observation.
+  Window OCR uses caption redaction and the complete pre-capture and post-capture
+  mask union, including when no picture is requested. Any intersecting OCR row
+  is omitted. Incomplete coverage, unproven capture geometry or unproven OCR
+  positions withhold recognized text with a named cause and retain the AX observation.
   Released images report both inspected node counts and the union's
-  mask count in `pixel_coverage`. Superseded views discard pixels and marks;
-  superseded looks return no action handles. LatestRead remains the publication owner and the shared
-  frame lifetime remains 180 seconds. Selected marks/text report omissions and
+  mask count in `pixel_coverage`. Pointer motion and scroll pulses with a global
+  screen point invalidate a published view or supersede an in-flight capture
+  only when that point is within its bounds or the view has no bounds. Other pulses, including motion or
+  scroll without a usable point, invalidate all views and in-flight captures.
+  Superseded views discard pixels and marks, and superseded looks return no
+  action handles. LatestRead owns publication order and the shared frame
+  lifetime is 180 seconds. Selected marks/text report omissions and
   AX truncation; they never claim an exhaustive window. Control names come from
   their own attributes or owned descendants, never unrelated nearby text.
   Focus paths use the owning observation's element identities and child order;
@@ -582,11 +612,12 @@ connectors and agent communication under the saved policy.
   for empty documents.
   When every kept line of the first screen frame comes from an `AXTextArea`
   value and no node, depth, character or per-node bound cut it, that frame is
-  the whole text: `reached_end: true`, without scrolling, pointer movement,
-  scroll capture/restoration or a scroll-target check. This works in a background
-  window and includes the beginning wherever the window is scrolled; it reports
-  neither `started_below_beginning` nor `scrollable: false`. Cancellation,
-  deadlines, secure-content handling and redaction still apply.
+  the whole text with indentation and blank lines preserved. It reports
+  `reached_end: true` without scrolling, pointer movement, scroll capture,
+  scroll restoration or a scroll-target check. This works in a background window
+  at any scroll position and omits `started_below_beginning` and
+  `scrollable: false`. Cancellation, deadlines, secure-content handling and
+  redaction still apply.
   Passive reads may return that effect-free whole-text frame; viewport-only
   passive reads return their visible text as incomplete without scrolling.
   Other screen reads accumulate by scrolling and report `scroll_target_changed`
@@ -654,7 +685,9 @@ connectors and agent communication under the saved policy.
   (year, month, day, seconds since midnight) and is built in the Mac's time zone,
   so reads do not depend on the Mac's language or region; a date that cannot be
   read keeps its note, with `modified_at: null` and `modified_at_unknown` saying
-  why, and is not a gap. Updates return the exact note id and observed title; if only the title
+  why, and is not a gap. A replacement body uses LF for CRLF and CR line endings
+  before comparing its first line with the note's name and writing the body.
+  Updates return the exact note id and observed title; if only the title
   readback fails after the update, the completed receipt retains that id and a
   failed `readback` with its actual error, without an invented title.
   Exact Messages history completes only when its history owner reports
@@ -726,8 +759,10 @@ connectors and agent communication under the saved policy.
   player PID returns `no_player` with no effect; Stop propagates cancellation,
   rather than a discovery failure. The player's Write switch still decides admission.
   `mac.apps` consumes the resident Spotlight snapshot. A readable bundle with no
-  declared platform is a Mac app. Missing bundle-identity or installation evidence produces
-  per-row `classification_failures`, `classification_unavailable` and a
+  declared platform is a Mac app. Ancestor package exclusion uses the filesystem's
+  package flag, so a dotted folder name alone leaves the app eligible. Missing
+  bundle-identity or installation evidence produces per-row
+  `classification_failures`, `classification_unavailable` and a
   `partial` reply, never a guessed installed classification. Such rows are
   excluded from the actionable installed projection; exact matching resolution
   reports uncertainty only for potentially installed Mac candidates, so known
@@ -784,7 +819,7 @@ connectors and agent communication under the saved policy.
   without treating a server answer as a transport failure.
   A successful thin/JavaScript-gated extraction selects Chrome's rendered
   reader through its normal app door in a new NativeAgent background tab.
-  This also applies from workspace: the nested navigation owns its page readback
+  This also applies from home items: the nested navigation owns its page readback
   and settlement evidence.
   The reply says `used_browser:true`, retains HTTP evidence/receipt under
   `http_read`, and carries Chrome's actual page or blocker. `text_reader` says
@@ -814,6 +849,8 @@ Chrome setup is in the [extension guide](../Extensions/NativeAgentChrome/README.
 
 Make allocates positive, increasing artifact versions with checked arithmetic;
 exhausted version numbers refuse the append without changing its metadata.
+Under the Make lock, an append removes any uncommitted file at the next version's
+path before copying the new version.
 A version the person saved by changing a table in the window records
 `person_edit_of`, the version it was changed from, and is appended only while
 that version is still the newest.
@@ -859,6 +896,7 @@ the completed one-shot backfill and its receipt reader are retired.
 
 Persona editor/setup appends reject a combined document above 30,000 code
 points before backup or mutation, leaving the caller's draft recoverable.
+Document replacement saves the complete supplied text without clipping.
 The separately authored `personaAppendSection` path remains unbounded.
 Onboarding voice selection, UTC backup timestamps and journal encounter stamps
 use total value selection without forced optional unwraps.
@@ -986,7 +1024,7 @@ approval and has no expiry timer. Explicit user blocks, origin authentication,
 macOS grants and hard domain refusals remain authoritative. **macOS privacy
 permission resets always ask the owner first.**
 
-A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. A note from your agent to you (`chat.post`) is never held, whoever steered the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+Peer cards offer **Just this** for one call or **For this task** for the run; [Trust](ONE_DOOR.md#authority-and-receipts) owns the rules.
 Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply.
 
@@ -1038,8 +1076,10 @@ message date for either sort and also the unread message selected by
 no default cutoff. `since` accepts local `YYYY-MM-DD`, ISO-8601 with a time
 zone, a positive duration such as `7d` (minutes/hours/days/weeks: `m/h/d/w`),
 or `this week` from the local week's start. The same date forms work with
-`from_me` and its exact window counts; exact-thread history uses its own
-message cursor instead. Read flags describe local state, not recipient receipts.
+`from_me` and its exact window counts. Exact-thread history refuses a nonblank
+`query` or positive `offset`. For older history, pass the returned
+`older_before_message_id` as `before_message_id` with the same `thread_id`.
+Read flags describe local state, not recipient receipts.
 
 Calendar day selection accepts `today`, `tomorrow`, or an exact `YYYY-MM-DD`
 date. Invalid supplied days fail explicitly; only an omitted day selects the

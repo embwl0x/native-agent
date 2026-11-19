@@ -124,7 +124,7 @@ extension SwiftNativeMacControl {
         }
         if let refusal = await send(confirmPlan, field: field) { return stoppedInput(refusal) }
         let closed = await macSettle("save_panel_sheet_closed", signals: fieldSignals, patience: 3) {
-            fieldEvents.saw(kAXUIElementDestroyedNotification)
+            fieldEvents.saw(kAXUIElementDestroyedNotification) || !source.isFocusedElement(field, pid: pid, context: context)
         }
         guard closed == .held, !Task.isCancelled else {
             return result("save_panel_placement_unverified",
@@ -133,6 +133,7 @@ extension SwiftNativeMacControl {
         var whereNow: String?
         var directoryNow: URL?
         let wantedDirectory = URL(fileURLWithPath: placement.directory, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+        let wantedName = FileManager.default.displayName(atPath: placement.directory)
         let directoryHeld = await macSettle("save_panel_directory", signals: openSignals, patience: 3) {
             guard !Task.isCancelled, evidenceError == nil else { return false }
             do {
@@ -140,10 +141,10 @@ extension SwiftNativeMacControl {
                 whereNow = popup?.value
                 directoryNow = try popup.flatMap { try accessibilityActSource(context: context).url(of: $0, context: context) }
             } catch { evidenceError = error.localizedDescription; return false }
-            return directoryNow?.standardizedFileURL.resolvingSymlinksInPath() == wantedDirectory
+            return directoryNow.map { $0.standardizedFileURL.resolvingSymlinksInPath() == wantedDirectory } ?? (whereNow == wantedName)
         }
         if let evidenceError { return result("ax_evidence_unavailable", guidance: evidenceError) }
-        let placed = directoryHeld == .held && directoryNow?.standardizedFileURL.resolvingSymlinksInPath() == wantedDirectory
+        let placed = directoryHeld == .held
         guard placed, !Task.isCancelled else {
             return result("save_panel_placement_unverified",
                 guidance: "Go-to-folder input was delivered; the destination URL is not verified yet. The basename was not changed; inspect the panel.")
@@ -162,10 +163,11 @@ extension SwiftNativeMacControl {
         let text = ok
             ? """
                 Pointed the save panel at \(placement.directory) (Where: \(whereNow ?? "")) and named the file \(placement.name); its Save button saves it \
-                there.
+                there. After Save, the file on disk is the proof.
                 """
             : "The save panel points at \(placement.directory); the basename is not verified yet. Read the panel before pressing Save."
         extra["where_after"] = whereNow.map(JSONValue.string) ?? .null
+        extra["directory_proof"] = .string(directoryNow == nil ? "where_name" : "url")
         extra["directory_url_after"] = directoryNow.map { .string($0.absoluteString) } ?? .null
         extra["name_after"] = nameNow.map(JSONValue.string) ?? .null
         extra["text"] = .string(text)
@@ -262,31 +264,34 @@ private final class MacSavePanelFieldSource: MacAXEffectObserverSource {
                     }
                     let callback = MacSavePanelCallback(onNotification)
                     let refcon = Unmanaged.passRetained(callback).toOpaque()
-                    var observer: AXObserver?
-                    let status = AXObserverCreate(pid, { _, _, kind, refcon in
-                        guard let refcon else { return }
-                        let callback = Unmanaged<MacSavePanelCallback>.fromOpaque(refcon).takeUnretainedValue()
-                        callback.receive(MacAXEffectNotification(kind: kind as String, at: Date()))
-                    }, &observer)
-                    guard status == .success, let observer else {
-                        Unmanaged<MacSavePanelCallback>.fromOpaque(refcon).release()
-                        throw MacAccessibilityReader.NativeReadFailure(
-                            detail: "Save-panel AXObserverCreate did not produce an observer (AX status \(status.rawValue)).")
-                    }
-                    let registrations: [(AXUIElement, String)] = [
-                        (field, kAXValueChangedNotification),
-                        (sheet, kAXUIElementDestroyedNotification),
-                    ]
-                    let observation = MacSavePanelFieldObservation(observer: observer, registrations: registrations, refcon: refcon)
-                    for (element, kind) in registrations {
+                    let observation = MacSavePanelFieldObservation(refcon: refcon)
+                    for (element, kind) in [(field, kAXValueChangedNotification), (sheet, kAXUIElementDestroyedNotification)] {
+                        var owner: pid_t = 0
+                        if AXUIElementGetPid(element, &owner) != .success { owner = pid }
+                        var observer = observation.observer(for: owner)
+                        if observer == nil {
+                            let status = AXObserverCreate(owner, { _, _, kind, refcon in
+                                guard let refcon else { return }
+                                let callback = Unmanaged<MacSavePanelCallback>.fromOpaque(refcon).takeUnretainedValue()
+                                callback.receive(MacAXEffectNotification(kind: kind as String, at: Date()))
+                            }, &observer)
+                            guard status == .success, let created = observer else {
+                                observation.stop()
+                                throw MacAccessibilityReader.NativeReadFailure(
+                                    detail: "Save-panel AXObserverCreate did not produce an observer (AX status \(status.rawValue)).")
+                            }
+                            CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(created), .defaultMode)
+                            observation.keep(created, for: owner)
+                        }
+                        guard let observer else { continue }
                         let status = AXObserverAddNotification(observer, element, kind as CFString, refcon)
                         guard status == .success else {
                             observation.stop()
                             throw MacAccessibilityReader.NativeReadFailure(
                                 detail: "Save-panel observation of \(kind) could not be registered (AX error \(status.rawValue)).")
                         }
+                        observation.registered(observer, element, kind)
                     }
-                    CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
                     return observation
                 }
             } catch {
@@ -306,26 +311,30 @@ private final class MacSavePanelCallback: Sendable {
 private final class MacSavePanelFieldObservation: MacAXEffectObservation {
     /// AX references are used only on the AX lane; the mutex hands them there once.
     private struct Registration: @unchecked Sendable {
-        let observer: AXObserver
-        let registrations: [(AXUIElement, String)]
-        let refcon: UnsafeMutableRawPointer
+        var observers: [pid_t: AXObserver] = [:]
+        var registrations: [(AXObserver, AXUIElement, String)] = []
+        var refcon: UnsafeMutableRawPointer?
     }
-    private let registration: Mutex<Registration?>
+    private let registration: Mutex<Registration>
 
-    init(observer: AXObserver, registrations: [(AXUIElement, String)], refcon: UnsafeMutableRawPointer) {
-        registration = Mutex(Registration(observer: observer, registrations: registrations, refcon: refcon))
+    init(refcon: UnsafeMutableRawPointer) { registration = Mutex(Registration(refcon: refcon)) }
+
+    func observer(for pid: pid_t) -> AXObserver? { registration.withLock { $0.observers[pid] } }
+    func keep(_ observer: AXObserver, for pid: pid_t) { registration.withLock { $0.observers[pid] = observer } }
+    func registered(_ observer: AXObserver, _ element: AXUIElement, _ kind: String) {
+        registration.withLock { $0.registrations.append((observer, element, kind)) }
     }
 
     func stop() {
         MacAXExecutionLane.sync {
             registration.withLock { state in
-                guard let live = state else { return }
-                for (element, kind) in live.registrations {
-                    AXObserverRemoveNotification(live.observer, element, kind as CFString)
+                guard let refcon = state.refcon else { return }
+                for (observer, element, kind) in state.registrations { AXObserverRemoveNotification(observer, element, kind as CFString) }
+                for observer in state.observers.values {
+                    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
                 }
-                CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(live.observer), .defaultMode)
-                Unmanaged<MacSavePanelCallback>.fromOpaque(live.refcon).release()
-                state = nil
+                Unmanaged<MacSavePanelCallback>.fromOpaque(refcon).release()
+                state = Registration()
             }
         }
     }

@@ -53,8 +53,6 @@ extension EngineFaceActs {
             let detail = await runtime.observatoryDetail()
             if (detail.summary.ablations[name] != false) != enabled { await runtime.setAblation(name, enabled: enabled) }
             (status, message) = ("saved", enabled ? "Workspace included." : "Workspace excluded.")
-        case .setLane:
-            throw Self.failure("cognition_lane_unknown", "Use the named inner life controls in Settings.")
         }
         await engine.cognitionView.refreshObservatory(contextFlowHealthRead: { @Sendable [engine] in
             await engine.contextFlow.observatoryHealthState()

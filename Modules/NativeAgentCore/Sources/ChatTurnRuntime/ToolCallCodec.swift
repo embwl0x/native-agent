@@ -150,7 +150,7 @@ enum ToolCallCodec: Sendable, Equatable {
     func roundCalls(
         streamed: [ParsedToolCall], text: String, schemas: [LLMToolSchema], recordShims: Bool = true, turn: Turn?
     ) throws -> [ParsedToolCall] {
-        switch self {
+        let calls: [ParsedToolCall] = switch self {
         case .native:
             ToolCallParser.executableCalls(streamed)
         case .none:
@@ -158,5 +158,23 @@ enum ToolCallCodec: Sendable, Equatable {
         case .textMarkers:
             try TextMarkerCodec(schemas: schemas, turnActiveTools: [], turn: turn).calls(in: text, recordShims: recordShims)
         }
+        // Private root fields come from the host, never from a model. Action arguments retain their owner's declared vocabulary.
+        return calls.map { call in
+            var admitted = ParsedToolCall(id: call.id, name: call.name, input: Self.modelInput(call.input),
+                invokeRawText: call.invokeRawText.filter { !$0.key.hasPrefix("__") })
+            admitted.undeclaredKeys = call.undeclaredKeys.filter { !$0.hasPrefix("__") }
+            return admitted
+        }
+    }
+
+    private static func modelInput(_ input: [String: JSONValue]) -> [String: JSONValue] {
+        var input = input.filter { !$0.key.hasPrefix("__") }
+        if case .array(let entries)? = input["actions"] {
+            input["actions"] = .array(entries.map { entry in
+                guard case .object(let fields) = entry else { return entry }
+                return .object(modelInput(fields))
+            })
+        }
+        return input
     }
 }

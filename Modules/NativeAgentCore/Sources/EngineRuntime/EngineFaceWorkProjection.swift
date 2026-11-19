@@ -87,6 +87,11 @@ enum EngineFaceWorkProjection {
                 await engine.face.post(shelfFace(metadata, newest: newest, loaded: loaded, issue: issue), at: key)
             }
         case .makePreview(let reference, let version):
+            if reference == BoardDocument.tableRef, version == "0" {
+                await engine.face.post(MakePreviewFace(reference: reference, version: version, kind: BoardDocument.type,
+                    text: BoardDocument().text, resources: [], revision: version, state: .ready), at: key)
+                return
+            }
             let studio = MakeStudio(dataRoot: engine.dataRoot)
             guard MakeStudio.isRef(reference), let number = Int(version), number > 0, String(number) == version else {
                 await engine.face.post(previewFailure(reference, version, cause: "Choose a canonical Make ref and version."), at: key)
@@ -249,7 +254,8 @@ enum EngineFaceWorkProjection {
     static func versionTitle(_ ref: String, _ version: MakeStudio.Version) -> String { ref + "-" + version.file }
 
     private static func shelfFace(_ metadata: [MakeStudio.Meta], newest: String?, loaded: Bool, issue: String?) -> MakeShelfFace {
-        let versions = metadata.flatMap { meta in
+        let pieces = metadata.filter { $0.ref != BoardDocument.tableRef }
+        let versions = pieces.flatMap { meta in
             meta.versions.map { version in
                 FaceMakeVersion(reference: meta.ref, version: String(version.n), title: versionTitle(meta.ref, version),
                     date: NativeTimestampFormat.parseISO8601(version.created),
@@ -259,7 +265,10 @@ enum EngineFaceWorkProjection {
                         : makeKind(URL(fileURLWithPath: version.file)))
             }
         }
-        return MakeShelfFace(versions: versions, newest: newest, state: state(issue, loaded: loaded, owner: "Make shelf"))
+        let selected = newest == BoardDocument.tableRef ? pieces.max {
+            ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "")
+        }?.ref : newest
+        return MakeShelfFace(versions: versions, newest: selected, state: state(issue, loaded: loaded, owner: "Make shelf"))
     }
 
     private static func senseFace(_ view: SenseInteractiveView?, revision: String?, loaded: Bool, issue: String?) -> SenseViewFace {

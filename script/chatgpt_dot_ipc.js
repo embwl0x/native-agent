@@ -361,7 +361,7 @@ async function main(input) {
     // ChatGPT's selection file can name a conversation ChatGPT no longer has
     // (deleted, or moved by an app update): its own answer says so, and that is
     // not a protocol change. Nothing was accepted, so nothing is unknown.
-    if (response.resultType === "error" && /thread not found|not found/i.test(String(response.error ?? ""))) {
+    if (response.resultType === "error" && /not found/i.test(String(response.error ?? ""))) {
       dispatched = false;
       fail("dot_conversation_gone", "Dot's conversation in ChatGPT no longer exists (ChatGPT: " + String(response.error) + "). Open Dot in ChatGPT, or start his conversation again, so ChatGPT selects a current one; then send again. Nothing was sent.");
     }
@@ -369,11 +369,6 @@ async function main(input) {
       || response.handledByClientId !== follower.owner || !string(result?.turn?.id)
       || result.clientUserMessageId !== clientUserMessageId
       || !["started", "steered", "duplicate"].includes(result.admissionOutcome)) {
-      try { require("fs").writeFileSync(require("path").join(process.cwd(), "logs", "dot_ipc_admission.json"),
-        JSON.stringify({ at: new Date().toISOString(), resultType: response.resultType, method: response.method,
-          handledBy: response.handledByClientId === follower.owner, keys: Object.keys(result ?? {}),
-          admissionOutcome: result?.admissionOutcome, hasTurn: !!result?.turn?.id,
-          idMatch: result?.clientUserMessageId === clientUserMessageId, error: response.error }, null, 1)); } catch {}
       fail("admission_shape_changed");
     }
     return { status: "sent", sent: true, client_user_message_id: clientUserMessageId };

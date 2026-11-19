@@ -5,6 +5,7 @@ import Cognition
 import DreamREMCycle
 import Foundation
 import MacControl
+import MemoryV2
 import NativeAgentShared
 import ProviderRouting
 import PersonaEngine
@@ -28,7 +29,7 @@ extension NativeAgentEngine {
             let result: Result<FaceActOutcome, Error>
             do { result = .success(try await tools.personTap(call, tap)) }
             catch { result = .failure(error) }
-            if tap.page == "memories" {
+            if tap.page == "memories", ["memories.search", "memories.refresh"].contains(call.action) {
                 await pages?.refresh(page: "memories")
                 await phoneMemoryPages?.refresh(page: "memories")
             }
@@ -72,11 +73,29 @@ extension NativeAgentEngine {
         }
         await watch(page: "settings", paths: [
             "trust/policy.json", "config/embeddings.json", "security/mac_integration_permissions.json",
-            "memory/memory.sqlite", "memory/memory.sqlite-wal", "triggers/trigger_config.json", "research/config.json",
+            "research/config.json",
         ].map { dataRoot.appendingPathComponent($0) },
               notifications: [MacIntegrationPermissionStore.didChange, SettingsFaceChange.platform, SettingsFaceChange.cognition,
                               AbilityStore.didChange],
               read: { try await self.settingsFace() })
+        Task { [memory, pages] in
+            await memory.observePage(.settings) { await pages.refresh(page: "settings") }
+        }
+        Task { @MainActor [memory, pages] in
+            let changes = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            defer { changes.continuation.finish() }
+            var iterator = changes.stream.makeAsyncIterator()
+            var previous: [String?]?
+            while !Task.isCancelled {
+                let snapshot = await memory.readEmbeddingSnapshot(onChange: { changes.continuation.yield(()) })
+                let current = [snapshot?.effectiveBackend, snapshot?.lastLoadError, memory.embeddingsError]
+                if previous != current {
+                    previous = current
+                    await pages.refresh(page: "settings")
+                }
+                guard await iterator.next() != nil else { return }
+            }
+        }
         Task { @MainActor [cognitionView] in
             var previous: SettingsInnerLifeStatus.State?
             for await change in await cognitionView.changes() {
@@ -91,15 +110,27 @@ extension NativeAgentEngine {
                 NotificationCenter.default.post(name: SettingsFaceChange.cognition, object: nil)
             }
         }
-        let database = dataRoot.appendingPathComponent("memory/memory.sqlite")
-        let memoryPaths = [database, URL(fileURLWithPath: database.path + "-wal"), dataRoot.appendingPathComponent("memory/profile.json")]
-        await pages.register(page: "memories", part: "native-memories", read: { try await self.memoriesPacket() })
-        await phoneMemoryPages.register(page: "memories", part: "native-memories", read: { try await self.memoriesPacket(surface: "ios") })
-        Task { @MainActor [pages, phoneMemoryPages] in
-            await EventDeadlinePhysiology.refreshOnChanges(paths: memoryPaths, notifications: [AgentPeerStore.trustDidChange, .NSCalendarDayChanged]) {
-                await pages.refresh(page: "memories")
-                await phoneMemoryPages.refresh(page: "memories")
+        await pages.register(page: "memories", part: "native-memories", read: {
+            try await self.memory.checkPageObservation(.memories)
+            return try await self.memoriesPacket()
+        })
+        await phoneMemoryPages.register(page: "memories", part: "native-memories", read: {
+            try await self.memory.checkPageObservation(.memories)
+            return try await self.memoriesPacket(surface: "ios")
+        })
+        let refreshMemories: @Sendable () async -> Void = { [pages, phoneMemoryPages] in
+            await pages.refresh(page: "memories")
+            await phoneMemoryPages.refresh(page: "memories")
+        }
+        Task { [memory] in await memory.observePage(.memories, changed: refreshMemories) }
+        Task { [dataRoot] in
+            let events = await EventDeadlinePhysiology.readEvents(paths: [dataRoot.appendingPathComponent("memory/profile.json")],
+                notifications: [AgentPeerStore.trustDidChange, .NSCalendarDayChanged])
+            for await _ in events.stream {
+                guard !Task.isCancelled else { break }
+                await refreshMemories()
             }
+            await events.cancel()
         }
         watchPersonalityAvailability()
         await watch(page: "personality", part: "native-personality", paths: personalityPaths, notifications: [ChatGPTAccountModelRefresh.didRefresh],
@@ -111,7 +142,8 @@ extension NativeAgentEngine {
         await watch(page: "capabilities", paths: CapabilitiesFace.paths(dataRoot), notifications: CapabilitiesFace.notifications,
               read: CapabilitiesFace.reader(self))
         await pages.register(page: "capabilities", body: CapabilitiesFace.body(self))
-        await watch(page: "diagnostics", part: "native-diagnostics", paths: [], read: { [self] in try await diagnosticsPacket() })
+        await watch(page: "diagnostics", part: "native-diagnostics", paths: [], notifications: [TranscriptsFacade.sessionIndexDidChange],
+              read: { [self] in try await diagnosticsPacket() })
         await watch(page: "home", part: "native-home", paths: [], read: homePacketRead())
         await watch(page: "bots", paths: ContactThreadReadouts.helperPaths(dataRoot), notifications: [BotRunQueue.didChange, ShelfStore.didChange,
             ContactThreadReadouts.helpersDidChange, TranscriptsFacade.sessionIndexDidChange],
@@ -126,9 +158,13 @@ extension NativeAgentEngine {
         await pages.register(page: "dreams", contains: { $0.hasPrefix("entry:") }, body: { [self] item in
             try await collectionDocument(page: "dreams", item: item)
         })
-        await watch(page: "knowledge", part: "native-graph", paths: [database, URL(fileURLWithPath: database.path + "-wal"),
-            SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)],
-            read: { try await self.graphPacket() })
+        await watch(page: "knowledge", part: "native-graph", paths: [SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)], read: {
+            try await self.memory.checkPageObservation(.graph)
+            return try await self.graphPacket()
+        })
+        Task { [memory, pages] in
+            await memory.observePage(.graph) { await pages.refresh(page: "knowledge") }
+        }
         await pages.register(page: "knowledge", contains: { _ in true }, item: { [self] item, request in
             let reading = try await graphPresentation(item, request: request)
             return try await collectionItemFace(reading, part: "native-graph")
@@ -148,7 +184,7 @@ extension NativeAgentEngine {
         let pages = self.pages
         Task { @MainActor in
             await EventDeadlinePhysiology.refreshOnChanges(paths: paths, notifications: notifications,
-                directoryFiles: pageDirectoryFiles) { await pages.refresh(page: page) }
+                directoryFiles: pageDirectoryFiles, label: page) { await pages.refresh(page: page) }
         }
     }
 
@@ -158,7 +194,7 @@ extension NativeAgentEngine {
         let pages = self.pages
         Task { @MainActor in
             await EventDeadlinePhysiology.refreshOnChanges(paths: paths, notifications: notifications,
-                directoryFiles: pageDirectoryFiles) { await pages.refresh(page: page) }
+                directoryFiles: pageDirectoryFiles, label: page) { await pages.refresh(page: page) }
         }
     }
 
@@ -175,6 +211,9 @@ extension NativeAgentEngine {
         }
         if path == dataRoot.appendingPathComponent("bots/definitions", isDirectory: true).standardizedFileURL.path {
             return try BotDefinitionStore(dataRoot: dataRoot).definitionFiles()
+        }
+        if path == dataRoot.appendingPathComponent("agents/recipes", isDirectory: true).standardizedFileURL.path {
+            return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" }
         }
         return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
     }

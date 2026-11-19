@@ -1,11 +1,9 @@
 import Foundation
 import PersistenceCore
+import Senses
 import UniformTypeIdentifiers
 // Blueprint: | `PartMIMERead.swift` | `PartMIMERead`: pure saved-message reader behind `files.mime` and the native attachment save |
 
-/// Reads one saved message as Mail keeps it: an `.emlx` (byte-count line, RFC 822 message, plist trailer) or a plain RFC 822 file. Pure: reach,
-/// admission and anything shown to the agent belong to the caller. A `.partial.emlx` keeps its downloaded parts in `../Attachments/<id>/` beside
-/// its shard, and those files are its attachments too.
 package enum PartMIMERead {
     package struct Part: Sendable {
         package let part: String
@@ -23,8 +21,12 @@ package enum PartMIMERead {
 
     /// `{headers, parts:[{part, type, charset?, disposition?, filename?, bytes, text?}], partial}`; attachments carry metadata only. Body text past
     /// maxTextBytes (UTF-8) is cut at a character and `partial` says so.
-    package static func read(_ url: URL, maxTextBytes: Int) throws -> JSONValue {
-        let message = try message(url, loadAttachments: false)
+    package static func read(_ url: URL, maxTextBytes: Int, readPaths: [String], permissions: [String], dataRoot: URL) throws -> JSONValue {
+        var skipped: [JSONValue] = []
+        let message = try message(url, loadAttachments: false) { directory in
+            do { return try PartFileReads.admitted(.string(directory.path), readPaths: readPaths, permissions: permissions, dataRoot: dataRoot) }
+            catch let error as SenseFailure { skipped.append(.object(["path": .string(directory.path), "error": .string(error.message)])); return nil }
+        }
         var budget = max(0, maxTextBytes), partial = false
         let parts: [JSONValue] = message.parts.map { part in
             var fields: [String: JSONValue] = ["part": .string(part.part), "type": .string(part.type),
@@ -46,11 +48,13 @@ package enum PartMIMERead {
             }
             return .object(fields)
         }
-        return .object(["headers": .object(message.headers.mapValues(JSONValue.string)), "parts": .array(parts), "partial": .bool(partial)])
+        return .object(["headers": .object(message.headers.mapValues(JSONValue.string)), "parts": .array(parts), "partial": .bool(partial),
+                        "skipped_directories": .array(skipped)])
     }
 
     /// Lowercased top-level header names (the last of a repeated name), and every body text and attachment part in MIME order, downloaded parts last.
-    package static func message(_ url: URL, loadAttachments: Bool) throws -> (headers: [String: String], parts: [Part]) {
+    package static func message(_ url: URL, loadAttachments: Bool, admit: (URL) throws -> URL? = { $0 }) throws
+        -> (headers: [String: String], parts: [Part]) {
         let data = try Data(contentsOf: url)
         let source: Data
         if url.pathExtension == "emlx" {
@@ -63,13 +67,14 @@ package enum PartMIMERead {
         let attachmentsRoot = name.hasSuffix(suffix)
             ? url.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Attachments/" + name.dropLast(suffix.count)) : nil
         var parts = try mimeParts(source, attachmentsRoot: attachmentsRoot, loadAttachments: loadAttachments)
-        if let root = attachmentsRoot, FileManager.default.fileExists(atPath: root.path) {
+        if let root = attachmentsRoot, let root = try admit(root), FileManager.default.fileExists(atPath: root.path) {
             for folder in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
                 .sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-                guard try folder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
+                guard let folder = try admit(folder), try folder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
                 for file in try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey],
                     options: [.skipsHiddenFiles]).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                     guard !parts.contains(where: { $0.part == folder.lastPathComponent && $0.filename == file.lastPathComponent }) else { continue }
+                    parts.removeAll { $0.part == folder.lastPathComponent && $0.filename == nil && $0.disposition == "attachment" }
                     try requireInside(file, root: root)
                     let content = try attachment(file, load: loadAttachments)
                     parts.append(Part(part: folder.lastPathComponent,
@@ -145,7 +150,9 @@ package enum PartMIMERead {
             } else { data = try decode(body, encoding: fields["content-transfer-encoding"]) }
             return [Part(part: number, type: kind, charset: nil, disposition: disposition, filename: filename, data: data, text: nil, byteCount: bytes)]
         }
-        if fields["content-disposition"]?.lowercased().hasPrefix("attachment") == true { return [] }
+        if disposition == "attachment" {
+            return [Part(part: number, type: kind, charset: nil, disposition: disposition, filename: nil, data: nil, text: nil)]
+        }
         if kind.hasPrefix("multipart/") {
             guard let boundary = parameter("boundary"), !boundary.isEmpty else { throw failure() }
             var result: [Part] = [], lines: [String] = [], started = false, closed = false, count = 0

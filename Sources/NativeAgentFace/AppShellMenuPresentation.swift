@@ -22,21 +22,6 @@ enum NavigateMenuPresentation {
     }
 }
 
-/// Render reachability before status detail on one line so conflicting status cannot obscure an unavailable runtime.
-enum MenuBarStatusPresentation {
-    static func line(statusText: String, health: RuntimeHealth?) -> String {
-        let status = statusText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let health else {
-            return status.isEmpty ? "My connection status is unknown" : status
-        }
-        let reachability = health.ok ? "I'm online" : "I'm unavailable"
-        guard !status.isEmpty,
-              status.caseInsensitiveCompare(reachability) != .orderedSame else {
-            return reachability
-        }
-        return "\(reachability) — \(status)"
-    }
-}
 
 /// One entry of the layout's `rail` block, in its order: an app page, the divider (the rail draws none; its surfaces group the pages),
 /// or a page of the agent's own by its id.

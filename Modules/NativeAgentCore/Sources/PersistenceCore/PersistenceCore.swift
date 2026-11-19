@@ -184,7 +184,11 @@ public enum SwiftNativePersistenceCore {
         let data: Data
         do { data = try Data(contentsOf: path) }
         catch CocoaError.fileReadNoSuchFile { return ([], .clean) }
-        return Self.decodeJSONL(data) { value, _ in value }
+        let read = Self.decodeJSONL(data) { value, _ in value }
+        guard read.report.trailingPartialLine, FileLockScope.heldLockPaths.contains(path.path + ".lock") else { return read }
+        let complete = Data(data[..<(data.lastIndex(of: 0x0A).map { data.index(after: $0) } ?? data.startIndex)])
+        try Self.writeDataAtomicDurable(complete, to: path)
+        return Self.decodeJSONL(complete) { value, _ in value }
     }
 
     /// Invalid UTF-8 is malformed; only the final unterminated parse failure is tolerated in shared physical framing.

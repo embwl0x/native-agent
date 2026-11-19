@@ -1,11 +1,10 @@
+import AuthoredCapabilities
 import Foundation
 import os
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `PeerDataTaint.swift` | `PeerDataTaint`; `mark`; `markConsumed`; `elevate`; `steer` |
 
-/// Only an untrusted agent starting a turn steers it; reading words latches nothing. One card covers the run.
-/// Checkpoints retain provenance and the answered set so continuation preserves that decision.
 public final class PeerDataTaint: @unchecked Sendable {
     private let lock = NSLock()
     private var sources: [String] = []
@@ -44,7 +43,7 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     /// Restore only the complete current record. Missing provenance is not an
     /// unsteered run and cannot be repaired by inventing a principal.
-    public static func steer(in record: JSONValue?) throws -> (sources: [String], elevated: [String]) {
+    public static func steer(in record: JSONValue?, scope: String? = nil) throws -> (sources: [String], elevated: [String]) {
         func invalid(_ detail: String) -> ToolFailureError {
             ToolFailureError("Carried steering is unavailable: \(detail). The continuation was not restored.", effects: .none,
                 owner: "Carried run provenance", code: "steering_record_invalid",
@@ -60,13 +59,12 @@ public final class PeerDataTaint: @unchecked Sendable {
                 return text
             }
         }
-        return (try list("sources"), try list("elevated"))
+        let sources = try list("sources"), elevated = try list("elevated")
+        return (sources, elevated + (scope == "task" ? sources.filter { !ownerTrusts($0) && !elevated.contains($0) } : []))
     }
 
-    /// Reading grants no steering. Only a peer-started turn latches provenance, and one elevation covers that turn.
     public static func markConsumed(peer: String, line: String = "") {}
 
-    /// The card's answer elevates steering peers for the turn and handed-on steps; senses, tools, skills and Trust still apply.
     public func elevate(peer: String) {
         let name = Self.principal(peer.trimmingCharacters(in: .whitespacesAndNewlines))
         guard Self.steers(name) else { return }
@@ -148,11 +146,10 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     public static func abilityWriteFailure(turn: Turn) -> ToolFailureError? {
         let peers = abilitySources(turn: turn)
-        // One answered card covers the run, so its peers impose no further cap.
         let answered = Set(turn.peerSteering?.elevatedSources ?? [])
         do {
             let untrusted = peers.filter { !ownerTrusts($0) && !answered.contains($0) }.sorted()
-            guard !untrusted.isEmpty else { return nil }
+            guard turn.personAct == nil, !untrusted.isEmpty else { return nil }
             let names = untrusted.map { sourceName($0) }
             let tap = names.allSatisfy { $0 != nil }
                 ? names.compactMap { $0 }.map { "Trust > Connected agents > " + $0 }.joined(separator: "; ") : nil
@@ -193,7 +190,6 @@ public final class PeerDataTaint: @unchecked Sendable {
         lock.withLock { elevated }.filter { !Self.ownerTrusts($0) }
     }
 
-    /// Untrusted, unanswered principals steer a run. One answered card removes steering for the whole run, including its floor.
     public var isTainted: Bool {
         let answered = lock.withLock { elevated }
         return checkpointSources.contains { !Self.ownerTrusts($0) && !answered.contains($0) }

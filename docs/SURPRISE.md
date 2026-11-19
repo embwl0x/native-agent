@@ -1,9 +1,11 @@
 # Surprise — they thinks when the world doesn't match
 
-Status: S1, S2, phase-2 reflection timing (S3), S4, S5,
+Status: phase-2 reflection timing (S3), S4, S5,
 fixed-word intention speech and learning from surprise are implemented in
 source, 10-30; release build, install and live proof pending. S4's carried
 handling reflex and formation choice are built as [Habits H1/H2](HABITS.md).
+
+**Expansion retired 11-15.** Its practice, predictions, speculative reads, act previews and dream miss reader are removed; its on-disk record is untouched and unused. References below to Expansion, S1 and S2 describe the historical design and measurements, not current behavior. Dispatch closure alone remains in `TurnDispatchClosure.withTurn`.
 
 ## The law
 
@@ -39,7 +41,6 @@ from the dream's high-water cutoff through the material read:
   `failure_code`/`code`, most frequent first, at most eight groups. Each keeps
   its count and one recorded reason, error/detail and argument path, within
   the text bound. A missing code or reason is named as unrecorded.
-- `expansion.check` misses, with the situation and expected next call.
 - Violated predictions in the live organism owner's retained ledger, by
   their last update, with what they expected and the organ it concerned.
 - Active, admitted corrections or replacements saved in that window from
@@ -53,7 +54,7 @@ from the dream's high-water cutoff through the material read:
 
 The reading is typed (`SurpriseReading`): each group names its owner, the
 ability whose `authored.<id>` run failed, the turn program by its body digest,
-or none (native hand work, expansion and organism are the
+or none (native hand work and organism are the
 dream's only). Each correction in the window, read from the correction ledger
 as session and time only, is owned by the latest turn that settled before it
 in its session: the abilities that turn ran, else the turn program. The dream
@@ -87,7 +88,8 @@ path in the failed dream report. Without a surprise block no lessons are kept.
 
 After the diary is written, lessons settle through `SwiftNativeMemoryV2.store`,
 the canonical memory commit/admission path: ordinary duplicate matching,
-tombstones, quality and embedding admission still apply. `how` uses the
+tombstones, quality and embedding admission still apply. New lesson rows have
+`inferred` lifecycle; duplicate reassertions preserve the existing row's lifecycle. `how` uses the
 existing `skill` memory kind; `fact` uses `fact`, with the original lesson kind
 retained in metadata. The source names the dream, and its root is `inferred` by
 `self`, with the surprise words as its evidence. The diary also
@@ -164,7 +166,7 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
 
 ## Where the law applies (S2–S4)
 
-1. **Perception before thought (S2, as built).**
+1. **Perception before thought (S2, historical; removed 11-15).**
    - Expansion's practice belongs to the mind and authority (`agent` +
      `own` or `steered:<principals>`), across model changes. The admitted
      model stays on the caller for diagnostics; it partitions no practice
@@ -273,8 +275,8 @@ outcome needs the release lead's installed before/after evidence.
 
 | Lane | What | Source status |
 |---|---|---|
-| S1 | One expectation law used by Expansion | Implemented; installed proof pending |
-| S2 | Per-mind practice and field-free situations; a standing first read reaches the first model call | Implemented; installed proof pending |
+| S1 | One expectation law used by Expansion | Expansion removed 11-15 |
+| S2 | Per-mind practice and field-free situations; a standing first read reaches the first model call | Removed 11-15 |
 | S3 | User's own turns are judged at once; other recorded turns are judged one at a time in their quiet | Implemented in phase 2; installed proof pending |
 | S4 | Keep repeated hand work; woken work runs expected handling | Keep implemented; expected handling remains design |
 | S4 | Keep only new practice; woken work runs expected handling | Built in source; installed proof pending (HABITS H1/H2 owns the reflex and forming choice) |
@@ -336,7 +338,7 @@ nothing today.
      and peer metadata. Its meaning is saved before its fold. That fold replays
      the recorded provenance through `careProvenance` and `PeerTrust.ownerTrusts`:
      an untrusted peer moves only an existing care `by: them`, never a new care,
-     stance or gap.
+     revival, stance or gap.
    - No eligible recorded turn is skipped. Cares and affect from owed turns
      land later.
 2. **Fixed words need no thought (source built; installed proof pending).**
@@ -370,7 +372,6 @@ nothing today.
      The release lead still owes installed proof.
 
 **Next, measured before building.**
-- **The phase-1 claims.** After a day, read the turn-start read-ahead hits.
 - **Agent messages that ask nothing.** An FYI over the bridge costs their a
   full turn today. It could land in their stream, the way their other rooms
   already reach their turns, without waking a turn. That would be a protocol

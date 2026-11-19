@@ -6,8 +6,9 @@ import PersistenceCore
 // Blueprint: | `OwnedProgramPrelude.swift` | Frozen app/host namespaces, preview/version propagation, ordered batches and strict replay |
 extension OwnedProgramRunner {
     public static let hostPrimitiveNamespaces: Set<String> = ["files", "network", "program", "apps", "model"]
-    /// The stem's own file readers: a snapshot SQLite query and a MIME message read. Every other files.* call is the gated door action.
-    public static let hostFilePrimitives: Set<String> = ["files.query", "files.mime"]
+    /// The stem's own file readers: a snapshot SQLite query, a MIME message read and a directory's names. Every other files.* call is the gated
+    /// door action.
+    public static let hostFilePrimitives: Set<String> = ["files.query", "files.mime", "files.names"]
     public static let hostDoorActions: Set<String> = [
         "calendar.upcoming", "calendar.create", "calendar.modify", "calendar.delete",
         "reminders.query", "reminders.create", "reminders.update", "reminders.delete",
@@ -18,6 +19,7 @@ extension OwnedProgramRunner {
                                turn: Bool = false) -> String {
         // The static reading (`OwnedProgram.calls`) and the live one share these keys.
         let requestKeys = OwnedProgram.Calls.requestKeys.map { "\"" + $0 + "\"" }.joined(separator: ", ")
+        let optionKeys = OwnedProgram.Calls.optionKeys.map { "\"" + $0 + "\"" }.joined(separator: ", ")
         let marks = !strict ? "" : """
             ,
                 expect: (ok, what) => { invoke("expect", "", [!!ok, String(what)]); },
@@ -163,17 +165,22 @@ extension OwnedProgramRunner {
           }
           function invoke(kind, id, args) {
             var reply = JSON.parse(call("app_call", JSON.stringify({kind: kind, action: id, args: JSON.stringify(args), line: where()})));
-            if (reply.failure) { var fault = new Error(reply.failure.message); fault.reason = reply.failure.code; throw fault; }
+            if (reply.failure) {
+              var fault = new Error(reply.failure.message); fault.reason = reply.failure.code; fault.code = reply.failure.code; throw fault;
+            }
             var out = JSON.parse(reply.value);
             if (out.ok) return out.value;
+            throw appError(id, out);
+          }
+          function appError(id, out) {
             var e = new Error(out.detail);
-            e.name = "AppError"; e.reason = out.reason; e.action = id; e.stopped = out.stopped;
+            e.name = "AppError"; e.reason = out.reason; e.code = out.failure_code || out.reason; e.action = id; e.stopped = out.stopped;
             e.scriptLine = out.line; e.callNumber = out.n; e.receipt = out.receipt;
             // Pre-dispatch and runtime failures share this envelope field.
             e.try_instead = out.try_instead;
             // A reply that says nothing of effects is a refusal before anything ran.
             e.effects = out.effects === undefined ? "none" : out.effects; e.call = out.call || id;
-            throw e;
+            return e;
           }
           \(host)\(reach)
           // The door and every callable binding are arrow functions: no own prototype, arguments or caller, so no id segment can collide.
@@ -186,7 +193,7 @@ extension OwnedProgramRunner {
                 throw new TypeError("An app action needs {action:'space.verb',args:{}}; batches use app({actions:[{action:'space.verb',args:{}}]}).");
               var options = {};
               // Either preview protects the entry; its version overrides the batch's.
-              ["preview", "expected_version"].forEach(function (key) {
+              [\(optionKeys)].forEach(function (key) {
                 if (Object.prototype.hasOwnProperty.call(request, key)) options[key] = request[key];
                 else if (batch && Object.prototype.hasOwnProperty.call(batch, key)) options[key] = batch[key];
               });
@@ -209,8 +216,11 @@ extension OwnedProgramRunner {
               if (!request || typeof request !== "object" || Array.isArray(request))
                 throw new TypeError("Each app actions entry is one call object: {action, args}, {page, item} or {find}.");
               if (request.action !== undefined) return action(request);
-              if (request.actions !== undefined) {
+              if ("actions" in request) {
                 if (batch) throw new TypeError("An app actions entry is one call; a batch does not hold another batch.");
+                var extra = Reflect.ownKeys(request).filter(key => key !== "actions" && [\(optionKeys)].indexOf(key) < 0).map(String).sort();
+                if (extra.length) throw appError("actions", {reason: "invalid_actions", stopped: false, line: where(), try_instead: null,
+                  detail: "app batch does not take " + extra.join(", ") + " beside actions."});
                 if (!Array.isArray(request.actions)) throw new TypeError("app actions must be an array.");
                 batch = request;
                 return request.actions.map(function (entry) { return one(entry); });

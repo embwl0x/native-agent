@@ -436,9 +436,11 @@ extension AppRelaunch {
 
         let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
         defer { for p in cArgs where p != nil { free(p) } }
+        let cEnvironment: [UnsafeMutablePointer<CChar>?] = ManagedProcess.agentEnvironment().map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { for p in cEnvironment where p != nil { free(p) } }
 
         var childPID: pid_t = 0
-        let rc = posix_spawn(&childPID, executable, &fileActions, &attr, cArgs, environ)
+        let rc = posix_spawn(&childPID, executable, &fileActions, &attr, cArgs, cEnvironment)
         guard rc == 0 else {
             throw NSError(
                 domain: "AppRestartCoordinator",

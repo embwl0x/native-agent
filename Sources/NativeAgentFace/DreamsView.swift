@@ -44,19 +44,3 @@ struct DreamsView: View {
         else if case .dream(let date)? = FaceLink(link) { selectedDate = date }
     }
 }
-
-enum DreamsActionFeedback: Equatable {
-    case completed(PartFace.Value)
-    case failed(String)
-    var message: String {
-        switch self {
-        case .completed(.string(let message)): message
-        case .completed(let value): value.text
-        case .failed(let message): message
-        }
-    }
-    var isSuccess: Bool {
-        if case .completed = self { return true }
-        return false
-    }
-}

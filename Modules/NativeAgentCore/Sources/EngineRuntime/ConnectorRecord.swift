@@ -65,15 +65,9 @@ extension ConnectorActionRecord {
         for connector in connectors {
             byID[ConnectorReadiness.normalizedConnectorID(connector.id)] = connector
         }
-        let nativeConnectors: Set<String> = [
-            "scheduler", "mac_assistant", "local_files", "codex_work", "codex_handoff",
-        ]
         return connectorActionDescriptors().map { descriptor in
             let key = ConnectorReadiness.normalizedConnectorID(descriptor.connectorId)
             let connector = byID[key]
-            let enabled = connector?.enabled ?? nativeConnectors.contains(key)
-            let connectorStatus = connector?.healthStatus ?? (enabled ? "active" : "needs_setup")
-            let authState = connector?.authState ?? (enabled ? "not_required" : "not_connected")
             return ConnectorActionRecord(
                 id: descriptor.id,
                 connectorId: descriptor.connectorId,
@@ -81,9 +75,9 @@ extension ConnectorActionRecord {
                 risk: descriptor.risk,
                 dryRunAvailable: descriptor.dryRunAvailable,
                 requiresApproval: descriptor.requiresApproval,
-                connectorStatus: connectorStatus,
-                authState: authState,
-                enabled: enabled
+                connectorStatus: connector?.healthStatus,
+                authState: connector?.authState,
+                enabled: connector?.enabled
             )
         }
     }

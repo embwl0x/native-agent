@@ -416,7 +416,7 @@ extension SwiftNativeMacControl {
                 }
             }
         }
-        let redaction = MacClipboardRead.redacted(accumulator.text)
+        let redaction = MacClipboardRead.redacted(accumulator.text) { MacDocumentRead.nonEmpty($0) }
         var output: [String: JSONValue] = [
             "read": .bool(true),
             "source": .string("screen"),

@@ -1,9 +1,11 @@
 import AgentConversations
+import AgentWorkspace
 import Desk
 import Foundation
 import NativeAgentShared
 import PersistenceCore
 import Studio
+import ChatToolRuntime
 // Blueprint: | `DeskFaceItem.swift` | The selected Desk item or execution's canonical details, dependencies, pursuit, notes and references as Desk packet facts |
 
 extension NativeAgentEngine {
@@ -38,7 +40,11 @@ extension NativeAgentEngine {
         let progress: JSONValue = item.progress.map { measured -> JSONValue in
             .object(["done": .int(Int64(measured.done)), "total": .int(Int64(measured.total)), "note": faceText(measured.note)])
         } ?? .null
-        let notes: [JSONValue] = item.notes.map { note -> JSONValue in .object(["text": .string(note.text), "at": .string(note.ts)]) }
+        let names = AgentScreen.names(dataRoot)
+        let authors = ["owner": names.person, "agent": names.agent, "system": "System"]
+        let notes: [JSONValue] = item.notes.map { note -> JSONValue in
+            .object(["text": .string(note.text), "at": .string(note.ts), "author": faceText(note.author.flatMap { authors[$0] })])
+        }
         let refs: [JSONValue] = item.refs.map { ref -> JSONValue in
             let target: (text: String, label: String) = switch DeskRefAffordance.action(for: ref) {
             case .open(let url, let named): (url, named)
@@ -84,6 +90,26 @@ struct DeskPieceShelf: Sendable {
     let loaded: Bool
     let fault: String?
     let metadata: [String: MakeStudio.Meta]
+
+    func standingTable(_ items: [DeskItem]?, dataRoot: URL) -> JSONValue {
+        var facts: [String: JSONValue] = ["ref": .string(MakeStudio.tableRef), "version": .string("0")]
+        guard loaded else { facts["reason"] = .string("Reading the table…"); return .object(facts) }
+        do {
+            let studio = MakeStudio(dataRoot: dataRoot)
+            let newest = try studio.readMeta(MakeStudio.tableRef)?.versions.last
+            let document = try newest.map { try studio.board(MakeStudio.tableRef, $0) } ?? BoardDocument()
+            facts["version"] = .string(String(newest?.n ?? 0))
+            let reading = try SwiftToolDispatcher.tableReading(document, items: items, dataRoot: dataRoot) { ref in
+                let meta = metadata[ref]
+                if let fault, meta?.versions.last == nil { throw BoardDocument.Unreadable(message: fault) }
+                return meta
+            }
+            facts["elements"] = reading.document.objectValue?["elements"]
+            facts["card_pairs"] = .array(reading.cards.sorted { $0.key < $1.key }.map { .array([.string($0.key), $0.value]) })
+            facts["source_boundary"] = reading.sourceBoundary.map(JSONValue.string)
+        } catch { facts["reason"] = .string("The table could not be read: " + error.localizedDescription) }
+        return .object(facts)
+    }
 
     /// A piece's facts: its Make ref, its title (the label, else Make's), what it is, its versions and the newest; opened, a text piece's
     /// words, or a table's size and first rows. Nil for a reference that is not a piece. A ref Make has not read is waiting, a fault is

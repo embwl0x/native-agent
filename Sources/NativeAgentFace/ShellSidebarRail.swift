@@ -201,13 +201,15 @@ struct ShellPlaceRow: View {
         let words = ShellPageWords(appModel, pages: place.pages)
         let help = place.pages.map { words.title($0) }.joined(separator: ", ")
         let identifier = "sidebar.surface.\(place.surface.rawValue)"
-        if place.surface == .desk {
-            ShellAttentionRailItem(title: title, help: help, identifier: identifier, isSelected: isSelected,
-                                   barNamespace: barNamespace, onSelect: onSelect)
-        } else {
-            ShellRailItem(title: title, help: help, identifier: identifier, isSelected: isSelected,
-                          onSelect: onSelect, barNamespace: barNamespace)
-        }
+        Group {
+            if place.surface == .desk {
+                ShellAttentionRailItem(title: title, help: help, identifier: identifier, isSelected: isSelected,
+                                      barNamespace: barNamespace, onSelect: onSelect)
+            } else {
+                ShellRailItem(title: title, help: help, identifier: identifier, isSelected: isSelected,
+                              onSelect: onSelect, barNamespace: barNamespace)
+            }
+        }.modifier(ShellPageWordObservation(pages: place.pages))
     }
 }
 

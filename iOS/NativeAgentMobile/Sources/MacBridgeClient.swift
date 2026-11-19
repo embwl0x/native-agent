@@ -291,18 +291,6 @@ final class MacBridgeClient: ObservableObject {
         bridge.observeResyncHints(onResync: onHint)
     }
 
-    func removeICloudResyncHintObserver(_ id: UUID?) {
-        bridge.removeResyncObserver(id)
-    }
-
-    func removeICloudReplyObserver(_ id: UUID?) {
-        bridge.removeIncomingObserver(id)
-    }
-
-    func removeICloudReplyRejectionObserver(_ id: UUID?) {
-        bridge.removeRejectedObserver(id)
-    }
-
     @discardableResult
     func pollICloudRepliesNow() async -> Bool {
         let delivered = await bridge.pollIncomingNow()

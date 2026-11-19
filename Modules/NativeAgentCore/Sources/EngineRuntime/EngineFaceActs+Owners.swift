@@ -61,7 +61,7 @@ extension EngineFaceActs {
             let result = try await engine.repairOnboardingProfile(payload: .init(agentName: name, personaType: type, userName: user),
                 publishProfile: { [engine] in
                     do { _ = try await engine.persona.loadProfile() }
-                    catch { SystemToastCenter.shared.push(error: error.localizedDescription, autoDismissAfter: nil) }
+                    catch { SystemToastCenter.shared.push(error: error.localizedDescription) }
                 }, resident: engine)
             return completion(result)
         case .reset(let confirmed):

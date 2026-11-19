@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MyQueue.swift` | `MyQueue`, `entries`, `add`, `isReady`, `releaseSignal`, `releaseNews`, `freeAfter`, `shown`, `Entry.owedToPerson` |
+// Blueprint: | `MyQueue.swift` | `MyQueue`, `entries`, `add`, `releaseSignal`, `releaseNews`, `freeAfter`, `shown`, `spoken`, `Entry.owedToPerson` |
 
 /// Desk steps carry readiness so waiting on the person or a card does not nag the agent.
 public enum MyQueue {
@@ -242,6 +242,15 @@ public enum MyQueue {
 
     public static func until(_ entry: Entry) -> Until { Until(entry.step.until) }
 
+    /// Words said as they are at the moment, only for the agent's own steps and promises to the person; a worded end condition needs the agent's
+    /// judgment on every occurrence.
+    public static func spoken(_ entry: Entry) -> String? {
+        guard entry.step.origin == "self" || entry.owedToPerson, let words = entry.step.say,
+              !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        if case .words = until(entry) { return nil }
+        return words
+    }
+
     public static func isOver(_ entry: Entry, at now: Date) -> Bool {
         until(entry).endsAt.map { now >= $0 } ?? false
     }
@@ -280,11 +289,6 @@ public enum MyQueue {
         catch { return .unavailable("Readiness is unavailable: \(error.localizedDescription). Repair the named evidence before continuing this step.") }
     }
 
-    public static func isReady(_ entry: Entry, _ context: Context) -> Bool {
-        if case .ready = readiness(entry, context) { return true }
-        return false
-    }
-
     private static func checkedReady(_ entry: Entry, _ context: Context) throws -> Bool {
         guard entry.step.status != "stopped", !isOver(entry, at: context.now), let condition = when(entry) else { return false }
         switch condition {
@@ -309,7 +313,7 @@ public enum MyQueue {
     public static func releaseNotes(for entry: Entry) -> [DeskNote] {
         guard let condition = when(entry),
               let filed = DeskClock.parseISO(entry.step.filedAt ?? entry.item.openedAt) else { return [] }
-        let handled = entry.item.notes.filter { $0.author == "agent" }
+        let handled = entry.item.notes.filter { $0.author == "agent" && !$0.text.hasPrefix("Said ") }
             .compactMap { DeskClock.parseISO($0.ts) }.max()
         let floor = max(filed, handled ?? filed)
         return entry.item.notes.filter {

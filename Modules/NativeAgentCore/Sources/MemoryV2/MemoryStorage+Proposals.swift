@@ -107,7 +107,9 @@ extension MemoryStorage {
             guard let proposal = try Row.fetchOne(
                 db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]
             ).map(Self.decodeProposal) else { throw MemoryV2Error.recordNotFound }
-            guard proposal.status == "pending" else { return proposal.status == "superseded" }
+            let successor = SwiftNativeMemoryV2.supersededByMarker(in: proposal.metadata)
+            if proposal.status == "superseded" { return successor == successorId }
+            guard proposal.status == "pending", successor == nil || successor == successorId else { return false }
             var metadata: [String: JSONValue] = [:]
             if case .object(let existing)? = proposal.metadata { metadata = existing }
             let now = Self.nowISO8601()

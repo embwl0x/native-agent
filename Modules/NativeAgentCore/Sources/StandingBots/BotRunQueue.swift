@@ -49,6 +49,7 @@ public struct BotRunQueue: Sendable {
         var runID: UUID
         var context: String? = nil
         var origin: BotRunOrigin
+        var steeringSources: [String]?
         var provenance: BotEventProvenance? = nil
         var isEvent: Bool { origin == .event }
     }
@@ -76,21 +77,19 @@ public struct BotRunQueue: Sendable {
         let shelf = ShelfStore(dataRoot: dataRoot)
         let settled = try shelf.rawEntryLocked(claim.requestID)
         if let settled, settled.botId != id { throw StandingBotsError.corruptStore("helper claim/result identity") }
-        guard settled != nil || claim.executionAdmittedAt != nil else {
-            throw StandingBotsError.corruptStore("""
-                Helper request \(claim.requestID) lost its pre-execution admission outcome. Restore its refusal or execution evidence; \
-                no interrupted run was invented and nothing was replayed.
-                """)
+        if settled == nil, claim.executionAdmittedAt == nil {
+            try recordRefusal(bot: id, requestID: claim.requestID, detail: "The request was interrupted before execution. No helper turn ran.")
+        } else if settled == nil {
+            let detail = "Helper admission ended without a settled result. Effects are unknown; do not replay the request."
+            var entry = ShelfEntry(id: claim.requestID, botId: id, briefVersion: claim.briefVersion,
+                runAt: claim.admittedAt, coverageStart: claim.admittedAt, coverageEnd: claim.admittedAt,
+                headline: "Interrupted helper request", findings: "", changedSinceLastGood: "",
+                uncertainties: [detail], runHealth: .partial, spend: ShelfSpend(tokens: nil, seconds: 0))
+            entry.status = .interrupted
+            entry.statusDetail = detail
+            entry.sessionID = BotDefinition.sessionID(for: id)
+            try shelf.appendLocked(entry)
         }
-        let detail = "Helper admission ended without a settled result. Effects are unknown; do not replay the request."
-        var entry = ShelfEntry(id: claim.requestID, botId: id, briefVersion: claim.briefVersion,
-            runAt: claim.admittedAt, coverageStart: claim.admittedAt, coverageEnd: claim.admittedAt,
-            headline: "Interrupted helper request", findings: "", changedSinceLastGood: "",
-            uncertainties: [detail], runHealth: .partial, spend: ShelfSpend(tokens: nil, seconds: 0))
-        entry.status = .interrupted
-        entry.statusDetail = detail
-        entry.sessionID = BotDefinition.sessionID(for: id)
-        if settled == nil { try shelf.appendLocked(entry) }
         if requests[id]?.runID == claim.requestID {
             requests.removeValue(forKey: id)
             try disk.write(requests, at: self.path)
@@ -115,7 +114,7 @@ public struct BotRunQueue: Sendable {
     /// Event context is run input, never authority to instruct the app.
     public func enqueue(bot id: UUID, context: String? = nil,
                         origin: BotRunOrigin = .manual,
-                        provenance: BotEventProvenance? = nil, scope: BotRunScope) throws -> BotRunReceipt {
+                        provenance: BotEventProvenance? = nil, steeringSources: [String], scope: BotRunScope) throws -> BotRunReceipt {
         guard !scope.ancestry.contains(id) else {
             throw StandingBotsError.invalidValue(Self.alreadyExecutingWords)
         }
@@ -138,7 +137,7 @@ public struct BotRunQueue: Sendable {
                 }
                 let runID = UUID()
                 let text = (context?.isEmpty ?? true) ? nil : context
-                requests[id] = QueuedRequest(runID: runID, context: text, origin: origin, provenance: provenance)
+                requests[id] = QueuedRequest(runID: runID, context: text, origin: origin, steeringSources: steeringSources, provenance: provenance)
                 try disk.write(requests, at: path)
                 return BotRunReceipt(runID: runID, accepted: true, reason: "queued")
             }
@@ -206,7 +205,7 @@ public struct BotRunQueue: Sendable {
         return (active, Set(queued.keys), started, issues)
     }
 
-    public enum RequestPresence: Sendable { case queued, running, deadlineExceeded, absent }
+    public enum RequestPresence: Sendable { case queued, running, absent }
 
     func admitExecution(bot id: UUID, requestID: UUID) throws {
         try disk.locked {
@@ -262,6 +261,7 @@ public struct BotRunQueue: Sendable {
         let bot: BotDefinition
         let context: String?
         let provenance: BotEventProvenance?
+        let steeringSources: [String]
     }
 
     func claim(bot id: UUID, requestID: UUID?, manual: Bool = false) throws -> ClaimedRun {
@@ -346,14 +346,14 @@ public struct BotRunQueue: Sendable {
             // Consume refused requests too, so a later settings edit cannot replay them.
             var context: String? = nil
             var provenance: BotEventProvenance? = nil
-            if let runID, requests[id]?.runID != runID { throw BotRunAdmissionError.alreadyRunning }
+            var steeringSources: [String] = []
             let admittedID = runID ?? UUID()
-            if runID != nil {
-                // Retain the durable request until its successor claim or refusal commits.
-                let request = requests[id]
-                context = request?.context
-                if request?.isEvent == true {
-                    provenance = request?.provenance ?? BotEventProvenance(source: nil)
+            if let runID {
+                guard let request = requests[id], request.runID == runID else { throw BotRunAdmissionError.alreadyRunning }
+                context = request.context
+                steeringSources = request.steeringSources ?? []
+                if request.isEvent {
+                    provenance = request.provenance ?? BotEventProvenance(source: nil)
                 }
             }
             // A queued deliberate check is independent of scheduled checks.
@@ -380,7 +380,7 @@ public struct BotRunQueue: Sendable {
             }
             Self.admission.active[rootKey, default: [:]][id] = (descriptor, ScopedWaiter(), nil)
             retained = true
-            return ClaimedRun(runID: admittedID, bot: bot, context: context, provenance: provenance)
+            return ClaimedRun(runID: admittedID, bot: bot, context: context, provenance: provenance, steeringSources: steeringSources)
         }
     }
 

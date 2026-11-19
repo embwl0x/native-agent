@@ -16,7 +16,7 @@ import NativeAgentCore
 import PersistenceCore
 import Privacy
 import MacControl
-// Blueprint: | `ClaudeBridgeOperations.swift` | Message and tool endpoint execution under the existing listener admission and actual-exit worker lifetime |
+// Blueprint: | `ClaudeBridgeOperations.swift` | Bridge endpoint admission and actual-exit settlement preserve turn steering on repair births |
 
 extension ClaudeBridgeRuntime {
     public func messageRuntime() -> ClaudeBridgeMessageRuntime {
@@ -55,8 +55,8 @@ extension ClaudeBridgeRuntime {
     // MARK: - /claude/tool
 
     /// Only the door's own authenticated key carries its identity and grant.
-    func bridgeCallerPrincipal(headers: [String: String]) -> AgentBridgePrincipal? {
-        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: host.dataRoot)
+    func bridgeCallerPrincipal(headers: [String: String]) throws -> AgentBridgePrincipal? {
+        let principal = try AgentBridgePrincipal.resolve(headers: headers, dataRoot: host.dataRoot)
         guard !principal.replyOnly,
               !AgentBridgePrincipal.claimsIdentity(headers: headers) || principal.peerID != nil else { return nil }
         return principal
@@ -138,7 +138,7 @@ extension ClaudeBridgeRuntime {
                                 try await tasks.finishTool(taskID, owner: principal.id,
                                     result: .object(["status": .string(status), "detail": .string(dispatchCause)]))
                             } catch {
-                                RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message,
+                                RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message, steeredBy: turn.steeringStamp(),
                                     operation: "bridge.tool.settle:" + taskID, owner: taskID,
                                     words: "Tool dispatch failed: " + dispatchCause
                                         + "; saving its outcome also failed: " + error.localizedDescription,
@@ -150,7 +150,7 @@ extension ClaudeBridgeRuntime {
                     if let taskID {
                         do { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
                         catch {
-                            RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message,
+                            RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message, steeredBy: turn.steeringStamp(),
                                 operation: "bridge.tool.settle:" + taskID, owner: taskID,
                                 words: "Tool dispatch returned, but saving its result failed: " + error.localizedDescription,
                                 lever: "Repair this retained task's result from its original execution evidence; do not repeat the tool call.")
@@ -174,7 +174,7 @@ extension ClaudeBridgeRuntime {
                         try await tasks.finishTool(taskID, owner: principal.id,
                             result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
                     } catch {
-                        RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message,
+                        RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message, steeredBy: turn.steeringStamp(),
                             operation: "bridge.tool.settle:" + taskID, owner: taskID,
                             words: "Tool admission failed and its receipt could not settle: " + error.localizedDescription,
                             lever: "Repair this retained task's receipt before repeating the tool call.")

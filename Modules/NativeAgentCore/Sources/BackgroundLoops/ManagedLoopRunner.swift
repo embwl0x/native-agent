@@ -82,7 +82,7 @@ internal struct ManagedLoopRunner: LoopRunner {
 
     var loopId: String { underlying.loopId }
     var wake: OrganWake { underlying.wake }
-    var tickTimeoutOverride: TimeInterval? { underlying.tickTimeoutOverride }
+    var waitingOn: String { underlying.waitingOn }
 
     /// Managed registrations require the manager's explicit accounting handshake.
     func tickOutcome() async -> LoopTickOutcome {

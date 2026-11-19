@@ -13,7 +13,7 @@ import Experiences
 import AgentWorkspace
 import Privacy
 
-// Blueprint: | `NativeAgentA2AWire+Runtime.swift` | Shared admission and canonical reply framing. |
+// Blueprint: | `NativeAgentA2AWire+Runtime.swift` | A2A recovery preserves held-turn provenance through reply and repair settlement |
 
 public struct AgentContactA2AEndpoint: Sendable {
     public enum Response: @unchecked Sendable {
@@ -250,7 +250,7 @@ enum AgentContactRuntime {
                 } catch {
                     // Settlement debt must not discard the produced answer or files.
                     let detail = "The recovered builder reply needs settlement repair: " + error.localizedDescription
-                    RepairOwed.owe(dataRoot, id: turn.requestID, kind: .message,
+                    RepairOwed.owe(dataRoot, id: turn.requestID, kind: .message, steeredBy: heldTurn.steeringStamp(),
                         operation: "bridge.reply.settle:" + turn.requestID, owner: turn.taskID,
                         words: detail, lever: "Repair this exact retained task and run; do not repeat the turn.")
                     return ClaudeBridgeMessageRuntime.bridgeOutcome(reply, taskID: turn.taskID,

@@ -27,7 +27,6 @@ public actor DreamCycleRunner {
     private let gate: DreamREMGatePolicy?
     let fm = FileManager.default
 
-    // Exclude tool calls from dream identity input.
     private static let deltaCharBudget: Int = 20_000
     private static let deltaCountLimit: Int = 150
     // Bound the felt summary at the runner boundary as well as at its substrate owner.
@@ -36,7 +35,6 @@ public actor DreamCycleRunner {
     public static let studioCitationReceiptKind = "dream.studio_citation"
     private static let studioCitationLimit: Int = 4
     private static let studioEntryIDMaxCharacters: Int = 120
-    // Read persona context independently of conversation and memory-delta budgets.
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -86,7 +84,6 @@ public actor DreamCycleRunner {
         let dateKey = DreamREMSchedule.todayKey(now: beganAt)
         let outPath = diaryDir.appendingPathComponent("\(dateKey).md")
 
-        // Hold the reservation from mark reconciliation through diary and mark commit.
         let reservation: DreamRunReservation?
         if preview {
             reservation = nil
@@ -119,13 +116,12 @@ public actor DreamCycleRunner {
         }
         let mark: Date
         do {
-            let committedMark = try reconcileDreamMark(commit: !preview)
+            let committedMark = try ConversationHistory.dreamConsolidationMark(dataRoot: dataRoot)
             mark = force
                 ? now().addingTimeInterval(-recencyWindow)
                 : (committedMark ?? now().addingTimeInterval(-recencyWindow))
         } catch {
-            report.errors.append("dream progress could not be recovered from \(diaryDir.path) (\(error)); "
-                + "repair the unreadable diary or high-water mark before retrying")
+            report.errors.append("Dream cutoff could not be read at \(dreamMarkPath().path) (\(error)). Repair the saved cutoff before retrying.")
             return report
         }
         let feltOrigins: [CognitiveFeltOrigin]
@@ -138,19 +134,18 @@ public actor DreamCycleRunner {
         let gathered: (messages: [(sessionId: String, role: String, content: String, source: String?)],
             newest: Date?,
             sources: [DreamSourceRef],
-            material: [String: CognitiveReflectionCause])
+            material: [String: CognitiveReflectionCause],
+            moreMessagesRemain: Bool)
         do {
-            gathered = try gatherRecentMessagesAcrossSessions(
-                since: mark,
-                feltRank: Self.feltRankIndex(from: feltOrigins)
-            )
+            gathered = try gatherRecentMessagesAcrossSessions(since: mark)
         } catch {
             let message = "transcript read failed; dream will retry: \(error)"
             report.errors.append(message)
             FileHandle.standardError.write(Data("DreamCycleRunner: \(message)\n".utf8))
             return report
         }
-        let (messages, newestIncluded, messageSources, sourceMaterial) = gathered
+        let (messages, newestIncluded, messageSources, sourceMaterial, moreMessagesRemain) = gathered
+        report.moreMessagesRemain = moreMessagesRemain
         report.sessionsProcessed = Set(messages.map { $0.sessionId }).count
 
         // No new material means no empty entry and no mark change.
@@ -215,6 +210,7 @@ public actor DreamCycleRunner {
             // Standalone dream work keeps its parent's identity without borrowing the parent's model route.
             let identity = parent.map { Turn(id: $0.id, run: $0.run, session: $0.session) }
             var call = LLMCall(turn: identity, surface: "dream", purpose: "dream")
+            call.session = nil
             call.preview = preview
             raw = try await llm.complete(
                 prompt: prompt.text, system: dreamSystem, model: nil,
@@ -243,7 +239,7 @@ public actor DreamCycleRunner {
         let lessons = surpriseBlock.isEmpty ? [] : payload.lessons
         report.careNight = careNight.map {
             CognitiveCareNight(block: $0.block, readAt: $0.readAt, keys: $0.keys, answers: payload.cares, source: "dream_diary/\(dateKey).md",
-                clusters: $0.clusters, merges: payload.careMerges, mergesMalformed: payload.careMergesMalformed, stanceChanges: payload.careStanceChanges,
+                clusters: $0.clusters, merges: payload.careMerges, stanceChanges: payload.careStanceChanges,
                 mindEpoch: $0.mindEpoch, selfStoryRefs: $0.selfStoryRefs, selfChangeRefs: $0.selfChangeRefs,
                 selfPeople: $0.selfPeople, traits: payload.traits, story: payload.story, people: payload.people)
         }
@@ -256,7 +252,6 @@ public actor DreamCycleRunner {
             return report
         }
         // Ordinary runs append sections without changing prior writing; force replaces the day.
-        // The committed footer supplies crash recovery for the mark.
         let previousDiary: Data?
         if fm.fileExists(atPath: outPath.path) {
             do {
@@ -277,11 +272,12 @@ public actor DreamCycleRunner {
             studioEntryIDs: citedStudioEntryIDs,
             sources: messageSources,
             sourcePeerIds: prompt.peerIds
-        // Only the writer's footer can advance the cutoff; defuse matching model-authored prose.
-        ).replacingOccurrences(of: Self.consumedFooter, with: "<!-- dream consumed through: ")
-        var reflectionMaterial = sourceMaterial
+        )
+        let citedSources = Set(DreamEntryProvenance.readClaims(in: prose, as: DreamEntryProvenance.self)
+            .flatMap { $0.claims.flatMap(\.sourceRefs) })
+        var reflectionMaterial = sourceMaterial.filter { citedSources.contains($0.key) }
         reflectionMaterial["dream_diary/\(dateKey).md"] = CognitiveReflectionCause(
-            text: prose, sourcePeerIds: prompt.peerIds, sourceRefs: sourceMaterial.keys.sorted())
+            text: prose, sourcePeerIds: prompt.peerIds, sourceRefs: citedSources.sorted())
         var work = DreamPendingWork(id: UUID(), date: dateKey, trigger: trigger, force: force,
             sessionsProcessed: report.sessionsProcessed, sourcePeerIds: prompt.peerIds,
             lessons: lessons, reflection: reflectionMaterial, care: report.careNight.map(DreamPendingWork.Care.init),
@@ -291,7 +287,6 @@ public actor DreamCycleRunner {
         if careNight == nil { work.finish("care", result: "skipped: inner life off") }
         if payload.affect == nil { work.finish("mood", result: "skipped: no affect judgment") }
         let markdown = prose + "\n" + work.identityMarker + "\n"
-            + Self.consumedFooter + "\(NativeTimestampFormat.fractionalZulu(newestIncluded)) -->\n"
         let entry: Data
         if addsSection, let previousDiary { entry = previousDiary + Data(("\n" + markdown).utf8) }
         else { entry = Data(markdown.utf8) }
@@ -325,7 +320,8 @@ public actor DreamCycleRunner {
             "evidence": .object(["speaker": .string("self"), "words": .string(lesson.from)]),
         ]), context: MemoryWriteContext(
             // The agent worked it out; its root names the material's principals, and authorship cannot attest that unknown sources were clean.
-            material: sourcePeerIds ?? ["unattributed dream material"], telling: MemoryRoot.Telling(how: .inferred, by: "self")))
+            material: sourcePeerIds ?? ["unattributed dream material"], telling: MemoryRoot.Telling(how: .inferred, by: "self"),
+            lifecycle: MemoryLifecycle.inferred))
     }
 
     private func commitDream(_ captured: DreamPendingWork) -> (written: Bool, errors: [String]) {
@@ -340,15 +336,12 @@ public actor DreamCycleRunner {
         return (true, [])
     }
 
-    /// Only confirmed dated delivery advances the marker; absence remains owed under the substrate's result.
     @discardableResult
     func integrateMood(
         affect: Double?,
-        in diaryDir: URL,
         dateKey: String
     ) async throws -> String? {
-        let integrated = diaryDir.appendingPathComponent(".mood_integrated_\(dateKey)")
-        guard let affect, !fm.fileExists(atPath: integrated.path) else { return nil }
+        guard let affect else { return nil }
         guard let datedMoodSink else {
             throw PersistenceCoreError.ioFailure("mood delivery for \(dateKey) is unavailable; the saved judgment remains pending")
         }
@@ -358,7 +351,6 @@ public actor DreamCycleRunner {
         case .reflection:
             throw PersistenceCoreError.ioFailure("mood delivery returned a reflection instead of effect acknowledgment")
         }
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(), to: integrated)
         return nil
     }
 
@@ -375,30 +367,6 @@ public actor DreamCycleRunner {
     private func dreamMarkPath() -> URL {
         dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
             .appendingPathComponent(".dream_state.json")
-    }
-
-    static let consumedFooter = "<!-- dream-consumed-through: "
-
-    /// Reconcile marks under the reservation before gathering or model work; archival cannot change consumed cutoffs.
-    private func reconcileDreamMark(commit: Bool = true) throws -> Date? {
-        let saved = try ConversationHistory.dreamConsolidationMark(dataRoot: dataRoot)
-        var committed = saved
-        let diary = FileBackedDreamDiary(dataRoot: dataRoot).listEntriesChecked(limit: .max)
-        guard diary.isComplete else { throw CocoaError(.fileReadUnknown) }
-        let prefix = Self.consumedFooter
-        for entry in diary.entries {
-            for line in (entry.content ?? "").split(separator: "\n") where line.hasPrefix(prefix) {
-                guard line.hasSuffix(" -->"),
-                      let cutoff = ConversationHistory.parseTimestamp(.string(String(line.dropFirst(prefix.count).dropLast(4)))) else {
-                    throw CocoaError(.fileReadCorruptFile)
-                }
-                committed = committed.map { max($0, cutoff) } ?? cutoff
-            }
-        }
-        if commit, let committed, saved.map({ committed > $0 }) ?? true {
-            try advanceDreamMark(to: committed)
-        }
-        return committed
     }
 
     /// Never regress the mark; force cannot return consumed material to future windows.

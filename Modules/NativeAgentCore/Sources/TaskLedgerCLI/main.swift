@@ -57,6 +57,10 @@ struct TaskLedgerCLI {
             fputs("error: --data-root requires a non-empty path\n", stderr)
             return 64
         }
+        if parsed.options["task-id"]?.isEmpty == true {
+            fputs("error: --task-id requires a non-empty id\n", stderr)
+            return 64
+        }
         let dataRoot = resolveDataRoot(parsed.options["data-root"])
         switch command {
         case "append", "claim":
@@ -83,7 +87,7 @@ struct TaskLedgerCLI {
             return 64
         }
         let taskId: String
-        if let explicit = parsed.options["task-id"], !explicit.isEmpty {
+        if let explicit = parsed.options["task-id"] {
             taskId = explicit
         } else if kind == .created {
             taskId = UUID().uuidString
@@ -115,7 +119,7 @@ struct TaskLedgerCLI {
     static func list(_ parsed: ParsedOptions, dataRoot: URL) async throws -> Int {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         let pretty = parsed.flags.contains("pretty")
-        if let taskId = parsed.options["task-id"], !taskId.isEmpty {
+        if let taskId = parsed.options["task-id"] {
             let snapshot = try await ledger.taskDetail(id: taskId)
             guard let task = snapshot.state else {
                 printJSON(.object([

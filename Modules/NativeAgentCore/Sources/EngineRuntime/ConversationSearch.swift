@@ -1,74 +1,12 @@
 import Foundation
-import Cognition
 import ChatSessionWork
 import Transcripts
 import NativeAgentCore
 @_exported import NativeAgentShared
 import StandingBots
 import MemoryV2
-import Connectors
-import DeviceSync
 import PersistenceCore
-import ProviderRouting
-import CloudKit
-import DoctorChecks
-import Observation
-import ChatToolRuntime
-import ChatTurnRuntime
-import ChatToolParsing
-import SlackBot
-import TelegramBot
-import TriggerScheduler
-import BackgroundLoops
-import AppToolRuntime
-import TrustCenter
-import MacControl
-import ApprovalTransactions
-import AttentionRouting
-import ApprovalInbox
-import Desk
-import NotificationInbox
-import ToolRegistry
-import ChatTurnContracts
-import BackgroundWork
-import DreamREMCycle
-import AuthoredCapabilities
-@preconcurrency import EventKit
-import MacIntegration
-import ToolExecution
-import Senses
-import Browser
-import PersonaEngine
-import AgentWorkspace
-import Synchronization
-import Studio
-import Agents
 import AgentConversations
-import ChromeControl
-import CognitiveSubstrate
-import Context
-import ContextFlow
-import TurnTrace
-import os
-import TrustPersistence
-import SwarmRuns
-import Onboarding
-import Privacy
-import Experiences
-import CryptoKit
-import ActivityWatch
-import OSLog
-import SchedulerExecution
-import Darwin
-import Combine
-import UserNotifications
-import Research
-import ImageIO
-import UniformTypeIdentifiers
-import AppKit
-import Dispatcher
-import SystemOps
-import CoreGraphics
 // Blueprint: | `ConversationSearch.swift` | Canonical conversation ranking, saved-result readers and cause-preserving message index |
 
 public enum ConversationPaletteRanking {
@@ -97,15 +35,6 @@ public enum ConversationPaletteRanking {
 }
 
 extension TranscriptsFacade {
-    public func observeSavedSearch(bots: BotRunnerScheduler, memory: MemoryFacade) async {
-        let paths = ["memory/memory.sqlite", "memory/memory.sqlite-wal", "bots/definitions",
-                     "bots/shelf-index.json", "clock/times.json", "bots/missed-runs.json", "bots/last-events.json", "trust/policy.json"]
-        await EventDeadlinePhysiology.refreshOnChanges(paths: paths.map { dataRoot.appendingPathComponent($0) },
-                                                       notifications: [BotRunQueue.didChange]) {
-            await self.refreshSavedSearch(bots: bots, memory: memory)
-        }
-    }
-
     /// Share saved search inputs with the transcript owner; Desk and dreams own their revisions.
     public func refreshSavedSearch(bots: BotRunnerScheduler, memory: MemoryFacade) async {
         _ = await savedSearchRead.read({

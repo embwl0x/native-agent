@@ -43,7 +43,9 @@ enum RequestPrefixReceipt {
             try JSONByteScanner.elements(bytes, from: $0.lowerBound)
         } ?? []
         let wireItems = items.prefix(400).map { JSONValue.string(String(digest([Data(bytes[$0])]).prefix(12))) }
-        return [
+        let effort = try root["reasoning"].flatMap { try members($0)["effort"] } ?? root["reasoning_effort"]
+        let effortSent = effort.flatMap { (try? JSONSerialization.jsonObject(with: Data(bytes[$0]), options: .fragmentsAllowed)) as? String }
+        var receipt: [String: JSONValue] = [
             "wireItemDigests": .array(Array(wireItems)),
             "component.toolsSHA256": .string(toolsHash),
             "tools.wireSchemaBytes": .int(Int64(tools.count)),
@@ -53,6 +55,8 @@ enum RequestPrefixReceipt {
                     + prefix.prefixMessageDigests.map { Data($0.utf8) }
             )),
         ]
+        receipt["reasoningEffortSent"] = effortSent.map(JSONValue.string)
+        return receipt
     }
 
     private static func digest(_ parts: [Data]) -> String {

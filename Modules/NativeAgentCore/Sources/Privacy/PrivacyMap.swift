@@ -82,16 +82,10 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 surface layout and previous revision; off-disk backup only; no local backup or production export; phone sync projects the current \
                 layout as ui_layout.json
                 """),
-            Spec(id: "workspace_desktops", title: "Saved Desktops", relativePath: "workspace_desktops", detail: """
-                navigation references and draft inputs; off-disk backup excludes lock and temporary sidecars; no local backup, production export, or \
-                phone sync
-                """),
             Spec(id: "her_screen", title: "My Screen", relativePath: "her_screen", detail: """
                 stable screen names, touched items, last-seen marks, acknowledgement stamps, app maps and retained quarantine bytes; off-disk backup \
                 only; no local backup, production export, or phone sync
                 """),
-            Spec(id: "notice_state", title: "App Offers", relativePath: "notice-state.json",
-                detail: "notice part's per-app/version offer and dismissal state; off-disk backup only; no local backup, production export, or phone copy"),
             Spec(id: "memory", title: "Memory", relativePath: "memory", detail: "semantic memories, recall indexes, and knowledge graph state"),
             Spec(id: "chat", title: "Chat", relativePath: "chat", detail: """
                 chat sessions, messages, archives, retained tool results, pins, prefix replay and session scratch with private working memory; \
@@ -209,7 +203,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 detail: "attention delivery and notification deduplication ledgers; off-disk backup only; no local backup, production export, or phone sync"),
             Spec(id: "mobile_snapshot_cache", title: "Phone Sync Cache", relativePath: "mobile_snapshot_cache",
                 detail: "phone snapshots/responses and local transaction ledger; no backup or export"),
-            Spec(id: "improvements", title: "Self Improvement", relativePath: "improvements", detail: "evaluation gauntlet records"),
+            Spec(id: "improvements", title: "Self Improvement", relativePath: "improvements", detail: "records an earlier version left"),
             Spec(id: "benchmark", title: "Retained Benchmarks", relativePath: "body/benchmark",
                 detail: """
                     orphaned benchmark receipts; no live reader or writer; excluded from backups, export and phone sync; \
@@ -280,8 +274,6 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "research", title: "Research Files", relativePath: "research", detail: """
                 search configuration, fetched sources and lab runs; excluded from local backup, archive inputs and direct phone copy
                 """),
-            Spec(id: "work_journal", title: "Work Journal", relativePath: "work_journal",
-                detail: "retained work journal files; excluded from local backup, archive inputs and direct phone copy"),
             Spec(id: "native_power", title: "Mac Action Files", relativePath: "native_power", detail: """
                 Mac action receipts, browser operations/receipts and disposable source/link/PNG captures, intent and notification files, and retained \
                 unused browser profile; off-disk backup only; no local backup, archive inputs or direct phone copy
@@ -289,8 +281,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "nextgen", title: "Retained Action Files", relativePath: "nextgen",
                 detail: "retained action and remote files; excluded from local backup, archive inputs and direct phone copy"),
             Spec(id: "self_worktrees", title: "Retained Worktrees", relativePath: "self_worktrees", detail: """
-                retained worktrees; the external cleanup script still references self_worktrees; Doctor no longer creates this directory; excluded \
-                from local backup, archive inputs and direct phone copy
+                retained worktrees; excluded from local backup, archive inputs and direct phone copy
                 """),
             Spec(id: "llm", title: "LLM Files", relativePath: "llm",
                 detail: "live provider probe receipts and retained LLM files; excluded from local backup, archive inputs and direct phone copy"),

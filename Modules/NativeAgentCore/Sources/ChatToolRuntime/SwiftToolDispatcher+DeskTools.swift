@@ -496,14 +496,14 @@ extension SwiftToolDispatcher {
 
     // MARK: - desk_note
 
-    func impl_desk_note(input: [String: JSONValue]) async throws -> JSONValue {
+    func impl_desk_note(input: [String: JSONValue], byPerson: Bool) async throws -> JSONValue {
         let handle = try deskString(input, "handle")
         let text = try deskString(input, "text").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             throw deskInvalid("text", reason: "desk_note: text is empty")
         }
         let store = deskStore()
-        _ = try await store.appendNote(handle, text: text, author: "agent")
+        _ = try await store.appendNote(handle, text: text, author: byPerson ? "owner" : "agent")
         return await deskConfirm(store, handle: handle, prefix: "noted")
     }
 
@@ -690,7 +690,6 @@ extension SwiftToolDispatcher {
 
     // MARK: - desk_defer
 
-    /// An empty until clears the defer; deferred items are neither next-up nor stale.
     func impl_desk_defer(input: [String: JSONValue]) async throws -> JSONValue {
         try Self.validateDeskMutationArguments("desk_defer", input: input)
         let handle = try deskString(input, "handle")
@@ -700,18 +699,29 @@ extension SwiftToolDispatcher {
             throw deskInvalid("until", reason: "until must be yyyy-MM-dd or an ISO timestamp.")
         }
         let store = deskStore()
+        let prefix: String
         do {
-            _ = try await store.setDeferUntil(handle, until: until)
-        } catch let e as DeskError {
+            prefix = try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
+                let when = until.map { "at \($0)" }
+                if let until, let when,
+                   let entry = try await MyQueue.entry(handle, store: store), entry.item.project == MyQueue.project, entry.step.action == nil,
+                   case .at? = MyQueue.when(entry), case .at? = MyQueue.When(when) {
+                    var step = entry.step
+                    step.when = when
+                    let updated = try await MyQueue.update(entry, step: step, store: store)
+                    if updated.item.deferUntil != nil { _ = try await store.setDeferUntil(handle, until: nil) }
+                    return "moved to \(until)"
+                }
+                _ = try await store.setDeferUntil(handle, until: until)
+                return until.map { "deferred until \($0)" } ?? "defer cleared"
+            }
+        } catch let error where error is DeskError || error is MyQueue.Superseded {
             return .object([
                 "status": .string("refused"),
-                "reason": .string(e.errorDescription ?? "\(e)"),
+                "reason": .string(error.localizedDescription),
             ])
         }
-        return await deskConfirm(
-            store, handle: handle,
-            prefix: until.map { "deferred until \($0)" } ?? "defer cleared"
-        )
+        return await deskConfirm(store, handle: handle, prefix: prefix)
     }
 
     // MARK: - desk_archive

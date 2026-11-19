@@ -126,7 +126,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
         FeatureSurfaceRecord(
             sourceId: "capability_foundry",
             name: "Capability Foundry",
-            description: "Unified index for feature surfaces, skills, tools, workflows, and catalog packs without loading all bodies into context.",
+            description: "Unified index for feature surfaces, skills, tools, and catalog packs without loading all bodies into context.",
             triggers: ["capability", "what can you do", "feature", "tool list", "skill list"],
             permissions: [],
             riskClass: "read_only",
@@ -161,7 +161,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             sourceId: "research_browser",
             name: "Research and Browser Runtime",
             description: """
-                SearXNG research, URL fetch/source capture, research lab receipts, and live browser actions governed by Trust permissions and \
+                SearXNG research, URL fetch/source capture, and live browser actions governed by Trust permissions and \
                 approval requirements.
                 """,
             triggers: ["research", "search", "web", "browser", "source", "fetch"],
@@ -189,16 +189,6 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             riskClass: "safety_surface",
             updatedAt: nowISO,
             endpoints: ["app doctor.run", "app setting.get", "app setting.set", "app backup.now", "app doctor.support_report", "app provider.sign_in"]
-        ),
-        FeatureSurfaceRecord(
-            sourceId: "auto_improvement",
-            name: "Self-Improvement Center",
-            description: "Directed app-owned self-improvement, autonomous Codex worktrees, cleanup, gauntlet, and staged receipts.",
-            triggers: ["improve", "self improve", "autonomy", "train", "gauntlet"],
-            permissions: ["app_owned_worktree"],
-            riskClass: "guardrailed_autonomy",
-            updatedAt: nowISO,
-            endpoints: []
         ),
         FeatureSurfaceRecord(
             sourceId: "native_mac_power",

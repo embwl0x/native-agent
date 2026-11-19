@@ -1,23 +1,22 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ModelCompensationsCheck.swift` | Bounded Doctor-only `shim.fired` counts since launch; no judgment or repair |
+// Blueprint: | `ModelCompensationsCheck.swift` | Bounded Doctor-only `shim.fired` counts since this build first launched; no judgment or repair |
 
 /// Explicit Doctor reads share the bounded prefix-health window; neither turns nor unattended checks may trigger them.
 public struct ModelCompensationsCheck: DoctorCheck {
     public let id: String = "model.shims"
     public let title: String = "Model compensations"
-    public let heartbeatEligible: Bool = false
 
     private let root: URL
     private let cache: DoctorScanCache
 
-    /// Count only in-build shim.fired sites; silence measures receipt count, never mechanism health.
+    /// Count recorded shim.fired receipts; silence measures receipt count, never mechanism health.
     private static let censusIDs = [
-        "C02", "C04", "C09",
-        "L01", "L10", "L12", "L13",
+        "C04", "C09",
+        "L10", "L12", "L13",
         "L22", "L23",
-        "T01", "T05", "T16", "T17", "T21",
+        "T01", "T16", "T17", "T21",
         "M20",
     ]
 
@@ -38,10 +37,7 @@ public struct ModelCompensationsCheck: DoctorCheck {
         guard let window = DoctorWindowFloor.resolve(root: root, now: now) else {
             return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
                 id: id, title: title, status: "unmeasured",
-                detail: """
-                    This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring \
-                    this build.
-                    """)
+                detail: "build_launch.json does not name the running build, so its window cannot be measured; the next launch writes it.")
         }
         var turns = Set<String>()
         var counts: [String: Int] = [:]

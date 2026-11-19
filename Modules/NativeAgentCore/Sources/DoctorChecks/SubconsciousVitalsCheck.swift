@@ -5,15 +5,13 @@ import PersistenceCore
 // Blueprint: | `SubconsciousVitalsCheck.swift` | `SubconsciousVitalsCheck`: measured capsule, felt vocabulary and chemistry |
 
 // MARK: - Subconscious vitals (Cognition)
-// Capsule drift may leave chat looking normal; measure bounded context snapshots and chemistry explicitly in Doctor. Name the window from this build's launch;
+// Capsule drift may leave chat looking normal; measure bounded context snapshots and chemistry explicitly in Doctor since this build first launched;
 // rates and variety describe observations without grading the agent's health. The full feelingFrame and bounded cognitiveCue are measured independently;
 // missing or clipped wording cannot be measured.
 
 public struct SubconsciousVitalsCheck: DoctorCheck {
     public let id: String = "subconscious_vitals"
     public let title: String = "Subconscious Vitals"
-    /// Measurement-window verdicts stay in Doctor and cannot trigger unattended pushes.
-    public let heartbeatEligible: Bool = false
 
     private let root: URL
     private let cache: DoctorScanCache
@@ -63,10 +61,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         guard let window = DoctorWindowFloor.resolve(root: root, now: moment) else {
             return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
                 id: id, title: title, status: "unmeasured",
-                detail: """
-                    This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring \
-                    this build.
-                    """)
+                detail: "build_launch.json does not name the running build, so its window cannot be measured; the next launch writes it.")
         }
         let summary: TurnTraceScanSummary
         do {

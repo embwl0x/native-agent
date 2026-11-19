@@ -29,12 +29,6 @@ final class NetworkPathObserver: ObservableObject {
         monitor.start(queue: queue)
     }
 
-    func stop() {
-        guard started else { return }
-        started = false
-        monitor.cancel()
-    }
-
     static func offlineBannerMessage(isOffline: Bool?) -> String? {
         isOffline == true
             ? "This iPhone has no network connection. Messages are queued and will send when it returns."

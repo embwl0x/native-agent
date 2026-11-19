@@ -29,7 +29,7 @@ extension InlineInteraction.Continuation {
         continuation.originTurnId = turn.id
         continuation.lifeID = try DataRootLife.current(in: dataRoot)
         continuation.fileAccessCeiling = turn.fileAccessCeiling
-        continuation.signatureReceipt = InlineInteractionSignatureWitness.receipt(for: .init(
+        continuation.signatureReceipt = try InlineInteractionSignatureWitness.receipt(for: .init(
             sessionID: sessionID, interactionID: interaction.id, continuation: continuation,
             originEnvelope: originEnvelope, interaction: interaction),turn: turn)
         return continuation
@@ -123,9 +123,9 @@ public enum InlineInteractionSignatureWitness {
         static let version = "inline-interaction-witness/v4"
     }
 
-    public typealias Minter = @Sendable (_ canonicalWitness: String) -> String?
+    public typealias Minter = @Sendable (_ canonicalWitness: String) throws -> String?
     /// Verify against live pairing keys so rotation invalidates old receipts.
-    public typealias Verifier = @Sendable (_ canonicalWitness: String, _ receipt: String) -> Bool
+    public typealias Verifier = @Sendable (_ canonicalWitness: String, _ receipt: String) throws -> Bool
 
     // Keep the raw minter private so callers cannot bypass the signed-context check.
     nonisolated(unsafe) private static var minter: Minter?
@@ -137,18 +137,18 @@ public enum InlineInteractionSignatureWitness {
     }
 
     /// Mint only with both a signature-verified current turn and installed pairing owner.
-    public static func receipt(for witness: Witness,turn: Turn) -> String? {
+    public static func receipt(for witness: Witness,turn: Turn) throws -> String? {
         // Inbound task-local and resumed-envelope verification may permit minting; only the resulting receipt survives replay.
         let signed = turn.envelope?.commandSignatureVerified == true
             || turn.envelope?.commandSignatureVerified == true
         guard signed else { return nil }
-        return minter?(witness.canonical)
+        return try minter?(witness.canonical)
     }
 
     /// Rebuild the full witness at replay so transplanted or edited receipts cannot grant signature-verified authority.
-    public static func isStillSigned(_ witness: Witness) -> Bool {
+    public static func isStillSigned(_ witness: Witness) throws -> Bool {
         guard let receipt = witness.continuation.signatureReceipt, !receipt.isEmpty
         else { return false }
-        return verifier?(witness.canonical, receipt) ?? false
+        return try verifier?(witness.canonical, receipt) ?? false
     }
 }

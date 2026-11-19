@@ -40,6 +40,7 @@ extension ExperienceStore {
         public var subjects: [String]?
         public var subjectPrefix: String?
         public var kinds: [String]?
+        public var kindContains: String?
         public var from: Date?
         public var through: Date?
         /// Only details written after this sequence.
@@ -48,6 +49,10 @@ extension ExperienceStore {
         public var before: Int64?
         public var limit: Int?
         public var newestFirst: Bool
+        /// Each `holding` path holds exactly that JSON (`"\"end\""`, `"false"`), each `lacking` path is absent and each `bearing` path holds text.
+        public var holding: [String: String] = [:]
+        public var lacking: [String] = []
+        public var bearing: [String] = []
 
         public init(sources: [String]? = nil, subjects: [String]? = nil, kinds: [String]? = nil, from: Date? = nil, through: Date? = nil,
                     after: Int64? = nil, before: Int64? = nil, limit: Int? = nil, newestFirst: Bool = false, subjectPrefix: String? = nil) {
@@ -107,15 +112,26 @@ extension ExperienceStore {
     }
 
     /// One transaction; a durable one also syncs through the drive's cache, which SQLite's ordinary sync on macOS does not.
-    private func write<T>(durable: Bool, _ body: (Database) throws -> T) throws -> T {
-        guard durable else { return try database().write(body) }
+    /// The store's one write door: only its own database failure opens the gap, in order with the commits that close it.
+    func write<T>(durable: Bool = false, _ body: (Database) throws -> T) throws -> T {
+        do { return try committedWrite(durable: durable, body) }
+        catch let error as DatabaseError { failed(error); throw error }
+    }
+
+    private func committedWrite<T>(durable: Bool, _ body: (Database) throws -> T) throws -> T {
+        guard durable else {
+            let result = try database().write(body)
+            self.committed()
+            return result
+        }
+        var committed = false
+        defer { if committed { self.committed() } }
         return try database().writeWithoutTransaction { db in
             guard let original = try Int.fetchOne(db, sql: "PRAGMA fullfsync"), original == 0 || original == 1 else {
                 throw DetailError.unreadableFullSync
             }
             if original == 0 { try db.execute(sql: "PRAGMA fullfsync = ON") }
             var result: Result<T, Error>?
-            var committed = false
             do {
                 try db.inTransaction {
                     result = .success(try body(db))
@@ -143,29 +159,15 @@ extension ExperienceStore {
         try readRecorded { try Self.selectDetails(query, in: $0, counting: true) }
     }
 
-    /// The distinct strings one JSON path holds across the committed details a query matches, where each `holding` path holds exactly that JSON
-    /// (`"\"end\""`, `"false"`), each `lacking` path is absent and each `bearing` path holds text. SQLite answers from the rows; none is decoded
+    /// The distinct strings one JSON path holds across the committed details a query matches. SQLite answers from the rows; none is decoded
     /// here. A store not yet written holds none, and reading never initializes it.
-    public nonisolated func recordedDetailValues(_ query: DetailQuery, at value: String, holding: [String: String] = [:],
-                                                 lacking: [String] = [], bearing: [String] = []) throws -> [String] {
+    public nonisolated func recordedDetailValues(_ query: DetailQuery, at value: String) throws -> [String] {
         guard let found = Self.conditions(query) else { return [] }
         do { _ = try FileManager.default.attributesOfItem(atPath: path.path) }
         catch CocoaError.fileReadNoSuchFile { return [] }
         var clauses = found.clauses, arguments = found.arguments
         clauses.append("json_type(row, ?) = 'text'")
         arguments += [value]
-        for (key, json) in holding.sorted(by: { $0.key < $1.key }) {
-            clauses.append("(row -> ?) = ?")
-            arguments += [key, json]
-        }
-        for key in lacking {
-            clauses.append("json_type(row, ?) IS NULL")
-            arguments += [key]
-        }
-        for key in bearing {
-            clauses.append("json_type(row, ?) = 'text'")
-            arguments += [key]
-        }
         let sql = "SELECT DISTINCT json_extract(row, ?) FROM detail WHERE " + clauses.joined(separator: " AND ")
         return try readRecorded { try String.fetchAll($0, sql: sql, arguments: StatementArguments([value]) + arguments) }
     }
@@ -192,10 +194,23 @@ extension ExperienceStore {
             clauses.append("substr(subject, 1, length(?)) = ?")
             arguments += [prefix, prefix]
         }
+        if let part = query.kindContains { clauses.append("instr(lower(kind), ?) > 0"); arguments += [part] }
         if let from = query.from { clauses.append("at >= ?"); arguments += [from.timeIntervalSince1970] }
         if let through = query.through { clauses.append("at <= ?"); arguments += [through.timeIntervalSince1970] }
         if let after = query.after { clauses.append("seq > ?"); arguments += [after] }
         if let before = query.before { clauses.append("seq < ?"); arguments += [before] }
+        for (key, json) in query.holding.sorted(by: { $0.key < $1.key }) {
+            clauses.append("(row -> ?) = ?")
+            arguments += [key, json]
+        }
+        for key in query.lacking {
+            clauses.append("json_type(row, ?) IS NULL")
+            arguments += [key]
+        }
+        for key in query.bearing {
+            clauses.append("json_type(row, ?) = 'text'")
+            arguments += [key]
+        }
         return (clauses, arguments)
     }
 
@@ -236,7 +251,7 @@ extension ExperienceStore {
     private func forgetPastHorizon() throws {
         let now = Date()
         guard now.timeIntervalSince(detailsForgottenAt) >= 6 * 3_600 else { return }
-        _ = try database().write { db in
+        _ = try write { db in
             try db.execute(sql: """
                 DELETE FROM detail WHERE at < ? AND NOT (source = ? AND kind IN (?, ?, ?, ?, ?, ?))
                 """, arguments: [now.addingTimeInterval(-Self.detailHorizon).timeIntervalSince1970,

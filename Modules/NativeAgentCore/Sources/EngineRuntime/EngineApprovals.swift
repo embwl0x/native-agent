@@ -272,17 +272,13 @@ extension NativeAgentEngine {
             }
         }
 
-        // Persist a MAC over the card identity, never the signed-turn verdict; replay must verify against the live pairing secret, refusing missing or rotated
-        // authority.
         InlineInteractionSignatureWitness.install(
             mint: { canonical in
-                guard let secret = try? PairingSecret.loadOrGenerateSecret()
-                else { return nil }
+                let secret = try PairingSecret.requireExistingSecret()
                 return BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
             },
             verify: { canonical, receipt in
-                guard let secret = try? PairingSecret.loadOrGenerateSecret()
-                else { return false }
+                let secret = try PairingSecret.requireExistingSecret()
                 let expected = BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
                 return BridgeMessage.constantTimeEqual(receipt, expected)
             }

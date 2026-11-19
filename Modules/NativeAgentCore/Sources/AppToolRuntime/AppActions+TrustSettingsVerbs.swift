@@ -2,11 +2,6 @@ import Foundation
 // Blueprint: | `AppActions+TrustSettingsVerbs.swift` | The verbs Trust's and Settings' rows call beyond `setting.set` and the existing backup, history and grant verbs: the Mac's own buttons, each the person's lever where it needs the person at the Mac |
 
 extension AppActions {
-    /// What the Trust and Settings rows call that no existing verb does. Each runs its Mac handler through `upkeep`
-    /// (`AppQuietToolHost.runTrustSettingsUpkeep`). A row that needs the person's own hands in the act itself (choosing in a file chooser, a
-    /// damaged policy no gate can read) is a lever the agent's call never takes: `asks: false`, since no card and no word of theirs can stand
-    /// in for the person there. A row that only puts something in front of the person (macOS's own prompts, which only the person answers, a
-    /// window, the clipboard) is a lever a card can carry: the agent does it when they ask, and asks first when it is its own idea.
     static var trustSettingsInboxVerbs: [AppAction] {
         get throws {
             let foreground = "it runs in the foreground on this Mac for the person at it"

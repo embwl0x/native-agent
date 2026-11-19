@@ -20,8 +20,6 @@ extension ContextPreparation {
         let kernelSourceFingerprint: String
         let stableIncludedDocumentIDs: [String]
         let allowedPrivacy: [String]
-        /// Part of the key because it changes the DERIVED value: it decides whether every persona source is precovered or only the kernel's.
-        let stableSegmentCarriesRequiredDocuments: Bool
         let userMemoryCore: [String]
         let memoryRecallDisabled: Bool
         let excludedSourceOwners: Set<String>
@@ -43,7 +41,6 @@ extension ContextPreparation {
             kernelSourceFingerprint = kernel.key.sourceFingerprint
             stableIncludedDocumentIDs = kernel.includedDocumentIDs.map(\.rawValue)
             allowedPrivacy = request.allowedPrivacy.map(\.rawValue).sorted()
-            stableSegmentCarriesRequiredDocuments = request.stableSegmentCarriesRequiredDocuments
             userMemoryCore = request.userMemoryCore
             memoryRecallDisabled = !request.memoryRecallEnabled
             self.excludedSourceOwners = excludedSourceOwners
@@ -101,27 +98,15 @@ extension ContextPreparation {
         }
 
         let allowedSourceIDs = Set(selectedSources.map(\.descriptor.id))
-        let precoveredDocumentNames = Set(kernel.includedDocumentIDs.map {
-            String($0.rawValue.dropLast(3))
-        })
-        let surfaceSuffix = "/surfaces/\(request.surface.rawValue).md"
-        // Precover persona sources carried verbatim by the stable segment; otherwise precover only kernel and surface documents. Rendering and precoverage must
-        // both enforce the source's surface permission.
+        // Persona documents reach every turn through the stable segment. Existing stored persona atoms remain covered, never ranked.
         var precoveredSourceIDs = Set(selectedSources.lazy.filter { source in
-            guard source.descriptor.owner == ContextPersonaSourceNaming.owner,
-                  source.descriptor.permittedSurfaces.contains(request.surface)
-            else { return false }
-            if request.stableSegmentCarriesRequiredDocuments { return true }
-            let locator = source.descriptor.canonicalLocator
-            if locator.hasSuffix(surfaceSuffix) { return true }
-            let documentName = locator.split(separator: "/").last.map(String.init)?
-                .replacingOccurrences(of: ".md", with: "")
-            return documentName.map(precoveredDocumentNames.contains) ?? false
+            source.descriptor.owner == ContextPersonaSourceNaming.owner
+                && source.descriptor.permittedSurfaces.contains(request.surface)
         }.map(\.descriptor.id))
-        // Precover persona USER atoms, but suppress canonical memory only for carried USER facts.
+        // Suppress canonical memory only for carried USER pins, independent of whether persona atoms were ever stored.
         if let user = mirror.documents.first(where: { $0.id.rawValue == "USER.md" }),
-           let userSourceID = user.sourceID, precoveredSourceIDs.contains(userSourceID) {
-            let carried = UserMDAutogenMarkers.promptText(user.text, userMemoryCore: request.userMemoryCore)
+           user.permitsStablePrefix(on: request.surface) {
+            let carried = UserMDAutogenMarkers.userSection(user.text, userMemoryCore: request.userMemoryCore)
             let facts = Set(carried.split(separator: "\n").compactMap { line in
                 line.hasPrefix("- ") ? MemoryDisplayText.projectionJoinKey(String(line.dropFirst(2))) : nil
             })
@@ -177,12 +162,6 @@ extension ContextPreparation {
             }
         }
         if feedbackRestoreFailure != nil { await restoreFeedbackEvents() }
-        if let reconciliationFailure {
-            reconcileInBackground(reason: "turn_generation_repair")
-            throw ContextFlowStoreError.malformedStoredValue("""
-                Context preparation is unavailable: \(reconciliationFailure). Repair its source and republish before another turn.
-                """)
-        }
         // The turn reads the published generation; it never joins a compile.
         guard let generation = activeStoredGeneration else {
             reconcileInBackground(reason: "turn_generation_recovery")

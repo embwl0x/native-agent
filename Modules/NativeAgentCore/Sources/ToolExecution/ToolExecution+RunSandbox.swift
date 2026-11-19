@@ -30,6 +30,7 @@ actor ToolPrimitiveBroker {
         return AuthoredToolEffects.primitiveEffect(operation, arguments: arguments).capabilities.contains("safe_read")
     }
     private let permissions: Set<String>
+    private let readPaths: [String]
     private let abilityID: String
     private let dataRoot: URL
     /// Held reach outlives individual runs and its arrivals wake the resident ability.
@@ -123,8 +124,9 @@ actor ToolPrimitiveBroker {
         }
     }
 
-    init(permissions: Set<String>, abilityID: String, dataRoot: URL, held: AbilityStore? = nil) {
+    init(permissions: Set<String>, abilityID: String, dataRoot: URL, readPaths: [String], held: AbilityStore? = nil) {
         self.permissions = permissions
+        self.readPaths = readPaths
         self.dataRoot = dataRoot
         self.abilityID = abilityID; self.held = held
     }
@@ -173,7 +175,7 @@ actor ToolPrimitiveBroker {
                         """)
             }
             // A fetch to this Mac's own loopback (a local agent's endpoint) is reached as localhost is, and its secret may go there as network.send's does.
-            let local = try operation == "fetch" && Self.loopback(Self.destination(args))
+            let local = try operation == "fetch" && NetworkAddress.loopback(Self.destination(args))
             let reach = operation == "model.call" ? "model" : local ? "network_localhost" : "network_public"
             guard permissions.contains(reach) else {
                 throw Parts.revisionFailure("undeclared", "Declare reach.capabilities \(reach) to call \(operation) in ability \(abilityID).", id: abilityID)
@@ -184,16 +186,12 @@ actor ToolPrimitiveBroker {
                     "Declare network_localhost for loopback, network_public for public outbound connections, or network for inbound and outbound reach.")
             }
             if operation == "network.connect", args["path"] != nil {
-                // A socket path is a stream on this Mac, reached as localhost is.
-                _ = try text(args, "path")
-                guard !permissions.isDisjoint(with: ["network", "network_localhost"]) else {
-                    throw denied("A socket path needs loopback reach.", "Declare reach.capabilities network_localhost before opening this socket path.")
-                }
+                _ = try socketPath(args)
                 guard args["host"] == nil, args["port"] == nil, args["tls"] == nil, args["transport"] == nil else {
                     throw Self.inputFailure("invalid_socket_arguments", field: "path", accepted: "{path: string}, without host, port, tls or transport")
                 }
             } else if operation == "network.connect" || operation == "network.listen" {
-                let local = Self.loopback(try text(args, "host"))
+                let local = NetworkAddress.loopback(try text(args, "host"))
                 guard permissions.contains("network") || local && permissions.contains("network_localhost")
                     || operation == "network.connect" && !local && permissions.contains("network_public") else {
                     throw denied("\(operation) host is outside the declared reach.", """
@@ -282,7 +280,7 @@ actor ToolPrimitiveBroker {
             guard operation == "network.connect", case .string(let id)? = Parts.fields(result)["id"] else { return result }
             // A secret goes out only on a connection that established TLS, as the transport reports it (or to this Mac by host); udp carries none.
             if let host = Parts.string(args, "host"), args["transport"] != .string("udp"),
-               connections[id]?.metadata(definition: NWProtocolTLS.definition) != nil || Self.loopback(host) { hosts[id] = host.lowercased() }
+               connections[id]?.metadata(definition: NWProtocolTLS.definition) != nil || NetworkAddress.loopback(host) { hosts[id] = host.lowercased() }
             pump(id)
             return result
         } catch {
@@ -304,7 +302,7 @@ actor ToolPrimitiveBroker {
         guard urls[1].host == url.host else {
             throw Self.inputFailure("secret_in_url_host", field: "url", accepted: "a fixed host; place {{secret:<name>}} only in the path or query")
         }
-        guard names.isEmpty || url.scheme == "https" || loopback(url.host!) else {
+        guard names.isEmpty || url.scheme == "https" || NetworkAddress.loopback(url.host!) else {
             throw Self.inputFailure("secret_transport_required", field: "url", accepted: "https, or http to admitted loopback on this Mac",
                 detail: "Use an https URL for a secret, or http to admitted loopback on this Mac.")
         }
@@ -700,7 +698,7 @@ actor ToolPrimitiveBroker {
         guard host.lowercased() == destination else { throw denied("With its secrets in, this fetch no longer goes to \(destination); nothing was sent.",
             "Keep the destination host fixed; put secret placeholders in the URL path, query, headers or body.") }
         let connected = try await network("network.connect", args: ["host": .string(host),
-            "port": .int(Int64(url.port ?? (tls ? 443 : 80))), "tls": .bool(tls), "publicOnly": .bool(!Self.loopback(host))], fetch: true,
+            "port": .int(Int64(url.port ?? (tls ? 443 : 80))), "tls": .bool(tls), "publicOnly": .bool(!NetworkAddress.loopback(host))], fetch: true,
                 onActivity: onActivity)
         let id = try text(Parts.fields(connected), "id")
         defer { connections.removeValue(forKey: id)?.cancel(); fetchConnections.remove(id) }
@@ -861,16 +859,6 @@ actor ToolPrimitiveBroker {
         }
         return data
     }
-    /// Only exact localhost/loopback IP literals are local; lookalike names grant no local authority.
-    private static func loopback(_ host: String) -> Bool {
-        if host.lowercased() == "localhost" { return true }
-        var v4 = in_addr(), v6 = in6_addr()
-        if inet_pton(AF_INET, host, &v4) == 1 { return UInt32(bigEndian: v4.s_addr) >> 24 == 127 }
-        guard inet_pton(AF_INET6, host, &v6) == 1 else { return false }
-        let bytes = withUnsafeBytes(of: v6) { Array($0) }
-        return bytes == Array(repeating: 0, count: 15) + [1] || bytes.prefix(12) == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] && bytes[12] == 127
-    }
-
     /// Run DNS off the broker and retain its handle until synchronous exit; cancellation cannot interrupt getaddrinfo. Admitted fetches retain their
     /// original lookup through transport settlement.
     private func address(_ host: String, publicOnly: Bool = false, fetch: Bool = false) async throws -> String {
@@ -889,13 +877,15 @@ actor ToolPrimitiveBroker {
         try Task.checkCancellation()
         // A run closing ends ordinary lookups, while an admitted fetch still owns its one request.
         guard !closed || fetch else { throw CancellationError() }
-        // A local destination resolves to this Mac alone; a public one never reaches it.
-        guard !publicOnly || addresses.allSatisfy({ !Self.loopback($0) }), !Self.loopback(host) || addresses.allSatisfy(Self.loopback),
+        // Loopback resolves only to this Mac; public fetches cannot reach private networks either.
+        guard !publicOnly || addresses.allSatisfy({ !NetworkAddress.loopback($0) && !NetworkAddress.privateNetwork($0) }),
+              !NetworkAddress.loopback(host) || addresses.allSatisfy(NetworkAddress.loopback),
               let chosen = addresses.first, permissions.contains("network")
-            || addresses.allSatisfy({ Self.loopback($0) ? permissions.contains("network_localhost") : permissions.contains("network_public") }) else {
+            || addresses.allSatisfy({ NetworkAddress.loopback($0) ? permissions.contains("network_localhost")
+                : !NetworkAddress.privateNetwork($0) && permissions.contains("network_public") }) else {
             throw denied("The resolved address for \(host) is outside the declared network reach.", """
                 Check the host's DNS addresses; use a matching loopback or public host and declare its network reach. A public fetch cannot target \
-                loopback.
+                loopback or private network addresses.
                 """)
         }
         return chosen
@@ -920,13 +910,26 @@ actor ToolPrimitiveBroker {
         return addresses
     }
 
+    private func socketPath(_ args: [String: JSONValue]) throws -> String {
+        func resolved(_ path: String) -> String {
+            URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path
+        }
+        let raw = try text(args, "path"), path = resolved(raw), root = resolved(dataRoot.path)
+        guard permissions.contains("network"), raw.hasPrefix("/") || raw.hasPrefix("~/"), !raw.utf8.contains(0),
+              readPaths.contains(where: { resolved($0) == path }), path != root, !path.hasPrefix(root + "/") else {
+            throw denied("Socket reach is undeclared or targets NativeAgent's data root.",
+                "Declare reach.capabilities network and this exact socket in reach.readPaths; NativeAgent's data root sockets cannot be opened.")
+        }
+        return path
+    }
+
     private func network(_ operation: String, args: [String: JSONValue], fetch: Bool = false, onActivity: (@Sendable () -> Void)?) async throws -> JSONValue {
         try Task.checkCancellation()
         guard !closed || fetch else { throw CancellationError() }
         switch operation {
         case "network.connect" where args["path"] != nil:
             let id = UUID().uuidString
-            connections[id] = NWConnection(to: .unix(path: try text(args, "path")), using: .tcp)
+            connections[id] = NWConnection(to: .unix(path: try socketPath(args)), using: .tcp)
             try await ready(id, onActivity: onActivity)
             guard !closed, connections[id] != nil else { throw CancellationError() }
             return .object(["id": .string(id)])
@@ -950,7 +953,7 @@ actor ToolPrimitiveBroker {
                 guard !closed || fetch, connections[id] != nil else { throw CancellationError() }
                 return .object(["id": .string(id)])
             }
-            guard permissions.contains("network") || Self.loopback(address) && permissions.contains("network_localhost") else {
+            guard permissions.contains("network") || NetworkAddress.loopback(address) && permissions.contains("network_localhost") else {
                 throw denied("Listening requires the declared inbound network reach.",
                     "Declare network_localhost for a loopback listener or network for a listener beyond loopback.")
             }

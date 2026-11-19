@@ -118,19 +118,6 @@ extension NativeOAuthFlow {
         return "Signed in (expires in \(label))"
     }
 
-    /// Shared-session offers name the account only when known.
-    public static func openAIAdoptedCLISessionDetail(
-        activeAuthPath: URL? = nil,
-        sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome(),
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) throws -> String? {
-        guard let path = try activeAuthPath
-            ?? openAIStatusAuthPath(dataRoot: dataRoot, sharedCLIHome: sharedCLIHome)
-        else { return nil }
-        guard try ChatGPTTransport.hasAccessToken(at: path) else { return nil }
-        return openAIAdoptedCLISessionDetail(activeAuthPath: path, accountEmail: openAIAccountEmail(at: path), sharedCLIHome: sharedCLIHome)
-    }
-
     private static func openAIAdoptedCLISessionDetail(
         activeAuthPath path: URL, accountEmail: String?,
         sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome()
@@ -175,15 +162,6 @@ extension NativeOAuthFlow {
             dataRoot: dataRoot,
             allowSharedFallbacks: false
         )
-    }
-
-    /// Status must use the adapter's selected root, overrides and consent rules.
-    public static func openAIStatusAuthPath(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome()
-    ) throws -> URL? {
-        let path = ChatGPTTransport.preferredAuthPath(dataRoot: dataRoot, userCodexHome: sharedCLIHome)
-        return try ChatGPTTransport.hasAccessToken(at: path) ? path : nil
     }
 
     public static func anthropicTokenPath(dataRoot: URL? = nil) -> URL {

@@ -257,7 +257,7 @@ private func run() throws {
             signature
         } else { error as? ChromeHostIdentity.SigningFailure }
         let check = signature?.check ?? failure?.check ?? (error as NSError).userInfo["chrome_check"] as? String ?? "relay greeting"
-        let scope: ChromeRelayRefusal.Scope = if case .browserSignature? = failure { .browser } else { .listener }
+        let scope: ChromeRelayRefusal.Scope = switch failure { case .browserSignature?, .originRefused?: .browser; default: .listener }
         do {
             let refusal = ChromeRelayRefusal(scope: scope, check: check, osStatus: signature?.status,
                                             reason: error.localizedDescription, browserPID: browserPID)

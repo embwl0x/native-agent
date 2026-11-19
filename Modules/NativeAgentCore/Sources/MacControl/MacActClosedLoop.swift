@@ -115,6 +115,10 @@ public enum MacActClosedLoop {
 
     public static func canType(role: String) -> Bool { typeableRoles.contains(role) }
 
+    static func replacesTextValue(role: String) -> Bool {
+        ["AXTextField", "AXComboBox", "AXSearchField"].contains(role)
+    }
+
     // MARK: - Secure keyboard entry
 
     /// Secure-input refusals retain both a machine-readable reason and an actionable sentence.

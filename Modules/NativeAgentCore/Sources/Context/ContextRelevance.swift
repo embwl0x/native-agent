@@ -114,7 +114,6 @@ extension ContextSelector {
             need.unresolvedQuestion,
             need.goal,
             need.currentProjectID,
-            need.sessionID,
             need.executionID,
         ].compactMap { $0 }
             + recentTurns
@@ -208,16 +207,13 @@ extension ContextSelector {
         min(1, max(0, VectorMath.cosine(lhs, rhs)))
     }
 
-    /// Use the best leave-one-out standing across query readings, removing each atom's general pull. Aggregate moments keep this linear; the fixed deviation
-    /// floor ignores diagnostic `looks`. Saturate infinite standing to finite Double. Fewer than three comparable vectors use model-scaled semantics; none
-    /// supply no touch.
     func memoryRelevance(
         _ atoms: [ContextStoredAtom],
         need: NeedSignal,
         scores: [ContextAtomID: ContextCandidateScoreFeatures]
-    ) -> (relevance: [ContextAtomID: Double], looks: Int) {
+    ) -> (relevance: [ContextAtomID: Double], cosines: [ContextAtomID: Double], looks: Int) {
         guard let fingerprint = need.queryEmbeddingModelFingerprint,
-              let primary = need.queryEmbedding, !primary.isEmpty else { return ([:], 0) }
+              let primary = need.queryEmbedding, !primary.isEmpty else { return ([:], [:], 0) }
         var units: [(id: ContextAtomID, vector: [Double])] = []
         for atom in atoms {
             guard let embedding = atom.draft.embedding, embedding.modelFingerprint == fingerprint,
@@ -229,11 +225,12 @@ extension ContextSelector {
         // One or two vectors cannot establish a relative population. Use the same model-scaled semantic contribution as the ordinary score.
         if units.count < 3 {
             let floor = min(0.99, max(0, configuration.memorySemanticFloor(forModel: need.queryEmbeddingModelID) ?? 0))
-            return (Dictionary(uniqueKeysWithValues: units.map {
-                ($0.id, configuration.weights.semanticCosine * max(0, (scores[$0.id]?.semanticCosine ?? 0) - floor) / (1 - floor))
-            }), units.count)
+            let cosines = Dictionary(uniqueKeysWithValues: units.compactMap { unit in
+                scores[unit.id].map { (unit.id, $0.semanticCosine) }
+            })
+            return (cosines.mapValues { configuration.weights.semanticCosine * max(0, $0 - floor) / (1 - floor) }, cosines, units.count)
         }
-        guard let dimension = units.first?.vector.count else { return ([:], 0) }
+        guard let dimension = units.first?.vector.count else { return ([:], [:], 0) }
         var sum = [Double](repeating: 0, count: dimension)
         for unit in units { for index in sum.indices { sum[index] += unit.vector[index] } }
         let count = Double(units.count)
@@ -244,13 +241,16 @@ extension ContextSelector {
         let readings = ([primary] + [need.alternateQueryEmbedding].compactMap { $0 }
             + (need.ownWordsQueryEmbeddings ?? [])).filter { $0.count == dimension }
         var best = [Double](repeating: 0, count: units.count)
+        var cosines = [Double](repeating: 0, count: units.count)
         var readingsLooked = 0
         for reading in readings {
             let norm = reading.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
             guard norm > 0, norm.isFinite else { continue }
             let query = reading.map { Double($0) / norm }
-            let touch = zip(units, pull).map { unit, pull in
-                min(1, max(0, zip(unit.vector, query).reduce(0.0) { $0 + $1.0 * $1.1 })) - (pull - meanPull)
+            let touch = units.enumerated().map { index, unit in
+                let cosine = min(1, max(0, zip(unit.vector, query).reduce(0.0) { $0 + $1.0 * $1.1 }))
+                cosines[index] = max(cosines[index], cosine)
+                return cosine - (pull[index] - meanPull)
             }
             for (index, standing) in VectorMath.standout(touch).enumerated() {
                 guard let standing else { continue }
@@ -258,8 +258,9 @@ extension ContextSelector {
             }
             readingsLooked += 1
         }
-        guard readingsLooked > 0 else { return ([:], 0) }
+        guard readingsLooked > 0 else { return ([:], [:], 0) }
         return (Dictionary(zip(units, best).map { ($0.id, $1) }, uniquingKeysWith: { first, _ in first }),
+                Dictionary(zip(units, cosines).map { ($0.id, $1) }, uniquingKeysWith: { first, _ in first }),
                 readingsLooked * units.count)
     }
 }

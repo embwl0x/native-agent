@@ -140,10 +140,9 @@ public struct DeskState: Sendable, Equatable {
     }
 
     public var topLevel: [DeskItem] { items.filter { $0.parent == nil } }
-    /// Keep the person's board distinct from the agent's intentions.
     public var board: DeskState {
         var board = self
-        board.items.removeAll { $0.project == MyQueue.project }
+        board.items.removeAll { $0.project == MyQueue.project && $0.step != nil }
         return board
     }
     public var boardCountSummary: String {

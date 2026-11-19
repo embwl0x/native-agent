@@ -10,26 +10,36 @@ import TrustCenter
 /// Partial or damaged policy fails closed and owes its repair.
 public enum UnattendedWork {
     public static func allowed(dataRoot: URL) async -> Bool {
-        guard let policy = await checkedPolicy(dataRoot: dataRoot) else { return false }
-        if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
-        if policy["permissionLevel"] == .string("full_mac_os") { return true }
-        return await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-            .fullMacYoloAuthority(origin: SecurityOriginContext(surface: "autonomy", source: "unattended_work", isRemote: false), turn: nil)
-            .admitted
+        await refusal(dataRoot: dataRoot) == nil
     }
 
-    /// A boolean admission carries no cause, so an unreadable policy is owed as a repair rather than read as a disabled setting.
-    private static func checkedPolicy(dataRoot: URL) async -> [String: JSONValue]? {
+    /// The deciding read supplies its receipt; callers must not interpret every denial as Autonomy being off.
+    public static func refusal(dataRoot: URL) async -> JSONValue? {
         let operation = "unattended_work.trust_policy"
         do {
-            let policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked()
+            let snapshot = try SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+            let policy = snapshot.policy
             RepairOwed.settle(dataRoot, operation: operation, evidence: .init(source: "trust/policy.json", id: operation))
-            return policy
+            if case .bool(true) = policy["enableAutonomy"] ?? .null { return nil }
+            if policy["permissionLevel"] == .string("full_mac_os") { return nil }
+            let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+                .fullMacYoloAuthority(origin: SecurityOriginContext(surface: "autonomy", source: "unattended_work", isRemote: false),
+                    snapshot: snapshot, turn: nil)
+            if authority.admitted { return nil }
+            return .object(["status": .string("refused"), "reason": .string("autonomy_off"),
+                "checker": .string("unattended_work"), "effects": .string("none"),
+                "detail": .string("Unattended work did not run: Autonomy is off."),
+                "remedy": Repair.why(owner: "Autonomy", tap: "Trust > Autonomy",
+                    instruction: "Only the person can turn Autonomy on.")])
         } catch {
             RepairOwed.owe(dataRoot, id: operation, kind: .run, operation: operation,
                 owner: "trust/policy.json", words: "Unattended work cannot read Trust authority: \(error.localizedDescription)",
                 lever: "Preserve the policy bytes and repair the reported cause. No unattended work was admitted by this read.")
-            return nil
+            let failure = error as? ToolFailureError ?? SwiftNativeTrustCenter.policyUnavailable(error.localizedDescription)
+            var evidence = failure.failureEvidence(defaultCode: "trust_policy_unavailable")
+            evidence["checker"] = .string("unattended_work")
+            evidence["detail"] = .string(error.localizedDescription)
+            return .object(evidence)
         }
     }
 }

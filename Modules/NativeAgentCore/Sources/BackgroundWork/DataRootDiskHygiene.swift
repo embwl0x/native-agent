@@ -531,7 +531,6 @@ public enum DataRootDiskHygiene {
 public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
     public let loopId: String = "data_root_disk_hygiene"
     public let wake: OrganWake
-    public var tickTimeoutOverride: TimeInterval? { 120 }
 
     private let dataRoot: URL
     private let clock: @Sendable () -> Date

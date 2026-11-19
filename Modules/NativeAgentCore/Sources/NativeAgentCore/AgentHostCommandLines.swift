@@ -175,9 +175,12 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
 /// The contact owner's checked message-effect projection. Trust sits below that owner, so assembly installs its reader; absence reports unavailable.
 public enum AgentHostLaunches {
     public typealias Launch = (acp: AgentHostACP?, commandLine: AgentHostCommandLine?)
-    private static let reader = OSAllocatedUnfairLock<(@Sendable (String, URL) throws -> Bool)?>(initialState: nil)
+    private struct Reader: Sendable {
+        let read: @Sendable (String, URL) throws -> Bool
+    }
+    private static let reader = OSAllocatedUnfairLock<Reader?>(initialState: nil)
 
-    public static func install(_ read: @escaping @Sendable (String, URL) throws -> Bool) { reader.withLock { $0 = read } }
+    public static func install(_ read: @escaping @Sendable (String, URL) throws -> Bool) { reader.withLock { $0 = Reader(read: read) } }
 
     public static func messagesByCommand(agent: String, dataRoot: URL) throws -> Bool {
         guard let read = reader.withLock({ $0 }) else {
@@ -185,7 +188,7 @@ public enum AgentHostLaunches {
                 owner: "Agent contacts", code: "agent_profile_unavailable",
                 instruction: "Repair runtime assembly before sending to another agent.")
         }
-        return try read(agent, dataRoot)
+        return try read.read(agent, dataRoot)
     }
 }
 

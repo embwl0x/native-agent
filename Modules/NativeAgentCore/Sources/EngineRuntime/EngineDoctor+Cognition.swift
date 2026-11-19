@@ -20,14 +20,12 @@ extension EngineDoctorRuntime {
         var rows: [CheckResult] = []
         rows += await doctorPhoneChecks()
         if let detail = await port.doctorEngine.cognition?.doctorRead() {
+            let cognition = [doctorPersistenceCheck(detail), doctorReceiptCheck(detail), doctorReadoutCheck(detail),
+                             doctorBodyCheck(detail), doctorCapacityCheck(detail), doctorAssociationCheck(detail)]
             rows.append(CheckResult(source: "Cognition registration", id: "live.cognition.runtime", title: "Cognition runtime",
-                                    status: "ok", detail: "Mounted cognition state is readable."))
-            rows.append(doctorPersistenceCheck(detail))
-            rows.append(doctorReceiptCheck(detail))
-            rows.append(doctorReadoutCheck(detail))
-            rows.append(doctorBodyCheck(detail))
-            rows.append(doctorCapacityCheck(detail))
-            rows.append(doctorAssociationCheck(detail))
+                                    status: detail.configuration.enabled ? "ok" : "off",
+                                    detail: "Mounted cognition state is readable; each component row below carries its own verdict."))
+            rows += cognition
         } else {
             rows.append(CheckResult(source: "Cognition registration",
                 id: "live.cognition.runtime", title: "Cognition runtime", status: "unmeasured",
@@ -175,6 +173,7 @@ extension EngineDoctorRuntime {
                                detail: "No body dependency needs attention; ordinary affect is not damage.")
         }
         return CheckResult(source: "cognition/organism_state.json: residual repair",
+            // An observation with nothing due is a fact on an ok row; only a due repair asks anyone to act.
             id: id, title: title, status: organism.residualRepairOpportunity.ready ? "warn" : "ok",
             detail: "Body observations: \(causes.joined(separator: ", ")).",
             harm: organism.residualRepairOpportunity.ready ? "A due residual repair remains unfinished." : nil,
@@ -245,21 +244,14 @@ extension EngineDoctorRuntime {
             return CheckResult(source: "cognition/cognition.sqlite: associations", id: id, title: title, status: "off",
                 detail: "Cognition associations are intentionally off.")
         }
-        guard !detail.associations.isEmpty else {
+        let missing = detail.associationMissingEndpointCount
+        guard missing > 0 else {
             return CheckResult(source: "cognition/cognition.sqlite: associations", id: id, title: title, status: "ok",
-                detail: "No unresolved association graph is displayed.")
-        }
-        let nodeIDs = Set(detail.substrate.nodes.map(\.id))
-        let allMissing = detail.associations.allSatisfy {
-            !nodeIDs.contains($0.fromNodeId) && !nodeIDs.contains($0.toNodeId)
-        }
-        guard allMissing else {
-            return CheckResult(source: "cognition/cognition.sqlite: associations", id: id, title: title, status: "ok",
-                detail: "At least one association endpoint resolves in the current snapshot.")
+                detail: "The association producer dropped no links for missing endpoints in this snapshot.")
         }
         return CheckResult(source: "cognition/cognition.sqlite: associations", id: id, title: title, status: "warn",
-                           detail: "Neither endpoint resolves for any of \(detail.associations.count) association links in this snapshot.",
-                           harm: "The displayed associations no longer connect to the agent's current thoughts.",
+                           detail: "The association producer dropped \(missing) link(s) with missing endpoints from this snapshot.",
+                           harm: "Some association links are withheld because their endpoints are missing.",
                            human_action: "Preserve the association graph evidence.", owner: .builder)
     }
 

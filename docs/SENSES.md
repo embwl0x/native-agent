@@ -136,6 +136,8 @@ line. Stdout is protocol only; diagnostics use stderr. One helper serves one
 sense id/version/source for its lifetime. Entry points and JS API calls are
 synchronous (no async functions/Promises). The runner serializes entries and replies;
 never interleave a run/change with an outstanding API reply.
+The first valid sense entry loads the bundled sense SDK when creating its JavaScript context.
+Ordinary programs construct their admitted-actions prelude when creating their own context.
 
 `id` is the app's integer entry id. Every helper API message also has an
 integer `callID`, positive and increasing within that entry (cached reads also
@@ -195,11 +197,11 @@ identities use `ExistingCornersSourceProvider.packageManifest`'s existing
 8,000-member bound and symlink/type refusals. [Body-signal intentions](INTENTIONS.md#as-built-10-30)
 join that existing watcher.
 
-The senses source owns file observation, including absent paths, failed reads,
-bounded membership re-arming and repair edges. It emits `SenseSourceChange`:
-checked material with file identities, a checked absent root, or an explicit
-unavailable reading. Only the gated reader's ENOENT establishes root absence;
-permission and I/O failures remain unavailable. A checked absent root removes
+The senses source owns file observation and bounded membership re-arming. Its root and parent watches cover edits and replacements.
+It emits `SenseSourceChange` with material and identity on first admission, identity change or repair. A healthy watch suppresses unchanged file readings.
+It also emits a checked absent root or an explicit unavailable reading.
+The reader establishes root absence through gated ENOENT. Permission and I/O
+failures remain unavailable. A checked absent root removes
 previously admitted members and becomes an empty membership baseline, so a
 later creation is added. It supplies no invented file material to a helper;
 the owning sense reports the absent path in news and keeps observing.
@@ -207,7 +209,8 @@ An unavailable reading preserves the last admitted identity; it cannot imply
 removed members. The same root/parent subscription waits for a source change
 before reading again. If observation itself ends, its consumer retires that
 exact task generation, keeps unavailable news visible, and a later canonical
-part/catalog change can register the same source again. `EnginePartWake`
+part/catalog change can register the same source again, even when the wake index
+is unchanged. `EnginePartWake`
 constructs no substitute watcher and does no independent identity read.
 With no repair edge the watch stays unavailable; stop cancels it.
 A repaired admitted reading, including a checked absent root, delivers
@@ -258,6 +261,8 @@ a worker with a private application element, before renderer preparation or
 lane reads. Passive source observations do not admit. Effect waits judge fresh
 evidence after event batches through `macSettle`; silence at patience remains
 unobserved, and notifications alone cannot establish the declared effect.
+Each act settlement read compiles its percept and effect diff once; its verdict,
+receipt and published frame share the final read's compiled evidence.
 `mac.settled` rows retain payload-free timing and pass evidence; the
 [MacControl contract](ARCHITECTURE_BLUEPRINT.md#maccontrol) owns the admission
 patience, IPC exception and observer lifecycle. Raw source flights explicitly
@@ -281,8 +286,8 @@ the source. While Autonomy is off, the wake waits on the existing trust-policy
 change path with its source slot and helper generation intact, including senses
 without a wake header. On resume it interprets the newest retained material;
 a retired helper generation cannot interpret a later edge.
-The registry assigns each selected lifetime an in-memory identity under its
-publication lock. Disable, replacement and unavailable reporting retire only
+The registry assigns each selected lifetime an in-memory identity under its publication lock. Pure queries select helpers from their checked catalog.
+Mutation closures reread committed state before helper selection. Disable, replacement and unavailable reporting retire only
 that selection's live helpers, passive on-call helpers and pending admissions;
 accepted human on-call work settles with its caller. Part wakes carry the
 unattended observation context, while the person's view events explicitly carry
@@ -348,7 +353,11 @@ before spawn, with no wildcard grant; shared-IP hosting is the granularity
 Seatbelt can enforce. JS exposes no direct OS/network API. Extra reads still
 go through source.read and the app must enforce reach there. All source material
 delivery shares the private-root policy, explicitly permitting workspace files
-even inside the data root; the helper itself has no such exception. Network resolution
+even inside the data root; the helper itself has no such exception. App delivery compares device/inode identities of the resolved file and its
+ancestors with the workspace and private roots, including alternate path spellings. Missing roots protect nothing.
+ENOENT or ENOTDIR at the target or any component walks up to the nearest existing ancestor, whose identity and ancestors decide the fence;
+the reader still owns reporting source absence. Any other target or ancestor stat error refuses delivery with its cause,
+as does an unreadable root. Network resolution
 failure is `bad_reach`, never a broad network fallback. JavaScriptCore and the
 runner wait for terminal events or cancellation without an execution watchdog.
 The runner retains the memory cap. App-served plug replies have no timer.
@@ -400,9 +409,10 @@ The runner retains the memory cap. App-served plug replies have no timer.
   IDs whose removal changes neither unread items nor retained histories returns
   before persistence and either presentation/context invalidation. Storage failure
   is visible news and damaged state remains preserved. What a new notice is worth
-  is the agent's `weigh` to say, never below one: the watch is a care the agent
-  made on purpose, so its news gathers on the watch's own subject, never on
-  another care, and always opens its own thought there ([SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares).
+  is the agent's `weigh` to say. News gathers on its own subject, never on another care; only the first weighed news per `watch`
+  there lands at least one, opening a thought ([SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares). Later news lands its weighed worth.
+  `SenseNews.watch` carries Chrome's watch UUID or the helper's observation-generation UUID onto `Happening.watch`.
+  Both fields are optional; existing rows decode with nil. News without `watch` keeps the floor on every notice.
   File senses compare their full structural rows, not a clipped page; native
   Chrome and the site authoring example report navigation as the destination
   title and top sections with from → to. Content diffs compare only the same

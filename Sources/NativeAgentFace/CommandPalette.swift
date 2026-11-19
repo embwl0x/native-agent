@@ -192,14 +192,7 @@ struct CommandPaletteView: View {
         case .conversation(let id):
             try await MacFaceLinks.follow(.init(page: "chat", item: nil, session: id, message: nil), appModel: appModel)
         case .newConversation:
-            let selection = UUID()
-            appModel.chatSelectionGeneration = selection
-            let session = try appModel.acceptedConversation(try await appModel.chatAct(.createConversation))
-            guard appModel.chatSelectionGeneration == selection else {
-                throw WireFailure(code: "palette_selection_changed", message: "The new conversation was created; your newer selection is preserved.",
-                    cause: nil, effects: .known)
-            }
-            appModel.commitChatSessionSelection(session)
+            _ = try await appModel.createFaceConversation()
             ApplicationLifetime.shared.request(.sidebar(.chat))
         case .refresh(let scope):
             try FaceWindowReply.check(await appModel.client.act(.refresh(scope)))

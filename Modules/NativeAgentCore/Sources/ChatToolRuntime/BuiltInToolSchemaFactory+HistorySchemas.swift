@@ -15,11 +15,49 @@ import Dispatcher
 import MacControl
 import Senses
 import StandingBots
-// Blueprint: | `BuiltInToolSchemaFactory+HistorySchemas.swift` | `BuiltInToolSchemaFactory`: `historySchemas` |
+// Blueprint: | `BuiltInToolSchemaFactory+HistorySchemas.swift` | `BuiltInToolSchemaFactory`: work context, artifact discovery and history schemas |
 
 extension BuiltInToolSchemaFactory {
     func historySchemas() -> [LLMToolSchema?] {
         [
+            requestedSchema(name: "work_context", toolClass: .read,
+                description: """
+                    Read current Desk status, original conversation evidence and recent Mail sender/subject matches for a topic, with dates and \
+                    exact source links. Mail Read must be allowed and ready; its search is bounded to 1.5 seconds, five newest inbox matches from \
+                    the last 90 days, with mail.N names to open bodies. Mail, Messages and Notes can hold personal facts; Messages and Notes \
+                    require their own readers. This detailed reader also supports conversation and result limits. Historical reports are not fresh \
+                    verification; nothing is restarted.
+                    """,
+                parametersJSON: ToolSchema.params(properties: [
+                    ("query", ToolSchema.strSchema("The work or topic to pick back up, in ordinary words (1–400 characters).")),
+                    ("session_id", ToolSchema.nullable(ToolSchema.strSchema("""
+                        Optional exact conversation to restrict historical evidence; null searches across conversations. Desk remains the current \
+                        shared Desk.
+                        """))),
+                    ("limit", ToolSchema.nullable(ToolSchema.intSchema("""
+                        Maximum Desk items and chat excerpts per source, default 3, range 1–4; null uses the default. Mail returns at most five \
+                        matches.
+                        """))),
+                    ("desk_offset", ToolSchema.nullable(ToolSchema.intSchema("Omit initially; retained continuation for more current work."))),
+                    ("history_offset", ToolSchema.nullable(ToolSchema.intSchema("""
+                        Omit initially; retained continuation for more history with the same topic and selection policy.
+                        """))),
+                ], required: ["query"])
+            ),
+            requestedSchema(name: "artifact_find", toolClass: .read,
+                description: """
+                    Find a document, image, mockup or handoff by what it was for or the conversation around it. Searches recorded chat attachments, \
+                    structured artifact references in call results and current Desk links; returns exact references with source conversation and version \
+                    evidence when recorded. Does not crawl disk, open files, infer approval from filenames, or prove current file availability. Use \
+                    the returned evidence to distinguish approved work from a later draft.
+                    """,
+                parametersJSON: ToolSchema.params(properties: [
+                    ("query", ToolSchema.strSchema("Describe the artifact or its topic in ordinary words.")),
+                    ("session_id", ToolSchema.strSchema("Optional exact conversation to search. When supplied, excludes shared Desk links.")),
+                    ("limit", ToolSchema.intSchema("Maximum artifact candidates, default 6, range 1–12.")),
+                    ("session_offset", ToolSchema.intSchema("Omit initially; use returned continuation for older conversation evidence.")),
+                ], required: ["query"])
+            ),
             requestedSchema(name: "search_chat_history", toolClass: .read,
                 description: """
                     Search persisted conversation transcripts, including this conversation; scope/session_id narrows it. For work \

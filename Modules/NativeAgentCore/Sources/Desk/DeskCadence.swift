@@ -1,6 +1,7 @@
 import NativeAgentShared
 import Foundation
 import PersistenceCore
+import NativeAgentCore
 // Blueprint: | `DeskCadence.swift` | Checked step provenance and cadence; malformed saved values cannot become defaults |
 
 /// Inferred work keeps its source sentence; every step preserves peer steering.
@@ -108,11 +109,9 @@ public struct DeskStep: Sendable, Equatable {
     public var actionText: String? { action.flatMap { try? $0.serialize(pretty: false) } }
 
     /// Filing, attachment and approval resumption use the same visible words and peer provenance.
-    public var title: String {
-        peers.isEmpty && elevated.isEmpty
-            ? String(words.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
-            : "A step from \((peers + elevated).joined(separator: ", "))'s turn"
-    }
+    public var title: String { (peers + elevated).allSatisfy { CapabilityLifecycle.ownerTrusts($0) } ? ownTitle : withheldTitle }
+    public var ownTitle: String { String(words.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200)) }
+    public var withheldTitle: String { "A step from \((peers + elevated).joined(separator: ", "))'s turn" }
 
     mutating func preserveOrigin(of previous: DeskStep) {
         promiseCaptures = previous.promiseCaptures + promiseCaptures.filter { !previous.promiseCaptures.contains($0) }

@@ -23,35 +23,22 @@ extension MacFourVerbs {
                                           "require_front_pid": .int(Int64(pid))], screen: "\n" + screen, turn: turn, context: context)
         }
         guard let app else { return nil }
-        let menuName = MacMenuBar.components(path).first ?? path
-        let glyphs = Self.string(row["shortcut"])
-        let chord = Self.string(row["chord"])
-        let greyed = Self.bool(row["enabled"]) == false ? " It's greyed out right now."
-            : (row["enabled"] == nil ? " Whether it's greyed out is unknown until \(app) is in front." : "")
-        let shortcut = glyphs.map { " (\($0))" } ?? ""
-        var detail: [String: JSONValue] = [
-            "menu_path": .string(path),
-            "target": .string(target),
-            "owner_front_changed": .bool(false),
-        ]
-        if let glyphs { detail["shortcut"] = .string(glyphs) }
-        if let chord { detail["chord"] = .string(chord) }
-        detail["error"] = .string("needs_front")
-        detail["status"] = .string("needs_front")
-        detail["needs_front_reason"] = .string("it's a menu command")
-        detail["background"] = .bool(true)
-        let text = "\"\(target)\" is in \(app)'s \(menuName) menu\(shortcut) — I need the screen because it's a menu command. "
-            + "Nothing was touched. Only use front:true when the task explicitly asks to bring \(app) forward." + greyed
-        return MacFourVerbsReply(ok: false, text: text + "\n" + screen, detail: detail)
+        return await pressMenu(path, ["path": .string(path), "app": .string(app)],
+                               screen: "\n" + screen, turn: turn, context: context)
     }
 
-    /// A windowless app's menu can open a window; `frontPid` must still own the front.
-    func menuPressNoWindow(_ target: String, frontPid: Int32?, turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply {
-        let lookup = await menuLookup(target, app: nil, frontPid: frontPid, turn: turn, context: context)
+    /// A windowless app's menu can open a window; an unnamed app must still own the front.
+    func menuPressNoWindow(_ target: String, app: String?, frontPid: Int32?, turn: Turn,
+                           context: MacOperationContext) async -> MacFourVerbsReply {
+        let lookup = await menuLookup(target, app: app, frontPid: app == nil ? frontPid : nil, turn: turn, context: context)
         if let refusal = Self.menuLookupRefusal(target, lookup: lookup) { return refusal }
         let path = lookup.row.flatMap { Self.string($0["path"]) } ?? target
-        var body: [String: JSONValue] = ["path": .string(path), "require_front": .bool(true)]
-        if let frontPid { body["require_front_pid"] = .int(Int64(frontPid)) }
+        var body: [String: JSONValue] = ["path": .string(path)]
+        if let app { body["app"] = .string(app) }
+        else {
+            body["require_front"] = .bool(true)
+            if let frontPid { body["require_front_pid"] = .int(Int64(frontPid)) }
+        }
         return await pressMenu(path, body, screen: "", turn: turn, context: context)
     }
 
@@ -64,32 +51,32 @@ extension MacFourVerbs {
                                               "outcome_unknown": .bool(true),
                                               "menu_path": .string(path)])
         }
-        return await pressedMenu(pressed, path: path, app: nil, screen: screen, turn: turn, context: context)
+        return await pressedMenu(pressed, path: path, app: Self.string(body["app"]), screen: screen, turn: turn, context: context)
     }
 
     /// What a menu press says, for an act's menu path and the direct `menu_press` alike: the sentence, then the screen after it (`app`'s
-    /// window, the front one when nil or when `app` is gone), or why that screen could not be read. A refusal carries `screen`, the look
+    /// window, the front one only when nil), or why that screen could not be read. A refusal carries `screen`, the look
     /// it was refused against.
     public func pressedMenu(_ pressed: MacControlResult, path: String, app: String?, screen: String, turn: Turn,
         context: MacOperationContext) async -> MacFourVerbsReply {
         if pressed.error == "front_changed" {
             // The person took the front during the lookup: their choice stands.
             return MacFourVerbsReply(ok: false, text: "The person changed apps; nothing pressed.",
-                                     detail: ["error": .string("owner_changed_apps"), "menu_path": .string(path)])
+                detail: Self.operationDetail(pressed).merging(["error": .string("owner_changed_apps"), "menu_path": .string(path)]) { _, new in new })
         }
         if pressed.ok {
             let output = Self.object(pressed.output)
             var text = "Pressed the menu command \(path). " + (Self.string(output["status_note"]) ?? "")
-            // A press can end the app it was pressed in (Quit, closing its last window); what the person then sees is the front screen.
-            var look = await sight(part: nil, app: app, turn: turn, context: context)
-            if app != nil, case .blind = look { look = await sight(part: nil, turn: turn, context: context) }
+            var detail = Self.operationDetail(pressed)
+            let look = await sight(part: nil, app: app, turn: turn, context: context)
             switch look {
             case .seen(let after): text += "\n" + after.render
             case .blind(let unseen):
                 text = text.trimmingCharacters(in: .whitespaces) + " The screen after could not be read: "
                     + (Self.string(unseen.detail["message"]) ?? unseen.text)
+                detail["screen_after"] = .object(unseen.detail.filter { ["error", "remedy"].contains($0.key) }
+                    .merging(["message": unseen.detail["message"] ?? .string(unseen.text)]) { $1 })
             }
-            var detail = Self.operationDetail(pressed)
             detail["menu_path"] = .string(path)
             return MacFourVerbsReply(ok: true, text: text, detail: detail)
         }

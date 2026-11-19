@@ -26,8 +26,10 @@ import AppKit
 // Blueprint: | `EnginePartWake.swift` | `EnginePartWake`, `start`, `deliver`, `run`, `readsOnly`, `reindex`, `held`, `resumed`, `holdBack`, `tainted_signal`, `changed`, `changed_more`, `person.away`, `person.here`, `network.down`, `network.up`, `chrome.tab_taken`, `AgentOpened` |
 
 /// Deliver source signals after their own work settles, including durable turn terminals. Schedules belong to TriggerScheduler and file watches to
-/// senses; this owner never polls. Autonomy and unreadable catalogs hold wakes without consuming their input; source subscriptions retain their helper
-/// generation. Each unattended run gets its own resident gate chain, approval route, current Trust and source taint; approvals wait through quiet hours.
+/// senses; this owner never polls. Catalog-backed wakes retain only held/resumed when Autonomy is off or the catalog is unreadable;
+/// other catalog-backed signals are dropped in those cases. Source subscriptions bypass the catalog and retain sense.source.changed through
+/// holdBack when Autonomy is off, preserving their helper generation. Each unattended run gets its own resident gate chain, approval route,
+/// current Trust and source taint; approvals wait through quiet hours.
 /// Suppress self-write and self-turn echoes. Part runs and carried habits run in their own session, never a conversation or the agent's mind stream.
 actor EnginePartWake {
     static let shared = EnginePartWake()
@@ -120,6 +122,7 @@ actor EnginePartWake {
         observers.append(center.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { _ in
             Task { await Self.shared.refresh(dataRoot: root, epoch: epoch) }
         })
+        reindex(dataRoot: root)
         let desk = SwiftNativeDeskStore(dataRoot: root)
         let deskChanges = EventDeadlinePhysiology.storeAndFileEvents(paths: [desk.opsPath, desk.basePath])
         deskObservation = Task {
@@ -147,12 +150,13 @@ actor EnginePartWake {
         workspaceCenter = workspace
         for (name, awake) in [(NSWorkspace.didWakeNotification, true), (NSWorkspace.willSleepNotification, false)] {
             workspaceObservers.append(workspace.addObserver(forName: name, object: nil, queue: nil) { _ in
-                Task { await Self.shared.awake(awake, dataRoot: root, epoch: epoch) }
+                let at = Date()
+                Task { await Self.shared.awake(awake, at: at, dataRoot: root, epoch: epoch) }
             })
         }
         observers.append(center.addObserver(forName: NetworkSense.changed, object: nil, queue: nil) { note in
-            guard let up = note.userInfo?["is_up"] as? Bool else { return }
-            Task { await Self.shared.network(up, dataRoot: root, epoch: epoch) }
+            guard let up = note.userInfo?["is_up"] as? Bool, let at = note.userInfo?["at"] as? Date else { return }
+            Task { await Self.shared.network(up, at: at, dataRoot: root, epoch: epoch) }
         })
         _ = NetworkSense.isUp
         observers.append(center.addObserver(forName: ChromeTabTaken.happened, object: nil, queue: nil) { note in
@@ -205,9 +209,12 @@ actor EnginePartWake {
         Attention.post(happening, dataRoot: dataRoot)
     }
 
-    private func network(_ up: Bool, dataRoot: URL, epoch: UUID) {
+    private func network(_ up: Bool, at: Date, dataRoot: URL, epoch: UUID) {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         AbilityStore(dataRoot: dataRoot).signal(up ? "network.up" : "network.down", ["is_up": .bool(up)])
+        Attention.post(Happening(.world, subject: "mac:network", door: "mac",
+            words: up ? "The Mac's network is up." : "The Mac's network is down.",
+            once: "mac:network:\(up):" + String(at.timeIntervalSince1970)), dataRoot: dataRoot)
     }
 
     /// The person taking a tab signals the parts and posts a world happening, so the agent can hear it before its next call on that tab fails.
@@ -223,8 +230,11 @@ actor EnginePartWake {
         Attention.post(happening, dataRoot: dataRoot)
     }
 
-    private func awake(_ awake: Bool, dataRoot: URL, epoch: UUID) async {
+    private func awake(_ awake: Bool, at: Date, dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch else { return }
+        Attention.post(Happening(.world, subject: "mac:awake", door: "mac",
+            words: awake ? "The Mac woke up." : "The Mac is going to sleep.",
+            once: "mac:awake:\(awake):" + String(at.timeIntervalSince1970)), dataRoot: dataRoot)
         let here = awake ? PersonPresence.read(dataRoot: dataRoot).transition?.here : nil
         await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.rhythmAwakeChanged(awake: awake, here: here)
     }
@@ -294,8 +304,6 @@ actor EnginePartWake {
             tails[part] = id
             return
         }
-        await refresh(dataRoot: dataRoot, epoch: epoch)
-        guard lifecycle == epoch, !Task.isCancelled else { return }
         let indexed = Self.indexedSignal(signal, dataRoot: dataRoot)
         let fileNews = signal.hasPrefix("file.changed:") && payload["changed"] != nil
         // Queue identity excludes member paths but retains provenance, including peer taint.
@@ -333,17 +341,24 @@ actor EnginePartWake {
                 // A busy resident part retains its wake for fresh admission after the call settles.
                 repeat {
                     // Recheck Autonomy at execution because it may change while queued.
-                    let allowed = await UnattendedWork.allowed(dataRoot: dataRoot)
+                    let refusal = await UnattendedWork.refusal(dataRoot: dataRoot)
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
-                    self.reindex(dataRoot: dataRoot)
                     // Retain held and resumed wakes while the catalog is unavailable.
                     if self.index == nil, ["held", "resumed"].contains(signal) {
                         return self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch)
                     }
                     guard let current = self.index?[indexed]?.first(where: { $0.id == file.id }) else { return }
-                    guard allowed else {
+                    if let refused = refusal {
                         if ["held", "resumed"].contains(signal) { self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch) }
-                        return nativeLog("[wake] %@ did not wake %@: Autonomy is off", signal, file.id)
+                        let wake = "wake-" + UUID().uuidString.lowercased()
+                        let turn = Turn(id: wake, run: wake, session: Self.session)
+                            .with(\.envelope, .native("wake:" + current.id)).with(\.verifiedSessionID, Self.session).with(\.partID, current.id)
+                        let result = if current.kind == .part {
+                            await Self.receipt(refused, call: ["action": .string("authored." + current.id)], turn: turn, dataRoot: dataRoot)
+                        } else { refused }
+                        TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake", sessionId: Self.session, surface: "chat",
+                            payload: .object(["part": .string(current.id), "input": .object(input), "result": result]), turn: turn))
+                        return nativeLog("[wake] %@ did not wake %@: unattended work refused (see part.wake)", signal, file.id)
                     }
                     // Suppress exact self-write echoes rather than interpreting them as news.
                     if signal.hasPrefix("file.changed:"),
@@ -661,7 +676,7 @@ actor EnginePartWake {
                 replaceIntentionFiles([:])
                 nativeLog("[wake] intention file watches stopped: Desk does not read (%@)", error.localizedDescription)
             }
-            reindex(dataRoot: dataRoot)
+            updateFileWatches(dataRoot: dataRoot)
         })
     }
 
@@ -692,6 +707,7 @@ actor EnginePartWake {
     }
 
     private func reindex(dataRoot: URL) {
+        nativeLog("[wake] reindexing part wakes")
         let files: [AbilityStore.File]
         do { files = try AbilityStore(dataRoot: dataRoot).files(includeProposals: false) }
         catch {
@@ -715,6 +731,9 @@ actor EnginePartWake {
                 built[signal, default: []].append(file)
             }
         }
+        // A catalog change can rearm an ended subscription even when its wake index is equal.
+        defer { updateFileWatches(dataRoot: dataRoot) }
+        guard index != built else { return }
         index = built
         let live = Set(files.filter { !$0.wakes.isEmpty }.map(\.id))
         // Source wakes retain their helper generation even without a wake header.
@@ -735,7 +754,6 @@ actor EnginePartWake {
             watched[file.id] = paths
             for url in paths { PhysiologySelfWriteRegistry.shared.register(loopId: Self.echo(file.id, url), paths: [url]) }
         }
-        updateFileWatches(dataRoot: dataRoot)
     }
 
     private func updateFileWatches(dataRoot: URL) {

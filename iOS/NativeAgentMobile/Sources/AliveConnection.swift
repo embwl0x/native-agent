@@ -5,7 +5,6 @@ import UIKit
 
 enum AliveConnection {
     static let unpaired = "Not paired with your Mac yet"
-    static let unreachable = "I can\u{2019}t reach your Mac right now"
     static let noICloud = "No iCloud on this iPhone"
     static let pairToChange = "Pair with your Mac to change this"
 
@@ -55,12 +54,6 @@ struct AliveUnpairedReason: View {
         } else {
             AliveFootnote(AliveConnection.pairToChange + ".", systemImage: "lock")
         }
-    }
-}
-
-extension View {
-    func aliveUnavailable(_ off: Bool) -> some View {
-        disabled(off).opacity(off ? 0.5 : 1)
     }
 }
 

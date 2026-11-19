@@ -40,7 +40,6 @@ extension EngineFaceActs {
         case .answerCard(let answer): secrets = Array(answer.secrets.values)
         case .saveConnectorCredentials(let request): secrets = Array(request.fields.values)
         case .configureTelegram(let request): secrets = request.token.map { [$0] } ?? []
-        case .saveSlackIngress(let request): secrets = request.token.map { [$0] } ?? []
         case .importGrokCredentials(let request): secrets = [request.secret]
         // These open value maps can carry submitted text; their owners decide its meaning.
         case .pageAct(let request):
@@ -64,13 +63,13 @@ extension EngineFaceActs {
         // Account operations carry ids, consent or choices; credentials use the typed cases above.
         case .readProviderAccount, .saveChatChoice, .disconnectProvider, .beginOAuth, .signOutProvider, .decideCodexCLIConsent,
              .repairCodexCLIConsent, .verifyCardOnReturn, .openCard, .setConnectorEnabled, .disconnectConnector,
-             .testTelegram, .clearTelegramLogs, .repairTelegram, .removePhonePairing, .setUpChrome:
+             .testTelegram, .clearTelegramLogs, .removePhonePairing, .setUpChrome:
             secrets = []
         // Named app preferences, policy and maintenance carry decisions, identifiers, counts and declared modes.
         case .setPreference, .resolveApproval, .applyTrustPreset, .setAutonomyEnabled, .setChromeControlEnabled, .setKillSwitchEnabled,
-             .saveMacIntegrationPreset, .saveMacControlPolicy, .authorizeSafePolicy, .refreshPrivacyInventory,
+             .saveMacIntegrationPreset, .saveMacControlPolicy, .refreshPrivacyInventory,
              .checkMail, .requestMacOSAccess, .openMacOSSettings, .excludeActivityApp, .removeActivityExclusion,
-             .wipeActivity, .setInboxTrigger, .createBackup, .restoreBackup, .createProductionExport, .runDoctor,
+             .wipeActivity, .createBackup, .restoreBackup, .createProductionExport, .runDoctor,
              .requestSupportSnapshot, .setEmbeddingDownload, .setEmbeddingsEnabled, .reindexSpotlight,
              .requestUpdate, .updateInteraction, .pinMemory, .forgetMemory, .resolveMemoryProposal,
              .cognition, .runDream, .runREM,
@@ -78,7 +77,7 @@ extension EngineFaceActs {
             secrets = []
         // Authored conversation, memory, persona and work content has no credential field.
         case .renameConversation, .send, .notify, .remember, .commitNote, .writeScratch, .searchMemories,
-             .readPersona, .savePersonaProfile, .savePersonaName, .savePersonaDocument, .createStarterPersona, .onboarding,
+             .readPersona, .savePersonaProfile, .savePersonaName, .savePersonaDocument, .onboarding,
              .createDeskTask, .addDeskNote, .research, .exportMake, .sendContactMessage, .stopContactMessage,
              .resendContactMessage, .withdrawContactMessage, .ingestAttachment, .captureScreen, .openBrowser, .voice:
             secrets = []

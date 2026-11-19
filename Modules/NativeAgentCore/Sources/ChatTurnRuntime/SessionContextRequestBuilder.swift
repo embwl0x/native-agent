@@ -48,7 +48,8 @@ extension SwiftNativeChatOrchestrationClient {
             }
             return context
         }
-        let halfBudget = SessionHistoryTail.halfBudgetCharacters(windowTokens: window, outputTokens: before.outputTokens)
+        let halfBudget = try SessionHistoryTail.halfBudgetCharacters(windowTokens: window, outputTokens: before.outputTokens,
+            charactersPerToken: before.charactersPerToken)
         var next = context
         var after = before
         var selected: SessionHistoryTail.Checkpoint?

@@ -50,9 +50,9 @@ public final class SwiftOpenAITTSClient: Sendable {
 
     private let dataRoot: URL
 
-    public init(model: String) {
+    public init(model: String, dataRoot: URL) {
         self.model = model
-        self.dataRoot = PersistenceCore.defaultDataRoot()
+        self.dataRoot = dataRoot
     }
 
     /// Missing flags use the shipped default; damaged policies throw their cause.

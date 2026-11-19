@@ -38,27 +38,6 @@ enum BackupCreationOutcome {
 
 @MainActor
 extension AppModel {
-    func resolveApproval(_ approval: ApprovalRecord, decision: String) async {
-        let result = await resolveApprovalOnce(id: approval.id, decision: decision)
-        switch result {
-        case .applied, .noOpAlreadyResolved:
-            statusText = result.visibleMessage
-            await refreshAll()
-        case .noOpInFlight, .unavailable:
-            statusText = result.visibleMessage
-        }
-    }
-
-    /// All mounted approval controls must share the facade's one resolution flight.
-    func resolveApprovalOnce(id: String, decision: String) async -> ApprovalsFacade.Resolution {
-        do {
-            return try await engine.approvals.resolveOnce(id: id) { id in
-                try await resolveApproval(id: id, decision: decision)
-            }
-        } catch {
-            return .unavailable(UserFacingError.cause(error, action: "update that approval"))
-        }
-    }
 
     @MainActor
     func saveMemoryPolicy(crossSessionRecall: Bool) async {
@@ -93,15 +72,6 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func saveEnableAutonomy(_ enabled: Bool) async {
-        do {
-            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveEnableAutonomy(enabled)
-            applySavedTrustPolicy(savedPolicy, status: enabled ? "Autonomy enabled" : "Autonomy disabled")
-        } catch {
-            recordTrustActionFailure(UserFacingError.message(error, action: "save autonomy"), cause: error)
-        }
-    }
 
     @MainActor
     func saveChromeControlEnabled(_ enabled: Bool) async {
@@ -187,11 +157,7 @@ extension AppModel {
                     """
                 statusText = message
                 trustCenterActionOutcome = .saved(message)
-                AppRelaunch.relaunchApp(terminate: {
-                    RunLoop.main.perform(inModes: [.common]) {
-                        MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
-                    }
-                }, onSpawnFailure: { error in
+                AppRelaunch.relaunchApp(terminate: AppDelegate.terminateFromRunLoop, onSpawnFailure: { error in
                     ModuleLog.app("[relaunch] failed to spawn relaunch helper for %@: %@", Bundle.main.bundlePath, "\(error)")
                 })
                 return .saved(message)
@@ -236,9 +202,6 @@ extension AppModel {
     }
 
     // MARK: Mac assistant / Mac control
-    func saveMacIntegrationPreset(_ preset: String, currentPolicy: TrustPolicy? = nil) async throws -> TrustPolicy {
-        try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMacIntegrationPreset(preset, currentPolicy: currentPolicy)
-    }
 
     func saveMacControlPolicy(
         _ policy: MacControlPolicyWireSnapshot,
@@ -258,23 +221,5 @@ extension AppModel {
         )
     }
 
-    func macControlRun(action: MacControlWorkbenchAction, body: [String: JSONValue]) async throws -> MacControlResult {
-        let turn = TurnRequest(message: "", sessionID: nil, surface: "native_actions",
-            envelope: TurnEnvelope.personOnMac("mac_ui:mac_control." + action.rawValue, surface: "native_actions")).turn()
-        return try await engine.trust.runMacControl(
-            action: action, body: body,
-            notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn
-        )
-    }
-
-    func macControlRead(action: String, operation: UUID) async throws -> CommittedResult {
-        let reply = try await engine.faceActs.handle(.runMacControl(.init(action: action,
-            arguments: ["operationId": .string(operation.uuidString)], checking: true)))
-        guard case .committed(let result) = reply else {
-            throw WireFailure(code: "workbench_read_unconfirmed", message: "The Mac control owner did not return its operation state.",
-                cause: nil, effects: .unknown)
-        }
-        return result
-    }
 
 }

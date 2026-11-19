@@ -184,13 +184,14 @@ public actor UserMDGenerator {
 
     // MARK: - Rendering
 
-    /// Bound newest-first facts at promptByteCap; facts beyond it remain recallable.
+    /// Bound pinned facts at promptByteCap; unpinned facts and overflow remain recallable.
     static func renderBody(memories: [StoredMemory], now: Date, dataRoot: URL) -> String {
         var budget = UserMDAutogenMarkers.promptByteCap - "# USER\n".utf8.count
         var lines: [String] = []
-        for fact in userFacts(memories: memories, now: now, dataRoot: dataRoot) {
+        let pinned = memories.filter { MemoryStorage.metadataFlag($0.metadata, "pinned") }
+        for fact in userFacts(memories: pinned, now: now, dataRoot: dataRoot) {
             let line = "- \(fact)\n"
-            guard line.utf8.count <= budget else { break }
+            guard line.utf8.count <= budget else { continue }
             lines.append(line)
             budget -= line.utf8.count
         }

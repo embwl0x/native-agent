@@ -9,16 +9,6 @@ import ChatSessionWork
 
 @MainActor
 extension AppModel {
-    /// Failed profile reads retain the owner's cause and mark identity unavailable.
-    func reloadPersonality() async {
-        let previousName = engine.persona.profile?.name
-        do {
-            try await engine.persona.loadProfile()
-            teachMemoryHygieneName(previousName: previousName)
-        } catch {
-        }
-    }
-
     func pruneSessionChatState(_ sessionId: String) async {
         engine.transcripts.removeMessages(for: sessionId)
         engine.turns.runtime.pruneSessionState(sessionId)
@@ -50,21 +40,6 @@ extension AppModel {
         }
     }
 
-    // MARK: - Detached chat windows
-    // Detached windows must stream their fixed session without changing the main window's active session.
-
-    func loadDetachedSessionMessages(_ sessionId: String) async {
-        guard !sessionId.isEmpty else { return }
-        await engine.panelFreshness.refreshDetached(session: sessionId) { [self] in
-            await readDetachedSessionMessages(sessionId)
-        }
-    }
-
-    private func readDetachedSessionMessages(_ sessionId: String) async -> [String]? {
-        var outcome: [String]?
-        await engine.loadDetachedSessionMessages(sessionId) { outcome = $0 }
-        return outcome
-    }
 
     /// Publish pin membership through the transcript owner so detached and main windows agree.
     @MainActor
@@ -79,9 +54,6 @@ extension AppModel {
         }
     }
 
-    /// Turn presentation comes from this conversation's slot; commands keep their operational admission checks.
-    var isBusy: Bool { turnPart("isBusy", for: activeChatSessionId) { $0?.isBusy == true } }
-    var isChatStreaming: Bool { turnPart("isStreaming", for: activeChatSessionId) { $0?.isStreaming == true } }
 
     /// Exclude only the foreground session and retain unknown running IDs so work remains stoppable.
     var otherRunningChatSessionIDs: [String] {
@@ -135,10 +107,6 @@ extension AppModel {
 }
 
 extension AppModel {
-    /// One part of a conversation's turn face: its reader redraws only when that part changes.
-    func turnPart<Part: Equatable>(_ name: String, for sessionID: String, _ part: @escaping (TurnFace?) -> Part) -> Part {
-        face.slot(.turn(session: sessionID)).select(name, as: TurnFace.self, part)
-    }
 
     var turnSessionsFace: TurnSessionsFace? {
         face.slot(.turns).value(as: TurnSessionsFace.self)

@@ -39,7 +39,6 @@ public struct DeskNotificationRead: Sendable {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         let state = try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
             let feed = try await store.readFeedUnlocked()
-            guard feed.integrity.isClean else { throw UnavailableRead() }
             return SwiftNativeDeskStore.compact(base: feed.base, feed.ops)
         }
         let config = try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked()
@@ -135,7 +134,7 @@ public struct DeskNotificationRead: Sendable {
             try Task.checkCancellation()
             let feed = try await store.readFeedUnlocked()
             let currentState = SwiftNativeDeskStore.compact(base: feed.base, feed.ops)
-            guard feed.integrity.isClean, currentState.items == state.items else { throw ChangedRead() }
+            guard currentState.items == state.items else { throw ChangedRead() }
             // Delivery holds belong to the router; Desk retains only its own mute and digest rules.
             if !unmute && (!config.enabled
                 || proposal.openWindow && !proposal.digest.isEmpty && !digestAccepted) {
@@ -173,9 +172,6 @@ public struct DeskNotificationRead: Sendable {
 
     public struct ChangedRead: LocalizedError {
         public var errorDescription: String? { "Desk notification sources changed before commit; this proposal was not published." }
-    }
-    private struct UnavailableRead: LocalizedError {
-        var errorDescription: String? { "The Desk feed is incomplete or unreadable; no notification proposal was made." }
     }
     private struct InvalidProposal: LocalizedError {
         var errorDescription: String? { "The Desk notification proposal exceeds its native consent or source bounds; this proposal was not published." }

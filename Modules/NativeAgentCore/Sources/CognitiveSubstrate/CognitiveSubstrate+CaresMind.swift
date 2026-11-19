@@ -63,7 +63,7 @@ extension CognitiveSubstrate {
         var stale: [CognitiveCare] = []
         let epoch = mindEpoch
         // No warm identity means no cache admission. Still ask the checked embedder: it distinguishes a cold model from unreadable configuration.
-        let embeddingEpoch = await dependencies.embeddingEpoch()
+        let embeddingEpoch = try await dependencies.embeddingEpoch()
         for care in candidates {
             if let embeddingEpoch, let cached = careVectors[care.id], cached.epoch == embeddingEpoch,
                cached.text == Self.careEmbeddingText(care) {

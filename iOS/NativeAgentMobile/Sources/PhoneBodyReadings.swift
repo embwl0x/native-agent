@@ -129,15 +129,13 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
             if !observingPhotos { PHPhotoLibrary.shared().register(self); observingPhotos = true }
             queryPhotos(pairing: pairing, limited: photoStatus == .limited)
         } else {
-            photoQuery = nil
-            owner?.objectWillChange.send()
+            if photoQuery != nil { photoQuery = nil; owner?.objectWillChange.send() }
             if observingPhotos { PHPhotoLibrary.shared().unregisterChangeObserver(self); observingPhotos = false }
             if enabled.contains(.photos) { owner?.observed(.photos, value: "unknown", pairing: pairing, at: at) }
         }
         if enabled.contains(.network) { queryNetwork(pairing: pairing) }
-        else {
-            network?.cancel(); network = nil; networkQuery = nil
-            owner?.objectWillChange.send()
+        else if networkQuery != nil {
+            network?.cancel(); network = nil; networkQuery = nil; owner?.objectWillChange.send()
         }
     }
 

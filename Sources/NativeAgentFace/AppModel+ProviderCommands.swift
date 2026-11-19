@@ -45,77 +45,18 @@ extension AppModel {
         face.slot(.settings).select("providers.readiness", as: SettingsFace.self) { $0?.providers.readiness } ?? .loading
     }
 
-    /// Drawing readers are separate from the command getters, including while a saved frame is in flight.
     var displayedChatModel: String {
-        pendingChatBrainSelection?.model
-            ?? face.slot(.settings).select("providers.chatModel", as: SettingsFace.self) { $0?.providers.chatChoice?.model } ?? ""
+        face.slot(.settings).select("providers.chatModel", as: SettingsFace.self) { $0?.providers.chatChoice?.model } ?? ""
     }
 
     var displayedChatProvider: String {
-        pendingChatBrainSelection?.provider
-            ?? face.slot(.settings).select("providers.chatProvider", as: SettingsFace.self) { $0?.providers.chatChoice?.provider } ?? ""
+        face.slot(.settings).select("providers.chatProvider", as: SettingsFace.self) { $0?.providers.chatChoice?.provider } ?? ""
     }
 
     var providerSavingChatBrain: Bool {
         face.slot(.settings).select("providers.savingChatBrain", as: SettingsFace.self) { $0?.providers.isSavingChatBrain } == true
     }
 
-    func missingProviderChatGuidance() -> String? {
-        guard providerReadiness == .needsConnection else { return nil }
-        return """
-        No AI provider is connected yet, so I can't reply.
-
-        Use Open Providers below to connect one.
-        """
-    }
-
-
-    var currentChatBrainSelection: ProviderTurnChoice? {
-        pendingChatBrainSelection ?? face.slot(.settings).select("providers.chatChoice", as: SettingsFace.self) { $0?.providers.chatChoice }
-    }
-
-    func stageChatBrainSelection(model: String? = nil, reasoningEffort: String? = nil, fast: Bool? = nil) {
-        guard let selection = currentChatBrainSelection else {
-            statusText = "Read Providers before changing the model choice."
-            return
-        }
-        pendingChatBrainSelection = .init(provider: selection.provider, model: model ?? selection.model,
-            reasoningEffort: reasoningEffort ?? selection.reasoningEffort, fast: fast ?? selection.fast)
-    }
-
-    @discardableResult
-    func enqueueChatBrainDefaultsSave(_ choice: ProviderTurnChoice? = nil) -> Task<ProviderSettingsFace, Error>? {
-        guard let requested = choice ?? currentChatBrainSelection,
-              let baseline = face.slot(.settings).select("providers.saveBaseline", as: SettingsFace.self, { $0?.providers }),
-              let revision = baseline.snapshot?.routing.revision else {
-            statusText = "Read Providers before changing the model choice."
-            return nil
-        }
-        pendingChatBrainSelection = requested
-        return Task {
-            do {
-                let reply = try await checkedFaceAct(.saveChatChoice(.init(choice: requested,
-                    expectedBaseline: baseline.chatChoice, expectedRevision: revision)))
-                guard case .provider(let saved) = reply, let committed = saved.chatChoice else {
-                    throw PartCallError(code: "choice_unconfirmed", message: "The model choice has no committed readback.")
-                }
-                if pendingChatBrainSelection == requested { pendingChatBrainSelection = nil }
-                statusText = "Chat brain saved: \(committed.model) / \(committed.reasoningEffort)"
-                return saved
-            } catch {
-                if pendingChatBrainSelection == requested { pendingChatBrainSelection = nil }
-                setFailureStatus(error, action: "save the model choice")
-                throw error
-            }
-        }
-    }
-
-    func saveChatBrainDefaults() async throws -> ProviderSettingsFace {
-        guard let task = enqueueChatBrainDefaultsSave() else {
-            throw PartCallError(code: "choice_unavailable", message: "Read Providers before changing the model choice.")
-        }
-        return try await task.value
-    }
 
     /// The providers panel refresh: the body starts asking any connected provider with no complete list (`startAskingMissingModelLists`) and
     /// reads at once, so setup's "Read accounts again" retries a failed or cancelled first fetch.
@@ -125,16 +66,6 @@ extension AppModel {
             _ = try await checkedFaceAct(.refresh(.panel(SidebarItem.providers.rawValue)))
             return true
         } catch { setFailureStatus(error, action: "read Providers"); return false }
-    }
-
-    func disconnectProvider(_ id: String) async -> (ok: Bool, detail: String, cause: String?) {
-        do {
-            let result = try await committedFaceAct(.disconnectProvider(id: id))
-            guard result.identities.contains(id) else {
-                throw PartCallError(code: "disconnect_unconfirmed", message: "The reply did not confirm removal of this account.")
-            }
-            return (true, "Sign-in removed.", nil)
-        } catch { return (false, error.localizedDescription, error.localizedDescription) }
     }
 
     func testProviderConnection(_ request: ProviderTestRequest) async throws -> ProviderTestReply {

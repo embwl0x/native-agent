@@ -135,7 +135,7 @@ public final class OpenRouterTransport: LLMTransport {
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter")
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
-                        request: req, providerID: providerId, model: model, idPrefix: "openrouter",
+                        request: req, providerID: providerId, model: model,
                         started: startedNs, telemetry: telemetry, call: call
                     )
                     continuation.finish()

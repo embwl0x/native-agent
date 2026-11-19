@@ -245,12 +245,6 @@ public actor ProviderVitalsSensor {
 
     // MARK: Read-only introspection / snapshot
 
-    public func vitals(for providerId: String) -> ProviderVitals? {
-        let key = normalizedProviderId(providerId)
-        guard let state = states[key] else { return nil }
-        return vitals(key: key, state: state)
-    }
-
     private func vitals(key: String, state: State) -> ProviderVitals {
         ProviderVitals(
             providerId: key,

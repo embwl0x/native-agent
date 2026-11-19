@@ -60,7 +60,7 @@ ALLOW_VERSION_DRIFT=false
 PREVIOUS_DMG="${NATIVEAGENT_SPARKLE_PREVIOUS_DMG:-}"
 
 usage() {
-  sed -n '2,50p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,39p' "${BASH_SOURCE[0]}" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -129,10 +129,10 @@ if [[ -z "$PRIV_KEY" ]]; then
   echo "  1. Generate the release key once:   ./script/sparkle_keygen.sh" >&2
   echo "     (it uses Sparkle's generate_keys, which stores the key in your Keychain)" >&2
   echo "  2. Export it to a file for scripted signing:" >&2
-  echo "       .build/artifacts/sparkle/Sparkle/bin/generate_keys -x ~/.config/nativeagent/sparkle_ed_priv.key" >&2
+  echo "       DerivedData/ReleaseBundle/SourcePackages/artifacts/sparkle/Sparkle/bin/generate_keys -x ~/.config/nativeagent/sparkle_ed_priv.key" >&2
   echo "  3. Export both halves before releasing:" >&2
   echo "       export NATIVEAGENT_SPARKLE_ED_PRIV_KEY=~/.config/nativeagent/sparkle_ed_priv.key" >&2
-  echo "       export NATIVEAGENT_SPARKLE_PUBLIC_KEY=\"\$(.build/artifacts/sparkle/Sparkle/bin/generate_keys -p)\"" >&2
+  echo "       export NATIVEAGENT_SPARKLE_PUBLIC_KEY=\"\$(DerivedData/ReleaseBundle/SourcePackages/artifacts/sparkle/Sparkle/bin/generate_keys -p)\"" >&2
   echo "  The public key MUST be the SUPublicEDKey baked into the app being signed." >&2
   exit 1
 fi

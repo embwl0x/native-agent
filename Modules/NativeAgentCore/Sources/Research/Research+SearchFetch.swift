@@ -131,11 +131,12 @@ extension SwiftNativeResearchClient {
               scheme == "http" || scheme == "https" else {
             throw ResearchClientError.malformedResponse("Only http/https URLs are allowed")
         }
+        let publicOrigin = try await BoundedResearchDownload.resolving { try BoundedResearchDownload.publicAddress(parsed) }
         func get(_ target: URL) async throws -> ResearchHTTPResponse {
             let response: ResearchHTTPResponse
             do {
                 response = try await http.getBounded(url: target, timeout: 30, maxBytes: 1_000_000,
-                                                     pdfMaxBytes: MacDocumentRead.maxFileBytes)
+                                                     pdfMaxBytes: MacDocumentRead.maxFileBytes, publicOrigin: publicOrigin)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -158,6 +159,7 @@ extension SwiftNativeResearchClient {
         if mimeOf(response).contains("html"),
            let next = try Self.metaRefreshTarget(String(decoding: response.body, as: UTF8.self), base: finalURL ?? parsed),
            next.absoluteString != (finalURL ?? parsed).absoluteString {
+            try await BoundedResearchDownload.resolving { try BoundedResearchDownload.checkRedirect(next, publicOrigin: publicOrigin) }
             response = try await get(next)
             finalURL = response.finalURL ?? next
         }

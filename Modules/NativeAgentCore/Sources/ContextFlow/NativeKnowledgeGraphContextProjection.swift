@@ -56,7 +56,7 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
         guard !relations.isEmpty else { return ContextTurnExclusion() }
         // Supporting memories cannot prove the graph is readable; selection and expansion must reread its canonical owner.
         let current: (sources: [ContextCompiledSource], failures: [ContextSourceID: String])
-        do { current = Self.prepare(try await readRelations()) }
+        do { current = Self.prepare(try await readRelations(), sourceIDs: Set(relations.map(\.draft.sourceID))) }
         catch {
             return ContextTurnExclusion(atomIDs: Set(relations.map(\.draft.id)), unverified:
                 Set(relations.map(\.draft.sourceID)).sorted().map {
@@ -141,7 +141,8 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
 
 extension KnowledgeGraphContext {
     /// Group by subject so maximumAtomsPerSource prevents one entity consuming the packet's relationship budget.
-    static func prepare(_ relations: [KnowledgeGraphContextRelation]) -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
+    static func prepare(_ relations: [KnowledgeGraphContextRelation], sourceIDs: Set<ContextSourceID>? = nil)
+        -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
         let usable = relations.filter { relation in
             let body = self.body(relation)
             return !body.isEmpty
@@ -157,6 +158,7 @@ extension KnowledgeGraphContext {
             let locatorDigest = ContextStableID.digest(parts: [subjectID])
             let locator = "knowledge-graph/entities/\(locatorDigest)"
             let sourceID = ContextStableID.source(owner: owner, locator: locator)
+            guard sourceIDs?.contains(sourceID) != false else { continue }
             let ordered = edges.sorted {
                 if $0.predicate != $1.predicate { return $0.predicate < $1.predicate }
                 if $0.object != $1.object { return $0.object < $1.object }

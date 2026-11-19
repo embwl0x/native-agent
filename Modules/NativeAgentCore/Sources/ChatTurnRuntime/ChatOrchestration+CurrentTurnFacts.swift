@@ -12,14 +12,14 @@ import Context
 import Experiences
 import ChatToolRuntime
 import CognitiveSubstrate
-// Blueprint: | `ChatOrchestration+CurrentTurnFacts.swift` | `SwiftNativeTurnEngine`; Parallel read-only facts; consuming reads at composition |
+// Blueprint: | `ChatOrchestration+CurrentTurnFacts.swift` | Parallel facts; the last clean thought and body lead every turn's inner stream |
 
 extension SwiftNativeTurnEngine {
     /// Gather read-only facts before context exists so failed assembly consumes nothing; defer consuming reads until composition.
     typealias ReadOnlyTurnFacts = (
         clock: String, note: String?, directive: String?,
         voiceStep: String?, place: String?, glance: PreparedWorkspaceGlance?, contacts: JSONValue,
-        elsewhere: AgentScreen.ElsewhereReading?, thought: ThoughtWords?, body: BodyFelt.Pending?, timings: [ContextStageName: Int64]
+        elsewhere: AgentScreen.ElsewhereReading?, body: BodyFelt.Pending?, timings: [ContextStageName: Int64]
     )
 
     private nonisolated static func timedFact<T: Sendable>(_ read: @Sendable () async -> T) async -> (value: T, ms: Int64) {
@@ -68,20 +68,13 @@ extension SwiftNativeTurnEngine {
             return await ChatWorkspaceBinding.currentPlace(dataRoot: read.0, scope: read.1)
         }
         async let elsewhere = Self.timedFact { () async -> AgentScreen.ElsewhereReading? in
-            guard let read = glanceRead else { return nil }
+            guard let dataRoot else { return nil }
             return await ChatWorkspaceBinding.readElsewhere(turn: turn, invocation: work.invocation,
-                dataRoot: read.0, scope: read.1, at: clockNow, live: ChatTurnSteering.liveSessions(dataRoot: read.0))
+                dataRoot: dataRoot, scope: sessionID, at: clockNow)
         }
-        async let thought: ThoughtWords? = {
-            guard sessionID == Attention.stream, let dataRoot else { return nil }
-            guard let kind = turn.attended?.objectValue?["class"]?.stringValue, !kind.isEmpty else {
-                return .unavailable("Thought words unavailable: this thought has no recorded class.")
-            }
-            return await ThoughtWords.last(on: kind, dataRoot: dataRoot, now: clockNow)
-        }()
-        let (readContacts, readPlace, readGlance, readElsewhere, readThought, readBody) = await (contacts, place, glance, elsewhere, thought, body)
+        let (readContacts, readPlace, readGlance, readElsewhere, readBody) = await (contacts, place, glance, elsewhere, body)
         return (clock, note, directive, voiceStep, readPlace.value, readGlance.value, readContacts.value,
-            readElsewhere.value, readThought, readBody, [.factsClockNotes: notesMs, .factsContacts: readContacts.ms, .factsPlace: readPlace.ms,
+            readElsewhere.value, readBody, [.factsClockNotes: notesMs, .factsContacts: readContacts.ms, .factsPlace: readPlace.ms,
                                   .factsGlance: readGlance.ms, .factsElsewhereRead: readElsewhere.ms])
     }
 
@@ -104,8 +97,8 @@ extension SwiftNativeTurnEngine {
             let origin = turn.origin
             let surface = [origin?.surface, turn.envelope?.surface].compactMap { $0 }
                 .first { AgentScreen.door($0) != nil } ?? context.surface
-            let peer = try !Self.personContinuityAllowed(root: dataRoot, sessionID: sessionID, turn: turn)
-            if !peer || Self.peerContinuityTurn(turn) {
+            let peer = !turn.steeringStamp().isEmpty
+            if try peer || Self.personContinuityAllowed(root: dataRoot, sessionID: sessionID, turn: turn) {
                 elsewhere = await ChatWorkspaceBinding.elsewhere(turn: turn, invocation: work.invocation,
                     dataRoot: dataRoot, scope: sessionID, surface: surface,
                     peer: peer, at: clockNowOverride, reading: facts.elsewhere, shown: context.recentLifeActs)
@@ -121,20 +114,15 @@ extension SwiftNativeTurnEngine {
             .map { try $0.serialize(pretty: false) }
             .map { "Workspace arrivals (navigation notices, not requests):\n" + $0 }
         trace.record(.factsArrivals, since: arrivalsStart)
-        let thought: String?
-        switch facts.thought {
-        case .words(let words, let gap)?:
-            let peer = turn.peerSteering?.checkpointSources.isEmpty == false
-            let title = gap == nil ? "Your last thought" : "Your last readable thought"
-            thought = peer ? nil : [gap, title + " on this same class (closing words):\n" + words].compactMap { $0 }.joined(separator: "\n")
-        case .unavailable(let cause)?: thought = cause
-        case .withheld?, nil: thought = nil
-        }
+        let thought = turn.steeringStamp().isEmpty
+            ? facts.elsewhere?.lastThought.map { "Your last thought (closing words):\n" + ChatSecretRedactor.redactText(String($0.suffix(600))) } : nil
         let runtimeStart = DispatchTime.now().uptimeNanoseconds
         defer { trace.record(.factsRuntime, since: runtimeStart) }
-        let all = [facts.clock, facts.note, facts.directive, elsewhere, thought, facts.voiceStep, arrivals,
-                   facts.place, facts.glance?.text, facts.body?.line].compactMap { $0 }
+        let all = [facts.clock, facts.note, facts.directive, elsewhere, facts.voiceStep, arrivals,
+                   facts.place, facts.glance?.text].compactMap { $0 }
         var withFacts = all.reduce(context) { Self.contextByAppendingRuntimeContext($0, runtimeContext: $1) }
+        withFacts.innerStream = [thought, facts.body?.line]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         withFacts.partsDelivery = facts.glance?.delivered
         withFacts.bodyFelt = facts.body
         withFacts.agentNow = agentNow
@@ -169,7 +157,7 @@ extension SwiftNativeTurnEngine {
     }
 
     static func deliveredInput(_ context: TurnContext) -> String {
-        [context.systemPrompt, context.turnVolatileBlock].compactMap { $0 }.joined(separator: "\n\n")
+        (context.innerStream + [context.systemPrompt, context.turnVolatileBlock].compactMap { $0 }).joined(separator: "\n\n")
     }
 
     /// Capture only pending instructions actually present in the prepared

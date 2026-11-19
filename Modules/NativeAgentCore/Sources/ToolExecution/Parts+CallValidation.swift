@@ -15,7 +15,7 @@ extension Parts {
         }
         if let refusal = calls.refusals.first { throw PartError.invalid(refusal + " Nothing was saved.") }
         let declared = Set(try actions.map { try host.canonicalAction($0) })
-        let primitives = ToolPrimitiveBroker.operations.union(["apps.call", "part.call"])
+        let primitives = ToolPrimitiveBroker.operations.union(OwnedProgramRunner.hostFilePrimitives).union(["apps.call", "part.call"])
         var shapes: [String: JSONValue] = [:]
         func shape(_ action: String) throws -> JSONValue? {
             if let known = shapes[action] { return known }

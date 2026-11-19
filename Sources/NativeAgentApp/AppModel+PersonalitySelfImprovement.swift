@@ -24,23 +24,6 @@ enum PersonalityDocumentsReloadOutcome: Equatable {
 
 @MainActor
 extension AppModel {
-    func readPersonaFormState(documents: Bool) async throws -> PersonaSettingsFace {
-        var state = PersonaSettingsFace()
-        if documents { state.documents = try await engine.persona.loadDocuments() }
-        else { state.profile = try await engine.persona.loadProfile() }
-        return state
-    }
-
-    func savePersonaFormName(_ name: String) async throws -> PersonalityProfile {
-        let previousName = engine.persona.profile?.name
-        let saved = try await engine.persona.saveName(name)
-        teachMemoryHygieneName(previousName: previousName)
-        return saved
-    }
-
-    func savePersonaFormDocument(id: String, content: String, expectedContent: String) async throws -> PersonaDocSpec {
-        try await engine.persona.saveDocument(id: id, content: content, appending: false, expectedContent: expectedContent)
-    }
 
     /// Preserve persistence errors in the save result.
     @MainActor
@@ -103,12 +86,6 @@ extension AppModel {
         return .loaded(diagnostics, reusedDoctorReport: reuse != nil)
     }
 
-    @MainActor
-    @discardableResult
-    func loadPersonalityDocs() async -> Bool {
-        if case .loaded = await reloadPersonalityDocuments() { return true }
-        return false
-    }
 
     @MainActor
     @discardableResult
@@ -124,57 +101,6 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    @discardableResult
-    func savePersonalityDoc(id: String, content: String, appending: Bool = false) async -> Bool {
-        do {
-            let saved = try await engine.persona.saveDocument(id: id, content: content, appending: appending)
-            statusText = "\(saved.filename) saved"
-            return true
-        } catch {
-            setFailureStatus(error, action: "save that personality doc")
-            return false
-        }
-    }
-
-    // MemoryFacade owns pending rows and their publication.
-    @MainActor
-    func loadMemoryProposals() async {
-        _ = await decodeLogged("getMemoryProposals") {
-            try await engine.memory.proposals(status: "pending", publish: { change in
-                change()
-            })
-        }
-    }
-
-    @MainActor
-    func approveMemoryProposal(id: String) async throws {
-        _ = try await engine.memory.accept(proposalID: id, publish: { change in
-            change()
-        })
-        await loadMemoryProposals()
-        await engine.approvals.refresh()
-    }
-
-    @MainActor
-    func rejectMemoryProposal(id: String, reason: String = "") async throws {
-        try await engine.memory.reject(proposalID: id, reason: reason, publish: { change in
-            change()
-        })
-        await loadMemoryProposals()
-        await engine.approvals.refresh()
-    }
-
-    @MainActor
-    func fetchDreamEntry(date: String) async -> DreamEntry? {
-        dreamError = nil
-        do {
-            return try await engine.cognitionView.dreamEntry(date: date)
-        } catch {
-            dreamError = UserFacingError.message(error, action: "load the entry for \(date)")
-            return nil
-        }
-    }
 
     /// Use the native completion record so zero proposals cannot conceal an incomplete or failed REM run.
     @MainActor

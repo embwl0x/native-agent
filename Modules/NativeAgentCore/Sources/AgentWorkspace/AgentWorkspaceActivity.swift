@@ -1,10 +1,7 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceActivity.swift` | owner reads preserve availability, groups and paging |
-// Preserve owner next_offset for task/timeline paging; Today requires due-today and overdue groups.
-// Helper selection and copy belong to workspace-readout.js, not a second native interpretation.
+// Blueprint: | `AgentWorkspaceActivity.swift` | Owner work, calendar, reminder and reply reads; existing app actions and paging |
 
-/// Native views over work, helpers and communication owners. Only typed fields at known owner boundaries create actions; prose and embedded recipes do not.
 enum AgentWorkspaceActivity {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "ongoing", title: "Ongoing work", summary: "The live Desk and shared work in progress.", tool: "desk_read", input: [:],
@@ -44,16 +41,16 @@ enum AgentWorkspaceActivity {
         case "mac_calendar_calendars", "mac_calendar_free_busy":
             return list(title: "Calendar", result: result, key: "calendars", actions: [
                 read("Calendars", tool: "mac_calendar_calendars"),
-                configure("Check availability", tool: "mac_calendar_free_busy")
+                read("Check availability", tool: "app", input: ["find": .string("mac_calendar_free_busy"), "args": .object([:])])
             ]) { row in
                 guard let id = row["calendarId"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) else {
                     return .init(title: row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
                         ?? "Calendar", content: .object(row), actions: [])
                 }
                 var actions = [read("Events", tool: "mac_calendar_list_upcoming", input: ["calendar_id": .string(id)]),
-                    configure("Check availability", tool: "mac_calendar_free_busy", input: ["calendar_ids": .array([.string(id)])])]
+                    read("Check availability", tool: "app", input: ["find": .string("mac_calendar_free_busy"), "args": .object(["calendar_ids": .array([.string(id)])])])]
                 if row["writable"] == .bool(true) {
-                    actions.append(configure("Create an event", tool: "mac_calendar_create_event", input: ["calendar_id": .string(id)]))
+                    actions.append(read("Create an event", tool: "app", input: ["find": .string("mac_calendar_create_event"), "args": .object(["calendar_id": .string(id)])]))
                 }
                 return .init(title: row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? id,
                     content: .object(row), actions: actions)
@@ -66,7 +63,6 @@ enum AgentWorkspaceActivity {
         }
     }
 
-    /// Selecting Today alone triggers its independent owner reads; start them together in the requesting context.
     static func today(workspace: WorkspaceOperation, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> WorkspacePage {
         var sections: [JSONValue] = [], facts: [JSONValue] = []
         var items: [String: AgentWorkspaceItem] = [:], actions: [String: AgentWorkspaceButton] = [:]
@@ -144,7 +140,6 @@ enum AgentWorkspaceActivity {
                 buttons.append(.init(label: "Follow up", action: .followUpSavedReply(.init(
                     entryID: id, botID: bot, title: name)), needsText: true))
             }
-            // Preserve the shelf's exact outcome.
             return .init(title: name, content: .object(row), actions: buttons)
         }
     }
@@ -185,7 +180,7 @@ enum AgentWorkspaceActivity {
             actions.append(read(id == nil ? "More shared work" : "More timeline events", tool: "task_ledger_list", input: next))
         }
         if let id {
-            actions.append(configure("Record an update", tool: "task_ledger_post", input: ["task_id": .string(id)]))
+            actions.append(read("Record an update", tool: "app", input: ["find": .string("task_ledger_post"), "args": .object(["task_id": .string(id)])]))
             return .init(title: "Selected shared work", content: result, items: [], actions: actions)
         }
         actions.append(read("Include finished work", tool: "task_ledger_list", input: ["include_done": .bool(true)]))
@@ -210,23 +205,25 @@ enum AgentWorkspaceActivity {
                 ]), items: [], actions: [])
             }
         }
-        // A named day must reach its read without opening a default form.
         let day = AgentWorkspaceButton(label: "One day", action: .perform(tool: "mac_calendar_list_upcoming", input: ["limit": .int(16)],
             title: "One day", textField: "day", isEffect: false), needsText: true)
-        var projection = list(title: "Calendar", result: result, key: "events", actions: [configure("Create an event", tool: "mac_calendar_create_event"),
-            read("Calendars", tool: "mac_calendar_calendars"), configure("Check availability", tool: "mac_calendar_free_busy"), day]) { row in
+        var projection = list(title: "Calendar", result: result, key: "events", actions: [read("Create an event", tool: "app", input: ["find": .string("mac_calendar_create_event"), "args": .object([:])]),
+            read("Calendars", tool: "mac_calendar_calendars"), read("Check availability", tool: "app", input: ["find": .string("mac_calendar_free_busy"), "args": .object([:])]), day]) { row in
             let title = row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? "Calendar event"
-            var actions = row["id"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }).map { [configure(
-                "Edit event", tool: "mac_calendar_modify_event", input: ["id": .string($0)])] } ?? []
-            if let id = row["id"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }),
-                let title = row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }),
+            let rowID = row["id"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
+            var actions: [AgentWorkspaceButton] = rowID.map { id in
+                var input: [String: JSONValue] = ["id": .string(id)]
+                if let start = row["startAt"] { input["expected_start"] = start }
+                return [read("Edit event", tool: "app", input: ["find": .string("mac_calendar_modify_event"), "args": .object(input)])]
+            } ?? []
+            if let id = rowID,
+                row["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
                 let start = row["startAt"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) {
-                actions.append(configure("Delete this event", tool: "mac_calendar_delete_event", input: [
-                    "id": .string(id), "expected_title": .string(title), "expected_start": .string(start)]))
+                actions.append(read("Delete this event", tool: "app", input: ["find": .string("mac_calendar_delete_event"), "args": .object([
+                    "id": .string(id), "expected_title": .string(title), "expected_start": .string(start)])]))
             }
             return .init(title: title, content: .object(row), actions: actions)
         }
-        // An empty read says it read fine, so it is not taken for no access.
         if projection.items.isEmpty, ["completed", "ok"].contains(result.objectValue?["status"]?.stringValue ?? ""), case .object(var content) = projection
             .content {
             let hours: Int64 = if case .int(let n)? = (result.objectValue ?? [:])["hoursAhead"] { n } else { 24 }
@@ -241,8 +238,8 @@ enum AgentWorkspaceActivity {
     private static func reminders(tool: String, input: [String: JSONValue], _ result: JSONValue) -> WorkspacePage {
         var source = (result.objectValue ?? [:])
         if tool == "mac_reminders_read", let reminder = source["reminder"] { source["reminders"] = .array([reminder]) }
-        var buttons = [configure("Create a reminder", tool: "mac_reminders_create"),
-            configure("Find reminders", tool: "mac_reminders_query"),
+        var buttons = [read("Create a reminder", tool: "app", input: ["find": .string("mac_reminders_create"), "args": .object([:])]),
+            read("Find reminders", tool: "app", input: ["find": .string("mac_reminders_query"), "args": .object([:])]),
             read("Due today and overdue", tool: "mac_reminders_list_due_today", input: ["limit": .int(16)])]
         if tool == "mac_reminders_query", case .int(let next)? = source["next_offset"] {
             var arguments = input
@@ -260,12 +257,11 @@ enum AgentWorkspaceActivity {
                 } else { row["due_status"] = .string("undated") }
             }
             var actions: [AgentWorkspaceButton] = []
-            // Missing owner identifiers must never be guessed from titles.
             if let id = row["id"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) {
                 if tool != "mac_reminders_read" {
                     actions.append(read("Open reminder", tool: "mac_reminders_read", input: ["id": .string(id)], title: title))
                 }
-                actions.append(configure("Edit reminder", tool: "mac_reminders_update", input: ["id": .string(id)]))
+                actions.append(read("Edit reminder", tool: "app", input: ["find": .string("mac_reminders_update"), "args": .object(["id": .string(id)])]))
                 if row["completed"] == .bool(false) {
                     actions.append(effect("Done (mark complete)", tool: "mac_reminders_complete", input: ["id": .string(id)]))
                 }
@@ -285,7 +281,6 @@ enum AgentWorkspaceActivity {
                     "detail": .string("Reminders did not return readable today and overdue groups. Repair the due-reminders part's grouped result."),
                     "effects": .string("none"), "source": result]), items: [], actions: buttons)
             }
-            // Each row keeps the group from the part's frozen local day, including across midnight. No equality/name/date inference.
             var items: [AgentWorkspaceItem] = []
             for (rows, status) in [(overdue, "overdue"), (today, "due_today")] {
                 for value in rows {
@@ -322,9 +317,7 @@ enum AgentWorkspaceActivity {
         .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
     }
 
-    private static func configure(_ label: String, tool: String, input: [String: JSONValue] = [:]) -> AgentWorkspaceButton {
-        .init(label: label, action: .configure(tool: tool, input: input, title: label))
-    }
+
 
     private static func effect(_ label: String, tool: String, input: [String: JSONValue]) -> AgentWorkspaceButton {
         .init(label: label, action: .perform(tool: tool, input: input, title: label, textField: nil, isEffect: true))

@@ -83,7 +83,6 @@ final class iCloudSyncEngine {
     var knowledgeGraph: KGEntityResponse?
     var memoryProposals: [MemoryProposalRecord] = []
     var snapshotReadRevisions: [String: Double] = [:]
-    var recordReadbackRevisions: [String: [String: Double]] = [:]
     var trustPolicy: TrustPolicy?
     private(set) var personality: PersonalityProfile?
     var voicePreference: MobileVoicePreference?
@@ -129,7 +128,6 @@ final class iCloudSyncEngine {
         memoryProposals = []
         snapshotReadRevisions = [:]
         snapshotHealth = [:]
-        recordReadbackRevisions = [:]
         trustRead.write { trustPolicy = nil }
         personalityPairing = nil
         personality = nil
@@ -146,7 +144,6 @@ final class iCloudSyncEngine {
         connectors = []
         telegram = nil
         providers = []
-        providerSignIns = [:]
         surfaceModels = [:]
         surfaceModelRevisions = [:]
         approvals = []
@@ -177,7 +174,6 @@ final class iCloudSyncEngine {
     var connectors: [MobileConnectorSnapshot] = []
     var telegram: MobileTelegramSnapshot?
     var providers: [ProviderInfo] = []
-    var providerSignIns: [String: [String: String]] = [:]
     var surfaceModels: [String: NAProviderSurfaceSelection] = [:]
     var surfaceModelRevisions: [String: Double] = [:]
     var approvals: [ApprovalRequest] = []

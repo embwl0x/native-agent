@@ -275,6 +275,7 @@ final class BodyFaceTranscripts {
         var events = changes.makeAsyncIterator()
         while !Task.isCancelled {
             withObservationTracking {
+                _ = conversationContact(session)
                 _ = engine.transcripts.structureVersion(for: session)
                 _ = engine.transcripts.transcriptReadStatus(for: session)
             } onChange: { signal.yield() }
@@ -396,6 +397,7 @@ final class BodyFaceTranscripts {
 
     private func readConversation(_ session: String, transcript: TranscriptReadout) async throws -> ConversationFace {
         let messages = transcript.messages
+        let contact = conversationContact(session)
         let snapshot = await engine.pages.snapshots["inbox"]
         let inbox = snapshot?.drawnFace
         var attachments: [FaceResolvedAttachment] = []
@@ -457,17 +459,26 @@ final class BodyFaceTranscripts {
         let target = messages.last(where: { $0.role == "assistant" }).flatMap { message in
             message.metadata?.turnTraceId.map { VisibleReplyTarget(message: message.id, turn: $0) }
         }
-        return ConversationFace(session: session, state: .ready, cacheReady: engine.transcripts.hasCachedTranscript(for: session),
+        var face = ConversationFace(session: session, state: .ready, cacheReady: engine.transcripts.hasCachedTranscript(for: session),
             actions: actions, attachments: attachments, otherRoomExchanges: [],
             waitingForPerson: waiting ? true : (transcript.isComplete ? false : nil), visibleReply: target,
             transcriptComplete: transcript.isComplete)
+        face.contactName = contact?.name
+        return face
+    }
+
+    private func conversationContact(_ session: String) -> AgentContactRow? {
+        guard let row = engine.transcripts.sessions.first(where: { $0.id == session }) else { return nil }
+        return ChatShellConversationRow.contact(for: row, doors: engine.contacts.doors)
     }
 
     private func failed(_ session: String, error: any Error) async {
-        let value = ConversationFace(session: session, state: .unavailable(.init(code: "conversation_read_failed",
+        var value = ConversationFace(session: session, state: .unavailable(.init(code: "conversation_read_failed",
             message: "The conversation could not be read.", cause: NativeAppSecretRedactor.redactText(error.localizedDescription),
             effects: .none)), cacheReady: false,
             actions: [], attachments: [], otherRoomExchanges: [], transcriptComplete: false)
+        let contact = conversationContact(session)
+        value.contactName = contact?.name
         conversationRead(session).write { enqueueConversation(value) }
     }
 

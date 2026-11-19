@@ -101,11 +101,9 @@ extension ChatView {
                       revision: voiceDraftRevision)
     }
 
-    func attachFromClipboardOrPickFile() {
+    func pickFileToAttach() {
         let destination = appModel.activeChatSessionId
-        ChatAttachmentTypeResolver.attachFromClipboardOrPickFile(
-            appModel: appModel, session: destination,
-            appendImage: { appModel.chatPendingAttachments[destination, default: []].append($0) },
+        ChatAttachmentTypeResolver.pickFileToAttach(
             attachFile: { attachLocalFile($0, sessionId: destination) },
             showToast: showToast,
             emptySelectionMessage: "No file selected"

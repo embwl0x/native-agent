@@ -12,7 +12,7 @@ public enum UserMDAutogenMarkers {
 
     /// The person picture rides every turn, so cap UTF-8 bytes at recall's floor allowance: five rows of 1,200 characters. Keep this bound aligned with
     /// ContextBudgetPolicy.floorRecallRowLimit and floorMemoryRowChars, which this target cannot import. Excess facts remain in memory; only carried facts are
-    /// precovered. Pins lead the same ordered fact selection; an empty core carries only prose.
+    /// precovered. The core contains only pinned facts; an empty core carries only prose.
     public static let promptByteCap = 5 * 1_200
 
     public static func promptText(_ document: String, userMemoryCore: [String]) -> String {
@@ -50,7 +50,7 @@ public enum UserMDAutogenMarkers {
         }
         for fact in userMemoryCore {
             let size = (result.isEmpty && facts.isEmpty ? 0 : 2) + "- ".utf8.count + fact.utf8.count
-            guard bytes + size <= budget else { break }
+            guard bytes + size <= budget else { continue }
             facts.append(fact)
             bytes += size
         }

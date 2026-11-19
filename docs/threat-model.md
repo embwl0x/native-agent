@@ -21,7 +21,7 @@ underlying Trust checks still apply.
 | Browser IPC | Separate loopback endpoint/token; browser operations reject unsafe URL schemes |
 | Paired iOS transport | Signed requests checked by `MacSyncEngine` before dispatch; pairing material owned by `PairingSecret` |
 | APNS | HTTP 2xx means provider acceptance, not proof of user display; `MobileNotificationDeliveryReceipt.swift` reports display as unverified |
-| Peer-steered turns | A turn an untrusted agent started with its message: `PeerTurnEffectPolicy` files one card on its first effect and the owner's answer covers the turn; the agent's note to its own person (`chat.post`) is no such effect; a read steers nothing; agents enabled in Trust → Connected agents carry the owner's authority; ordinary Trust and domain checks remain |
+| Peer-steered turns | **Just this** admits one call; **For this task** elevates its peers for the run; [Trust](ONE_DOOR.md#authority-and-receipts) applies |
 | Contacts at the table | A contact reads the Desk and the pieces laid on it through MCP `agent_desk` with its own key, only while the person's per-contact lever (`readsDesk`) is on; it writes nothing, reaches only pieces laid on open board items (each document's words bounded at 2 MB), the lever is rechecked before any words go back, and the contact's last read is kept on its own record, shown on Connectors and in the agent's line for it |
 | Model input from web, tools or peers | Content is input, not operator authority |
 
@@ -36,8 +36,8 @@ can obtain its bearer token; the peer descriptor contains only the URL.
   operator surfaces may use Full Mac; a remote surface label alone grants nothing.
 - **An untrusted agent's command:** even under Full Mac, a turn an agent the
   owner has not trusted started with its message files one card on its first
-  effect, quoting what the agent asked; the owner's answer covers the rest of
-  that turn. Reading any agent's words steers nothing. Agents enabled in
+  effect, quoting what the agent asked. **Just this** runs one call; the next protected call asks again.
+  **For this task** elevates the card's peers until the run ends. Reading any agent's words steers nothing. Agents enabled in
   Trust → Connected agents carry the owner's authority on authenticated turns.
   Lower Trust modes and ordinary domain checks retain their restrictions.
 - **Privacy reset without consent:** `SecurityCenter.swift` requires explicit
@@ -58,8 +58,13 @@ can obtain its bearer token; the peer descriptor contains only the URL.
   call. Unknown batch entries reach that same door individually; catalog read
   failures retain the checked failure path, and recognized actions keep their
   existing consent decisions.
-- **Sensitive file access and protected-path mutations:** file tools deny
-  sensitive credential, trust, pairing and token paths. File/Mac-control
+- **Sensitive file access and protected-path mutations:** raw file reads deny
+  app-owned credential, trust, pairing and token locations under the data root,
+  including backup payloads; Full Mac does not bypass this fence
+  (`FileSystemActions.isSensitiveDataPath`). Parts and certified read-only
+  commands also fence home credentials and the signing key. The agent's own
+  file, search and Mac-control reads may reach home credential folders; raw
+  file reads retain the app-data fence. File/Mac-control
   mutations retain the protected-system-path floor under Full Mac, enforced
   by `FileSystemActions.swift` and `MacControlSensitivePathFence`.
   Both raw file routes also preserve the dedicated owners of Mac-control
@@ -82,21 +87,33 @@ other commands remain writes. The same certification gives Trust its read
 class and receipts `read_only:true`, `effect:read`. Certified reads always
 retain the Git read sandbox (no writes, network or Apple Events, with sensitive
 stores fenced), sanitized Git environment/config and disabled diff helpers,
-including under Full Mac. This is read certification, not a command deny-list.
+including under Full Mac. A helper Git runs (a repository's filter or textconv) inherits
+that sandbox, so it gains nothing Git lacks. Certified shell reads also deny reads beneath the
+credential fence's home roots (.ssh, .aws, .gnupg, .codex and Library/Keychains),
+the manifest signing key, and the data root's providers, codex_home and
+codex_child_home. The shared Git profile builder emits case-folded read-deny
+rules for these resolved roots; cwd and symlink operands cannot grant access.
+This is read certification, not a command deny-list.
 Both shell actions default to the canonical workspace; relative cwd starts
 there and source-checkout work requires explicit cwd. Pre-launch refusals
 record `execution:not_run`, `effect:none`; a process that started retains
 execution evidence even when it fails or is stopped.
 
-For commands that are not certified reads, saved Trust policy and the explicit
-`NATIVE_AGENT_SHELL_SANDBOX` override select the Seatbelt posture:
+For commands that are not certified reads, saved Trust policy selects the Seatbelt posture:
 
 - Strict/locked-down keeps workspace confinement and ignores wrapper-off
   overrides.
 - Ordinary workspace mode uses `sandbox-exec`; Developer Mode uses its broader
   user-space profile with protected OS, credential and authority paths fenced.
-- An explicit Full Mac shell permission level with active Full Mac, a permitted
-  environment override, or the saved sandbox-off setting can omit the wrapper.
+- An explicit Full Mac shell permission level with active Full Mac or the saved
+  sandbox-off setting can omit the wrapper.
+
+Child processes start from HOME, USER, LOGNAME, SHELL, TMPDIR, LANG, every LC_*
+variable, TERM, PATH, DOCKER_HOST and DOCKER_CONTEXT present in the app environment.
+The Docker selectors identify a daemon, keeping local-daemon validation and
+execution aligned. Explicit launch environments and builder additions supply their
+own variables. Git reads use this named set with their read-only overrides.
+App credentials and SSH_AUTH_SOCK are not inherited.
 
 The launch owner and coding bridges share starting-directory validation and
 sensitive-path fences; each retains its own external-directory authority check.
@@ -143,7 +160,9 @@ changing memory or growth; disclosure and the keep gate are unchanged.
 
 | Material | Owner / location |
 |---|---|
-| Provider API keys | `ProviderAPIKeyStore.swift`, backed by macOS Keychain |
+| Provider API keys | `ProviderAPIKeyStore.swift`, Keychain references; distinct from OAuth sign-in storage below |
+| Claude sign-in and setup tokens | Plaintext `<dataRoot>/providers/anthropic_oauth_direct.json`; `NativeOAuthFlow` and `AnthropicOAuthTransport` |
+| xAI OAuth credentials | `XAIOAuthCredentialStore.swift`, Keychain token bytes with references in provider metadata |
 | Service credentials | The keyring (`Keyring.swift`) for what abilities use; Slack's door tokens in Keychain (`SlackCredentials.swift`). Retired services' credential files and Keychain items stay untouched and unread. |
 | Codex OAuth credentials | App `codex_home/auth.json` and login-mode-dependent credential candidates in `LLMClient+OpenAIOAuthCredentials.swift` |
 | Operator bridge endpoint/bearer | `Agents/ClaudeBridgeRuntime.swift` publishes `bridge.json` and the separate `token` file under `AgentHostDirectory.bridgeDiscoveryDirectory` (normally `~/.config/claude-bridge/`) |
@@ -158,6 +177,18 @@ needed; Shared's `TurnSecretRedactor.swift` owns text recognition and replacemen
 Slack xox/xapp recognition uses that scanner; socket evidence strips URL queries/fragments through its shared traversal.
 Receipts and displays share its case-insensitive credential patterns, including
 JWTs, Slack xox/xapp tokens and Bearer values of 20 or more characters.
+They also recognize AWS AKIA access keys, Basic authorization values that are base64-shaped, URL user/password
+pairs, Cookie/Set-Cookie headers, Stripe test keys and webhook secrets, Hugging
+Face, GitLab, Google OAuth, xAI, Groq, npm and SendGrid token shapes, and PGP
+message/private-key blocks. Credential names include secret_key, secretHex,
+passphrase and cookies; `PWD` and session ids are not credentials. In diagnostic text an assignment to a credential name
+(`password=hunter2`) is cut at any length; a colon value or a provider label's
+value is cut only when it proves itself (eight or more characters with a digit
+or a lower-to-upper turn), so "Key: yes" and "token: 42" stay whole.
+Display-only named values still require token-shape evidence.
+Diagnostic text also redacts single- or double-quoted values after bare credential
+names in assignments and fields, such as `DB_PASSWORD="x"` and `password: 'x'`.
+Recognition does not decode base64 wrappers, Unicode escapes or split tokens.
 `NativeAgentSecretRedactor.swift` retains digest replacements for receipts.
 Calendar and Reminder note previews inspect the complete notes with
 `NativeAppSecretRedactor` before taking 300 characters; Mac and phone
@@ -165,8 +196,8 @@ notification receipts likewise redact the complete message before taking 200.
 Phone transcript words and their display metadata, faces, card strings,
 attachment recognition and reading copies use the same shared text policy
 before bounding; tool-input objects additionally withhold secret-named values.
-Phone replies and cumulative live text are scrubbed before signing, and KVS
-notices before clipping. Typed card controls and provenance retain their schema;
+Phone replies and cumulative live text are scrubbed before signing. The Mac
+has no KVS notice publisher. Typed card controls and provenance retain their schema;
 this projection does not repair saved transcripts or retained signed envelopes.
 Security audit strings use the canonical credential recognizer before clipping,
 as well as the audit boundary's additional token and JWT checks. A match

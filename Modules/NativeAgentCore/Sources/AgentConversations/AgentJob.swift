@@ -1,5 +1,7 @@
 import Foundation
+import NativeAgentShared
 import PersistenceCore
+import TrustCenter
 import os
 // Blueprint: | `AgentJob.swift` | `AgentJob` record, `AgentJobStore` (agents/jobs.json), the `JobRunner` door contract, its refusing stub, `OwnLineRunner` |
 
@@ -25,7 +27,7 @@ public struct AgentJob: Codable, Sendable, Equatable {
         public var path: String
     }
 
-    /// What the organ may touch. Built by the stem from the commission and capped by the agent's Trust posture; the organ cannot widen it.
+    /// What the organ may touch. Built from the commission, capped by Trust and the commissioning turn's file access; the organ cannot widen it.
     public struct Envelope: Codable, Sendable, Equatable {
         public var writes: Bool
         public var network: Bool
@@ -74,6 +76,8 @@ public struct AgentJob: Codable, Sendable, Equatable {
     public struct Commission: Codable, Sendable, Equatable {
         public var session: String?
         public var surface: String
+        /// Ingress-bound provenance for checking launch authority again after restart; absent proof cannot launch ACP.
+        public var origin: SecurityOriginContext? = nil
     }
 
     public var id: String
@@ -88,9 +92,8 @@ public struct AgentJob: Codable, Sendable, Equatable {
     /// reach the agent's hands through a line of its own.
     public var peers: [String]?
     public var elevated: [String]?
-    /// The file access of the turn that started the agent's own line: the line asks no wider. Nil: no turn narrowed it, so the agent's saved choice alone
-    /// applies.
-    public var fileAccess: String?
+    /// The commissioning turn's file access bounds the job's envelope or own line. Nil means no turn narrowed it.
+    public var fileAccess: ICloudChatFileAccessPolicy.Ceiling?
     public var place: Place?
     /// A repo job's own worktree and branch, cut before its door ran; the envelope's folder is its path.
     public var worktree: Worktree?
@@ -112,7 +115,7 @@ public struct AgentJob: Codable, Sendable, Equatable {
     public var commission: Commission
     /// Stopped by the agent through agent.cancel: the agent already knows, so its settle wakes nothing.
     public var stoppedByHer: Bool?
-    /// A job of an earlier life of this data root, stopped until its door resumes it by session.
+    /// A job of an earlier life of this data root, stopped without resuming its session.
     public var restored: Bool?
     public var startedAt: Date
     public var updatedAt: Date
@@ -205,7 +208,7 @@ public struct AgentJobStore: Sendable {
         return try CredentialFileLock.withLock(fileURL, work)
     }
 
-    /// Work of an earlier life of this data root reads stopped (restored) until its door resumes it.
+    /// Work of an earlier life of this data root reads stopped (restored); only current-life work resumes.
     private func load() throws -> [AgentJob] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         let data = try Data(contentsOf: fileURL)
@@ -218,7 +221,7 @@ public struct AgentJobStore: Sendable {
         for i in rows.indices where !rows[i].state.isTerminal && DataRootLife.life(of: rows[i].lifeID) != life {
             rows[i].state = .stopped
             rows[i].restored = true
-            rows[i].detail = "Stopped (restored): this job ran in an earlier life of this data root. Its door can resume it by its session."
+            rows[i].detail = "Stopped (restored): this job ran in an earlier life of this data root. Its session is not resumed."
         }
         return rows
     }
@@ -238,6 +241,7 @@ public struct JobStart: Sendable {
     /// The folder the organ works in: the job's place, or for a repo the worktree allocated for it, never the agent's checkout. Nil when the job has no place.
     public let folder: URL?
     public let envelope: AgentJob.Envelope
+    public let handle: @Sendable (String) throws -> Void
 }
 
 /// What one door reports, normalized from its own protocol (ACP updates, Codex app-server items, Claude stream-json, A2A task states).

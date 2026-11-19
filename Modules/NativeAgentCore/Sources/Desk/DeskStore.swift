@@ -45,7 +45,6 @@ public struct SwiftNativeDeskStore: Sendable {
     public func continuation(_ handle: String) async throws -> DeskContinuation? {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
-            guard feed.integrity.isClean else { throw DeskContinuationError.unsafe }
             return try inCurrentLife(Self.compact(base: feed.base, feed.ops)).items.first { $0.handle == handle }?.continuation
         }
     }
@@ -56,7 +55,6 @@ public struct SwiftNativeDeskStore: Sendable {
         guard DeskContinuation.fromJSON(record.toJSON()) != nil else { throw DeskContinuationError.unsafe }
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             var feed = try await readFeedUnlocked()
-            guard feed.integrity.isClean else { throw DeskContinuationError.unsafe }
             let state = Self.compact(base: feed.base, feed.ops)
             guard let item = state.items.first(where: { $0.handle == handle }),
                   item.continuation?.revision == expectedRevision else { throw DeskContinuationError.conflict }

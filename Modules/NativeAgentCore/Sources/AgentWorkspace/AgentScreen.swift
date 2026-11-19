@@ -13,23 +13,17 @@ import Desk
 import StandingBots
 import Senses
 import NativeAgentShared
-// Blueprint: | `AgentScreen.swift` | `AgentScreen`, `withNames`, `resolve`: stable names and checked owner projections |
-// Home acknowledges what it told, in full or counted; a wait it only counted, and what an unread source drew, stay news.
-// Home and turn context share registry/news sense changes and live ability state.
+// Blueprint: | `AgentScreen.swift` | AgentScreen resolves pages and actions, including the shared recent-life item |
 
-/// Home renders retained owner state in layout order without reading another domain.
 package enum AgentScreen {
     enum Target { case action(AgentWorkspaceAction), page(String) }
 
-    // MARK: - Stable names (data/her_screen/names.json)
 
-    /// Issued numbers are never reused across turns or restarts; Desk aliases already supply stable identity.
     struct NameBook: Codable, Equatable {
         struct Slug: Codable, Equatable { var id: String; var name: String }
         var slugs: [String: Slug] = [:]
         var numbers: [String: [String: Int]] = [:]
         var next: [String: Int] = [:]
-        /// Display metadata, keyed by issued room/number; never an identity.
         var titles: [String: String]? = nil
 
         mutating func slug(id: String, name: String) -> String {
@@ -49,7 +43,6 @@ package enum AgentScreen {
             return candidate
         }
 
-        /// Prune only missing items after 200 names of a kind; retained counters must lead issued numbers, and exhaustion must fail without reuse.
         func validate() throws {
             for (kind, counter) in next where counter < 1 {
                 throw NameFailure("Invalid next counter for \(kind): \(counter)")
@@ -69,7 +62,6 @@ package enum AgentScreen {
         mutating func number(_ kind: String, id: String, title: String? = nil, existing: () -> Set<String>) throws -> Int {
             func retainedNumber() -> Int? {
                 if let n = numbers[kind]?[id] { return n }
-                // Preserve issued numbers by owner locator despite display-title changes; duplicate bindings cannot be reassigned.
                 guard kind.hasPrefix("item."), let locator = AgentScreen.recordIdentity(id) else { return nil }
                 return numbers[kind]?.filter { AgentScreen.recordIdentity($0.key) == locator }.map(\.value).min()
             }
@@ -122,7 +114,6 @@ package enum AgentScreen {
         let url = dataRoot.appendingPathComponent("her_screen/names.json")
         namesLock.lock(); defer { namesLock.unlock() }
         let key = dataRoot.standardizedFileURL.path + "\u{0}names"
-        // Only absence creates a book. Every present unreadable or invalid book stays byte-for-byte intact and its failure reaches the caller.
         let old = try AgentMemo.shared.cached(key, stamp: [stamp(url)]) {
             do { return try JSONDecoder().decode(NameBook.self, from: Data(contentsOf: url)) }
             catch let error as CocoaError where error.code == .fileReadNoSuchFile { return NameBook() }
@@ -145,23 +136,22 @@ package enum AgentScreen {
     package static func classify(workspace: WorkspaceOperation, _ name: String, dataRoot: URL, scope: String) async -> NameKind {
         switch await resolve(workspace: workspace, name, dataRoot: dataRoot, scope: scope, browserPages: []) {
         case nil: .unknown
-        case .page, .action(.open), .action(.window(.open)), .action(.openArrival): .read
+        case .page, .action(.open), .action(.openArrival): .read
         case .action(.perform(_, _, _, _, let isEffect)): isEffect ? .effect : .read
         default: .effect
         }
     }
     static let views: [String: AgentWorkspaceLocation] = [
         "home": .home, "people": .people(page: 0), "conversations": .conversations(page: 0),
-        "windows": .openPlaces, "arrivals": .arrivals, "work": .workOverview
+        "arrivals": .arrivals
     ]
     static let reserved: Set<String> =
         Set(placeNames.keys).union(views.keys).union(AgentWorkspaceEnvironment.destinations.map(\.id)).union(["crews", "delegations", "elsewhere"])
 
-    static let verbs: Set<String> = ["say", "run", "settings", "note", "done", "drop", "status", "add", "go", "click", "fill", "more"]
+    static let verbs: Set<String> = ["say", "run", "note", "done", "drop", "status", "go", "click", "fill", "more"]
 
-    /// Reuse an existing window for the same item instead of duplicating it.
     static func resolve(workspace: WorkspaceOperation, _ raw: String, dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation],
-                        openPlaces: [AgentWorkspaceLocation] = [], currentPlace: AgentWorkspaceLocation? = nil) async -> Target? {
+                        currentPlace: AgentWorkspaceLocation? = nil) async -> Target? {
         do {
             var name = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if name.hasPrefix("agent/") {
@@ -181,11 +171,11 @@ package enum AgentScreen {
             }
             if let target = buildTarget(workspace: workspace, name, dataRoot: dataRoot) { return target }
             if name.hasPrefix("elsewhere."), try !MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) {
-                return .page(elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope))
+                return .page(await elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope))
             }
-            let cachedName = name.hasPrefix("windows.") || name.hasPrefix("elsewhere.") ? scope + "\u{0}" + name : name
+            let cachedName = name.hasPrefix("elsewhere.") ? scope + "\u{0}" + name : name
             if let page = AgentItemPages.shared.page(workspace: workspace, dataRoot, cachedName) { return .page(page) }
-            if name == "elsewhere" { return .page(elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope)) }
+            if name == "elsewhere" { return .page(await elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope)) }
             if let action = try namedAction(workspace: workspace, name, dataRoot: dataRoot, scope: scope) {
                 if case .open(let place) = action, case .record = place { return open(place) }
                 return .action(action)
@@ -197,12 +187,9 @@ package enum AgentScreen {
                 verb = String(name[name.index(after: dot)...]); name = String(name[..<dot])
             }
             func open(_ place: AgentWorkspaceLocation) -> Target {
-                let existing = openPlaces.last { AgentWorkspaceNavigation.placeIdentity($0) == AgentWorkspaceNavigation.placeIdentity(place)
-                    || sameConversation($0, place) }
-                return .action(.window(AgentWorkspaceNavigation.windowAction(existing ?? place)))
+                return .action(.open(place))
             }
             if let web = webTarget(workspace: workspace, name, verb: verb, dataRoot: dataRoot, scope: scope) { return web }
-            if name == "desk", verb == "add" { return .action(.configure(tool: "desk_add_item", input: [:], title: "Add work")) }
             if name.hasPrefix("desk.") {
                 let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
                 let alias = String(name.dropFirst(5))
@@ -217,7 +204,6 @@ package enum AgentScreen {
                                                      title: name + " done", textField: nil, isEffect: true))
                 case "drop": return .action(.perform(tool: "desk_close", input: handle.merging(["canceled": .bool(true),
                     "reason": .string("dropped")]) { a, _ in a }, title: name + " dropped", textField: nil, isEffect: true))
-                // A supplied status executes in one call without leaving a form open.
                 case "status": return .action(.perform(tool: "desk_set_status", input: handle, title: "Status of " + name, textField: "status", isEffect: true))
                 default: return nil
                 }
@@ -236,9 +222,8 @@ package enum AgentScreen {
             if verb == nil, name.hasPrefix("browser.tab"), let n = Int(name.dropFirst(11)),
                let id = try withNames(workspace: workspace, dataRoot, { $0.id("browser.tab", n) }),
                let page = browserPages.first(where: { AgentWorkspaceNavigation.placeIdentity($0) == id }) {
-                return .action(.window(AgentWorkspaceNavigation.windowAction(page)))
+                return .action(.open(page))
             }
-            // Resolve names to their room without requiring protocol handles.
             if let slug = try withNames(workspace: workspace, dataRoot, { book in
                 book.slugs[name] ?? book.slugs.values.first { $0.name.caseInsensitiveCompare(raw.trimmingCharacters(
                     in: .whitespacesAndNewlines)) == .orderedSame }
@@ -255,7 +240,6 @@ package enum AgentScreen {
                     return .action(.message(agent: slug.id, conversation: nil, name: slug.name))
                 case ("run", let id?): return .action(.perform(tool: "bot_run_once", input: ["id": .string(id)], title: "Run " + slug.name, textField: nil,
                     isEffect: true))
-                case ("settings", let id?): return .action(.configure(tool: "bot_update", input: ["id": .string(id)], title: slug.name + " settings"))
                 default: return nil
                 }
             }
@@ -268,31 +252,18 @@ package enum AgentScreen {
         } catch { return .page(nameFailure(error)) }
     }
 
-    /// Match contact IDs case-insensitively; an explicit thread matches only itself, while a contact name can reuse any open thread.
-    private static func sameConversation(_ a: AgentWorkspaceLocation, _ b: AgentWorkspaceLocation) -> Bool {
-        guard case .record("agent_read", let x, _) = a, case .record("agent_read", let y, _) = b,
-              case .string(let one)? = x["agent"], case .string(let two)? = y["agent"],
-              one.caseInsensitiveCompare(two) == .orderedSame,
-              Set(x.keys).isSubset(of: ["agent", "conversation"]), Set(y.keys).isSubset(of: ["agent", "conversation"]) else { return false }
-        guard case .string(let wanted)? = y["conversation"] else { return true }
-        guard case .string(let open)? = x["conversation"] else { return false }
-        return open.caseInsensitiveCompare(wanted) == .orderedSame
-    }
-
-    // MARK: - Home
 
     private static let homeFooter = [
-        "Open: app {item:\"desk.4\"} or {item:\"mail\"}; text/fields: args. Also: windows, people, conversations, arrivals, work, mac.",
+        "Open: app {item:\"desk.4\"} or {item:\"mail\"}; text: args. Also: people, conversations, arrivals, mac.",
         "Face links page:home/<item> open with app {page:\"home\", item:\"<item>\"}; "
             + "page:desk/<handle> with app {page:\"desk\", item:<handle>}.",
-        "Job rows: agent.read {job:<row id without job:>}. Queue: a step closes by itself once its work is seen done; queue.drop {id:<row id>} lets one go.",
+        "Job rows: agent.read {job:<row id without job:>}. Queue: queue.done {id:<row id>} marks a step done and queue.drop {id:<row id>} lets it go.",
         "Blocked steps: desk.wait {handle:<page:desk handle>, on:<card, message or debt id>}. Peer elevation: Trust > Connected agents.",
         "Repair: repair.let_go {id:<row id>, reason}.",
         "Find: app {page:\"home\", find:\"…\"}.",
     ]
 
-    /// Only `markSeen: true` advances Home's observation; the user's Agent view must not mark seen.
-    static func home(workspace: WorkspaceOperation, dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation], windows: [String] = [],
+    static func home(workspace: WorkspaceOperation, dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation],
                      now: Date = Date(), markSeen: Bool = true) async -> String {
         var sharedFace: PartFace?
         do {
@@ -307,7 +278,6 @@ package enum AgentScreen {
             let page = ChromePageMirror.page(tab: nil, dataRoot: dataRoot, session: scope)
             var marks = try worldMarks(workspace: workspace, world, dataRoot: dataRoot, person: person, now: now)
             try preserveUnreadMarks(&marks, seen: seen, world: world, workspace: workspace, dataRoot: dataRoot)
-            // Home alone acknowledges presence, Chrome, day badges and this chat's tabs.
             var shown: [String: Mark] = [:]
             if let transition = presence.transition {
                 let word = transition.here ? " here" : " away"
@@ -325,7 +295,6 @@ package enum AgentScreen {
             }
             let tabs: [(id: String, title: String)] = page.map { [("tab:" + String($0.tab), tabTitle($0))] }
                 ?? browserPages.compactMap { place in AgentWorkspaceNavigation.placeIdentity(place).map { ($0, place.title) } }
-            // Tabs are per chat: another chat's saved tabs pass through untouched (a day at most), so its home never calls them closed here.
             let ownTabs = "home:tab:" + scope + "\u{0}"
             for (name, mark) in seen?.marks ?? [:] where name.hasPrefix("home:tab:") && !name.hasPrefix(ownTabs)
                 && now.timeIntervalSince1970 - mark.at < 86_400 { shown[name] = mark }
@@ -333,7 +302,6 @@ package enum AgentScreen {
                 shown[ownTabs + tab.id] = Mark(fp: "open", line: "", new: "browser tab opened: " + clip(tab.title, 40),
                                                    gone: "browser tab closed: " + clip(tab.title, 40), at: now.timeIntervalSince1970)
             }
-            // The first look with these sets their baseline rather than calling them all new.
             let baseline = seen?.marks.keys.contains { $0.hasPrefix("home:") } == true
             if baseline { marks.merge(shown) { a, _ in a } }
             let changed = changes(since: seen, now: marks, excluding: scope)
@@ -371,10 +339,6 @@ package enum AgentScreen {
             if face.sections.contains(where: { $0.id == "changed" }) {
                 lines += section("CHANGED", ["Tracked home records since last look; not all activity."] + told.lines.map { "● " + $0 })
             }
-            if !windows.isEmpty {
-                lines.append("This chat's OPEN · " + windows.prefix(3).map { clip($0, 40) }.joined(separator: " · ")
-                    + (windows.count > 3 ? " +\(windows.count - 3)" : "") + " · item \"windows\"")
-            }
             if let tab = webTabCell(workspace: workspace, dataRoot: dataRoot, scope: scope, now: now) {
                 lines.append("This chat's browser · " + tab)
             } else if !browserPages.isEmpty {
@@ -408,10 +372,7 @@ package enum AgentScreen {
                 for place in ["browser", "calendar", "reminders"] where places.contains(place) { acknowledged.insert("home:" + place) }
                 if places.contains("browser"), let page { acknowledged.insert(ownTabs + "tab:" + String(page.tab)) }
             }
-            if markSeen {
-                // A look acknowledges what it could read. A mark an unread or failed source would draw keeps its last-seen state; a pending
-                // source was read, and its retained reading only moves forward. A name nothing drew is let go: unread Desk and helper marks
-                // are kept above, and a name that comes back is told as it appears.
+            if markSeen, seen.map({ $0.form == Seen.form }) ?? true || world.pending.isEmpty && world.unread.isEmpty {
                 var read = world
                 read.pending = []
                 let drawn = try worldMarks(workspace: workspace, read, dataRoot: dataRoot, person: person, now: now, currentOnly: true)
@@ -435,9 +396,7 @@ package enum AgentScreen {
         return rows.enumerated().map { ($0.offset == 0 ? pad(label, width) : String(repeating: " ", count: width)) + $0.element }
     }
 
-    // MARK: Desk
 
-    /// Use DeskParking's shared last-touch rule; a live execution keeps work active.
     struct DeskSplit { var waiting: [DeskItem] = []; var active: [DeskItem] = []; var parked: [DeskItem] = []; var quietDays: Int? }
 
     static func deskSplit(_ state: DeskState, live: Set<String>, now: Date) -> DeskSplit {
@@ -455,7 +414,6 @@ package enum AgentScreen {
         return split
     }
 
-    /// Keep repair owed until its operation succeeds or is released; agent-owned repairs stay in MY QUEUE, person-owned ones in owner waits.
     static func owedRows(_ dataRoot: URL, person: String, now: Date) async -> (agent: [String], person: [String]) {
         let open: [Experience]
         do { open = try await ExperienceStore.at(dataRoot).projection() }
@@ -489,11 +447,9 @@ package enum AgentScreen {
                 Array(personRows.prefix(cap)) + (personRows.count > cap ? ["+\(personRows.count - cap) more for \(person)"] : []))
     }
 
-    // MARK: People
 
     struct Contact { let id: String; let name: String; let kind: String?; var agents: [String] = [] }
 
-    /// Only persisted bridge identity establishes a sender; `heard` tracks their message and `answered` tracks the newest local reply.
     package struct BridgeChat { package let id: String; package let who: String; package let title: String; package let at: Date;
         package var heard: Date? = nil; package var answered = false }
 
@@ -503,13 +459,11 @@ package enum AgentScreen {
             guard let at = row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(date) else { return nil }
             let raw = row["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? session.topic
             let named = humanTitle(raw, agentName: nil)
-            // The index keeps a title's first 60 characters; its last word may be cut.
             var title = named.title
             if raw.count >= 60, let space = title.lastIndex(of: " ") { title = String(title[..<space]) + "…" }
             if let summary = row["summary"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) { title = clip(summary, 56) }
             return .init(id: session.id, who: session.sender, title: title, at: at)
         }
-        // Bound sender history to the two newest chats and the last 32 KB of each.
         var looked: [String: Int] = [:]
         for index in chats.indices where looked[chats[index].who, default: 0] < 2 {
             looked[chats[index].who, default: 0] += 1
@@ -520,19 +474,16 @@ package enum AgentScreen {
         return chats
     }
 
-    /// A peer id named as Home names it: the contact whose id or merged identities carry it.
     package static func peerName(identity: AgentContactIdentity) -> (String) -> String? {
         let people = contacts(identity: identity)
         return { peer in people.first { $0.id == peer || $0.agents.contains(peer) }?.name }
     }
 
-    /// Saved contacts, grouped only by their explicit identities.
     static func contacts(identity: AgentContactIdentity, mergeIdentities: Bool = true) -> [Contact] {
         var contacts: [Contact] = []
         for peer in identity.peers {
             guard let id = peer["id"], let name = peer["name"] else { continue }
             if let who = peer["who"], identity.peers.contains(where: { $0["id"] == who }) { continue }
-            // Shared display names do not make two routes one.
             let kind: String? = switch peer["transport"] {
             case "desktop", "desktopChat": "desktop app"
             case "grokBot": "routine"
@@ -568,7 +519,6 @@ package enum AgentScreen {
                           heard: tail.last { !$0.mine }?.at, answered: last.mine)
     }
 
-    /// Use the contact's latest exchange, including a newer bridge chat when it is the answering route.
     static func state(_ contact: Contact, record: AgentConversationRecord?, chat: BridgeChat?,
                       answered: [String: Date], now: Date, health: AgentLocalHealth? = nil) -> (text: String, asks: Bool, change: String) {
         if let record, record.phase != "sending", record.sendFailed {
@@ -595,7 +545,6 @@ package enum AgentScreen {
                 else if receipt["sent"] == .bool(false) { text = "✗ not sent " + ago; change = "not sent" }
                 else { text = "✗ no reply " + ago; change = "did not reply" }
             } else if record.retainedReply?.text ?? record.exchanges?.last?.reply != nil {
-                // Reply text stays in the conversation; its age is the exchange's.
                 let at = record.exchanges?.last?.settledAt ?? record.exchanges?.last?.sentAt ?? record.operationStartedAt ?? record.updatedAt
                 text = "✓ replied " + age(now.timeIntervalSince(at)); change = "replied"
             } else { text = "sent " + ago }
@@ -643,7 +592,6 @@ package enum AgentScreen {
         } catch { return ([("unavailable", nameFailure(error))], [], 0, []) }
     }
 
-    // MARK: Helpers
 
     static func helperState(_ bot: BotDefinition, entry: ShelfEntry?, running: Bool, person: String, now: Date) -> String {
         var state: String
@@ -662,9 +610,7 @@ package enum AgentScreen {
         return bot.paused ? state + " · paused" : state
     }
 
-    // MARK: Working and crews
 
-    /// One job as home shows it: another agent's or a line of the agent's own.
     package struct JobGlance: Sendable {
         package let id: String
         package let agent: String
@@ -673,7 +619,6 @@ package enum AgentScreen {
         package let state: String
         package let working: Bool
         package let brief: String
-        /// The Desk item the job carries, as the agent bound it.
         package let desk: String?
         package let at: Date
         package init(id: String, agent: String, name: String, own: Bool, state: String, working: Bool, brief: String, desk: String?, at: Date) {
@@ -682,13 +627,16 @@ package enum AgentScreen {
         }
     }
 
-    /// The agent's jobs as their owner (AgentJobs) reads them, newest first; it installs this reader at launch.
-    package static let jobGlances = OSAllocatedUnfairLock<(@Sendable (URL) throws -> [JobGlance])?>(initialState: nil)
+    package struct JobGlances: Sendable {
+        package let read: @Sendable (URL) throws -> [JobGlance]
+        package init(_ read: @escaping @Sendable (URL) throws -> [JobGlance]) { self.read = read }
+    }
+    package static let jobGlances = OSAllocatedUnfairLock<JobGlances?>(initialState: nil)
 
     static func jobRows(dataRoot: URL, now: Date, _ keep: (JobGlance) -> Bool, empty: String) -> [String] {
         guard let read = jobGlances.withLock({ $0 }) else { return ["your jobs are not readable in this app yet"] }
         do {
-            let rows = try read(dataRoot).filter(keep).prefix(10)
+            let rows = try read.read(dataRoot).filter(keep).prefix(10)
             return rows.isEmpty ? [empty] : rows.map { job in
                 pad(job.own ? "line" : clip(job.name, 8), 10) + clip(firstLine(job.brief), 44) + " · " + job.state + " · "
                     + age(now.timeIntervalSince(job.at)) + " · agent.read {agent:\"\(job.agent)\", job:\"\(job.id)\"}"
@@ -696,15 +644,12 @@ package enum AgentScreen {
         } catch { return ["your jobs could not be read: " + error.localizedDescription] }
     }
 
-    /// The agent's lines are its crews: each a turn in its own work conversation, several at once side by side.
     static func crewsRoom(dataRoot: URL, now: Date = Date()) -> String {
         screen(["CREWS", "your own lines"], [jobRows(dataRoot: dataRoot, now: now, { $0.own }, empty: "no lines yet")],
             verbs: [("agent.job {agent:\"self\", brief, instructions?}", "start a line of your own"), ("agent.jobs {agent:\"self\"}", "list them")])
     }
 
-    // MARK: - Small readers
 
-    /// Adapt read errors to the existing failure envelope, keeping owner evidence.
     static func readFailure(_ error: any Error, reason: String, remedy: JSONValue) -> String {
         let typed = error as? ToolFailureError, sense = error as? SenseFailure
         let cancelled = error is CancellationError || typed?.status == .cancelled || sense?.code == "cancelled"
@@ -725,13 +670,6 @@ package enum AgentScreen {
         }
         if let hint = (error as? LocalizedError)?.recoverySuggestion { fields["hint"] = .string(hint) }
         return failureFace(.object(fields))
-    }
-
-    static func fileReadFailure(_ error: any Error, reason: String, file: URL, shape: String) -> String {
-        return readFailure(error, reason: reason, remedy: Repair.remedy(owner: file.path,
-            nextCall: nil, tap: nil, instruction: ToolFailureError.fileRepairInstruction(file,
-                shape: shape)
-                + " Restore access or repair the reported file damage, preserving its original bytes and records."))
     }
 
     static func sensesRows(workspace: WorkspaceOperation, dataRoot: URL, now: Date, full: Bool = false) async -> [String] {
@@ -821,7 +759,6 @@ package enum AgentScreen {
         return nil
     }
 
-    /// Keep the owner's evidence intact, including fixes and executable levers.
     static func failureFace(_ value: JSONValue) -> String {
         let evidence: JSONValue
         if case .object(let fields) = value {
@@ -834,7 +771,6 @@ package enum AgentScreen {
         return UntrustedText.neutralized((try? evidence.serialize(pretty: false)) ?? String(describing: evidence))
     }
 
-    /// Keep complete owner remedies, even when supplied as text.
     static func failureReason(_ error: String) -> String {
         UntrustedText.neutralized(error)
     }
@@ -857,7 +793,6 @@ package enum AgentScreen {
         (plainLines(text).first ?? "").replacingOccurrences(of: "\"", with: "'")
     }
 
-    /// Defuse every non-empty source line before joining it; fenced code contributes only its first line as a code excerpt.
     static func plainLines(_ text: String) -> [String] {
         var body = text
         while let fence = body.range(of: #"```[^\n]*\n[\s\S]*?(```|$)"#, options: .regularExpression) {
@@ -881,7 +816,6 @@ package enum AgentScreen {
         }
     }
 
-    /// Include a second sentence when the first is under 16 characters so terse acknowledgements retain useful context.
     static func sentence(_ text: String) -> String {
         let flat = plainLines(text).joined(separator: " ")
         var said = "", rest = Substring(flat)
@@ -894,12 +828,9 @@ package enum AgentScreen {
         return said.hasSuffix(":") ? String(said.dropLast()) : said
     }
 
-    /// Outside titles and replies must become inert bounded text before Home displays them.
     package static func clip(_ text: String, _ limit: Int) -> String {
-        // Defuse each line before joining so a leading result header cannot move past detection.
         let flat = text.split(whereSeparator: \.isNewline).map { UntrustedText.neutralized(String($0)) }.joined(separator: " ")
         guard flat.count > limit else { return flat }
-        // At a word boundary when one is near, never mid-word.
         var cut = String(flat.prefix(limit - 1))
         if let space = cut.lastIndex(of: " "), cut.distance(from: space, to: cut.endIndex) < 16 { cut = String(cut[..<space]) }
         return cut.trimmingCharacters(in: .whitespaces) + "…"
@@ -914,9 +845,7 @@ package enum AgentScreen {
         return text
     }
 
-    // MARK: - Human titles
 
-    /// Content titles exclude transport prefixes and greetings; retain the sender separately for disambiguation.
     static func humanTitle(_ raw: String, agentName: String?) -> (title: String, who: String?) {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines), who: String?
         if text.hasPrefix("[from: "), let end = text.range(of: ", via bridge]") {
@@ -926,7 +855,6 @@ package enum AgentScreen {
         }
         let greeting = (agentName ?? "").lowercased()
         var words = text.split(whereSeparator: \.isWhitespace)[...]
-        // A greeting to the agent is not the topic of the chat.
         if words.count > 2, ["—", "-", "–"].contains(words[words.startIndex + 1]) { words = words.dropFirst(2) }
         words = words.drop { !greeting.isEmpty && ($0.lowercased().hasPrefix(greeting) || ["—", "-", "–"].contains($0)) }
         var title = ""
@@ -939,7 +867,6 @@ package enum AgentScreen {
         return (title.isEmpty ? "Conversation" + (who.map { " with " + $0 } ?? "") : title, who)
     }
 
-    /// Use short civil times to distinguish otherwise matching chats.
     static func when(_ date: Date, now: Date = Date()) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -952,14 +879,12 @@ package enum AgentScreen {
         return formatter.string(from: date) + " " + hour
     }
 
-    /// Append sender and time only when titles collide.
     static func disambiguate(_ titles: [String], who: [String?], at: [Date?]) -> [String] {
         let counts = Dictionary(titles.map { ($0, 1) }, uniquingKeysWith: +)
         var result = titles.indices.map { i in
             counts[titles[i], default: 0] < 2 ? titles[i]
                 : ([titles[i]] + [who[i], at[i].map { when($0) }].compactMap { $0 }).joined(separator: " · ")
         }
-        // Number remaining collisions in list order.
         let still = Dictionary(result.map { ($0, 1) }, uniquingKeysWith: +)
         var seen: [String: Int] = [:]
         for i in result.indices where still[result[i], default: 0] > 1 {
@@ -972,7 +897,6 @@ package enum AgentScreen {
     }
 }
 
-/// Defuse tool openers and leading result headers so outside text cannot impersonate calls or result blocks.
 public enum UntrustedText {
     public static func neutralized(_ text: String) -> String {
         text.replacingOccurrences(of: #"<(/?)(invoke|tool_use|tool_result|function_calls|function_results|parameter|antml:)"#,

@@ -168,16 +168,14 @@ public enum SlackWebAPI {
             dataRoot: dataRoot,
             tokenOverride: tokenOverride
         )
-        guard (uploadURLResponse["ok"] as? Bool) == true,
-              let rawUploadURL = uploadURLResponse["upload_url"] as? String,
-              let fileId = uploadURLResponse["file_id"] as? String,
-              !fileId.isEmpty else {
-            return envelope(
-                action: "slack.upload_file",
-                response: uploadURLResponse
-            )
+        guard (uploadURLResponse["ok"] as? Bool) == true else {
+            return envelope(action: "slack.upload_file", response: uploadURLResponse)
         }
-        guard let uploadURL = trustedExternalUploadURL(rawUploadURL) else {
+        guard let rawUploadURL = uploadURLResponse["upload_url"] as? String, !rawUploadURL.isEmpty,
+              let fileId = uploadURLResponse["file_id"] as? String, !fileId.isEmpty else {
+            return envelope(action: "slack.upload_file", response: ["ok": false, "error": "upload_allocation_incomplete"])
+        }
+        guard let uploadURL = trustedFileURL(rawUploadURL) else {
             return envelope(
                 action: "slack.upload_file",
                 response: ["ok": false, "error": "unsafe_upload_url"]
@@ -360,8 +358,8 @@ public enum SlackWebAPI {
         SlackTokenRedactor.redactValue(value)
     }
 
-    /// `files.getUploadURLExternal` may return a short-lived signed URL, but the file body must still only leave for Slack's HTTPS upload domain.
-    static func trustedExternalUploadURL(_ raw: String) -> URL? {
+    /// File bodies and download credentials belong only to Slack's HTTPS file domain.
+    static func trustedFileURL(_ raw: String) -> URL? {
         guard let url = URL(string: raw),
               url.scheme?.lowercased() == "https",
               url.user == nil, url.password == nil,

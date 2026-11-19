@@ -4,6 +4,7 @@ import ChatToolRuntime
 import CoreFoundation
 import CryptoKit
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `NativeAgentMCPWire.swift` | MCP negotiation, parsing, caller-supplied request identity and reply projection |
 
@@ -391,7 +392,19 @@ enum NativeAgentMCPWire {
 
     static func tools() throws -> [[String: Any]] {
         let agent = PeerFacingIdentity.agentName
-        let table = try SwiftToolDispatcher.tableReadParameters().foundationObject
+        guard case .object(var table) = try SwiftToolDispatcher.tableReadParameters(),
+              case .object(var properties)? = table["properties"] else { throw ToolFailureError("The table schema is unavailable.", effects: .none) }
+        properties["do"] = .object(["type": .string("string"), "enum": .array(["put", "cross", "remove"].map(JSONValue.string)),
+            "description": .string("Optional table action, only for a trusted contact at the table; omit to read. All other work goes through agent_message.")])
+        for key in ["id", "type", "text", "color", "kind", "size", "from", "to", "fromSide", "toSide", "label", "item"] {
+            properties[key] = .object(["type": .string("string")])
+        }
+        for key in ["x", "y", "w", "h", "width"] { properties[key] = .object(["type": .string("number")]) }
+        properties["type"] = .object(["type": .string("string"),
+            "enum": .array(["shape", "text", "container", "arrow", "stroke"].map(JSONValue.string))])
+        properties["text"] = .object(["type": .string("string"), "maxLength": .int(2_000)])
+        properties["points"] = .object(["type": .string("array"), "items": .object(["type": .string("number")])])
+        table["properties"] = .object(properties)
         return [
             ["name": "agent_message", "description": """
                 Talk with \(agent). This session of yours has its own conversation with \(agent): every message goes on in it, and its mcp- \
@@ -436,14 +449,19 @@ enum NativeAgentMCPWire {
              ], "required": ["session_id", "request_id"], "additionalProperties": false],
              "annotations": ["readOnlyHint": true, "idempotentHint": true, "openWorldHint": false]],
             ["name": "agent_desk", "description": """
-                Read \(agent)'s Desk, once the person has brought you to \(agent)'s table: the same reading \(agent) has of it, with handles. \
-                With handle, one item, whose on_the_table lists the pieces laid on it; with piece set to a make_ref from there, that piece's \
+                piece:"\(BoardDocument.tableRef)" reads \(agent)'s standing table, its marks and live cards: any saved contact may. The rest of \
+                \(agent)'s Desk is yours once the person has brought you to the table or trusts you: the same reading \(agent) has of it, \
+                with handles. With handle, one item, whose on_the_table lists pieces; \
+                a make_ref reads that piece's \
                 source. next_read and next_archive_read name \(agent)'s own desk_read and desk.read: pass their arguments to agent_desk. It \
-                only reads: make.read, make.add and the other calls named in a result are \(agent)'s; to change anything, ask \(agent) with \
-                agent_message. Not at the table, it says how to get there. \(heldNote)
+                reads when do is omitted. A trusted contact can use do:put|cross|remove with table action fields: add signed marks \
+                or readable item/piece cards, edit or remove only its own elements, and cross any element. A put with type and no id mints e plus \
+                twelve lowercase hex digits. Crossing an item card marks the card \
+                without closing the item. Everything else, including make.add and Desk changes, is \(agent)'s: ask with agent_message. \
+                Not at the table, it says how to get there. \(heldNote)
                 """,
-             "inputSchema": table,
-             "annotations": ["readOnlyHint": true, "idempotentHint": true, "openWorldHint": false]]
+             "inputSchema": JSONValue.object(table).foundationObject,
+             "annotations": ["readOnlyHint": false, "idempotentHint": false, "openWorldHint": false]]
         ]
     }
 }

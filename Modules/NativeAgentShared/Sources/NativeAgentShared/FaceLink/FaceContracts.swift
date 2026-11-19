@@ -457,17 +457,6 @@ public struct TelegramConfigurationWrite: Codable, Sendable, Equatable {
     }
 }
 
-public struct SlackIngressWrite: Codable, Sendable, Equatable {
-    public var token: Data?
-    public var allowedChannelIDs: [String]
-    public var allowedUserIDs: [String]
-    public init(token: Data?, allowedChannelIDs: [String], allowedUserIDs: [String]) {
-        self.token = token
-        self.allowedChannelIDs = allowedChannelIDs
-        self.allowedUserIDs = allowedUserIDs
-    }
-}
-
 public struct GrokCredentialWrite: Codable, Sendable, Equatable {
     public var operation: UUID
     public var contact: String
@@ -543,17 +532,6 @@ public struct DoctorRequest: Codable, Sendable, Equatable {
     public init(scope: String, repair: Bool) {
         self.scope = scope
         self.repair = repair
-    }
-}
-
-public struct StarterPersonaRequest: Codable, Sendable, Equatable {
-    public var agentName: String
-    public var personaType: String
-    public var userName: String
-    public init(agentName: String, personaType: String, userName: String) {
-        self.agentName = agentName
-        self.personaType = personaType
-        self.userName = userName
     }
 }
 

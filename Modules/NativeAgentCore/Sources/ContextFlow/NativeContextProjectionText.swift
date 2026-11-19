@@ -1,7 +1,7 @@
 import Foundation
 import Context
 import NativeAgentShared
-// Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText`; `clean`, `bounded`; ContextMarkdownCompiler triggers |
+// Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText`: projection text bounds and trigger tokens |
 
 enum NativeContextProjectionText {
     static func requiredDate(_ raw: String?, owner: String) throws -> Date {
@@ -29,9 +29,28 @@ enum NativeContextProjectionText {
     }
 
     static func triggers(_ text: String, minimumLength: Int = 2, excluding: Set<String> = []) -> [String] {
-        ContextMarkdownCompiler.triggerTokens([text], minimumLength: minimumLength,
+        triggerTokens([text], minimumLength: minimumLength,
             maximumCount: 12, excluding: excluding,
             tokens: { $0.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init) },
             bound: { $0 }).map { bounded($0, to: 64) }
+    }
+
+    /// Each projection supplies its trigger-token and bound rules.
+    private static func triggerTokens(
+        _ texts: [String], minimumLength: Int, maximumCount: Int,
+        excluding stopwords: Set<String>, tokens: (String) -> [String],
+        bound: (String) -> String
+    ) -> [String] {
+        var result: [String] = []
+        var seen = Set<String>()
+        for text in texts {
+            for token in tokens(text) where !stopwords.contains(token) {
+                let value = bound(token)
+                guard value.count >= minimumLength, seen.insert(value).inserted else { continue }
+                result.append(value)
+                if result.count == maximumCount { return result }
+            }
+        }
+        return result
     }
 }

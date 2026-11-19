@@ -1,4 +1,5 @@
 import Foundation
+import ChatTurnContracts
 import NativeAgentCore
 import PersistenceCore
 import Desk
@@ -7,7 +8,7 @@ import Transcripts
 import TurnTrace
 import ProviderRouting
 import NativeAgentShared
-// Blueprint: | `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop`, closing expansion predictions through `Expansion.withTurn` after the whole turn, including deferred after-reply work or its abandonment; explicit checkpoint and resume inputs, serialized `TurnCheckpointWriter`; same-turn transcript/receipt recovery and finished-run cleanup |
+// Blueprint: | `ChatOrchestration+Continuation.swift` | Continuation recovery preserves saved answer provenance and settlement identity |
 
 
 /// Serialize with receipts so checkpoints never claim unrecorded effects. Failed writes owe repair; the next committed write settles it.
@@ -23,7 +24,7 @@ actor TurnCheckpointWriter {
         pendingCalls = record.runningStep == nil ? 0 : 1
     }
 
-    func capture(prose: String, commentaryCharacters: Int, conversation: [LLMMessage], log: [JSONValue],
+    func capture(prose: String, commentaryCharacters: Int, log: [JSONValue],
                  startingCalls: Int = 0, turn: Turn) {
         record.log = log
         record.keptProse = prose
@@ -212,9 +213,19 @@ extension SwiftNativeChatOrchestrationClient {
             }
             let answerRef = Self.transcriptRef(sessionId, outcome.messageID)
             let heardID = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.answerExperienceID ?? outcome.turnID
+            var recordedTurn = Turn(id: outcome.turnID, run: runId, session: sessionId)
+            recordedTurn.envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
+                ?? fields["source"]?.stringValue.map { TurnEnvelope(surface: ChatThreadKind.surface(transcriptSource: $0)) }
+            if let origin = metadata["origin"] {
+                recordedTurn.origin = try JSONDecoder().decode(ChatMessageOrigin.self, from: JSONEncoder().encode(origin))
+            }
+            let line = ContactThread.Line(fields)
+            let sources = line.steeredBy + (metadata["untrusted_sources"]?.arrayValue?.compactMap(\.stringValue) ?? ["unrecorded"])
+                + (line.contact ? [line.stamp.source ?? "another agent"] : [])
             // Preserve the turn's original birth across recovery.
             await Self.recordAnswer(runID: runId, heardID: heardID, evidence: answerRef, state: state,
                 dataRoot: dataRoot, words: content, attachments: response.attachments ?? [],
+                steeredBy: line.provenanceFailure == nil ? recordedTurn.steeringStamp(sources: sources) : ["unrecorded"],
                 conversation: (sessionId, outcome.turnID))
             return response
         }
@@ -246,9 +257,6 @@ extension SwiftNativeChatOrchestrationClient {
         try await turnTraceBus.deliverDurably(terminal)
         for checkpoint in checkpoints {
             if !checkpoint.deliveryPending { try checkpoint.remove(dataRoot: dataRoot) }
-            if let scope = ProviderToolResultRecoveryStore.Scope(sessionId: sessionId, turnId: checkpoint.turnId) {
-                await ProviderToolResultRecoveryStore.shared.remove(scope: scope)
-            }
         }
     }
 
@@ -422,7 +430,7 @@ extension SwiftNativeTurnEngine {
         surface: String = "chat", userMessage: String, sessionId: String? = nil,
         toolSessionId: String? = nil, runId: String? = nil,
         llm: any LLMClient,
-        tools: any ExpansionToolDispatchClient, preBuiltContext: TurnContext,
+        tools: any ToolDispatchClient, preBuiltContext: TurnContext,
         progress: ToolProgress? = nil,
         onDelivery: (@Sendable () async -> Void)? = nil,
         cancelFlagPath: URL? = nil, providerAdmission: (@Sendable () async throws -> Void)? = nil,
@@ -468,7 +476,7 @@ extension SwiftNativeTurnEngine {
         return try await holding(work.with(\.checkpoint, checkpoint)) { work in
         return try await holding(work.with(\.journal, journal)) { work in
             do {
-                let returned = try await Expansion.withTurn(dataRoot: remPinsDataRoot, turn: turn, afterReply: { $0.afterReply }) {
+                let returned = try await TurnDispatchClosure.withTurn(dataRoot: remPinsDataRoot, turn: turn, afterReply: { $0.afterReply }) {
                     try await Self.untilStopped(cancelFlagPath) { [self] in
                         try await executeContinuationTurnBody(
                             surface: surface, userMessage: userMessage, sessionId: sessionId,

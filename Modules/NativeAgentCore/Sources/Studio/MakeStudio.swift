@@ -16,6 +16,8 @@ public struct MakeRegistration: Sendable {
 /// Numbered copies keep each version and the user's comments tied to unchanged bytes. Store refs under make/, apart from the taste journal's studio/ directory
 /// to prevent identity collisions.
 public struct MakeStudio: Sendable {
+    /// The Desk's standing board in the Make store.
+    public static let tableRef = BoardDocument.tableRef
     public struct Version: Codable, Sendable, Equatable {
         public let n: Int
         public let file: String
@@ -48,6 +50,16 @@ public struct MakeStudio: Sendable {
     public func folder(_ ref: String) -> URL { root.appendingPathComponent(ref, isDirectory: true) }
 
     public func url(_ ref: String, _ version: Version) -> URL { folder(ref).appendingPathComponent(version.file) }
+
+    /// Reads a retained board within the Make document bound.
+    public func board(_ ref: String, _ version: Version) throws -> BoardDocument {
+        let file = url(ref, version)
+        guard let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize else { throw CocoaError(.fileReadUnknown) }
+        guard size <= MakePreviewFace.wordsLimit else {
+            throw Refusal(reason: "board_too_large", message: "The board exceeds the 2 MB limit.")
+        }
+        return try BoardDocument(String(contentsOf: file, encoding: .utf8))
+    }
 
     public static func isRef(_ ref: String) -> Bool {
         !ref.isEmpty && ref.count <= 40 && ref.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" }
@@ -127,7 +139,7 @@ public struct MakeStudio: Sendable {
             readState = "not_created"
         }
         var rows: [(ref: String, created: Date?, value: JSONValue)] = []
-        for ref in refs {
+        for ref in refs where ref != Self.tableRef {
             do {
                 guard let meta = try readMeta(ref), let latest = meta.versions.last else {
                     throw Refusal(reason: "metadata_missing", message: "No retained version metadata was found for this ref.")
@@ -174,7 +186,7 @@ public struct MakeStudio: Sendable {
         return try CredentialFileLock.withLock(root) {
             var meta: Meta
             if ref.isEmpty {
-                meta = Meta(ref: String(UUID().uuidString.lowercased().prefix(8)), versions: [])
+                repeat { meta = Meta(ref: String(UUID().uuidString.lowercased().prefix(8)), versions: []) } while try self.readMeta(meta.ref) != nil
             } else {
                 guard let found = try self.readMeta(ref) else {
                     throw Refusal(reason: "unknown_ref", message: "No Make ref is called \(ref). Leave ref out to start a new one.")
@@ -187,33 +199,78 @@ public struct MakeStudio: Sendable {
                     The newest is the one to change.
                     """)
             }
-            let (n, exhausted) = (meta.versions.last?.n ?? 0).addingReportingOverflow(1)
-            guard !exhausted else {
-                throw Refusal(reason: "version_exhausted", message: "Make has no version numbers left for this ref. Nothing was written.")
-            }
-            let ext = file.pathExtension.lowercased()
-            let version = Version(n: n, file: ext.isEmpty ? "v\(n)" : "v\(n).\(ext)", prompt: prompt, model: model,
-                                  created: NativeTimestampFormat.sixDigitUTCOffset(Date()), madeBy: madeBy, personEditOf: personEditOf)
-            let dir = folder(meta.ref)
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let copy = try checkedDestination(meta.ref, file: version.file)
-            try FileManager.default.copyItem(at: file, to: copy)
-            meta.versions.append(version)
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            do {
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(meta), to: checkedDestination(meta.ref, file: "meta.json"))
-            } catch let writeError {
-                // A directory-sync error can follow the metadata rename. Keep a referenced copy (or an unreadable commit); remove only a known orphan.
-                do {
-                    if try readMeta(meta.ref)?.versions.contains(version) != true {
-                        try FileManager.default.removeItem(at: copy)
-                    }
-                } catch { nativeLog("Make append cleanup: %@", error.localizedDescription) }
-                throw writeError
-            }
-            return (meta.ref, version)
+            return try append(file, meta: &meta, prompt: prompt, model: model, madeBy: madeBy, personEditOf: personEditOf)
         }
+    }
+
+    /// Applies one signed board change to the newest retained version under the Make lock.
+    public func change(_ ref: String, by: String, _ apply: (inout BoardDocument) throws -> Bool) throws -> Version? {
+        try CredentialFileLock.withLock(root) {
+            var meta = try readMeta(ref) ?? Meta(ref: ref, versions: [])
+            guard Self.isRef(ref), ref == Self.tableRef || !meta.versions.isEmpty else {
+                throw Refusal(reason: "unknown_ref", message: "No board is called \(ref).")
+            }
+            var document = BoardDocument()
+            if let newest = meta.versions.last {
+                document = try board(ref, newest)
+            }
+            let before = document
+            guard try apply(&document) else { return nil }
+            let earlier = Dictionary(uniqueKeysWithValues: before.elements.map { ($0.id, $0) })
+            for index in document.elements.indices {
+                let element = document.elements[index]
+                if let old = earlier[element.id] {
+                    var was = old.fields, now = element.fields
+                    if was["crossedBy"] != nil || now["crossedBy"] != nil {
+                        for key in ["crossed", "crossedBy"] { was[key] = nil; now[key] = nil }
+                    }
+                    if was != now { document.elements[index].fields["changedBy"] = .string(by) }
+                } else { document.elements[index].fields["by"] = .string(by) }
+            }
+            guard document.text.utf8.count <= MakePreviewFace.wordsLimit else {
+                throw Refusal(reason: "board_too_large", message: "The board exceeds the 2 MB limit. Nothing changed.")
+            }
+            let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension(BoardDocument.type)
+            defer { try? FileManager.default.removeItem(at: file) }
+            try Data(document.text.utf8).write(to: file)
+            return try append(file, meta: &meta).version
+        }
+    }
+
+    private func append(_ file: URL, meta: inout Meta, prompt: String? = nil, model: String? = nil,
+                        madeBy: String? = nil, personEditOf: Int? = nil) throws -> (ref: String, version: Version) {
+        let (n, exhausted) = (meta.versions.last?.n ?? 0).addingReportingOverflow(1)
+        guard !exhausted else {
+            throw Refusal(reason: "version_exhausted", message: "Make has no version numbers left for this ref. Nothing was written.")
+        }
+        let ext = file.pathExtension.lowercased()
+        let version = Version(n: n, file: ext.isEmpty ? "v\(n)" : "v\(n).\(ext)", prompt: prompt, model: model,
+                              created: NativeTimestampFormat.sixDigitUTCOffset(Date()), madeBy: madeBy, personEditOf: personEditOf)
+        let dir = folder(meta.ref)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let copy = try checkedDestination(meta.ref, file: version.file).deletingLastPathComponent().appendingPathComponent(version.file)
+        if FileManager.default.fileExists(atPath: copy.path) { try FileManager.default.removeItem(at: copy) }
+        try FileManager.default.copyItem(at: file, to: copy)
+        meta.versions.append(version)
+        let dropped = meta.ref == Self.tableRef ? Array(meta.versions.dropLast(200)) : []
+        if !dropped.isEmpty { meta.versions.removeFirst(dropped.count) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(meta), to: checkedDestination(meta.ref, file: "meta.json"))
+        } catch let writeError {
+            do {
+                if try readMeta(meta.ref)?.versions.contains(version) != true {
+                    try FileManager.default.removeItem(at: copy)
+                }
+            } catch { nativeLog("Make append cleanup: %@", error.localizedDescription) }
+            throw writeError
+        }
+        for old in dropped {
+            do { try FileManager.default.removeItem(at: checkedDestination(meta.ref, file: old.file)) }
+            catch { nativeLog("Make prune cleanup: %@", error.localizedDescription) }
+        }
+        return (meta.ref, version)
     }
 
 }

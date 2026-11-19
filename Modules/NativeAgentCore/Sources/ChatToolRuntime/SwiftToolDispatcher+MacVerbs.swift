@@ -564,7 +564,7 @@ extension SwiftToolDispatcher {
                 invocation: invocation, host: impl, liveScene: fourVerbLiveScene))
             let said = await verbs.pressedMenu(result, path: path, app: pressedApp?["bundle_id"]?.stringValue ?? pressedApp?["name"]?.stringValue,
                 screen: "", turn: turn, context: context)
-            return result.toJSON(readContent: invocation.readContent, text: said.text)
+            return result.toJSON(readContent: invocation.readContent, text: said.text, screenAfter: said.detail["screen_after"])
         }
         var body = input
         if tool == "menu" { body["words"] = input["find"] }

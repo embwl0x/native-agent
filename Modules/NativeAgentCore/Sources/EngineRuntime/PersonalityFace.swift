@@ -89,7 +89,7 @@ extension NativeAgentEngine {
                dataRoot.appendingPathComponent("providers", isDirectory: true), dataRoot.appendingPathComponent("providers/surfaces.json"),
                dataRoot.appendingPathComponent("providers/active.json"), dataRoot.appendingPathComponent("providers/pending-surface-configuration.json"),
                dataRoot.appendingPathComponent("dream_diary", isDirectory: true),
-               dataRoot.appendingPathComponent("workflows/approvals/requests.json"), SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)]
+               SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)]
     }
 
     /// Becoming can become readable after the initial read without changing its saved file.

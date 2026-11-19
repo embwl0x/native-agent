@@ -68,11 +68,15 @@ private actor TelegramSpeechRecognition {
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) else {
             throw TelegramVoiceTranscriptionError.speechUnavailable("locale \(localeIdentifier) is not supported")
         }
+        guard recognizer.supportsOnDeviceRecognition else {
+            throw TelegramVoiceTranscriptionError.speechUnavailable("on-device recognition is not supported for locale \(localeIdentifier)")
+        }
         guard recognizer.isAvailable else {
             throw TelegramVoiceTranscriptionError.speechUnavailable("recognizer is not currently available")
         }
         self.recognizer = recognizer
         let request = SFSpeechURLRecognitionRequest(url: url)
+        request.requiresOnDeviceRecognition = true
         request.shouldReportPartialResults = false
         request.contextualStrings = contextualStrings
         request.addsPunctuation = true

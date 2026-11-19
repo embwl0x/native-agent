@@ -396,8 +396,8 @@ public final class ProviderRecovery: Sendable {
         if let waiting {
             call.replyWork?.own(waiting)
             let result = await withTaskCancellationHandler { await waiting.value } onCancel: { waiting.cancel() }
-            try result.get()
             state.withLock { $0.waiting = nil }
+            try result.get()
         }
         try Task.checkCancellation()
         if call.replyWork?.isStopped == true { throw CancellationError() }

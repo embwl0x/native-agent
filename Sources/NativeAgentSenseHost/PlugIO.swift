@@ -8,8 +8,9 @@ final class PlugIO {
     private var pending = Data()
 
     func receive() throws -> [String: Any]? {
+        var searched = pending.startIndex
         while true {
-            if let end = pending.firstIndex(of: 10) {
+            if let end = pending[searched...].firstIndex(of: 10) {
                 let line = pending.prefix(upTo: end)
                 pending.removeSubrange(...end)
                 guard line.count <= Self.maximumLineBytes,
@@ -18,6 +19,7 @@ final class PlugIO {
                 }
                 return object
             }
+            searched = pending.endIndex
             var buffer = [UInt8](repeating: 0, count: 64 * 1024)
             let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
             if count < 0, errno == EINTR { continue }

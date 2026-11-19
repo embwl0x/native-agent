@@ -29,7 +29,7 @@ Prepare these private release inputs:
 | `NATIVEAGENT_GITHUB_REPOSITORY` | Public `owner/repository`; authenticated `gh` access |
 | `NATIVEAGENT_DEVELOPER_ID` | Developer ID Application signing identity |
 | `NATIVEAGENT_TEAM_ID` | Apple team ID |
-| `NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE` | Stored notarytool profile |
+| `NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE` | Required stored notarytool profile |
 | `NATIVEAGENT_SPARKLE_ED_PRIV_KEY` | Sparkle private-key file |
 | `NATIVEAGENT_PRIVACY_DENYLIST_FILE` | Local identity/privacy regex file |
 | `NATIVEAGENT_RELEASE_ENTITLEMENTS` | CloudKit-only production Mac entitlements |
@@ -38,8 +38,8 @@ Prepare these private release inputs:
 | `NATIVEAGENT_EMBEDDING_MODEL_DIR` | Complete local model directory; default `extras/embedding` |
 
 The GitHub wrapper can infer a sole Developer ID identity and its team.
-Without a notary profile, it accepts `NATIVEAGENT_APPLE_ID` and
-`NATIVEAGENT_NOTARIZATION_PASSWORD`. Keep credentials and keys outside source.
+`NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE` is required for notarization.
+Keep credentials and keys outside source.
 
 Release/build configuration uses only `NATIVEAGENT_*`. `release.sh` accepts
 `NATIVEAGENT_ICLOUD_BUILD=personal`, `cloudkit` or `none`; numeric encodings

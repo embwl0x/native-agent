@@ -17,17 +17,13 @@ struct ContentView: View {
     }
     private var showsSimpleView: Bool { displayedViewMode == ShellViewMode.simple }
     private var showsAgentView: Bool { displayedViewMode == ShellViewMode.agent }
-    private var displayedPage: String? {
-        showsAgentView ? "home" : ownPageID ?? ShellPageContent.doorPage(activeContentItem)
-    }
     @State private var didCheckFirstRunOnboarding = false
     @State private var showFirstRunOnboarding = false
     @State private var firstRunReadError: String?
     @State private var showCommandPalette = false
     /// Remount Settings' unbound NavigationStack by identity so every route reaches its root.
-    // Own the task sheet outside Desk so macOS permits repeated presentations.
-    @State private var showNewDeskTask = false
     @State private var navigationMountID: UUID?
+    @State private var shownBodyToasts: Set<UUID> = []
     @State private var chatShortcut: ChatSlashPage?
     @State private var agentRoom = "home"
     @State private var tourID = UUID()
@@ -145,14 +141,6 @@ struct ContentView: View {
             }
             }
             .accessibilityHidden((showTour && appModel.shellLayout?.value != nil) || showFirstRunOnboarding)
-            .overlay {
-                FacePagePaintHost(page: displayedPage)
-                    .allowsHitTesting(false).accessibilityHidden(true)
-            }
-            .onChange(of: [selectionRaw, displayedViewMode], initial: true) {
-                // Links that await the body before navigating slightly undercount the person's wait.
-                FacePageDiagnostics.selected(page: displayedPage)
-            }
             .onChange(of: shownRow, initial: true) {
                 surfacePages[shownSurface] = shownRow
                 ApplicationLifetime.shared.sceneShown()
@@ -195,11 +183,19 @@ struct ContentView: View {
                 }
             }
         }
-        .overlayPreferenceValue(NoticeLaneRoomKey.self) { room in
-            GeometryReader { proxy in
-                NoticeLane(centers: [appModel.systemToasts] + [room?.notices].compactMap { $0 })
-                    .padding(.top, room.map { proxy[$0.anchor].maxY + NativeAgentSpacing.sm } ?? NativeAgentSpacing.md)
+        .overlay(alignment: .top) {
+            NoticeLane(centers: [appModel.systemToasts])
+                .padding(.top, NativeAgentSpacing.md)
+        }
+        .onChange(of: appModel.face.slot(.counts).select("toastQueues", as: CountsFace.self) {
+            $0?.statuses.toastQueues.values.flatMap { $0 }
+        }, initial: true) { _, toasts in
+            guard let toasts else { return }
+            for id in shownBodyToasts.subtracting(toasts.map(\.id)) { appModel.systemToasts.dismiss(id) }
+            for toast in toasts where !shownBodyToasts.contains(toast.id) {
+                appModel.systemToasts.push(SystemToast(kind: toast.kind, text: toast.text, autoDismissAfter: nil, id: toast.id, createdAt: toast.createdAt))
             }
+            shownBodyToasts = Set(toasts.map(\.id))
         }
         .viewModeSwitch()
         .animation(
@@ -276,12 +272,6 @@ struct ContentView: View {
             guard DeskWindowPresentation.shared.receiver == nil else { return }
             showCommandPalette = true
         }
-        .sheet(isPresented: $showNewDeskTask) {
-            NewDeskTaskSheet()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .newDeskTaskRequest)) { _ in
-            showNewDeskTask = true
-        }
         // AppModel already prepared the draft; this receiver only routes and recovers a missing first session.
         .onReceive(NotificationCenter.default.publisher(for: .skillBuildRequest)) { note in
             selectionRaw = SidebarItem.chat.rawValue
@@ -300,17 +290,6 @@ struct ContentView: View {
             if appModel.activeChatSessionId.isEmpty { return }
             if appModel.chatDraft(for: appModel.activeChatSessionId).isEmpty {
                 appModel.injectChatDraft(draft, sessionId: appModel.activeChatSessionId)
-            }
-        }
-        // The message is durable; reload its session without touching the composer.
-        .onReceive(NotificationCenter.default.publisher(for: .openSpokenChatRequest)) { note in
-            selectionRaw = SidebarItem.chat.rawValue
-            guard let sessionId = note.object as? String, !sessionId.isEmpty else { return }
-            Task {
-                if sessionId != appModel.activeChatSessionId {
-                    do { try FaceWindowReply.check(await appModel.client.act(.selectConversation(session: sessionId, userInitiated: true))) }
-                    catch { appModel.statusText = error.localizedDescription }
-                }
             }
         }
     }
@@ -415,7 +394,7 @@ struct ContentView: View {
             }
             guard await appModel.selectChatSession(id: session, userInitiated: true) else { return }
             selectSidebarItem(.chat)
-        } catch { appModel.statusText = error.localizedDescription }
+        } catch { appModel.statusText = error.localizedDescription; appModel.systemToasts.push(error: appModel.statusText) }
     }
 
     /// Choosing a surface shows the page last shown in it, or the page it opens on. The choice is the person's.
@@ -472,71 +451,13 @@ struct ContentView: View {
 
 }
 
-struct MetricTile: View {
-    var title: String
-    var value: String
-    var systemImage: String
-
-    var body: some View {
-        HStack {
-            Image(systemName: systemImage)
-                .foregroundStyle(.secondary)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(value)
-                    .font(.system(.title3, design: .rounded, weight: .semibold))
-                    .monospacedDigit()
-                    .lineLimit(1)
-                Text(title)
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
-        .frame(minHeight: 48)
-        .padding(NativeAgentSpacing.md)
-        .aliveCard(radius: NativeAgentRadius.panel)
-    }
-}
 
 
 
 extension Notification.Name {
-    static let openApprovalsRequest = Notification.Name("NativeAgent.openApprovalsRequest")
-    static let openTrustMultimodalRequest = Notification.Name("openTrustMultimodalRequest")
     static let openCommandRouteRequest = Notification.Name("NativeAgent.openCommandRouteRequest")
     static let openCommandPaletteRequest = Notification.Name("NativeAgent.openCommandPaletteRequest")
-    /// Own the sheet in ContentView: a sheet attached inside Desk presents only once on macOS.
-    static let newDeskTaskRequest = Notification.Name("NativeAgent.newDeskTaskRequest")
     static let openActivitySectionRequest = Notification.Name("NativeAgent.openActivitySectionRequest")
     static let openActivityRootRequest = Notification.Name("NativeAgent.openActivityRootRequest")
     static let openChatDraftRequest = Notification.Name("NativeAgent.openChatDraftRequest")
-    static let openSpokenChatRequest = Notification.Name("NativeAgent.openSpokenChatRequest")
-}
-
-
-
-
-// MARK: - Render audit
-
-// Enable render counters only on request to keep ordinary rendering quiet.
-@MainActor final class RenderAudit {
-    static let shared = RenderAudit()
-    let enabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_RENDER_AUDIT"] == "1"
-    private var counts: [String: Int] = [:]
-    private var lastDump = Date()
-
-    static func bump(_ key: String) { shared._bump(key) }
-
-    private func _bump(_ key: String) {
-        guard enabled else { return }
-        counts[key, default: 0] += 1
-        if Date().timeIntervalSince(lastDump) >= 5 {
-            let line = counts.sorted { $0.key < $1.key }
-                .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
-            FileHandle.standardError.write(Data("RenderAudit[5s]: \(line)\n".utf8))
-            counts = [:]
-            lastDump = Date()
-        }
-    }
 }

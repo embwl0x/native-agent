@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+import os
 
 // Blueprint: | `EventDeadlinePhysiology.swift` | `EventDeadlinePhysiology`. |
 
@@ -66,11 +67,17 @@ public enum EventDeadlinePhysiology {
         debounceDelay: Duration = .milliseconds(250),
         directoryFiles: @escaping DirectoryFiles = { try FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil) },
         fileReading: @escaping FileReading = { _ in nil },
+        label: String = "",
         refresh: @escaping @MainActor @Sendable () async -> Void
     ) async {
         let observation = await readEvents(paths: paths, stores: stores, notifications: notifications,
             directoryFiles: directoryFiles, fileReading: fileReading)
+        let causes = OSAllocatedUnfairLock(initialState: Set<String>())
         let debouncer = StoreReloadDebouncer(delay: debounceDelay) {
+            causes.withLock {
+                if !label.isEmpty, !$0.isEmpty { nativeLog("[page] %@ refresh cause=%@", label, $0.sorted().joined(separator: ",")) }
+                $0.removeAll()
+            }
             await refresh()
         }
         // Arm before reading so a racing write remains buffered for replay.
@@ -82,8 +89,9 @@ public enum EventDeadlinePhysiology {
         }
         await debouncer.setVisible(true)
 
-        for await _ in observation.stream {
+        for await cause in observation.stream {
             guard !Task.isCancelled else { break }
+            _ = causes.withLock { $0.insert(cause) }
             await debouncer.signal()
         }
         await debouncer.cancel()
@@ -92,7 +100,7 @@ public enum EventDeadlinePhysiology {
 
     /// Exact source invalidations without scheduling a reread; the source owner holds and coalesces its work.
     public struct ReadEvents: Sendable {
-        public let stream: AsyncStream<Void>
+        public let stream: AsyncStream<String>
         public let cancel: @Sendable () async -> Void
     }
 
@@ -102,26 +110,26 @@ public enum EventDeadlinePhysiology {
         fileReading: @escaping FileReading = { _ in nil }
     ) async -> ReadEvents {
         let normalized = Set(paths.map(\.standardizedFileURL))
-        let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let pair = AsyncStream<String>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let files = ReadFiles(paths: normalized, directoryFiles: directoryFiles, fileReading: fileReading, changed: pair.continuation)
         let changes = StoreChangeBus.shared.changes()
         let bus = Task {
             for await change in changes {
                 guard !Task.isCancelled else { return }
-                if stores.contains(change.store) { pair.continuation.yield(()) }
+                if stores.contains(change.store) { pair.continuation.yield("store:" + change.store.rawValue) }
                 else if normalized.contains(change.path.standardizedFileURL) { await files.receive() }
             }
         }
-        let tokens = ObservationNotifications(center: .default, names: notifications) { pair.continuation.yield(()) }
+        let tokens = notifications.map { name in ObservationNotifications(center: .default, names: [name]) { pair.continuation.yield(name.rawValue) } }
         pair.continuation.onTermination = { _ in
             bus.cancel()
-            tokens.cancel()
+            tokens.forEach { $0.cancel() }
             Task { await files.cancel() }
         }
         await files.start()
         return ReadEvents(stream: pair.stream, cancel: {
             bus.cancel()
-            tokens.cancel()
+            tokens.forEach { $0.cancel() }
             await files.cancel()
             pair.continuation.finish()
         })
@@ -146,7 +154,7 @@ public enum EventDeadlinePhysiology {
         private let paths: Set<URL>
         private let directoryFiles: DirectoryFiles
         private let fileReading: FileReading
-        private let changed: AsyncStream<Void>.Continuation
+        private let changed: AsyncStream<String>.Continuation
         private var watcher: FileChangeWatcher?
         private var watched: Set<URL> = []
         private var previous: [URL: Identity]?
@@ -155,7 +163,7 @@ public enum EventDeadlinePhysiology {
         private var eventTask: Task<Void, Never>?
 
         init(paths: Set<URL>, directoryFiles: @escaping DirectoryFiles, fileReading: @escaping FileReading,
-             changed: AsyncStream<Void>.Continuation) {
+             changed: AsyncStream<String>.Continuation) {
             self.paths = paths; self.directoryFiles = directoryFiles; self.fileReading = fileReading; self.changed = changed
         }
 
@@ -200,12 +208,12 @@ public enum EventDeadlinePhysiology {
                 try Self.subscriptions(Set(current.keys), into: &selected)
                 if selected != watched { arm(selected) }
                 defer { previous = current }
-                if !initial, current != previous { changed.yield(()) }
+                if !initial, current != previous { changed.yield("file") }
             } catch {
                 // A chain that cannot be read keeps every watch already armed and adds the link parents seen so far, so a repair reaches its owner.
                 if !selected.isSubset(of: watched) { arm(selected.union(watched)) }
                 previous = nil
-                changed.yield(())
+                changed.yield("file")
             }
         }
 
@@ -258,7 +266,7 @@ public enum EventDeadlinePhysiology {
         private func failed() {
             guard !stopped else { return }
             previous = nil
-            changed.yield(())
+            changed.yield("file")
         }
 
         func cancel() {

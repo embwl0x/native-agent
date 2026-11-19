@@ -79,29 +79,6 @@ private func prop(_ type: String, description: String) -> JSONValue {
 public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
     return [
         ConnectorActionDescriptor(
-            id: "codex.work_journal", connectorId: "codex_work", connector: "codex_work",
-            name: "Codex Work Journal",
-            description: """
-                Scan registered workspaces and immediate ~/Projects repositories for recent Codex work: git commits, dirty status, and handoff \
-                summaries. Use this to keep a daily cross-project work log. Does not read .env files or crawl arbitrary folders.
-                """,
-            risk: "low", dryRunAvailable: true, requiresApproval: false,
-            category: "work_journal",
-            statusEndpoint: "/v1/codex/work_journal",
-            inputSchema: schema([
-                ("days", prop("integer")),
-                ("roots", .object([
-                    "type": .string("array"),
-                    "items": .object(["type": .string("string")]),
-                ])),
-                ("includeSelfRepo", prop("boolean")),
-                ("includeRegisteredWorkspaces", prop("boolean")),
-                ("includeProjectsDirectory", prop("boolean")),
-                ("maxProjects", prop("integer")),
-                ("maxCommitsPerProject", prop("integer")),
-            ])
-        ),
-        ConnectorActionDescriptor(
             id: "codex.handoff", connectorId: "codex_handoff", connector: "codex_handoff",
             name: "Codex Handoff",
             description: """

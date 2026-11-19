@@ -4,15 +4,13 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Transcripts
-// Blueprint: | `AgentScreenPreview.swift` | shared screen/room text projection |
+// Blueprint: | `AgentScreenPreview.swift` | Read-only home and current room previews |
 
-/// The user's Agent view must not mark seen, mint names, remember verbs or run tools; owner-read places expose only their retained copies.
 package enum AgentWorkspaceScreenPreview {
     public static let didChange = Notification.Name("NativeAgent.agentWorldDidChange")
-    /// Keep preview order aligned with Home's layout.
     public static func tabs(_ layout: SurfaceLayoutAvailability, profile: String?) -> [String] {
         var names = ["home"]
-        for name in (layout.contentNames("places", profile: profile) + ["people", "helpers", "mac", "conversations", "windows", "arrivals", "work"]).map(
+        for name in (layout.contentNames("places", profile: profile) + ["people", "helpers", "mac", "conversations", "arrivals"]).map(
             AppDoorNames.resolve)
             where !names.contains(name) { names.append(name) }
         return names
@@ -27,7 +25,6 @@ package enum AgentWorkspaceScreenPreview {
         "ui/layout.json",
     ]
 
-    /// Render the glance without a turn's pin or budget.
     package static func glance(workspace: WorkspaceOperation, dataRoot: URL, scope: String) async -> String? {
         do { if try SessionConversation.checkedIsHelper(scope, dataRoot: dataRoot) { return nil } }
         catch { return "Conversation ownership unavailable: \(error.localizedDescription). Repair the saved session index before reading this room." }
@@ -56,11 +53,11 @@ package enum AgentWorkspaceScreenPreview {
             + " so this view has no tool list to show it from."
 
         let target = await AgentScreen.resolve(workspace: workspace, room, dataRoot: dataRoot, scope: scope, browserPages: pages,
-                                            openPlaces: await navigation.places(key: key), currentPlace: await navigation.current(key: key))
+                                            currentPlace: await navigation.current(key: key))
         let location: AgentWorkspaceLocation
         switch target {
         case .page(let text)?: return text
-        case .action(.window(.open(let place)))?, .action(.open(let place))?: location = place
+        case .action(.open(let place))?: location = place
         case .action?: return room.uppercased() + " · opens as an action, not a room."
         case nil:
             guard AgentScreen.families.contains(where: { $0.name == AppDoorNames.resolve(room) }) else { return room.uppercased()
@@ -75,11 +72,8 @@ package enum AgentWorkspaceScreenPreview {
         var projection: WorkspacePage
         switch location {
         case .arrivals: projection = await navigation.arrivalProjection(workspace: workspace, key: key)
-        case .openPlaces: projection = await navigation.openPlaces(key: key)
-        case .workOverview: projection = await navigation.workOverview(key: key)
         case .area(let id):
             guard let place = AgentWorkspaceEnvironment.destinations.first(where: { $0.id == id }) else { return room.uppercased() + " · no such place." }
-            // Owner-read places expose their retained copy.
             let reads = id == "today" || place.tool.map { tool in
                 place.searchField == nil && AgentWorkspaceEnvironment.readTools.contains(tool) && schemas?.contains { $0.name == tool } != false
             } ?? false
@@ -110,7 +104,6 @@ package enum AgentWorkspaceScreenPreview {
         return "(the view as last read, \(AgentScreen.age(Date().timeIntervalSince(kept.at))) ago; opening it runs \(tool) again)\n\n" + kept.text
     }
 
-    // MARK: What the agent's workspace last showed, in memory only
 
     private static let cache = Mutex<(catalogs: [String: [LLMToolSchema]], rooms: [String: (text: String, at: Date)])>(([:], [:]))
 

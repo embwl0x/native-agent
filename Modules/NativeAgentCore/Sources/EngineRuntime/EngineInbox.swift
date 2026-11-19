@@ -1,17 +1,15 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import AuthoredCapabilities
 import Observation
 import NotificationInbox
 import PersistenceCore
-import TriggerScheduler
 import Cognition
 import BackgroundWork
 import Experiences
 import ApprovalTransactions
 import Privacy
-// Blueprint: | `EngineInbox.swift` | Root-specific ForPerson inbox reading, face-change subscription lifetime and checked trigger publication |
+// Blueprint: | `EngineInbox.swift` | Root-specific ForPerson inbox reading and face-change subscription lifetime |
 
 extension InboxItemRecord {
     public var isUnread: Bool { normalizedStatus == "unread" }
@@ -23,12 +21,6 @@ extension InboxItemRecord {
 public final class InboxFacade {
     public nonisolated let dataRoot: URL
     private nonisolated let reading: InboxReadings
-    public private(set) var triggerRows: [TriggerConfig] = []
-    public private(set) var triggersRead = false
-    public private(set) var triggerError: String?
-    public var isLoadingTriggers: Bool { pendingTriggerReads > 0 }
-    private var pendingTriggerReads = 0
-    @ObservationIgnored private lazy var triggerRead = LatestRead()
     @ObservationIgnored var faceChanges: Task<Void, Never>?
 
     isolated deinit { faceChanges?.cancel() }
@@ -136,65 +128,6 @@ private actor InboxReadings {
             }, interaction_session_id: row.interaction_session_id, interaction_id: row.interaction_id)
         result.relatedDelegationID = row.relatedDelegationID
         return result
-    }
-}
-
-// MARK: - Proactive triggers
-
-extension InboxFacade {
-    public func observeTriggers() async {
-        await EventDeadlinePhysiology.refreshOnChanges(
-            paths: [dataRoot.appendingPathComponent("triggers/trigger_config.json")],
-            notifications: [AbilityStore.didChange]
-        ) {
-            do { _ = try await self.triggers() }
-            catch { print("[inbox triggers] \(error.localizedDescription)") }
-        }
-    }
-
-    public func triggers() async throws -> [TriggerConfig] {
-        pendingTriggerReads += 1
-        defer { pendingTriggerReads -= 1 }
-        let result: Result<[TriggerConfig], Error> = await triggerRead.read({
-            do { return .success(try await NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: dataRoot).listInboxTriggers()) }
-            catch { return .failure(error) }
-        }) { result in
-            triggersRead = true
-            switch result {
-            case .success(let loaded):
-                triggerRows = loaded
-                triggerError = nil
-            case .failure(let error):
-                triggerError = UserFacingError.message(error, action: "load triggers")
-            }
-        }
-        return try result.get()
-    }
-
-    /// Unknown trigger names must throw instead of silently ignoring the request.
-    public func setTrigger(_ name: String, enabled: Bool) async throws {
-        let scheduler = NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: dataRoot)
-        let status = try await enabled
-            ? scheduler.enableInboxTrigger(name: name)
-            : scheduler.disableInboxTrigger(name: name)
-        try Self.requireTrigger(status, name: name)
-        triggerRead.write {
-            if let enabled = status.enabled, let index = triggerRows.firstIndex(where: { $0.name == status.name }) {
-                triggerRows[index].enabled = enabled
-            }
-        }
-        do { _ = try await triggers() }
-        catch { print("[inbox triggers] \(error.localizedDescription)") }
-    }
-
-    private nonisolated static func requireTrigger(_ status: TriggerStatus, name: String) throws {
-        if status.status == "not_found" {
-            throw NSError(
-                domain: "NativeAgent",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "trigger not found: \(name)"]
-            )
-        }
     }
 }
 

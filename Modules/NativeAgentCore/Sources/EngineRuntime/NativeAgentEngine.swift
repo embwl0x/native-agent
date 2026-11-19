@@ -228,7 +228,7 @@ public final class NativeAgentEngine: Sendable {
         self.pages = PartFaces(dataRoot: dataRoot, feed: face) { id, input, version in
             await faceTools.face(id: id, input: input, version: version)
         }
-        self.phoneMemoryPages = PartFaces(dataRoot: dataRoot, feed: face, key: { PageFaceKey.phone($0) }) { id, input, version in
+        self.phoneMemoryPages = PartFaces(dataRoot: dataRoot) { id, input, version in
             await faceTools.face(id: id, input: input, version: version)
         }
         let turns = TurnsFacade(dataRoot: dataRoot)
@@ -259,9 +259,8 @@ public final class NativeAgentEngine: Sendable {
             turns.bindTurnFaces(source: face, approvals: approvals, persona: persona, transcripts: transcripts)
         }
         Task { @MainActor [layout] in layout.start() }
-        Task { @MainActor [weak self, pages] in
+        Task { @MainActor [weak self] in
             await self?.registerPages()
-            await pages.finishRegistration()
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -375,8 +374,8 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
             appTools: appToolExecutor?.withExecution(execution),
             agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
             a2aPushConfiguration: (hasBody ? ports : nil).map { $0.a2aPushConfiguration },
-            standingBotRunEnqueue: (hasBody ? ports : nil).map { ports in { @Sendable id, question in
-                try ports.standingBotQueue.enqueue(bot: id, context: question,
+            standingBotRunEnqueue: (hasBody ? ports : nil).map { ports in { @Sendable id, question, turn in
+                try ports.standingBotQueue.enqueue(bot: id, context: question, steeringSources: turn.peerSteering.map { taint in taint.checkpointSources.filter { !taint.elevatedSources.contains($0) } } ?? [],
                     scope: .init(ancestry: execution.invocation.botAncestry))
             } },
             standingBotSession: standingBotSession()
@@ -504,31 +503,6 @@ private final class EngineAgentContactClients: AgentContactClients, @unchecked S
 }
 
 extension NativeAgentEngine {
-    /// Observe this engine’s authority sources only while Activity is mounted.
-    @MainActor
-    public func watchActivityChanges(refresh: @escaping @MainActor @Sendable () async -> Void) async {
-        let database = dataRoot.appendingPathComponent("memory/memory.sqlite")
-        var paths = [
-            dataRoot.appendingPathComponent("workflows/approvals/requests.json"),
-            database, URL(fileURLWithPath: database.path + "-wal"),
-        ]
-        if #available(macOS 27, *) {
-            paths += [dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
-                      dataRoot.appendingPathComponent("desk/desk_ops_base.json")]
-        }
-        let observedPaths = paths
-        let forPerson = ForPerson.at(dataRoot)
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await EventDeadlinePhysiology.refreshOnChanges(paths: observedPaths, refresh: refresh) }
-            group.addTask {
-                for await _ in await forPerson.changes() {
-                    guard !Task.isCancelled else { return }
-                    await refresh()
-                }
-            }
-        }
-    }
-
     private static let liveRoot: (engine: NativeAgentEngine, body: Body) = {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let ports = NativeAgentEnginePorts.app(dataRoot: dataRoot)

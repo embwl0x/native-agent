@@ -321,16 +321,10 @@ final class TalkModeController: NSObject {
         let interrupted = runs.keys.filter { runs[$0]?.terminal == false && runs[$0]?.suppressed == false }
         guard !utterances.isEmpty || !interrupted.isEmpty else { return }
         for key in runs.keys { runs[key]?.suppressed = true }
+        // Talking over the agent silences its voice; its work keeps going, and the new words arrive as their own message.
         stopSpeech()
         status = "Listening to you"
         updateActivity()
-        let activeRuns = interrupted.filter { ChatStore.shared.activeTurnRunIDs.contains($0) }
-        guard !activeRuns.isEmpty, let client else { return }
-        let session = sessionID
-        Task {
-            do { try await client.cancelChat(sessionID: session, runIDs: activeRuns) }
-            catch { self.error = "The agent's voice stopped. The Mac has not confirmed stopping its reply: \(error.localizedDescription)" }
-        }
     }
 
     private func stopSpeech() {

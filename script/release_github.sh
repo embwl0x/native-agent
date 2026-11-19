@@ -128,9 +128,7 @@ fi
 [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || note_failure "set NATIVEAGENT_TEAM_ID to the 10-character Apple team ID."
 
 if [[ -z "${NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
-  if [[ -z "${NATIVEAGENT_APPLE_ID:-}" || -z "${NATIVEAGENT_NOTARIZATION_PASSWORD:-}" ]]; then
-    note_failure "store a notarytool keychain profile and set NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE (recommended), or set Apple ID notarization credentials."
-  fi
+  note_failure "store a notarytool keychain profile and set NATIVEAGENT_NOTARY_KEYCHAIN_PROFILE (required)."
 fi
 
 if [[ ${#failures[@]} -gt 0 ]]; then

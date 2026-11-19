@@ -10,10 +10,8 @@ import Senses
 import PersistenceCore
 import Privacy
 import TriggerScheduler
-// Blueprint: | `ClockWork.swift` | `ClockWork`: what the one clock's dream, REM, watch and scan deliveries tell; one dream matter shared with manual dreams |
+// Blueprint: | `ClockWork.swift` | Dream and REM matters shared with manual calls; watches and scans post news to attention |
 
-/// The work behind the one clock's body times. The clock owns when; this owns what each delivery leaves behind: the dream's matter (shared with a dream
-/// run by hand), the weekly REM card, a watch's news and a scan's opportunity cards.
 public struct ClockWork: Sendable {
     struct DreamDiarySnippet: Sendable {
         let path: String
@@ -191,24 +189,20 @@ public struct ClockWork: Sendable {
 
     // MARK: - A proactive scan
 
-    /// One scan: each opportunity it surfaces is one card to the person, referring to its source experiences. Returns the cards' ids.
-    public func scan(payload: [String: JSONValue]) async throws -> [String] {
-        let scan = try await NativeAgentScheduledProactiveScan.evaluate(dataRoot: root, payload: payload)
-        var itemIds: [String] = []
+    public func scan(id: String, payload: [String: JSONValue], seen: [String]) async throws -> [String] {
+        let scan = try await NativeAgentScheduledProactiveScan.evaluate(dataRoot: root, payload: payload, seen: seen)
         for opportunity in scan.surfaced {
-            let itemId = "proactive-\(UUID().uuidString.lowercased())"
-            let actions = try NativeAgentScheduledProactiveScan.inboxActions(for: opportunity).map { value -> PartFace.Action in
-                let row = try JSONRow(value)
-                return .init(id: try row.string("id"), label: try row.string("label"))
+            guard await SenseNewsBoard.shared.post(SenseNews(senseID: "proactive_scan", version: 1,
+                address: "Proactive scan (scheduled \(id))",
+                summary: "\(opportunity.title)\n\(opportunity.summary)\n\(opportunity.detail)",
+                at: Date(), observationID: opportunity.id, changeID: opportunity.id)) else {
+                try Task.checkCancellation()
+                throw NSError(domain: "NativeAgentScheduler", code: -411, userInfo: [
+                    NSLocalizedDescriptionKey: "scan_news_not_saved: a surfaced opportunity was not durably accepted."
+                ])
             }
-            try await tell(Matter(id: itemId,
-                form: opportunity.severity == "actionable" ? .ask : .words, from: opportunity.source,
-                title: opportunity.title, summary: opportunity.summary, words: opportunity.detail, choices: actions,
-                evidence: opportunity.relatedMatters.map { .init(source: "experiences/experiences.sqlite", id: $0) },
-                artifacts: opportunity.relatedPaths.map { .init(source: Matter.files, id: $0) }))
-            itemIds.append(itemId)
         }
-        return itemIds
+        return seen + scan.surfaced.map(\.id)
     }
 
     // MARK: - Telling

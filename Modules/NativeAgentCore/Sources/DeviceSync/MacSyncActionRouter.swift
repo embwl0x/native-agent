@@ -393,9 +393,8 @@ struct MacSyncActionRouter {
                 var sessionId = payload["sessionId"] ?? ""
                 let sourceKey = payload["sourceKey"] ?? ""
                 if sessionId.isEmpty, !sourceKey.isEmpty {
-                    if let sessions = try? await api.getChatSessions() {
-                        sessionId = sessions.first(where: { $0.sourceKey == sourceKey })?.id ?? ""
-                    }
+                    let sessions = try await api.getChatSessions()
+                    sessionId = sessions.first(where: { $0.sourceKey == sourceKey })?.id ?? ""
                 }
                 if !sessionId.isEmpty {
                     guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
@@ -566,7 +565,7 @@ extension MacSyncActionRouter {
               let raw = action.payload["actionId"], let answer = InboxActionVocabulary.routedAction(raw, itemID: id) else {
             throw PartCallError(code: "invalid_action", message: "inboxAction requires an itemId and one of its shown actionId values.")
         }
-        if !id.hasPrefix("interaction:"), ["approve", "reject"].contains(answer) {
+        if !id.hasPrefix("interaction:"), ["approve", "approve_task", "reject"].contains(answer) {
             return try await phoneApprovalResponse(id: id, decision: answer, device: action.clientId, inboxItem: id)
         }
         var response = ["status": "ok", "ok": "true", "itemId": id, "actionId": raw]

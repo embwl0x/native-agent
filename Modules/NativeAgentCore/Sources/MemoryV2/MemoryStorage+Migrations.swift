@@ -162,33 +162,12 @@ extension MemoryStorage {
                 )
             """)
         }
-        // Keep the first core choice after every pinned row is unpinned or deleted. Triggers cover every writer in the pin's own transaction.
         m.registerMigration("v11_user_core_chosen") { db in
             try db.execute(sql: """
                 CREATE TABLE memory_metadata (
                   key TEXT NOT NULL PRIMARY KEY,
                   value INTEGER NOT NULL
                 );
-                INSERT INTO memory_metadata (key, value)
-                SELECT 'user_core_chosen', 1 WHERE EXISTS (
-                  SELECT 1 FROM memories
-                  WHERE json_extract(metadata_json, '$.pinned') = 1
-                     OR json_extract(metadata_json, '$.pinned_order') IS NOT NULL
-                );
-                CREATE TRIGGER memory_user_core_chosen_insert
-                AFTER INSERT ON memories
-                WHEN json_extract(NEW.metadata_json, '$.pinned') = 1
-                BEGIN
-                  INSERT OR IGNORE INTO memory_metadata (key, value)
-                  VALUES ('user_core_chosen', 1);
-                END;
-                CREATE TRIGGER memory_user_core_chosen_update
-                AFTER UPDATE OF metadata_json ON memories
-                WHEN json_extract(NEW.metadata_json, '$.pinned') = 1
-                BEGIN
-                  INSERT OR IGNORE INTO memory_metadata (key, value)
-                  VALUES ('user_core_chosen', 1);
-                END;
             """)
         }
         m.registerMigration("v12_sense_memory_provenance") { db in
@@ -357,6 +336,12 @@ extension MemoryStorage {
                 CREATE TABLE IF NOT EXISTS proposal_repair_cursor (singleton INTEGER PRIMARY KEY, stamp TEXT NOT NULL, id TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS proposals_repair_order ON proposals
                 (COALESCE(json_extract(metadata_json, '$.supersededAt'), resolved_at, staged_at), id);
+                """)
+        }
+        m.registerMigration("v23_drop_user_core_chosen_triggers") { db in
+            try db.execute(sql: """
+                DROP TRIGGER IF EXISTS memory_user_core_chosen_insert;
+                DROP TRIGGER IF EXISTS memory_user_core_chosen_update;
                 """)
         }
         return m

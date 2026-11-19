@@ -46,8 +46,11 @@ public enum ChromeExtensionFolder {
             }
             return destination
         } catch {
-            try? fm.removeItem(at: staging)
-            throw ToolFailureError("Could not copy the Chrome extension: \(error.localizedDescription)", effects: .none,
+            var reason = error.localizedDescription
+            do { try fm.removeItem(at: staging) }
+            catch let cleanup as NSError where cleanup.domain == NSCocoaErrorDomain && cleanup.code == NSFileNoSuchFileError {}
+            catch let cleanup { reason += "; staging cleanup failed at \(staging.path): \(cleanup.localizedDescription)" }
+            throw ToolFailureError("Could not copy the Chrome extension: \(reason)", effects: .none,
                 owner: destination.path,
                 instruction: """
                     Ask the person to repair file access from \(bundled.path) to \(destination.path), preserving existing bytes and all Trust and macOS \

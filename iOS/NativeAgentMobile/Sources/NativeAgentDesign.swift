@@ -31,14 +31,6 @@ enum NativeAgentAppearance: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var title: String {
-        switch self {
-        case .system: "System"
-        case .light: "Light"
-        case .dark: "Dark"
-        }
-    }
-
     var colorScheme: ColorScheme? {
         switch self {
         case .system: nil
@@ -55,8 +47,6 @@ enum NativeAgentAppearance: String, CaseIterable, Identifiable {
 // MARK: - Typography tokens
 
 enum AppFont {
-    static let body    = Font.system(.body,       design: .rounded)
-    static let label   = Font.system(.caption,    design: .rounded, weight: .semibold)
     static let tag     = Font.system(.caption2,   design: .rounded, weight: .bold)
 }
 
@@ -64,7 +54,6 @@ enum AppFont {
 
 enum AppMotion {
     static let snappy = Animation.spring(response: 0.32, dampingFraction: 0.82)
-    static let pulse  = Animation.easeInOut(duration: 1.6).repeatForever(autoreverses: true)
     // Animate appended bubbles at the mutation seam; list animation must not animate snapshot replacement.
     static let entrance = Animation.easeOut(duration: 0.22)
 

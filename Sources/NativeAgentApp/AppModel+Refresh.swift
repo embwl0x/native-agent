@@ -53,10 +53,8 @@ extension AppModel {
         _ = await decodeLogged("getSkills") { try await engine.tools.refreshSkills() }
         _ = await decodeLogged("getTools") { try await engine.tools.listAuthored() }
         for failure in await engine.trust.refreshCapabilityCatalog() { recordRefreshFailure(failure.label, error: failure.error) }
-        _ = await decodeLogged("getWorkflows") { try await engine.desk.refreshWorkflows() }
         _ = await decodeLogged("getApprovals") { try await engine.approvals.list() }
         _ = await decodeLogged("getInboxItems") { try await engine.inbox.list() }
-        await engine.desk.refreshResearchRuns()
         await engine.turns.refreshCapabilityTraces()
         await engine.memory.loadGraph()
         for failure in await engine.tools.refreshNativePower() { recordRefreshFailure(failure.label, error: failure.error) }
@@ -80,7 +78,7 @@ extension AppModel {
         await reloadChatState()
         _ = await decodeLogged("getConfig", { try await RuntimeReadouts.configuration(engine: engine) })
         let healthStatus: String
-        switch engine.doctor.health?.ok {
+        switch engine.doctor.health?.reachable {
         case true?: healthStatus = "I'm online"
         case false?: healthStatus = "I'm unavailable"
         case nil: healthStatus = "My connection status is unknown"

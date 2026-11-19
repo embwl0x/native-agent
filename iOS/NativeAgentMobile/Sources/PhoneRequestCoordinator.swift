@@ -75,7 +75,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         do {
             let history = try await loadTask.value
             guard !loaded else { return }
-            records = history.pending; replay = history.replay
+            records = history.pending; replay = Array(history.replay.suffix(256))
             interrupted = Set(history.pending.filter { $0.executing && $0.result == nil }.map { $0.request.id })
             loaded = true
             self.loadTask = nil
@@ -87,7 +87,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
     }
 
     private func remember(_ record: Record, state: PhoneRequestResult.Status) {
-        replay.append(Replay(id: record.request.id, state: state))
+        replay = Array((replay + [Replay(id: record.request.id, state: state)]).suffix(256))
     }
 
     private func retireOtherPairings(pairing: String) {
@@ -154,6 +154,10 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
                 if interrupted.contains(record.request.id) {
                     active = record.request
                     errorMessage = "The app closed while handling request \(record.request.id). Its outcome is unknown; cancel it to retire the request."
+                    return
+                }
+                if record.request.expiresAt <= Date() {
+                    await complete(record.request.id, status: .failed, message: "Request expired.")
                     return
                 }
                 let approval: Bool
@@ -266,8 +270,8 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         }
     }
 
-    func locate(_ request: PhoneRequest) async {
-        guard await begin(request) else { return }
+    func locate(_ request: PhoneRequest) async -> Bool {
+        guard await begin(request) else { return false }
         locationRequestID = request.id
         let manager = CLLocationManager()
         locationManager = manager
@@ -277,6 +281,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         case .notDetermined: manager.requestWhenInUseAuthorization()
         default: locationManagerDidChangeAuthorization(manager)
         }
+        return true
     }
 
     func applySetting(_ request: PhoneRequest, approved: Bool = false) async {
@@ -317,9 +322,12 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard manager === locationManager, let id = locationRequestID,
-              let location = locations.last, location.horizontalAccuracy >= 0,
-              abs(location.timestamp.timeIntervalSinceNow) < 60 else { return }
+        guard manager === locationManager, let id = locationRequestID else { return }
+        guard let location = locations.last, location.horizontalAccuracy >= 0,
+              abs(location.timestamp.timeIntervalSinceNow) < 60 else {
+            Task { await complete(id, status: .failed, message: "A current location was unavailable. Try sharing location again.") }
+            return
+        }
         Task { await complete(id, status: .completed, values: [
             "latitude": String(location.coordinate.latitude), "longitude": String(location.coordinate.longitude),
             "accuracy_meters": String(location.horizontalAccuracy),
@@ -436,20 +444,23 @@ struct PhoneRequestSheet: View {
                 Text("This request was executing when the app closed. Its outcome is unknown. Cancel retires it without repeating its action.")
             } else if request.kind.isSettings {
                 Text("This changes the setting on this iPhone. Any iOS permission prompt is still yours to answer.")
-                Button("Allow change") { working = true; Task { await coordinator.applySetting(request, approved: true) } }.disabled(working)
+                Button("Allow change") {
+                    working = true
+                    Task { await coordinator.applySetting(request, approved: true); working = false }
+                }.disabled(working)
             } else if request.kind == .currentLocation {
-                Button("Share location") { working = true; Task { await coordinator.locate(request) } }.disabled(working)
+                Button("Share location") { working = true; Task { working = await coordinator.locate(request) } }.disabled(working)
             } else if request.kind == .capturePhoto {
                 Button("Open camera") {
                     working = true
-                    Task { camera = await coordinator.openCamera(request) }
+                    Task { camera = await coordinator.openCamera(request); working = camera }
                 }.disabled(working)
             } else {
                 PhotosPicker("Choose photo", selection: $photo, matching: .images).disabled(working)
                     .onChange(of: photo) { _, item in
                         guard let item else { return }
                         working = true
-                        Task { await coordinator.picked(item, request: request) }
+                        Task { await coordinator.picked(item, request: request); working = false }
                     }
             }
             if working { ProgressView() }

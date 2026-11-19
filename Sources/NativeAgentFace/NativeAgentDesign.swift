@@ -208,6 +208,7 @@ struct ShellGlass: NSViewRepresentable {
 
 struct ShellSheet: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ZStack {
@@ -215,7 +216,7 @@ struct ShellSheet: View {
                 NativeAgentShell.room
             } else {
                 ShellGlass(material: .underWindowBackground)
-                NativeAgentShell.room.opacity(NativeAgentShellLayout.roomGlassTint)
+                NativeAgentShell.room.opacity(colorScheme == .dark ? 0.74 : 0.66)
             }
         }
         .ignoresSafeArea()
@@ -257,15 +258,11 @@ enum ShellType {
     static let caption = Font.system(size: captionSize)
     static let captionMedium = Font.system(size: captionSize, weight: .medium)
     static let captionSemibold = Font.system(size: captionSize, weight: .semibold)
-    static let captionCode = Font.system(size: captionSize, design: .monospaced)
-    static let captionCodeSemibold = Font.system(size: captionSize, weight: .semibold, design: .monospaced)
     static let label = Font.system(size: labelSize)
     static let labelMedium = Font.system(size: labelSize, weight: .medium)
     static let railSize: CGFloat = 14
     static let rail = Font.system(size: railSize, weight: .medium)
     static let labelSemibold = Font.system(size: labelSize, weight: .semibold)
-    static let rowTitle = Font.system(size: railSize, weight: .medium)
-    static let rowDetail = label
     static let pageSentence = Font.system(size: railSize)
     static let pageTitle = Font.system(size: pageTitleSize, design: .serif)
     static let body = Font.system(size: bodySize)
@@ -284,10 +281,6 @@ enum NativeAgentShellLayout {
     /// Bound composer room to five input lines, controls and attachments so a bad measurement cannot consume the transcript.
     static let composerClearanceMax: CGFloat = 320
     static let railWordInset: CGFloat = 14
-    @MainActor static var roomGlassTint: Double {
-        let dark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        return dark ? 0.74 : 0.66
-    }
     static let titleBarInset: CGFloat = 28
     static let columnHeaderTopInset: CGFloat = 6
     static let conversationsWidth: CGFloat = 288
@@ -300,7 +293,6 @@ enum NativeAgentShellLayout {
     static var roomLeadingInset: CGFloat { roomGutter }
     static var roomTrailingInset: CGFloat { roomGutter }
     static let roomAlignment: Alignment = .top
-    static let userBubbleMaxWidth: CGFloat = 640
     static let composerRadius: CGFloat = 22
     static let railPlateRadius: CGFloat = 18
     static let railPlateInset: CGFloat = 10

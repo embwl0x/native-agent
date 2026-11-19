@@ -162,7 +162,7 @@ public struct PromotionDossier: Sendable, Equatable {
 
     public static func fromJSON(_ value: JSONValue) -> PromotionDossier? {
         guard case .object(let obj) = value, case .array(let arr)? = obj["citations"],
-              let citations = DeskJSON.collection(JSONValue.array(arr), decode: DossierSource.fromJSON) else { return nil }
+              let citations = deskStoredCollection(JSONValue.array(arr), decode: DossierSource.fromJSON) else { return nil }
         let dossier = PromotionDossier(citations: citations)
         return dossier.isValid ? dossier : nil
     }

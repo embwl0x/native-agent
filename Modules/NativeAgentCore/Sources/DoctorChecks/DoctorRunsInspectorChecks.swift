@@ -22,7 +22,6 @@ private enum DoctorRunLedgerRead {
 public struct RunLedgerIntegrityCheck: DoctorCheck {
     public let id = "runs.ledger_integrity"
     public let title = "Runs history"
-    public let heartbeatEligible = false
     private let root: URL
 
     public init(root: URL = defaultDataRoot()) { self.root = root }

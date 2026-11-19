@@ -110,9 +110,7 @@ public enum SchedulerJobNormalizer {
     }
 }
 
-extension SwiftNativeTriggerScheduler {
-    /// A scheduled read is a watch: its action runs through the app door as a read, and what changed comes to the agent as news. Nil when `action` is such a
-    /// read; otherwise why not, in words the agent can act on. Scheduling and each run ask it.
+extension SchedulerJobNormalizer {
     public static func watchRefusal(action: String, input: [String: JSONValue], turn: Turn?) -> String? {
         let declared: ToolClass?
         do { declared = try PermissionLaw.doorClass(action: action, args: input, turn: turn) }

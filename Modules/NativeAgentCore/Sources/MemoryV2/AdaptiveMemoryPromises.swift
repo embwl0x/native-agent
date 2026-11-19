@@ -315,9 +315,12 @@ extension AdaptiveMemoryPromoter {
                         try await MyQueue.finish(entry, dropped: dropped, why: why, store: store)
                         trace("settled", id: entry.name, reason: why, basis: settlement.evidence.basis)
                     }
+                } catch let error as MyQueue.Superseded {
+                    trace("void", id: id, reason: error.localizedDescription)
+                    continue
                 } catch {
                     failure = PromiseFailure(cause: .desk, words: error.localizedDescription)
-                    trace("failed", id: id)
+                    trace("failed", id: id, reason: error.localizedDescription)
                     _ = await failed(error.localizedDescription, owner: "MyQueue", cause: .desk, wait: false)
                 }
             case .keep(let promise, let target, let candidates):

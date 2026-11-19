@@ -266,7 +266,11 @@ public enum AgentContactThreads {
     }
 
     public static func mobileThreads(root: URL, contacts: ContactListFacade) async throws -> [MobileAgentThread] {
-        let snapshot = try await read(root: root, contacts: contacts, includeHelpers: false)
+        let snapshot = try await read(root: root, contacts: contacts, includeHelpers: false, refreshDoors: false)
+        return try mobileThreads(snapshot: snapshot)
+    }
+
+    static func mobileThreads(snapshot: Snapshot) throws -> [MobileAgentThread] {
         return try snapshot.contacts.map { contact in
             let lines = snapshot.lines[contact.id] ?? []
             let status = contact.status(flight: snapshot.flights[contact.id],
@@ -311,9 +315,17 @@ public enum AgentContactThreads {
         }
     }
 
-    public static func read(root: URL, contacts contactOwner: ContactListFacade, includeHelpers: Bool = true) async throws -> Snapshot {
+    public static func read(root: URL, contacts contactOwner: ContactListFacade,
+                            includeHelpers: Bool = true, refreshDoors: Bool = true) async throws -> Snapshot {
         let recordsStamp = try threadStamp(root: root)
-        let (doors, recordRead) = try await contactOwner.refreshDoors()
+        let doors: [AgentContactRow]
+        let recordRead: Result<[AgentConversationRecord], Error>
+        if !refreshDoors, await contactOwner.loaded, await contactOwner.loadError == nil {
+            doors = await contactOwner.doors
+            recordRead = Result { try AgentConversationStore(dataRoot: root).records() }
+        } else {
+            (doors, recordRead) = try await contactOwner.refreshDoors()
+        }
         let rows = doors.filter { $0.primary && $0.contact != nil }
         let restrictions = rows.map(sendRestriction)
         let grouped = rows.indices.sorted { a, b in

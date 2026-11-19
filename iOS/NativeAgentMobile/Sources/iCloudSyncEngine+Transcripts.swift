@@ -187,7 +187,7 @@ extension iCloudSyncEngine {
                 }
             }
             current.historyIDs.formUnion(records.compactMap { UUID(uuidString: $0.id) })
-            current.generation = generation
+            if let generation { current.generation = generation }
             chatTranscripts[sessionID] = current
         } else {
             adoptChatTranscripts([sessionID: .init(records: records, messages: messages,

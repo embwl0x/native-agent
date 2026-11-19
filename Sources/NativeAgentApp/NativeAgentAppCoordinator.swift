@@ -109,7 +109,6 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
 
 @MainActor @Observable
 final class ApplicationLifetime {
-    static let mainSceneID = "main"
     var appModel: AppModel? {
         didSet { bootstrapProcessServicesIfReady() }
     }
@@ -165,8 +164,6 @@ final class ApplicationLifetime {
             Task { @MainActor in SettingsLink.open(.trust) }
             return nil
         }
-        observe(.openChatDraftRequest) { _ in .sidebar(.chat) }
-        observe(.openSpokenChatRequest) { _ in .sidebar(.chat) }
         observe(.openCommandRouteRequest) { note in
             NativeAgentNavigationDestination.route(note.object as? String)
         }

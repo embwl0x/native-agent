@@ -356,7 +356,7 @@ public actor DeskContinuationTurn {
             try await store.setContinuation(handle, expectedRevision: expected, record: record, requiresActive: requiresActive)
         } catch {
             fenced = true
-            if let actual = try await store.continuation(handle), actual.revision == record.revision {
+            if let actual = try? await store.continuation(handle), actual.revision == record.revision {
                 record = actual
             } else { record.revision = expected }
             record.state = .blocked

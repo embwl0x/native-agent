@@ -2,10 +2,8 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `WorkspaceReadout.swift` | `workspace-readout.js`: native bindings and authority |
-// Part decisions select frozen opaque keys; native code retains item identity, content, permissions and actual source status.
+// Blueprint: | `WorkspaceReadout.swift` | `workspace-readout.js`: bound owner facts, named actions and app discovery |
 
-/// Parts select opaque source and action keys. Native identities, exact arguments, permissions and the actual read status never come back from JS.
 enum WorkspaceReadout {
     struct Action: Codable { let key: String; let label: String? }
     struct Item: Codable {
@@ -36,7 +34,6 @@ enum WorkspaceReadout {
                             button.action = .open(.record(tool:tool,input:input,title:button.label))
                         case .perform(let tool, let input, _, let field, let effect):
                             button.action = .perform(tool:tool,input:input,title:button.label,textField:field,isEffect:effect)
-                        case .configure(let tool, let input, _): button.action = .configure(tool:tool,input:input,title:button.label)
                         default: break
                         }
                         return button
@@ -69,7 +66,7 @@ enum WorkspaceReadout {
         func read(_ label: String, _ tool: String, _ input: [String: JSONValue] = [:], _ title: String? = nil) -> AgentWorkspaceButton {
             .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
         }
-        actions["create"] = .init(label: "create", action: .configure(tool: "bot_create", input: [:], title: "create"))
+        actions["create"] = .init(label: "create", action: .open(.record(tool: "app", input: ["find": .string("bot_create"), "args": .object([:])], title: "create")))
         actions["replies"] = read("replies","shelf_read",["limit": .int(16),"include_read": .bool(true),"sort": .string("newest_first")])
         actions["all"] = read("all","bot_list")
         for (index,value) in rows.enumerated() {
@@ -83,7 +80,7 @@ enum WorkspaceReadout {
                     ("talk",.init(label:"talk",action:.message(agent:agent,conversation:nil,name:name),needsText:true)),
                     ("conversation",read("conversation","agent_read",["agent": .string(agent)],name)),
                     ("run",.init(label:"run",action:.perform(tool:"bot_run_once",input:["id": .string(id)],title:"run",textField:nil,isEffect:true))),
-                    ("settings",.init(label:"settings",action:.configure(tool:"bot_update",input:["id": .string(id)],title:"settings")))
+                    ("settings",.init(label:"settings",action:.open(.record(tool: "app", input: ["find": .string("bot_update"), "args": .object(["id": .string(id)])], title: "settings"))))
                 ]
                 for (verb,button) in candidates { actions[key+":"+verb] = button; keys.append(key+":"+verb) }
                 if case .bool(let paused)? = row["paused"],

@@ -339,7 +339,7 @@ extension CognitiveSubstrate {
     /// Unknown peer provenance remains tainted.
     func reflectionIsTainted(_ request: CognitiveReflectionRequest) -> Bool {
         guard let peers = request.sourcePeerIds else { return true }
-        return peers.contains { !dependencies.peerTrusted($0) }
+        return !Set(peers).isSubset(of: dependencies.trustedPeers(peers))
     }
 
     /// Agent sessions use `peer:<uuid>`; built-in sessions use their surface name. Unknown peer identity grants no trust.

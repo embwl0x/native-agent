@@ -18,7 +18,7 @@ import PersistenceCore
 import StandingBots
 import ToolRegistry
 import Transcripts
-// Blueprint: | `MindStream.swift` | Thoughts including the hour's opportunity, commissioned returns and the night's reading |
+// Blueprint: | `MindStream.swift` | Settled thoughts retain their run and final turn steering in the one record |
 
 /// The agent's mind stream. A thought is a turn in the agent's own conversation that carries only its breath and what it attends; the conversation is
 /// never replayed as history. One stream means one thought at a time: offers during a carry invalidate its route for reading on release.
@@ -147,7 +147,7 @@ public actor MindStream: AttentionStream {
     }
 
     private func thinkBatch(_ attended: Attended, excluding attempted: Set<String>) async -> (ids: [String], proceed: Bool) {
-        // Whatever the agent still owes itself rides the next thought: a thought that failed left it owed, and it is never retried on a clock.
+        // Whatever the agent still owes itself rides the next thought: a thought that failed left it owed until it is offered again.
         var happenings = attended.happenings
         var unread = attended.unread
         do {
@@ -199,13 +199,19 @@ public actor MindStream: AttentionStream {
                 return !Task.isCancelled
             }
         }
+        var gathered: [String] = []
+        for id in thought.happenings where !happenings.contains(where: { $0.id == id }) {
+            guard let earlier = try? await ExperienceStore.at(dataRoot).experience(id) else { gathered.append("unrecorded"); continue }
+            gathered += (earlier.happening?.peers ?? []) + (earlier.happening?.elevated ?? [])
+        }
+        let earlierSources = gathered
         let peers = Array(Set(happenings.flatMap { $0.happening?.peers ?? [] })).sorted()
         let elevated = Array(Set(happenings.flatMap { $0.happening?.elevated ?? [] })).sorted()
         let taint = PeerDataTaint(restoring: [], elevated: elevated)
         for peer in peers { taint.mark(peer: peer) }
         var origin = ChatMessageOrigin(surface: session, agent: "self", authored: .agent)
-        origin.peerSources = taint.checkpointSources
-        origin.elevatedPeerSources = taint.elevatedSources
+        origin.peerSources = peers
+        origin.elevatedPeerSources = elevated
         // A thought about a care carries what the agent would otherwise go looking for: the care's stance and its open question.
         var care: CognitiveCare?
         if let id = attended.node?.care, let cognition { care = await cognition.substrate.liveCare(id) }
@@ -260,8 +266,8 @@ public actor MindStream: AttentionStream {
                     }
                 } else { wonderingSaved = false }
                 guard response.terminalState == .completed else {
-                    await Attention.record(thought: recorded, id: "thought:" + held.run, status: "failed", cause: thought.happenings, dataRoot: dataRoot)
-                    await giveBack(attended)
+                    await Attention.record(thought: recorded, id: "thought:" + held.run, status: "failed", cause: thought.happenings, dataRoot: dataRoot, steeredBy: held.steeringStamp(sources: earlierSources))
+                    await giveBack(attended, failed: response.terminalState != .stopped)
                     return response.terminalState != .stopped
                 }
                 let acted = try await Self.acted(turn: held.id, since: started, dataRoot: dataRoot)
@@ -269,25 +275,28 @@ public actor MindStream: AttentionStream {
                 let hit = acted || wonderingSaved == true
                 // A thought its record ended on CPU is withheld: it is no evidence for the record that ended it.
                 let status = hit ? "hit" : wonderingSaved == nil ? "failed" : silent && response.isSilentCompletion ? "withheld" : "empty"
-                await Attention.record(thought: recorded, id: "thought:" + held.run, status: status, cause: thought.happenings, dataRoot: dataRoot)
+                await Attention.record(thought: recorded, id: "thought:" + held.run, status: status, cause: thought.happenings, dataRoot: dataRoot, steeredBy: held.steeringStamp(sources: earlierSources))
                 await Attention.settle(happenings, by: .init(source: "thought", id: "thought:" + held.run), dataRoot: dataRoot)
             }
         } catch {
             nativeLog("MindStream: thought did not settle; what it carried stays owed: %@", error.localizedDescription)
-            RepairOwed.owe(dataRoot, id: "thought:" + turn.run, kind: .message,
-                operation: "thought.read:" + turn.run, owner: Attention.stream,
-                words: "The thought could not read or settle its evidence: " + error.localizedDescription + ". What it carried remains owed.",
-                lever: "Repair the named source or thought record; attention can then read the owed happenings again.")
-            await Attention.record(thought: recorded, id: "thought:" + turn.run, status: "failed", cause: thought.happenings, dataRoot: dataRoot)
-            await giveBack(attended)
+            // Stop cancels the thought, not a fault: its happenings go back and nothing is broken to repair.
+            if !(error is CancellationError) {
+                RepairOwed.owe(dataRoot, id: "thought:" + turn.run, kind: .message, steeredBy: turn.steeringStamp(),
+                    operation: "thought.read", owner: Attention.stream,
+                    words: "The thought could not read or settle its evidence: " + error.localizedDescription + ". What it carried remains owed.",
+                    lever: "Repair the named source or thought record; attention can then read the owed happenings again.")
+            }
+            await Attention.record(thought: recorded, id: "thought:" + turn.run, status: "failed", cause: thought.happenings, dataRoot: dataRoot, steeredBy: turn.steeringStamp(sources: earlierSources))
+            await giveBack(attended, failed: !(error is CancellationError))
             return !(error is CancellationError)
         }
         return true
     }
 
-    /// A thought that failed attended nothing: the worth it drained returns to its node, and the next worth landing there ignites it again.
-    private func giveBack(_ attended: Attended) async {
-        if attended.node != nil, attended.drive != nil { await cognition?.restoreDrive(attended) }
+    /// Failure spends the drained drive but returns its payload; other returns keep both drive and payload.
+    private func giveBack(_ attended: Attended, failed: Bool = false) async {
+        if attended.node != nil, let drive = attended.drive { await cognition?.restoreDrive(attended, returning: failed ? 0 : drive) }
     }
 
     /// A thought is a hit when it acted with an effect: it spoke to the person, acted, filed a promise or kept a memory.
@@ -668,11 +677,11 @@ public actor MindStream: AttentionStream {
         var origin = ChatMessageOrigin(surface: Attention.stream, agent: "self", authored: .agent)
         origin.peerSources = taint.checkpointSources
         origin.elevatedPeerSources = taint.elevatedSources
-        let request = TurnRequest(message: text, sessionID: session, fileAccess: fileAccess, surface: "chat", suppressUserAppend: true,
+        let request = TurnRequest(message: text, sessionID: session, fileAccess: fileAccess.mode ?? "auto", surface: "chat", suppressUserAppend: true,
             envelope: TurnEnvelope(surface: "chat", agent: "self", declaredRemote: false),
             verifiedSessionID: session, origin: origin,
             pinnedRunID: runID, codexCompletion: binding, threadKind: kind)
-        var turn = request.turn()
+        var turn = request.turn().with(\.fileAccessCeiling, fileAccess)
         turn.peerSteering = taint
         let lifecycle = lifecycle
         func claim(_ route: AgentBridgeCompletionRoute?) async throws {
@@ -749,7 +758,7 @@ public actor MindStream: AttentionStream {
     }
 
     private func prepareReturn(_ happenings: [Experience], session: String, kind: ChatThreadKind)
-        throws -> ([Happening], PeerDataTaint, String, AgentPeerContact?) {
+        throws -> ([Happening], PeerDataTaint, ICloudChatFileAccessPolicy.Ceiling, AgentPeerContact?) {
         let returned = try happenings.map { experience in
             guard let happening = experience.happening else {
                 throw StandingBotsError.invalidValue("Return \(experience.id) has no happening payload; repair its recorded evidence.")
@@ -758,7 +767,7 @@ public actor MindStream: AttentionStream {
         }
         let taint = PeerDataTaint(restoring: [], elevated: Array(Set(returned.flatMap { $0.elevated ?? [] })).sorted())
         for peer in Set(returned.flatMap { $0.peers ?? [] }) { taint.mark(peer: peer) }
-        var fileAccess = "auto"
+        var fileAccess = ICloudChatFileAccessPolicy.Ceiling()
         // A line's commissioning turn owns its steering and file ceiling; moving its news cannot discard either.
         for happening in returned where happening.subject.hasPrefix("job:") {
             let job = try AgentJobStore(dataRoot: dataRoot).job(String(happening.subject.dropFirst(4)))
@@ -767,16 +776,7 @@ public actor MindStream: AttentionStream {
             }
             for peer in job.peers ?? [] { taint.mark(peer: peer) }
             for peer in job.elevated ?? [] { taint.elevate(peer: peer) }
-            if let raw = job.fileAccess {
-                guard let mode = ICloudChatFileAccessPolicy.Mode(raw) else {
-                    throw StandingBotsError.invalidValue("The job's recorded file-access ceiling is unreadable.")
-                }
-                switch mode {
-                case .none: fileAccess = "none"
-                case .readOnly: if fileAccess != "none" { fileAccess = "read_only" }
-                case .auto, .workspace, .full: break
-                }
-            }
+            fileAccess = fileAccess.intersecting(job.fileAccess ?? .init())
         }
         let contact: AgentPeerContact?
         if kind == .agent {
@@ -873,7 +873,7 @@ public actor MindStream: AttentionStream {
             owner = cognition
             if let attended {
                 if let refusal = try await cognition.admitNight(attended, at: beganAt) {
-                    // Changed presence attended nothing: return the crossing just as a failed thought does, for the next edge.
+                    // Changed presence attended nothing: return the crossing's drive and payload for the next edge.
                     await settle { await self.giveBack(attended) }
                     return .failed(cause: refusal)
                 }
@@ -909,10 +909,12 @@ public actor MindStream: AttentionStream {
         if night.objectValue?["attend"] == .bool(true) {
             await think(Attended(node: nil, drive: nil, happenings: [], readings: nil, mode: "night", night: night))
         }
+        let cancelled = Task.isCancelled
         await settle {
             await owner.woke("the night settled")
             if let attended {
-                await Attention.settle(attended.happenings, by: .init(source: "attention", id: parent.id), dataRoot: self.dataRoot)
+                if cancelled { await self.giveBack(attended) }
+                else { await Attention.settle(attended.happenings, by: .init(source: "attention", id: parent.id), dataRoot: self.dataRoot) }
             }
             await self.releaseNight()
         }

@@ -11,7 +11,9 @@ enum SlackSocketSessionClosure: Error, Sendable, Equatable {
 public struct SlackSocketModeLoop: LoopRunner {
     public let loopId = "slack_socket_mode"
     public let wake: OrganWake
-    public var tickTimeoutOverride: TimeInterval? { 3_900 }
+    public var waitingOn: String {
+        "saved-reply recovery, then opening the Slack connection, then a socket frame or close; cancel by switching Socket Mode off"
+    }
 
     let config: SlackSocketModeConfig
     let dataRoot: URL
@@ -139,7 +141,7 @@ public struct SlackSocketModeLoop: LoopRunner {
 
     private func receiveLoop(socket: URLSessionWebSocketTask) async throws {
         try Task.checkCancellation()
-        await writeState(["waitingOn": .string("Slack socket frame or close; cancel by switching Socket Mode off")])
+        await writeState(["waitingOn": .string(waitingOn)])
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
             try await receiveLoopBody(socket: socket)

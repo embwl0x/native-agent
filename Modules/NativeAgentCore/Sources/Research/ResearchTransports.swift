@@ -9,17 +9,20 @@ public final class URLSessionResearchHTTPClient: Sendable {
     public init() {}
 
     public func getBounded(
-        url: URL, timeout: TimeInterval, maxBytes: Int, pdfMaxBytes: Int? = nil
+        url: URL, timeout: TimeInterval, maxBytes: Int, pdfMaxBytes: Int? = nil, publicOrigin: Bool? = nil
     ) async throws -> ResearchHTTPResponse {
         try Task.checkCancellation()
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = timeout
         request.setValue("NativeAgent/0.1", forHTTPHeaderField: "User-Agent")
-        let configuration = URLSession.shared.configuration
+        let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
-        let collector = BoundedResearchDownload(limit: max(0, maxBytes), pdfLimit: pdfMaxBytes.map { max(0, $0) })
+        let origin = if let publicOrigin { publicOrigin }
+            else { try await BoundedResearchDownload.resolving { try BoundedResearchDownload.publicAddress(url) } }
+        try Task.checkCancellation()
+        let collector = BoundedResearchDownload(limit: max(0, maxBytes), pdfLimit: pdfMaxBytes.map { max(0, $0) }, publicOrigin: origin)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 collector.start(request: request, configuration: configuration, continuation: continuation)

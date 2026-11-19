@@ -77,14 +77,17 @@ private struct TrustFaceWorkbench: View {
 /// Windows retain native presentation; their buttons send acts to the body.
 @MainActor enum TrustFaceWindows {
     static var controllers: [String: NSWindowController] = [:]
+    private static var frames: [String: WindowFrame] = [:]
 
     static func closeAll() {
+        for frame in frames.values { frame.end() }
+        frames.removeAll()
         let shown = controllers.values
         controllers.removeAll()
-        for controller in shown { controller.close(); controller.contentViewController = nil }
+        for controller in shown { controller.close(); controller.window?.contentView = nil }
     }
 
-    static func show<Content: View>(_ id: String, title: String, content: Content) {
+    static func show<Content: View>(_ id: String, title: String, frame: (name: String, minimum: NSSize)? = nil, content: Content) {
         if let controller = controllers[id], controller.window?.isVisible == true {
             controller.showWindow(nil)
             controller.window?.makeKeyAndOrderFront(nil)
@@ -93,8 +96,26 @@ private struct TrustFaceWorkbench: View {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 640),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = title
-        window.contentViewController = NSHostingController(rootView: content)
-        window.center()
+        frames.removeValue(forKey: id)?.end()
+        var placed = false
+        if let frame {
+            let host = NSHostingView(rootView: content)
+            host.sizingOptions = []
+            let surface = NSView()
+            window.contentView = surface
+            host.frame = surface.bounds
+            host.autoresizingMask = [.width, .height]
+            surface.addSubview(host)
+            let kept = WindowFrame(window, name: frame.name)
+            frames[id] = kept
+            let size = window.contentRect(forFrameRect: window.frame).size
+            placed = kept.restored && size.width >= frame.minimum.width && size.height >= frame.minimum.height
+            window.contentMinSize = frame.minimum
+            if !placed { window.setContentSize(NSSize(width: 900, height: 700)) }
+        } else {
+            window.contentViewController = NSHostingController(rootView: content)
+        }
+        if !placed { window.center() }
         let controller = NSWindowController(window: window)
         controllers[id] = controller
         controller.showWindow(nil)

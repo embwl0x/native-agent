@@ -87,9 +87,12 @@ extension NativeCognitionRuntime {
                 await AdaptiveMemoryPromoter.shared.drainOwedMomentsAtWake()
             }
         }
-        // A MY QUEUE time comes back as a fresh read of the Desk; the read posts what is due, once.
+        // A MY QUEUE time comes back as a fresh read of the Desk; the read posts what is due, once; its owed time offers again what is still owed.
         Task { [root = dataRoot] in
-            await OneClock.at(root).handle(MyQueueReady.owner) { [weak self] _, _ in await self?.startPursuitRefresh() }
+            await OneClock.at(root).handle(MyQueueReady.owner) { [weak self] time, _ in
+                await self?.startPursuitRefresh()
+                if time.id == MyQueueReady.owner + ":owed" { await self?.reofferQueueMoments() }
+            }
         }
     }
 
@@ -376,26 +379,19 @@ extension NativeCognitionRuntime {
     }
 
     /// A due step's reflex runs, or its moment is posted: a habit runs on CPU and hands the agent only what needs judgment; fixed words are said as
-    /// they are; everything else opens a thought.
+    /// they are and the moment still comes to her; everything else opens a thought.
     private func take(_ admission: MomentAdmission, at: Date) async {
         let moment = admission.moment
         let once = MyQueueReady.once(moment.item.handle, moment.occurrence)
         guard let entry = MyQueue.entry(moment.item) else { await post(moment.item, once: once, at: at, admission: admission); return }
         if entry.step.action != nil {
             await runHabit(entry, once: once, at: at, admission: admission)
-        } else if let words = Self.fixedWords(entry), entry.step.origin == "self" || entry.owedToPerson {
+        } else if let words = MyQueue.spoken(entry) {
             // Quiet hours hold person-facing notifications, never the agent's work; delivery routing owns the knock.
             await deliverSay(entry, words: words, once: once, at: at, admission: admission)
         } else {
             await post(moment.item, once: once, at: at, admission: admission)
         }
-    }
-
-    /// Words to say as they are; a worded end condition needs the agent's judgment on every occurrence.
-    private static func fixedWords(_ entry: MyQueue.Entry) -> String? {
-        guard let words = entry.step.say, !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        if case .words = MyQueue.until(entry) { return nil }
-        return words
     }
 
     /// A moment owed to the agent: it opens a thought in the agent's mind stream, or, for a promise made to the person, in the conversation it was
@@ -410,8 +406,10 @@ extension NativeCognitionRuntime {
         do {
             if owed, let route = step?.replyRoute { reply = try route.serialize(pretty: false) }
             if let receipt {
-                shows += "\nalready_looked (your habit already ran; start from this receipt, do not blindly repeat the call): "
-                    + (try receipt.serialize(pretty: false))
+                shows += "\nalready_looked at \(MyQueue.shown(at)) (your habit already ran; start from this receipt, do not blindly repeat the call): "
+                let text = try receipt.serialize(pretty: false), cut = " … (cut here; make the call again for the rest)"
+                let room = Happening.showsLimit - shows.count
+                shows += text.count <= room ? text : String(text.prefix(max(0, room - cut.count))) + cut
             }
         } catch {
             owe("moment", item.handle, "Its moment could not be written: " + error.localizedDescription)
@@ -490,7 +488,11 @@ extension NativeCognitionRuntime {
                 && (result.objectValue?["again"] == nil || result.objectValue?["again"] == .null)
             // A completed call cannot decide its own worded end condition.
             let judgedEnd: Bool = { if case .words = MyQueue.until(entry) { return true }; return false }()
-            guard finished, !judgedEnd else {
+            let ran = reply.payload.objectValue?["receipts"]?.arrayValue?.compactMap(\.objectValue) ?? [reply.payload.objectValue ?? [:]]
+            let looked = !ran.isEmpty && ran.allSatisfy {
+                $0["read_only"] == .bool(true) && $0["action"]?.stringValue?.hasPrefix("authored.") != true
+            }
+            guard finished, !judgedEnd, !looked else {
                 await post(entry.item, once: once, at: at, receipt: reply.payload, admission: admission)
                 return
             }
@@ -536,7 +538,10 @@ extension NativeCognitionRuntime {
             return
         }
         do {
-            if habitResult == nil, try await MyQueueCarried.run(once: once, dataRoot: root)?.done == true { return }
+            if habitResult == nil, try await MyQueueCarried.run(once: once, dataRoot: root)?.done == true {
+                await post(entry.item, once: once, at: at, admission: admission)
+                return
+            }
             // Stamp the destination conversation's route rather than the turn that released the intention.
             let route = try await HumanConversationReader.read(sessionID: anchor, dataRoot: root).route
             guard ChatTurnSteering.liveSessions(dataRoot: root).isEmpty, await admits(admission) else { return }
@@ -620,7 +625,7 @@ extension NativeCognitionRuntime {
             for note in debt.notes {
                 _ = try await store.appendNoteIfAbsent(item.handle, marker: note, text: note, author: "agent", after: item.updatedAt)
             }
-            if case .once = MyQueue.until(entry) {
+            if debt.reason != "said", case .once = MyQueue.until(entry) {
                 // Close only the still-matching intention; one retry covers a concurrent write between read and close.
                 for attempt in 0..<2 {
                     guard let current = try await MyQueue.entry(entry.item.handle, store: store),
@@ -635,8 +640,9 @@ extension NativeCognitionRuntime {
         try await MyQueueCarried.settled(debt, dataRoot: dataRoot)
     }
 
-    /// Each open step's next time, and the agent's next free time when work waits for it, are MY QUEUE's times on the one clock; a time whose step
-    /// closed or changed is withdrawn. Each time is kept or reported on its own.
+    /// Each open step's next time, the agent's next free time when work waits for it, and the next offer of a moment still owed to her (1, 1, 2, 4,
+    /// 8, 16, then every 30 minutes from its birth) are MY QUEUE's times on the one clock; a time whose step closed or changed, or with nothing
+    /// owed, is withdrawn. Each time is kept or reported on its own.
     private func keepTimes(_ items: [DeskItem], at: Date, freeAt: Date?) async {
         let clock = OneClock.at(dataRoot)
         var wanted: [String: OneClock.Time] = [:]
@@ -646,6 +652,17 @@ extension NativeCognitionRuntime {
             wanted[id] = OneClock.Time(id: id, rhythm: MyQueueReady.rhythm(item), next: next, payload: .object(["handle": .string(item.handle)]))
         }
         if let freeAt { wanted[MyQueueReady.freeTime] = OneClock.Time(id: MyQueueReady.freeTime, next: freeAt) }
+        let owedTime = MyQueueReady.owner + ":owed"
+        do {
+            let offers = try await Attention.owed(dataRoot: dataRoot).filter {
+                $0.happening?.kind == .moment && $0.happening?.subject.hasPrefix("queue:") == true
+            }.compactMap { NativeTimestampFormat.parseISO8601FractionalFirst($0.at) }.map { born in
+                var offset: TimeInterval = 60
+                while born + offset <= at { offset += min(offset, 1800) }
+                return born + offset
+            }
+            if let next = offers.min() { wanted[owedTime] = OneClock.Time(id: owedTime, next: next) }
+        } catch { owe("clock", owedTime, "What is still owed could not be read, so it is not offered again on the clock: " + error.localizedDescription) }
         do {
             for time in try await clock.times(owner: MyQueueReady.owner) where wanted[time.id] == nil {
                 do { try await clock.withdraw(time.id) }

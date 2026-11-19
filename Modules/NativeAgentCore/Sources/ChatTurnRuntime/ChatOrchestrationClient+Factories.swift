@@ -1,4 +1,5 @@
 import Foundation
+import ChatTurnContracts
 import ApprovalInbox
 import CryptoKit
 import NativeAgentCore
@@ -120,7 +121,7 @@ public func makeGatedToolDispatchClient(
     approvedReplay: ApprovedChatToolReplay? = nil,
     tracePeerTurn: Bool = false,
     work: ChatTurnWork = .init()
-) -> any ExpansionToolDispatchClient {
+) -> any ToolDispatchClient {
     let gate = AutonomyGate(approvalFiler: approvalFiler)
     // Canonicalize aliases outside the gates so file access and Trust judge the name that executes.
     var dispatcher: any ToolDispatchClient = AutonomyGatedDispatcher(
@@ -147,10 +148,7 @@ public func makeGatedToolDispatchClient(
     // Every surface resolves saved peer names from this same root.
     let canonical = CanonicalToolNameDispatcher(inner: dispatcher, peerDataRoot: dataRoot,
         conversationScope: verifiedSessionId)
-    // Expansion owns outer practice feedback; nested calls re-enter below it.
-    // Bind and refuse before expansion or conversation coordination can leave work behind.
-    return FileAccessGatedDispatcher(inner: ExpansionDispatcher(inner: canonical, dataRoot: dataRoot,
-        session: verifiedSessionId, work: work), fileAccess: fileAccess, dataRoot: dataRoot)
+    return FileAccessGatedDispatcher(inner: canonical, fileAccess: fileAccess, dataRoot: dataRoot)
 }
 
 /// Recall uses the root's canonical SQLite owner and managed embedder; unavailable stores remain fail-closed.

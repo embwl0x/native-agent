@@ -88,6 +88,8 @@ private enum LLMErrorForOutputMeasurement: LocalizedError {
 public struct LLMToolSchema: Sendable, Codable, Equatable {
     public let name: String
     public let description: String
+    /// Local catalog prose carried with the turn's volatile context, outside the provider's tool contract.
+    public var volatileCatalogAppendix = ""
     /// Retain canonical JSON-Schema bytes so every adapter offers the same argument contract.
     public let parametersJSON: Data
     /// The class its declaration gives it; nil on a decoded wire copy.

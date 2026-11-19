@@ -42,7 +42,12 @@ extension FileSystemActions {
             let protected = (Array(connectorSensitiveDataSubpaths) + connectorPartPrivateDataSubpaths + CapabilityLifecycle.protectedStores)
                 .map { dataRoot.appendingPathComponent($0) }
                 + [ctx.personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)]
-            if protected.contains(where: { isWithinRoots(resolved, [$0]) || isWithinRoots($0, [resolved]) }) {
+            let target = NativeAgentWorkspaceRoot.canonicalFileURL(resolved).path.lowercased()
+            if protected.contains(where: {
+                let store = NativeAgentWorkspaceRoot.canonicalFileURL($0).path.lowercased()
+                return NativeAgentWorkspaceRoot.relativePath(target, under: store) != nil
+                    || NativeAgentWorkspaceRoot.relativePath(store, under: target) != nil
+            }) {
                 return errResult("The path reaches a protected app store or executable authority.", code: "path_not_allowed")
             }
         }

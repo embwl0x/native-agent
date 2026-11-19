@@ -3,31 +3,28 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 import CognitiveSubstrate
-// Blueprint: | `DreamCycleRunner+Messages.swift` | `DreamCycleRunner`, `gatherRecentMessagesAcrossSessions`, `feltRankIndex`. |
+// Blueprint: | `DreamCycleRunner+Messages.swift` | `DreamCycleRunner`, `gatherRecentMessagesAcrossSessions`: oldest-first whole exchanges. |
 
 extension DreamCycleRunner {
-    private static let convCharBudget: Int = 80_000
-    private static let convCountLimit: Int = 300
+    private static let convCharBudget: Int = 160_000
+    private static let convCountLimit: Int = 600
 
     // MARK: cross-session message gather
 
-    /// Gather eligible conversation across sessions before sampling whole exchanges by felt rank and recency.
-    /// Use checked occurrence times and return the newest eligible timestamp for the next mark; tool/system rows are not identity input.
-    /// An absent felt rank contributes no feeling weight while recency still orders eligible conversation.
-    func gatherRecentMessagesAcrossSessions(
-        since mark: Date,
-        feltRank: [String: Int] = [:]
-    ) throws -> (
+    /// Gather eligible conversation across sessions, oldest whole exchange first, until the budget is full. The returned mark is the last
+    /// exchange read, so what did not fit is the next dream's first material; tool/system rows are not identity input.
+    func gatherRecentMessagesAcrossSessions(since mark: Date) throws -> (
         messages: [(sessionId: String, role: String, content: String, source: String?)],
         newest: Date?,
         sources: [DreamSourceRef],
-        material: [String: CognitiveReflectionCause]
+        material: [String: CognitiveReflectionCause],
+        moreMessagesRemain: Bool
     ) {
         let messagesDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
         let names: [String]
         do { names = try fm.contentsOfDirectory(atPath: messagesDir.path) }
-        catch CocoaError.fileReadNoSuchFile { return ([], nil, [], [:]) }
+        catch CocoaError.fileReadNoSuchFile { return ([], nil, [], [:], false) }
         let conversations = try SessionConversation(dataRoot: dataRoot, includingArchived: true)
         struct Row {
             let at: Date;
@@ -91,89 +88,67 @@ extension DreamCycleRunner {
         let ordered = paired.map { (exchange: $0.exchange, row: all[$0.row]) }.sorted { $0.row.at < $1.row.at }
         let exchangeByIndex = ordered.map(\.exchange)
         all = ordered.map(\.row)
-        // Select whole exchanges, preserving session reach before spending remaining room on feeling weight.
         struct Exchange {
-            let sid: String
             let start: Int
             var rows: [(index: Int, row: Row)]
             var at: Date
-            var weight: Double
             var length: Int
         }
-        // Rank zero carries the strongest recorded feeling; unranked rows carry no felt weight.
-        func weight(of row: Row) -> Double {
-            guard !feltRank.isEmpty, let mid = row.mid, !mid.isEmpty else { return 0 }
-            guard let rank = feltRank["\(row.sid):\(mid)"] ?? feltRank[mid] else { return 0 }
-            return 1.0 / Double(1 + max(0, rank))
-        }
         func rowLength(_ row: Row) -> Int { row.role.count + row.content.count + 4 }
-
-        var rowsBySession: [String: [(index: Int, row: Row)]] = [:]
-        for (index, row) in all.enumerated() {
-            rowsBySession[row.sid, default: []].append((index, row))
-        }
         var exchanges: [Exchange] = []
         let grouped = Dictionary(grouping: all.enumerated(), by: { exchangeByIndex[$0.offset] })
         for entries in grouped.values {
             let rows = entries.map { (index: $0.offset, row: $0.element) }
             guard let first = rows.first else { continue }
-            exchanges.append(Exchange(sid: first.row.sid, start: first.index, rows: rows,
-                at: rows.map { $0.row.at }.max() ?? first.row.at,
-                weight: rows.reduce(0) { $0 + weight(of: $1.row) }, length: rows.reduce(0) { $0 + rowLength($1.row) }))
+            exchanges.append(Exchange(start: first.index, rows: rows, at: rows.map { $0.row.at }.max() ?? first.row.at,
+                length: rows.reduce(0) { $0 + rowLength($1.row) }))
         }
         exchanges.removeAll { $0.at <= mark }
-        var exchangeIndicesBySession: [String: [Int]] = [:]
-        for index in exchanges.indices {
-            exchangeIndicesBySession[exchanges[index].sid, default: []].append(index)
-        }
-        // Resolve equal feeling weight by recency and stable structural identity.
-        func moreMeaningful(_ lhs: Exchange, _ rhs: Exchange) -> Bool {
-            if lhs.weight != rhs.weight { return lhs.weight > rhs.weight }
-            if lhs.at != rhs.at { return lhs.at > rhs.at }
-            if lhs.sid != rhs.sid { return lhs.sid < rhs.sid }
-            return lhs.start < rhs.start
-        }
-
-        var takenExchanges = Set<Int>()
+        exchanges.sort { ($0.at, $0.start) < ($1.at, $1.start) }
         var pickedEntries: [(index: Int, row: Row)] = []
-        var used = 0
-        var count = 0
-        // Skip an oversized whole exchange rather than ending selection so one conversation cannot swallow the day's reach.
-        func take(_ exchangeIndex: Int) {
-            guard !takenExchanges.contains(exchangeIndex) else { return }
-            let exchange = exchanges[exchangeIndex]
-            guard count + exchange.rows.count <= Self.convCountLimit,
-                  used + exchange.length <= Self.convCharBudget else { return }
-            takenExchanges.insert(exchangeIndex)
-            pickedEntries.append(contentsOf: exchange.rows)
-            used += exchange.length
-            count += exchange.rows.count
+        var used = 0, count = 0
+        var moreMessagesRemain = false
+        var newest: Date?, firstAt: Date?, stoppedAt: Date?
+        for (index, exchange) in exchanges.enumerated() {
+            if count + exchange.rows.count <= Self.convCountLimit, used + exchange.length <= Self.convCharBudget {
+                pickedEntries.append(contentsOf: exchange.rows)
+                used += exchange.length
+                count += exchange.rows.count
+                if firstAt == nil { firstAt = exchange.at }
+                newest = exchange.at
+                continue
+            }
+            // An exchange larger than a whole dream is read first in its own night, as much of its end as fits; anything else waits.
+            if pickedEntries.isEmpty {
+                for entry in exchange.rows.sorted(by: { $0.index > $1.index }) {
+                    var entry = entry
+                    // A single message larger than a whole dream is read from its end.
+                    if pickedEntries.isEmpty, rowLength(entry.row) > Self.convCharBudget {
+                        let row = entry.row
+                        entry.row = Row(at: row.at, sid: row.sid, mid: row.mid, runID: row.runID, role: row.role,
+                            content: String(row.content.suffix(Self.convCharBudget - row.role.count - 4)), peers: row.peers, lived: row.lived)
+                    }
+                    let length = rowLength(entry.row)
+                    guard count < Self.convCountLimit, used + length <= Self.convCharBudget else { break }
+                    pickedEntries.append(entry)
+                    used += length
+                    count += 1
+                }
+                newest = exchange.at
+                moreMessagesRemain = index + 1 < exchanges.count
+            } else {
+                stoppedAt = exchange.at
+                moreMessagesRemain = true
+            }
+            break
         }
-
-        // Cover newest-active sessions first when the budget cannot reach every session.
-        let sessionOrder = exchangeIndicesBySession.keys.sorted { lhs, rhs in
-            let lat = rowsBySession[lhs]?.last?.row.at ?? .distantPast
-            let rat = rowsBySession[rhs]?.last?.row.at ?? .distantPast
-            if lat != rat { return lat > rat }
-            return lhs < rhs
-        }
-        for sid in sessionOrder {
-            guard let indices = exchangeIndicesBySession[sid],
-                  let best = indices.max(by: { moreMeaningful(exchanges[$1], exchanges[$0]) })
-            else { continue }
-            take(best)
-        }
-        // Spend remaining room on the strongest felt exchanges regardless of their window position.
-        for exchangeIndex in exchanges.indices.sorted(by: { moreMeaningful(exchanges[$0], exchanges[$1]) }) {
-            if count >= Self.convCountLimit { break }
-            take(exchangeIndex)
-        }
-        if pickedEntries.isEmpty, !exchanges.isEmpty {
-            throw DreamREMCycleError.oversizedConversationInput
+        // An unread exchange ending at the same instant as the last one read stays eligible: the mark stops just before that instant and
+        // the exchanges read at it come again. When every exchange read shares that instant, the mark moves past it so the night advances.
+        if let last = newest, stoppedAt == last, let first = firstAt, first < last {
+            newest = last.addingTimeInterval(-0.001)
         }
         // Restore chronology so the dream reads a day rather than a ranking.
         pickedEntries.sort { $0.index < $1.index }
-        let picked = pickedEntries.map(\.row)
         // Rows remain citable without a run; only known runs establish exchange grouping.
         var sourcesByIndex: [Int: DreamSourceRef] = [:]
         var material: [String: CognitiveReflectionCause] = [:]
@@ -187,34 +162,13 @@ extension DreamCycleRunner {
             material[source.reference] = CognitiveReflectionCause(text: "\(row.role):\n\(row.content)", sourcePeerIds: row.peers)
         }
         let sources = pickedEntries.compactMap { sourcesByIndex[$0.index] }
-        // Advance across all eligible rows so budget-omitted old material cannot enter the next dream as new.
         return (
             pickedEntries.map { ($0.row.sid, $0.row.role, $0.row.content, sourcesByIndex[$0.index]?.reference) },
-            picked.isEmpty ? nil : all.last?.at,
+            newest,
             sources,
-            material
+            material,
+            moreMessagesRemain
         )
-    }
-
-    /// First strongest-felt occurrence wins per canonical origin key; accept session/message and bare message IDs from the same owner.
-    /// Origins without a message cannot rank transcript rows.
-    static func feltRankIndex(from origins: [CognitiveFeltOrigin]) -> [String: Int] {
-        var index: [String: Int] = [:]
-        for (rank, origin) in origins.enumerated() {
-            var keys: [String] = []
-            let subjectID = origin.subjectID.trimmingCharacters(in: .whitespacesAndNewlines)
-            if subjectID.contains(":") {
-                keys.append(subjectID)
-            }
-            let sessionID = origin.metadata["sessionId"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let messageID = origin.metadata["messageId"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !sessionID.isEmpty, !messageID.isEmpty { keys.append("\(sessionID):\(messageID)") }
-            if !messageID.isEmpty { keys.append(messageID) }
-            for key in keys where index[key] == nil { index[key] = rank }
-        }
-        return index
     }
 
     // Exclude tool-call rows before prompt assembly so tool-heavy days cannot dilute identity input.

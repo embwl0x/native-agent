@@ -16,8 +16,6 @@ struct ContentView: View {
     private let talk = TalkModeController.shared
     private let sync = iCloudSyncEngine.shared
 
-    // Share stores so tab badges and destination views read the same state.
-    @StateObject private var approvalsStore = ApprovalsStore()
     @StateObject private var inboxStore = InboxStore()
 
     @State private var selection: Tab = ContentView.initialTabFromLaunchArgs()
@@ -26,7 +24,6 @@ struct ContentView: View {
     @State private var openedFromNotificationLaunch = NativeAgentNotificationLaunchIntent.isPending
     @State private var notificationOpenRefreshTask: Task<Void, Never>? = nil
     @State private var lastNotificationOpenAt: Date = .distantPast
-    @State private var suppressActivityRefreshUntil: Date = .distantPast
     @State private var activityNavigationTarget: ActivitySection?
     /// A card a face's link asked Today to open.
     @State private var activityCardID: String?
@@ -163,7 +160,6 @@ struct ContentView: View {
     private var tabContent: some View {
         TabView(selection: $selection) {
             ChatView(notifiedSessionID: $notifiedSessionID)
-                .environmentObject(approvalsStore)
                 .tabItem {
                     Label("Chat", systemImage: "bubble.left.and.bubble.right")
                     .environment(\.symbolVariants, .none)
@@ -175,7 +171,6 @@ struct ContentView: View {
                 navigationTarget: $activityNavigationTarget,
                 cardTarget: $activityCardID
             )
-                .environmentObject(approvalsStore)
                 .environmentObject(inboxStore)
                 .tabItem {
                     Label("Today", systemImage: "sun.max")
@@ -235,7 +230,6 @@ struct ContentView: View {
             consumePendingNotificationOpenIfNeeded()
         }
         .onChange(of: sync.approvals) { _, _ in
-            approvalsStore.applySyncedApprovalsFromSnapshot()
             Task {
                 await pruneActivityNotifications()
             }
@@ -247,19 +241,13 @@ struct ContentView: View {
             }
         }
         .onChange(of: sync.inboxItems) { _, _ in
-            approvalsStore.applySyncedApprovalsFromSnapshot()
             inboxStore.applySyncedInboxFromSnapshot()
             Task {
                 await pruneActivityNotifications()
             }
         }
         .task {
-            if openedFromNotificationLaunch {
-                // Let launch/tap transitions settle before rereading iCloud or notification state.
-                try? await Task.sleep(nanoseconds: 900_000_000)
-            } else {
-                await refreshActivityBadgesIfAllowed()
-            }
+            if !openedFromNotificationLaunch { await refreshActivityBadges() }
         }
         .onDisappear {
             notificationOpenRefreshTask?.cancel()
@@ -305,7 +293,6 @@ struct ContentView: View {
         lastNotificationOpenAt = now
         openedFromNotificationLaunch = true
         skipNextActivityInitialRefresh = (target == .activity)
-        suppressActivityRefreshUntil = now.addingTimeInterval(2.0)
         selection = target
 
         notificationOpenRefreshTask?.cancel()
@@ -318,12 +305,6 @@ struct ContentView: View {
     }
 
     @MainActor
-    private func refreshActivityBadgesIfAllowed() async {
-        guard Date() >= suppressActivityRefreshUntil else { return }
-        await refreshActivityBadges()
-    }
-
-    @MainActor
     private func refreshActivityBadges(
         pruneNotifications: Bool = true
     ) async {
@@ -332,7 +313,6 @@ struct ContentView: View {
         defer { isRefreshingActivityBadges = false }
         await sync.refreshActivitySnapshot()
         if pairingStore.usesICloudTransport {
-            approvalsStore.applySyncedApprovalsFromSnapshot()
             inboxStore.applySyncedInboxFromSnapshot()
         }
         if pruneNotifications {
@@ -345,7 +325,7 @@ struct ContentView: View {
         await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
             activeInboxItems: sync.inboxSnapshotLoaded ? inboxStore.items : nil,
             pendingApprovalIDs: sync.approvalsSnapshotLoaded
-                ? Set(approvalsStore.approvals.filter { $0.outcome == .pending }.map(\.id))
+                ? Set(sync.approvals.filter { $0.outcome == .pending }.map(\.id))
                 : nil
         )
     }

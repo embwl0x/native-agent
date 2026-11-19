@@ -22,9 +22,7 @@ extension AppToolExecutor {
 
     private static let nonDoorSchemas = makeAppToolSchemas(includeDoor: false)
 
-    /// The agent's hand is what the agent has done: the door as it was last drawn, with what it was drawn from. A turn's collection reads it once and holds
-    /// it for the turn; it is drawn again only when a verb entered the agent's done set or an ability's definition changed, and a drawing whose forms
-    /// come out byte-identical keeps the door it had, so the provider's cached prefix is not broken for nothing.
+    /// The door holds the launch hand; later verbs ride the volatile catalog until relaunch. Ability definitions can redraw that held hand.
     enum Hand {
         /// The abilities as they stood when a drawing read them; each change to an ability's definition stands a new one.
         final class Abilities: Sendable {}
@@ -57,20 +55,35 @@ extension AppToolExecutor {
             }
             let (drawn, abilities) = state.withLock { ($0.drawn, $0.abilities) }
             if let drawn, drawn.abilities === abilities, drawn.from == done { return drawn.door }
-            let forms = AppToolExecutor.handForms(done, gaps: &gaps)
+            let held = drawn?.from ?? done
+            let forms = drawn.flatMap { $0.abilities === abilities ? $0.forms : nil }
+                ?? AppToolExecutor.handForms(held, gaps: &gaps)
+            let additions = done.subtracting(held)
+            let appended = additions.isEmpty ? [] : AppToolExecutor.handForms(additions, gaps: &gaps)
             if !gaps.isEmpty {
                 let at = Date()
                 TurnTraceBus.fire(TurnTraceEvent(kind: "app.hand", title: "The agent's hand", status: "partial", payload: .object(gaps),
                     createdAt: NativeTimestampFormat.plainZulu(at), ts: at, turn: nil))
             }
-            // An unread inventory leaves the last drawing standing; the next collection draws again.
-            if forms == nil, let drawn { return drawn.door }
-            let door = drawn.flatMap { $0.forms == forms ? $0.door : nil }
-                ?? AppToolExecutor.makeAppToolSchemas(includeDoor: true, hand: forms ?? [])
-            // A first drawing over an unread inventory is never current, so the next collection draws again.
-            let drew = Drawn(from: done, abilities: forms == nil ? Abilities() : abilities, forms: forms ?? [], door: door)
-            state.withLock { $0.drawn = drew }
-            return door
+            let drew: Drawn
+            if forms == nil, let drawn {
+                // An unread inventory leaves the last drawing standing, with its gaps carried below.
+                drew = drawn
+            } else {
+                let door = drawn.flatMap { $0.forms == forms ? $0.door : nil }
+                    ?? AppToolExecutor.makeAppToolSchemas(includeDoor: true, hand: forms ?? [])
+                // A first drawing over an unread inventory is never current, so the next collection draws again.
+                drew = Drawn(from: held, abilities: forms == nil ? Abilities() : abilities, forms: forms ?? [], door: door)
+                state.withLock { $0.drawn = drew }
+            }
+            let extra = (appended ?? []).filter { !drew.forms.contains($0) }
+            let gapLines = gaps.sorted { $0.key < $1.key }.map { "Hand gap (\($0.key)): \($0.value.foundationObject)" }
+            return drew.door.map {
+                var schema = $0
+                schema.volatileCatalogAppendix = ([extra.isEmpty ? "" : "Also in your hand:\n" + extra.joined(separator: "; ") + "."]
+                    + gapLines).filter { !$0.isEmpty }.joined(separator: "\n")
+                return schema
+            }
         }
     }
 
@@ -161,8 +174,8 @@ extension AppToolExecutor {
                             """)),
                         ("item", ToolSchema.strSchema("""
                             With page: one thing on it, a note id on inbox or a conversation id on chat; actions reads full action signatures when the page \
-                            returns a compact catalog. Alone: a name or ref from home or its rooms (desk.4, mail.find, an agent's name), with args {text, \
-                            conversation?} for an agent message or {fields} for a form.
+                            returns a compact catalog. Alone: a name or ref from home or its rooms (desk.4, mail.N, an agent's name), with args {text, \
+                            conversation?, expects_reply?} for an agent message; named fields use an action's args.
                             """)),
                         ("action", ToolSchema.strSchema("An action id from a read, such as inbox.archive.")),
                         ("args", ToolSchema.obj([("type", .string("object")),
@@ -190,7 +203,8 @@ extension AppToolExecutor {
                                              """))])),
                         ("then_say", ToolSchema.strSchema("""
                             With actions: your closing words. When every step ran, had an expect that held, and none is beyond undoing, they are said and \
-                            the turn ends without a read-back; otherwise the result says why they did not stand.
+                            the turn ends without a read-back; otherwise the result says why they did not stand. One deed is enough: \
+                            actions:[{action:"desk.wait",args:{…},expect:"waiting"}], then_say:"Parked it." acts and answers in one pass.
                             """)),
                         ("with", ToolSchema.obj([("type", .string("object")),
                                       ("description", .string("""
@@ -212,8 +226,10 @@ extension AppToolExecutor {
                             """)),
                         ("find", ToolSchema.strSchema("""
                             What you want done, in words. Discovers actions on every page, including home, one line each as id(args) label, with the best \
-                            match's example. Name an action's id in the words for its args_schema and example. Search history explicitly with work.context or \
-                            chat.search.
+                            match's example. Name an action's id in the words for its args_schema and example. Each action found may carry gave_back: the \
+                            shapes its results had the last times you called it, keyed by the arguments you gave (keys and types only, merged over from_calls \
+                            calls: key? was not always there, a|b is a type that varied). Search history explicitly with \
+                            work.context or chat.search.
                             """)),
                         // OwnedProgram.seconds / ProgramProgressWindow own this renewable stall window.
                         ("script", ToolSchema.strSchema("""

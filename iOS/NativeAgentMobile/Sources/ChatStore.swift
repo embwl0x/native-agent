@@ -379,10 +379,6 @@ final class ChatStore {
         }
     }
 
-    var hasPendingICloudReplies: Bool {
-        !pendingICloudPlaceholders.isEmpty
-    }
-
     static let nilQueueSessionKey = "__nativeagent_main_session__"
 
     func queueSessionKey(_ sessionID: String?) -> String {
@@ -415,6 +411,4 @@ final class ChatStore {
             && expiredExchange(for: message.id) != nil
     }
 
-
-    /// Silence releases the composer while observation of the same request continues.
 }

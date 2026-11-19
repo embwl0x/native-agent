@@ -114,7 +114,7 @@ final class BodyFaceVoice {
             } else { text = supplied }
             let owner = id.uuidString
             let playback = VoiceOutputController.sharedMessagePlayback
-            await playback.speak(text: text, policy: engine.trust.policy,
+            await playback.speak(text: text, dataRoot: engine.dataRoot, policy: engine.trust.policy,
                 loadPolicy: { try await self.engine.trust.load() }, ownerID: owner)
             let value = VoiceFace(operation: id, session: session, message: message, composerRevision: nil,
                 phase: playback.isSpeaking(ownerID: owner) ? .speaking : .finished, text: nil, attachment: nil,
@@ -126,6 +126,7 @@ final class BodyFaceVoice {
             speech[id] = Task { [weak self] in
                 guard let self else { return }
                 await watchSpeech(value)
+                if !Task.isCancelled { speech.removeValue(forKey: id) }
             }
             return .voice(value)
         case .stopSpeech(let id):

@@ -482,7 +482,7 @@ extension LocalPIMConnectorActions {
             "actionId": .string("mac.reminders_create"),
             "source": .string("eventkit"),
             "reminderId": .string(reminder.calendarItemIdentifier),
-            "title": .string(title),
+            "title": .string(NativeAppSecretRedactor.redactText(title)),
             "list": .string(targetList.title),
             "timeZone": .string(TimeZone.current.identifier),
         ]
@@ -589,7 +589,7 @@ extension LocalPIMConnectorActions {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState(), handsBack: handsBack)
         }
         guard let reminder = store.reminder(withIdentifier: expected.id) else { return failed("reminder_not_found") }
-        guard reminder.title == expected.title else {
+        guard NativeAppSecretRedactor.redactText(reminder.title ?? "(Untitled reminder)") == expected.title else {
             return failed("reminder_changed: refresh the reminder and confirm it before retrying")
         }
         guard reminder.calendar.allowsContentModifications else { return failed("reminder_list_read_only") }

@@ -29,11 +29,6 @@ extension View {
     func alivePrimaryButton() -> some View {
         buttonStyle(.borderedProminent).buttonBorderShape(.capsule).hazeTinted(labelled: true)
     }
-
-    /// Keep secondary actions neutral so the primary action retains emphasis.
-    func aliveSecondaryButton() -> some View {
-        buttonStyle(.bordered).buttonBorderShape(.capsule).tint(AlivePalette.text)
-    }
 }
 
 /// Floating search uses glass because it sits over content.

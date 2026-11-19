@@ -70,10 +70,11 @@ extension AppToolExecutor {
             // to an active model continuation.
             try prunePageShots(in: folder, preserving: file)
         } catch {
-            return AppToolExecutor.doorRefusal("page_image_retention_failed", "The PNG was saved, but retention failed: \(error.localizedDescription)",
-                remedy: "inspect", "Use the saved PNG; delivery was not attempted. Inspect the reported retention error before another screenshot.",
-                next: ["action": .string("files.read"), "args": .object(["path": .string(file.path)])],
-                extra: ["path": .string(file.path), "effects": .string("occurred")])
+            return AppToolExecutor.failure("page_image_retention_failed", "The PNG was saved, but retention failed: \(error.localizedDescription)",
+                extra: ["path": .string(file.path), "effects": .string("occurred"), "remedy": .object(["kind": .string("inspect"),
+                    "instruction": .string("Use the saved PNG; delivery was not attempted. Inspect the reported retention error before another screenshot."),
+                    "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("files.read"),
+                        "args": .object(["path": .string(file.path)])])])])])
         }
         // Text-only bridge calls have no image continuation, so return the file path.
         if imageSink == nil {
@@ -88,10 +89,11 @@ extension AppToolExecutor {
             rendered.data, name: "\(page.id).png",
             width: rendered.width, height: rendered.height, sink: imageSink
         ) else {
-            return AppToolExecutor.doorRefusal("page_image_delivery_failed", "The PNG was saved; delivery to the model was not verified.",
-                remedy: "inspect", "Read the saved PNG; do not render another copy to recover delivery.",
-                next: ["action": .string("files.read"), "args": .object(["path": .string(file.path)])],
-                extra: ["path": .string(file.path), "effects": .string("occurred")])
+            return AppToolExecutor.failure("page_image_delivery_failed", "The PNG was saved; delivery to the model was not verified.",
+                extra: ["path": .string(file.path), "effects": .string("occurred"), "remedy": .object(["kind": .string("inspect"),
+                    "instruction": .string("Read the saved PNG; do not render another copy to recover delivery."),
+                    "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("files.read"),
+                        "args": .object(["path": .string(file.path)])])])])])
         }
         if !ChatToolOutcome.outputLooksSuccessful(.object(delivery)) {
             delivery["reason"] = .string("page_image_delivery_failed")

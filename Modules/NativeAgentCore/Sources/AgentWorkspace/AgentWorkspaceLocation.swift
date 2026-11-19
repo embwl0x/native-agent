@@ -1,6 +1,5 @@
 import Foundation
 import ChatToolParsing
-import CryptoKit
 import PersistenceCore
 import ChatSessionWork
 import NativeAgentCore
@@ -10,24 +9,16 @@ import NotificationInbox
 import Desk
 import StandingBots
 import NativeAgentShared
-// Blueprint: | `AgentWorkspaceLocation.swift` | `AgentWorkspaceDocument`: source-bound navigation evidence |
+// Blueprint: | `AgentWorkspaceLocation.swift` | Owner locations, named actions, returned text evidence and page rows |
 
-/// References only; owners supply fresh reads and actions through the dispatcher and permission chain.
 indirect enum AgentWorkspaceLocation: Sendable, Equatable {
     case home
-    case openPlaces
-    case savedWorkspaces
-    case workOverview
     case arrivals
-    case find(String)
     case browserBookmark(url: String, title: String, tabID: Int64? = nil)
-    case work(String)
     case documents(String)
     case people(page: Int)
     case conversations(page: Int)
     case area(String)
-    case capabilities(query: String)
-    case form(AgentWorkspaceForm)
     case page(AgentWorkspaceLocation, Int)
     case receipt(tool: String, title: String, value: JSONValue, readback: AgentWorkspaceLocation? = nil)
     case record(tool: String, input: [String: JSONValue], title: String)
@@ -35,19 +26,12 @@ indirect enum AgentWorkspaceLocation: Sendable, Equatable {
     var title: String {
         switch self {
         case .home: return "Home"
-        case .openPlaces: return "Open places"
-        case .savedWorkspaces: return "Saved workspaces"
-        case .workOverview: return "This work"
         case .arrivals: return "Arrivals"
-        case .find(let query): return "Find: " + query
         case .browserBookmark(_, let title, _): return title
-        case .work(let topic): return topic
         case .documents(let topic): return "Documents: " + topic
         case .people: return "People and agents"
         case .conversations: return "Conversations"
         case .area(let id): return AgentWorkspaceEnvironment.destinations.first { $0.id == id }?.title ?? "Workspace"
-        case .capabilities: return "Available actions"
-        case .form(let form): return form.title
         case .page(let source, _): return source.title
         case .receipt(_, let title, _, _): return title
         case .record(let tool, let input, let title):
@@ -71,57 +55,22 @@ indirect enum AgentWorkspaceLocation: Sendable, Equatable {
 enum AgentWorkspaceAction: Sendable {
     case openArrival(String)
     case dismissArrival(String)
-    case returnFromArrival
     case open(AgentWorkspaceLocation)
-    indirect case window(AgentWorkspaceAction)
-    case findWork
-    case findDocument
-    case find
-    case workspaceControls
-    case message(agent: String, conversation: String?, name: String? = nil, document: AgentWorkspaceDocument? = nil)
+    case message(agent: String, conversation: String?, name: String? = nil)
     case followUpSavedReply(AgentWorkspaceSavedReply)
-    case back
-    case returnToWork
-    case findCapability
     case perform(tool: String, input: [String: JSONValue], title: String, textField: String?, isEffect: Bool)
-    case configure(tool: String, input: [String: JSONValue], title: String)
-    case submit(AgentWorkspaceForm)
-    case saveForm(AgentWorkspaceForm)
-    case editFormField(AgentWorkspaceForm, field: String)
-    case reviewDraft(AgentWorkspaceForm)
-    case discardDraft(AgentWorkspaceForm)
-    case clearSource
     case searchWeb
-    case createFile(directory: String)
-    case reviseFile(AgentWorkspaceFileRevision)
-    case saveWorkspace
-    case newWorkspace
-    case restoreWorkspace(String)
-    case renameWorkspace(String)
-    case forgetWorkspace(String)
-    case closePlace(AgentWorkspaceLocation)
-    case keepWorkPlace(AgentWorkspaceLocation)
-    case removeWorkPlace(AgentWorkspaceLocation)
-    case updateWorkNote
-    case focusWork
 }
 
 struct AgentWorkspaceDocument: Sendable {
-    var location: AgentWorkspaceLocation
-    var fingerprint: String
-
-    static func evidence(_ value: JSONValue) -> (text: String, fingerprint: String)? {
+    static func evidence(_ value: JSONValue) -> String? {
         let reply = ToolResult(value)
         guard reply.hasReadEvidence(),
               let full = value.stringValue ?? value.objectValue?["content"]?.stringValue else { return nil }
-        let row = value.objectValue
-        let version = row?["version"]?.stringValue ?? row?["next"]?.objectValue?["version"]?.stringValue ?? ""
-        // Compare the full returned window, even when only an excerpt is shared.
-        let hash = SHA256.hash(data: Data((full + "\u{0}" + version).utf8)).map { String(format: "%02x", $0) }.joined()
-        return (String(full.prefix(12000)), hash)
+        return String(full.prefix(12000))
     }
 
-    static func evidence(location: AgentWorkspaceLocation, value: JSONValue) -> (text: String, fingerprint: String)? {
+    static func evidence(location: AgentWorkspaceLocation, value: JSONValue) -> String? {
         if case .page(let source, _) = location { return evidence(location: source, value: value) }
         guard case .record(let tool, let input, _) = location else { return nil }
         if tool == "read_file" || tool == "read_skill" { return evidence(value) }
@@ -144,10 +93,7 @@ struct AgentWorkspaceDocument: Sendable {
         default: return nil
         }
         guard !content.isEmpty else { return nil }
-        var identity: [String: JSONValue] = ["content": .string(content)]
-        for key in ["content_sha256", "has_more", "coverage", "url", "title"] { identity[key] = row[key] }
-        guard let data = try? JSONValue.object(identity).serializedData(pretty: false), data.count <= 512 * 1024 else { return nil }
-        return (String(content.prefix(12_000)), SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
+        return String(content.prefix(12_000))
     }
 }
 
@@ -155,9 +101,6 @@ struct AgentWorkspaceButton: Sendable {
     var label: String
     var action: AgentWorkspaceAction
     var needsText: Bool = false
-    var consumed = false
-    var retired = false
-    var viewName: String?
 }
 
 struct AgentWorkspaceItem: Sendable {

@@ -239,12 +239,6 @@ public struct REMProposalStore: Sendable {
         }
     }
 
-    /// Deduplicate pending appends by canonical proposal ID.
-    @discardableResult
-    public func appendPending(_ proposals: [REMProposalRow]) async throws -> Int {
-        try await appendPendingWithReceipt(proposals).appended
-    }
-
     /// Name every refused target and passage bound.
     @discardableResult
     public func appendPendingWithReceipt(

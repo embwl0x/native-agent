@@ -156,7 +156,7 @@ RELEASE_ASSETS=( "$APPCAST" "$DMG" "$TEST_RECEIPT" "$ATTESTATION" )
 EMBEDDING_DISTRIBUTION="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"
 case "$EMBEDDING_DISTRIBUTION" in
   bundled)
-    [[ -z "$MODEL_ASSET" ]] && jq -e '.model_asset == null' "$ATTESTATION" "$TEST_RECEIPT" >/dev/null \
+    [[ -z "$MODEL_ASSET" ]] && jq -es 'all(.[]; .model_asset == null)' "$ATTESTATION" "$TEST_RECEIPT" >/dev/null \
       || fail "bundled releases must not carry a separate model asset"
     ;;
   separate-download) ;;
@@ -238,10 +238,6 @@ fi
 [[ "$(git -C "$ROOT" ls-remote --tags "$GIT_REMOTE" "refs/tags/$TAG" | awk '{print $1}')" == "$LOCAL_TAG_OBJECT" ]] \
   || fail "remote tag object changed before release publication."
 echo "==> Release tag $TAG is live on $GIT_REMOTE at $TARGET"
-
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-github-release.XXXXXX")"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
 
 # 2026-09-07: GitHub's releases-by-tag endpoint does not serve DRAFT releases
 # (404), and the draft is exactly the state this script verifies before

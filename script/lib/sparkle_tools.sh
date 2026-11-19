@@ -4,9 +4,6 @@
 # Usage:  source script/lib/sparkle_tools.sh
 #         path="$(sparkle_tool_path generate_appcast)" || <handle missing>
 
-# shellcheck disable=SC2034
-SPARKLE_TOOLS_LIB_LOADED=1
-
 # Validate feed-declared deltas and retain their exact paths for publication.
 sparkle_validate_deltas() { # feed, release URL prefix, private key, optional sign_update
   local feed="$1" prefix="$2" key="$3" sign_tool="${4:-}" index node url name path signature length
@@ -109,8 +106,6 @@ sparkle_tool_path_or_die() {
   echo "ERROR: Sparkle's '$tool' tool was not found." >&2
   echo "" >&2
   echo "REMEDIATION:" >&2
-  echo "  Sparkle is a SwiftPM dependency; its CLI tools appear only after a build." >&2
-  echo "  Run:  swift build --package-path \"${root:-.}\"" >&2
-  echo "  Then re-run this script." >&2
+  echo "  Build the release app to resolve Sparkle, then re-run this script." >&2
   exit 1
 }

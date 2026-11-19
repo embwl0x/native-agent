@@ -2,7 +2,7 @@
 # Install the tracked git hooks into this clone's .git/hooks.
 # Idempotent; safe to re-run. Run from anywhere in the repo.
 set -euo pipefail
-ROOT="$(git rev-parse --show-toplevel)"
+ROOT="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
 HOOKS="$(git rev-parse --path-format=absolute --git-path hooks)"
 mkdir -p "$HOOKS"
 ln -sf "$ROOT/script/hooks/pre-commit" "$HOOKS/pre-commit"

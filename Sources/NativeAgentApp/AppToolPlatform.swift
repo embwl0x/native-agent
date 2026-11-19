@@ -38,7 +38,7 @@ extension AppToolExecutor {
                 return AppToolExecutor.failure("doctor_unavailable", "Doctor did not run: \(reason)")
             }
         }
-        return try await appModel.engine.doctor.toolStatusEnvelope(turn: turn)
+        return try await appModel.engine.doctor.toolStatusEnvelope(repair: repair == true, turn: turn)
     }
 
     convenience init(

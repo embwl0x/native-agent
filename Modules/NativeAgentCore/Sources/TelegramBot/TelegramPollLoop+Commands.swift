@@ -56,7 +56,7 @@ extension TelegramPollLoop {
 
         guard let parsed = TelegramCommandRegistry.parse(text: text) else {
             FileHandle.standardError.write(
-                Data("TelegramPollLoop: unsupported slash command \(text)\n".utf8)
+                Data("TelegramPollLoop: unsupported slash command for update \(update.updateId)\n".utf8)
             )
             await recordBlocked(reason: "unsupported_slash_command", update: update, message: message, text: text)
             return false
@@ -150,7 +150,7 @@ extension TelegramPollLoop {
 
     func handleModelSelectionCallback(update: TelegramUpdate, callback: JSONValue) async -> Bool {
         guard let parsed = TelegramModelSelectionCallback(callback) else { return false }
-        let authorization = Self.inboundAuthorizationDecision(
+        let authorization = Self.controlAuthorizationDecision(
             allowedChatIds: allowedChatIds, allowedUserIds: allowedUserIds,
             chatId: parsed.chatId, fromUserId: parsed.fromUserId)
         guard authorization != .allowlistEmpty else {
@@ -161,7 +161,8 @@ extension TelegramPollLoop {
         }
         guard authorization == .allowed else {
             await recordBlocked(reason: "not_allowlisted", update: update, message: nil, text: nil)
-            await answerRecordedCallback(parsed.callbackId, text: "This Telegram chat is not allowlisted.", context: "model_callback_answer", update: update)
+            await answerRecordedCallback(parsed.callbackId, text: "This is the owner's control; your Telegram sender must be allowlisted.",
+                context: "model_callback_answer", update: update)
             return true
         }
 
@@ -246,26 +247,24 @@ extension TelegramPollLoop {
                 await answerRecordedCallback(parsed.callbackId, text: "That model is no longer available.", context: "model_callback_answer", update: update)
                 return true
             }
+            let presentation: (text: String, markup: JSONValue)
             do {
-                let presentation = try await bot.modelPickerPresentation("selected", menu: menu, providerId: provider.id, modelId: model.id, turn: turn)
+                presentation = try await bot.modelPickerPresentation("selected", menu: menu, providerId: provider.id, modelId: model.id, turn: turn)
                 try Task.checkCancellation()
-                try await bot.saveTelegramModelSelection(
-                    surface: "telegram",
-                    provider: provider.id,
-                    model: model.id, turn: turn
-                )
-                try await Self.defaultEditMessageTextWithReplyMarkup(
-                    token,
-                    parsed.chatId,
-                    parsed.messageId,
-                    presentation.text,
-                    presentation.markup
-                )
-                await answerRecordedCallback(parsed.callbackId, text: "Chat model set to \(model.id).", context: "model_callback_answer", update: update)
+                try await bot.saveTelegramModelSelection(surface: "telegram", provider: provider.id, model: model.id, turn: turn)
             } catch {
                 let reply = "Failed to set Telegram model: \(TurnSecretRedactor.redactText(String(describing: error)))"
                 await answerRecordedCallback(parsed.callbackId, text: reply, context: "model_callback_answer", update: update)
-                await recordError(context: "model_selection_callback_save", error: String(describing: error), update: update, message: nil, text: nil)
+                await recordError(context: "model_selection_callback_save", error: String(describing: error), update: update)
+                return true
+            }
+            do {
+                try await Self.defaultEditMessageTextWithReplyMarkup(token, parsed.chatId, parsed.messageId, presentation.text, presentation.markup)
+                await answerRecordedCallback(parsed.callbackId, text: "Chat model set to \(model.id).", context: "model_callback_answer", update: update)
+            } catch {
+                await answerRecordedCallback(parsed.callbackId, text: "Chat model saved. Could not update model menu.",
+                    context: "model_callback_answer", update: update)
+                await recordError(context: "model_menu_callback_edit", error: String(describing: error), update: update)
             }
             return true
         }
@@ -411,9 +410,6 @@ extension TelegramPollLoop {
                                 to: claim.failedBeforeAnswer ? .failedBeforeAnswer : .completed)
                             await updateInbox.pruneTerminalClaims(dataRoot: dataRoot)
                             await recordReceipt(kind: "retry_reply", update: claim.update, message: originalMessage, text: text, reply: retained.reply)
-                            if let cardId = await turnCardRestartRepairer.takeInterruptedCard(chatId: message.chatId) {
-                                try await Self.defaultDeleteMessage(token, message.chatId, cardId)
-                            }
                         case .failed(let reason), .outcomeUnknown(let reason):
                             await sendCommandReply(reason, kind: "retry_delivery_pending", update: update, message: message, text: text)
                         }
@@ -720,16 +716,29 @@ extension TelegramPollLoop {
     ) async {
         let loop = self
         // Await binding changes before admitting the next update so /new and /resume cannot resolve into the previous conversation.
-        let isStop = TelegramCommandRegistry.parse(text: text)?.definition.handler == .stop
+        let command = TelegramCommandRegistry.parse(text: text)
+        let isStop = command?.definition.handler == .stop
             || UserMessageIntentSignals.isControlHandoff(text)
-        await turnCoordinator.runCommandUntilAdmitted(destination: isStop ? nil : message.destination) { admissionReady in
+        let admitted = await turnCoordinator.runCommandUntilAdmitted(destination: isStop ? nil : message.destination) { admissionReady in
             let transferred: Bool
-            if UserMessageIntentSignals.isControlHandoff(text) {
+            let requiresSender: Bool
+            switch command?.definition.handler {
+            case .help, .sessions, .provider, .brain, .tools: requiresSender = false
+            case .persona where command?.args.isEmpty == true: requiresSender = false
+            case nil: requiresSender = UserMessageIntentSignals.isControlHandoff(text)
+            default: requiresSender = true
+            }
+            if requiresSender, !loop.isAllowlistedControl(chatId: message.chatId, fromUserId: message.fromUserId) {
+                admissionReady()
+                await loop.sendCommandReply("This is the owner's control; your Telegram sender must be allowlisted.",
+                    kind: "control_refused", update: update, message: message, text: text)
+                transferred = false
+            } else if UserMessageIntentSignals.isControlHandoff(text) {
                 await loop.handleControlHandoff(
                     update: update, message: message, text: text, admissionReady: admissionReady
                 )
                 transferred = false
-            } else if let parsed = TelegramCommandRegistry.parse(text: text),
+            } else if let parsed = command,
                       parsed.definition.handler == .resume ||
                       parsed.definition.handler == .new ||
                         (parsed.definition.name == "session" && ["new", "reset", "clear"].contains(parsed.args.first?.lowercased() ?? "")) {
@@ -763,6 +772,18 @@ extension TelegramPollLoop {
                 )
             }
             await loop.turnCoordinator.endUpdateProcessing(update.updateId)
+        }
+        if !admitted {
+            await settle {
+                do {
+                    _ = try await TelegramUpdateInbox(offsetURL: loop.offsetURL, dataRoot: loop.dataRoot).transition(
+                        updateId: update.updateId, from: [.processing], to: .pending
+                    )
+                } catch {
+                    await loop.recordError(context: "command_admission_release", error: String(describing: error), update: update)
+                }
+                await loop.turnCoordinator.endUpdateProcessing(update.updateId)
+            }
         }
     }
 }

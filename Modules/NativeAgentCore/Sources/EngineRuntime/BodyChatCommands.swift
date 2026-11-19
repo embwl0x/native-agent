@@ -247,11 +247,7 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
     public func animateMacChatMutation(_ mutation: () -> Void) { mutation() }
     public func presentMacChatTurn(_ event: MacChatTurnPresentationEvent) {
         switch event {
-        case .status(let text): SystemToastCenter.shared.push(info: text, autoDismissAfter: nil)
-        case .activity(let activity):
-            if case .notice = activity.source, let text = activity.userVisibleNoticeText, !text.isEmpty {
-                SystemToastCenter.shared.push(info: text, autoDismissAfter: nil)
-            }
+        case .status(let text): SystemToastCenter.shared.push(info: text)
         }
     }
     public func recordMacControlHandoff(text: String, reply: String, sessionId: String, turn: Turn) async throws {

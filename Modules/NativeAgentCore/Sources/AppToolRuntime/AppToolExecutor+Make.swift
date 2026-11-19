@@ -10,6 +10,8 @@ import PersistenceCore
 import Studio
 import TrustCenter
 import MemoryV2
+import Desk
+import AuthoredCapabilities
 
 // Blueprint: | `AppToolExecutor+Make.swift` | `AppToolExecutor`; Studio versions, intake and workspace-fenced reply images |
 
@@ -23,8 +25,10 @@ extension AppToolExecutor {
                 guard let ref else { return try studio.shelfPage(offset: offset) }
                 let found = try (ref.isEmpty ? studio.newestMeta() : studio.readMeta(ref))
                 guard let meta = found else {
-                    return Self.doorRefusal("unknown_ref", ref.isEmpty ? "Nothing is in Make yet." : "No Make ref is called \(ref).",
-                        remedy: "correct_route", "Read Make's shelf to choose a retained ref.", next: ["page": .string("make")])
+                    return Self.failure("unknown_ref", ref.isEmpty ? "Nothing is in Make yet." : "No Make ref is called \(ref).",
+                        extra: ["try_instead": .object(["page": .string("make")]), "remedy": .object(["kind": .string("correct_route"),
+                            "instruction": .string("Read Make's shelf to choose a retained ref."),
+                            "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("make")])])])])
                 }
                 return studio.receipt(meta)
             }.value
@@ -61,6 +65,9 @@ extension AppToolExecutor {
         let ref = input["ref"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if verb == "read" {
             return await readMake(ref: ref)
+        }
+        guard ref != MakeStudio.tableRef else {
+            return Self.failure("table_actions_required", "Change the table with table.put, table.cross or table.remove. Nothing was written.")
         }
         let path = input["path"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let file: URL
@@ -109,9 +116,10 @@ extension AppToolExecutor {
             return .object(["status": .string("ok"), "ref": .string(added.ref), "version": .int(Int64(added.version.n)),
                             "path": .string(studio.url(added.ref, added.version).path)])
         } catch let refusal as MakeStudio.Refusal {
-            return Self.doorRefusal(refusal.reason, refusal.message, remedy: "inspect",
-                "Read Make's shelf before choosing a destination; omit ref only for a new piece.",
-                next: ["page": .string("make")])
+            return Self.failure(refusal.reason, refusal.message,
+                extra: ["remedy": .object(["kind": .string("inspect"),
+                    "instruction": .string("Read Make's shelf before choosing a destination; omit ref only for a new piece."),
+                    "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("make")])])])])
         } catch {
             return Self.ownedFailure(error, code: "make_add_failed", owner: studio.root.path,
                 instruction: "Read Make's retained versions and resolve the reported storage error before adding another copy; this add was not verified.",
@@ -119,17 +127,40 @@ extension AppToolExecutor {
         }
     }
 
+    @concurrent func runTable(verb: String, input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+        let by: String
+        if case .tap? = turn.personAct?.by { by = "owner" } else { by = "agent" }
+        let result = try await SwiftToolDispatcher(dataRoot: securityCenter.dataRoot, allowProcessGlobalTools: false)
+            .tableChange(verb: verb, input: input, by: by)
+        if let crossedItem = result.objectValue?["crossed_item"]?.stringValue {
+            guard let perform = execution.perform else { return Self.failure("door_unavailable", "The Desk dispatcher is unavailable.") }
+            let tableVersion = try MakeStudio(dataRoot: securityCenter.dataRoot).readMeta(MakeStudio.tableRef)?.versions.last?.n ?? 0
+            let close: [String: JSONValue] = ["action": .string("desk.close"), "args": .object([
+                "handle": .string(crossedItem), "reason": .string("Crossed off on the table")])]
+            var hand = turn
+            if let act = turn.personAct, case .tap = act.by {
+                hand = turn.with(\.personAct, PersonAct(by: act.by, tool: "app", input: close))
+            }
+            let result = try await perform("app", close, hand, execution)
+            guard case .object(var closed) = result else { return result }
+            closed["table_change"] = .string("no_change")
+            closed["version"] = .int(Int64(tableVersion))
+            return .object(closed)
+        }
+        return result
+    }
+
     /// A job's posture ceiling is read here, at the door, from the turn's own origin. What the job makes registers in Make through `jobRegistrar`.
     @MainActor
     func runAgentJob(input: [String: JSONValue], surface: String, turn: Turn) async -> JSONValue {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let ceiling = await SwiftNativeSecurityCenter(dataRoot: root).drivenAgentLaunchPermission(
-            origin: SecurityOriginContext.currentTurn(turn: turn, surface: surface), turn: turn)
+        let origin = SecurityOriginContext.currentTurn(turn: turn, surface: surface)
+        let ceiling = await SwiftNativeSecurityCenter(dataRoot: root).drivenAgentLaunchPermission(origin: origin, turn: turn)
         // A line of the agent's carries this turn's limits: the peers steering it and its file access, so nothing reaches the agent's hands wider through a
         // line.
-        let limits = (peers: turn.peerSteering?.checkpointSources ?? [], elevated: turn.peerSteering?.elevatedSources ?? [], fileAccess: turn.fileAccess)
+        let limits = (peers: turn.peerSteering?.checkpointSources ?? [], elevated: turn.peerSteering?.elevatedSources ?? [], fileAccess: turn.fileAccessCeiling)
         return await AgentJobs.commission(input.filter { !$0.key.hasPrefix("__") }, session: turn.verifiedSessionID ?? input["__session_id"]?.scalarText,
-            surface: surface, ceiling: ceiling, limits: limits, dataRoot: root, register: Self.jobRegistrar(dataRoot: root))
+            surface: surface, ceiling: ceiling, limits: limits, origin: origin, dataRoot: root, register: Self.jobRegistrar(dataRoot: root))
     }
 
     /// The image_generate receipt's rule, generalized: only paths the native stem verified inside the job's folder reach this, and only the stem supplies

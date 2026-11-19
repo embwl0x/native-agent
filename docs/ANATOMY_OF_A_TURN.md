@@ -38,9 +38,10 @@ flowchart TD
 ## Before the message arrives
 
 `NativeContextFlowRuntime` coordinates source projections and generation
-publication. The Context module maintains an immutable generation and a bounded
-`ContextArena` containing budget/eviction descriptors, indexes and required-document
-mirrors.
+publication. The Context module maintains an immutable generation and a
+`ContextArena` containing lexical indexes and required-document mirrors, held by
+turn leases. Persona documents reach the stable segment without atomization or
+embedding.
 
 Persona, MemoryV2, skills and Desk remain the owners of their source material.
 Context is a derived working set. Full documents, skill bodies and external
@@ -80,7 +81,8 @@ or requesting a model that can acknowledge it. Reservations extend across cuts
 before first text. Relaunch rebuilds these readings outside history, whose end
 is pinned before the resumed turn's first shown input; a restored joining door
 takes the same delivered answer through admission instead of running again.
-The person's and their own untainted words may join a turn of theirs;
+The person's and their own untainted words may join a turn of theirs, except Mac
+intent arrivals, which always wait for their own turn;
 peer-steered arrivals join only a turn that same sender started under the same steering, so
 nothing rides past the floor its own turn would meet. Every arrival's
 file-access ceiling must also be held by the reading turn: an arrival with
@@ -105,7 +107,7 @@ accepted turn.
 canonical mode IDs. Assigning another mode intersects it; neither `auto` nor
 an absent binding erases an inherited restriction. `fileAccess` is its existing
 scalar control label, not a complete representation of a combined ceiling.
-Checkpoints, Desk continuations and approval continuations retain the complete
+Checkpoints, jobs, Desk continuations and approval continuations retain the complete
 value; a recorded scalar still supplies its declared restriction when no
 additional ceiling was recorded. Nothing rewrites existing saved records.
 Every arrival outside the agent's mind stream wakes attention from sleep
@@ -192,6 +194,9 @@ turn identity from them. Mac UI owners (including Send, Regenerate, Research
 Lab and local card decisions) construct the person's local envelope through
 `TurnEnvelope.personOnMac`; it never names the agent's `self`. Native part
 and helper owners name their own native origin through `native`.
+Mac Ask, Query Memory and Remember intents use `native("intent:chat")` too;
+device unlock does not prove that their words are the person's own ask.
+They cannot steer a running turn; they wait for their own turn and return its reply.
 Mac commands invoked by an existing turn retain that caller's provenance;
 the same command name cannot turn a remote caller into a local person.
 A card answer continues the card's recorded request, not the answering door's
@@ -344,8 +349,11 @@ becomes an empty successful reading or prevents unrelated recall from serving.
 The conversation's private working-memory slot is read from its existing scratch
 owner. `chat.working_memory {text:…}` replaces it; empty text clears it. It holds
 at most 1200 characters until explicitly replaced or cleared, across relaunches.
-`ConversationPrefixSeeding` prepends it only to the live provider message, after
-capturing the public sent-context evidence. The text is absent from
+`ConversationPrefixSeeding` inserts it after the last thought, body line and
+cognitive capsule, before the world/work block, only in live provider input.
+The stem holds these inner pieces outside selection and budgets. Public inner
+words lead the retained moment block; the private slot joins after that evidence
+is captured. The text is absent from
 `SentTurnContext`, replay, tool previews, traces and phone payloads; request
 measurement includes its characters. Public scratch reads exclude the reserved
 slot. Conversation-bound ephemeral requests use their verified conversation;
@@ -377,8 +385,10 @@ not confirm them), or that they changed or were removed since the context was
 prepared. Each reason speaks only for the withheld items of the source it names
 (an owner that cannot confirm anything names each source it held back), with a
 tally per reason when there are several. What is withheld does not change. An unread user core withholds
-generated USER facts and leaves `expression.established` unknown, so the seed
-does not infer a first conversation from a failed read.
+generated USER facts and leaves `expression.established` unknown, as does
+disabled recall. A successful read sets it from whether any eligible person
+facts exist, pinned or not: false adds onboarding guidance in `turn.js`.
+An empty pin selection alone does not establish a first conversation.
 
 `context.summary` records `contextFlow.semanticQueryReady=false` when the
 semantic reading was unavailable, `memory.userCoreUnavailable` for the USER
@@ -464,6 +474,19 @@ See [One door: the contract](ONE_DOOR.md) for the exact interface.
 
 ## 4. The provider request is assembled
 
+The bundled `turn.js` enters through the same sealed seed path as abilities.
+Launch replaces an untouched sealed turn with the bundle. An unsealed program
+whose body and header equal the current bundle's is the shipped seed missing
+its seal and is sealed in place; any other unsealed turn stays theirs, with the
+shipped description and source announced beside it.
+Missing-turn installation and throwing-turn recovery use that sealed bundle
+candidate too. `ability.save` revisions remove the candidate and proof, so
+adopting shipped code through their own revision stays authored. Launch logs each
+seed's resource, installed and bundled program digests (source and manifest; an unsealed copy logs its body digest) and `follows`, `theirs` or
+`beside`; unavailable selections carry their cause instead of a verdict.
+Unchanged seed installation writes nothing. Persona, guidance, memory, diary,
+Desk and settings are outside this seed path.
+
 `ChatOrchestration+StreamingToolLoop.swift` opens `TurnPart` and delivers the
 message event, the facts of the moment, read-only: `text`, the authorizing
 `surface` and the arrival `door`, `attachments`, `who` (`person`, `self` or
@@ -471,26 +494,32 @@ message event, the facts of the moment, read-only: `text`, the authorizing
 `steered_by` (the peers steering the turn) and `posture` (`full_mac`, `work`,
 `safe`, or `unreadable: <cause>`; the saved posture, which untrusted steering
 still caps to Work at each gate). The part's `Resources/abilities/turn.js` owns
-the decisions: `step(state, event)` requests the first `model.call` on every
-message, `stable(persona, pins)` assembles persona/guidance/pins, and
+the decisions: `step(state, event)` ends a thought with a standing silent no-op
+on CPU and otherwise requests the first `model.call` on a message;
+`stable(persona, pins)` assembles persona/guidance/pins, and
 `dynamic(context, recall)` orders the changing packet. `TurnPart` retains the
 system and tool offering of the first `model.call`, whenever it comes; the Swift
-loop composes them into the prepared context and re-seeds the request then. A
-turn that acts or ends before any `model.call` sends no request. Provider adapters
+loop composes them into the prepared context and re-seeds the request then,
+preserving messages appended by earlier acts and arrivals. Until then the seed
+has no wire system or text-marker catalog appendix. Text-marker layout waits
+for those segments; a model call without them fails as a provider configuration
+error. A turn that acts or ends before any `model.call` sends no request. Provider adapters
 encode the request for the selected route. Tool continuation, their own acts and
 reply-ending decisions return through `step`, rather than being prompt policy
 in the Swift helpers.
 
-The changing packet can include `# USER (pinned)`,
+The changing packet can include `# USER`,
 `# What I mean to do (mine; I do what's safe now, and raise one only when it's done, it needs someone, or I'm asked)`,
 `# Live sense news`, `# Relevant context (derived from canonical local sources)`
 and deeper-context pointers; the optional `[CognitiveSubstrate]` capsule joins
 the turn's context separately. USER carries the person's disclosure-filtered
 picture up to 6,000 UTF-8 bytes including its heading and preamble allowance:
-pinned facts first in pinned order, then the remaining person facts newest
-first. A pin changes order, never the selection to pins alone. Only facts
-that fit are precovered against recall; excess facts stay recallable. The
-stable segment carries only USER's preamble, so changing memory facts leave
+pinned person facts only, in pinned order. Only pins that fit are precovered
+against recall; unpinned person facts and excess pins compete in ordinary
+context selection by relevance to the message. The persona reader's picture
+uses the same pinned core. Generated USER.md also contains only pinned facts,
+ordered newest first. Both skip a pin that exceeds the remaining budget and
+continue considering later pins. The stable segment carries only USER's preamble, so changing memory facts leave
 its bytes and the cached history prefix alone. The intention section gives one
 bounded line per open step: its words, moment and until. Clock moments come soonest first,
 then other steps by newest update, with at most six lines and no empty section.
@@ -501,8 +530,9 @@ rest, including fixed delivery words and completion/wait instructions. Other
 steps keep bounded lines with their words, moment and until: clock moments
 soonest first, then other steps by newest update. At most six steps appear,
 with no empty section.
-A person's turn lists only the steps due on it, with a count of the rest and
-`queue.list`; their own turns list them all. User's turns and their own carry their/person-origin steps (including older
+A person's turn lists only the steps due on it; their own turns also include
+other steps. Both show at most six lines and count every omitted step beside
+`queue.list`, including due steps past six. User's turns and their own carry their/person-origin steps (including older
 `owedToPerson` steps); peer turns carry only that peer's recorded intentions,
 regardless of Trust elevation. Unidentified peer provenance discloses none.
 `ChatOrchestration+Intentions.swift` reads the live Desk owner;
@@ -527,9 +557,7 @@ the runtime retains the embedding read until settlement; pending or failed
 readings cannot select lexical recall.
 
 Explicit app previews use the recorder's same predicate to exclude their whole
-dispatch from familiarity and ambient recollection. Expansion act proposals under
-`ready_to_confirm` are excluded at every depth of result traversal; ordinary sibling
-results remain eligible. An oversized document attachment supplies selected passages,
+dispatch from familiarity and ambient recollection. An oversized document attachment supplies selected passages,
 an explicit no-match, or an unavailable selection reason. No-match and selection
 failure never substitute the document's introduction; a specific section or
 document location can be requested for the next read.
@@ -544,63 +572,63 @@ Queue conditions likewise require checked approval and conversation evidence
 before evaluating readiness. A shown home or completed Mac act keeps its real
 result if its seen/window bookkeeping fails and owes repair for that write.
 
-`AgentScreen.elsewhere` carries what changed in other rooms since their last reply
-in this one (the last hour if they have not replied here yet): the person's words
-on every other conversation and their answers there (the newest four exchanges, 280
-characters per side, older ones counted), the other conversations they are mid-turn
-in right now, the agent's newest thought (`Your own thought <age> ago (<outcome>)`,
-with up to 200 closing characters of its own prose through `ThoughtWords`), up to five completed bridge exchanges (600 characters
-per side), and up to three helpers' newest replies, newest helper first. Every
-later step of the turn, after their reply too, carries `AgentScreen.breath`: this same
-reading and rendering with the window starting at their last step, so a message they
-gets or answers on another door, a post, a thought or a bridge exchange reaches this
-line while it is still working. The same window also reads `act` experiences
-whose outcomes report `effects: occurred`, resolving their cause to the heard
-experience's exact transcript row. It excludes this conversation and helper
-sessions, and carries the newest eight as `<door> you <action> <status>`, oldest
-first, with `+N more` for the rest. A peer-steered line carries these action names
-only from person doors that the word reading admits; bridge and wake actions stay
-out. A native part call's closing dispatch can attest the mind stream without a
-heard row. Missing or unreadable act evidence names that item's gap; a failed
-word reading leaves the step's cursor unchanged. Each nonempty step reading
-records `context.breath` with
-its lines and `read` flag in the record's detail grain. A peer-steered line gets
-only door, count and time for speech. Each helper
-line names its bot-store owner as `name (my helper) since your last reply here`
-and quotes only the newest reply's first sentence, at most 200 characters. The
-same incremental transcript index reads the word sources and supplies indexed
-acts' originating rows; the transcript owner's row resolver reads unindexed
-evidence. Helpers' rooms stay out of the
-person's door timeline. This replaces reading helpers by tool just
-to learn what they last did. What they said first on one of their doors — a post of
-theirs, not a reply (a check-in summary, an intention's words) — is kept apart from
-the door lines and carried as `You posted to <person> on <door> <age> ago: "<first
-sentence>"` (door, count and time only on a turn a peer steers), so they knows what
-they already told them (10-30: an open Desk step made their believe a summary they had
-posted at 9:02 never went out). "Remember across conversations" off closes the
-whole summary. Peer-steered turns carry no helper or bridge words and no words
-from the person's other doors; a thought's closing words also stay out.
+`AgentScreen.elsewhere` carries their recent life in their own words from one
+newest-first reading of their record: `heard`, `answer`, `message`, `thought` and
+owed happenings (`returned`, `moment`, `body`). The selection excludes `world`
+and `self` happenings: perceptions reach their through `weigh` and, where present,
+Live sense news. A conversation is where they are speaking now, not a separate mind.
+The window starts at their last nonempty answer here, or an hour ago if there is
+none. Each later `AgentScreen.breath` uses the same read and renderer since their
+last step. Their current conversation is already history and is omitted. The
+Elsewhere home item opens these same rendered lines.
 
-At turn start, other conversations remain present for 24 hours: up to five compact
-lines, newest first, show the last message's time before the recent-word boundary,
-who spoke it (the agent or the other side) and its opening 600 characters, the length
-an exchange is quoted at, and `app {page:"chat",item:"<session>"}` to open the
-conversation. This read runs ahead of every first word, so each recently modified
-other transcript is read back in 64 KiB chunks from captured EOF only until a chunk
-holds an eligible message or lies wholly before the day. Imported reply times need
-not follow append order, so a whole chunk decides, never one row. An incomplete
-append waits for its newline. A contact send counts with its attested reply or the
-delivery owner's positive acceptance for that exact send; earlier delivered/read
-exchanges retain that evidence when a newer send starts. Delivered one-way notes
-count without an answer; person-authored sends do not. The mind stream is read
-through its thought owner. Helpers and their own work use this same day reading; their own
-work's words require its self-authored, unsteered source stamp. The day reading is
-moment context, never a retained summary or part of the cached prefix. Recent
-exchanges retain their existing words, and the day excludes those exchanges.
-Effected acts read from their last reply here; the life packet's exact
-experience IDs suppress duplicate action lines. Later breaths read only their
-step window. Peers retain only the existing recent person-door action names,
-door/count/time speech, and day door/time lines, with no private words.
+`ExperienceStore.conversationLife` takes one committed record snapshot. It joins
+answers to their heard causes and thoughts to `answer:<run>` within that same
+record; it never resolves speech through transcript evidence. A completed
+exchange names who asked and what they said, then their answer. A thought carries
+its mind run's answer words; empty, failed and withheld thoughts have no line.
+Each line names its door, kind and age, and open obligations remain named beside
+the exchange that owes them. Newest lines fill one 12,000-character block, with
+4,200 characters per line and up to 2,000 per quoted side. There are no per-kind
+counts or per-conversation caps on this speech stream, and no day summaries,
+helper summaries, model calls or additional store.
+
+Steering is recorded at birth in `Experience.steeredBy`, using the turn's same
+sources as transcript `untrusted_sources` / `steered_by`; clean births write
+`[]`. Happenings mirror their peers and elevated sources into that field.
+There are two disclosure rules: a peer-steered receiving turn gets speech shapes
+only (door, kind, time and exchange counts); on every turn, a row with any
+steering source or no birth stamp gets shape only, while a clean row can carry
+its words. Historical rows are not migrated or stamped by inference. Administrative repair
+and obligation births without a supplied turn stamp retain an `unrecorded`
+source, so an unknown writer is never asserted clean. Recovery
+uses the saved row's stamp, never the recovery turn's identity. Ordinary sends
+and queued sends carry their own birth stamp; their message face remains the
+send's words rather than replacing them with a recipient's reply.
+
+“Remember across conversations” still gates this whole read. The block remains
+a volatile fact in the current user message, at the existing elsewhere position;
+it does not alter the cached prefix. The separate `ThoughtWords` reader and its
+backward transcript walk are removed. Every turn's “Your last thought” comes
+from the latest clean, nonempty settled thought and its clean answer in the same
+record snapshot, including a thought before the recent-life window. Its closing
+600 characters lead the inner stream, then the body line, cognitive capsule and
+private working memory. Sessionless turns read the same thought without acquiring
+another conversation's private choice or acts. A peer-steered receiving turn
+receives no carried thought words. Missing clean words or an unavailable reading
+does not establish that they had no thought. `prior = []`
+remains: this writes neither persona nor memory and replays no mind transcript.
+
+Effected acts retain `elsewhereActs` and its existing evidence resolution. It
+reads acts since the same boundary, names the newest eight with older acts
+counted, and suppresses exact experience IDs already shown in the life packet.
+Peer-steered turns still receive act names only from person doors; bridge and
+mind acts remain withheld. Missing act evidence names its gap. The speech and
+act lines share the renderer's total character budget. A failed speech reading
+leaves the breath cursor unchanged; each nonempty breath still records
+`context.breath` with its lines and read flag. `doorLines`, `DoorIndex` and
+`otherRoomExchanges` remain for Home and contact presentation, with no role in
+the new speech reading. Their dead unsolicited-post accumulator is removed.
 
 `SwiftNativeTurnEngine.personContinuityAllowed` is the shared turn gate for the life
 packet, elsewhere words and each later breath: a person's chat/iPhone arrival,
@@ -617,44 +645,16 @@ dispatch directly attests a native act on their own unsteered mind stream even w
 no heard experience exists. Other unavailable causes remain named gaps. A complete empty
 selection has no heading or disclaimer; bounds and real read gaps still speak.
 
-`ThoughtWords` reads only a thought settled `hit` or `empty`, joining its saved run
-to the completed assistant row in `chat/messages/mind.jsonl`. One backward pass
-from a captured end of that file uses at most 64 KiB per read and retains only
-the current row's fragments. Complete rows use `ContactThread.decodeRow`; an
-incomplete trailing append is ignored, never decoded. The pass stops at the run's
-last assistant row, or its opening user row when no assistant words exist; it
-never loads and splits the whole transcript. Open, seek, short-read and decoding
-failures remain unavailable. Before sharing prose it checks every recorded
-happening, including earlier-drive references:
-any peer or elevated source withholds the words. The closing row's own steering
-stamp also withholds them. Missing or unreadable provenance, transcript or
-completion evidence is unavailable with its cause; a missing row does not prove
-silence. Zero recorded happening IDs leave earlier-drive provenance unknown and
-make the words unavailable, even when the closing row has a clean stamp.
-Failed and withheld thoughts supply no prose. The read retains at most
-600 closing characters, redacted by the transcript's secret redactor.
-
-A thought (`scope == mind`) receives the last `hit` or `empty` thought on its own
-recorded class through this same read, as a dynamic fact after history establishes
-the receiving turn's provenance. Peer-steered thoughts receive no carried prose.
-No eligible previous thought means no same-class line. Zero-ID thoughts may be
-passed over on this class only: the last readable words are labeled as such,
-beside one cause for the later gap. If none can be shared, that cause appears
-once without prose. Taint or any other unreadable evidence stops this search.
-Other rooms still name the newest thought's own unavailable evidence, never
-older words in its place.
-`prior = []` remains: this is neither history replay nor tool output, and writes
-neither persona nor memory. The class is `attended.class`, the same key used by
-the thought's no-op record. [Subconscious](SUBCONSCIOUS.md#attention) owns the
-thought record and its outcomes.
-
-### How prompt caching reduces token cost
+## How prompt caching reduces token cost
 
 The implementation separates stable system segments from dynamic material.
 Persona documents belong in the stable prefix; the changing clock and turn
 context do not. History entry pins one clock before parallel reads for facts,
 quiet hours and workspace timing. The tool loop requires that prepared context;
-the single static `app` schema keeps discovery from changing the tool array.
+the single `app` schema holds its launch hand for the process, with later done
+verbs in the volatile catalog until relaunch folds them into the door. Ability
+definition changes can redraw the held hand; discovery does not change the tool array.
+A failed later-verb inventory read adds a `catalog` gap with the trace's same cause to the volatile catalog; the door stays held.
 
 Replayed history follows the stable system material, each exchange with its
 time and each message one text block. Quiet never ends what they holds. A
@@ -680,9 +680,12 @@ to resident and helper turns.
 OpenAI OAuth routes both its `session_id` header and `prompt_cache_key` by the
 conversation id. Sessionless calls on the `workshop` surface (the morning
 brief's) share one stable cache scope across runs; other sessionless calls share a
-scope per purpose (every after-turn judgment reaches one cache node, so its
-unchanging text is cached across moments). These are routing
-hints and do not create a conversation or carry earlier task content.
+scope per purpose. After-turn judgments put their fixed frame, rules, reply
+shapes, form instructions and standing memories in the cache-marked system
+block; each moment's evidence and nonstanding recall stay in its user message.
+Promise filing keeps instructions in the system and per-call JSON in the user
+message. These are routing hints and do not create a conversation or carry
+earlier task content.
 
 This arrangement permits provider-side prefix reuse. It does not guarantee a
 cache hit or a particular latency or price reduction; those require actual
@@ -854,36 +857,12 @@ the new summaries expose the applicable boundaries without manufacturing
 historical step timings.
 
 Long tool rounds keep calls and speech intact. Only overflowing oldest result
-bodies become one-line pointers after their exact bodies are retained on disk;
+bodies become one-line pointers after retention under the shared result boundary's redaction and explicit body cap;
 resident and helper delivery share this rule and final request admission.
 
 ## 5. The model answers or requests a tool
 
-Before a fresh message's opening `model.call`, the stem asks Expansion's
-mind-and-authority practice for `start woke:<what woke the turn>`. A predicted
-read with measured-cost standing under `Expectation`, unless withheld, runs
-through the ordinary gates and reaches that first call as
-`already_looked: [{call, result}]`, under the same deadline and inline ceiling
-as follow-up delivery. It never prepares or runs an act, and does not chain
-another read at start. The actual first call labels the claim by exact read
-and argument match, delivered or unshown; no call before turn closure is a
-miss. Retries keep the read; resumed turns do not repeat it. Each settled
-claim emits the existing `expansion.check` row with situation, outcome and standing.
-
-The loop holds an `ExpansionToolDispatchClient`: opening reads are part of
-its required contract, carried through the outer file-access wrapper with
-the request's ceiling. No dispatcher type cast selects whether they run.
-Each call's result passes through `ExpansionDispatcher` inside that wrapper
-on its way back. Part thoughts wrap their restricted dispatcher in the same
-expansion owner, which excludes part callers from practice.
-Follow-up situations use verb, argument names and status word,
-plus the wake on the first call; result field lists no longer fragment
-practice. Practice persists across model changes, separately for each mind
-and authority. Record v3 folds v2 practices on load, unions situations with
-the newest bounded examples, and pools counters only for identical historical
-claim signatures. The [manifest](skill_manifest_spec.md#expansion-a-part-is-a-prediction)
-owns prediction, delivery and closure; [Surprise](SURPRISE.md) records the
-starvation evidence and source-only implementation status.
+The loop uses `ToolDispatchClient` directly through the canonical file-access, Trust, provenance and trace chain. Part thoughts use their restricted dispatcher directly. Expansion's call prediction and speculative delivery are removed. `TurnDispatchClosure.withTurn` preserves `tool.dispatch.closed` after deferred private work settles or is abandoned, and closes throwing turns through `settle`.
 
 Words for the person stream as the provider writes them, including words
 before a tool call. Mac chat, phone chat, Telegram and Slack keep those words in the
@@ -896,6 +875,14 @@ An unstarted round withdrawn for the person records `turn.proposalSkipped`
 with its call ids and names, `reason: person_arrival` and `effects: none`.
 Its completed prose stays before the arrival in context and once in the reply;
 no tool-use blocks from that proposal enter the provider conversation.
+
+The Anthropic OAuth text lane ends visible text at the parsed call boundary
+and drains the provider stream through its terminal event to retain usage.
+Requests carry no text-lane stop sequences. A transport failure after that
+boundary remains a failure; cancellation still releases the stream.
+Empty text blocks are omitted from this lane's request. Messages with no
+remaining content are omitted on the wire, retaining their source indices
+for conversation-cache boundaries; saved transcript rows are unchanged.
 
 A turn is alive exactly while its stream moves, and the person sees that
 movement as it happens. Every provider byte is movement, words or not: a
@@ -914,11 +901,11 @@ with an `app` call named by its action once the input names it. The line ends
 with the next lifecycle step (the call's dispatch, reply words, a retry). A
 phone-originated turn relays the line as its existing `notice` progress; the
 Mac card of another door's turn reads the same `stream.tick`. A resident turn
-begun on the Mac carries that line through `ChatLiveTap` and its existing live
-relay as `kind: writing`, under the turn's run id. The phone draws the working
-line on that run's bubble. Writing and unknown movement kinds never settle it;
-only an explicit terminal kind ends it. The relay coalesces unsent movement and
-an ending replaces it.
+begun on the Mac carries that line through `ChatLiveTap` and the
+[phone relay](mobile_companion.md#transport-architecture) as `kind: writing`
+under the turn's run id if the relay admitted the run. The phone draws the
+working line on that run's bubble. Only an explicit terminal kind settles the
+bubble. The relay coalesces unsent movement and an ending replaces it.
 The same presentation evidence also reaches a quiet line above another
 conversation's composer on Mac, full Shotgun and phone. The first call-writing
 or tool-start event makes it eligible; a thought with no calls stays silent
@@ -951,7 +938,8 @@ Telegram card its tool use and result, the same way. A result whose start has le
 Only their acts are steps. A wait is a state of the turn, never a step: a notice, a
 retry, a provider or network wait, thinking, stream progress, settled reply text
 and a working transition change the turn's words, phase and line, never its
-steps. A call with no words of its own takes its shown name read as an act
+steps. Mac turn activity notices use this lifecycle presentation, without toasts.
+A call with no words of its own takes its shown name read as an act
 (`Running a command`). The newest twelve steps are kept. `TurnFace.Step` carries
 the step's id (its turn and number), its words, its outcome, its start time and
 whether it is running: started, not ended, in a turn not yet terminal. The
@@ -1093,18 +1081,20 @@ A call runs beside another only when its declared class is read and its
 catalog bucket is core or file-ops; browser, Mac integration, Mac control,
 system, shell, the app door and unplaced tools run one at a time, and
 `git diff` of the working tree runs alone because it rewrites `.git/index`.
-Provider-facing results are bounded only after their complete redacted body
-is retained. `ProviderToolResultPage` and `ProviderToolResultRecoveryStore`
+Provider-facing results are bounded only after their redacted body is retained,
+up to a 4 MiB head; a longer body's stored text and reference both name the cut and omitted byte count.
+`ProviderToolResultPage` and `ProviderToolResultRecoveryStore`
 own this boundary for every tool, dispatch preview and context-overflow
-pointer (whose `saved_result_path` remains with chat after its handle is
-released). Program returns cross the helper transport whole; a script's or
+pointer in the engine root's `tool_results/`. Program returns cross the helper transport whole; a script's or
 part's journal keeps every step's answer privately for replay, and its receipt's
 `calls` show each step's identity and outcome, never its raw result (the
 [receipts law](ONE_DOOR.md#authority-and-receipts)). No helper prefix
 bypasses retention.
 
-A bounded view names `result_handle`, `full_result_retained:true` and
-`next_call`. `result.page` reads that session-and-turn-scoped handle: `page`
+A bounded view names `result_handle`, `full_result_retained` (false when a tail was cut) and
+`next_call`. `result.page` reads that handle across turns, including after relaunch. Producing
+conversations are metadata, never body scope; only an untrusted-steered turn is restricted to handles
+its own conversation produced, using the automatic-recall predicate. Other turns read any handle. `page`
 is the zero-based page offset, `raw:true` reads exact UTF-8 bytes, `pages`
 joins that many pages in one answer up to what one inline result holds (omitted,
 a read joins as many as that holds and an explicit raw read takes one; a long
@@ -1131,10 +1121,14 @@ has more (`has_more` with `next`), every page and the end of reading carry
 In sections, a value's small fields come before its bulk, so a source's own
 state never trails its content. Dispatch traces keep the bounded view's
 pointer in `receipt.result_recovery` even when their result preview is
-bounded. Handles distinguish exact content and scope; later views and
-elapsed time never overwrite or evict a live turn's output. Turn settlement
-releases its handles; expired crash leftovers have no read authority. A
-missing scope, failed retention, unavailable spill or incomplete page reports
+bounded. In-turn and standalone traces share one writer. Traces inline up to 8,000 bytes using
+the trace envelope's same constant; larger results keep this reference, never a clipped body.
+The result survives whole-row summarization, whose row allowance includes JSON escaping.
+The life packet claims a whole result only after opening its body; missing old handles keep gap words.
+Handles distinguish tool and exact content. Results stay for `ExperienceStore.detailHorizon` (14 days), pruned on store;
+only read positions belong to a turn. Every store write structurally redacts parsed values and then
+redacts text, in a 0700 folder with 0600 files. Pruning deletes the saved file too; an aged-out remedy
+directs inspection of affected state, never promises that file. Failed retention, an unavailable body or an incomplete page reports
 its own failure, never an unretained prefix or a verdict about the original
 action's effects. A retention failure keeps the complete result
 in its caller's dispatch record; model delivery marks the projection error.
@@ -1200,8 +1194,11 @@ then settles through `AfterReply`'s [owed-recording contract](SUBCONSCIOUS.md#li
 and emits terminal evidence.
 
 Every moment is judged alone. User's own turns are judged at once; every other
-recorded turn is left owed and judged when they are idle. The judgment's
-unchanging text comes first, so the provider caches it.
+recorded turn is left owed and judged when they are idle. The judgment's fixed
+policy, reply shapes, form instructions and standing memories occupy its
+cache-marked system block; exchange evidence and nonstanding recall stay in
+the user message. Promise filing likewise keeps instructions in the system
+and per-call JSON in the user message.
 Outcomes show in `mind.why` lane `interpretation`. See
 [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
 
@@ -1342,6 +1339,8 @@ records how many rounds called it, under the version that ran
 (`AbilityStore.recordRounds`, read as `learned.use.rounds_per_use`).
 Terminal execution accounting supplies each part's exact full version key to the turn's round owner, including answered verbs and nested
 scripts/batches. Each tool round counts once per version, settled on reply or interruption; another turn's last run cannot change that identity.
+The same settlement records one run of the selected turn program, including failure and Stop, through `AbilityStore.recordRun`.
+Its body digest keys versioned outcomes and `first_seen` in the shared [run accounting](skill_manifest_spec.md); part-round counts stay unchanged.
 
 Source: `ChatTurnRuntime/ChatTurnSettlement.swift`,
 `ChatOrchestration+StreamingToolLoop.swift`, `AfterReply.swift`, `PersistedToolReceipt.swift`,

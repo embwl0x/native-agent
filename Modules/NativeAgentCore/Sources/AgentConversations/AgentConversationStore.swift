@@ -10,7 +10,7 @@ import ChatTurnContracts
 import Experiences
 import TurnTrace
 import Transcripts
-// Blueprint: | `AgentConversationStore.swift` | Retained conversation identity, send evidence, queue reservations and checked mutations. |
+// Blueprint: | `AgentConversationStore.swift` | Retained conversation identity, send evidence and stamped send/queue admission |
 
 
 
@@ -106,7 +106,7 @@ public struct AgentConversationStore: Sendable {
                       replyRoute: [String: String]?, message: String? = nil,
                       personInitiated: Bool = false,
                       supersedeWaiting: Bool = false, expectsReply: Bool? = nil,
-                      reservation: String? = nil, messageID: String? = nil) throws -> AgentConversationRecord {
+                      reservation: String? = nil, messageID: String? = nil, steeredBy: [String]) throws -> AgentConversationRecord {
         if let messageID, messageID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw ToolFailureError("message_id must be a non-empty protocol message string.",
                 argumentPath: "message_id", effects: .none)
@@ -194,13 +194,13 @@ public struct AgentConversationStore: Sendable {
             row.queueReservation = nil
             if let i = rows.firstIndex(where: { $0.id == row.id }) { rows[i] = row }
             else { rows.append(row) }
-            try save(rows)
+            try save(rows, birth: (row.operationID, steeredBy))
             return row
         }
     }
 
     /// If the reply settled meanwhile, leave the send to the caller instead of queuing it.
-    public func enqueue(id: String, scopeSessionID: String, text: String, byPerson: Bool, arguments: [String: JSONValue]? = nil,
+    public func enqueue(id: String, scopeSessionID: String, text: String, byPerson: Bool, steeredBy: [String], arguments: [String: JSONValue]? = nil,
                         stillInFlight: (AgentConversationRecord) throws -> Bool) throws -> (AgentConversationRecord, AgentConversationQueued)? {
         guard !scopeSessionID.isEmpty, scopeSessionID.utf8.count <= 256 else {
             throw Failure(message: "The queued message needs its caller's conversation; nothing was queued.")
@@ -217,7 +217,7 @@ public struct AgentConversationStore: Sendable {
             item.lifeID = try DataRootLife.current(in: fileURL.deletingLastPathComponent().deletingLastPathComponent())
             rows[i].queued = (rows[i].queued ?? []) + [item]
             rows[i].updatedAt = Date()
-            try save(rows)
+            try save(rows, birth: (item.id, steeredBy))
             return (rows[i], item)
         }
     }
@@ -414,7 +414,8 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// `touch: false` (a read) moves updatedAt only when the phase or the newest reply changed, so opening a conversation never reads as news.
+    /// An edit that changes nothing writes nothing. `touch: false` (a read) moves updatedAt only when the phase or the newest reply changed, so
+    /// opening a conversation never reads as news.
     @discardableResult public func update(id: String, operationID: String, touch: Bool = true,
         edit: (inout AgentConversationRecord) throws -> Void) throws -> AgentConversationRecord {
         try locked {
@@ -429,7 +430,7 @@ public struct AgentConversationStore: Sendable {
                   rows[i].scopeSessionID == identity.scopeSessionID,
                   rows[i].operationID == operationID else { throw Failure(message: "Conversation identity cannot change.") }
             try Self.absorbExchange(into: &rows[i], file: fileURL)
-            if touch || rows[i].phase != identity.phase || rows[i].exchanges?.last?.reply != identity.exchanges?.last?.reply {
+            if touch && rows[i] != identity || rows[i].phase != identity.phase || rows[i].exchanges?.last?.reply != identity.exchanges?.last?.reply {
                 rows[i].updatedAt = Date()
             }
             if rows[i].selected {
@@ -442,6 +443,23 @@ public struct AgentConversationStore: Sendable {
             // Only the route owner can attest the reply.
             noteReplies(was: identity, now: rows[i], from: rows[i].agent)
             return rows[i]
+        }
+    }
+
+    public func handle(_ target: AgentConversationLiveTarget, conversationID: String? = nil, messageID: String? = nil,
+                       readInput: [String: JSONValue] = [:]) throws {
+        guard let id = target.recordID, let operation = target.operationID else { return }
+        try update(id: id, operationID: operation, touch: false) {
+            guard $0.phase == "sending" || $0.phase == "waiting" else {
+                throw Failure(message: "This send has already ended; its handle was not changed.")
+            }
+            if let conversationID { $0.conversationID = conversationID }
+            if let messageID, let index = $0.exchanges?.lastIndex(where: { $0.id == operation }) {
+                $0.exchanges?[index].messageID = messageID
+            }
+            if !readInput.isEmpty {
+                $0.readInput = ($0.readInput ?? [:]).merging(readInput) { _, new in new }
+            }
         }
     }
 

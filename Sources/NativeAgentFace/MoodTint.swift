@@ -79,11 +79,6 @@ final class MoodTintWeather {
 
 // MARK: - The seam the views use
 
-extension EnvironmentValues {
-    /// Apply local tint only inside the prose guard; elsewhere the window pass already warms the card and a second pass would double it.
-    @Entry var moodTintProseGuarded: Bool = false
-}
-
 enum MoodTintSpace {
     static let name = "moodTint.window"
 }
@@ -116,23 +111,8 @@ extension View {
                 )
             }
         }
-        .environment(\.moodTintProseGuarded, true)
     }
 
-    func moodTintProseGuard() -> some View {
-        background {
-            GeometryReader { geometry in
-                Color.clear.preference(
-                    key: MoodTintProseRectKey.self,
-                    value: geometry.frame(in: .named(MoodTintSpace.name)))
-            }
-        }
-        .environment(\.moodTintProseGuarded, true)
-    }
-
-    func moodTintSurface(in shape: some Shape) -> some View {
-        modifier(MoodTintSurfacePass(shape: AnyShape(shape)))
-    }
 }
 
 // MARK: - The passes
@@ -170,7 +150,7 @@ private struct MoodTintWindowPass: ViewModifier {
     }
 
     func body(content: Content) -> some View {
-        FacePreferences(keys: ["uiMoodTint"]) { preferenceContent(content) }
+        preferenceContent(content)
     }
 
     private func preferenceContent(_ content: Content) -> some View {
@@ -251,49 +231,5 @@ private struct MoodTintSampling: NSViewRepresentable {
             observer = nil
             MoodTintWeather.shared.setConsumer(id, enabled: false)
         }
-    }
-}
-
-private struct MoodTintSurfacePass: ViewModifier {
-    let shape: AnyShape
-    @FacePreference("uiMoodTint") private var enabled = true
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorSchemeContrast) private var contrast
-    @Environment(\.moodTintProseGuarded) private var inProseGuard
-
-    private var level: Double {
-        // Apply no local pass outside the prose guard because the window has already tinted that card.
-        guard inProseGuard else { return 0 }
-        return MoodTintGate.level(enabled: enabled, scheme: scheme,
-                                  reduceTransparency: reduceTransparency, contrast: contrast,
-                                  weather: MoodTintWeather.shared.level)
-    }
-
-    func body(content: Content) -> some View {
-        FacePreferences(keys: ["uiMoodTint"]) { preferenceContent(content) }
-    }
-
-    private func preferenceContent(_ content: Content) -> some View {
-        content.overlay {
-            if level > 0 {
-                // Blend through to the room behind the card; compositingGroup would isolate it.
-                shape
-                    .fill(MoodTintWeather.hue)
-                    .opacity(MoodTintWeather.cap * level)
-                    .blendMode(.color)
-                    .allowsHitTesting(false)
-            }
-        }
-    }
-}
-
-@MainActor
-enum MoodTintReadout {
-    static func line(enabled: Bool?) -> String {
-        guard let enabled else { return "Warmth in the glass: preference unavailable." }
-        guard enabled else { return "Warmth in the glass: off." }
-        let level = MoodTintWeather.shared.level
-        return "Warmth in the glass: \(Int((level * 100).rounded()))% of the cap."
     }
 }

@@ -1,12 +1,13 @@
 import AuthoredCapabilities
 import Foundation
 @preconcurrency import EventKit
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `LocalPIMStore.swift` | `LocalPIMStore`: main-actor mutations, queue-confined reads and nonisolated callbacks |
 
 public enum LocalPIMCalendarAccess { case read, write }
 
-/// Confine each action's EventKit objects to their actor or enumeration queue; export only rendered Sendable values.
+/// Each action owns its EventKit store; join off-actor occurrence reads before main-actor mutations.
 @MainActor
 final class LocalPIMStore {
     private let store = EKEventStore()
@@ -44,6 +45,29 @@ final class LocalPIMStore {
 
     func event(withIdentifier id: String) -> EKEvent? {
         store.event(withIdentifier: id)
+    }
+
+    func occurrence(of event: EKEvent, expectedStart: Date?) async throws -> EKEvent? {
+        guard event.hasRecurrenceRules || event.isDetached else { return event }
+        guard let expectedStart else { return nil }
+        try Task.checkCancellation()
+        // Keep the occurrence on the store that will save/remove it; this action awaits the read before using either.
+        let calendar: EKCalendar = event.calendar
+        let read = Task.detached(priority: .userInitiated) { [store, id = event.eventIdentifier] () throws -> EKEvent? in
+            try Task.checkCancellation()
+            // Calendar rows carry starts at whole-second precision.
+            let predicate = store.predicateForEvents(withStart: expectedStart.addingTimeInterval(-1),
+                end: expectedStart.addingTimeInterval(1), calendars: [calendar])
+            return store.events(matching: predicate).first { occurrence in
+                guard let start = occurrence.startDate else { return false }
+                return occurrence.eventIdentifier == id && abs(start.timeIntervalSince(expectedStart)) < 1
+            }
+        }
+        return try await withTaskCancellationHandler {
+            let occurrence = try await settle { await read.result }.get()
+            try Task.checkCancellation()
+            return occurrence
+        } onCancel: { read.cancel() }
     }
 
     func reminder(withIdentifier id: String) -> EKReminder? {

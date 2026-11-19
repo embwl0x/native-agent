@@ -10,7 +10,7 @@ import PersistenceCore
 import StandingBots
 import TurnTrace
 
-// Blueprint: | `AgentConversationWaiting.swift` | Waits preserve checked approval and restart evidence. |
+// Blueprint: | `AgentConversationWaiting.swift` | Checked waits and restart reads settle sends from retained handles or their restart cause. |
 extension AgentConversationSession {
     private static let approvalWaitFailureCode = "agent_conversation_approval_unavailable"
     /// Admission precedes the caller's documented retrieval wait; expiry returns evidence without settling execution.
@@ -185,11 +185,12 @@ extension AgentConversationSession {
         guard row.phase == "waiting", case .object(let receipt)? = row.receipt else { return false }
         return receipt["background_send"] == .bool(true)
     }
-    /// Before resuming queues, settle sends begun before this process as interrupted; restart never authorizes resending.
-    static func settleInterrupted(dataRoot: URL) throws {
+    static func settleInterrupted(dataRoot: URL,
+        read: (AgentConversationRecord, AgentPeerContact) async throws -> JSONValue) async throws {
         let store = AgentConversationStore(dataRoot: dataRoot)
         let running = AgentConversationRunning.shared
-        let desktop = Set(try AgentPeerStore(dataRoot: dataRoot).list().filter { $0.transport == .desktop }.map { "peer:" + $0.id })
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
+        let desktop = Set(peers.filter { $0.transport == .desktop }.map { "peer:" + $0.id })
         func orphaned(_ row: AgentConversationRecord) throws -> Bool {
             if backgroundSend(row) { return !running.routeWatching(row: row.id, operation: row.operationID) }
             guard ownerless(row) else { return false }
@@ -197,13 +198,67 @@ extension AgentConversationSession {
             if row.phase == "waiting" { return desktop.contains(row.agent) && !running.routeWatching(row: row.id, operation: row.operationID) }
             return try row.phase == "sending" || unsettledAttentionChecked(row, dataRoot: dataRoot) && !awaitingApproval(row)
         }
-        // An old row keeps its time (a phase change still moves it); the agent is told, in the chat that sent it, what the restart did to its send.
-        for row in try store.records() {
+        let rows = try store.records()
+        let newest = Dictionary(rows.compactMap { row in row.operationStartedAt.map { (row.agent, $0) } }, uniquingKeysWith: { max($0, $1) })
+        func reached(_ row: AgentConversationRecord) {
+            guard row.agent.hasPrefix("peer:"), let started = row.operationStartedAt, newest[row.agent] == started else { return }
+            AgentPeerStore(dataRoot: dataRoot).clearUnavailable(peerID: String(row.agent.dropFirst(5)), since: started)
+        }
+        for row in rows {
             do {
+                let peer = peers.first { "peer:" + $0.id == row.agent && AgentConversationStore.sameRoute(row.peerRouteFingerprint, $0) }
+                if let peer, [.a2a, .nativeAgent].contains(peer.transport), let input = row.readInput,
+                   (peer.transport == .a2a ? string(input["task_id"]) != nil
+                    : string(input["message_id"]) != nil && string(input["conversation_id"]) != nil),
+                   try orphaned(row) || ownerless(row) && row.phase == "waiting" && row.automaticRead {
+                    _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
+                        guard try orphaned($0) || ownerless($0) && $0.phase == "waiting" && $0.automaticRead else { return }
+                        if $0.phase == "sending" {
+                            $0.receipt = .object(["status": .string("waiting"), "sent": .null, "completed": .bool(false),
+                                "delivery": .string("unconfirmed")])
+                        } else if case .object(var fields)? = $0.receipt {
+                            fields["background_send"] = nil; $0.receipt = .object(fields)
+                        }
+                        $0.phase = "waiting"; $0.automaticRead = true; $0.nextReadAt = Date()
+                    }
+                    reached(row)
+                    continue
+                }
                 guard try orphaned(row) else { continue }
+                reached(row)
+                let exchange = row.exchanges?.last(where: { $0.id == row.operationID })
+                let cause = peer?.transport == .acp || peer?.transport == .mcpHost
+                    ? "The app restarted while \(row.name) was answering and its run ended with it."
+                    : "The app restarted and stopped watching for \(row.name)'s answer, which can no longer be read here."
+                var receipt: JSONValue = .object(["status": .string("failed"), "sent": .null, "delivery": .string("failed"),
+                    "completed": .bool(false), "terminal": .bool(true), "detail": .string(
+                        cause + "\nYou sent:\n" + (exchange?.prompt ?? "The sent words were not retained.")
+                        + "\nNothing was resent.")])
+                if let peer, peer.transport == .acp, row.conversationID != nil {
+                    let replay: JSONValue?
+                    do { replay = try await read(row, peer) }
+                    catch is CancellationError { throw CancellationError() }
+                    catch { replay = nil }
+                    try Task.checkCancellation()
+                    if let replay, case .object(let fields) = replay, !readRefused(replay),
+                       let exchange, let prompt = exchange.prompt, !prompt.isEmpty, let replayedPrompt = string(fields["prompt"]),
+                       replayedPrompt.hasSuffix(prompt) || exchange.promptTruncated && replayedPrompt.hasPrefix(prompt) {
+                        if let text = AgentConversationExchange.answer(fields).text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            receipt = try await store.retainReply(replay, for: row)
+                            _ = try record(receipt, for: row, store: store, peer: peer, background: backgroundSend(row))
+                        } else {
+                            receipt = .object(["status": .string("failed"), "sent": .null, "delivery": .string("delivered"),
+                                "completed": .bool(false), "terminal": .bool(true), "detail": .string("""
+                                    \(row.name) received your message: its session shows it. The app restarted before it answered, and \
+                                    its run ended with it.\nYou sent:\n\(prompt)\nNothing was resent. The message is in \(row.name)'s \
+                                    session: ask it to continue in this conversation instead of sending the message again.
+                                    """)])
+                        }
+                    }
+                }
                 _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
-                    guard try orphaned($0) else { return }
-                    interrupted(&$0)
+                    if try orphaned($0) { absorb(receipt, into: &$0) }
+                    guard $0.phase != "sending", $0.phase != "waiting" else { return }
                     if $0.agent.hasPrefix("peer:"), $0.personInitiated != true {
                         $0.deliveryState = "delivering"; $0.automaticRead = true; $0.nextReadAt = Date()
                     }
@@ -213,59 +268,11 @@ extension AgentConversationSession {
                 nativeLog("Conversation %@ remains held: %@", row.id, failure.localizedDescription)
             }
         }
-        // An interrupted newest send may clear only an unavailable mark written since it began; newer genuine faults remain.
-        let peers = AgentPeerStore(dataRoot: dataRoot)
-        let newest = try Dictionary(store.records().filter { $0.agent.hasPrefix("peer:") }
-            .map { row -> (String, (row: AgentConversationRecord, startedAt: Date)) in
-                guard let startedAt = row.operationStartedAt else {
-                    throw AgentConversationStore.Failure(
-                        message: "Conversation \(row.id) has no operation start time; repair its retained evidence before ordering interrupted sends.")
-                }
-                return (row.agent, (row: row, startedAt: startedAt))
-            }) {
-                a, b in a.startedAt >= b.startedAt ? a : b
-            }
-        for (agent, send) in newest {
-            guard case .object(let receipt)? = send.row.receipt, receipt["status"] == .string("interrupted") else { continue }
-            peers.clearUnavailable(peerID: String(agent.dropFirst(5)), since: send.startedAt)
-        }
     }
     /// Use process start time as well as liveness: a current send can briefly precede its live registration.
     static func ownerless(_ row: AgentConversationRecord) -> Bool {
         row.operationStartedAt.map { $0 < AbandonedTurnReconciler.processEpoch } == true
             && !AgentConversationRunning.shared.live(row: row.id, operation: row.operationID)
-    }
-    /// Process exit ends the local turn without proving a reply or authorizing a resend. Only an owner seen dead may say the work ended; the
-    /// restart sees none, and the other agent may still be working on it (a separate gateway can carry accepted work on), so a resend could
-    /// run it twice.
-    package static func restartDetail(_ name: String) -> String {
-        "The app restarted while this was in flight to \(name). It may have reached \(name), and \(name) may still be working on it; if \(name) "
-            + "answers, the answer arrives in this conversation. Nothing was resent."
-    }
-    /// A sending row still holds its previous receipt and needs a fresh interruption receipt. Preserve other sends’ locators: remote work may finish after
-    /// the local wait ends.
-    static func interrupted(_ row: inout AgentConversationRecord) {
-        guard row.phase != "sending", case .object(var root)? = row.receipt else {
-            var fields: [String: JSONValue] = ["status": .string("interrupted"), "completed": .bool(false),
-                "detail": .string(restartDetail(row.name))]
-            if let conversation = row.conversationID { fields["conversation_id"] = .string(conversation) }
-            absorb(.object(fields), into: &row)
-            return
-        }
-        let detail = row.phase == "attention"
-            ? """
-                An app restart ended this app's wait for \(row.name)'s reply; \(row.name) may still be working on it. Nothing was resent; if the \
-                reply comes, it still arrives here when this conversation is read.
-                """
-            : restartDetail(row.name)
-        func settle(_ fields: inout [String: JSONValue]) {
-            fields["status"] = .string("interrupted")
-            if fields["run_status"] != nil { fields["run_status"] = .string("interrupted") }
-            fields["completed"] = .bool(false)
-            fields["detail"] = .string(detail)
-        }
-        settle(&root)
-        absorb(.object(root), into: &row)
     }
     /// Unknown dispatched outcomes fence the thread while their call is live; executable approvals fence it until terminal evidence or explicit
     /// cancellation. This projection cannot replace the checked approval owner used by executable waits.

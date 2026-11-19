@@ -20,10 +20,23 @@ full reply string. On macOS 27, the Ask intent adopts `LongRunningIntent`
 and uses `performBackgroundTask`; earlier systems call the same reply method
 directly.
 
+Ask, Query Memory and Remember share the native local envelope `intent:chat`
+(`agent: "self"`), because Siri and Shortcuts cannot prove the person is speaking.
+Their words cannot decide a lever, setting raise or owner-only change as the
+person's own ask. Under Full Mac a lever a card can carry is theirs, unless an untrusted voice steers the turn;
+below Full Mac those calls require the person's card, and Safe refuses. Reads and replies use
+the same chat path. These arrivals cannot steer a running turn: they wait for
+their own turn and return its full reply, including when the conversation is busy.
+
 The source also defines Status, Doctor, Approvals, Desk Task, Query Memory,
 Remember and Pending Memory Proposals intents. The App Shortcuts list includes
 Ask Your Agent and these actions except Desk Task. The duplicate Ask NativeAgent
 intent and its separate shortcut registration are removed.
+
+Ask Your Agent and Create NativeAgent Desk Task use `requiresAuthentication`.
+On macOS, a locked device requires unlock unless the request originates on an
+authenticated remote device; an unlocked device needs no fresh prompt.
+See [Apple's policy](https://developer.apple.com/documentation/appintents/intentauthenticationpolicy/requiresauthentication).
 
 ## iPhone and iPad
 
@@ -83,6 +96,12 @@ admission and busy-session queueing.
 1. Open Shortcuts → App Shortcuts → NativeAgent. Confirm Ask Your Agent offers
    the current name. Invoke one named phrase, supply a brief message, and check
    the reply and the conversation it continued.
+   With the Mac locked and no authenticated remote origin, invoke Ask from
+   Shortcuts: it must request unlock before running. Cancel and confirm no message was submitted.
+   On an unlocked Mac, run an Ask shortcut requesting a setting raise: it must
+   raise a card without changing the setting. A question must return its normal reply.
+   Repeat the raise while a person-started turn is running: the intent must wait
+   for its own turn and raise its card, returning that turn's reply.
 2. For an existing benign pending approval, use its banner's Approve or Deny
    action and inspect the decision in Approvals. Do not change Trust solely to
    manufacture a banner.

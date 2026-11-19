@@ -33,14 +33,14 @@ extension REMConsolidator {
     private static func evictionRange(
         in body: String, proposalRows: [REMProposalRow]
     ) -> (range: Range<String.Index>, slice: String)? {
-        if body.count <= REMConstants._REM_GROWTH_CHAR_CAP { return nil }
-
         // Only exact approved paragraphs establish evictable boundaries.
         let approvedRows = proposalRows
             .filter { $0.status == "approved" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
         let lessons = Set(approvedRows.map { $0.proposalText.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }.flatMap { REMGrowthWriter.entryParagraphRanges(body, $0) })
             .sorted { $0.lowerBound == $1.lowerBound ? $0.upperBound > $1.upperBound : $0.lowerBound < $1.lowerBound }
+        // Admit eviction by approved source size, before distillation; authored text cannot spend these lessons' retention allowance.
+        guard lessons.map({ String(body[$0]) }).joined().count > REMConstants._REM_APPROVED_GROWTH_CHAR_CAP else { return nil }
         guard var range = lessons.first else { return nil }
         // Keep one recoverable contiguous passage; authored text ends selection and only whitespace may join approved paragraphs.
         for next in lessons.dropFirst() {

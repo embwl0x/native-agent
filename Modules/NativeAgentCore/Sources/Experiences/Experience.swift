@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import os
-// Blueprint: | `Experience.swift` | `ExperienceStore`: append-only experiences, obligations, checked projections and write-fed changes |
+// Blueprint: | `Experience.swift` | `ExperienceStore`: append-only experiences, newest-first conversation life, obligations and write-fed changes |
 
 
 /// Keep births and changes in one experience store, validating each transaction through the same law.
@@ -64,7 +64,7 @@ public actor ExperienceStore {
         }
     }
 
-    /// Queue records per experience without retry; persistence failures create gaps, while law refusals leave exact history intact.
+    /// Queue records per experience without retry; only persistence failures create gaps.
     /// Join recording and gap accounting before retiring work so recording itself never throws into the producing result.
     @discardableResult
     public static func record(_ dataRoot: URL, _ id: String,
@@ -78,8 +78,7 @@ public actor ExperienceStore {
                 do { try await write(store) } catch let refused as LawError {
                     log("experience write refused: %@", refused.localizedDescription)
                 } catch {
-                    log("experience gap: %@", error.localizedDescription)
-                    await store.failed(error)
+                    log("experience write failed: %@", error.localizedDescription)
                 }
                 pending.withLock { if $0[key]?.token == token { $0[key] = nil } }
             }
@@ -133,7 +132,8 @@ public actor ExperienceStore {
         }
     }
     private func changed() { for observer in observers.values { observer.yield(()) } }
-    func failed(_ error: Error) {
+    func committed() { guard gap != nil else { return }; gap = nil; changed() }
+    func failed(_ error: DatabaseError) {
         guard gap != error.localizedDescription else { return }
         gap = error.localizedDescription
         changed()
@@ -146,7 +146,7 @@ public actor ExperienceStore {
     /// A repeated birth cannot create another experience.
     @discardableResult
     public func begin(_ new: Experience) throws -> Bool {
-        let inserted = try database().write { db -> Experience? in
+        let inserted = try write { db -> Experience? in
             if let born = try String.fetchOne(db, sql: "SELECT born FROM experience WHERE id = ?", arguments: [new.id]) {
                 var existing = try Self.decoder.decode(Experience.self, from: Data(born.utf8))
                 var proposed = new
@@ -179,7 +179,7 @@ public actor ExperienceStore {
 
     /// Validate every post-birth change through the same law.
     public func append(_ changes: [Change], to id: String) throws {
-        let moved = try database().write { try Self.append(changes, to: id, in: $0) }
+        let moved = try write { try Self.append(changes, to: id, in: $0) }
         guard let moved else { return }
         changed()
         wrote(moved)
@@ -208,7 +208,7 @@ public actor ExperienceStore {
         let detail = Detail(source: Attention.detailSource, at: Date(), subject: batch.route, kind: Attention.batchEndKind,
             row: try Self.encoder.encode(end), once: Attention.batchEndKind + ":" + batch.deliveryID)
         guard detail.row.count <= Self.maxRowBytes else { throw DetailError.tooLarge(detail.kind, detail.row.count) }
-        let moved = try database().write { db -> [Experience] in
+        let moved = try write { db -> [Experience] in
             guard let row = try Row.fetchOne(db, sql: "SELECT * FROM detail WHERE once = ?", arguments: [batch.deliveryID]),
                   row["source"] as String == Attention.detailSource, row["kind"] as String == Attention.batchKind,
                   row["subject"] as String == batch.route,
@@ -279,6 +279,42 @@ public actor ExperienceStore {
                                   ORDER BY experience.at DESC, experience.rowid DESC LIMIT ?)
                 """, arguments: pageArguments, order: "experience.at DESC, experience.rowid DESC")
             return (total, page.experiences, page.unreadable)
+        }
+    }
+
+    public func conversationLife(in conversation: String?, since step: Date?, through now: Date) throws -> (since: Date, rows: Folded) {
+        try readRecorded { db in
+            let end = NativeTimestampFormat.fractionalZulu(now)
+            let reply = try String.fetchOne(db, sql: """
+                SELECT MAX(at) FROM experience WHERE kind = 'answer' AND at <= ?
+                  AND json_extract(born, '$.face.words') != ''
+                  AND EXISTS (SELECT 1 FROM json_each(born, '$.addressedTo') WHERE value = ?)
+                """, arguments: [end, conversation.map { "conversation:" + $0 }])
+            let since = step ?? reply.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) ?? now.addingTimeInterval(-3600)
+            let rows = try Self.foldReadable(db, matching: """
+                experience.id IN (
+                    WITH recent AS (
+                        SELECT id, kind, born FROM experience WHERE at > ? AND at <= ?
+                          AND kind IN ('heard', 'answer', 'message', 'thought', 'happening')
+                        UNION
+                        SELECT id, kind, born FROM experience WHERE id = (
+                            SELECT t.id FROM experience t JOIN experience a ON a.id = 'answer:' || json_extract(t.born, '$.thought.run')
+                            WHERE t.kind = 'thought' AND t.at <= ?
+                              AND json_extract(t.born, '$.outcome.status') IN ('hit', 'empty')
+                              AND json_extract(t.born, '$.steeredBy') = '[]' AND json_extract(a.born, '$.steeredBy') = '[]'
+                              AND json_extract(a.born, '$.face.words') != ''
+                            ORDER BY t.at DESC, t.rowid DESC LIMIT 1)
+                    )
+                    SELECT id FROM recent
+                    UNION SELECT value FROM recent, json_each(recent.born, '$.cause') WHERE recent.kind = 'answer'
+                    UNION SELECT 'answer:' || json_extract(born, '$.thought.run') FROM recent WHERE kind = 'thought'
+                )
+                AND (experience.kind != 'happening'
+                     OR (json_extract(experience.born, '$.happening.kind') IS NOT 'world'
+                         AND json_extract(experience.born, '$.happening.kind') IS NOT 'self'))
+                """, arguments: [NativeTimestampFormat.fractionalZulu(since), end, end],
+                order: "experience.at DESC, experience.rowid DESC")
+            return (since, rows)
         }
     }
 
@@ -422,7 +458,7 @@ public actor ExperienceStore {
         public var unreadable: [Unreadable] = []
     }
 
-    /// A birth that will not decode; not a law refusal, so a write that meets it records a gap as before.
+    /// A birth that will not decode, named by its id and failed field.
     public struct UnreadableBirth: Error, LocalizedError, Sendable {
         public let id: String
         public let detail: String
@@ -587,6 +623,7 @@ public actor ExperienceStore {
             }
             try db.execute(sql: Self.detailSchema)
         }
+        committed()
         // Planner statistics improve reads but are not required for record correctness.
         do { try pool.writeWithoutTransaction { try $0.execute(sql: "PRAGMA optimize=0x10002") } }
         catch { Self.log("experience planner statistics unavailable: %@", error.localizedDescription) }

@@ -22,7 +22,7 @@ import CoreML
 public protocol EmbeddingProvider: Sendable {
     var dimensions: Int { get }
     var modelId: String { get }
-    var embeddingEpoch: MemoryEmbeddingEpoch { get }
+    var embeddingEpoch: MemoryEmbeddingEpoch { get throws }
     func embed(_ texts: [String]) async throws -> [[Float]]
     func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
     func embedItemsWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingItemBatch
@@ -41,7 +41,7 @@ public extension EmbeddingProvider {
     }
 
     func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
-        MemoryEmbeddingBatch(epoch: embeddingEpoch, vectors: try await embed(texts))
+        MemoryEmbeddingBatch(epoch: try embeddingEpoch, vectors: try await embed(texts))
     }
 }
 
@@ -106,23 +106,17 @@ public struct FailClosedEmbeddingProvider: EmbeddingProvider {
 
 
     public var embeddingEpoch: MemoryEmbeddingEpoch {
-        MemoryEmbeddingEpoch(
-            backend: "fail-closed",
-            modelID: modelId,
-            modelArtifactDigest: "unavailable",
-            tokenizerArtifactDigest: "unavailable",
-            preprocessing: "unavailable",
-            pooling: "unavailable",
-            normalization: "unavailable",
-            dimensions: dimensions,
-            maximumSequenceLength: nil
-        )
+        get throws { throw unavailable }
+    }
+
+    private var unavailable: ToolFailureError {
+        MemoryStorageError.searchFailure("The memory search model is unavailable.",
+            code: "memory_search_model_unavailable",
+            instruction: "Tell the person: NativeAgent's bge-large-en-v1.5 search model is unavailable; read Doctor for the model file and failure.")
     }
 
     public func embed(_ texts: [String]) async throws -> [[Float]] {
-        throw MemoryStorageError.searchFailure("The memory search model is unavailable.",
-            code: "memory_search_model_unavailable",
-            instruction: "Tell the person: NativeAgent's bge-large-en-v1.5 search model is unavailable; read Doctor for the model file and failure.")
+        throw unavailable
     }
 }
 
@@ -271,7 +265,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             modelID: modelID,
             modelArtifactDigest: modelArtifactDigest,
             tokenizerArtifactDigest: tokenizerDigest,
-            preprocessing: "wordpiece-v3;lowercase=true;unicode=nfc;accents=nfd-strip-mn;whitespace=space;controls=strip;punctuation=split;cjk=split",
+            preprocessing: "wordpiece-v4;lowercase=true;unicode=nfc;accents=nfd-strip-mn;whitespace=space;"
+                + "controls=bert;units=scalars;punctuation=split;cjk=split",
             pooling: "attention-mask-mean-or-model-pooled",
             normalization: "l2",
             dimensions: dimensions,

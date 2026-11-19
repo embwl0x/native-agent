@@ -119,14 +119,17 @@ public struct OrganBody: Sendable, Equatable {
 
     /// The app installs the body read where it installs pulse recording (BackgroundLoops owns the records; lower targets cannot import it).
     public static func install(_ read: @escaping @Sendable (Date) async throws -> OrganBody) {
-        reader.withLock { $0 = read }
+        reader.withLock { $0 = Reader(read: read) }
     }
 
     /// The body now; nil until the read is installed. A missing read is no body, never a quiet one; a failed read throws.
     public static func read(now: Date = Date()) async throws -> OrganBody? {
         guard let read = reader.withLock({ $0 }) else { return nil }
-        return try await read(now)
+        return try await read.read(now)
     }
 
-    private static let reader = Mutex<(@Sendable (Date) async throws -> OrganBody)?>(nil)
+    private struct Reader: Sendable {
+        let read: @Sendable (Date) async throws -> OrganBody
+    }
+    private static let reader = Mutex<Reader?>(nil)
 }

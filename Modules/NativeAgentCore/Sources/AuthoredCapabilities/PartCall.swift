@@ -129,10 +129,31 @@ extension PartFace {
                     throw PartCallError(code: "bad_face", message: "A section holds rows or a block, never both.")
                 }
                 let block = try object(block, keys: ["kind", "key", "text", "format", "language", "copy", "leaf", "ref", "alt",
-                                                      "fields", "submit", "revision", "protected", "receiver", "doors"])
+                                                      "fields", "submit", "revision", "protected", "receiver", "doors", "cards", "choices"])
                 guard case .string(let kind)? = block["kind"], !kind.isEmpty,
                       case .string(let key)? = block["key"], !key.isEmpty else {
                     throw PartCallError(code: "bad_face", message: "A block has nonempty kind and key strings.")
+                }
+                if let cards = block["cards"] {
+                    guard kind == "leaf", block["leaf"] == .string("board"), case .object(let entries) = cards,
+                          entries.values.allSatisfy({ if case .object = $0 { true } else { false } }) else {
+                        throw PartCallError(code: "bad_face", message: "Board cards are live fact objects keyed by element id.")
+                    }
+                }
+                if let choices = block["choices"] {
+                    guard kind == "leaf", block["leaf"] == .string("board"), block["ref"] == .string("table") else {
+                        throw PartCallError(code: "bad_face", message: "Card choices belong to the Desk table.")
+                    }
+                    var ids = Set<String>()
+                    for choice in try list(choices, at: 200, "card choices") {
+                        let entry = try object(choice, keys: ["id", "label", "detail", "item", "piece"])
+                        guard let id = entry["id"]?.stringValue, !id.isEmpty, ids.insert(id).inserted,
+                              let label = entry["label"]?.stringValue, !label.isEmpty, entry["detail"]?.stringValue != nil,
+                              (entry["item"] == nil) != (entry["piece"] == nil),
+                              let target = (entry["item"] ?? entry["piece"])?.stringValue, !target.isEmpty else {
+                            throw PartCallError(code: "bad_face", message: "A card choice has an id, label, detail and one item or piece reference.")
+                        }
+                    }
                 }
                 if let text = block["text"] {
                     guard case .string(let text) = text, documentRead || text.utf8.count <= Block.inlineByteLimit else {

@@ -236,7 +236,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
                             return runtime.effectiveBackend != ManagedEmbeddingProvider.failClosedBackend
                                 && runtime.coreMLLoaded
                         },
-                        embeddingEpoch: { await memory.embeddingEpoch() },
+                        embeddingEpoch: { try await memory.embeddingEpoch() },
                         embed: { try await memory.embedForDerivedContextWithEpoch($0) },
                         embedQuery: { try await memory.embedQueriesWithEpoch($0) })
                 },
@@ -245,8 +245,12 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
                     guard let batch = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).embedIfWarmWithEpoch(texts) else { return nil }
                     return CognitiveEmbeddingBatch(epoch: batch.epoch.rawValue, vectors: batch.vectors)
                 },
-                embeddingEpoch: { await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).warmEmbeddingEpoch() },
-                peerTrusted: { PeerTrust.ownerTrusts($0, dataRoot: root) },
+                embeddingEpoch: { try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).warmEmbeddingEpoch() },
+                trustedPeers: { peers in
+                    guard !peers.isEmpty else { return [] }
+                    let trust = PeerTrust.read(peers, dataRoot: root)
+                    return Set(peers.filter { trust.ownerTrusts($0) })
+                },
                 carePersonAliases: {
                     try AgentContactIdentity(dataRoot: root, peers: AgentPeerStore(dataRoot: root).list()).aliases
                 },

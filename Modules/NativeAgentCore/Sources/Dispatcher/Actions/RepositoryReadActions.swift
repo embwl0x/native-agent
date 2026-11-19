@@ -27,7 +27,9 @@ extension FileReadSourceMaterial {
                 command.insert(contentsOf: ["--no-ext-diff", "--no-textconv"], at: 2 + FileSystemActions.gitReadOnlyConfigOverrideArgs.count)
             }
         }
-        return (["-p", FileSystemActions.gitReadOnlySandboxProfile(ctx)] + command,
+        let profile = FileSystemActions.gitReadOnlySandboxProfile(ctx,
+            denyingReadRoots: MacControlSensitivePathFence.credentialRoots(dataRoot: dataRoot))
+        return (["-p", profile] + command,
                 FileSystemActions.gitReadOnlyEnvironment)
     }
 }
@@ -527,7 +529,8 @@ extension FileSystemActions {
         if staged { args.append("--staged") }
         if !pathFilter.isEmpty { args.append(contentsOf: ["--", pathFilter]) }
 
-        let run = runGit(args, cwd: cwd, timeout: 30, label: "git diff", context: ctx, okStatuses: [0, 1])
+        let run = runGit(args, cwd: cwd, timeout: 30, label: "git diff", context: ctx, okStatuses: [0, 1],
+            captureByteLimit: 16 * 1024 * 1024)
         if case .failure(let f) = run { return f }
         guard case .success(let result) = run else { return errResult("git diff failed", code: "git_unavailable") }
         return .object([
@@ -554,7 +557,7 @@ extension FileSystemActions {
         let pathFilter = input["path"]?.stringValue ?? ""
         if !pathFilter.isEmpty { args += ["--", pathFilter] }
 
-        let run = runGit(args, cwd: cwd, timeout: 15, label: "git log", context: ctx)
+        let run = runGit(args, cwd: cwd, timeout: 15, label: "git log", context: ctx, captureByteLimit: 16 * 1024 * 1024)
         if case .failure(let f) = run { return f }
         guard case .success(let result) = run else { return errResult("git log failed", code: "git_unavailable") }
 
@@ -685,20 +688,6 @@ extension FileSystemActions {
         FileManager.default.isExecutableFile(atPath: "/usr/bin/git") ? "/usr/bin/git" : nil
     }
 
-    /// Unset command-bearing variables entirely; empty values can still select executable behavior.
-    static let gitReadOnlyEnvironmentRemovals: [String] = [
-        "GIT_EXTERNAL_DIFF",
-        "GIT_PAGER",
-        "GIT_SSH",
-        "GIT_SSH_COMMAND",
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "GIT_EDITOR",
-        "GIT_SEQUENCE_EDITOR",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-    ]
-
     /// Override repository-controlled execution: diff/textconv drivers, fsmonitor, hooks and pager cannot run on reads.
     static let gitReadOnlyConfigOverrideArgs: [String] = [
         "--no-pager",
@@ -710,16 +699,14 @@ extension FileSystemActions {
         "-c", "protocol.ext.allow=never",
     ]
 
-    /// Merge read-only overrides with the inherited environment; Process.environment replaces the whole environment.
+    /// Git receives the named child environment and its read-only overrides.
     static var gitReadOnlyEnvironment: [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        ManagedProcess.agentEnvironment()
             .merging(gitReadOnlyEnvironmentOverrides) { _, override in override }
-        for key in gitReadOnlyEnvironmentRemovals { env.removeValue(forKey: key) }
-        return env
     }
 
     /// Confine children at execution so conversion, submodules or concurrent config changes cannot expand read authority.
-    static func gitReadOnlySandboxProfile(_ ctx: ConnectorActionContext) -> String {
+    static func gitReadOnlySandboxProfile(_ ctx: ConnectorActionContext, denyingReadRoots: [URL] = []) -> String {
         func quoted(_ path: String) -> String {
             "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"") + "\""
@@ -772,6 +759,10 @@ extension FileSystemActions {
             "/" + foldedPattern("catalog/.pack_signing_key") + "[^/]*(/|$)",
         ] {
             rules.append("(deny file-read-data (regex \(quoted("^" + dataPattern + suffix))))")
+        }
+        for root in denyingReadRoots {
+            let path = NativeAgentWorkspaceRoot.canonicalFileURL(root).path
+            rules.append("(deny file-read-data (regex \(quoted("^" + foldedPattern(path) + "(/|$)"))))")
         }
         return rules.joined(separator: "\n")
     }

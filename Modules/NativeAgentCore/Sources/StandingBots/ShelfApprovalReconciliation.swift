@@ -27,7 +27,7 @@ extension ShelfStore {
                 """)
         }
         if status == "pending" { return entry }
-        guard ["resolved", "denied", "canceled", "orphaned"].contains(status) else {
+        guard status == "resolved" else {
             throw StandingBotsError.corruptStore("""
                 Approval \(approvalID) has unsupported state \(status); repair the approval record before settling the helper result.
                 """)

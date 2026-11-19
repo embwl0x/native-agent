@@ -350,6 +350,9 @@ extension SwiftNativeMacControl {
         if let refusal = continuation?.refusal(context: context) {
             return refuse("continuation_unavailable", refusal)
         }
+        var validationOpened = false
+        var pressed = false
+        func pressValidated() async -> MacControlResult {
         // After a raise, enabled states may still reflect background validation. Opening the menu revalidates them; reread before pressing and close on
         // refusal.
         if requireFront, !target.enabled, let top = item.path.first,
@@ -361,7 +364,7 @@ extension SwiftNativeMacControl {
             let validation = MacWaitSignals(effects: effectObserverSource,
                 activation: defaultMacAppActivationObserverSource(), pid: app.processIdentifier)
             defer { validation.stop() }
-            _ = accessibilityActSource(context: context).perform(bar, action: "AXPress", turn: turn, context: context)
+            validationOpened = accessibilityActSource(context: context).perform(bar, action: "AXPress", turn: turn, context: context).emissionAttempted
             _ = await macSettle("menu_validation", signals: validation, patience: 0.15) {
                 guard case .resolved(let fresh) = self.accessibilityActSource(context: context).resolve(
                     menuPath: item.path, inAppPid: app.processIdentifier, titlePath: item.titlePath, context: context) else { return false }
@@ -372,11 +375,6 @@ extension SwiftNativeMacControl {
                 titlePath: item.titlePath, context: context) else { return driftRefusal() }
             target = fresh
             if !target.enabled {
-                if case .resolved(let menu) = accessibilityActSource(context: context).resolve(
-                    menuPath: Array(item.path.prefix(2)), inAppPid: app.processIdentifier, titlePath: nil
-                , context: context) {
-                    _ = accessibilityActSource(context: context).perform(menu, action: "AXCancel", turn: turn, context: context)
-                }
                 return refuse(
                     "menu_item_disabled",
                     MacMenuBar.words(for: .disabled(item), requested: requested, among: reading.items) ?? "\"\(item.display)\" is greyed out.",
@@ -440,6 +438,7 @@ extension SwiftNativeMacControl {
                     + (outcome.cause ?? outcome.rawValue), evidence
             )
         }
+        pressed = true
         let surfaceCommand = if case .surface = declaration { true } else { false }
         func pass() -> MacActClosedLoop.ActClassification {
             let windowsAfter: [MacAXWindowRef]
@@ -485,6 +484,28 @@ extension SwiftNativeMacControl {
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
+        }
+        let result = await pressValidated()
+        guard validationOpened, !pressed else { return result }
+        let cleanupContext = context.settling().with(\.driver, context.driver?.settlementBinding())
+        let source = accessibilityActSource(context: cleanupContext)
+        let cleanup: [String: JSONValue] = await settle {
+            switch source.resolve(menuPath: Array(item.path.prefix(2)), inAppPid: app.processIdentifier,
+                titlePath: nil, context: cleanupContext) {
+            case .resolved(let menu):
+                return source.perform(menu, action: "AXCancel", turn: turn, context: cleanupContext).receipt
+            case .unavailable(let cause):
+                return ["ax_outcome": .string("unavailable"), "ax_emission_attempted": .bool(false), "ax_cause": .string(cause)]
+            case .appGone, .pathNotFound, .menuPathDrifted, .windowGone:
+                return MacAXActOutcome.invalidTarget.receipt
+            }
+        }
+        // Both pressValidated exits (refuse and success) construct object output.
+        var output = result.output.objectValue!
+        output["menu_cleanup"] = .object(cleanup)
+        return MacControlResult(ok: result.ok, action: result.action,
+            output: .object(output),
+            error: result.error, durationMs: result.durationMs)
     }
 
     // MARK: - Clipboard
@@ -511,6 +532,9 @@ extension SwiftNativeMacControl {
             "types": MacClipboardRead.typesJSON(contents.types),
             "has_non_text": .bool(MacClipboardRead.hasNonTextTypes(contents.types)),
         ]
+        if contents.concealed {
+            output["note"] = .string("The clipboard holds concealed content; its text is not read.")
+        }
         if maxChars == 0 {
             output["has_text"] = .bool(contents.text != nil)
             output["text"] = .null

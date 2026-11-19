@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import ChatTurnContracts
 import NativeAgentShared
 import os
 import AgentWorkspace
@@ -155,11 +156,14 @@ public actor ChatTurnSteering {
             TurnAdmission.Steered(sessionID: sessionId, turnID: turnId, runID: run, requestID: door?.correlationId)
         }
 
-        /// The person's and the agent's own untainted words join any turn of the agent's. Anything an agent or peer said joins only a turn that same sender
-        /// started under the same steering, so it never rides past the floor its own turn would meet; refused, it runs alone under that floor.
+        /// Except Mac intents, the person's and the agent's own untainted words join any turn of the agent's. Anything an agent or peer said
+        /// joins only a turn that same sender started under the same steering, so it never rides past the floor its own turn would meet;
+        /// refused, it runs alone under that floor.
         func takes(_ offer: Offer) -> Bool {
             guard persist != nil, !helper, !unsaved.contains(offer.turn.run) else { return false }
             let from = offer.turn, carried = Set(from.peerSteering?.checkpointSources ?? [])
+            // Mac intents wait for their own turn; joining would inherit the opener's ask.
+            guard from.envelope?.workIdentity != "intent:chat" else { return false }
             // Every arrival keeps its file ceiling, regardless of who sent it.
             guard fileAccess.holds(from.fileAccessCeiling) else { return false }
             if ["person", "self"].contains(from.originPrincipal), from.peerSteering?.isTainted != true { return true }

@@ -81,7 +81,7 @@ struct BodyQuietChatCommands {
             let scope = try await composerScope(verb: verb, value: value, sessionID: sessionID, reachesUser: reachesUser)
             if let refusal = QuietComposerCommands.fence(verb: verb, value: value, sessionId: sessionID, reachesUser: reachesUser,
                 turnSessionId: turnSessionID, appModel: model, turn: turn, scope: scope).refusal { return refusal }
-            if verb == "show_pane" {
+            if verb == "show_pane", value != "table" {
                 guard case .composerControls(let controls) = try await call(.readComposerControls(turn: callerTurn)) else {
                     throw FaceWireError.invalidFeedOrder
                 }
@@ -94,6 +94,7 @@ struct BodyQuietChatCommands {
     }
 
     private func composerScope(verb: String, value: String, sessionID: String, reachesUser: Bool) async throws -> QuietChatSessionScope {
+        if verb == "show_pane", value == "table" { return reportedScope }
         if verb == "send", !value.isEmpty, !sessionID.isEmpty { return reportedScope }
         if ["speak", "check_updates"].contains(verb) { return reportedScope }
         if verb == "write_scratch", reachesUser, !sessionID.isEmpty { return reportedScope }

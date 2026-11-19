@@ -462,20 +462,20 @@ public struct TelegramUpdateInbox: Sendable {
     func pruneTerminalClaims(dataRoot: URL, keepingNewest keep: Int = 256) async {
         do {
             try await SwiftNativePersistenceCore.withFileLock(indexPath) {
-                let referenced = try CodexCompletionReadout.unsettledAnswerRuns(
-                    configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
-                try await pruneTerminalClaimsLocked(keepingNewest: keep, referenced: referenced)
+                try await pruneTerminalClaimsLocked(dataRoot: dataRoot, keepingNewest: keep)
             }
         } catch {
             nativeLog("Telegram claim retention failed at %@: %@", indexPath.path, error.localizedDescription)
         }
     }
 
-    private func pruneTerminalClaimsLocked(keepingNewest keep: Int, referenced: Set<String>) async throws {
+    private func pruneTerminalClaimsLocked(dataRoot: URL, keepingNewest keep: Int) async throws {
         var index = try await loadIndex()
         let terminal = index.entries.values
             .filter { $0.phase == .completed || $0.phase == .failedBeforeAnswer }
         guard terminal.count > keep else { return }
+        let referenced = try CodexCompletionReadout.unsettledAnswerRuns(
+            configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
         var eligible: [TelegramUpdateClaim] = []
         for entry in terminal {
             do {

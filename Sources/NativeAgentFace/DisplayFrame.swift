@@ -7,6 +7,24 @@ import QuartzCore
 final class DisplayFrame: NSObject {
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var link: CADisplayLink?
+    private var screenChanges: Task<Void, Never>?
+
+    override init() {
+        super.init()
+        let changes = NotificationCenter.default.notifications(named: NSApplication.didChangeScreenParametersNotification).map { _ in () }
+        screenChanges = Task { [weak self] in
+            for await _ in changes {
+                guard let self else { return }
+                link?.invalidate()
+                link = NSScreen.main?.displayLink(target: self, selector: #selector(frame(_:)))
+                link?.add(to: .main, forMode: .common)
+                link?.isPaused = waiters.isEmpty
+                if link == nil { tick() }
+            }
+        }
+    }
+
+    deinit { screenChanges?.cancel() }
 
     func next() async {
         await withCheckedContinuation { waiter in

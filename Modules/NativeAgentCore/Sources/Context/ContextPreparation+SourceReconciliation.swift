@@ -265,49 +265,7 @@ extension ContextPreparation {
         })
         var successfulSources: [ContextSourceID: ContextCompiledSource] = [:]
 
-        for registration in batch.registrations {
-            try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
-            let sourceID = registration.descriptor.id
-            if let currentIDs = authoritativeSources[registration.descriptor.owner],
-               !currentIDs.contains(sourceID) {
-                // A retry may still carry this now-retired registration.
-                continue
-            }
-            do {
-                let attributes = try FileManager.default.attributesOfItem(atPath: registration.fileURL.path)
-                guard let updatedAt = attributes[.modificationDate] as? Date else {
-                    throw ContextFlowStoreError.malformedStoredValue("Source modification time is unavailable for \(registration.fileURL.lastPathComponent)")
-                }
-                let data = try Data(contentsOf: registration.fileURL, options: [.mappedIfSafe])
-                guard data.count <= registration.maximumUTF8Bytes else {
-                    throw ContextMarkdownCompilerError.sourceTooLarge(
-                        actualBytes: data.count,
-                        maximumBytes: registration.maximumUTF8Bytes
-                    )
-                }
-                let compiled = try await compiler.compile(
-                    sourceData: data,
-                    descriptor: registration.descriptor,
-                    previous: previousBySource[sourceID],
-                    updatedAt: updatedAt
-                )
-                try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
-                successfulSources[sourceID] = compiled
-                // Embedding-epoch changes require publication even when source bytes match.
-                let embeddingChanged = Set(compiled.atoms.map { $0.embedding?.modelFingerprint })
-                    != Set((previousBySource[sourceID]?.atoms ?? []).map { $0.embedding?.modelFingerprint })
-                if compiled.sourceHash != previousBySource[sourceID]?.sourceHash
-                    || compiled.descriptor != previousBySource[sourceID]?.descriptor
-                    || embeddingChanged {
-                    changedSources.append(compiled)
-                }
-            } catch let error as CancellationError {
-                throw error
-            } catch {
-                compileFailures[sourceID] = String(ContextSecretContentPolicy.redactedFragment(
-                    String(describing: error)).prefix(2_048))
-            }
-        }
+        // Registered persona files feed the required-document mirror, never derived atoms.
 
         // SQLite may have advanced before a mirror/arena failure retained the live generation. Rebuild projection metadata against that durable baseline before
         // a selective retry can accept it.
@@ -366,15 +324,8 @@ extension ContextPreparation {
             for (id, failures) in candidate.projectionReadResults {
                 admittedReadFailures[.projection(id)] = failures.isEmpty ? nil : failures
             }
-            var registeredFailures = admittedReadFailures[.registered] ?? [:]
-            for registration in candidate.batch.registrations {
-                let id = registration.descriptor.id
-                registeredFailures[id] = candidate.compileFailures[id]
-            }
-            for id in candidate.removedSourceIDs { registeredFailures[id] = nil }
-            admittedReadFailures[.registered] = registeredFailures.isEmpty ? nil : registeredFailures
-            let persistedDegradedCount = try await store.healthSnapshot().degradedSources
-            let hasUnknownPersistedDegradation = persistedDegradedCount > degradedSourceIDs.count
+            let degradedSourceIDs = try await store.degradedSourceIDs()
+            let persistedDegradedCount = degradedSourceIDs.count
             for (sourceID, error) in candidate.compileFailures.sorted(by: { $0.key < $1.key }) {
                 try await markSourceDegraded(sourceID, error: error)
             }
@@ -384,16 +335,13 @@ extension ContextPreparation {
             let recoveredSourceIDs = degradedSourceIDs
                 .intersection(candidate.successfulSources.keys)
                 .subtracting(candidate.compileFailures.keys)
-            let healthRecoverySourceIDs = hasUnknownPersistedDegradation
-                ? recoveredSourceIDs.union(candidate.successfulSources.keys)
-                : recoveredSourceIDs
-            for sourceID in healthRecoverySourceIDs {
+            for sourceID in recoveredSourceIDs {
                 if let source = candidate.successfulSources[sourceID] {
                     changedBySource[sourceID] = source
                 }
             }
 
-            if !changedBySource.isEmpty || !candidate.removedSourceIDs.isEmpty {
+            if !changedBySource.isEmpty || !candidate.removedSourceIDs.isEmpty || candidate.baselineGenerationID == nil {
                 _ = try await store.publish(ContextGenerationDraft(
                     reason: candidate.batch.reason,
                     changedSources: changedBySource.values.sorted {
@@ -401,14 +349,6 @@ extension ContextPreparation {
                     },
                     removedSourceIDs: candidate.removedSourceIDs
                 ))
-                degradedSourceIDs.subtract(healthRecoverySourceIDs)
-                degradedSourceIDs.subtract(candidate.removedSourceIDs)
-            } else if try await store.activeGeneration() == nil {
-                sourceReadFailures = admittedReadFailures
-                await pruneStoreIfDue()
-                lastReconciledAt = Date()
-                acknowledge(candidate.batch)
-                return false
             }
 
             let stored: ContextStoredGeneration
@@ -447,7 +387,7 @@ extension ContextPreparation {
            currentSnapshot.generationID == stored.generation.id,
            currentSnapshot.sourceFingerprint == stored.generation.sourceFingerprint,
            currentSnapshot.requiredDocumentMirrors == mirrors.sorted(by: { $0.personaID < $1.personaID }),
-           currentSnapshot.hotEntries.count + currentSnapshot.warmEntries.count == stored.atoms.count {
+           currentSnapshot.selectionIndex.count == stored.atoms.count {
             snapshot = currentSnapshot
         } else {
             snapshot = try Self.makeArenaSnapshot(stored: stored, mirrors: mirrors)
@@ -463,7 +403,6 @@ extension ContextPreparation {
         switch outcome {
         case nil, .published, .rehydrated:
             lastError = nil
-            reconciliationFailure = nil
             activateStoredGeneration(stored)
             if let readFailures { sourceReadFailures = readFailures }
             for provider in compiledProjectionProviders {
@@ -513,7 +452,7 @@ extension ContextPreparation {
 
     private func markSourceDegraded(_ sourceID: ContextSourceID, error: String) async throws {
         try await store.markSourceDegraded(sourceID, error: error)
-        degradedSourceIDs.insert(sourceID)
+        arena.healthEvents.signal()
         guard let stored = activeStoredGeneration else { return }
         invalidateGenerationDerivedCache()
         activeStoredGeneration = ContextStoredGeneration(
@@ -540,7 +479,6 @@ extension ContextPreparation {
 
     private func recordReconciliationFailure(_ error: any Error) {
         lastError = String(describing: error)
-        reconciliationFailure = lastError
         // Failed discovery/health demand supersedes any older publisher too. Reuse the admission owner's existing request identity; no second clock.
         nextReconciliationRequestID &+= 1
         // Leave failed demand pending. A later external reconciliation will coalesce and retry it without scheduling an immediate retry loop.
@@ -591,48 +529,14 @@ extension ContextPreparation {
         stored: ContextStoredGeneration,
         mirrors: [RequiredDocumentMirror]
     ) throws -> ContextGenerationSnapshot {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .millisecondsSince1970
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        var hot: [ContextArenaEntry] = []
-        var warm: [ContextArenaEntry] = []
         var selectionIndex: [ContextAtomID: ContextSelectionIndexEntry] = [:]
-        for storedAtom in stored.atoms {
-            let atom = storedAtom.draft
-            selectionIndex[atom.id] = ContextSelectionIndexEntry(atom: atom)
-            let tier: ContextArenaTier = atom.injectionPolicy == .always
-                || [.identity, .relationship, .correction, .runtimeTruth].contains(atom.kind)
-                ? .hot
-                : .warm
-            let vectorBytes = (atom.embedding?.values.count ?? 0)
-                .multipliedReportingOverflow(by: MemoryLayout<Float>.stride)
-            guard !vectorBytes.overflow else { throw ContextArenaEntryError.logicalByteOverflow }
-            // Preserve admission accounting without retaining a second atom payload.
-            let logicalBytes = try ContextLogicalByteAccounting.checkedSum([
-                96, atom.kind.rawValue.utf8.count, atom.id.rawValue.utf8.count,
-                atom.sourceHash.utf8.count, atom.body.utf8.count,
-                atom.deterministicSummary?.utf8.count ?? 0,
-                try encoder.encode(atom).count, vectorBytes.partialValue,
-            ], overflowError: ContextArenaEntryError.logicalByteOverflow)
-            let entry = try ContextArenaEntry(
-                key: ContextArenaEntryKey(
-                    namespace: atom.kind.rawValue,
-                    id: atom.id.rawValue,
-                    sourceFingerprint: atom.sourceHash,
-                    generationID: stored.generation.id
-                ),
-                tier: tier,
-                logicalByteCount: logicalBytes,
-                retentionPriority: atom.authority.rank
-            )
-            if tier == .hot { hot.append(entry) } else { warm.append(entry) }
+        for atom in stored.atoms {
+            selectionIndex[atom.draft.id] = ContextSelectionIndexEntry(atom: atom.draft)
         }
         return try ContextGenerationSnapshot(
             generationID: stored.generation.id,
             sourceFingerprint: stored.generation.sourceFingerprint,
             requiredDocumentMirrors: mirrors,
-            hotEntries: hot,
-            warmEntries: warm,
             selectionIndex: selectionIndex
         )
     }

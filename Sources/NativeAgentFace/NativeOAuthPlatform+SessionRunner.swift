@@ -7,9 +7,7 @@ import NativeAgentShared
 @MainActor
 final class OAuthSessionResult {
     let done = ScopedWaiter()
-    let expectedState: String
     var outcome: Result<URL, Error>?
-    init(expectedState: String) { self.expectedState = expectedState }
     func finish(_ outcome: Result<URL, Error>) {
         guard self.outcome == nil else { return }
         self.outcome = outcome
@@ -37,7 +35,7 @@ extension NativeOAuthPlatform {
         guard sessions[request.operation] == nil else {
             throw PartCallError(code: "oauth_already_presented", message: "This sign-in operation already has an authentication session.")
         }
-        let response = OAuthSessionResult(expectedState: request.expectedState)
+        let response = OAuthSessionResult()
         sessions[request.operation] = response
         let presenter = BodyOAuthSessionPresenter(window: window)
         let session = ASWebAuthenticationSession(url: url, callbackURLScheme: request.callbackScheme,

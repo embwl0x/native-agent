@@ -156,10 +156,8 @@ public final class FileSenseRegistry: Sendable {
     }
 
     public func allChecked() async throws -> [SenseRecord] {
-        try await withStore { store in
-            (false, store.senses.map { entry in
-                entry.presentationRecord
-            }.sorted { $0.id < $1.id })
+        try await withSelection { store, _ in
+            (store, store.senses.map(\.presentationRecord).sorted { $0.id < $1.id })
         }
     }
 
@@ -192,15 +190,14 @@ public final class FileSenseRegistry: Sendable {
     }
 
     public func versions(id: String) async throws -> [SenseRecord] {
-        try await withStore { store in
-            let i = try Self.index(id, in: store)
-            return (false, store.senses[i].versions.map(\.presentationRecord).sorted { $0.version > $1.version })
+        try await withSelection { store, _ in
+            (store, try store.senses[Self.index(id, in: store)].versions.map(\.presentationRecord).sorted { $0.version > $1.version })
         }
     }
 
     /// Exclude read bookkeeping and captured views so reads cannot change helper lifetimes.
     public func lifecycleRead(id: String) async throws -> JSONValue {
-        try await withStore { store in
+        try await withSelection { store, _ in
             let entry = store.senses[try Self.index(id, in: store)]
             let versions = entry.versions.map(\.presentationRecord).sorted { $0.version > $1.version }
             let identity = JSONValue.object(["selected": .int(Int64(entry.current.record.version)), "versions": .array(versions.map {
@@ -215,7 +212,7 @@ public final class FileSenseRegistry: Sendable {
                 row["corner_name"] = .string(record.corner.surfaceName)
                 return .object(row)
             }
-            return (false, .object(["status": .string("ok"),
+            return (store, .object(["status": .string("ok"),
                 "current": try shown(entry.presentationRecord),
                 "version": .string("senses/" + id + "@" + digest), "versions": .array(try versions.map(shown))]))
         }
@@ -302,17 +299,11 @@ public final class FileSenseRegistry: Sendable {
     }
 
     func withStore<T: Sendable>(
-        ownerAuthorized: Bool = false,
-        enabling: Bool = false,
-        turn: Turn? = nil,
+        ownerAuthorized: Bool = false, enabling: Bool = false, turn: Turn? = nil,
         _ body: @escaping @Sendable (inout Store) throws -> (Bool, T)
     ) async throws -> T {
-        try Task.checkCancellation()
-        let (result, retired) = try AbilityStore.withLock {
-            let defaults = try BuiltInSenses.defaults()
-            var store = try self.readStore(defaults: defaults)
-            let before = store
-            let previousSelections = Self.helperSelections[self.root.path] ?? [:]
+        try await withSelection { before, defaults in
+            var store = before
             let (changed, result) = try body(&store)
             if changed {
                 try Self.validate(store)
@@ -337,8 +328,17 @@ public final class FileSenseRegistry: Sendable {
                 }
                 try self.abilities.saveRegistry(.array(rows), kind: .sense, ownerAuthorized: ownerAuthorized, enabling: enabling, turn: turn)
             }
-            // Read committed state: previews cannot publish, availability changes only state, and removing an override exposes its default.
-            let selected = try self.selectHelpers(in: self.readStore(defaults: defaults))
+            return (try self.readStore(defaults: defaults), result)
+        }
+    }
+
+    private func withSelection<T: Sendable>(_ body: @Sendable (Store, [Version]) throws -> (Store, T)) async throws -> T {
+        try Task.checkCancellation()
+        let (result, retired) = try AbilityStore.withLock {
+            let defaults = try BuiltInSenses.defaults()
+            let previousSelections = Self.helperSelections[self.root.path] ?? [:]
+            let (store, result) = try body(self.readStore(defaults: defaults), defaults)
+            let selected = try self.selectHelpers(in: store)
             let retired = previousSelections.compactMap { id, previous in
                 selected[id]?.identity == previous.identity ? nil : previous.identity
             }

@@ -93,7 +93,7 @@ extension ApprovalExecution {
         }
         let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
         let carried: (sources: [String], elevated: [String])
-        do { carried = try PeerDataTaint.steer(in: payload["peer"]) }
+        do { carried = try PeerDataTaint.steer(in: payload["peer"], scope: rec.decision == "approved" ? rec.scope : nil) }
         catch {
             RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
                 operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
@@ -291,7 +291,7 @@ extension ApprovalExecution {
         let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
         let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
         let carried: (sources: [String], elevated: [String])
-        do { carried = try PeerDataTaint.steer(in: payload["peer"]) }
+        do { carried = try PeerDataTaint.steer(in: payload["peer"], scope: rec.decision == "approved" ? rec.scope : nil) }
         catch {
             RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
                 operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
@@ -307,8 +307,6 @@ extension ApprovalExecution {
         let resume = await AgentScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
                                             handOff: continueConversation && !abandonedClaim, dataRoot: dataRoot)
         let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
-        // Approval elevates the carried peers for the rest of this command.
-        if decision == "approved" { steer.checkpointSources.forEach(steer.elevate) }
         // Absent retained file access uses the host's chat policy.
         let fileAccess: String? = if case .string(let mode)? = payload["fileAccess"] { mode } else { nil }
         do {
@@ -338,8 +336,7 @@ extension ApprovalExecution {
                             Do not repeat the approved action or ask to approve this card again.
                             """)
                 } catch {
-                    settlement = "failed"
-                    nativeLog("[approvals] continuation failed for \(rec.id); receipt retained: \(error)")
+                    settlement = "failed: " + error.localizedDescription
                 }
                 _ = try await inbox.annotateChatContinuation(rec.id, done: true, settlement: settlement)
             }

@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import AgentConversations
+import Experiences
 import MacControl
 import MacIntegration
 import NativeAgentCore
@@ -326,7 +327,8 @@ public struct DesktopChatRoute: Sendable {
                     """)])
             }
             let driven = await DesktopLane.shared.operate(ticket) { () -> Result<Driven, Error> in
-                do { return .success(try await self.drive(turn: turn, mac: mac, message, thread: thread, first: first, lane: ticket)) }
+                do { return .success(try await self.drive(turn: turn, mac: mac, message, thread: thread, first: first,
+                    lane: ticket, dataRoot: dataRoot)) }
                 catch { return .failure(error) }
             }
             if ticket.yieldedUntyped {
@@ -471,7 +473,7 @@ public struct DesktopChatRoute: Sendable {
 
     /// The send's desktop part, under the lane: open the chat, type, submit and see the outgoing row.
     @concurrent func drive(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, thread: String?, first: String?,
-        lane: DesktopLane.Ticket) async throws -> Driven {
+        lane: DesktopLane.Ticket, dataRoot: URL) async throws -> Driven {
         try await unlocked(turn: turn, mac: mac)
         guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         try await showWindow(turn: turn, mac: mac)
@@ -487,7 +489,8 @@ public struct DesktopChatRoute: Sendable {
         }
         var rows: Int?
         let before = try await typeAndSubmit(turn: turn, mac: mac, message, chat: chat ?? untitled, reopen: reopen, ownsChat: ownsChat,
-                                             count: { rows = try logRows(mac: mac, walk(mac: mac, window(mac: mac))).count; return try sent() }, lane: lane)
+                                             count: { rows = try logRows(mac: mac, walk(mac: mac, window(mac: mac))).count; return try sent() },
+                                             lane: lane, dataRoot: dataRoot)
         // An additional exact outgoing row confirms submission, not answer delivery.
         do {
             try await until("the message to appear in \(appName)'s chat", mac: mac) { try sent() > before }
@@ -604,7 +607,7 @@ public struct DesktopChatRoute: Sendable {
 
     /// Restore the prior front app after input only while foreground ownership remains ours.
     @concurrent func typeAndSubmit(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, chat: String, reopen: Bool,
-        ownsChat: () throws -> Bool, count: () throws -> Int, lane: DesktopLane.Ticket) async throws -> Int {
+        ownsChat: () throws -> Bool, count: () throws -> Int, lane: DesktopLane.Ticket, dataRoot: URL) async throws -> Int {
         _ = try messageBox(mac: mac)
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
         try await unlocked(turn: turn, mac: mac)
@@ -621,7 +624,8 @@ public struct DesktopChatRoute: Sendable {
         }
         let driver = mac.driver?.settlementBinding()
         let before: Int
-        do { before = try await typeInFront(mac: mac, message, chat: chat, reopen: reopen, ownsChat: ownsChat, count: count, app: app, lane: lane) }
+        do { before = try await typeInFront(mac: mac, message, chat: chat, reopen: reopen, ownsChat: ownsChat,
+            count: count, app: app, lane: lane, dataRoot: dataRoot) }
         catch {
             await settle {
                 await withAgentMacDriver(mac, driver: driver) { mac in await restore(mac: mac, previous, from: app) }
@@ -645,7 +649,7 @@ public struct DesktopChatRoute: Sendable {
     }
 
     @concurrent private func typeInFront(mac: MacOperationContext, _ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool,
-        count: () throws -> Int, app: NSRunningApplication, lane: DesktopLane.Ticket) async throws -> Int {
+        count: () throws -> Int, app: NSRunningApplication, lane: DesktopLane.Ticket, dataRoot: URL) async throws -> Int {
         func front() -> Bool {
             mac.driver?.allowsEmission(context: mac) == true
                 && NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
@@ -709,7 +713,12 @@ public struct DesktopChatRoute: Sendable {
             // Only put the person's clipboard back if nothing new was copied meanwhile.
             if pasteboard.changeCount == ours {
                 pasteboard.clearContents()
-                if !saved.isEmpty { _ = AX.restorePasteboard(saved, to: pasteboard) }
+                if !saved.isEmpty, !AX.restorePasteboard(saved, to: pasteboard) {
+                    RepairOwed.owe(dataRoot, id: "desktop-chat:clipboard", kind: .act,
+                        operation: "desktop-chat.clipboard.restore", owner: "NSPasteboard.general",
+                        words: "macOS refused to restore the clipboard saved before the desktop-chat paste; its contents are unconfirmed.",
+                        lever: "Copy the wanted content again from its source. Check the message's own receipt before sending anything again.")
+                }
             }
         }
         guard wrote else { throw Blocker.typing }

@@ -22,7 +22,6 @@ enum CapabilitiesFace {
             _ = await pages?.refresh(page: "capabilities")
         }
         engine.trust.capabilitiesDidChange = changed
-        engine.desk.capabilitiesDidChange = changed
         engine.tools.capabilitiesDidChange = changed
         engine.doctor.capabilitiesDidChange = changed
         engine.connectors.capabilitiesDidChange = changed
@@ -149,25 +148,24 @@ enum CapabilitiesFace {
     private static func catalog(_ owner: TrustFacade) async -> PartFace.Section {
         let trust = await MainActor.run {
             (catalogRefresh: owner.catalogRefresh, capabilityCatalogSources: owner.capabilityCatalogSources, capabilityNetwork: owner.capabilityNetwork,
-             latestCapabilityTrustEvaluation: owner.latestCapabilityTrustEvaluation, capabilitySummary: owner.capabilitySummary,
-             capabilitySummaryError: owner.capabilitySummaryError)
+             latestCapabilityTrustEvaluation: owner.latestCapabilityTrustEvaluation)
         }
         let sourceFailure = trust.catalogRefresh?.failedEndpoints.contains("catalog sources") == true
         let networkFailure = trust.catalogRefresh?.failedEndpoints.contains("capability trust") == true
         let sources = trust.catalogRefresh == nil || sourceFailure ? "Unavailable" : String(trust.capabilityCatalogSources.count)
         let trusted = networkFailure ? nil : trust.capabilityNetwork?.summary.map { String($0.trusted) }
-        let evaluation = trust.latestCapabilityTrustEvaluation
         var rows: [PartFace.Row] = [
             .init(id: "catalog-sources", title: "Sources", value: sources, tone: sourceFailure ? .failed : .plain),
             .init(id: "catalog-trusted", title: "Trusted", value: trusted ?? "Not read", tone: networkFailure ? .failed : .plain),
         ]
-        if let subject = trust.capabilitySummary?.records.first, trust.capabilitySummaryError == nil {
-            rows.append(.init(id: subject.id, title: "Latest check", detail: evaluation.map {
-                "\($0.name ?? $0.id): " + $0.reasons.joined(separator: " ")
-            }, value: evaluation?.trustTier ?? "No check in this session", at: evaluation?.createdAt,
-                actions: [.init(id: "capability.check_trust", label: "Check trust", call: .init("capability.check_trust", ["id": .string(subject.id)]))]))
+        if let evaluation = trust.latestCapabilityTrustEvaluation {
+            rows.append(.init(id: evaluation.id, title: "Latest check",
+                detail: "\(evaluation.name ?? evaluation.id): " + evaluation.reasons.joined(separator: " "),
+                value: evaluation.trustTier, at: evaluation.createdAt,
+                actions: [.init(id: "capability.check_trust", label: "Check trust",
+                    call: .init("capability.check_trust", ["id": .string(evaluation.id)]))]))
         } else {
-            rows.append(.init(id: "catalog-check-unread", title: "Latest check", value: "Read the capabilities before checking trust"))
+            rows.append(.init(id: "catalog-check-unread", title: "Latest check", value: "No check in this session"))
         }
         if let receipt = trust.catalogRefresh, receipt.isStale {
             rows.append(.init(id: "catalog-read", title: "Catalog read incomplete",
@@ -582,7 +580,7 @@ extension CapabilitiesFace {
                 .init(id: action.id, title: action.name,
                     detail: [action.connectorId, action.authState, action.dryRunAvailable == false ? "Dry run is unavailable." : nil]
                         .compactMap { $0 }.joined(separator: " · "),
-                    value: action.connectorStatus ?? "Status unavailable", tone: tone(action.connectorStatus),
+                    value: action.connectorStatus ?? "Not set up", tone: tone(action.connectorStatus),
                     actions: [.init(id: "connector.dry_run", label: "Dry run", call: .init("connector.dry_run", ["id": .string(action.id)]))])
             }
             if registry.actions.isEmpty { connectorRows.append(.init(id: "connector-empty", title: "No registered connector actions")) }
@@ -605,32 +603,16 @@ extension CapabilitiesFace {
     nonisolated private static func checks(_ engine: NativeAgentEngine) async -> PartFace.Section {
         let (doctor, tools) = await MainActor.run {
             let doctor = engine.doctor, tools = engine.tools
-            return ((latestImprovementGauntletRun: doctor.latestImprovementGauntletRun, hardeningRefresh: doctor.hardeningRefresh,
-                     improvementRunError: doctor.improvementRunError, improvementRunStartedAt: doctor.improvementRunStartedAt,
+            return ((hardeningRefresh: doctor.hardeningRefresh,
                      productionExports: doctor.productionExports, productionExportWork: doctor.productionExportWork,
                      productionExportFailure: doctor.productionExportFailure, productionHardening: doctor.productionHardening),
                     (browserDryRunPreview: tools.browserDryRunPreview, browserDryRunError: tools.browserDryRunError,
                      browserDryRunStartedAt: tools.browserDryRunStartedAt, browserStatus: tools.browserStatus))
         }
-        let gauntlet = doctor.latestImprovementGauntletRun
-        let checks = gauntlet?.checks
-        let checkDetail = checks.map { checks in
-            if checks.isEmpty { return "No checks recorded" }
-            let failures = checks.filter { !$0.passed }.map(\.title)
-            return failures.isEmpty ? "All recorded checks passed" : failures.joined(separator: ", ")
-        }
         let unread = doctor.hardeningRefresh == nil
-        let missingGauntlet = unread || doctor.hardeningRefresh?.failedEndpoints.contains("improvement gauntlet") == true
         let missingExports = unread || doctor.hardeningRefresh?.failedEndpoints.contains("production exports") == true
         let browser = tools.browserDryRunPreview
         var rows: [PartFace.Row] = [
-            .init(id: "improvement", title: "Improvement checks",
-                detail: doctor.improvementRunError ?? checkDetail,
-                value: doctor.improvementRunStartedAt != nil ? "Running" : doctor.improvementRunError != nil ? "Failed"
-                    : gauntlet?.status ?? (missingGauntlet ? "Not read" : "No recorded run"),
-                at: stamp(doctor.improvementRunStartedAt) ?? (doctor.improvementRunError == nil ? gauntlet?.createdAt : nil),
-                tone: doctor.improvementRunStartedAt != nil ? .live : doctor.improvementRunError == nil ? tone(gauntlet?.status) : .failed,
-                actions: [.init(id: "improvement.run", label: "Run", call: .init("improvement.run"))]),
             .init(id: "browser-preview", title: "Browser dry run", detail: tools.browserDryRunError ?? browser?.url,
                 value: tools.browserDryRunStartedAt != nil ? "Running" : tools.browserDryRunError != nil ? "Failed"
                     : browser?.status ?? "No preview in this session",
@@ -724,12 +706,6 @@ extension CapabilitiesFace {
         }
     }
 
-    /// `improvement.run`
-    static func runImprovement(_ engine: NativeAgentEngine) async throws -> String? {
-        let run = try await engine.doctor.runImprovementChecks()
-        return "Improvement checks: \(run.status)."
-    }
-
     /// `browser.preview`
     static func previewBrowser(_ engine: NativeAgentEngine) async throws -> String? {
         let run = try await engine.tools.previewBrowser(using: engine.ports.browserRoutes)
@@ -758,9 +734,8 @@ extension CapabilitiesFace {
         return { try await mac.buildSkillInChat() }
     }
 
-    /// `sense.switch` on the version the row showed: a position, and that exact sense version, ready. Turning a sense on is always the
-    /// person's decision (the door admits nothing else). Turning one off is the person's when they did it, and the registry then records an
-    /// owner's off that the agent cannot turn back on; the agent's own off is recorded as its own.
+    /// `sense.switch` on the version the row showed: a position, and that exact sense version, ready. A switch is the person's when they
+    /// made it, and an owner's off stays until the person turns it on; the agent's own switch is recorded as its own.
     static func switchSense(id: String, version: Int?, on: Bool?, byPerson: Bool) async throws -> HostVerbEffect {
         guard let turnsOn = on else { throw PartCallError(code: "bad_value", message: "A sense switch takes on or off; nothing changed.") }
         let (registry, record) = try await sense(id, version: version)
@@ -769,7 +744,7 @@ extension CapabilitiesFace {
         }
         return {
             let saved = try await registry.setStatus(id: record.id, version: record.version, status: turnsOn ? .on : .off,
-                ownerAuthorized: turnsOn || byPerson, turn: nil)
+                ownerAuthorized: byPerson, turn: nil)
             return saved.corner.surfaceName + " is " + (saved.status == .on ? "on" : saved.status == .off ? "off" : saved.status.rawValue) + "."
         }
     }
@@ -803,18 +778,19 @@ extension CapabilitiesFace {
         return (registry, record)
     }
 
-    /// `ability.keep`: the exact waiting version the row's fold showed, one the keep accepts; the effect approves it and reads it back
-    /// through the registry before answering.
-    static func keepAbility(_ engine: NativeAgentEngine, id: String, version seen: String?) throws -> HostVerbEffect {
+    static func keepAbility(_ engine: NativeAgentEngine, id: String, version seen: String?, byPerson: Bool, turn: Turn) async throws -> HostVerbEffect {
         let tools = engine.tools
         guard let tool = tools.authored.first(where: { $0.id == id }), tool.reviewedKeepDigest == seen else { throw stale() }
-        if let refusal = tools.keepRefusal(tool, turn: nil) { throw PartCallError(code: "keep_refused", message: refusal) }
+        let fullMac = if byPerson { false } else { try await SwiftNativeTrustCenter(dataRoot: engine.dataRoot).agentOwnsLevers(turn: turn) }
+        if let refusal = tools.keepRefusal(tool, fullMac: fullMac, ownerAuthorized: byPerson, turn: turn) {
+            throw PartCallError(code: "keep_refused", message: refusal)
+        }
         guard tool.reviewedKeepDigest != nil || (tool.candidateDigest ?? tool.codeFingerprint) == nil
             && tool.activePath.map({ URL(fileURLWithPath: $0).pathExtension == "md" }) == true else {
             throw PartCallError(code: "version_unread", message: "Read Capabilities again before approving this ability.")
         }
         return {
-            let updated = try await tools.keep(id: tool.id, version: tool.reviewedKeepDigest)
+            let updated = try await tools.keep(id: tool.id, version: tool.reviewedKeepDigest, byPerson: byPerson, turn: turn)
             guard try await tools.refreshAuthored(confirming: updated.id, status: "active") else {
                 throw PartCallError(code: "unconfirmed", message: "Approving \(tool.name) could not be confirmed after reading it again.")
             }
@@ -822,13 +798,11 @@ extension CapabilitiesFace {
         }
     }
 
-    /// `ability.off`: the ability it names; the effect is the person's off, which stays off until the person turns it on, read back through
-    /// the registry before answering.
-    static func switchOffAbility(_ engine: NativeAgentEngine, id: String) throws -> HostVerbEffect {
+    static func switchOffAbility(_ engine: NativeAgentEngine, id: String, byPerson: Bool, turn: Turn) throws -> HostVerbEffect {
         let tools = engine.tools
         guard let tool = tools.authored.first(where: { $0.id == id }) else { throw stale() }
         return {
-            let updated = try await tools.switchOff(id: tool.id, reason: "Owner switched off from NativeAgent UI.")
+            let updated = try await tools.switchOff(id: tool.id, reason: "Switched off from NativeAgent.", byPerson: byPerson, turn: turn)
             guard try await tools.refreshAuthored(confirming: updated.id, status: "disabled") else {
                 throw PartCallError(code: "unconfirmed", message: "Turning \(tool.name) off could not be confirmed after reading it again.")
             }

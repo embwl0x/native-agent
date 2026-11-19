@@ -9,7 +9,7 @@ import ApprovalInbox
 import ChatTurnContracts
 import Experiences
 import TurnTrace
-// Blueprint: | `AgentConversationPersistence.swift` | Checked conversation serialization and projection publication under the existing file lock |
+// Blueprint: | `AgentConversationPersistence.swift` | Conversation persistence passes each new send's steering to its experience birth |
 
 extension AgentConversationStore {
     /// Checked approval storage settles saved decisions, including queued-send races; unavailable authority leaves exchanges untouched.
@@ -140,7 +140,7 @@ extension AgentConversationStore {
         }
         return rows
     }
-    func save(_ rows: [AgentConversationRecord]) throws {
+    func save(_ rows: [AgentConversationRecord], birth: (id: String, sources: [String])? = nil) throws {
         let committed = try loadCommitted()
         let previous = try normalizing(committed)
         var rows = rows
@@ -181,7 +181,7 @@ extension AgentConversationStore {
         }
         guard data != (try encoder.encode(committed)) else { return }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
-        recordExperiences(rows)
+        recordExperiences(rows, birth: birth)
         if rows.contains(where: { $0.phase == "attention" }) {
             Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
         }

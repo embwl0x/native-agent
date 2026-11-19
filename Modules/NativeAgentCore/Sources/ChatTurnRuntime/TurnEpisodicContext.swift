@@ -1,4 +1,5 @@
 import Experiences
+import ChatToolRuntime
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -77,11 +78,7 @@ extension SwiftNativeTurnEngine {
 
     /// Peers retain their redacted awareness; a stranger's person-shaped remote arrival grants no person's continuity.
     static func peerContinuityTurn(_ turn: Turn) -> Bool {
-        turn.originPrincipal.hasPrefix("agent:")
-            || [turn.origin?.agent, turn.envelope?.agent].compactMap({ $0 }).contains(where: { $0 != "self" })
-            || turn.origin?.surface.hasSuffix("-bridge") == true || turn.envelope?.surface.hasSuffix("-bridge") == true
-            || turn.peerSteering?.checkpointSources.isEmpty == false
-            || turn.origin?.peerSources?.isEmpty == false || turn.origin?.elevatedPeerSources?.isEmpty == false
+        !turn.steeringStamp().isEmpty
     }
 
     /// Enough acts to fill four lines after privacy leaves some out, without reading a busy hour's receipts.
@@ -122,7 +119,7 @@ extension SwiftNativeTurnEngine {
             do {
                 guard try await Self.lifeBelongs(experience, event: event, sessionID: sessionID,
                     includePersonActs: across, includeMindActs: ownMind, store: store) else { continue }
-                let reading = Self.lifeWords(experience, event: event)
+                let reading = await Self.lifeWords(experience, event: event, root: root, turn: turn)
                 gaps += reading.gaps.map { experience.id + ": " + $0 }
                 guard let words = reading.words else { continue }
                 let effects = outcome.effects.map { "; effects \($0.rawValue)" } ?? "; effects unrecorded"
@@ -199,7 +196,7 @@ extension SwiftNativeTurnEngine {
         return conversations.contains(sessionID) || includePersonActs && (forPerson || !conversations.isEmpty)
     }
 
-    private static func lifeWords(_ experience: Experience, event: TurnTraceEvent?) -> (words: String?, gaps: [String]) {
+    private static func lifeWords(_ experience: Experience, event: TurnTraceEvent?, root: URL, turn: Turn) async -> (words: String?, gaps: [String]) {
         guard let outcome = experience.outcome else { return (nil, []) }
         guard outcome.domain != "chat.working_memory" else { return (nil, []) }
         let payload = event?.payload.objectValue
@@ -229,7 +226,13 @@ extension SwiftNativeTurnEngine {
                 do {
                     let recorded = try JSONValue.parse(Data(raw.utf8))
                     if recorded.objectValue?["provider_projection"] == .string("bounded_tool_result") {
-                        gaps.append("the dispatch retains a bounded result reference, not the outcome wording; inspect the original receipt")
+                        let reference = recorded.objectValue
+                        if let bytes = reference?["original_bytes"], let handle = reference?["result_handle"]?.stringValue,
+                           await ProviderToolResultRecoveryStore.shared.wholeBodyAvailable(handle: handle, dataRoot: root, turn: turn) {
+                            words += "; my result is kept whole (\(try bytes.serialize(pretty: false)) bytes, handle \(handle))"
+                        } else if let cut = reference?["retention_detail"]?.stringValue {
+                            gaps.append(lifeLine(cut))
+                        } else { gaps.append("the dispatch retains a bounded result reference, not the outcome wording; inspect the original receipt") }
                     } else {
                         words += "; my receipt recorded " + (try lifeFacts(recorded))
                     }

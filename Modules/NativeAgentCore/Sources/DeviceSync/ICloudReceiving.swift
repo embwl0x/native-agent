@@ -13,7 +13,7 @@ import MacControl
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `ICloudReceiving.swift` | Retained chat drains; separate metadata reads cannot hold pickup. |
+// Blueprint: | `ICloudReceiving.swift` | Retained chat drains; separate metadata reads cannot hold pickup; authenticated phone changes reach attention |
 
 /// The device a phone chat answers to, read once at admission; the phone writes both fields on every chat (ChatRuntimeControls.metadata).
 public struct ICloudPhoneRoute: Sendable, Equatable {
@@ -59,9 +59,7 @@ extension iCloudBridge {
         messageHandler = onMessage
         if let ck = deviceTransport {
             registerIncomingTransportObserver(ck)
-            return
         }
-        checkIosOutbox()
     }
     private func acceptsIncomingObserver(generation: UInt64) -> Bool {
         isSetUp && generation == incomingObserverGeneration && deviceTransport != nil
@@ -90,6 +88,10 @@ extension iCloudBridge {
                       await self.acceptsIncomingObserver(generation: observerGeneration)
                 else { return false }
                 let handled = await self.handleIncomingFromTransport(message, observerGeneration: observerGeneration)
+                if !handled {
+                    let status = await self.syncStatus
+                    nativeLog("[iCloudBridge] holding iOS msg %@ for the next drain: %@", message.id, status)
+                }
                 guard handled, message.metadata?["kind"] == PhonePlaceEvent.messageKind
                     || message.metadata?["kind"] == PhoneSenseEvent.messageKind
                     || message.metadata?["kind"] == PhoneRequestResult.messageKind else { return handled }
@@ -99,8 +101,15 @@ extension iCloudBridge {
                 guard await self.acceptsIncomingObserver(generation: observerGeneration),
                       message.sender == "ios", message.verifySignature(secret: secret) else { return handled }
                 // Deliveries without answers still need durable signed progress so the phone can observe acceptance.
-                return (try? await self.sendChatMessage(text: "Mac received it", sessionID: message.sessionID,
-                    correlationID: message.id, metadata: ["kind": "progress", "stage": "received"])) != nil
+                do {
+                    _ = try await self.sendChatMessage(text: "Mac received it", sessionID: message.sessionID,
+                        correlationID: message.id, metadata: ["kind": "progress", "stage": "received"])
+                    await self.recordSendResult(operation: "received progress")
+                    return true
+                } catch {
+                    await self.recordSendResult(operation: "received progress", error: error)
+                    return false
+                }
             }
             guard !Task.isCancelled, self.acceptsIncomingObserver(generation: observerGeneration)
             else { return }
@@ -208,7 +217,24 @@ extension iCloudBridge {
             do {
                 let lastInput = (MacPersonInput.idle()?.seconds).map { Date().addingTimeInterval(-$0) }
                 let root = sync.dataRoot
-                try await sync.storage.perform { try PhoneSenseHistory.record(event, dataRoot: root, afterPersonInput: lastInput) }
+                try await sync.storage.perform {
+                    let known = { (reading: PhoneSenseEvent) in reading.value.split(separator: "+").filter { $0 != "unknown" }.joined(separator: "+") }
+                    let previous = try PhoneSenseHistory.read(root).filter { $0.source == event.source && !$0.isSetup && !known($0).isEmpty }
+                        .max { $0.timestamp < $1.timestamp }
+                    try PhoneSenseHistory.record(event, dataRoot: root, afterPersonInput: lastInput)
+                    guard !event.isSetup, [.charging, .focus, .headphones, .network, .motion].contains(event.source), !known(event).isEmpty else { return }
+                    if let previous {
+                        guard event.timestamp > previous.timestamp, known(event) != known(previous) else { return }
+                    }
+                    if event.source == .motion, let transition = PersonPresence.read(dataRoot: root).transition,
+                       !transition.here, transition.since == event.timestamp { return }
+                    let fresh = (0...PhoneSenseHistory.freshFor).contains(Date().timeIntervalSince(event.timestamp))
+                    Attention.post(Happening(.world, subject: "phone:" + event.source.rawValue, door: "phone",
+                        words: (fresh ? "" : "Reading at \(event.timestamp.formatted(.iso8601)); current unknown. ")
+                            + PhoneSenseHistory.observationLine(event),
+                        once: "phone:" + event.source.rawValue + ":" + event.value + ":" + String(event.timestamp.timeIntervalSince1970)),
+                        dataRoot: root)
+                }
                 if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
                 recordSeenMessageID(msg.id)
                 persistCKSeenIDs()
@@ -226,7 +252,22 @@ extension iCloudBridge {
             }
             do {
                 let root = sync.dataRoot
-                try await sync.storage.perform { try PhonePlaceHistory.record(event, dataRoot: root) }
+                try await sync.storage.perform {
+                    let previous = try PhonePlaceHistory.read(root).filter { $0.placeID == event.placeID }
+                        .max { $0.timestamp < $1.timestamp }
+                    try PhonePlaceHistory.record(event, dataRoot: root)
+                    if let previous {
+                        guard event.timestamp > previous.timestamp,
+                              (event.transition == .left) != (previous.transition == .left) else { return }
+                    }
+                    let fresh = (0...PhoneSenseHistory.freshFor).contains(Date().timeIntervalSince(event.timestamp))
+                    Attention.post(Happening(.world, subject: "phone:place:" + event.placeID, door: "phone",
+                        words: "Phone: \(event.transition.rawValue) \(String(reflecting: event.name))."
+                            + (fresh ? "" : " Reading at \(event.timestamp.formatted(.iso8601)); current unknown."),
+                        once: "phone:place:" + event.placeID + ":" + event.transition.rawValue + ":"
+                            + String(event.timestamp.timeIntervalSince1970)),
+                        dataRoot: root)
+                }
                 if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
                 recordSeenMessageID(msg.id)
                 persistCKSeenIDs()

@@ -24,7 +24,7 @@ extension NativeAgentEngine {
         // Capture the user’s prior session before entering the shared queue.
         let takeover = await MacWorkContinuation.admit(message)
         var turn = Turn(session: sessionID)
-        turn.envelope = .personOnMac("siri:chat")
+        turn.envelope = .native("intent:chat")
         turn.macContinuation = takeover
         let admitted = try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID,
             arrival: TurnArrival(words: message, surface: "chat", row: .shown), turn: turn) { turn in

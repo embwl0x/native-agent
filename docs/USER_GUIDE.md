@@ -67,14 +67,18 @@ stop and completes without indexing a missing step.
   while it works, as they do from the composer, and the line says so. The page
   redraws by itself when the agent changes it. Pictures of a page do not show
   the bar.
-- **Agent** shows the agent's own desktop read-only.
+- **Agent** shows the agent's home and rooms read-only.
 
 An absent view preference starts in Simple, independently of saved chats.
 A saved supported choice is preserved. Page names in this guide refer to Advanced.
 The shell restores its current page and each rail page's current tab directly;
 startup does not translate the retired Skills & Tools scene section.
+The main window's frame keeper restores its saved placement, zoom and full screen.
+SwiftUI scene restoration is disabled so it does not restore a separate placement.
 Command search opens the exact selected helper reply, dream date or memory.
 Unavailable selected content reports that state rather than opening a different item.
+Saved search inputs refresh on demand through the transcript owner; no separate
+saved-search watcher or shell-specific trailing-failure verdict runs.
 The main conversation shows its transcript owner's read failure even before any
 messages have loaded. **Try reading again** awaits one fresh read's completion,
 error or cancellation; silence does not diagnose missing messages.
@@ -155,15 +159,22 @@ nothing to choose and says why, for example "No models to choose yet: Anthropic 
 reached: … Refresh to try again." A model you already chose keeps running and keeps its Think and
 Fast; it shows as "Saved. Anthropic has not listed it yet." Only choosing a different model waits
 for the list. At launch, on entering Providers and on setup's "Read accounts again", NativeAgent
-asks such an account once and says "Asking Anthropic for its models…" meanwhile. A model the
+asks such an account, and one whose list is a day old, once and says "Asking Anthropic for its
+models…" meanwhile. A model the
 provider retired leaves once a complete list says so. A ChatGPT
 sign-in adopted from the Codex command-line tool keeps that tool's list, and its refresh says to
 sign in with ChatGPT in the app for a list the app can refresh. Kimi Code has no list to ask: the
 models this build knows are its only list.
 ChatGPT, Codex, Moonshot and OpenRouter use their own fetched model catalogs.
-A missing or unreadable catalog, or a failed refresh, leaves its account unavailable with its cause and a refresh
-instruction. Credential-bound saved rows remain available until an explicit refresh or credential change;
-age alone neither removes models nor starts a request. It supplies no shipped replacement models, windows or capabilities.
+A missing or unreadable catalog leaves its account's list unavailable with its cause and a refresh
+instruction. Credential-bound saved rows remain available until a successful refresh or credential change.
+When settings are read, ChatGPT sign-ins made in the app ask again if the saved list is missing,
+belongs to another account, or is a day old. **Refresh** asks for the full account list regardless of age.
+A model newer than the app's checked ChatGPT wire can be selected with the Think levels the account lists.
+Its first turn checks the wire. For image input, the route must carry images and the model must list
+image input if it states which inputs it accepts. If ChatGPT refuses the full list, the app asks once more
+for the checked version's list. Providers shows that version and the reason. When the refresh fails,
+the previous list stays available. ChatGPT and Codex draw models, windows and Think levels from their account catalog.
 ChatGPT and Codex read the catalog beside their selected sign-in; they do not
 borrow the independent CLI's catalog. Provider configuration and picker files
 use the current object fields and surface names only. API-key and xAI token
@@ -173,8 +184,11 @@ This includes an adopted Codex CLI credential: unreadable or malformed saved
 credentials name their file and repair; only a confirmed missing file means sign in.
 Fetched API-key model lists belong to the credential that fetched them; changing
 the credential requires a matching refresh before those rows can be used.
-Moonshot models whose reasoning contract is unknown say so on their row and
-cannot be selected until NativeAgent has a declared adapter contract.
+New Kimi models from Moonshot use the Think levels of the nearest declared Moonshot
+model in the same line and variant at or below their version. A model without a
+matching contract says Think controls are unknown on its row and cannot be selected.
+New models on a refreshed ChatGPT, Anthropic, OpenAI API, xAI, Meta or Moonshot list
+become news the agent can notice once the same credential has an earlier list.
 
 credentials name their file and repair. A valid CLI API-key file without a ChatGPT
 access token offers no ChatGPT session to adopt. Credential files may be symlinks;
@@ -398,7 +412,7 @@ Every request to the phone, including settings reads and changes, requires
 **Trust → Mac → Apps and features → iPhone Notifications → Write**. Turning
 that switch off blocks these requests even under Full Mac.
 Appearance, haze, Live Activities, each phone sense and saved place switches
-use their phone owners. Enabling sharing or Lock Screen task names asks on
+use their phone owners. Enabling sharing or work Live Activities asks on
 the phone's approval sheet; iOS permission prompts still need your answer.
 The current phone waits for the person's decision or the owned action result,
 with cancellation. Its request's wire expiry does not decide execution. The
@@ -436,7 +450,9 @@ not promise a word-search replacement for failed semantic recall.
 
 Memories shows pinned and recent saved memories, proposals
 waiting for review, and read-only rejected history. Each saved row opens its
-full text and offers pinning or forgetting; forgetting asks once. The full-text
+full text and offers pinning or forgetting; forgetting asks once. The body's
+forget receipt identifies the deleted memory; the window accepts only a committed
+result before dismissing the document or reporting deletion. The full-text
 sheet can prepare a correction draft in Chat. **Knowledge graph** opens the
 native Mac canvas from a row rather than a page tab.
 The phone uses the same page design over memories and proposals permitted on
@@ -465,10 +481,10 @@ you to reopen the graph.
 The **Memory status and Spotlight** row opens the existing Mac upkeep panel,
 including the search model, Spotlight reindexing and **Check again**. The bulk
 **Consolidate now** and **Run hygiene** controls and their report are retired.
-Old memories fade from recall through disuse. Records can also be removed when
-you ask to forget them or when the store exceeds its capacity (2,000 rows by
-default): lower-value records go first, then the least recently used; pinned
-and identity records go last. See [Data bounds](data-bounds.md).
+Old memories fade from recall through disuse. Asking to forget removes records.
+Capacity overflow (2,000 active rows by default) archives active records with
+reason `capacity`: lower-value records go first, then the least recently used;
+pinned, identity and correction records go last. See [Data bounds](data-bounds.md).
 
 Remembered context and inner state do not grant action authority. Trust remains
 the owner of permissions.
@@ -495,16 +511,16 @@ intended result.
 and `frame_id`/`image`. These use the same gesture checks as a single act:
 explicit mouse buttons require a click, open, drag or pointer hold; real
 input requires the app in front. A failed step stops the batch. Optional
-targets and retries retain the gesture options, and changing them prevents
-reusing that step's landed receipt when continuing a stopped batch.
-The app and every step field are part of that identity; a changed step
-cannot reuse a prior landed receipt.
+targets and retries retain the gesture options. The app and every step field
+are part of the receipt identity for continuing a stopped batch. A resumed
+batch keeps matching landed and unverified steps without repeating their
+input, and reports how many of the kept steps were unverified.
 
 Steps also accept `{verb,handle,frame_id}` (the frame may be inherited from
 the call). Each step resolves that recorded control identity in the live
 window; a missing, changed, expired or ambiguous identity stops at that step.
-Earlier landed steps remain in the receipt. Each step's effect is judged
-against its own fresh before-read; a declared-effect mismatch stops later steps.
+Each step's effect is judged against its own fresh before-read; a
+declared-effect mismatch stops later steps.
 Editing a field's contents preserves its handle when the control identity is
 unchanged. Handles grant no authority.
 
@@ -632,11 +648,11 @@ role, including an editable field, with an unreadable subrole contributes no
 value to any text look, including when another control uses that element as
 its caption. All AX value reads share this subrole check; a failed caption
 subrole read leaves the control's caption unreadable.
-Recognized window text runs on every look under caption redaction, without the
-whole-window walk. When a picture is released it uses that picture's mask union,
-and whole OCR rows intersecting a mask are omitted. Unproven capture geometry or
-OCR positions withhold all recognized text for that capture
-the AX look remains available with its reported gaps.
+Window text recognition uses caption redaction and the union of the complete
+pre-capture and post-capture masks, including when no picture is requested.
+Whole OCR rows intersecting a mask are omitted. Incomplete coverage, unproven
+capture geometry or unproven OCR positions withhold recognized text for that
+capture. The AX look remains available with its reported gaps.
 Both pre-capture and post-capture inspections enforce these rules;
 desktop composition masks that window in full and reports its inspection error
 in `masking_failures`. An unread value never vouches for safe pixels.
@@ -711,7 +727,7 @@ Handles support double-click, right-click, hover and accessibility focus on the
 selected element. `focus` is offered only when `AXFocused` is settable, and its
 receipt verifies focus. Screen offers and action schemas share the hand's verbs.
 Identical full menu paths count as one command when every duplicate publishes
-a command identifier or key equivalent; an enabled copy wins. Unpublished
+the same command identifier or key equivalent; an enabled copy wins. Unpublished
 duplicates require a choice unless only one is enabled or a supplied chord
 selects one. Use the shown chord when available, otherwise the displayed path
 with `[first]` or `[second]` (later occurrences use `[third]` through `[tenth]`,
@@ -728,11 +744,17 @@ read, the reply says the read failed or coverage is incomplete rather than
 claiming an empty menu.
 A press answers the same way whether it comes as a menu path in `mac.act` or as
 `mac.menu_press` (`pressedMenu`): the sentence, then the screen after it: the
-pressed app's window, or the front screen when that app is gone (Quit, its last
-window closed); when no look succeeds, the sentence says why. The
+pressed app's window, or the front screen only when no app was specified for
+readback. If that read fails (including Quit or the last window closing), the
+sentence says why, and `screen_after` carries that read's error, message and
+remedy beside the press receipt (under `detail` for an act's menu path); no other
+app is read in its place. The
 direct press keeps its receipt fields (`output.pressed`, `status`,
 `verification`) and carries that answer in `text`; it needs no `mac.menu` read
 first, since the press reads the menu bar itself.
+An explicit menu path with `app` uses that app's native menu press in the
+background, including when it has no window. It does not bring the app forward
+as a prerequisite; the command itself may open or close a window.
 If the selected path's AX address cannot be revalidated before pressing, the
 reply reports unavailable; its current items remain unknown.
 Menu-bar optional failures appear as `attribute_gaps`; unreadable names leave coverage
@@ -772,7 +794,9 @@ in the accepted group inventory. A closed or released remembered tab is forgotte
 so the next destination opens a new inactive grouped tab. An explicit lost `tab_id`
 still refuses. `chrome.status` compares its printed running and folder code
 digests directly; its shipped version comes from the app bundle's manifest and
-may differ from a separately updated extension folder.
+may differ from a separately updated extension folder. A browser signature or
+extension origin refusal remains current across a NativeAgent restart while the
+same Chrome process is alive and no newer relay greeting has succeeded.
 Use `new_tab:true` with a destination and no `tab_id` to open another background
 tab in the NativeAgent group. Navigation and reads proceed when the document's
 main/feed/article content arrives. Resource completions cannot admit an unreadable
@@ -910,7 +934,8 @@ identifier, or empty for the Mac's system default. An unavailable identifier
 is reported without choosing another voice. Cloud playback records an
 unsuccessful finish or decode failure against its speech owner and clears the
 active speech owner on completion. Starting read-aloud does not confirm its
-completion.
+completion. Mac cloud read-aloud reads its route, Trust flag and credentials
+from the requesting engine's data root.
 
 For a hands-free conversation on iPhone, tap the phone button next to the mic,
 use **Talk to <agent name>** from Siri/Shortcuts or the Action Button, or use the
@@ -955,7 +980,7 @@ existing navigation behavior, which may open an Advanced page.
 | **Today** | Notifications, approvals, proposals, recent work and items waiting for you. |
 | **Memories** | Saved facts, pending proposals, rejected history and a row opening the native **Knowledge graph** canvas. |
 | **Desk** | Projects, dependencies, schedules, pursuits, progress and outcomes. |
-| **Notifications** | Proactive inbox, triggers, watched folders and history. |
+| **Notifications** | Notification preferences and history. |
 | **Helpers** | Standing bots, their briefs, schedules or event triggers, and replies. |
 | **Personality** | One face for identity, voice, becoming, minds and dreams; links open editing and review. |
 | **Providers** | AI accounts and the model choices for Chat, Work, and Memory and mind. |
@@ -965,10 +990,14 @@ existing navigation behavior, which may open an Advanced page.
 | **Trust** | Access presets, feature permissions and approvals; **Mac integration** for individual Mac services. |
 | **Connectors** | Service accounts, the iPhone, Telegram and agent contacts, each with its settings behind its row. |
 | **Capabilities** | What waits on you, my abilities by purpose, what is built in, catalog trust, senses, guardrails, actions and checks in one face. |
-| **Diagnostics** | Health checks, Status, Run history, Cognition, Chat turn details, Skills and Tools. **Expansion** lists, for each mind using the app, the turn-start reads and follow-up reads its own practice predicts across model changes, and each one's record: tries, hits, its bar and standing, and how often the app ran, prepared or held one back. |
+| **Diagnostics** | Health checks, Status, Run history, Cognition, Chat turn details, Skills and Tools. |
 | **Capabilities** | Capability inventory and **Show all actions**. |
 | **Diagnostics** | Health, living status, activity and runs in one reading; Cognition, Chat turn details, Skills and Tools tabs. |
 | **Settings** | Preferences in groups (where I reach you, what I can read, memory, inner life, how I look, shortcuts, other, advanced), notifications, right now, and updates and help. |
+
+Diagnostics shows the conversation count only after a successful index read;
+until then Sessions says **Being read**, or **Unavailable** with the read's cause.
+Index publication refreshes that row. Telegram health checks open **Connectors**.
 
 Page actions show their waiting state and any refusal beside the row. A second tap
 while that row is waiting sends no new action. Text entered after submitting an edit
@@ -991,8 +1020,13 @@ Turn on and Share sense are actions on it; the agent turns a sense off on its
 own, and turning one on asks you. Rows offer
 Check trust, Mac Dry run / Run, connector Dry run, improvement checks,
 a browser preview, cancellation of a live browser run, Export and Support bundle.
-Missing reads stay waiting or show their failure; a missing workflow status
-stays unavailable. Page search, catalog-entry forms, the memory graph,
+Latest check names the capability its Check trust action checks; without an
+evaluation it says No check in this session and offers no Check trust action.
+Connector actions without recorded health say Not set up. On Connectors,
+set-up routes whose health is missing or unknown say Set up · Not checked;
+Connected and Ready require measured health, as the
+[status contract](ONE_DOOR.md#authority-and-receipts) describes.
+Missing reads stay waiting or show their failure. Page search, catalog-entry forms, the memory graph,
 research lab and Your spaces are removed from this page; ask in Chat for
 searches, catalog changes and research, and use Personality for your spaces.
 Context receipts leave unmeasured sizes and totals unavailable; token shares
@@ -1041,7 +1075,7 @@ Activity's Inbox and Approvals open the same Inbox face, also read by
 `app {page:"inbox"}`. Requests appear in **Waiting for the person**, followed
 by **Went wrong**, then **News** with unread matters first. Rows retain the
 recorded time, symbol, destination and choices. Approval buttons say
-**Approve** and **Deny**; interaction requests keep their choices,
+**Approve** and **Deny**, or **Just this**, **For this task** and **Deny** for an untrusted agent; requests keep their choices,
 **Open request** and **Not now**. Other notes offer **Mark read**, **Archive**
 and **Dismiss**. Deny, Not now, Archive and Dismiss ask for confirmation.
 Putting a note away removes the note from the active face. In **News** and
@@ -1054,7 +1088,9 @@ a plain row. **Earlier** folds settled matters under their counts. Decided cards
 Mac and phone keep the same outcome after relaunch. An earlier **Not now** keeps
 its recorded consequence even if setup later becomes ready. An unavailable saved
 approval result says **Unknown** with its cause.
-Notifications continues to hold notification preferences and trigger switches.
+Notifications holds the master for raising things unasked and notification history.
+A morning brief runs only when they calls its part, directly or from their own queue step;
+it has no daily trigger switch.
 The separate Inbox category picker, archived toggle and approval history panel
 are removed. The chat header's note detail and notification preferences history
 remain available. Shared face rows currently show only four lines of detail;
@@ -1062,9 +1098,6 @@ the full approval preview is still available in the conversation's approval card
 
 ### The agent reading and setting these pages, quietly
 
-Notification trigger switches show a pending choice only while saving. When
-the write ends, they show the inbox owner's current setting, including changes
-made from another surface during the save.
 The Inbox face reads the in-memory experience owner and updates from that
 owner's change stream, including while no view is open. Interaction choices
 and **Not now** resolve the original transcript's card; **Open request** opens
@@ -1128,7 +1161,8 @@ first (five at most, then how many more and, when they fit, the rooms to read
 them in), and counts the rest in one line per room, such as `desk: 9 done,
 2 new`, or by the room's total when those counts do not fit; their own queue
 steps are not news to them, and a step the person closes from Home or the Desk
-is. Their look acknowledges every change it told,
+is. A change is only what its line tells: a contact's reply is news once, and
+a record rewritten with nothing new is no change. Their look acknowledges every change it told,
 shown or counted, except one drawn from a source it could not read; a change
 that needs their and was only counted stays news. The turn glance tells changes
 the same way, three at most, and acknowledges nothing. A source that is not
@@ -1167,6 +1201,8 @@ decisions. See [Trust modes and approvals](#trust-modes-and-approvals).
 Panel refresh notices publish through a per-panel `LatestRead`: an older read
 cannot clear a newer completed read's failure, and a canceled read publishes
 no freshness or status claim. Each caller still receives its own read outcome.
+Throwing panel and sidebar endpoint reads retain their redacted failure cause
+beside the endpoint name in that receipt; other endpoints finish independently.
 
 **MemoryV2** stores durable memories. **Personality** holds identity and voice
 documents. The generated about-you document is a projection of memory; edit
@@ -1222,6 +1258,7 @@ backup behavior are unchanged.
 
 Persona replacement, section append and editor saves require the existing
 document to read successfully under its write lock before backup or mutation.
+Replacement retains the complete supplied text; editor/setup append refuses a combined document above 30,000 code points before writing.
 A missing or unreadable document reports its full path and asks for repair or
 restoration; an ordinary edit never recreates it. Explicit setup and the
 compiler's missing-only genesis described above own creation.
@@ -1317,13 +1354,13 @@ components overflow, retaining the individual prompt and result counts.
 Everything the agent calls goes through `app`. Pages and `find` expose
 actions when needed, without adding more tool schemas to each request.
 The old catalog, loading and per-area tool calls are refused with a translated
-`app` call. Work previously opened through the workspace tool is now in home.
+`app` call. Home and the glance name items opened with `app {item:"<name>"}`.
 
 - Skills are built-in guidance: `ability.list` and `ability.read` find and read
   them.
 - To author a capability, the agent grows an ability with `ability.save`. Under
   Full Mac their ordinary own save is kept and on at once;
-  [practice-compiled abilities and their revisions](skill_manifest_spec.md#compiled-from-practice)
+  [abilities with tape fixtures](skill_manifest_spec.md#tape-fixtures)
   must replay their recorded examples before anyone can keep them. Otherwise
   `ability.enable` asks you with a card (or keep it on the Tools page). A kept ability appears as
   `authored.<id>`; `ability.disable` and `ability.drop` manage it; revisions fix it forward.
@@ -1427,20 +1464,22 @@ never promises something the gate does not do:
 | Sending things to other people | Not available | Asks first | Asks first | On |
 | Deleting for good | Not available | Asks first | Asks first | Asks first |
 | Changing things on your side | Not available | Asks first | Asks first | On |
-| Changing what is yours to decide | Not available | Asks first | Asks first | Asks first |
+| Changing what is yours to decide | Not available | Asks first | Asks first | On |
 | Working in my own space | On | On | On | On |
 | Reading and looking things up | On | On | On | On |
 
-“Changing what is yours to decide” lists the person's levers a card can carry,
-each by the name its action declares, after one sentence: “When you ask me for
+Under Full Mac a lever a card can carry is theirs, unless an untrusted voice steers the turn.
+Their ordinary class and reach apply, so destructive acts still ask. Below Full Mac it stays your card, and Safe refuses.
+“Changing what is yours to decide” lists the levers a card can carry,
+each by the name its action declares. Where the standing asks, it adds: “When you ask me for
 one of these, I do it. When it's my own idea, I ask you first.” Your own ask
 decides one of these as your tap and your card do: in a turn you started, at your
 Mac, your paired phone or your own Telegram, every one of these the agent does
 for it is made as yours, with no card and nothing to quote; any card still
 waiting for that same change is withdrawn as decided by your ask, its receipt
 carries your message, and the consent record keeps it. A turn another agent you
-have not trusted steered, or one the agent started on its own thought, asks you
-on a card instead. Words from a tool result, a web page, a file,
+have not trusted steered asks you on a card instead; below Full Mac, so does one the agent started on its own thought.
+Words from a tool result, a web page, a file,
 another agent, a helper or the agent itself never count. Under Safe nothing asks,
 so nothing runs on your word either. “Only you can do these” lists the levers
 no card can carry: typing or reading a secret, matching a pairing code, choosing
@@ -1448,7 +1487,7 @@ in a system panel, words sent as yours, an
 approval's own action opened on the Mac, recovering a damaged Trust policy, and
 resetting who the agent is; the agent's call to one is refused, at every
 standing, and your word cannot do it for you. Raising macOS's own permission
-prompts is not among them: on your word or your card the agent puts them in
+prompts is not among them: under the same lever law the agent puts them in
 front of you, and you answer each one yourself. A lever added to the app appears
 in one of them without touching the card.
 Some things ask case by case, decided from the request itself rather than the
@@ -1456,7 +1495,7 @@ standing, so they carry no lock; the fold says so in one sentence: a request
 from another device, chat or agent (who sent it, whether it is signed and
 trusted, or an untrusted agent steering the turn); a change that widens the
 agent's own limits (a setting raise, such as turning an app's Read or Write
-switch on, or an allow-list addition), unless you asked for it; and keeping an
+switch on, or an allow-list addition), below Full Mac or under an untrusted voice unless you asked for it; and keeping an
 ability, the turn program included (by where the ability came from, the
 standing, and whether the person had turned it off).
 
@@ -1552,10 +1591,12 @@ a repair direction. A successful empty Now Playing read returns `no_player`
 and sends no key. Stop remains cancellation, including during admission.
 
 `mac.apps` reads the resident Spotlight app inventory. A readable app bundle
-that declares no platform is a Mac app; installation classification uses its
-location and Launch Services evidence. Unavailable
-classification appears with its path and causes in `classification_unavailable`;
-the reply is `partial`, and those rows stay out of the installed projection.
+that declares no platform is a Mac app. Installation classification uses its
+location and Launch Services evidence. Ancestor package exclusion uses the
+filesystem's package flag, so a dotted folder name alone leaves the app
+eligible. Unavailable classification appears with its path and causes in
+`classification_unavailable`. The reply is `partial`, and those rows stay out
+of the installed projection.
 `all:true` includes them with their unavailable fields. Named-app resolution
 reports matching classification gaps instead of inventing an installed app or
 treating that row as absent; known copies and iOS builds do not block a separate
@@ -1595,12 +1636,18 @@ if several exist. Optional `phones` and `emails` are arrays of
 The entire raw request is validated before Contacts is read or saved;
 nulls, scalar strings, string arrays, numeric field values and malformed
 entries are refused rather than dropped or coerced. Omitted arrays and `[]`
-add nothing. Valid entries extend existing values; omitted name/organization
-fields preserve them. No partial malformed field is saved.
+add nothing. A save keeps existing values and the first entry for each new number
+(by digits) or address (case-insensitive). Omitted name and organization fields keep their values.
 
 Calendar event updates require strings for supplied title, notes and location.
 Omitting a field preserves it; an empty notes or location string clears that
 field. Malformed text fields are refused before reading or changing the event.
+Recurring event edits require the observed `startAt` from `calendar.upcoming`
+as `expected_start`, alongside `id`. Calendar and Reminders deletes take the
+returned, redacted `title` as `expected_title` and compare it in that same form;
+creation replies use that title form too. Edits and deletes match that occurrence's
+id and start before changing only it; an unavailable or moved occurrence is
+refused with a request to refresh. Deletes also check the observed title.
 Calendar day reads cover local midnight through the next local midnight as an
 exclusive end, including the final second of the requested day. EventKit full
 access permits reads and writes; write-only access permits Calendar creation
@@ -1622,11 +1669,8 @@ under Full Mac.
 authenticated turns.** They do not receive extra peer approval requirements;
 ordinary Trust, domain, service and macOS permission checks still apply.
 
-**An agent you have not trusted gets one card per command.** A turn such an
-agent starts with its message files one card on its first effect, quoting what
-it asked; your answer covers the rest of that turn. Reading any agent's words
-steers nothing, and conversing with agents or telling them what to do asks
-nothing. More restrictive Trust modes can require their own approvals.
+**Just this** runs one call; the next protected call asks again. **For this task** elevates the card's peers until the run ends.
+Approve alone means Just this. Ordinary Trust still applies. Reading agent words, conversing and giving them instructions steer nothing.
 
 Resolve requested approvals in Today. An approval authorizes a step; the
 action's receipt and the service that owns the effect establish what actually
@@ -1748,15 +1792,16 @@ The phone's Follow Providers form leaves its inactive per-helper controls
 unset; explicit settings submitted by phone clients follow the same rule.
 
 Use **Run once** for an explicit request, or configure a schedule or a supported
-Slack event. A run requested from a conversation returns there as one line:
+Slack event. An optional Slack keyword matches the message text, ignoring case.
+A run requested from a conversation returns there as one line:
 the helper's name, actual success/failure/waiting status and
 the exact saved reply to open with `bot.reply`. It uses the same durable
 reply-delivery and arrival path as a peer answer, without another model turn
-to summarize it. An interrupted execution keeps its exact shelf record. A
-request refused before execution keeps the queue owner's exact refusal, with
-its request ID and cause, instead of inventing an interrupted run. Missing
-result and refusal evidence leaves the outcome unavailable and asks for repair;
-it never creates run history. No request is repeated to obtain a result. If
+to summarize it. An interrupted execution keeps its exact shelf record. The
+queue records a refusal with the request ID and cause when it denies a request
+before execution or recovers an interrupted claim that never admitted execution.
+If there is no evidence to settle the request, its outcome remains unavailable
+and asks for repair. No request is repeated to obtain a result. If
 saving the asking conversation fails, the reply preserves the underlying
 outcome, conversation/operation identity and persistence cause. A run requested
 from the helper's own page stays in that helper's conversation. If refused
@@ -1817,7 +1862,8 @@ time; changing unread state or new arrivals can change offset positions.
 Helper-history reads and their continuation calls select a helper with `id`.
 Helper references use only `id`, and ordering uses only `sort`. A shelf entry's
 separate `bot_id` names its expected owner or selects that helper's latest reply.
-For `bot.reply` with `save_to`, `saved` contains a batch `status` and `files`.
+`bot.reply` returns the full text in `answer`. With `save_to`, `saved` contains
+a batch `status` and `files`.
 Each file has its artifact index and name, and its saved/existing path or a
 specific unavailable, access or write failure. A later failure keeps earlier
 saved rows; independent files still proceed. An incomplete export returns
@@ -1874,9 +1920,24 @@ conversation origin while sharing the engine's context, provider and action
 policy.
 Telegram's **Check sender** reports the sanitized configuration or transport
 failure returned by its owner, so a failure is not always described as a bad token.
+Bot API requests use Telegram's HTTPS endpoint; environment variables cannot redirect the bot credential to a local listener.
+In an allowlisted Telegram group, messages remain admitted, but turn controls and
+acting bot commands require the sender's user id on the user allowlist. A refused
+control answers that it belongs to the owner. Admitted private chats retain control
+when the chat id equals the sender's user id. Help, conversation lists and the
+provider, brain, tools and argument-free persona readouts remain available to
+admitted group members.
 
 Telegram's message and replay metadata readers reject malformed present values;
 unavailable transcript/diagnostic reads report their source instead of zero history.
+Unsupported slash-command stderr diagnostics identify the update without copying its message text.
+In an admitted private Telegram chat, slash text and captions enter the conversation unless their first word names a registered bot command.
+Only registered private-chat commands interpret an `@botname` suffix as a bot address.
+A command refused admission during shutdown stays pending for the next loop; it is not recorded as interrupted work that ran.
+Blocked-message, reply and voice-receipt write failures name their source in Telegram's
+error log and status; a failed reply receipt does not clear that status as a successful receipt.
+Malformed successful API results report their decoding cause; rejected API envelopes
+retain Telegram's refusal and pacing hints without requiring a success result.
 Disconnect preserves the checked allowlists, mention and voice settings even if
 the saved Keychain credential is unavailable. Status reports that credential
 cause separately from readable settings; a routing failure is unavailable rather
@@ -1889,8 +1950,9 @@ that no independent answer is owed so the claim follows ordinary retention,
 including when delivery had reserved a preview before the turn chose silence.
 Telegram OGG/Opus voice notes are decoded by the Mac's own audio reader, with
 nothing to install (this replaces the ffmpeg conversion). A format the Mac cannot
-read, WebM audio included, is refused by name. Apple Speech runs one recognition
-policy without an on-device retry branch. Already-readable system audio goes
+read, WebM audio included, is refused by name. Apple Speech requires on-device
+recognition; an unsupported locale reports its cause without sending audio to Apple.
+Already-readable system audio goes
 directly to recognition; unsupported declared formats report their cause.
 Its model controls require the configured single owner's verified sender and
 use the same `provider.choose` call as Providers for the Chat group. Model picks
@@ -1899,6 +1961,8 @@ Fast change only their own controls. Other allowed group members cannot change
 these shared choices. `/remember` and `/note` preserve those senders' principals
 and telling; only the owner speaks as the person. Missing sender or unreadable
 configuration refuses these model and memory writes.
+If Telegram cannot update the menu after saving a model, the callback reports
+the saved selection and the menu failure.
 The controls use the selected provider's catalog; unavailable capabilities
 stay unavailable. OpenRouter's model metadata owns its supported Think levels
 for pickers, saved selections and helpers; unavailable metadata requires
@@ -1908,6 +1972,17 @@ unavailable when authorizing remote Mac work; it is never
 described as a disabled setting. A queue-card removal failure is reported without editing the card
 through a second operation. Slack receives through Socket Mode only and reports
 socket failure without switching to history polling.
+
+A Slack helper-wake failure retains its repair obligation and records a
+`bot_event_intake` error; the independent chat turn still answers the message.
+The journal's fan-out claim prevents a reconnect from waking those helpers again.
+
+Slack file downloads attach the bot token only to HTTPS addresses on
+`files.slack.com` or its subdomains, without embedded credentials or a
+nonstandard port. Other addresses produce an `attachment_untrusted_url`
+notice asking for a direct Slack upload. File uploads require an upload URL and
+file ID before sending bytes, use the same address rule, and confirm only after
+Slack accepts completion.
 
 Readable captions, text and successfully downloaded attachments reach the turn
 even when another attachment fails; a named missing-media fact accompanies them.
@@ -1922,8 +1997,8 @@ Slack redacts reply text before preparation and fingerprinting and again at the
 send boundary, including saved replies and notices. Final replies retain
 confirmed progress per bounded text part before images; a truncation warning
 never establishes complete delivery. Slack `/retry resend` continues the saved
-answer after its confirmed text and images without repeating that prefix.
-Its journal explicitly retains turns
+answer after its confirmed text and images. Confirmed files need no local copy
+for the remaining images to send. Its journal explicitly retains turns
 completed without a post. Settings acquire one asynchronous checked Slack policy
 for the three rows; a save restarts the socket worker immediately while accepted
 handlers remain owned by the journal. There is no deferred settings queue.
@@ -1983,6 +2058,9 @@ reads or stops one. See [Jobs](agent-communication.md#jobs).
   and healthy background work fold under one **Nothing else needs attention** row
   with their count. A running check shows when it started; unreadable sources
   keep their availability notice beside any retained reading.
+  A repair requested while another repair runs reports that it did not run.
+  Each attempted repair carries its outcome receipt and rechecked status in
+  the returned report; logging does not claim to save a separate repair receipt.
 - Open a run row for its full prompt, output and saved facts. **Chat turn details**
   and **Cognition** keep their detailed turn and inner-state instruments;
   **Skills** and **Tools** keep their own tabs.

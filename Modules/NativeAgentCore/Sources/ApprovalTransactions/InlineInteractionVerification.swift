@@ -85,7 +85,7 @@ extension InlineInteractionResolver {
         ) else { return false }
         do {
             return try await finish(current, verification: .success(outcome), sessionID: sessionID,
-                                    turn: nil, dataRoot: dataRoot).state.outcome != nil
+                                    door: "owner_readback", turn: nil, dataRoot: dataRoot).state.outcome != nil
         } catch let error as ResolveError {
             if case .staleRevision = error { return true }
             recordControlFailure(id, dataRoot: dataRoot, error: error)

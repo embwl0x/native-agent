@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import CryptoKit
 import PersistenceCore
 import Synchronization
@@ -529,6 +530,7 @@ private extension EmbeddingModelDownload {
 
         init(archive: URL, destination: URL) {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.environment = ManagedProcess.agentEnvironment()
             process.arguments = ["-x", "-k", archive.path, destination.path]
         }
 

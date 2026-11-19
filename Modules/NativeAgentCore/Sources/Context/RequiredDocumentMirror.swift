@@ -67,7 +67,7 @@ public enum RequiredDocumentMirrorError: Error, Equatable, Sendable {
     case kernelFingerprintMismatch(expected: String, actual: String)
     case kernelDocumentCoverageMismatch(surface: ContextSurfaceVariant)
     case duplicateKernelKey(StablePromptKernelKey)
-    case logicalByteOverflow
+    case secretLikeContent
 }
 
 /// An exact, immutable RAM copy of one canonical document required in full.
@@ -76,7 +76,6 @@ public struct RequiredDocument: Sendable, Equatable {
     public let canonicalOrder: Int
     public let sourceHash: String
     public let text: String
-    public let logicalByteCount: Int
     /// Carry source provenance and permitted surfaces with document bytes so stable-prefix permission cannot drift with locator naming. Nil is unproven and
     /// unavailable to that prefix; packet admission still applies its own surface rules.
     public let sourceID: ContextSourceID?
@@ -115,22 +114,6 @@ public struct RequiredDocument: Sendable, Equatable {
         self.text = text
         self.sourceID = sourceID
         self.permittedSurfaces = permittedSurfaces
-        // Absent provenance contributes zero logical bytes.
-        let provenanceBytes = try ContextLogicalByteAccounting.checkedSum(
-            [sourceID?.rawValue.utf8.count ?? 0]
-                + (permittedSurfaces?.map { $0.rawValue.utf8.count } ?? []),
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
-        self.logicalByteCount = try ContextLogicalByteAccounting.checkedSum(
-            [
-                48,
-                id.rawValue.utf8.count,
-                sourceHash.utf8.count,
-                text.utf8.count,
-                provenanceBytes,
-            ],
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
     }
 
 }
@@ -175,7 +158,6 @@ public struct StablePromptKernel: Sendable, Equatable {
     /// Surface instructions follow the permission-checked documents.
     public let surfaceGuidance: String
     public let includedDocumentIDs: [RequiredDocumentID]
-    public let logicalByteCount: Int
 
     public init(
         key: StablePromptKernelKey,
@@ -189,23 +171,6 @@ public struct StablePromptKernel: Sendable, Equatable {
         self.renderedPrompt = renderedPrompt
         self.surfaceGuidance = surfaceGuidance
         self.includedDocumentIDs = includedDocumentIDs
-        let includedIDBytes = try ContextLogicalByteAccounting.checkedSum(
-            includedDocumentIDs.map { $0.rawValue.utf8.count },
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
-        self.logicalByteCount = try ContextLogicalByteAccounting.checkedSum(
-            [
-                64,
-                key.personaID.rawValue.utf8.count,
-                key.surfaceVariant.rawValue.utf8.count,
-                key.sourceFingerprint.utf8.count,
-                renderedPrompt.utf8.count,
-                surfaceGuidance.utf8.count,
-                includedIDBytes,
-                requestedPersonaOverride?.utf8.count ?? 0,
-            ],
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
     }
 }
 
@@ -215,7 +180,6 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
     public let sourceFingerprint: String
     public let documents: [RequiredDocument]
     public let kernels: [ContextSurfaceVariant: StablePromptKernel]
-    public let logicalByteCount: Int
 
     public init(
         personaID: ContextPersonaID,
@@ -283,24 +247,6 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
         self.sourceFingerprint = sourceFingerprint
         self.documents = orderedDocuments
         self.kernels = kernelsBySurface
-        let documentBytes = try ContextLogicalByteAccounting.checkedSum(
-            orderedDocuments.map(\.logicalByteCount),
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
-        let kernelBytes = try ContextLogicalByteAccounting.checkedSum(
-            kernels.map(\.logicalByteCount),
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
-        self.logicalByteCount = try ContextLogicalByteAccounting.checkedSum(
-            [
-                64,
-                personaID.rawValue.utf8.count,
-                sourceFingerprint.utf8.count,
-                documentBytes,
-                kernelBytes,
-            ],
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
     }
 
     public func document(id: RequiredDocumentID) -> RequiredDocument? {
@@ -309,17 +255,5 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
 
     public func kernel(for surfaceVariant: ContextSurfaceVariant) -> StablePromptKernel? {
         kernels[surfaceVariant]
-    }
-}
-
-enum ContextLogicalByteAccounting {
-    static func checkedSum<E: Error>(_ values: [Int], overflowError: @autoclosure () -> E) throws -> Int {
-        var total = 0
-        for value in values {
-            let addition = total.addingReportingOverflow(value)
-            guard !addition.overflow else { throw overflowError() }
-            total = addition.partialValue
-        }
-        return total
     }
 }

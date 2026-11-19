@@ -99,7 +99,7 @@ extension SwiftToolDispatcher {
                                 brief: try botString(args["brief"], field: "brief"),
                                 cadence: try botRequestedCadence(args) ?? .manual,
                                 budget: try args["budget"].map { try botDecode(BotBudget.self, $0, field: "budget") }
-                                    ?? BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds))
+                                    ?? BotBudget(tokens: BotRunLimits.maximumTokens))
         bot.personality = try args["personality"].map { try botString($0, field: "personality") }
         bot.provider = try args["provider"].map { try botString($0, field: "provider") }
         bot.model = try args["model"].map { try botString($0, field: "model") }
@@ -389,7 +389,7 @@ extension SwiftToolDispatcher {
                                     "detail": .string("The bot run queue is not connected.")])
                 }
                 writeStarted = true
-                let receipt = try standingBotRunEnqueue(bot.id, question)
+                let receipt = try standingBotRunEnqueue(bot.id, question, turn)
                 let request = receipt.runID.uuidString
                 return .object(["status": .string(receipt.accepted ? "queued" : "joined"), "id": .string(bot.id.uuidString),
                     "requestId": .string(request),
@@ -413,13 +413,6 @@ extension SwiftToolDispatcher {
                             return .object(["status": .string("running"), "id": .string(entryID.uuidString),
                                 "detail": .string("Run \(entryID.uuidString) is \(presence == .queued ? "queued" : "still running") and not on the shelf yet; "
                                     + "its result returns to the asking conversation when it lands. This does not start or repeat a run.")])
-                        case .deadlineExceeded:
-                            return .object(["status": .string("outcome_unknown"), "effects": .string("unknown"),
-                                "id": .string(entryID.uuidString), "terminal": .bool(false),
-                                "detail": .string("""
-                                    This run exceeded its observation deadline but still owns its writer claim. Its result is not settled; \
-                                    reconcile this run before requesting another.
-                                    """)])
                         case .absent:
                             if let detail = try BotRunQueue(dataRoot: dataRoot).refusal(bot: botID(owner), requestID: entryID) {
                                 return .object(["status": .string("refused"), "effects": .string("none"),
@@ -435,9 +428,7 @@ extension SwiftToolDispatcher {
                     }
                 } else {
                     let selected = try definitions.get(botReference(["id": selection["bot_id"] ?? .null], definitions: definitions, dataRoot: dataRoot))
-                    guard let latest = try shelf.entriesByBot()[selected.id]?.last(where: {
-                        !$0.uncertainties.contains("Run receipt pending finalization.")
-                    }) else {
+                    guard let latest = try shelf.entriesByBot()[selected.id]?.last else {
                         return .object(["status": .string("empty"), "agent_name": .string(selected.name),
                             "session_id": .string(selected.sessionID),
                             "detail": .string("No settled reply yet. This does not start or repeat a run.")])
@@ -637,7 +628,7 @@ private func botObject(_ value: JSONValue?, field: String) throws -> [String: JS
 
 private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field: String) throws -> T {
     var shape = type == Bool.self ? "A boolean." : type == Int.self ? "An integer." : type == String.self ? "A string."
-        : type == BotBudget.self ? "An object with tokens: positive integer and seconds: positive finite number."
+        : type == BotBudget.self ? "An object with tokens: positive integer."
         : type == BotCadence.self ? """
             An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string}. Times are on this Mac's local \
             clock and follow it when it changes zone.
@@ -656,7 +647,6 @@ private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field:
         let path = ([field] + keys).joined(separator: ".")
         switch path {
         case "budget.tokens": shape = "A positive integer."
-        case "budget.seconds": shape = "A positive finite number."
         case "cadence.interval.seconds": shape = "A finite number of seconds meeting the bot cadence minimum."
         case "cadence.cron.expression": shape = "A cron expression string."
         default: break

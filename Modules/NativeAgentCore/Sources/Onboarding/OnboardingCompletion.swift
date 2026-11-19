@@ -72,23 +72,17 @@ extension SwiftNativeOnboardingClient {
                     profilePath: profileJSONPath,
                     dataRoot: dataRoot
                 )
-                let userPath = allTargets["user"]!
-                let userShape = try Self.classifyUserDoc(at: userPath)
+                guard let userPath = allTargets["user"] else { throw OnboardingError.ioFailure("The persona target catalog is incomplete.") }
                 let preexisting = allTargets
                     .filter { $0.key != "profile" && $0.key != "user" }
                     .contains { FileManager.default.fileExists(atPath: $0.value.path) }
-                    || userShape == .authored
-                guard !preexisting else {
+                guard case let .replaceable(userBaseSHA256) = try Self.classifyUserDoc(at: userPath), !preexisting else {
                     return OnboardingCompleteResult(
                         ok: false,
                         error: "persona_already_exists",
                         detail: "Personality documents already exist. Start setup over to back them up before trying again."
                     )
                 }
-                // Pin projection bytes so ensureCommitted refuses changes after preparation.
-                let userBaseSHA256: String? = userShape == .generatorProjection
-                    ? (try? Data(contentsOf: userPath)).map { Self.sha256($0) }
-                    : nil
                 let docs: PersonaTemplates.Docs
                 do {
                     docs = try PersonaTemplates.generate(

@@ -166,7 +166,14 @@ public final class AppToolExecutor: ChatToolExecuting {
     static func doorReadOnly(_ input: [String: JSONValue], turn: Turn?) throws -> Bool {
         guard input["script"] == nil || input["script"] == .null || input["script"] == .string("") else { return false }
         if case .array(let entries)? = input["actions"], !entries.isEmpty {
-            return try entries.allSatisfy { if case .object(let call) = $0 { try doorReadOnly(call, turn: turn) } else { false } }
+            return try entries.allSatisfy { if case .object(let call) = $0 {
+                try doorReadOnly(call.filter { !["expect", "as", "cleanup"].contains($0.key) }, turn: turn) } else { false } }
+        }
+        var input = ToolNameAliases.doorCall("app", input)
+        if doorText(input["action"]).isEmpty {
+            let place = AppDoorNames.place(page: doorText(input["page"]), item: doorText(input["item"]))
+            input["page"] = .string(place.page)
+            input["item"] = .string(place.item)
         }
         let action = doorText(input["action"])
         if !action.isEmpty {
@@ -551,6 +558,8 @@ public final class AppToolExecutor: ChatToolExecuting {
             return .object(fields)
         case "make_studio":
             return await runMake(verb: verb, input: input, turn: turn, execution: execution)
+        case "table_change":
+            return try await runTable(verb: verb, input: input, turn: turn, execution: execution)
         case "studio_intake_read":
             return await runStudioIntakeRead(input: input, surface: surface)
         case "doctor_status":
@@ -562,7 +571,7 @@ public final class AppToolExecutor: ChatToolExecuting {
         case "repair_let_go":
             return await runRepairLetGo(input: input)
         case "record_read":
-            return await runRecordRead(input: input)
+            return await runRecordRead(input: input, turn: turn)
         case "abilities_restore_state":
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             let archive = try AbilityStore(dataRoot: root).restoreState(input["state"] ?? .null,
@@ -627,9 +636,10 @@ public final class AppToolExecutor: ChatToolExecuting {
             let answer = action.tool == "provider"
                 ? await host.provider(verb: verb, input: input, turn: turn) : await host.connections(verb: verb, input: input, turn: turn)
             guard case .object(var body) = answer else {
-                return Self.doorRefusal("handler_result_missing", "\(action.id) returned no structured result; its effects are unknown.",
-                    remedy: "inspect", "Read the owning page and reconcile the affected state before another change.",
-                    next: ["page": .string(action.page)], extra: ["effects": .string("unknown"), "action": .string(action.id), "verb": .string(verb)])
+                return Self.failure("handler_result_missing", "\(action.id) returned no structured result; its effects are unknown.",
+                    extra: ["effects": .string("unknown"), "action": .string(action.id), "verb": .string(verb), "remedy": .object(["kind": .string("inspect"),
+                        "instruction": .string("Read the owning page and reconcile the affected state before another change."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["page": .string(action.page)])])])])
             }
             body["verb"] = .string(verb)
             // Who decided it: the person when their own act admitted this call, the agent otherwise.

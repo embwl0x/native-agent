@@ -356,11 +356,10 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
         publishing = true
         defer { publishing = false }
-        for pending in state.pending.prefix(8) {
+        for pending in state.pending.filter({ !iCloudBridge.shared.isAwaitingMacAcceptance($0.event.id) }).prefix(8) {
             guard pending.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else { return }
             guard state.pending.contains(where: { $0.event.id == pending.event.id }),
-                  state.places.contains(where: { $0.id == pending.event.placeID && $0.enabled }),
-                  !iCloudBridge.shared.isAwaitingMacAcceptance(pending.event.id) else { continue }
+                  state.places.contains(where: { $0.id == pending.event.placeID && $0.enabled }) else { continue }
             do {
                 _ = try await iCloudBridge.shared.sendChatMessage(id: pending.event.id,
                     text: String(decoding: try JSONEncoder().encode(pending.event), as: UTF8.self),
@@ -377,7 +376,10 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
                             }
                         }
                     })
-            } catch { errorMessage = "Place events are waiting to sync: \(error.localizedDescription)"; return }
+            } catch {
+                if error is DeviceSyncSendOutcomeUnknown { iCloudBridge.shared.retireDelivery(for: pending.event.id) }
+                errorMessage = "Place events are waiting to sync: \(error.localizedDescription)"; return
+            }
         }
     }
 

@@ -75,18 +75,6 @@ extension EngineFaceActs {
         return try Self.committed(true, identities: ["telegram"])
     }
 
-    func saveSlackIngress(_ request: SlackIngressWrite) async throws -> FaceActReply {
-        let root = engine.dataRoot
-        let current = try await Task.detached { try SlackSocketModeConfig.loadIngressPolicy(dataRoot: root) }.value
-        let result = await NativeOAuthFlow.saveSlackToken(try Self.secret(request.token) ?? "",
-            allowedChannelIds: Set(request.allowedChannelIDs), allowedUserIds: Set(request.allowedUserIDs),
-            requireMention: current.requireMention, dataRoot: engine.dataRoot)
-        guard result.ok else { throw Self.failure("slack_save_failed", result.error ?? "Slack did not confirm the policy save.") }
-        await ConnectorReadiness.restartSlackLane(root: engine.dataRoot)
-        _ = try await engine.connectors.refresh().get()
-        return try Self.committed(true, identities: ["slack"])
-    }
-
     func testTelegram() async throws -> FaceActReply {
         let current = try await engine.telegram.load()
         let target = current.allowedChatIds.first ?? current.allowedUserIds.first

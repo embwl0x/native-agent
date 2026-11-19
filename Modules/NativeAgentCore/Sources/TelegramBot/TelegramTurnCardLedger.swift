@@ -197,8 +197,6 @@ actor TelegramTurnCardRestartRepairer {
     private var attemptedCards: Set<UUID> = []
     private var repairTask: Task<Void, Never>?
     private var isShuttingDown = false
-    /// Cards this repair marked interrupted, by chat, so a recovered reply resent into that chat can take its card away.
-    private var interruptedCards: [Int: [Int]] = [:]
 
     init(ledger: TelegramTurnCardLedger) {
         self.ledger = ledger
@@ -217,13 +215,6 @@ actor TelegramTurnCardRestartRepairer {
         repairTask?.cancel()
         await repairTask?.value
         isShuttingDown = false
-    }
-
-    /// Only when the chat has exactly one: with several, which card belongs to the resent reply is unknown, so all of them stay.
-    func takeInterruptedCard(chatId: Int) -> Int? {
-        guard let ids = interruptedCards[chatId], ids.count == 1 else { return nil }
-        interruptedCards[chatId] = nil
-        return ids[0]
     }
 
     func repairOnce(
@@ -286,7 +277,6 @@ actor TelegramTurnCardRestartRepairer {
             do {
                 try await edit(record, Self.interruptedText)
                 try await ledger.remove(turnId: record.turnId)
-                interruptedCards[record.chatId, default: []].append(record.messageId)
                 repaired += 1
             } catch {
                 // Retain ambiguous repair identities for restart; the API's not-modified response makes repeated edits safe.

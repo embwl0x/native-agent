@@ -35,12 +35,12 @@ let validClasses: Set<String> = [
 ]
 let primitiveNeedles = [
     "Task.sleep(",
-    "Task.sleep(for:",
     "Thread.sleep(",
     "usleep(",
     ".asyncAfter(",
     "Timer.publish(",
     "Timer.scheduledTimer(",
+    "Timer(timeInterval:",
     "DispatchSource.makeTimerSource(",
 ]
 

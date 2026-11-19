@@ -79,32 +79,3 @@ extension AppModel: FirstRunWelcomePort {
     }
 
 }
-
-extension AppModel {
-    // MARK: Onboarding
-    func completeOnboarding(agentName: String, personaType: String, userName: String) async throws -> OnboardingCompleteResult {
-        try await engine.completeOnboarding(
-            payload: OnboardingCompletePayload(agentName: agentName, personaType: personaType, userName: userName),
-            resident: .live
-        )
-    }
-
-    func resumePendingOnboarding() async throws -> OnboardingCompleteResult {
-        try await engine.resumePendingOnboarding(resident: .live)
-    }
-
-    func repairOnboardingProfile(agentName: String, personaType: String, userName: String) async throws -> OnboardingCompleteResult {
-        try await engine.repairOnboardingProfile(
-            payload: OnboardingCompletePayload(agentName: agentName, personaType: personaType, userName: userName),
-            publishProfile: { await self.reloadPersonality() }, resident: .live
-        )
-    }
-
-    func resetOnboarding(confirm: Bool = true) async throws -> OnboardingResetResult {
-        try await engine.resetOnboarding(confirm: confirm, resident: .live)
-    }
-
-    func refreshResidentMindAfterOnboardingTransition() async {
-        await NativeAgentEngine.live.refreshResidentMindAfterOnboardingTransition()
-    }
-}

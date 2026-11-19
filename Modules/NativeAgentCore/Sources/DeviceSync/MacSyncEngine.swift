@@ -26,10 +26,8 @@ public final class MacSyncEngine: ObservableObject {
     }
 
     var snapshotDir: URL?
-    var inboxDir: URL?
     var responsesDir: URL?
     var transactionDir: URL?
-    var inboxQuery: NSMetadataQuery?
     /// Exact snapshot-file observation; app/store mutations own normal writes.
     var snapshotIntegrityWatcher: FileChangeWatcher?
     var snapshotIntegrityReconcileTask: Task<Void, Never>?
@@ -53,8 +51,6 @@ public final class MacSyncEngine: ObservableObject {
     var chatTranscriptDidChangeObserver: NSObjectProtocol?
     var pageFacePublishedObserver: NSObjectProtocol?
     var turnSessionsFacePublishedObserver: NSObjectProtocol?
-    var pruneDeadlineTask: Task<Void, Never>?
-    var archiveRetentionWatcher: FileChangeWatcher?
     var connectorsSnapshotWatcher: FileChangeWatcher?
     var connectorHealthState: JSONValue?
     var activeDocsURL: URL?
@@ -67,9 +63,6 @@ public final class MacSyncEngine: ObservableObject {
     var snapshotWriteQueuedNeedsChatTranscripts = false
     /// Generation fences stop late passes from publishing into a restarted cache or container.
     var snapshotLifecycleGeneration: UInt64 = 0
-    /// Retained through accepted action settlement; stop closes the next admission.
-    var inboxProcessingTask: Task<Void, Never>?
-    var inboxProcessingQueued = false
     var snapshotFileDigests: [String: SnapshotFileDigest] = [:]
     // Maintain insertion order so oldest are evicted first.
     var processedMsgIds: Set<String> = []
@@ -150,25 +143,13 @@ public final class MacSyncEngine: ObservableObject {
     enum PairingSecretRotation: Equatable { case writing, awaitingVerification }
     var pairingSecretRotation: PairingSecretRotation?
     var pairingSecretRotationInProgress: Bool { pairingSecretRotation != nil }
-    enum KVSKey {
-        static let snapshotUpdated = "snapshot_updated"
-        static let inboxPending = "inbox_pending"
-    }
-
     init(sync: DeviceSync) {
         self.sync = sync
     }
 
     enum Folder {
         static let snapshots = "snapshots"
-        static let inbox = "inbox"
-        static let inboxRejected = "inbox/_rejected"
         static let responses = "responses"
         static let transactions = "transactions/mac"
     }
-
-    let inboxResponseKeyPrefix = ICloudKVSProgressWriteAdmission.inboxResponseKeyPrefix
-    let inboxResponseKeyTTL: TimeInterval = 24 * 3600
-    /// Backstop ceiling kept well below the hard 1024-key KVS quota.
-    let inboxResponseKeyMaxCount = ICloudKVSProgressWriteAdmission.inboxResponseKeyCeiling
 }

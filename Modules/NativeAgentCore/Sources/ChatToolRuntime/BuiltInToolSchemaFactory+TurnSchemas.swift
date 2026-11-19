@@ -23,20 +23,20 @@ extension BuiltInToolSchemaFactory {
         [
             requestedSchema(name: "tool_result_page", toolClass: .read, capabilities: ["catalog_read", "tool_call"],
                 description: """
-                    Read a result retained this turn without repeating its action. Only full_result_retained:true results are eligible. Follow \
-                    next_call; continue:true alone selects the sole retained result. Exact result_handle/page also works. Query returns the \
+                    Read a retained result without repeating its action, across turns and relaunches. An untrusted-steered turn reads only its \
+                    conversation's results; other turns read any handle. Bodies over 4 MiB keep their head and say how many bytes were cut. Follow \
+                    next_call; continue:true resumes this turn's last read. Exact result_handle/page also works. Query returns the \
                     lines that match in source order, each with its path, line or offset, the adjacent lines and section_page, the page a \
                     read without query shows its whole section on; it cannot search unread source content. \
                     source_continues means the answer held only part of its source: its next_call reads on, pages never do. Read-only, redacted; \
-                    expires at turn end.
+                    retained for the record's 14-day detail horizon, including after relaunch.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("result_handle", ToolSchema.nullable(ToolSchema.strSchema("Opaque handle from the bounded_tool_result receipt."))),
                         ("continue", ToolSchema.nullable(ToolSchema.boolSchema("""
                             Continue this turn's last successful read; page is ignored. With query or raw, reads that way: the same read goes on, \
-                            a different one starts at its page 0. result_handle explicitly changes result. Before any read, starts the sole \
-                            retained result or asks you to choose.
+                            a different one starts at its page 0. result_handle explicitly changes result. Name result_handle for the first read.
                             """))),
                         ("page", ToolSchema.nullable(ToolSchema.intSchema("""
                             Zero-based whole-number page index. Omit or null starts at 0; follow next_page while has_more is true. Keep query and \

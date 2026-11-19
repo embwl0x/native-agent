@@ -6,9 +6,6 @@ extension AppModel {
         face.slot(.counts).select(name, as: CountsFace.self, part)
     }
 
-    func panelRefreshStatus(for item: SidebarItem) -> PanelRefreshStatus? {
-        countPart("panel.receipt.\(item.rawValue)") { $0?.panels.panels[item.rawValue]?.receipt }
-    }
 
     func panelIsReading(_ item: SidebarItem) -> Bool {
         countPart("panel.reading.\(item.rawValue)") { face in
@@ -16,7 +13,4 @@ extension AppModel {
         }
     }
 
-    func detachedRefreshStatus(for session: String) -> PanelRefreshStatus? {
-        countPart("panel.detached.\(session)") { $0?.panels.detached[session] }
-    }
 }

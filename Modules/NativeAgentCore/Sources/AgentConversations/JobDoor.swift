@@ -3,16 +3,17 @@ import Foundation
 import MacControl
 import NativeAgentCore
 import PersistenceCore
+import Senses
 import os
 // Blueprint: | `JobDoor.swift` | `JobDoors.install`; what every job door shares: its outlet and beat, the envelope broker, what the organ made, its live runs |
 
 /// The doors through which another whole agent takes a job, one per native protocol, each using the agent's own approved program or card. Installed at
-/// launch, before a relaunch resumes any job. Every door bounds its organ by the job's envelope alone: the Mac's posture never widens it.
+/// launch, before a relaunch resumes any job. Permission requests use the job's envelope; launch confinement may narrow it, never widen it.
 public enum JobDoors {
-    public static func install(dataRoot: URL) {
+    public static func install(dataRoot: URL, acpLaunch: @escaping @Sendable (String, String, [String]) async throws -> [String]) {
         AgentJobDoors.install(CodexJobDoor(dataRoot: dataRoot))
         AgentJobDoors.install(ClaudeCodeJobDoor(dataRoot: dataRoot))
-        AgentJobDoors.install(ACPJobDoor(dataRoot: dataRoot))
+        AgentJobDoors.install(ACPJobDoor(dataRoot: dataRoot, launch: acpLaunch))
         AgentJobDoors.install(A2AJobDoor(dataRoot: dataRoot))
     }
 
@@ -36,6 +37,7 @@ public enum JobDoors {
             ?? AgentHostConnection.builderWorkspaceRoot(dataRoot: dataRoot).appendingPathComponent("agent-bridge-runs/" + host, isDirectory: true)
         do { try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         catch { throw JobRefusal("\(job.contact.name)'s own folder \(own.path) could not be made: \(error.localizedDescription). Nothing ran.") }
+        _ = try AgentJobs.place(.string(own.path), dataRoot: dataRoot).get()
         return own
     }
 
@@ -173,20 +175,20 @@ struct JobAsk: Sendable {
 /// The agent's one permission brain for organs: a request inside the job's envelope is answered at once; anything outside it becomes a card for the person,
 /// whatever the contact's trust or the Mac's posture.
 enum JobDoorBroker {
-    static func within(_ ask: JobAsk, _ envelope: AgentJob.Envelope, cwd: URL) -> Bool {
+    static func within(_ ask: JobAsk, _ envelope: AgentJob.Envelope, cwd: URL) throws -> Bool {
         switch ask.kind {
         case .read: return true
         case .network: return envelope.network
         case .other: return false
         case .write:
             guard envelope.writes, let folder = envelope.folder, !ask.paths.isEmpty else { return false }
-            return ask.paths.allSatisfy { inside($0, folder: folder, cwd: cwd) }
+            return try ask.paths.allSatisfy { try inside($0, folder: folder, cwd: cwd) }
         }
     }
 
     /// Inside the folder after symlinks: a link inside the folder that leads out is outside. A repo's `.git` is not the job's to write: its hooks and
     /// config would run in the agent's hands later.
-    static func inside(_ path: String, folder: String, cwd: URL) -> Bool {
+    static func inside(_ path: String, folder: String, cwd: URL) throws -> Bool {
         let expanded = (path as NSString).expandingTildeInPath
         var url = (expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : cwd.appendingPathComponent(expanded)).standardizedFileURL
         var tail: [String] = []
@@ -196,12 +198,26 @@ enum JobDoorBroker {
         }
         let resolved = tail.reduce(url.resolvingSymlinksInPath()) { $0.appendingPathComponent($1) }.path
         guard resolved == folder || resolved.hasPrefix(folder + "/") else { return false }
-        return resolved != folder + "/.git" && !resolved.hasPrefix(folder + "/.git/")
+        let root = URL(fileURLWithPath: folder)
+        if try SenseSandboxProfile.containsResolved(URL(fileURLWithPath: resolved),
+            roots: [root.appendingPathComponent(".git")]) { return false }
+        guard let caseSensitive = try root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames else {
+            throw JobDoorFailure("The job folder's case-sensitivity could not be read.")
+        }
+        let options: String.CompareOptions = caseSensitive ? [.literal] : [.literal, .caseInsensitive]
+        let git = folder + "/.git"
+        return resolved.compare(git, options: options) != .orderedSame
+            && resolved.range(of: git + "/", options: options.union(.anchored)) == nil
     }
 
     /// The organ waits while the person decides; the job reads needs_you until then. A card that cannot be filed declines the request and says why.
     static func answer(_ ask: JobAsk, job: JobStart, record: JobDoors.Record, cwd: URL, out: JobDoorOut, dataRoot: URL) async -> Bool {
-        if within(ask, job.envelope, cwd: cwd) { return true }
+        do {
+            if try within(ask, job.envelope, cwd: cwd) { return true }
+        } catch {
+            out.fail(JobDoorFailure("Its permission boundary could not be checked: \(error.localizedDescription)."))
+            return false
+        }
         out.send(.needsYou(JobPermissionRequest(id: "ask-" + UUID().uuidString.lowercased(), title: String(ask.title.prefix(300)),
                                                 subject: ask.paths.first)))
         let allowed: Bool
@@ -236,7 +252,8 @@ enum JobDoorArtifacts {
         var gaps: [String] = []
         if FileManager.default.fileExists(atPath: folder.appendingPathComponent(".git").path) {
             let ran = try await ProcessExecution().run(executable: "/usr/bin/git",
-                arguments: ["-C", folder.path, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+                arguments: ["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-C", folder.path,
+                            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=all"],
                 currentDirectory: folder, environment: nil, standardInput: nil, timeoutSeconds: nil, outputByteLimit: 8 * 1_048_576)
             guard ran.exitCode == 0, !ran.timedOut, !ran.stdoutTruncated else {
                 throw JobDoorFailure("git status in \(folder.path) did not answer (exit \(ran.exitCode)): \(ran.stderr.prefix(300))")

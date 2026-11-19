@@ -19,7 +19,7 @@ import TrustPersistence
 extension NativeAgentEngine {
     var trustFacePaths: [URL] {
         ["trust/policy.json", "security/mac_integration_permissions.json", "agents/peers.json", "agents/conversations.json",
-         "agents/discovery.json", "chat/sessions.json", "backups/index.json", "telegram/config.json", "paired_phones.json",
+         "agents/discovery.json", "agents/recipes/", "chat/sessions.json", "backups/index.json", "telegram/config.json", "paired_phones.json",
          "abilities/mac-watch-catalog.js", "connectors/registry.json"].map { dataRoot.appendingPathComponent($0) }
             + [ActivityWatchPaths.policyURL(dataRoot: dataRoot), AgentLocalHealth.url(dataRoot),
                TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)]
@@ -29,7 +29,8 @@ extension NativeAgentEngine {
         [SwiftNativeSecurityCenter.consentDidWrite, SystemPermissionPreflight.permissionDidChange,
          ChatGPTDotIPCTransport.didChange, QuietSettings.trustVoicePreferenceDidChange,
          SwiftNativeMacControl.auditDidWrite, ActivityWatchController.didChange, ChromeControlRuntime.connectionDidChange,
-         MacIntegrationFacade.systemStatusesDidChange, MacIntegrationFacade.watchesDidChange, NSApplication.didBecomeActiveNotification]
+         MacIntegrationFacade.systemStatusesDidChange, MacIntegrationFacade.watchesDidChange, NSApplication.didBecomeActiveNotification,
+         ContactThreadReadouts.contactsDidChange]
     }
 
     /// The standing leads alone. Every other block is one line until opened, unless a row in it needs the person: those are drawn open,
@@ -218,8 +219,6 @@ extension NativeAgentEngine {
                 : "Each switch saves immediately. File rules, macOS grants and Trust still apply.", rows: access + fields.map { id, title, on in
                     trustFaceToggle(id == "enabled" ? "trust.mac_control" : "trust.mac_control_" + id, title, on)
                 } + [
-                    .init(id: "mac.shortcuts", title: "macOS Shortcuts", value: "Not built yet"),
-                    .init(id: "mac.system", title: "System control", value: "Not built yet"),
                     .init(id: "mac.workbench", title: "Mac control workbench", detail: "Freeform commands use the Mac's native workbench.",
                         actions: [.init(id: "workbench", label: "Open workbench on this Mac", doors: macDoor, call: PartFace.Call("trust.workbench"))])
                 ]))
@@ -238,7 +237,7 @@ extension NativeAgentEngine {
 
     private func trustPeersFace() async -> PartFace.Section {
         do {
-            _ = try await contacts.refresh()
+            if await MainActor.run(body: { !contacts.loaded || contacts.loadError != nil }) { _ = try await contacts.refresh() }
             let state = await MainActor.run { (error: contacts.loadError, doors: contacts.doors) }
             if let error = state.error { throw PartCallError(code: "contacts_unavailable", message: error) }
             let rows = state.doors.compactMap { row -> PartFace.Row? in

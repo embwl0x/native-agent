@@ -82,7 +82,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
                   ChatTranscriptPresentation.hasVisibleText(final) else {
                 draft.edit(base())
                 showToast(result.phase == .cancelled ? "Dictation cancelled" : "No speech detected")
-                return false
+                return result.phase != .cancelled
             }
             draft.edit(voiceDraft(base: base(), transcript: final))
             if let attachment = result.attachment { attach(attachment) }
@@ -127,27 +127,11 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
     }
 
     @MainActor
-    static func attachFromClipboardOrPickFile(
-        appModel: AppModel, session: String,
-        appendImage: @escaping @MainActor (FaceAttachment) -> Void,
+    static func pickFileToAttach(
         attachFile: @escaping @MainActor (URL) -> Void,
         showToast: @escaping @MainActor (String) -> Void,
         emptySelectionMessage: String? = nil
     ) {
-        let pasteboard = NSPasteboard.general
-        if let type = imageType(in: (pasteboard.types ?? []).map(\.rawValue)) {
-            guard let bytes = pasteboard.data(forType: .init(type)), let mime = imageMIME(type) else {
-                showToast("Couldn't read the clipboard image"); return
-            }
-            Task {
-                do {
-                    let attachment = FaceAttachment(id: UUID().uuidString, name: "Clipboard image", mimeType: mime,
-                                                    byteCount: bytes.count, resource: nil, bytes: bytes)
-                    appendImage(try await ingest(attachment, appModel: appModel, session: session, showWarning: showToast))
-                } catch { showToast(error.localizedDescription) }
-            }
-            return
-        }
         guard let urls = pickAttachmentFiles() else { return }
         if urls.isEmpty, let emptySelectionMessage { showToast(emptySelectionMessage) }
         for url in urls { attachFile(url) }

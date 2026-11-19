@@ -110,19 +110,21 @@ extension SwiftNativeMemoryV2 {
         return try await underlying.memory(id: id).map(MemoryRecord.init(stored:))
     }
 
-    /// Carries disclosure-filtered person facts with pinned facts first.
+    /// Carries only disclosure-filtered pinned person facts.
     public func userPromptCore(surface: String, preview: Bool = false) async throws -> [String] {
         try await ensureCanonicalAttachment(preview: preview)
         guard let underlying = storage else { throw MemoryV2Error.storageUnavailable }
-        return try await underlying.userPromptCore(surface: surface)
+        return try await underlying.userPromptCore(surface: surface).facts
     }
 
     /// The same read, with how long it took once this actor took it up, so a caller can tell waiting for the actor (it also computes
     /// embeddings) from the read itself.
-    public func userPromptCoreTimed(surface: String) async throws -> (facts: [String], workNanoseconds: UInt64) {
+    public func userPromptCoreTimed(surface: String) async throws -> (facts: [String], established: Bool, workNanoseconds: UInt64) {
         let entered = DispatchTime.now().uptimeNanoseconds
-        let facts = try await userPromptCore(surface: surface)
-        return (facts, DispatchTime.now().uptimeNanoseconds &- entered)
+        try await ensureCanonicalAttachment()
+        guard let underlying = storage else { throw MemoryV2Error.storageUnavailable }
+        let core = try await underlying.userPromptCore(surface: surface)
+        return (core.facts, core.established, DispatchTime.now().uptimeNanoseconds &- entered)
     }
 
     /// The process-wide actor shares canonical SQLite and managed embeddings; failed real inference throws unless mock is explicitly configured. Attach

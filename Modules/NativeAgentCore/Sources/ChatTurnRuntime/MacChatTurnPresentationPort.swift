@@ -6,7 +6,6 @@ import MacControl
 
 public enum MacChatTurnPresentationEvent: Sendable {
     case status(String)
-    case activity(MacChatTurnActivity)
 }
 
 /// The turn's body owner supplies transcript and status publication at transaction boundaries; tokens use the stream port.

@@ -17,7 +17,7 @@ import Cognition
 import ProviderRouting
 // Blueprint: | `EngineDoctor.swift` | Shared report availability, route health, liveness and checked publication |
 
-/// Share one root’s health state across surfaces, including nonisolated phone reads; native ports observe while `EngineDoctorRuntime` interprets and
+/// Share one root’s health state across surfaces; native ports observe while `EngineDoctorRuntime` interprets and
 /// admits repairs.
 @MainActor
 @Observable
@@ -61,11 +61,7 @@ public final class DoctorFacade {
     public private(set) var activityRefresh: PanelRefreshStatus?
     public private(set) var productionHardening: ProductionHardeningSummary?
     public private(set) var productionExports: [ProductionExport] = []
-    public private(set) var latestImprovementGauntletRun: ImprovementGauntletRun?
-    public private(set) var improvementGauntletRunCount = 0
     public private(set) var hardeningRefresh: PanelRefreshStatus?
-    public internal(set) var improvementRunStartedAt: Date?
-    public internal(set) var improvementRunError: String?
     public internal(set) var productionExportWork: (support: Bool, startedAt: Date)?
     public internal(set) var productionExportFailure: (support: Bool, detail: String)?
     @ObservationIgnored var capabilitiesDidChange: (@MainActor @Sendable () async -> Void)?
@@ -88,9 +84,16 @@ public final class DoctorFacade {
     public var health: RuntimeHealth?
     @ObservationIgnored private let healthRead = LatestRead()
 
-    @discardableResult
-    public func refreshHealth() async -> RuntimeHealth {
-        await healthRead.read({ readHealth() }, publish: { health = $0; diagnosticsDidChange?() })
+    public func refreshHealth() async {
+        _ = await healthRead.read({ Result { try readHealth() } }, publish: { result in
+            switch result {
+            case .success(let value): health = value
+            case .failure(let error):
+                health = nil
+                nativeLog("Doctor health unavailable: %@", error.localizedDescription)
+            }
+            diagnosticsDidChange?()
+        })
     }
     public var watchdog: WatchdogStatus?
     public var healthCard: HealthCard?
@@ -130,27 +133,20 @@ public final class DoctorFacade {
         let read = await hardeningRead.read({
             var hardening: ProductionHardeningSummary?
             var exports: [ProductionExport]?
-            var gauntlet: [ImprovementGauntletRun]?
             var failures: [(endpoint: String, label: String, error: Error)] = []
             do { hardening = try await DoctorReadout.getProductionHardening(dataRoot: dataRoot) }
             catch { failures.append(("production hardening", "getProductionHardening", error)) }
             do { exports = try await ProductionExport.list(dataRoot: dataRoot) }
             catch { failures.append(("production exports", "getProductionExports", error)) }
-            do { gauntlet = try await ImprovementGauntletRun.readHistory(dataRoot: dataRoot) }
-            catch { failures.append(("improvement gauntlet", "getImprovementGauntlet", error)) }
-            return (hardening, exports, gauntlet, failures)
+            return (hardening, exports, failures)
         }, publish: { read in
             if let value = read.0 { productionHardening = value }
             if let value = read.1 { productionExports = value }
-            if let runs = read.2 {
-                latestImprovementGauntletRun = runs.last
-                improvementGauntletRunCount = runs.count
-            }
             hardeningRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
-                lastSuccessAt: read.3.isEmpty ? Date() : hardeningRefresh?.lastSuccessAt, failedEndpoints: read.3.map { $0.endpoint })
+                lastSuccessAt: read.2.isEmpty ? Date() : hardeningRefresh?.lastSuccessAt, failedEndpoints: read.2.map { $0.endpoint })
         })
         await capabilitiesDidChange?()
-        return read.3
+        return read.2
     }
 
     public nonisolated init(dataRoot: URL, launchedAt: Date) {
@@ -181,7 +177,7 @@ public final class DoctorFacade {
         diagnosticsDidChange?()
     }
 
-    public func toolStatusEnvelope(turn: Turn) async throws -> JSONValue {
+    public func toolStatusEnvelope(repair: Bool = false, turn: Turn) async throws -> JSONValue {
         guard let report else {
             if let latestRunFailure, !isRunning {
                 return AppToolExecutor.failure("doctor_unavailable", latestRunFailure)
@@ -263,7 +259,7 @@ public final class DoctorFacade {
             return true
         }
         var envelope: [String: JSONValue] = [
-            "status": .string(reportIssue == nil && routeIssue == nil ? report.status : "unavailable"),
+            "status": .string(reportIssue != nil || routeIssue != nil ? "unavailable" : repair ? report.status : "ok"),
             "report_status": .string(report.status),
             "report_availability": .string(reportIssue == nil ? "current" : runningSince != nil ? "running" : "unavailable"),
             "report_issue": reportIssue.map(JSONValue.string) ?? .null,
@@ -275,8 +271,9 @@ public final class DoctorFacade {
             "active_provider_status": .string(routeIssue == nil ? activeProvider?.auth_status.state ?? "unknown" : "unavailable"),
             "current_route_issue": routeIssue ?? .null,
             "status_scope_note": .string("""
-                status requires a completed latest run and readable current routing, then rolls up every check; report_status describes the retained \
-                checks; active_path_status covers the checks a chat turn here depends on (active_path_check_ids). Off and not needed are non-fault \
+                status is ok when this read has a completed latest run and readable current routing, and after a repair it rolls up every \
+                check; report_status rolls up every retained check; active_path_status covers the checks a chat turn here depends on \
+                (active_path_check_ids). Off and not needed are non-fault \
                 states; unmeasured and unknown checks cannot establish health.
                 """),
             "repaired": .bool(report.repaired),
@@ -311,10 +308,13 @@ public final class DoctorFacade {
         return String(head) + ellipsis
     }
 
-    /// `ok` proves this read answered, not Doctor health; launch belongs to the engine, never a health read.
-    public nonisolated func readHealth() -> RuntimeHealth {
-        RuntimeHealth(
-            ok: true,
+    /// The answering runtime is reachable even when Doctor has no current health verdict.
+    public func readHealth() throws -> RuntimeHealth {
+        let issue = reportAvailabilityIssue ?? (reportCompletedAt == nil || report == nil
+            ? "Doctor health has not been measured; run health checks for a current report." : nil)
+        let status = issue == nil ? report?.status ?? "unmeasured" : "unavailable"
+        return RuntimeHealth(
+            ok: status == "ok", reachable: true, doctorStatus: status, doctorIssue: issue,
             app: "NativeAgent",
             version: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
             dataDir: dataRoot.path,
@@ -401,37 +401,6 @@ extension WatchdogStatus {
         case "unmeasured": return "info"
         default: return "error"
         }
-    }
-}
-
-public enum SystemHealthSummary: Sendable, Equatable {
-    case unknown
-    case ok
-    case warn(count: Int)
-    case error(count: Int)
-}
-
-extension DoctorFacade {
-    public var systemHealth: (summary: SystemHealthSummary,
-        issues: [(id: String, title: String, detail: String, repairAvailable: Bool)]) {
-        if let issue = reportAvailabilityIssue {
-            return (.unknown, [("doctor.latest_run", "Health checks unavailable", issue, false)])
-        }
-        // Reuse the mounted health card until an explicit Doctor run; this toolbar must not launch a second full pass.
-        func summarize(_ statuses: [String]) -> SystemHealthSummary {
-            let buckets = statuses.map { DoctorPlainCopy.bucket(for: $0) }
-            let failCount = buckets.filter { $0 == "failing" }.count
-            let warnCount = buckets.filter { $0 == "warning" }.count
-            if failCount > 0 { return .error(count: failCount) }
-            if warnCount > 0 { return .warn(count: warnCount) }
-            if buckets.isEmpty || buckets.contains("unclear") || buckets.contains("reading") { return .unknown }
-            return .ok
-        }
-        let rows = report.map { $0.checks.map { ($0.id, $0.title, $0.status, $0.repairFace, $0.repair_available == true) } }
-            ?? (healthCard?.subsystems ?? []).map { ($0.id, $0.label, $0.status, $0.detail, false) }
-        return (summarize(rows.map(\.2)), rows.filter {
-            ["warning", "failing"].contains(DoctorPlainCopy.bucket(for: $0.2))
-        }.map { ($0.0, $0.1, $0.3, $0.4) })
     }
 }
 

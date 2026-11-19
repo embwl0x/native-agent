@@ -10,30 +10,40 @@ public enum DoctorReadout {
     private static let launchID = UUID().uuidString
 
     public static func repairProjection(_ rows: [CheckResult], dataRoot: URL) async -> [CheckResult] {
-        let rows = rows.filter { $0.repairExperience == nil }
+        let measuredIDs = Set(rows.filter { $0.repairExperience == nil }.map(\.id))
+        let rows = rows.compactMap { row -> CheckResult? in
+            guard row.repairExperience != nil else { return row }
+            guard !measuredIDs.contains(row.checkID),
+                  row.repairExperience?.outcome?.domain.hasPrefix("doctor.check:") == true else { return nil }
+            // A projected check still holds its measurement; recover its check identity before projecting current debt.
+            var reading = row
+            reading.id = row.checkID
+            reading.repairExperience = nil
+            return reading
+        }
         do {
             let open = try await ExperienceStore.at(dataRoot).projection()
-            let repairs = open.filter {
-                $0.owes["repair"]?.phase.isSettled == false
-                    && $0.evidence.contains { $0.source == "doctor" }
-            }
+            let repairs = open.filter { $0.owes["repair"]?.phase.isSettled == false }
             let owed = repairs.map { experience -> CheckResult in
                 let reading = rows.first { experience.outcome?.domain == "doctor.check:" + $0.id }
                 // Retained evidence keeps its human step; only a current measured owner can supply executable repair.
                 let tap = reading?.repairTap ?? RepairDebt(experience).tap
                 let checkID = (experience.outcome?.domain).flatMap { $0.hasPrefix("doctor.check:") ? String($0.dropFirst("doctor.check:".count)) : nil }
                 // Preserve evidence filenames and current severity; remedies and calls retain separate fields.
-                let words = experience.face?.words ?? experience.id
-                return CheckResult(source: reading?.repairOwner ?? RepairDebt(experience).owner, nextCall: reading?.repairCall,
+                let debt = RepairDebt(experience)
+                let named = [debt.operation ?? experience.outcome?.domain, experience.outcome?.status, debt.owner.map { "(" + $0 + ")" }]
+                    .compactMap { $0 }.joined(separator: " ")
+                let words = experience.face?.words ?? (named.isEmpty ? experience.id : named)
+                return CheckResult(source: reading?.source ?? RepairDebt(experience).owner, nextCall: reading?.repairCall,
                     id: experience.id, title: reading?.title ?? checkID ?? "Repair owed", status: reading?.status ?? "unmeasured",
-                    detail: reading.map { $0.detail.trimmingCharacters(
-                        in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; repair owed since \(experience.at)." } ?? words,
-                    harm: reading?.harm, receipt: reading?.receipt, repairApplied: reading?.repairApplied, human_action: tap,
+                    detail: reading?.detail ?? words,
+                    harm: reading?.harm, repair: reading?.repair, receipt: reading?.receipt, repairApplied: reading?.repairApplied,
+                    human_action: reading?.human_action ?? tap,
                     repair_available: reading?.repair_available, automaticRepairEligible: reading?.automaticRepairEligible,
                     ask: reading?.ask, owner: reading?.owner, repairExperience: experience)
             }
             // Keep measurements inspectable while unresolved failures render from their owning experience at current severity.
-            let owedIDs = Set(owed.map(\.checkID))
+            let owedIDs = Set(owed.map { $0.checkID })
             return rows.filter { !owedIDs.contains($0.id) || $0.ask != nil } + owed
         } catch {
             // A stopped run read nothing: the rows stand as measured, with no verdict on the store.
@@ -83,7 +93,7 @@ public enum DoctorReadout {
         do {
             if let cached = try readCachedReadings(at: cachePath) {
                 let liveIDs = Set(liveChecks.map(\.id))
-                return (cached.checks.filter { !liveIDs.contains($0.id) } + liveChecks, cached.measuredAt)
+                return (cached.checks.filter { !liveIDs.contains($0.checkID) } + liveChecks, cached.measuredAt)
             }
         } catch {
             return ([cacheFailure(error, path: cachePath)] + liveChecks, now)
@@ -112,14 +122,16 @@ public enum DoctorReadout {
             if inPlace, FileManager.default.fileExists(atPath: path.path) {
                 let previous = try JSONDecoder().decode(CachedDoctorPayload.self, from: Data(contentsOf: path))
                 if previous.launchID == launchID {
-                    let fresh = Dictionary(results.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-                    let previousIDs = Set(previous.checks.map(\.id))
-                    rows = previous.checks.map { fresh[$0.id] ?? $0 } + results.filter { !previousIDs.contains($0.id) }
-                    if previous.checks.contains(where: { fresh[$0.id] == nil }) {
+                    let previousChecks = previous.checks
+                    let fresh = Dictionary(results.map { ($0.checkID, $0) }, uniquingKeysWith: { first, _ in first })
+                    let previousIDs = Set(previousChecks.map(\.checkID))
+                    rows = previousChecks.map { fresh[$0.checkID] ?? $0 } + results.filter { !previousIDs.contains($0.checkID) }
+                    if previousChecks.contains(where: { fresh[$0.checkID] == nil }) {
                         measured = min(previous.measuredAt, measuredAt)
                     }
                 }
             }
+            rows = await repairProjection(rows, dataRoot: path.deletingLastPathComponent().deletingLastPathComponent())
             let enc = JSONEncoder()
             enc.outputFormatting = [.sortedKeys]
             try await SwiftNativePersistenceCore.writeJSON(.object([

@@ -33,7 +33,6 @@ public enum QuietSettingError: Error, LocalizedError {
     /// A rejected value, before any mutation. Failed saves are unavailable.
     case badValue(String)
     case unavailable(String)
-    /// Trust raises are the user's decision and refuse as owners_call.
     case users(String)
 
     public var errorDescription: String? {
@@ -91,7 +90,6 @@ public struct QuietSetting: Sendable {
     /// Catalog and validation share one runtime choice owner so separate lists cannot drift.
     public let liveChoices: (@MainActor @Sendable (@escaping QuietSettingsHostProvider) async throws -> [String])?
     public let note: String
-    /// User-owned posture rows stay readable but reject agent writes so self-administration cannot widen its own authority.
     public let ownerOnly: Bool
     /// The agent's own thought and memory controls do not ask for a person's request or Trust posture.
     public private(set) var mindOwned = false
@@ -269,10 +267,14 @@ public struct QuietSetting: Sendable {
         return row
     }
 
-    /// The agent may write a row that is not the person's alone; which direction a write goes is the row's own check, at any posture.
-    public var writable: Bool { !ownerOnly && write != nil }
+    public func writable(dataRoot: URL, turn: Turn) async throws -> Bool {
+        guard write != nil else { return false }
+        if !ownerOnly { return true }
+        return try await SwiftNativeTrustCenter(dataRoot: dataRoot).agentOwnsLevers(turn: turn)
+    }
 
-    public func catalogRow(host: @escaping QuietSettingsHostProvider) async throws -> JSONValue {
+    public func catalogRow(host: @escaping QuietSettingsHostProvider, dataRoot: URL, turn: Turn) async throws -> JSONValue {
+        let writable = try await writable(dataRoot: dataRoot, turn: turn)
         var row: [String: JSONValue] = [
             "id": .string(id),
             "page": .string(page),
@@ -285,7 +287,7 @@ public struct QuietSetting: Sendable {
         let guidance = mindOwned ? "Yours to set in either direction; no request needed." : ""
         let notes = [guidance, note].filter { !$0.isEmpty }
         if !notes.isEmpty { row["note"] = .string(notes.joined(separator: " ")) }
-        if ownerOnly {
+        if ownerOnly && !writable {
             row["owner_only"] = .bool(true)
             row["refusal"] = .string(QuietSettings.ownerOnlyRefusal)
         }

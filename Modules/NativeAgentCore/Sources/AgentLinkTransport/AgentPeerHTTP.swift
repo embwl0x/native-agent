@@ -30,7 +30,8 @@ public enum AgentPeerHTTP {
     }
 
     public static func send(_ request: AgentA2AWire.Request, bearerToken: String? = nil,
-                            timeout: TimeInterval = 45, liveUpdate: LiveUpdateSink?) async throws -> Response {
+                            timeout: TimeInterval = 45, liveUpdate: LiveUpdateSink?,
+                            taskOpened: @escaping @Sendable (String) throws -> Void = { _ in }) async throws -> Response {
         let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
         let forwarder: Task<Void, Never>?
         if request.streamInterface != nil, let liveUpdate {
@@ -47,13 +48,13 @@ public enum AgentPeerHTTP {
         return try await withTaskCancellationHandler {
             if request.grpcMethod != nil {
                 return try await AgentA2AGRPC.send(request, bearerToken: bearerToken, timeout: timeout,
-                    liveFeed: liveFeed)
+                    liveFeed: liveFeed, taskOpened: taskOpened)
             }
             return try await exchange(url: request.url, method: request.httpMethod, headers: request.headers,
                                       body: request.body, bearerToken: bearerToken, timeout: timeout,
                                       liveFeed: liveFeed,
                                       streamInterface: request.streamInterface, requestID: request.requestID,
-                                      expectedTaskID: request.expectedTaskID)
+                                      expectedTaskID: request.expectedTaskID, taskOpened: taskOpened)
         } onCancel: {
             liveFeed?.finish()
             forwarder?.cancel()
@@ -85,7 +86,8 @@ public enum AgentPeerHTTP {
                          bearerToken: String?, timeout: TimeInterval,
                          configuration: URLSessionConfiguration = .ephemeral,
                          liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?, streamInterface: AgentA2AWire.Interface? = nil,
-                         requestID: String? = nil, expectedTaskID: String? = nil) async throws -> Response {
+                         requestID: String? = nil, expectedTaskID: String? = nil,
+                         taskOpened: @escaping @Sendable (String) throws -> Void = { _ in }) async throws -> Response {
         try validateURL(url)
         guard ["GET", "POST", "DELETE"].contains(method), timeout.isFinite, timeout > 0, timeout <= 600 else { throw TransportError.invalidRequest }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
@@ -113,7 +115,7 @@ public enum AgentPeerHTTP {
         let exchange = Exchange(streaming: headers["Accept"] == "text/event-stream",
             liveFeed: liveFeed, accumulator: streamInterface.map {
                 AgentA2AStream.Accumulator(interface: $0, requestID: requestID,
-                    expectedTaskID: expectedTaskID, bearerToken: bearerToken)
+                    expectedTaskID: expectedTaskID, bearerToken: bearerToken, taskOpened: taskOpened)
             })
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in

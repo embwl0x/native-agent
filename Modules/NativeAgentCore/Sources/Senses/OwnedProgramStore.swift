@@ -3,7 +3,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgramStore.swift` | Sealed candidates, exact rehearsal reuse and publication; `tape: true` replays seal `tape` coverage; a kept shipped part follows it |
+// Blueprint: | `OwnedProgramStore.swift` | Sealed program seeds, exact proof, tape rehearsal and publication; kept shipped parts follow the bundle |
 
 /// Keep metadata and source in one ability file to preserve version identity.
 public struct OwnedProgramStore: Sendable {
@@ -91,10 +91,6 @@ public struct OwnedProgramStore: Sendable {
         }
         program.removeValue(forKey: "source")
         descriptor["program"] = .object(program)
-        if var manifest = descriptor["manifest"]?.objectValue, var script = manifest["script"]?.objectValue {
-            script.removeValue(forKey: "source"); manifest["script"] = .object(script)
-            descriptor["manifest"] = .object(manifest)
-        }
         return try AbilityStore.File(id: candidate.id, kind: kind,
             metadata: ["candidate": .object(descriptor), "version": .int(version)], body: candidate.program.source, pathExtension: "js")
     }
@@ -105,6 +101,14 @@ public struct OwnedProgramStore: Sendable {
             throw SenseFailure(code: "bad_input", message: "This program is not an ability.")
         }
         return try abilities.isCurrentSeed(file(candidate, kind: kind, version: version))
+    }
+
+    package static func turnSeed(_ seed: AbilityStore.File) throws -> Candidate {
+        guard seed.kind == .turn else {
+            throw SenseFailure(code: "bad_input", message: "Bundled program \(seed.id) needs its kind's seed candidate.")
+        }
+        return try Candidate(program: OwnedProgram(kind: .turn, id: seed.id, version: "seed", source: seed.body,
+            entry: .run, resident: true), manifest: .object(seed.record), fixtures: .array([]), dependencyShapes: .object([:]), prior: .null)
     }
 
     /// Trusted bundle seals prove installation bytes, never a validation run.
@@ -131,10 +135,6 @@ public struct OwnedProgramStore: Sendable {
             throw SenseFailure(code: "integrity", message: "The candidate descriptor is incomplete.")
         }
         programFields["source"] = .string(file.body); fields["program"] = .object(programFields)
-        if var manifest = fields["manifest"]?.objectValue, var script = manifest["script"]?.objectValue {
-            script["source"] = .string(file.body); manifest["script"] = .object(script)
-            fields["manifest"] = .object(manifest)
-        }
         guard
               let programValue = fields["program"], case .object(let descriptor) = programValue,
               let schema = descriptor["schema"], let manifest = fields["manifest"], let fixtures = fields["fixtures"],
@@ -399,6 +399,10 @@ public struct OwnedProgramStore: Sendable {
         return proof
     }
 
+    package func proof(_ file: AbilityStore.File, key: Data) throws -> JSONValue {
+        try proof(decode(file), key: key)
+    }
+
     /// Nil means a checked file lacks proof; null, damaged evidence, missing authority and read failures must throw.
     public func existingProof(_ candidate: Candidate, key: Data?) throws -> JSONValue? {
         guard let retained = try retained(id: candidate.id, matching: { $0 == candidate }) else {
@@ -598,9 +602,9 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
         let id = input["action"]?.stringValue
         let operation = id.map { "app." + $0 } ?? (input["find"] == nil ? "read" : "find")
         let args = id == nil
-            ? JSONValue.object(input.filter { !$0.key.hasPrefix("__") && !["preview", "expected_version"].contains($0.key) })
+            ? JSONValue.object(input.filter { !$0.key.hasPrefix("__") && !OwnedProgram.Calls.optionKeys.contains($0.key) })
             : input["args"] ?? .object([:])
-        let options = JSONValue.object(input.filter { ["preview", "expected_version"].contains($0.key) })
+        let options = JSONValue.object(input.filter { OwnedProgram.Calls.optionKeys.contains($0.key) })
         do {
             if calls != nil { return try consume(operation, arguments: args, options: options) }
             let result = try reads(input) ? await base.perform(input, execution: execution) : Self.placeholder(operation)

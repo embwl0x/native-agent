@@ -382,23 +382,29 @@ private struct NativeAgentLink {
         }
         await withDiscardingTaskGroup { group in
             var line = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
-                var byte: UInt8 = 0
-                let count = Darwin.read(STDIN_FILENO, &byte, 1)
+                let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
                 if count == 0 { return }
-                if count < 0 { if errno == EINTR { continue }; return }
-                if byte != 10 {
-                    guard line.count < 1_048_576 else {
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { return }
+                var rest = buffer.prefix(count)
+                while !rest.isEmpty {
+                    let part = rest.prefix { $0 != 10 }
+                    guard line.count + part.count <= 1_048_576 else {
                         output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "MCP input exceeds limit"]])
                         return
                     }
-                    line.append(byte)
-                    continue
+                    line.append(contentsOf: part)
+                    let end = part.endIndex
+                    if end == rest.endIndex { break }
+                    if !line.isEmpty {
+                        let request = line
+                        group.addTask { await relayOne(request, caller: caller) }
+                    }
+                    line.removeAll(keepingCapacity: true)
+                    rest = rest[rest.index(after: end)...]
                 }
-                defer { line.removeAll(keepingCapacity: true) }
-                if line.isEmpty { continue }
-                let request = line
-                group.addTask { await relayOne(request, caller: caller) }
             }
         }
     }

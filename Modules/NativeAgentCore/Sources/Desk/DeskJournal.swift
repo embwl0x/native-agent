@@ -178,8 +178,6 @@ extension SwiftNativeDeskStore {
         feed: DeskFeed
     ) async throws -> DeskCompactionBase? {
         guard feed.compactionRowCount >= opsCompactionThreshold else { return nil }
-        // Refuse compaction before the last-op guard so even wholly undecodable feeds report without erasing rows.
-        guard SnapshotTailOpLog.mayCompact(feed.integrity, feed: Self.logLabel, path: opsPath) else { return nil }
         guard let lastOpId = feed.ops.last?.opId, !lastOpId.isEmpty else { return nil }
         let liveHandles = Set(state.items.map(\.handle))
         // Keep alias high-water for live parents and top level so aliases are never reused.

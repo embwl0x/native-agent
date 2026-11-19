@@ -295,7 +295,7 @@ extension LocalPIMConnectorActions {
             "actionId": .string("mac.calendar_create_event"),
             "source": .string("eventkit"),
             "eventId": .string(event.eventIdentifier ?? ""),
-            "title": .string(title),
+            "title": .string(NativeAppSecretRedactor.redactText(title)),
             "start": event.startDate.map { .string(iso($0)) } ?? .null,
             "end": event.endDate.map { .string(iso($0)) } ?? .null,
             "timeZone": .string(TimeZone.current.identifier),
@@ -308,6 +308,7 @@ extension LocalPIMConnectorActions {
 
     struct CalendarModifyArguments {
         let id: String
+        var expectedStart: Date?
         var title: String?
         var start: Date?
         var end: Date?
@@ -334,6 +335,12 @@ extension LocalPIMConnectorActions {
             throw invalid("Missing required field: id")
         }
         var arguments = CalendarModifyArguments(id: id)
+        if input.keys.contains("expected_start") {
+            guard let start = parseInputDate(input["expected_start"]) else {
+                throw invalid("expected_start must be the observed startAt from calendar.upcoming, as ISO-8601 or epoch seconds.")
+            }
+            arguments.expectedStart = start
+        }
         if input.keys.contains("title") {
             guard case .string(let raw) = input["title"] else {
                 throw invalid("Invalid field: title (must be a non-empty string)")
@@ -393,7 +400,7 @@ extension LocalPIMConnectorActions {
             )
         }
 
-        guard let event = store.event(withIdentifier: arguments.id) else {
+        guard let found = store.event(withIdentifier: arguments.id) else {
             return .object([
                 "status": .string("failed"),
                 "effects": .string("none"),
@@ -401,6 +408,10 @@ extension LocalPIMConnectorActions {
                 "reason": .string("event_not_found"),
                 "detail": .string("No calendar event has that id, so nothing changed. List the calendar for current ids."),
             ])
+        }
+        guard let event = try await store.occurrence(of: found, expectedStart: arguments.expectedStart) else {
+            return CalendarArgumentError(action: "mac.calendar_modify_event", reason:
+                "event_changed: occurrence unavailable; refresh calendar.upcoming and pass its id and startAt as expected_start.").result
         }
 
         // Empty notes/location clears the field; absence leaves it alone.
@@ -444,7 +455,8 @@ extension LocalPIMConnectorActions {
 
     static func calendarDeleteMatches(title: String?, start: Date?, expectedTitle: String, expectedStart: Date) -> Bool {
         guard let start else { return false }
-        return (title ?? "") == expectedTitle && abs(start.timeIntervalSince(expectedStart)) < 1
+        return NativeAppSecretRedactor.redactText(title ?? "(Untitled event)") == expectedTitle
+            && abs(start.timeIntervalSince(expectedStart)) < 1
     }
 
     public static func calendarDeleteEvent(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
@@ -460,8 +472,11 @@ extension LocalPIMConnectorActions {
         guard try await store.requestCalendarAccess(.read) else {
             return permissionEnvelope(actionId: actionId, source: "calendar", status: calendarAuthorizationState(), handsBack: handsBack)
         }
-        guard let event = store.event(withIdentifier: expected.id) else {
+        guard let found = store.event(withIdentifier: expected.id) else {
             return failed("event_not_found")
+        }
+        guard let event = try await store.occurrence(of: found, expectedStart: expected.start) else {
+            return failed("event_changed: occurrence unavailable; refresh the event and confirm its id and start before retrying")
         }
         guard calendarDeleteMatches(title: event.title, start: event.startDate,
                                     expectedTitle: expected.title, expectedStart: expected.start) else {

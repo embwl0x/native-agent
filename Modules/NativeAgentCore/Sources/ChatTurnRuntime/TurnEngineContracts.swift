@@ -15,7 +15,7 @@ import CognitiveSubstrate
 import ToolRegistry
 import TurnTrace
 import ChatToolParsing
-// Blueprint: | `TurnEngineContracts.swift` | `TurnContext`; `TurnEngineResult`; Prepared context and engine-owned terminal truth |
+// Blueprint: | `TurnEngineContracts.swift` | `TurnContext` holds the unranked inner stream; `TurnEngineResult` holds terminal truth |
 
 // MARK: - TurnEngineError
 
@@ -91,6 +91,7 @@ struct AgentNowCursor: Sendable {
 public struct TurnContext: Sendable {
     /// The conversation's held choice travels only in live provider input, outside saved sent-context evidence.
     var privateWorkingMemory: String = ""
+    var innerStream: [String] = []
     public let surface: String
     /// Carry the exact persona into dispatch so explicit recall shares automatic recall's disclosure boundary.
     public let personaID: String?
@@ -207,23 +208,17 @@ public struct TurnContext: Sendable {
         return copy
     }
 
-    /// Move public dynamic context after its contributors append, preserving order and bytes before delta selection.
-    /// Deliver that block after replayed history and retain its bytes on the user row; private choices remain separate.
-    /// Rebuild systemPrompt from emptied segments so it remains equal to their combined value.
-    /// Append caller-supplied trailing material after the dynamic block; absent segments or volatile text leave the context unchanged.
     public func splittingVolatileBlock(appending trailingSection: String = "") -> TurnContext {
-        guard let segments = systemSegments else { return self }
-        let volatileBlock = [segments.dynamic, trailingSection]
+        let volatileBlock = (innerStream + (systemSegments.map { [$0.dynamic, trailingSection] } ?? []))
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
         guard !volatileBlock.isEmpty else { return self }
-        let lifted = SystemPromptSegments(
-            stable: segments.stable,
-            dynamic: ""
-        )
         var copy = self
-        copy.systemPrompt = lifted.combined
-        copy.systemSegments = lifted
+        if let segments = systemSegments {
+            let lifted = SystemPromptSegments(stable: segments.stable, dynamic: "")
+            copy.systemPrompt = lifted.combined
+            copy.systemSegments = lifted
+        }
         copy.turnVolatileBlock = volatileBlock
         return copy
     }

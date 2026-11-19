@@ -9,7 +9,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
     public let loopId: String = "delegation_outcome"
     public static let workRemaining = Notification.Name("NativeAgent.delegation.outcomeWorkRemaining")
     public let wake: OrganWake
-    public var tickTimeoutOverride: TimeInterval? { 120 }
 
     private let readJobs: @Sendable () async -> DelegationJobsRead
     /// Failed publication leaves the job uncarded for the next reconciliation.
@@ -17,9 +16,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
     /// Records downstream transition evidence. `false` keeps the cursor
     /// unsettled so the same transition is retried on the next reconciliation.
     private let observeTransition: @Sendable (DelegationReadout) async -> Bool
-    /// Reports a healthy per-tick cap remainder after the cursor is durable.
-    /// The owner requests one coalesced continuation. Failed settlement or
-    /// unavailable state waits for a source/repair event or the integrity pass.
     private let reportDeferral: @Sendable (Bool) async -> Void
     private let readHandledOutcomes: @Sendable () async throws -> Set<String>
     private let cursorPath: URL
@@ -185,7 +181,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         await reportDeferral(!Task.isCancelled && stampsMayAdvance && failed == 0
             && recoveryNote == nil && deferred > 0 && filed + receiptsRecorded > 0)
 
-        var result = "filed \(filed) delegation outcome card(s)"
+        var result = "filed \(filed) delegation outcome card(s); recorded \(receiptsRecorded) receipt(s)"
         if let recoveryNote { result += "; \(recoveryNote)" }
         if let seedResult { result += "; \(seedResult)" }
         if failed > 0 {
@@ -199,7 +195,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         if !stampsMayAdvance {
             return .failed(error: "\(result); \(unreadableStoreError)")
         }
-        if filed == 0 && failed == 0 {
+        if filed == 0 && receiptsRecorded == 0 {
             return .skipped(reason: "no delegation outcome card could be classified")
         }
         return .completed(result: result)

@@ -368,9 +368,6 @@ public final class TranscriptsFacade {
     public func transcriptReadStatus(for sessionID: String) -> TranscriptReadout.ReadStatus {
         slot(for: sessionID).readStatus
     }
-    public nonisolated func reclaimContinuations(for sessionID: String) async {
-        await InlineInteractionResolver.reclaimStrandedContinuations(sessionID: sessionID, dataRoot: dataRoot)
-    }
     public func refreshCards(in sessionID: String) async {
         do { _ = try await refreshDisplayedMessages(sessionId: sessionID) }
         catch { ModuleLog.app("[transcript-read] cards unavailable session=%@: %@", sessionID, error.localizedDescription) }

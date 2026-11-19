@@ -15,23 +15,26 @@ public struct MemoryWriteContext: Sendable {
     /// What the writer states about this telling; the store adds the time it was written and the principals the stem attests. Nil is a write that
     /// adds no root of its own (an acceptance, a pin, a lifecycle or repair edit); new words with no telling are refused, never guessed.
     public let telling: MemoryRoot.Telling?
+    public let lifecycle: String?
     /// Principals behind material the stem itself attests outside a turn.
     let material: [String]?
     let writtenAt: Date
 
-    public init(turn: Turn?, senseReads: SenseTurnReads?, telling: MemoryRoot.Telling?) {
+    public init(turn: Turn?, senseReads: SenseTurnReads?, telling: MemoryRoot.Telling?, lifecycle: String? = nil) {
         self.turn = turn
         self.senseReads = senseReads
         self.telling = telling
+        self.lifecycle = lifecycle
         self.material = nil
         self.writtenAt = Date()
     }
 
     /// A write outside any turn whose material the stem attests, such as a night's lesson: through names that material's principals.
-    public init(material: [String], telling: MemoryRoot.Telling) {
+    public init(material: [String], telling: MemoryRoot.Telling, lifecycle: String? = nil) {
         self.turn = nil
         self.senseReads = nil
         self.telling = telling
+        self.lifecycle = lifecycle
         self.material = material
         self.writtenAt = Date()
     }

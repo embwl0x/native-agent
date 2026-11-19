@@ -102,7 +102,6 @@ Do not move or rename these without updating their readers:
   slots once; missing files, sections or mismatched slots fail explicitly.
   Serializers and the connection probe stay with their callers; courier
   and morning-brief parts retain their policies.
-- `eval_acknowledgments.json` — read at runtime by the heartbeat.
 - `licenses/A2A-gRPC-NOTICES.txt` — Mac app resource in `project.yml`.
 - `ARCHITECTURE_BLUEPRINT.md` — generated source coverage and policy declarations
   read by `script/generate_architecture_blueprint.swift --check`, which the public export runs.

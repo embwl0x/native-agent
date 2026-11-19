@@ -237,7 +237,7 @@ public final class MacAppIndex: @unchecked Sendable {
             guard parent.path != "/" else { return (false, false) }
             if let facts = directories[parent] { return facts }
             let above = classify(parent.deletingLastPathComponent())
-            var excluded = above.excluded || parent.lastPathComponent == "Library" || !parent.pathExtension.isEmpty
+            var excluded = above.excluded || parent.lastPathComponent == "Library"
             if !excluded {
                 do {
                     let values = try parent.resourceValues(forKeys: [.isPackageKey])

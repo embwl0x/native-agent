@@ -14,6 +14,6 @@ extension AppModel {
             guard case .acknowledged = try await chatAct(.stop(session: session, expectedTurn: nil)) else {
                 throw chatProtocolFailure("a Stop acknowledgement.")
             }
-        } catch { setFailureStatus(error, action: "stop the conversation") }
+        } catch { setFailureStatus(error, action: "stop the conversation"); systemToasts.push(error: statusText) }
     }
 }

@@ -8,32 +8,15 @@ import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
 import TurnTrace
-// Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`, `impl_tool_result_page`: Retain turn-bound results without loss. |
+// Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`, `impl_tool_result_page`: Retain results for the record's detail horizon. |
 
-private enum ResultRecoveryScopePart: TurnPart { static let unset: ProviderToolResultRecoveryStore.Scope? = nil }
-
-extension Turn {
-    /// The result owner's held resource scope, shared by nested calls; a derived turn binds its own identity.
-    package var resultRecoveryScope: ProviderToolResultRecoveryStore.Scope? {
-        get { self[ResultRecoveryScopePart.self] }
-        set { self[ResultRecoveryScopePart.self] = newValue }
-    }
-}
-
-/// Bound a view only after its exact, already-redacted body is retained. Script steps and outer calls use this same owner.
+/// Bound a view only after its redacted body is retained. Script steps and outer calls use this same owner.
 package enum ProviderToolResultPage {
     package static let defaultMaxUTF8Bytes = 48_000
 
-    /// Non-loop doors and helpers release only the scope they admitted, after their operation settles on every exit.
-    package static func holding<Value: Sendable>(turn: Turn, sessionId: String?,
-        operation: @Sendable (Turn) async throws -> Value) async throws -> Value {
-        let scope = ProviderToolResultRecoveryStore.Scope(sessionId: sessionId, turnId: turn.id)
-        if scope == turn.resultRecoveryScope { return try await operation(turn) }
-        let outcome: Result<Value, Error>
-        do { outcome = .success(try await operation(turn.with(\.resultRecoveryScope, scope))) }
-        catch { outcome = .failure(error) }
-        if let scope { await settle { await ProviderToolResultRecoveryStore.shared.remove(scope: scope) } }
-        return try outcome.get()
+    package static func redactedContent(_ content: String) throws -> String {
+        let parsed = try? JSONValue.parse(Data(content.utf8))
+        return ChatSecretRedactor.redactText(try parsed.map { try TurnTraceRedactor.redactValue($0).serialize(pretty: false) } ?? content)
     }
 
     package struct View: Sendable {
@@ -42,52 +25,45 @@ package enum ProviderToolResultPage {
         package let failed: Bool
     }
 
-    package struct ContextResult: Sendable {
-        package let dataRoot: URL
-        package let callID: String
-        package init(dataRoot: URL, callID: String) { self.dataRoot = dataRoot; self.callID = callID }
-    }
-
-    private static func digest(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
     @concurrent package static func project(
         toolName: String,
         content: String,
-        sessionId: String?,
-        turnId: String,
+        dataRoot: URL?,
+        turn: Turn,
         originalResultClass: ChatToolOutcome.ExactResultClass,
         appDoor: Bool,
         inlineLimit: Int = defaultMaxUTF8Bytes,
-        includeSections: Bool = true,
-        contextResult: ContextResult? = nil
+        includeSections: Bool = true
     ) async -> View {
-        guard content.utf8.count > inlineLimit else { return View(content: content, recovery: nil, failed: false) }
         var recovery: JSONValue?
         do {
+            let content = try redactedContent(content)
+            guard content.utf8.count > inlineLimit else { return View(content: content, recovery: nil, failed: false) }
+            guard let dataRoot else { throw ToolFailureError("The engine's result storage root is unavailable.", effects: .unknown) }
             // A plain-text tool answer has no parsed envelope; it is still retained byte for byte.
             let parsed = try? JSONValue.parse(Data(content.utf8))
-            let durableURL = contextResult.map {
-                $0.dataRoot.appendingPathComponent("chat/tool_results/\(digest(turnId))", isDirectory: true)
-                    .appendingPathComponent(digest($0.callID + "\u{0}" + content) + ".txt")
-            }
             let receipt = try await ProviderToolResultRecoveryStore.shared.store(
-                content: content, parsed: parsed, toolName: toolName, sessionId: sessionId, turnId: turnId,
-                originalResultClass: originalResultClass, durableURL: durableURL)
+                content: content, toolName: toolName, dataRoot: dataRoot, conversation: ChatToolSessionInjection.currentSession(turn: turn),
+                originalResultClass: originalResultClass)
             var reference: [String: JSONValue] = [
-                "result_handle": .string(receipt.handle), "full_result_retained": .bool(true),
-                "original_bytes": .int(Int64(receipt.bytes)),
+                "result_handle": .string(receipt.handle), "full_result_retained": .bool(receipt.omittedBytes == 0),
+                "original_bytes": .int(Int64(receipt.bytes + receipt.omittedBytes)),
+                "omitted_bytes": .int(Int64(receipt.omittedBytes)),
+                "retention_limit_bytes": .int(Int64(ProviderToolResultRecoveryStore.maxBodyUTF8Bytes)),
                 "next_call": .object(["tool": .string("app"), "input": .object([
                     "action": .string("result.page"), "args": .object([
                         "result_handle": .string(receipt.handle), "page": .int(0), "raw": .bool(true)])])]),
             ]
-            if let durableURL { reference["saved_result_path"] = .string(durableURL.path) }
+            reference["saved_result_path"] = .string(receipt.url.path)
+            if receipt.omittedBytes > 0 {
+                reference["retention_detail"] = .string(
+                    "Kept the first \(receipt.bytes) redacted bytes; cut \(receipt.omittedBytes) tail bytes at the retention limit.")
+            }
             recovery = .object(reference)
             var fields = reference
             if includeSections {
                 let result = await ProviderToolResultRecoveryStore.shared.page(
-                    handle: receipt.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "",
+                    handle: receipt.handle, page: 0, dataRoot: dataRoot, turn: turn, query: "",
                     pages: ProviderToolResultRecoveryStore.usualSectionPages)
                 guard case .object(let page) = result, ToolResult(result).said("completed") else {
                     return View(content: try result.serialize(pretty: false), recovery: recovery, failed: true)
@@ -109,35 +85,27 @@ package enum ProviderToolResultPage {
                 fields["repeat"] = receipt["repeat"]
                 fields["repeat_note"] = receipt["repeat_note"]
             }
-            // Exact live home controls stay outside paged reading evidence.
-            if includeSections, toolName == "app", case .object(var frame)? = parsed {
-                fields["version"] = frame["version"]
-                if case .object(let view)? = frame["view"] { frame.merge(view) { top, _ in top } }
-                let keys: Set<String> = ["status", "workspace", "path", "actions", "windows", "places", "desktop"]
-                var candidate = fields
-                candidate["navigation"] = .object(frame.filter { keys.contains($0.key) })
-                if try JSONValue.object(candidate).serialize(pretty: false).utf8.count <= inlineLimit { fields = candidate }
-            }
             return View(content: try JSONValue.object(fields).serialize(pretty: false), recovery: recovery, failed: false)
         } catch {
             // Retention failure is its own failure, never an unretained prefix or a verdict about the original effects.
             let kept = recovery?.objectValue?["result_handle"]?.stringValue.map {
-                " The whole body is retained as \($0); read app result.page with result_handle:\"\($0)\", raw:true, page:0 and follow next_page."
+                " The retained body is at \($0); read app result.page with result_handle:\"\($0)\", raw:true, page:0 and follow next_page."
             } ?? " The body could not be retained."
             return View(content: """
-                Result retention/projection failed: \(error.localizedDescription). Original result class: \(originalResultClass.rawValue). \
+                Result retention/projection failed: \(String(error.localizedDescription.prefix(300))). Original result class: \(originalResultClass.rawValue). \
                 No clipped result was delivered.\(kept) Inspect the original dispatch receipt and repair result storage before repeating an action.
                 """, recovery: recovery, failed: true)
         }
     }
 }
 
-/// Lossless, turn-scoped result storage. Live views spill to private temp files; context-overflow bodies stay at their existing durable chat path.
-/// Owner-only files have scope/content-bound handles readable only in the originating session and turn.
+/// Redacted results live with their record, with an explicit cut past the body cap; memory holds only a rebuildable paging cache.
 package actor ProviderToolResultRecoveryStore {
     package static let shared = ProviderToolResultRecoveryStore()
 
     package static let pageUTF8Bytes = 8_000
+    /// No common upstream result cap exists; keep this head and explicitly name any omitted tail.
+    package static let maxBodyUTF8Bytes = 4 * 1024 * 1024
 
     /// Bound pages by raw and serialized bytes, leaving envelope space below the projection ceiling.
     package static let pageSerializedUTF8Bytes = 10_000
@@ -153,103 +121,105 @@ package actor ProviderToolResultRecoveryStore {
             return 12
         }
     }
-    package static let ttl: TimeInterval = 30 * 60
-
-    package struct Scope: Hashable, Sendable {
-        package let sessionId: String
-        package let turnId: String
-
-        package init?(sessionId: String?, turnId: String?) {
-            let session = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let turn = (turnId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !session.isEmpty, !turn.isEmpty, turn != "unknown" else { return nil }
-            self.sessionId = session
-            self.turnId = turn
-        }
-    }
-
     package struct Receipt: Sendable {
         package let handle: String
+        package let url: URL
         package let pageCount: Int
         package let characters: Int
         package let bytes: Int
+        package let omittedBytes: Int
         package let resultClass: ChatToolOutcome.ExactResultClass
     }
 
     private struct Entry: Sendable {
         let handle: String
         let toolName: String
-        let scope: Scope
-        var url: URL
-        var removeOnRelease: Bool
+        let content: Data
         let characters: Int
-        let bytes: Int
+        let conversations: Set<String>
+        let omittedBytes: Int
+        let originalBytes: Int
         let resultClass: ChatToolOutcome.ExactResultClass
         let pageByteOffsets: [Int]
         let sectionBudget: Int
         let version: JSONValue?
         /// The retained answer's own continuation of its source, apart from page position.
         let source: JSONValue?
-        let createdAt: Date
         let sectionProjection: [(value: JSONValue, text: String, bytes: Int)]
         var sectionPages: (query: String, pages: [[JSONValue]], counts: [Int])?
         /// The last query's search, read only as far as its pages have been asked for.
         var search: ToolResultSections.Search?
     }
 
-    // Live result spills are outside backup/export/phone sync. Durable context bodies retain the chat owner's existing retention policy.
-    private let root: URL
-    private var entries: [String: Entry] = [:]
+    /// A rebuildable paging cache of the most recently read bodies; the files are the record.
+    private var entries: [URL: Entry] = [:]
+    private var cacheOrder: [URL] = []
+    private static let cachedEntries = 8
+    /// Pruning runs on the first store of each day per root, not on every call.
+    private var prunedDay: [URL: Date] = [:]
     private struct ReadCursor {
         let handle: String
         let nextPage: Int?
         let query: String?
     }
-    private var readCursors: [Scope: ReadCursor] = [:]
-
-    package init(root: URL = FileManager.default.temporaryDirectory
-        .appendingPathComponent(InstallPaths.current.name("NativeAgent"), isDirectory: true)
-        .appendingPathComponent("provider_tool_results", isDirectory: true)) {
-        self.root = root
-    }
+    private var readCursors: [String: ReadCursor] = [:]
 
     package func store(
         content: String,
-        parsed: JSONValue?,
         toolName: String,
-        sessionId: String?,
-        turnId: String?,
+        dataRoot: URL,
+        conversation: String?,
         originalResultClass: ChatToolOutcome.ExactResultClass,
-        sectionBudget: Int = ToolResultSections.pageBudget,
-        durableURL: URL? = nil
+        sectionBudget: Int = ToolResultSections.pageBudget
     ) throws -> Receipt {
-        guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
-            throw ToolFailureError("A retained result needs its originating session and turn.", effects: .unknown,
-                owner: toolName, code: "missing_result_scope", recovery: .reconcile)
+        let root = dataRoot.standardizedFileURL.appendingPathComponent("tool_results", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        let day = Calendar.current.startOfDay(for: Date())
+        if prunedDay[root] != day {
+            // A prune that fails is tried again on the next store; it never costs this result its retention.
+            do { try cleanupExpired(root: root, now: Date()); prunedDay[root] = day }
+            catch { nativeLog("[results] pruning %@ failed: %@", root.path, error.localizedDescription) }
         }
-        cleanupExpired(now: Date())
 
-        let data = Data(content.utf8)
-        let fields = parsed?.objectValue ?? [:]
+        let redacted = try ProviderToolResultPage.redactedContent(content)
+        let data = Data(redacted.utf8)
+        var head = min(data.count, Self.maxBodyUTF8Bytes)
+        while String(data: data.prefix(head), encoding: .utf8) == nil { head -= 1 }
+        let omittedBytes = data.count - head
+        let content = String(decoding: data.prefix(head), as: UTF8.self) + (omittedBytes == 0 ? "" :
+            "\n[Result body cut: kept \(head) bytes; \(omittedBytes) bytes omitted by the \(Self.maxBodyUTF8Bytes)-byte retention limit.]")
+        let parsed = try? JSONValue.parse(Data(content.utf8))
+        let fields = (try? JSONValue.parse(Data(redacted.utf8)))?.objectValue ?? [:]
         let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
         let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
         // The same receipt can have distinct redacted views. Never overwrite bytes already promised by another view's handle.
-        let digest = SHA256.hash(data: Data((scope.sessionId + "\u{0}" + scope.turnId + "\u{0}" + toolName + "\u{0}").utf8) + data)
+        let digest = SHA256.hash(data: Data((toolName + "\u{0}" + content).utf8))
             .map { String(format: "%02x", $0) }.joined()
         let handle = (source == "detail" ? receipt : nil)
             .map { "receipt-" + $0.uuidString.lowercased() + "." + digest } ?? digest
-        if var entry = entries[handle] {
-            if let durableURL, entry.url != durableURL {
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: durableURL)
-                let temporary = entry.removeOnRelease ? entry.url : nil
-                entry.url = durableURL
-                entry.removeOnRelease = false
-                entries[handle] = entry
-                if let temporary { try? FileManager.default.removeItem(at: temporary) }
-            }
-            return Receipt(handle: handle, pageCount: entry.pageByteOffsets.count - 1,
-                characters: entry.characters, bytes: entry.bytes, resultClass: entry.resultClass)
+        let url = root.appendingPathComponent(handle)
+        var conversations = Set(conversation.map { [$0] } ?? [])
+        if FileManager.default.fileExists(atPath: url.path) {
+            conversations.formUnion(try loadEntry(handle: handle, url: url).conversations)
         }
+        let entry = try makeEntry(handle: handle, content: content, parsed: parsed, toolName: toolName,
+            originalResultClass: originalResultClass, sectionBudget: sectionBudget, conversations: conversations,
+            omittedBytes: omittedBytes, originalBytes: data.count)
+        let saved: JSONValue = .object(["content": .string(content), "tool": .string(toolName),
+            "conversations": .array(conversations.sorted().map(JSONValue.string)), "omitted_bytes": .int(Int64(omittedBytes)),
+            "original_bytes": .int(Int64(data.count)),
+            "original_result_class": .string(originalResultClass.rawValue), "section_budget": .int(Int64(sectionBudget))])
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(try saved.serialize(pretty: false).utf8), to: url)
+        cache(entry, at: url)
+        return Receipt(handle: entry.handle, url: url, pageCount: entry.pageByteOffsets.count - 1,
+            characters: entry.characters, bytes: head, omittedBytes: omittedBytes, resultClass: entry.resultClass)
+    }
+
+    private func makeEntry(handle: String, content: String, parsed: JSONValue?, toolName: String,
+                           originalResultClass: ChatToolOutcome.ExactResultClass, sectionBudget: Int,
+                           conversations: Set<String>, omittedBytes: Int, originalBytes: Int) throws -> Entry {
+        let fields = parsed?.objectValue ?? [:]
 
         // Build valid Unicode-scalar byte boundaries once. Bounding bytes (not grapheme count) prevents a pathological combining sequence from becoming an
         // unexpectedly huge provider page.
@@ -277,12 +247,6 @@ package actor ProviderToolResultRecoveryStore {
         }
 
         let sections = try ToolResultSections.projection(content: content, value: parsed, budget: sectionBudget)
-        let url = durableURL ?? root.appendingPathComponent(handle, isDirectory: false)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
-
-        let now = Date()
         let version = fields["version"]
         // An answer that said its source has more keeps that call beside every page: paging the answer never reaches the rest of the source.
         // Only an action of the app's own door is named: its next is that action's whole argument set, which another tool's cursor is not.
@@ -299,29 +263,20 @@ package actor ProviderToolResultRecoveryStore {
                 "next_call": .object(["tool": .string("app"), "input": input]),
             ])
         }
-        let entry = Entry(
+        return Entry(
             handle: handle,
             toolName: toolName,
-            scope: scope,
-            url: url,
-            removeOnRelease: durableURL == nil,
+            content: Data(content.utf8),
             characters: content.count,
-            bytes: data.count,
+            conversations: conversations,
+            omittedBytes: omittedBytes,
+            originalBytes: originalBytes,
             resultClass: originalResultClass,
             pageByteOffsets: pageByteOffsets,
             sectionBudget: sectionBudget,
             version: version,
             source: continues,
-            createdAt: now,
             sectionProjection: sections
-        )
-        entries[handle] = entry
-        return Receipt(
-            handle: handle,
-            pageCount: max(1, entry.pageByteOffsets.count - 1),
-            characters: entry.characters,
-            bytes: entry.bytes,
-            resultClass: entry.resultClass
         )
     }
 
@@ -331,12 +286,13 @@ package actor ProviderToolResultRecoveryStore {
     package func page(
         handle: String,
         page: Int,
-        sessionId: String?,
-        turnId: String?,
+        dataRoot: URL,
+        turn: Turn,
         query: String? = nil,
         pages: Int = 1
     ) -> JSONValue {
-        var result = readPage(handle: handle, page: page, sessionId: sessionId, turnId: turnId, query: query)
+        let key = dataRoot.standardizedFileURL.appendingPathComponent("tool_results/" + handle)
+        var result = readPage(handle: handle, page: page, dataRoot: dataRoot, turn: turn, query: query)
         // A read of several pages joins them in order while the whole answer stays within what one answer holds. Each mode's page size
         // differs, so the body is measured, never assumed: that measure alone sets how many pages one answer carries.
         if pages > 1, case .object(var answer) = result, ToolResult(result).said("completed") {
@@ -347,7 +303,7 @@ package actor ProviderToolResultRecoveryStore {
             func int(_ key: String) -> Int { if case .int(let value)? = answer[key] { Int(value) } else { 0 } }
             var used = bytes(answer[body]), read = 1
             while read < pages, case .int(let next)? = answer["next_page"] {
-                let more = readPage(handle: handle, page: Int(next), sessionId: sessionId, turnId: turnId, query: query)
+                let more = readPage(handle: handle, page: Int(next), dataRoot: dataRoot, turn: turn, query: query)
                 guard case .object(var joined) = more, ToolResult(more).said("completed") else { return more }
                 let added = bytes(joined[body])
                 guard added <= budget - used else { break }
@@ -377,14 +333,14 @@ package actor ProviderToolResultRecoveryStore {
             result = .object(answer)
         }
         let reply = ToolResult(result)
-        if let scope = Scope(sessionId: sessionId, turnId: turnId),
-           case .object(var object) = result, reply.said("completed"), reply.status == object["status"]?.stringValue {
+        if case .object(var object) = result, reply.said("completed"), reply.status == object["status"]?.stringValue {
             let next: Int?
             if case .int(let value)? = object["next_page"] { next = Int(exactly: value) }
             else { next = nil }
-            readCursors[scope] = ReadCursor(handle: handle, nextPage: next, query: query)
-            object["full_result_retained"] = .bool(true)
-            object["version"] = entries[handle]?.version
+            readCursors[turn.id] = ReadCursor(handle: handle, nextPage: next, query: query)
+            object["full_result_retained"] = .bool(entries[key]?.omittedBytes == 0)
+            object["omitted_bytes"] = entries[key].map { .int(Int64($0.omittedBytes)) }
+            object["version"] = entries[key]?.version
             var args: [String: JSONValue] = ["continue": .bool(true), "result_handle": .string(handle)]
             // Continuing already reads as much as fits; only an asked count travels with it.
             if pages > 1, pages < Self.usualSectionPages { args["pages"] = .int(Int64(pages)) }
@@ -395,68 +351,52 @@ package actor ProviderToolResultRecoveryStore {
         return result
     }
 
-    /// Continue the exact last read in this turn, preserving its query/mode. Before the first read only an unambiguous retained result is selected.
+    /// Continue the exact last read in this turn, preserving its query/mode. A first read names its retained result.
     /// A query or raw given with the continuation is the read wanted: the same read goes on from its position, a different one starts at its page 0.
     /// An empty query is the whole-sections read: after a search it starts that read at page 0.
-    package func continueReading(handle: String?, sessionId: String?, turnId: String?, pages: Int = 1,
+    package func continueReading(handle: String?, dataRoot: URL, turn: Turn, pages: Int = 1,
                                  query: String? = nil, raw: Bool = false) -> JSONValue {
-        cleanupExpired(now: Date())
-        guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
-            return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("missing_result_scope"),
-                "detail": .string("Continuing a result works inside the chat turn that read it; this call has no such turn.")])
-        }
-        if let cursor = readCursors[scope], handle == nil || handle == cursor.handle {
+        if let cursor = readCursors[turn.id], handle == nil || handle == cursor.handle {
             // A read is raw (nil), whole sections (a query without terms, "" here) or a search; a mode left unnamed keeps the cursor's.
             func reading(_ query: String?) -> String? { query.map { ToolResultSections.queryTerms($0).isEmpty ? "" : $0 } }
             let mode = raw ? nil : query ?? cursor.query
             if reading(mode) != reading(cursor.query) {
-                return page(handle: cursor.handle, page: 0, sessionId: sessionId, turnId: turnId, query: mode, pages: pages)
+                return page(handle: cursor.handle, page: 0, dataRoot: dataRoot, turn: turn, query: mode, pages: pages)
             }
             guard let next = cursor.nextPage else {
+                let check = readPage(handle: cursor.handle, page: 0, dataRoot: dataRoot, turn: turn, query: nil)
+                guard ToolResult(check).said("completed") else { return check }
+                let key = dataRoot.standardizedFileURL.appendingPathComponent("tool_results/" + cursor.handle)
                 var end: [String: JSONValue] = ["status": .string("completed"), "result_handle": .string(cursor.handle),
                     "has_more": .bool(false), "reading_complete": .bool(true),
-                    "full_result_retained": .bool(true), "next_call": .null,
+                    "full_result_retained": .bool(entries[key]?.omittedBytes == 0), "next_call": .null,
                     "recovery_only": .bool(true),
                     "verification_scope": .string("retained_tool_response_not_external_outcome"),
-                    "original_result_class": .string(entries[cursor.handle]?.resultClass.rawValue ?? "unknown"),
+                    "original_result_class": .string(entries[key]?.resultClass.rawValue ?? "unknown"),
                     "detail": .string("You reached the end of this retained result. No operation was repeated.")]
-                end["source_continues"] = entries[cursor.handle]?.source
+                end["source_continues"] = entries[key]?.source
                 return .object(end)
             }
-            return page(handle: cursor.handle, page: next, sessionId: sessionId, turnId: turnId, query: cursor.query, pages: pages)
+            return page(handle: cursor.handle, page: next, dataRoot: dataRoot, turn: turn, query: cursor.query, pages: pages)
         }
-        let candidates = entries.values.filter { $0.scope == scope && (handle == nil || $0.handle == handle) }
-            .sorted { $0.createdAt < $1.createdAt }
-        guard candidates.count == 1, let entry = candidates.first else {
-            if candidates.isEmpty, let handle { return unavailable(handle: handle, reason: "result_handle_unavailable", sessionId: sessionId) }
-            return .object([
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "reason": .string(candidates.isEmpty ? "result_handle_unavailable" : "choose_result"),
-                "results": .array(candidates.map { .object(["result_handle": .string($0.handle), "tool": .string($0.toolName)]) }),
-                "recovery_hint": .string(candidates.isEmpty
-                    ? """
-                        No matching retained result is readable in this turn. Inline results are not retained; handles expire at turn end. Follow \
-                        the original read's next arguments if it has more; never repeat a write to recover output.
-                        """
-                    : "Several results are retained. Choose result_handle once; subsequent continue reads keep its position."),
-            ])
+        guard let handle else {
+            return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("missing_result_handle"),
+                "recovery_hint": .string("Name result_handle for the first read in this turn; subsequent continue reads keep its position.")])
         }
-        return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: raw ? nil : query ?? "", pages: pages)
+        return page(handle: handle, page: 0, dataRoot: dataRoot, turn: turn, query: raw ? nil : query ?? "", pages: pages)
     }
 
-    private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
+    private func unavailable(handle: String, reason: String, cause: String = "") -> JSONValue {
         let receipt = handle.hasPrefix("receipt-") ? UUID(uuidString: String(handle.dropFirst(8).prefix(36))) : nil
         var args: [String: JSONValue] = ["view": .string("receipts")]
         // The receipt is found by its own id wherever it was recorded; only listing receipts needs this conversation.
         if let receipt { args["receipt_id"] = .string(receipt.uuidString.lowercased()) }
-        else if let sessionId { args["session_id"] = .string(sessionId) }
         let recovery = receipt == nil
             ? "This handle has no bound receipt; next_call lists this conversation's receipts."
             : "next_call reads the original dispatch receipt."
         return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string(reason),
             "detail": .string("""
-                Retained output \(handle) is unavailable. \
+                Retained output \(handle) is unavailable. \(cause) \
                 \(recovery) \
                 Missing output does not establish failure; never repeat a write to recover output.
                 """),
@@ -498,14 +438,57 @@ package actor ProviderToolResultRecoveryStore {
             """
     }
 
+    private func loadEntry(handle: String, url: URL) throws -> Entry {
+        let saved = try JSONValue.parse(Data(contentsOf: url)).objectValue
+        guard let content = saved?["content"]?.stringValue, let tool = saved?["tool"]?.stringValue,
+              let result = saved?["original_result_class"]?.stringValue,
+              let resultClass = ChatToolOutcome.ExactResultClass(rawValue: result),
+              case .array(let conversations)? = saved?["conversations"], conversations.allSatisfy({ $0.stringValue != nil }),
+              case .int(let omitted)? = saved?["omitted_bytes"], let omittedBytes = Int(exactly: omitted), omittedBytes >= 0,
+              case .int(let original)? = saved?["original_bytes"], let originalBytes = Int(exactly: original), originalBytes >= omittedBytes,
+              case .int(let budget)? = saved?["section_budget"], let sectionBudget = Int(exactly: budget), sectionBudget > 0
+        else { throw CocoaError(.fileReadCorruptFile) }
+        return try makeEntry(handle: handle, content: content, parsed: try? JSONValue.parse(Data(content.utf8)),
+            toolName: tool, originalResultClass: resultClass, sectionBudget: sectionBudget,
+            conversations: Set(conversations.compactMap(\.stringValue)), omittedBytes: omittedBytes, originalBytes: originalBytes)
+    }
+
+    /// A reference alone proves nothing: open the saved body, even if a paging entry is already cached.
+    package func wholeBodyAvailable(handle: String, dataRoot: URL, turn: Turn) -> Bool {
+        guard validHandle(handle), let entry = try? loadEntry(handle: handle,
+            url: dataRoot.standardizedFileURL.appendingPathComponent("tool_results/" + handle)) else { return false }
+        return entry.omittedBytes == 0 && mayRead(entry, turn: turn)
+    }
+
+    private func validHandle(_ handle: String) -> Bool {
+        handle.range(of: "^(receipt-[0-9a-f-]{36}\\.)?[0-9a-f]{64}$", options: .regularExpression) != nil
+    }
+
+    private func mayRead(_ entry: Entry, turn: Turn) -> Bool {
+        turn.peerSteering?.isTainted != true
+            || ChatToolSessionInjection.currentSession(turn: turn).map { entry.conversations.contains($0) } == true
+    }
+
     private func readPage(
-        handle: String, page: Int, sessionId: String?, turnId: String?, query: String?
+        handle: String, page: Int, dataRoot: URL, turn: Turn, query: String?
     ) -> JSONValue {
-        cleanupExpired(now: Date())
-        guard let scope = Scope(sessionId: sessionId, turnId: turnId),
-              var entry = entries[handle],
-              entry.scope == scope else {
-            return unavailable(handle: handle, reason: "result_handle_unavailable", sessionId: sessionId)
+        guard validHandle(handle) else {
+            return unavailable(handle: handle, reason: "result_handle_unavailable")
+        }
+        let key = dataRoot.standardizedFileURL.appendingPathComponent("tool_results/" + handle)
+        do {
+            if entries[key] == nil {
+                cache(try loadEntry(handle: handle, url: key), at: key)
+            }
+        } catch {
+            let missing = (error as? CocoaError)?.code == .fileReadNoSuchFile
+            return unavailable(handle: handle, reason: missing ? "result_handle_unavailable" : "result_spill_unreadable",
+                cause: error.localizedDescription)
+        }
+        guard var entry = entries[key] else { return unavailable(handle: handle, reason: "result_handle_unavailable") }
+        guard mayRead(entry, turn: turn) else {
+            return .object(["status": .string("refused"), "effects": .string("none"), "reason": .string("result_not_in_conversation"),
+                "detail": .string("A turn steered by an untrusted source reads only results produced in its own conversation. No body was disclosed.")])
         }
         if let query, !ToolResultSections.queryTerms(query).isEmpty {
             // A search reads on from where its last read stopped, only as far as this page.
@@ -513,7 +496,7 @@ package actor ProviderToolResultRecoveryStore {
             entry.search = nil
             search.fill(through: page, entry.sectionProjection)
             entry.search = search
-            entries[handle] = entry
+            entries[key] = entry
             guard search.pages.indices.contains(page) else {
                 return .object(["status": .string("failed"), "reason": .string("page_out_of_range"),
                     "page_count": .int(Int64(search.pages.count)),
@@ -556,7 +539,7 @@ package actor ProviderToolResultRecoveryStore {
             if entry.sectionPages?.query != query {
                 let pages = ToolResultSections.pages(sections: entry.sectionProjection, budget: entry.sectionBudget)
                 entry.sectionPages = (query, pages, pages.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1.count) })
-                entries[handle] = entry
+                entries[key] = entry
             }
             let (_, pages, counts) = entry.sectionPages!
             guard pages.indices.contains(page) else {
@@ -584,7 +567,7 @@ package actor ProviderToolResultRecoveryStore {
                 "result_handle": .string(handle), "query": .string(query),
                 "page": .int(Int64(page)), "page_count": .int(Int64(pages.count)),
                 "sections": .array(sections),
-                "searched_sections": .int(Int64(entries[handle]?.sectionProjection.count ?? 0)),
+                "searched_sections": .int(Int64(entry.sectionProjection.count)),
                 "matching_sections": .int(Int64(matching)),
                 "displayed_sections": .int(Int64(sections.count)),
                 "remaining_sections": .int(Int64(remaining)),
@@ -609,20 +592,10 @@ package actor ProviderToolResultRecoveryStore {
         let startByte = entry.pageByteOffsets[page]
         let endByte = entry.pageByteOffsets[page + 1]
         let content: String
-        do {
-            let file = try FileHandle(forReadingFrom: entry.url)
-            defer { try? file.close() }
-            try file.seek(toOffset: UInt64(startByte))
-            let data: Data?
-            if endByte == startByte { data = Data() }
-            else { data = try file.read(upToCount: endByte - startByte) }
-            guard let data, data.count == endByte - startByte, let text = String(data: data, encoding: .utf8) else {
-                return unavailable(handle: handle, reason: "result_spill_incomplete", sessionId: sessionId)
-            }
-            content = text
-        } catch {
-            return unavailable(handle: handle, reason: "result_spill_unreadable", sessionId: sessionId)
+        guard let text = String(data: entry.content.subdata(in: startByte..<endByte), encoding: .utf8) else {
+            return unavailable(handle: handle, reason: "result_spill_incomplete")
         }
+        content = text
         let hasMore = page + 1 < pageCount
         let nextPage: JSONValue = hasMore ? .int(Int64(page + 1)) : .null
         var answer: [String: JSONValue] = [
@@ -636,7 +609,7 @@ package actor ProviderToolResultRecoveryStore {
             "page_count": .int(Int64(pageCount)),
             "page_bytes": .int(Int64(endByte - startByte)),
             "original_characters": .int(Int64(entry.characters)),
-            "original_bytes": .int(Int64(entry.bytes)),
+            "original_bytes": .int(Int64(entry.originalBytes)),
             "content": .string(content),
             "has_more": .bool(hasMore),
             "next_page": nextPage,
@@ -645,36 +618,34 @@ package actor ProviderToolResultRecoveryStore {
         return .object(answer)
     }
 
-    package func remove(scope: Scope) {
-        for handle in entries.values.filter({ $0.scope == scope }).map(\.handle) {
-            remove(handle: handle)
-        }
+    private func cache(_ entry: Entry, at key: URL) {
+        entries[key] = entry
+        cacheOrder.removeAll { $0 == key }
+        cacheOrder.append(key)
+        while cacheOrder.count > Self.cachedEntries { entries.removeValue(forKey: cacheOrder.removeFirst()) }
     }
 
-    private func cleanupExpired(now: Date) {
-        // A live turn owns its handles until settlement; age and later results never evict promised output.
-        let liveNames = Set(entries.values.map { $0.url.lastPathComponent })
-        let cutoff = now.addingTimeInterval(-Self.ttl)
-        let urls = try? FileManager.default.contentsOfDirectory(
+    private func cleanupExpired(root: URL, now: Date) throws {
+        let cutoff = now.addingTimeInterval(-ExperienceStore.detailHorizon)
+        let urls = try FileManager.default.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         )
-        for url in urls ?? [] where !liveNames.contains(url.lastPathComponent) {
-            let modified = try? url.resourceValues(
+        for url in urls {
+            let modified = try url.resourceValues(
                 forKeys: [.contentModificationDateKey]
             ).contentModificationDate
-            if modified.map({ $0 < cutoff }) ?? true {
-                try? FileManager.default.removeItem(at: url)
+            guard let modified else { throw CocoaError(.fileReadUnknown) }
+            if modified < cutoff {
+                try FileManager.default.removeItem(at: url)
+                entries.removeValue(forKey: url)
+                cacheOrder.removeAll { $0 == url }
+                for turn in readCursors.keys.filter({ readCursors[$0]?.handle == url.lastPathComponent }) { readCursors.removeValue(forKey: turn) }
             }
         }
     }
 
-    private func remove(handle: String) {
-        for scope in readCursors.keys.filter({ readCursors[$0]?.handle == handle }) { readCursors.removeValue(forKey: scope) }
-        guard let entry = entries.removeValue(forKey: handle) else { return }
-        if entry.removeOnRelease { try? FileManager.default.removeItem(at: entry.url) }
-    }
 }
 
 extension SwiftToolDispatcher {
@@ -709,7 +680,7 @@ extension SwiftToolDispatcher {
             let handle = input["result_handle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             return await heldReceiptPointer(turnId: turn.id, await ProviderToolResultRecoveryStore.shared.continueReading(
                 handle: handle?.isEmpty == false ? handle : nil,
-                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: turn.id, pages: pages,
+                dataRoot: dataRoot, turn: turn, pages: pages,
                 query: input["query"]?.stringValue, raw: input["raw"] == .bool(true)))
         }
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
@@ -717,7 +688,7 @@ extension SwiftToolDispatcher {
                 "status": .string("failed"),
                 "effects": .string("none"),
                 "reason": .string("missing_result_handle"),
-                "recovery_hint": .string("Copy result_handle from the earlier bounded_tool_result response in this turn."),
+                "recovery_hint": .string("Copy result_handle from a retained bounded_tool_result response."),
             ])
         }
         guard let page = whole(input["page"], absent: 0), page >= 0 else {
@@ -734,8 +705,8 @@ extension SwiftToolDispatcher {
         return await heldReceiptPointer(turnId: turn.id, await ProviderToolResultRecoveryStore.shared.page(
             handle: handle,
             page: page,
-            sessionId: ChatToolSessionInjection.explicitSessionId(in: input),
-            turnId: turn.id,
+            dataRoot: dataRoot,
+            turn: turn,
             query: input["raw"] == .bool(true) ? nil : (input["query"]?.stringValue ?? ""),
             pages: pages
         ))
@@ -760,8 +731,8 @@ extension SwiftToolDispatcher {
             """)
         fields["receipt_aged_out"] = .bool(true)
         fields["remedy"] = Repair.terminal(instruction: """
-            This handle and its receipt can no longer be read back; a file the output was saved to (saved_result_path in its first answer) \
-            still reads. Otherwise inspect the affected state itself before any further change; never repeat a write to recover output.
+            This handle and its receipt can no longer be read back; retained result files are pruned with trace details. \
+            Inspect the affected state itself before any further change; never repeat a write to recover output.
             """)
         return .object(fields)
     }

@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 
-// Blueprint: | `MessageBubbleActions.swift` | Bubble hover controls, canonical message JSON sheet and advanced text editor |
+// Blueprint: | `MessageBubbleActions.swift` | Bubble hover controls and canonical message JSON sheet |
 
 struct BubbleHoverBar: View {
     var message: TranscriptMessageReference
@@ -64,27 +64,6 @@ struct MessageJSONSheet: View {
             FaceDocumentReader(identity: [message.session, message.id], presentation: { _ in
                 try await appModel.documentPresentation(.message(session: message.session, message: message.id))
             }).padding(16)
-        }
-    }
-}
-
-struct AdvancedTextEditor: View {
-    var title: String
-    @Binding var text: String
-    var minHeight: CGFloat = 82
-    var isReadOnly: Bool = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            TextEditor(text: $text)
-                .font(.body)
-                .disabled(isReadOnly)
-                .frame(minHeight: minHeight, maxHeight: minHeight + 44)
-                .scrollContentBackground(.hidden)
-                .padding(6)
         }
     }
 }

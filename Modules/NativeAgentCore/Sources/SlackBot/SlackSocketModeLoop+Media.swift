@@ -8,7 +8,7 @@ import BackgroundLoops
 
 extension SlackSocketModeLoop {
     enum AttachmentFailure: Error {
-        case missingMetadata, unsupported, oversized, empty, limit
+        case missingMetadata, unsupported, untrustedURL, oversized, empty, limit
         case permanent(Int), transient(String)
 
         var notice: String {
@@ -17,6 +17,8 @@ extension SlackSocketModeLoop {
                 return "attachment_metadata_missing: Slack did not provide a MIME type or download URL. Upload the file again with complete metadata."
             case .unsupported:
                 return "attachment_unsupported: Expected an HTTPS JPEG, PNG, GIF or WebP image. Send a supported image or paste its text."
+            case .untrustedURL:
+                return "attachment_untrusted_url: Expected an HTTPS file address on files.slack.com. Upload the file directly to Slack."
             case .oversized:
                 return "attachment_oversized: Image exceeds the remaining byte limit (10 MB each, 20 MB total). Send a smaller image."
             case .empty:
@@ -110,10 +112,10 @@ extension SlackSocketModeLoop {
               let downloadURL = file.downloadURL, !downloadURL.isEmpty else { throw AttachmentFailure.missingMetadata }
         let mime = mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let supportedMIMEs: Set<String> = ["image/jpeg", "image/png", "image/gif", "image/webp"]
-        guard supportedMIMEs.contains(mime),
-              let url = URL(string: downloadURL), url.scheme?.lowercased() == "https" else {
+        guard supportedMIMEs.contains(mime) else {
             throw AttachmentFailure.unsupported
         }
+        guard let url = SlackWebAPI.trustedFileURL(downloadURL) else { throw AttachmentFailure.untrustedURL }
         if let declared = file.byteSize, declared < 0 || declared > maximumBytes {
             throw AttachmentFailure.oversized
         }

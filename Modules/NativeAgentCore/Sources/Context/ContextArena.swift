@@ -1,99 +1,11 @@
 import Foundation
 
-// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded generations, leases, pressure and post-lock health invalidations |
-
-public enum ContextArenaBudget: Int, CaseIterable, Sendable, Codable {
-    case mib32 = 32
-    case mib64 = 64
-    case mib96 = 96
-    case mib128 = 128
-    case mib256 = 256
-
-    public static let `default`: Self = .mib96
-
-    public var byteLimit: Int {
-        rawValue * 1_048_576
-    }
-}
-
-public enum ContextArenaTier: String, Sendable, Codable {
-    case hot
-    case warm
-}
-
-public struct ContextArenaEntryKey: Hashable, Comparable, Sendable {
-    public let namespace: String
-    public let id: String
-    public let sourceFingerprint: String
-    public let generationID: Int64
-
-    public init(namespace: String, id: String, sourceFingerprint: String, generationID: Int64) {
-        self.namespace = namespace
-        self.id = id
-        self.sourceFingerprint = sourceFingerprint
-        self.generationID = generationID
-    }
-
-    public static func < (lhs: Self, rhs: Self) -> Bool {
-        if lhs.namespace != rhs.namespace { return lhs.namespace < rhs.namespace }
-        if lhs.id != rhs.id { return lhs.id < rhs.id }
-        if lhs.generationID != rhs.generationID { return lhs.generationID < rhs.generationID }
-        return lhs.sourceFingerprint < rhs.sourceFingerprint
-    }
-}
-
-public enum ContextArenaEntryError: Error, Equatable, Sendable {
-    case emptyNamespace
-    case emptyID
-    case emptySourceFingerprint
-    case negativeGeneration
-    case negativeRetentionPriority
-    case negativeLogicalByteCount
-    case logicalByteOverflow
-}
-
-/// A logical admission descriptor; content stays in the typed generation.
-public struct ContextArenaEntry: Sendable, Equatable {
-    public let key: ContextArenaEntryKey
-    public let tier: ContextArenaTier
-    public let retentionPriority: Int
-    public let logicalByteCount: Int
-
-    public init(
-        key: ContextArenaEntryKey,
-        tier: ContextArenaTier,
-        logicalByteCount: Int,
-        retentionPriority: Int = 0
-    ) throws {
-        guard !key.namespace.isEmpty else { throw ContextArenaEntryError.emptyNamespace }
-        guard !key.id.isEmpty else { throw ContextArenaEntryError.emptyID }
-        guard !key.sourceFingerprint.isEmpty else {
-            throw ContextArenaEntryError.emptySourceFingerprint
-        }
-        guard key.generationID >= 0 else { throw ContextArenaEntryError.negativeGeneration }
-        guard retentionPriority >= 0 else {
-            throw ContextArenaEntryError.negativeRetentionPriority
-        }
-
-        guard logicalByteCount >= 0 else {
-            throw ContextArenaEntryError.negativeLogicalByteCount
-        }
-
-        self.key = key
-        self.tier = tier
-        self.retentionPriority = retentionPriority
-        self.logicalByteCount = logicalByteCount
-    }
-}
+// Blueprint: | `ContextArena.swift` | `ContextArena`: generations, leases, pressure and post-lock health invalidations |
 
 public enum ContextGenerationSnapshotError: Error, Equatable, Sendable {
     case negativeGeneration
     case emptySourceFingerprint
     case duplicatePersona(ContextPersonaID)
-    case duplicateEntryKey(ContextArenaEntryKey)
-    case tierMismatch(key: ContextArenaEntryKey, expected: ContextArenaTier)
-    case entryGenerationMismatch(key: ContextArenaEntryKey, expected: Int64)
-    case logicalByteOverflow
 }
 
 /// Immutable, generation-consistent data used for an entire provider/tool loop.
@@ -101,18 +13,12 @@ public struct ContextGenerationSnapshot: Sendable, Equatable {
     public let generationID: Int64
     public let sourceFingerprint: String
     public let requiredDocumentMirrors: [RequiredDocumentMirror]
-    public let hotEntries: [ContextArenaEntry]
-    public let warmEntries: [ContextArenaEntry]
     public let selectionIndex: [ContextAtomID: ContextSelectionIndexEntry]
-    public let hotLogicalByteCount: Int
-    public let logicalByteCount: Int
 
     public init(
         generationID: Int64,
         sourceFingerprint: String,
         requiredDocumentMirrors: [RequiredDocumentMirror] = [],
-        hotEntries: [ContextArenaEntry] = [],
-        warmEntries: [ContextArenaEntry] = [],
         selectionIndex: [ContextAtomID: ContextSelectionIndexEntry] = [:]
     ) throws {
         guard generationID >= 0 else {
@@ -130,47 +36,10 @@ public struct ContextGenerationSnapshot: Sendable, Equatable {
             }
         }
 
-        let sortedHot = hotEntries.sorted { $0.key < $1.key }
-        let sortedWarm = warmEntries.sorted { $0.key < $1.key }
-        var entryKeys = Set<ContextArenaEntryKey>()
-        for (entries, expectedTier) in [(sortedHot, ContextArenaTier.hot), (sortedWarm, .warm)] {
-            for entry in entries {
-                guard entry.tier == expectedTier else {
-                    throw ContextGenerationSnapshotError.tierMismatch(
-                        key: entry.key,
-                        expected: expectedTier
-                    )
-                }
-                guard entry.key.generationID == generationID else {
-                    throw ContextGenerationSnapshotError.entryGenerationMismatch(
-                        key: entry.key,
-                        expected: generationID
-                    )
-                }
-                guard entryKeys.insert(entry.key).inserted else {
-                    throw ContextGenerationSnapshotError.duplicateEntryKey(entry.key)
-                }
-            }
-        }
-
-        let snapshotOverhead = 128 + sourceFingerprint.utf8.count
-        let hotComponents = [snapshotOverhead]
-            + mirrors.map(\.logicalByteCount)
-            + sortedHot.map(\.logicalByteCount)
-            + selectionIndex.values.map(\.logicalByteCount)
-        let warmComponents = sortedWarm.map(\.logicalByteCount)
-        let hotBytes = try ContextLogicalByteAccounting.checkedSum(hotComponents, overflowError: ContextGenerationSnapshotError.logicalByteOverflow)
-        let warmBytes = try ContextLogicalByteAccounting.checkedSum(warmComponents, overflowError: ContextGenerationSnapshotError.logicalByteOverflow)
-        let totalBytes = try ContextLogicalByteAccounting.checkedSum([hotBytes, warmBytes], overflowError: ContextGenerationSnapshotError.logicalByteOverflow)
-
         self.generationID = generationID
         self.sourceFingerprint = sourceFingerprint
         self.requiredDocumentMirrors = mirrors
-        self.hotEntries = sortedHot
-        self.warmEntries = sortedWarm
         self.selectionIndex = selectionIndex
-        self.hotLogicalByteCount = hotBytes
-        self.logicalByteCount = totalBytes
     }
 
 }
@@ -179,9 +48,6 @@ public enum ContextArenaPublicationFailure: Error, Equatable, Sendable {
     case generationNotNewer(candidate: Int64, current: Int64)
     case rehydrationGenerationMismatch(candidate: Int64, current: Int64)
     case rehydrationFingerprintMismatch(candidate: String, current: String)
-    case prewarmingDisabled(ContextArenaPressure)
-    case logicalBudgetExceeded(actual: Int, limit: Int)
-    case hotTierLimitExceeded(actual: Int, limit: Int)
 }
 
 public enum ContextArenaPublicationOutcome: Equatable, Sendable {
@@ -198,23 +64,10 @@ public enum ContextArenaPressure: String, Sendable, Codable {
 
 public enum ContextArenaError: Error, Equatable, Sendable {
     case noPublishedSnapshot
-    case invalidHotTierLimit
-}
-
-public struct ContextArenaTrimReceipt: Sendable, Equatable {
-    public let pressure: ContextArenaPressure
-    public let beforeLogicalBytes: Int
-    public let afterLogicalBytes: Int
-    public let evictedWarmEntryKeys: [ContextArenaEntryKey]
-    public let pinnedGenerations: [Int64: Int]
 }
 
 public struct ContextArenaMetrics: Sendable, Equatable {
-    public let budget: ContextArenaBudget
-    public let hotTierByteLimit: Int
     public let currentGenerationID: Int64?
-    public let currentLogicalBytes: Int
-    public let residentLogicalBytes: Int
     public let activeLeaseCount: Int
     public let pinnedGenerations: [Int64: Int]
     public let pressure: ContextArenaPressure
@@ -254,10 +107,6 @@ public final class ContextGenerationLease: @unchecked Sendable {
 
 /// One short-held lock serializes swaps and lease accounting; construct snapshots before taking it.
 public final class ContextArena: @unchecked Sendable {
-    public static let defaultHotTierByteLimit = 16 * 1_048_576
-
-    public let budget: ContextArenaBudget
-    public let hotTierByteLimit: Int
     public let healthEvents: ContextHealthEvents
 
     private struct PublishedSnapshot {
@@ -268,7 +117,6 @@ public final class ContextArena: @unchecked Sendable {
     private struct ActiveSnapshot {
         var leaseCount: Int
         let generationID: Int64
-        let logicalByteCount: Int
     }
 
     private struct State {
@@ -282,19 +130,7 @@ public final class ContextArena: @unchecked Sendable {
     private let lock = NSLock()
     private var state = State()
 
-    public init(
-        budget: ContextArenaBudget = .default,
-        hotTierByteLimit: Int = ContextArena.defaultHotTierByteLimit,
-        healthEvents: ContextHealthEvents = ContextHealthEvents()
-    ) throws {
-        guard hotTierByteLimit > 0,
-              hotTierByteLimit <= Self.defaultHotTierByteLimit,
-              hotTierByteLimit <= budget.byteLimit
-        else {
-            throw ContextArenaError.invalidHotTierLimit
-        }
-        self.budget = budget
-        self.hotTierByteLimit = hotTierByteLimit
+    public init(healthEvents: ContextHealthEvents = ContextHealthEvents()) {
         self.healthEvents = healthEvents
     }
 
@@ -320,12 +156,6 @@ public final class ContextArena: @unchecked Sendable {
                 generationID: currentGeneration
             )
         }
-        if let failure = publicationBudgetFailure(candidate) {
-            return .retainedLastGood(
-                failure: failure,
-                generationID: state.current?.snapshot.generationID
-            )
-        }
 
         let previousGeneration = state.current?.snapshot.generationID
         state.current = makePublishedSnapshot(candidate)
@@ -336,7 +166,7 @@ public final class ContextArena: @unchecked Sendable {
         )
     }
 
-    /// Refresh mirrors only for the exact published source fingerprint while normal-pressure prewarming is allowed; do not invent a durable generation.
+    /// Required mirror updates land at every pressure level for the exact published generation and source fingerprint.
     @discardableResult
     public func rehydrate(
         _ candidate: ContextGenerationSnapshot
@@ -372,19 +202,6 @@ public final class ContextArena: @unchecked Sendable {
                 generationID: current.generationID
             )
         }
-        guard state.prewarmingAllowed else {
-            return .retainedLastGood(
-                failure: .prewarmingDisabled(state.pressure),
-                generationID: current.generationID
-            )
-        }
-        if let failure = publicationBudgetFailure(candidate) {
-            return .retainedLastGood(
-                failure: failure,
-                generationID: current.generationID
-            )
-        }
-
         state.current = makePublishedSnapshot(candidate)
         changed = true
         return .rehydrated(generationID: candidate.generationID)
@@ -398,8 +215,7 @@ public final class ContextArena: @unchecked Sendable {
         }
         var active = state.activeSnapshots[published.sequence] ?? ActiveSnapshot(
             leaseCount: 0,
-            generationID: published.snapshot.generationID,
-            logicalByteCount: published.snapshot.logicalByteCount
+            generationID: published.snapshot.generationID
         )
         active.leaseCount += 1
         state.activeSnapshots[published.sequence] = active
@@ -411,45 +227,25 @@ public final class ContextArena: @unchecked Sendable {
         }
     }
 
-    @discardableResult
-    public func applyMemoryPressure(_ pressure: ContextArenaPressure) throws -> ContextArenaTrimReceipt {
+    public func applyMemoryPressure(_ pressure: ContextArenaPressure) throws {
         lock.lock()
         var changed = false
         defer { lock.unlock(); if changed { healthEvents.signal() } }
-        guard let current = state.current else {
+        guard state.current != nil else {
             throw ContextArenaError.noPublishedSnapshot
         }
 
         changed = state.pressure != pressure
         state.pressure = pressure
         state.prewarmingAllowed = pressure == .normal
-        // Descriptors cannot free payload retained by the generation owner; pressure closes optional prewarming only.
-        let snapshot = current.snapshot
-        return ContextArenaTrimReceipt(
-            pressure: pressure,
-            beforeLogicalBytes: snapshot.logicalByteCount,
-            afterLogicalBytes: snapshot.logicalByteCount,
-            evictedWarmEntryKeys: [],
-            pinnedGenerations: pinnedGenerationsLocked()
-        )
+        // Pressure closes optional prewarming without dropping the published generation.
     }
 
     public func metrics() -> ContextArenaMetrics {
         lock.lock()
         defer { lock.unlock() }
-        let currentSequence = state.current?.sequence
-        let retainedBytes = state.activeSnapshots.reduce(into: 0) { result, item in
-            if item.key != currentSequence {
-                result += item.value.logicalByteCount
-            }
-        }
-        let currentBytes = state.current?.snapshot.logicalByteCount ?? 0
         return ContextArenaMetrics(
-            budget: budget,
-            hotTierByteLimit: hotTierByteLimit,
             currentGenerationID: state.current?.snapshot.generationID,
-            currentLogicalBytes: currentBytes,
-            residentLogicalBytes: currentBytes + retainedBytes,
             activeLeaseCount: state.activeSnapshots.values.reduce(into: 0) {
                 $0 += $1.leaseCount
             },
@@ -463,24 +259,6 @@ public final class ContextArena: @unchecked Sendable {
         let published = PublishedSnapshot(sequence: state.nextSequence, snapshot: snapshot)
         state.nextSequence &+= 1
         return published
-    }
-
-    private func publicationBudgetFailure(
-        _ candidate: ContextGenerationSnapshot
-    ) -> ContextArenaPublicationFailure? {
-        if candidate.hotLogicalByteCount > hotTierByteLimit {
-            return .hotTierLimitExceeded(
-                actual: candidate.hotLogicalByteCount,
-                limit: hotTierByteLimit
-            )
-        }
-        if candidate.logicalByteCount > budget.byteLimit {
-            return .logicalBudgetExceeded(
-                actual: candidate.logicalByteCount,
-                limit: budget.byteLimit
-            )
-        }
-        return nil
     }
 
     private func releaseLease(sequence: UInt64) {

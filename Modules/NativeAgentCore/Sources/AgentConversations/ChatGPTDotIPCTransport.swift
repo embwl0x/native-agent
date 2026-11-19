@@ -7,15 +7,16 @@ import NativeAgentCore
 
 public enum ChatGPTDotIPCTransport {
     public typealias Conversation = @Sendable (Turn?, URL, AgentPeerContact, [JSONValue], String?, [String: JSONValue]?) async throws -> JSONValue
-    private static let handler = OSAllocatedUnfairLock<Conversation?>(initialState: nil)
+    private struct Handler: Sendable { let conversation: Conversation }
+    private static let handler = OSAllocatedUnfairLock<Handler?>(initialState: nil)
 
     public static func installConversation(_ conversation: @escaping Conversation) {
-        handler.withLock { $0 = conversation }
+        handler.withLock { $0 = Handler(conversation: conversation) }
     }
 
     public static func conversation(turn: Turn?, _ root: URL, _ peer: AgentPeerContact, _ messages: [JSONValue], _ sent: String?,
         window: [String: JSONValue]? = nil) async throws -> JSONValue {
-        guard let conversation = handler.withLock({ $0 }) else {
+        guard let conversation = handler.withLock({ $0 })?.conversation else {
             return .object(["status": .string("unavailable"), "detail": .string("Dot's conversation is unavailable.")])
         }
         return try await conversation(turn, root, peer, messages, sent, window)
@@ -105,7 +106,8 @@ public enum ChatGPTDotIPCTransport {
             state.stopping = true
             state.generation = UUID()
             let retired = (state.events, state.observation, state.process, state.lifeline, state.output,
-                           Array(state.deliveries.values), state.generation)
+                           Array(state.deliveries.values), state.generation,
+                           state.state != unavailable("Dot messaging has not been checked yet.", status: "not_checked"))
             state.dataRoot = nil
             state.state = unavailable("Dot messaging has not been checked yet.", status: "not_checked")
             state.events = nil; state.observation = nil
@@ -122,7 +124,7 @@ public enum ChatGPTDotIPCTransport {
         listener.withLock { state in
             if state.generation == retired.6 { state.stopping = false }
         }
-        NotificationCenter.default.post(name: didChange, object: nil)
+        if retired.7 { NotificationCenter.default.post(name: didChange, object: nil) }
     }
 
     /// No saved contact means there is no conversation to follow.
@@ -140,7 +142,7 @@ public enum ChatGPTDotIPCTransport {
         process.executableURL = node
         process.arguments = [helper.path, "listen"]
         process.currentDirectoryURL = root
-        process.environment = environment
+        process.environment = ManagedProcess.agentEnvironment(environment)
         process.standardInput = lifeline
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice

@@ -177,7 +177,7 @@ extension CognitiveSubstrate {
         return drive
     }
 
-    /// Drive a failed thought drained returns to its node, without igniting it.
+    /// Return drive to its node without igniting it; zero preserves the field unchanged.
     public func restoreDrive(_ node: String, _ drive: Double) throws -> Bool {
         let now = dependencies.now()
         guard try field.restore(drive, to: node, now: now) else { return false }

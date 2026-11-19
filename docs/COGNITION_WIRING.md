@@ -93,13 +93,12 @@ flowchart TD
 | Edge | Owner and consumer | Regulation |
 | --- | --- | --- |
 | Turn lifecycle → core execution | `EngineRuntime/EngineTurns.swift` exposes `TurnsFacade` and its `MacChatTurnRuntime`; `ChatTurnRuntime/TurnContextPreparation.swift` assembles context on `SwiftNativeTurnEngine`, with `+TurnReach`, `+CurrentTurnFacts` and `+AfterTurn` on the same actor. | Core admission, cancellation and checked provider routing. |
-| Happening → attention | Every source posts through `Experiences/Attention.swift`; committed readback precedes intake. `Cognition/NativeCognitionRuntime+Attention.swift` opens owed ones in `Agents/MindStream.swift` and admits serial weigh/land/record/claim batches. | Complete retained weigh/ignition/return records own membership. Missing provenance refuses a claim with repair owed; failed thoughts retain their drive and payload through the same admission ([Subconscious](SUBCONSCIOUS.md#attention)). |
+| Happening → attention | Every source posts through `Experiences/Attention.swift`; committed readback precedes intake. `Cognition/NativeCognitionRuntime+Attention.swift` opens owed ones in `Agents/MindStream.swift` and admits serial weigh/land/record/claim batches. | Complete retained weigh/ignition/return records own membership. Missing provenance refuses a claim with repair owed; failed thoughts spend their drive and return their payload with drive zero through the same admission. Stop, cancellation and admission returns keep their full drive ([Subconscious](SUBCONSCIOUS.md#attention)). |
 | Persisted turn → cognitive event | `ChatTurnRuntime/ChatOrchestrationClient+LivedObservations.swift` → `Cognition/NativeCognitionRuntime.observe`. | Redacted evidence and explicit turn kind/origin; exact replay does not repeat state changes. |
 | Cognitive event → body | `CognitiveSubstrate/Organism/OrganismSignalBus.swift` → `CognitiveSomaticSignals` → `OrganismKernel.ingest`. | Bounded metadata; debug/verification and body-originated resolution events are excluded. |
 | Shared interpretation → facts, affect, caring, cares, promises and settlements | `MemoryV2/MemoryV2+AdaptivePromoter.swift` calls `ChatTurnRuntime/MindMemoryManager.swift`; callbacks installed by `NativeCognitionRuntime.refreshConfiguration` finish cognition processing and apply cares (`CognitiveSubstrate+Cares.swift`); `AdaptiveMemoryPromises.swift` files their promises and saved settlements through MY QUEUE. | [Turns that are not User's own defer interpretation; the recorded turn remains owed and is judged alone when they are idle](#shared-after-turn-interpretation). Lane switches, origin matching, candidate screening, proposal review, caring encounter admission, care provenance and carried queue steering still apply. |
-| Turn start / a call's result → expected reads (Expansion) | `ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` asks before the opening model call; `ExpansionDispatcher.swift` is the outermost node of `makeGatedToolDispatchClient`. | Mind/authority practice, prediction, gated delivery and closure follow the [manifest contract](skill_manifest_spec.md#expansion-a-part-is-a-prediction). |
 | Memory → selected context | `ContextFlow/NativeMemoryContextProjection.swift` → Context selector → prepared turn. | Record disclosure, lifecycle eligibility, selection and character budgets. |
-| Body + substrate → capsule/posture | `NativeCognitionRuntime.prepareTurnProjection` → substrate frozen capsule preparation. | Body and horizon share one frozen value and instant; the preparing request survives for the successful delivery commit, even with an empty capsule. Unshown cues never count as presented. |
+| Body + substrate → capsule/posture | `NativeCognitionRuntime.prepareTurnProjection` → substrate frozen capsule preparation. | Body and horizon share one frozen value and instant; the preparing request survives for the successful delivery commit, even with an empty capsule. Unshown cues never count as presented. Frozen reads batch peer Trust through one contact and credential pass, retaining missing, unreadable and duplicate-key refusals. |
 | Selected memory IDs → felt continuity | `ContextFlow/NativeContextMemoryProvenance.swift` → turn delivery accounting → assistant event `memoryRecordIds` → substrate. | Identity stays attached to the exact generation lease; missing mappings do not invent provenance. |
 | Body posture → background work | `loopBudget` is always `normal`; `OrganismBehaviorPosture.directives` enters the turn's private runtime context. | Fatigue and pressure color presentation; the shared work-slot admission below is separate from body posture. |
 | Dream/REM commit → replay and reflection | `Cognition/NativeCognitionRuntime+Organism.swift` handles `dreamCompleted`/`remIntegrated` and joins retained integration before checked reflection. An already-running pass settles before a fresh source read. | Actual integration completion ends the wait; no caller deadline or failure retry clock runs. A failed reading names its cause and waits for a source commit or explicit request. Later commits require another pass before reflection. Sleep joins retained integration. |
@@ -119,13 +118,14 @@ facts are asked of every turn with a reply.
 
 **One moment, one judgment, stillest first.** Every moment is judged alone,
 by one prompt (`Resources/prompts/turn-interpretation.md`, assembled by
-`MindMemoryJudgment.prompt`). The judgment's unchanging text comes first, so
-the provider caches it: the frame, the rules, the relay rules and the reply
-shape (with the cares shape when cares are shown), then the form's own rules
-(cares, a care wake's cares, or settlement alone). Everything about this
+`MindMemoryJudgment.interpret` and `prompt`). The fixed frame, rules, relay rules
+and reply shapes live in the cache-marked system block. The cares shape stays
+fixed; no shown cares means omit cares. Provider usage determines actual cache
+reuse. The user message carries the form's rules (cares, a care wake's cares, or
+settlement alone) and everything about this
 moment follows: the cares shown, the speaker, the facts switch, the exchange
-time and zone, relay and caring eligibility, existing, pending and forgotten
-memories, the prior exchange, prior encounters, the incoming words, the reply,
+time and zone, relay and caring eligibility, existing and pending memories,
+the prior exchange, prior encounters, the incoming words, the reply,
 the work line and the settlement input. `MindMemoryJudgment.judgmentRoute`
 inherits the bound call's model and provider when present, otherwise uses
 Memory when configured, else Chat.
@@ -144,6 +144,10 @@ care, only the agent's side; that thought takes this same owed path.
 
 A left-owed row stays `owed` (no new state, no queue); its `mind.why` outcome
 is `deferred: not the person's turn; left owed, judged when they are idle`.
+Settlement starts an additional incoming appraisal only with a recorded incoming
+message origin and no appraisal already started by the reply. A failed or stopped
+turn without that origin starts none; successful reply-owned after-turn work
+retains its care and settlement judgments.
 An owed row is eligible when live work releases the interpretation owner or the
 last turn window closes (a turn's own promotion can finish while its window is
 still open, so the closing edge drains too); no elapsed delay runs. The drain takes the oldest owed moment not in flight and not
@@ -158,7 +162,7 @@ leaves the row owed with its cause and repair lever. Old checkpoints never
 substitute for the current record. Its meaning is written (`meant`) before any
 apply, then folded. Refolding replays that recorded provenance through the same
 care fold and its `PeerTrust` gate: an untrusted peer can move only an existing
-care as `by: them`, never create a care or change a stance or gap. Its
+care as `by: them`, never revive or create a care or change a stance or gap. Its
 `mind.why` outcome is `judged while they was idle`, or `left owed:` with the
 actual failure.
 
@@ -183,8 +187,10 @@ person, on a moment that ends once. Peer, self, page and assistant words grant n
 person authority. The
 [intention contract](INTENTIONS.md#promises-they-makes) owns the act bounds,
 evidence checks and self-wake admission limit.
-Retained judgments replay from canonical terminal evidence, and invalid
-judgments or failed closures stay owed.
+Retained judgments replay from canonical terminal evidence. A settlement
+superseded by a changed or closed Desk row is traced `void` with its reason
+and dropped without repair; the newer state stands and the moment continues.
+Invalid judgments or other failed closures stay owed.
 Canonical `DeskStep.promiseCaptures` identities survive closure and archive;
 refolding reads them rather than recreating a landed source. Filing uses the turn's recorded
 origin principal, session, envelope and exact carried/elevated steer, captured
@@ -198,7 +204,8 @@ captured groups stay inert on partial replay. Any filing failure remains owed. T
 
 Returned replies are validated and usable meanings persisted through `settle`,
 even if Stop or sleep arrived as the call returned; unfinished provider work
-is cancelled and stays owed. A missing, malformed or refused section leaves its row owed with the actual failure.
+is cancelled and stays owed. A missing, malformed or refused section leaves its row owed with the actual failure,
+except that an array-shaped `cares` section drops only its faulty entries with indexed field faults.
 Dependency/basis changes admit another judgment; neither a single-item retry nor elapsed time consumes the obligation.
 A failed call or meaning write likewise leaves its row owed.
 Recovery uses the live observation tail, admitting each pass only while no live
@@ -207,8 +214,8 @@ recorded meaning or judges one moment, continuing through due work while idle
 until no pass progresses. Every ask for a drain is answered: one that comes
 while a drain runs is kept, and that drain's next pass looks again with nothing
 yet tried (a row that failed while the ask came is retried in it), so a moment left owed or a window that closed after its last
-look is never left for a later turn. A failed call, write or fold retries on the
-next drain; a successful interpretation write advances into folding in the same drain.
+look is never left for a later turn. A failed call retries only when its named dependency changes; a failed write or fold retries on the
+next drain. A successful interpretation write advances into folding in the same drain.
 A model wait retains its typed cause and dependency
 in `lived_moments.parts_json`.
 The ChatTurnRuntime memory manager forms the route key with MemoryV2's public,
@@ -225,7 +232,8 @@ failure rather than classifying every error as storage. The remaining waits are:
 
 | Model work waiting | What releases it |
 |---|---|
-| Provider interpretation or matching | A resolved route key changes, or the journal records another successful answer on that route. Missing route/answer evidence releases nothing. |
+| Provider transport or promise matching | A resolved route key changes, or the journal records another successful answer on that route. |
+| Interpretation shape | The judgment route key or the stamped app build changes; another judgment's answer releases nothing. |
 | Desk read before interpretation or promise matching | A live, base or archive file changes identity, size, modification time or access attributes. |
 | Recorded input before interpretation | The row's input or meaning content changes. Journal access and unrelated appends are excluded. |
 | Person profile before interpretation | `memory/profile.json` changes identity, size, modification time or access attributes, or its directory's access identity changes. |
@@ -233,6 +241,8 @@ failure rather than classifying every error as storage. The remaining waits are:
 | Embedding preflight | The embedding owner's backend, model/dimensions, serving epoch, availability, load error or reload state changes. Usage timestamps and journal changes are excluded. |
 | Trust-policy preflight | `trust/policy.json` changes identity, size, modification time or access attributes, or its directory's access identity changes. |
 
+Shape reasons cover JSON, required sections, caring, affect, memories and the cares array.
+Missing route, answer or build identity supplies no change evidence.
 A cause without a readable repair basis states its actual failure and owes repair
 without a wait. A wait is ignored once its remaining work needs no model call;
 this also releases older local-write waits without a data rewrite.
@@ -246,7 +256,9 @@ Night joins any drain already in flight, then continues through that same
 owner before the dream reads their day. Only the caller that starts a drain
 cancels it and joins its settlement; joining another caller's flight leaves
 that shared work running.
-`mind.why` lane `interpretation` reports the outcome.
+`mind.why` lane `interpretation` reports the outcome with dropped care entries' `careFaults`.
+`memory.rejected` records the purpose, typed reason, validator complaint and rejected text through the trace bus, within its payload bounds.
+Existing provider waits retain their recorded cause and release once under that cause's rule; no journal rewrite changes them.
 The retired held-file executor, separate drain result/row-presence flags,
 per-pass judgment budget and lapse-derived deadline are removed.
 
@@ -336,8 +348,10 @@ other context preparation errors still fail the turn.
 prepared turn, under its generation lease and expansion bounds.
 
 Memories reach the packet through one selector: only what the message
-touches, ranked by relevance times reachability, the recently served resting
-(relationships, lesson origins and kept moments compete like any memory). The law
+touches above the model's unrelated-cosine mark, ranked by relevance times
+reachability, the recently served resting. Relationships, lesson origins and kept
+moments compete like any memory. Reachability has an age-independent 0.5 baseline
+with boosts from confirmed uses. The law
 and its numbers are in [MEMORY_SYSTEM_MAP.md](MEMORY_SYSTEM_MAP.md#recall-into-a-turn);
 see [personality-ablation.md](personality-ablation.md) for the mechanism
 checklist.
@@ -407,7 +421,8 @@ delivery.
 | Microcycle | `NativeCognitionRuntime.scheduleDirtyMicrocycle` after admitted state changes. | Coalesced substrate processing and persistence. |
 | Replay/reflection | Dream/REM commit signals; daily integrity applies to replay, without a reflection loop. | Replayed continuity and gated reflective work. |
 
-Dream/REM carry typed reports through background processing; cognition returns `LoopTickOutcome` directly, bounded only for published status. `EngineDreams` constructs
+Dream/REM carry typed reports through background processing; cognition returns `LoopTickOutcome` on its own terminal event or cancellation,
+with no scheduler timeout. `EngineDreams` constructs
 external responses after commit signals, care processing and practice admission.
 Replacement commits share PersistenceCore's durable byte writer; Dream/REM owners retain their encodings and commit order.
 Dream input selects complete exchanges paired by `ConversationHistory`; `oversized_conversation_input` preserves the watermark.
@@ -421,6 +436,9 @@ cutoff unchanged. Only an explicitly disabled inner life omits the care payload.
 
 This is the dream settlement law: every owed step carries its input, each successful effect
 checkpoints its own completion, and a switched-off owner, or one that finds nothing owed, records `skipped` with its reason.
+A terminal, effect-free memory refusal (including the storage owner's semantic tombstone refusal)
+settles that lesson with its input and cause in the journal;
+it is reported as refused, never saved. Storage failures and unknown effects keep the lesson owed.
 Failure is a note for display and repair, never an admission gate for the next attempt.
 Every admitted real pass retries every still-owed step, including force passes and passes with
 no new material; Stop prevents the next effect and retains its input. Unreadable input names
@@ -431,14 +449,17 @@ replaced by force. An unrelated night's failed effect does not prevent a new dre
 journal discovery or publication blocks generation, preserving the recoverable diary write.
 
 Through `settle`, the diary owner publishes the retained writing with an immutable `dream-id`
-marker and cutoff, advances the consumption mark, then records publication done. Recovery uses
+marker, advances the consumption mark to the journaled cutoff if later, then records publication done. Recovery uses
 that same identity, preserving and reporting any conflicting external diary edit. Effect
 checkpoints never rewrite diary bytes. The old mutable `dream-work` marker and historical
 prose-to-mood adoption are removed; no missing historical payload is invented.
 
 Reflection has separate judgment and integration steps. The substrate first persists its
 provider receipt, including shown cares, provenance and epoch, without applying any care or mood
-changes. The night then checkpoints that receipt before invoking integration. Recovery finds the
+changes. Dream reflection reads the dream and only the sources its retained claims cite;
+the dream retains the provenance of all material it read. Dream, REM and reflection calls have
+no conversation cache scope; Anthropic system blocks carry no cache markers for these one-shot calls.
+The night then checkpoints that receipt before invoking integration. Recovery finds the
 same judgment even when care embedding or disposition persistence failed, and retries effects
 without another provider call. Both care judgments prepare before mutation; embedding failure
 leaves care integration pending. Applied care values and their done receipt share a transaction;
@@ -471,6 +492,9 @@ with the exact gaps after processing readable evidence. Section identity markers
 An unavailable-evidence failure releases its own weekly exclusion claim when no proposals were saved;
 once proposals are durable, retries stage those same proposal IDs.
 Quotes require claim-bound sources; failed binding supplies no support. Diary-wide source lines do not establish lineage.
+The full Dreams collection reads the diary without enlarging the shared preview's
+retained entry limit for Personality and diagnostics. Personality observes
+its diary and Trust policy inputs independently of approval requests.
 Dream diary entries encode modification time as `modified_at`. Nightly discovery recognizes
 `YYYY-MM-DD.md`; the live archive collision writer's `YYYY-MM-DD_<UUID>.md` retains the same day.
 Each further dream in that file begins `## Dreamt again — <time>`.
@@ -502,8 +526,15 @@ flow, under its normal disclosure and write gates; dream/GROWTH source quotes
 are not deleted by approval. Legacy imports are not backfilled from today's
 content. Replaced content stays outside the lesson written into GROWTH and pins.
 
+Lesson-origin moments require a checked conversation kind, including archived
+sessions. Missing or unclassified ownership supplies no origin moment. A failed
+session-index read during selection owes `rem.origin:<proposal-id>` repair and
+creates no origin memory. The approved lesson's application keeps its own outcome.
+
 `REMGrowthWriter` matches exact standalone paragraphs for append, pins and eviction, joining evicted lessons only across whitespace;
 authored text ends the slice, and retained-passage history names the contiguous removal.
+The 20,000-character eviction allowance counts only live exact approved paragraphs;
+other authored GROWTH text cannot trigger their eviction.
 REM pins require a complete strict proposal read and, when approved rows exist, a successfully
 read current `GROWTH.md`. Unreadable base/feed or missing/unreadable GROWTH leaves the prior index
 intact and reports failure; it establishes neither live lessons nor removed lessons.
@@ -516,12 +547,16 @@ Default cycles and shared background clients use the resident provider assembly'
 ### Shared work-slot admission
 
 They stays active while the Mac is on; fatigue and heat color presentation.
-`runReflectionIfDue` claims the persisted two-hour `BackgroundWorkLease` window
-of the Desk day (`background_lease.json`) before substrate planning; a claimed
-window skips the pass. Only the holder's newest unused claim is released; spent
+`runReflectionIfDue` attempts to claim the persisted two-hour `BackgroundWorkLease`
+window of the Desk day (`background_lease.json`) before substrate planning.
+A claimed window skips waking reflection. A dream's reflection proceeds to
+substrate planning even when acquisition fails, without consulting the claim
+read or its failures; the daily ceiling and single flight still bound it.
+A dream that acquires a free slot keeps it, pacing waking reflection in that slot.
+Only a call that acquired the holder's newest unused claim releases it; spent
 windows remain claimed.
 `NativeCognitionRuntime+Reflection.swift` and `BackgroundWorkLease.swift` own this gate.
-`runManualReflection` bypasses the shared slot; both paths retain
+`runManualReflection` bypasses the shared slot; all paths retain
 [Subconscious admission](SUBCONSCIOUS.md#between-turns).
 
 ## Authority stays with the action owners

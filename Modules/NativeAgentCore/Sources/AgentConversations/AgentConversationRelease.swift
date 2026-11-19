@@ -10,7 +10,7 @@ import ChatTurnContracts
 import Experiences
 import TurnTrace
 import MacControl
-// Blueprint: | `AgentConversationRelease.swift` | Release requires positive owner evidence. |
+// Blueprint: | `AgentConversationRelease.swift` | Stamped message births and positive owner evidence settle retained sends |
 
 extension AgentConversationStore {
     private static let releasingNow = OSAllocatedUnfairLock(initialState: (draining: false, pending: false))
@@ -119,7 +119,7 @@ extension AgentConversationStore {
     }
 
     /// Replay the durable conversation owner’s identities once at startup, including held sends.
-    func recordExperiences(_ rows: [AgentConversationRecord], dropped: Bool = false) {
+    func recordExperiences(_ rows: [AgentConversationRecord], dropped: Bool = false, birth: (id: String, sources: [String])? = nil) {
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         for row in rows where row.agent.hasPrefix("peer:") && row.phase != "sending" && !dropped {
             let operation = "agent.accept:" + row.operationID
@@ -165,9 +165,9 @@ extension AgentConversationStore {
                 let destination = "agent:" + row.agent
                 for item in row.queued ?? [] {
                     let experience = Experience(id: item.id, kind: .message,
-                        evidence: [.init(source: "agents/conversations", id: row.id)],
+                        evidence: [.init(source: "agents/conversations", id: row.id), .init(source: "door", id: row.sourceSurface)],
                         addressedTo: [destination], owes: ["deliver": .init(to: "conversation:" + row.id), "accept": .init(to: destination),
-                            "answer": .init(to: destination)])
+                            "answer": .init(to: destination)], steeredBy: birth?.id == item.id ? birth?.sources : ["unrecorded"])
                     if try await store.experience(experience.id) == nil { try await store.begin(experience) }
                     let words = item.text + (item.held.map { "\n\n" + $0 } ?? "")
                     try await store.append([.face(.init(words: TurnSecretRedactor.redactText(words), artifacts: []))], to: item.id)
@@ -179,8 +179,9 @@ extension AgentConversationStore {
                 let current = try await store.experience(row.operationID)
                 guard current != nil || exchange != nil || ["sending", "waiting"].contains(row.phase) else { continue }
                 let experience = Experience(id: row.operationID, kind: .message,
-                    evidence: [.init(source: "agents/conversations", id: row.id)],
-                    addressedTo: [destination], owes: ["accept": .init(to: destination), "answer": .init(to: destination)])
+                    evidence: [.init(source: "agents/conversations", id: row.id), .init(source: "door", id: row.sourceSurface)],
+                    addressedTo: [destination], owes: ["accept": .init(to: destination), "answer": .init(to: destination)],
+                    steeredBy: birth?.id == row.operationID ? birth?.sources : ["unrecorded"])
                 if current == nil { try await store.begin(experience) }
                 let mark = HeldSends.evidence(experience.id)
                 if AgentConversationSession.heldSend(row), try await store.experience(experience.id)?.evidence.contains(mark) == false {
@@ -199,7 +200,7 @@ extension AgentConversationStore {
                     try await store.append([.obligation(key: "accept", phase: .accepted,
                         evidence: .init(source: "agents/conversations", id: row.id))], to: experience.id)
                 }
-                try await store.append([.face(.init(words: TurnSecretRedactor.redactText(exchange?.reply ?? exchange?.prompt ?? ""),
+                try await store.append([.face(.init(words: TurnSecretRedactor.redactText(exchange?.prompt ?? ""),
                     artifacts: []))], to: experience.id)
                 if held, let now = try await store.experience(experience.id) {
                     try await HeldSends.settle(now, in: store, dataRoot: root)

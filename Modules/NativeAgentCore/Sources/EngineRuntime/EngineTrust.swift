@@ -517,12 +517,6 @@ extension TrustFacade {
                     status: backupRequired ? "ok" : "warn"
                 ),
             ],
-            approvalClasses: [
-                ApprovalClass(id: "external_send", title: "External sends", requiresApproval: true),
-                ApprovalClass(id: "filesystem_write", title: "Filesystem writes", requiresApproval: true),
-                ApprovalClass(id: "system_change", title: "System changes", requiresApproval: true),
-                ApprovalClass(id: "safe_read", title: "Safe reads", requiresApproval: false),
-            ],
             createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
         )
     }

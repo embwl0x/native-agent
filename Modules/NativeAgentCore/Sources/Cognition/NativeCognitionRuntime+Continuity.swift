@@ -50,7 +50,7 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         now: Date,
         isWarm: @Sendable () async -> Bool,
-        embeddingEpoch: @Sendable () async -> MemoryEmbeddingEpoch?,
+        embeddingEpoch: @Sendable () async throws -> MemoryEmbeddingEpoch?,
         embed: @escaping @Sendable ([String]) async throws -> MemoryEmbeddingBatch,
         embedQuery: @Sendable ([String]) async throws -> MemoryEmbeddingBatch
     ) async -> CognitiveCueRead<[CognitiveDreamTheme]> {
@@ -59,7 +59,13 @@ extension NativeCognitionRuntime {
             return CognitiveCueRead([], unreadable: ["last night's dream diary (\(error.localizedDescription))"])
         }
         guard let diary else { return CognitiveCueRead([]) }
-        guard let epoch = await embeddingEpoch(), await isWarm() else { return CognitiveCueRead([]) }
+        let epoch: MemoryEmbeddingEpoch
+        do {
+            guard let available = try await embeddingEpoch(), await isWarm() else { return CognitiveCueRead([]) }
+            epoch = available
+        } catch {
+            return CognitiveCueRead([], unreadable: ["the dream embedding epoch (\(error.localizedDescription))"])
+        }
         let space = DreamThemeSpace(root: dataRoot.standardizedFileURL.resolvingSymlinksInPath().path, epoch: epoch)
         let cached: DreamThemeFile?
         do { cached = try cachedDreamTheme(dataRoot: dataRoot, diary: diary, space: space) } catch {

@@ -20,7 +20,6 @@ public struct ContextSelectionIndexEntry: Equatable, Sendable {
     public let bodyTokens: Set<String>
     public let searchableTokens: Set<String>
     public let normalizedSearchableText: String
-    public let logicalByteCount: Int
 
     public init(atom: ContextAtomDraft) {
         let metadata = [atom.deterministicSummary].compactMap { $0 }
@@ -35,10 +34,6 @@ public struct ContextSelectionIndexEntry: Equatable, Sendable {
         self.bodyTokens = bodyTokens
         self.searchableTokens = searchableTokens
         self.normalizedSearchableText = normalizedSearchableText
-        self.logicalByteCount = 64
-            + normalizedSearchableText.utf8.count
-            + bodyTokens.reduce(0) { $0 + 24 + $1.utf8.count }
-            + searchableTokens.subtracting(bodyTokens).reduce(0) { $0 + 24 + $1.utf8.count }
     }
 }
 /// Live selection measures with the monotonic clock. Other provenance remains decodable for archived receipts and never enters a production latency window.

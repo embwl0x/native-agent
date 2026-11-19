@@ -32,7 +32,10 @@ Successful memory reads report `count`, an exact `total` or `capped: true`,
 and `has_more` with `next_offset`. `memory.list` keeps its exact total and
 sort-stamped cursor (`next_after_id`); only emitted cursors and the current
 `newest_first|oldest_first`, `active|archived` vocabulary are accepted, and
-`pinned: true|false` keeps only the pinned or only the unpinned. A bare
+`pinned: true|false` keeps only the pinned or only the unpinned.
+Pinned-only listing filters JSON boolean pins in SQL. Its ordered eligibility
+cursor reads scalar fields and metadata; the requested page then reads content
+and evidence without embeddings or recall usage, in the same transaction. A bare
 ID or old name is refused with a fresh-page remedy. Recall search follows `read_more` with the same
 query and k. Its offset walks ranked, disclosed candidates, including rows
 the relevance judgment rejected. A bounded page can therefore be empty and
@@ -54,21 +57,42 @@ owner evidence rather than labeling the refusal an attempted write.
 | --- | --- |
 | `MemoryV2/MemoryV2+Storage.swift` | `MemoryStorage` actor, shared database pool and canonical writes, including bounded admission, duplicate folding and supersession. |
 | `MemoryV2/MemoryStorage+Corrections.swift` | The same storage actor's full, turn-identified correction occurrence record and checked window coverage; supplies miss counts independently of bounded examples. |
-| `MemoryV2/MemoryStorage+Projections.swift` | The same storage actor's ordered graph/Spotlight hooks, USER.md regeneration, context invalidation, projection readback and shutdown settlement. |
+| `MemoryV2/MemoryStorage+Projections.swift` | The same storage actor's committed page regions, bounded Today moments, ordered graph/Spotlight hooks, USER.md regeneration, context invalidation, projection readback and shutdown settlement. |
 | `MemoryV2/MemoryStorage+Migrations.swift`, `MemoryStorage+Codecs.swift`, `MemoryStorage+Integrity.swift` | Schema, checked decoding and semantic integrity of the same store. |
 | `PersistenceCore/MemoryRoot.swift`, `MemoryV2/MemoryDataProvenance.swift` | The current root type, union and lines; each write adds its root with the steer read from roots. |
 | `MemoryV2/MemoryStorage+Proposals.swift`, `MemoryStorage+Tombstones.swift` | Proposal acceptance/rejection and suppression of rejected or forgotten content. |
 | `MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Cached recall candidates and vector/lexical scoring. Raw BM25 mathematics are shared with earlier-session snippets; memory normalizes by the maximum and weights at one standard deviation of the query's dense similarities (`lexicalBoostWeight`). Each caller owns tokenization, its candidate cohort and ranking. |
 | `MemoryV2/MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live journal-only interpretation: User's own turns are judged at once; other recorded turns stay owed and are judged alone when they are idle. Writes meaning before applying and keeps facts by operation identity. Keeps trusted facts, stages the rest. Deferral follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
 | `MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: replay from the complete recorded carriers (`carriedSources`), with answered decisions separate and Trust read live; missing completeness retains the recorded checkpoint plus an unknown boundary. Fair retries and wake/idle/night drains that judge one owed moment at a time, with judgment settlement. |
-| `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation per turn, returning memories, affect, caring, cares, optional reply promises and evidence-backed done/let-go settlements (person words, act or delivered reply) against shown open moments. One prompt for every moment, its unchanging text first so the provider caches it. Its route key identifies the provider wait of an owed moment. Promise matching runs separately only for uncaptured candidates, without settlement authority. |
+| `ChatTurnRuntime/MindMemoryManager.swift` | Shared interpretation and promise matching; see [contract][judgment]. |
 | `MemoryV2/AdaptiveMemoryPromises.swift` | Reads turn-owned successful dispatch evidence; files [promises](INTENTIONS.md#promises-they-makes) and checked done/let-go settlements on the canonical Desk. |
 | `MemoryV2/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
 | `MemoryV2/KnowledgeGraph+StudioRelations.swift`, `KnowledgeGraph+GrowthDistillation.swift`, `KnowledgeGraph+SQLite.swift` | Studio journal and REM/GROWTH eviction graph sources, preserved by memory rebuilds; checked canonical SQLite reads. |
 | `MemoryV2/MemoryV2+EmbeddingRuntime.swift`, `MemoryStorage+EmbeddingEpoch.swift` | Embedding convergence and persistent derived action-vector fill/lookup for AppToolRuntime. |
 | `ContextFlow/NativeMemoryContextProjection.swift` | Compiles eligible memory records into selectable context atoms. |
 
+[judgment]: COGNITION_WIRING.md#shared-after-turn-interpretation
+
 ## Writing memories
+
+Memory pages follow GRDB's committed database-region observations, not SQLite/WAL
+file activity. Memories observes its content, status, lifecycle, metadata and
+identity/evidence columns plus proposals and the correction tables; Settings
+observes proposals and the embedding runtime fields it displays; Knowledge
+observes both graph tables. Access-only use-count/last-used writes touch none
+of these memory regions. No page counters, triggers or schema are added.
+Knowledge's list revision describes its first 256-row packet and total, not
+every entity; unchanged packet inputs reuse the drawn face and post nothing.
+Continuation reads check that first packet's revision, then read the current
+requested slice; offscreen edits alone do not invalidate the first packet.
+The canvas feed compares its own retained typed value before posting.
+Today observes content, creation time, metadata, lifecycle and identity columns
+and reads six current-day quotes, their exact visible count and earliest time
+in one transaction; missing timestamps remain a named partial reading. Without
+a kind/day index its three SQL statements each scan at most the memory table
+(the unreadable-time EXISTS may stop early), about 1,200 row visits at 400 rows,
+plus the matching day's bounded top-six sort. It decodes no embedding blobs or
+lifetime memory records. Missing or unreadable storage stays unavailable.
 
 ### Explicit saves
 
@@ -133,8 +157,8 @@ for embedding, tombstone admission and the stored patch alike.
 A tool result must be checked: a refused save is not a remembered fact. A save carries its source like any kept
 fact: `evidence_json` names the turn that saved it (session, message, turn,
 speaker `self`), and `observed_at` and `valid_from` are that turn's time, or
-`since` when they states when they first knew it (an ISO-8601 date-time, never
-after now). When they first knew a memory is its earliest root's `at`
+`since` when they states when they first knew it (an ISO-8601 date-time, or a
+date meaning the start of that local day; never after now). When they first knew a memory is its earliest root's `at`
 (`MemoryRecord.firstKnown`): the age tag, recall `ts` and the receipt's `since`
 read it. `created_at`, `turn_at`, `turn_id` and `history` stay the write, which
 the dream, surprises and duplicate windows read. The receipt returns `since`,
@@ -218,6 +242,8 @@ demands their joined names, which no single teller satisfies, so no commit or
 roots rewrite succeeds there (a known limit that predates roots). A dream
 lesson's root is `{inferred, by: self, through: the
 material's peers, or "unattributed dream material"}`.
+Its new row has lifecycle `inferred`; duplicate reassertions preserve the existing
+row's lifecycle. `MemoryWriteContext.lifecycle` is optional; absent, stores use `confirmed`.
 
 Each memory read pass asks `PeerTrust` once for the live trust picture of its
 recorded principals (`MemoryDataProvenance.reading`). That value carries resolved
@@ -241,6 +267,17 @@ reader on a temporary copy, then each active or archived memory not already here
 `SwiftNativeMemoryV2.store` with the root its recorded provenance names: told or known by a recorded name keeps that how and name from when
 first known; stated with no name is remembered by the archive's past self ("Agent of Oct 19"); nothing recorded is kept. Recorded
 principals are its through, so a steered one stays its teller's, dated when brought back. Deleted rows, chats, diary, proposals and graph stay.
+Bring-back carries the recorded correction subject and supplies the archive row's lifecycle to the write context.
+On duplicate fold, an incoming correction subject fills an absent or null top-level subject on the kept row; an existing subject stays.
+Correction/supersession links are attached after import, mapping archive IDs to the IDs returned by the memory write (including duplicate folds).
+A target not imported in that run has its incoming link omitted; the row's other metadata remains. A failed link write is reported for that row.
+It does not repair rows already brought back.
+Archived and recall-excluded archive rows land archived in the insertion transaction, without a second status write.
+Only the person's exact name, `<person> via <relay>` or `<relay> relaying <person>` identifies their telling, ignoring letter case.
+A teller merely containing the person's name retains its own principal.
+Bring-back checks both archive and current profiles before attribution. An unreadable archive profile refuses preparation as `archive_unreadable`;
+an unreadable current profile refuses as `memory_unavailable`, each retaining its cause and bringing back nothing. Missing profiles may have unset names.
+Recall reachability starts at the same baseline for every row; first-known roots and age tags keep their own dates.
 `MemoryDataProvenance` owns the root a write adds, the steer, and the shared
 evidence/turn stamps and time helpers. `MemoryMoments` retains only interpretation of actual retained moment
 rows. A saved replacement whose correction read fails retains its save ID and
@@ -267,7 +304,9 @@ The miss readout counts the full `MemoryStorage.correctionOccurrences` record
 for the requested ISO weeks. Canonical insertion, proposal acceptance and duplicate
 folding retain correction occurrences in `memory.sqlite` in the same transaction
 as the memory write, before the turn journal drops its payload. Session/message
-identity (or a turn ID, or a turnless save's row ID) makes replay idempotent. A
+identity (or a turn ID, or a turnless save's row ID) makes replay idempotent.
+Only a new occurrence on a kept standing correction updates its merge evidence
+(`recall_count` and provenance). Replaying matching evidence leaves the row as committed. A
 pending correction retains every merged occurrence with its proposal; acceptance
 moves that evidence to the memory's record, and rejection never counts it. A
 late owed-vector fold moves the full record onto the surviving memory. The readout
@@ -347,12 +386,18 @@ kept target retains the original fingerprint, so acceptance leaves it pending
 for review. An update to an unshown target, or an older meant update without a
 reviewed contract, stays meant for
 repair rather than being re-judged or receiving a new fingerprint.
-"Is this the same claim" is the model's judgment: interpretation unions up to
-8 recalled memories with up to 24 active corrections by ID, and sees the 8 nearest
-forgotten or rejected claims (`forgottenClaims(near:)`), which it must not restate. The
-store's own gates act only on a near-verbatim restatement, cosine 0.96 or
-more (`memoryNearVerbatimSimilarity`, one constant for the duplicate fold,
-which also needs the same numbers and negations, and the tombstone refusal).
+"Is this the same claim" is the model's judgment. One memory read supplies the
+standing comparisons after disclosure for the turn's surface: every eligible
+pin in ascending creation and ID order, then the newest 24 eligible
+corrections in descending creation order. A pinned correction in the newest
+24 keeps its pin position and appears once. Up to 8 surface-disclosed ranked
+recall results follow, excluding IDs already in the standing comparisons.
+The same surface policy selects pending update targets before the newest 24 are taken.
+Forgotten or rejected claims stay on this Mac for matching and are withheld
+from models. The store's own gates act only on a near-verbatim restatement,
+cosine 0.96 or more (`memoryNearVerbatimSimilarity`, one constant for the
+duplicate fold, which also needs the same numbers and negations, and the
+tombstone refusal).
 A survivor is kept at once when the owner stands behind its words: the owner's
 own turn, a peer they trusts (`PeerTrust.ownerTrusts`, read through
 `PeerDataTaint`; an agent or helper session id names the peer before a bridge
@@ -423,8 +468,9 @@ limit are removed. The horizon still chooses what is close enough to feel.
 The cognition journal owns [settlement and recovery](SUBCONSCIOUS.md#lived-moments).
 MemoryV2 facts finish the recorded decisions by `(row life, moment, ordinal)`: a prior pending
 proposal continues to acceptance, a resolved one skips acceptance. Both finish
-the recorded pending-target retirement, even after the successor was accepted;
-an unfinished retirement keeps the moment meant. An unreadable
+the recorded pending-target retirement, even after the successor was accepted.
+The retirement transaction checks the stored successor ID. A competing successor
+or unfinished retirement keeps the moment meant. An unreadable
 fact store leaves an unjudged row owed; a staging failure keeps the row meant,
 lived again later. With the fact lane disabled no facts are asked, and the row
 is lived once its fold lands.
@@ -455,10 +501,11 @@ bulk consolidation producer.
 A replacement and a denial have different consequences. An accepted update
 retires its target through the atomic superseding-acceptance path. The target's
 reviewed fingerprint must still match; otherwise the proposal stays pending
-for review. The after-turn interpretation reads every eligible current pin
-beside recalled comparisons, so a newer ruling can name the old belief as
-its update target even when recall would omit it. Semantic supersession is
-the interpretation's decision; no lexical subject guess retires a memory.
+for review. The after-turn interpretation includes every current pin eligible
+for the turn's surface in its standing comparisons, so a newer ruling can
+name the old belief as its update target even when recall would omit it.
+Semantic supersession is the interpretation's decision. Lexical subject
+matching carries no retirement authority.
 The transaction transfers a target's pin and order to its eligible replacement
 and clears both pin fields from the retired row. A pin compares the newest native
 originating turn_at across the row and its duplicate occurrences, including the
@@ -468,9 +515,10 @@ can take the pin, and an older ruling cannot displace the newer pin.
 The retired row stays in the
 store with lifecycle corrected and its valid_to closed at the replacement's
 valid_from; an explicit corrects uses the same transaction.
-MemoryRecordDisclosurePolicy excludes records whose valid_to has passed from
-automatic context and recall. Explicit restoration reopens that interval in
-the canonical transaction while retaining correction lineage.
+`MemoryRecordDisclosurePolicy` excludes records whose `valid_to` has passed
+from automatic context, recall and after-turn standing comparisons. Explicit
+restoration reopens that interval in the canonical transaction while retaining
+correction lineage.
 Active curation, Spotlight and graph projection use the same temporal predicate.
 Graph fingerprints carry validity dates, and checked graph reads reconcile that
 projection against the current clock while graph production is enabled.
@@ -482,8 +530,8 @@ Live proposal supersession never removes them. Historical repair removes only
 the exact content/hash carrying that proposal's recorded supersession reason;
 superseded status alone does not prove a tombstone was erroneous. Suppression uses
 the exact words by hash, a near-verbatim restatement by cosine 0.96
-(`memoryNearVerbatimSimilarity`), and a paraphrase by the memory manager, which
-is shown the nearest forgotten claims.
+(`memoryNearVerbatimSimilarity`), all on CPU; a paraphrase farther than that can be
+admitted, since forgotten text is never shown to the memory manager.
 Typed tombstone columns use throwing reads, so malformed stored values report
 the existing read failure instead of trapping the process. Opening integrity
 also validates required tombstone hash, content and rejection-time scalars;
@@ -522,6 +570,9 @@ save with no kind. A nonempty scope on any other kind is refused. The shared
 eight nonempty, trimmed strings of at most 120 characters each. Invalid shape,
 entries or excess length refuse the save. Only omission, null or [] supplies
 no scope; no scope is inferred from dispatched tools. Omitted scope stays global.
+Memory tags and record-kind labels do not impose engineering scope: memories
+tagged `delegation`, `codex` or other build terms compete under the same relevance,
+rest and budget rules as other memories, without a vocabulary gate.
 Explicit recall is not restricted by these topics. A save returns existing
 agreements with the same declared scope for judgment; scope alone never
 retires them or grants authority.
@@ -545,6 +596,10 @@ numeric payloads and the unused top-level correction slot do not classify a row.
 WordPiece model loading requires `[UNK]`, `[CLS]`, `[SEP]` and `[PAD]`, with
 vocabulary IDs representable by the model's Int32 input. Damaged vocabularies
 surface the model-load error; special-token IDs are never manufactured.
+Cleaning removes BERT control/format categories, null and replacement characters
+before lowercasing and accent stripping. Word length and greedy subword boundaries
+use Unicode scalars. The wordpiece-v4 preprocessing identity moves these vectors
+through the existing checked epoch convergence; earlier vectors never share its space.
 The resident tokenizer stops after proving window overflow, finishing each word
 before clipping; complete-text embedding reuses its admitted IDs and masks.
 Download byte ranges bound their length by the remaining archive bytes before
@@ -565,6 +620,8 @@ rollback column remains migration-compatible but has no live reader or writer.
 table and ordering index; the repair only reads and advances that cursor.
 Existing progress is adopted without resetting it. Retained historical tables
 and transformations are not retired on the strength of an empty query alone.
+`consolidation_applied` has no runtime writer or reader; its schema registration
+and stored rows remain untouched.
 Backend selection prepares the requested provider and stages its complete corpus
 before the existing epoch owner activates it. Only successful activation publishes
 the selected backend configuration; there is no configuration undo write. A
@@ -588,7 +645,7 @@ when any row fails; no row silently drops. Unreadable stamps leave repair owed.
 
 The Memories search field uses canonical recall and resolves its hit IDs,
 without supplementing results from the bounded inventory. Request identity
-(`searchQuery`) is separate from the successful rows' query (`searchResultQuery`):
+(`query`) is separate from the successful rows' query (`resultQuery`):
 a failed request retains the last successful rows under their original query
 and reports its cause. The page shows that failure before any retained rows;
 neither failed nor empty recall substitutes inventory text matches. Queries
@@ -596,13 +653,21 @@ under three characters leave the inventory unfiltered.
 Page and panel refreshes re-rank the facade's current query without calling the
 person's query setter or crediting recall hits. Query selection and `LatestRead`
 admission share the main actor; a clear or new query invalidates older search
-publication. A packet copies the query, results and read state together.
+publication. Mac and phone each hold their own query, results and `LatestRead`
+gate in the memory facade. A packet copies its surface's query, results and read
+state together; one surface's search never changes the other's query.
 
 Proposal state changes belong to acceptance, rejection or explicit supersession;
 there is no unrestricted status setter or automatic single-valued-kind policy.
 A memory with correction or supersession lineage is retained by the canonical capacity
 predicate, including older rows carrying only `corrected_by`; capacity admission
 fails if too few disposable rows remain.
+The 2,000-row cap counts active memories only; victims retain their vectors and
+metadata as archived rows with `archived_reason: capacity`. Active corrections
+share pinned/identity retention rank. Non-active rows are never capacity victims.
+Restoration enforces the same cap in its write transaction, preserving the restored
+row; insufficient disposable capacity refuses the whole restore. Pending admissions
+and their replacement targets are never capacity victims.
 Each memory row's `valid_from`, `valid_to`, `observed_at` and `evidence_json` columns are
 its interval of truth and its source; writes lift them from the same metadata
 keys.
@@ -634,8 +699,9 @@ locator to derived-state consumers. `LatestRead` orders candidate-cache publicat
 and committed invalidation; each recall receives its own result. Cache reuse
 checks the embedding epoch and canonical `recall_generation`, advanced by
 content/epoch triggers, so other connections' writes invalidate stale candidates.
-One recall ranks every query voice
-against that snapshot; usage-only changes need no candidate refresh.
+On a cache miss, epoch validation, generation and candidates use the same database
+snapshot. One recall ranks every query voice against the same candidates.
+Usage-only changes need no candidate refresh.
 
 Default USER facts, chosen pins and canonical Context share
 `MemorySenseProvenance.presentation`: a later-invalidated sense version keeps
@@ -651,21 +717,29 @@ eligibility: each captures one clock and excludes facts whose `valid_to` has
 passed at that clock. Generation is gated on onboarding. USER.md is a projection,
 not an independent place to repair memory facts. It and the per-turn prompt
 core (`userPromptCore`) are the always-present picture of the person: they
-carry facts about the owner only, every person kind the memory writer's own
-vocabulary names (identity, location, employment, schedule, preference,
+carry pinned facts about the owner only, from every person kind the memory
+writer's own vocabulary names (identity, location, employment, schedule, preference,
 relationship) plus the legacy user_fact, user_preference and attribute
-(`MemoryKindStamp.personKinds`; schedule since 10-27, so the owner's sleep
-schedule reaches every turn). Ops and generic kinds stay out. The picture is
+(`MemoryKindStamp.personKinds`). Ops and generic kinds stay out. The picture is
 bounded at what one turn carries of memory at the floor window
 (`UserMDAutogenMarkers.promptByteCap`, 6,000 B = recall's floor of 5 rows of
 1,200 characters; was 3,500 B); the generated document holds the same bound,
 and a fact past it stays in recall and the memory lane. The document orders
-facts newest first. The turn's one disclosure-filtered selection puts pinned
-facts first in pinned order, then every remaining eligible person fact newest
-first, with each row appearing once. It never reads `user_core_chosen`; the
-registered migration and its triggers remain part of the store schema.
+its pinned facts newest first. The turn's one disclosure-filtered selection
+carries only pinned facts in pinned order, with each row appearing once.
+Both the generated document and prompt skip a pin that exceeds the remaining
+budget and continue considering later pins in their respective order.
+The prompt-core read selects content and evidence without embeddings or recall
+usage; its establishment check still considers all eligible person facts,
+including unpinned facts, in that same disclosure-filtered read.
+Unpinned person facts compete in ordinary context selection by relevance to
+the message, using its existing query readings and stored vectors. The
+persona reader's picture uses the same pinned core. No path reads or writes
+`user_core_chosen`; schema setup drops its two triggers without changing saved
+metadata rows. `memory_metadata` still owns recall's generation.
 `UserMDAutogenMarkers` applies the same cap to rendering and recall precoverage:
-only facts actually carried in `# USER` are excluded from recall seats.
+only pins actually carried in `# USER` are excluded from recall seats;
+preamble mentions do not precover canonical memory.
 The stable prompt holds only USER's preamble; the facts ride the changing
 packet and cannot change the cached prefix's bytes. Empty selections carry
 only preamble prose, and failed reads retain their named gap rather than
@@ -697,8 +771,25 @@ writes that finish after projection admission closes are reconciled at next laun
 bge-large-en-v1.5 in `Resources/embedding` (1024 dimensions, CLS pooling and L2
 normalisation baked into the model). It is the one production embedding model;
 the MiniLM fallback and its SwiftPM resources are retired. A data-root copy of
+bge takes precedence over the app's copy. When Core ML is selected, missing or
+broken bge assets fail closed by model name and file path in Doctor, the memory
+page and embedding status.
+Doctor reads the canonical memory owner's selection before asset checks or repair.
+Its prediction probe uses that owner's provider, validates against its own dimensions
+and checks the returned epoch against the owner's runtime snapshot. Meaning-based
+memory Off reports `off` after a usable selected mock-provider probe, without requiring
+Core ML assets or offering cache repair. With meaning-based memory On, Doctor also
+checks the serving epoch and dimensions against the installed and active model;
+one installation supplies its asset check and compile-cache repair. The cache
+owner loads exactly the digest/OS-keyed compiled artifact;
 bge takes precedence over the app's copy. Missing or broken bge assets fail
 closed by model name and file path in Doctor, the memory page and embedding status.
+Epoch reads throw their configuration or artifact failure and retain the cold
+probe's cause in the embedding owner's `lastLoadError`; an unavailable model
+has no invented epoch. Context startup and compilation carry that failure to
+their existing error boundary instead of admitting a substitute fingerprint;
+launch warm-up failures record a failed `embedding_warmup` organ beat, or stopped
+for cancellation, through the existing pulse owner.
 Doctor resolves one installation for its asset check, prediction probe and compile-cache
 repair. The cache owner loads exactly the digest/OS-keyed compiled artifact;
 load failure retains that path and cause without another load or an automatic
@@ -787,7 +878,8 @@ the activation transaction, preserving the prior corpus. That owner commits the
 refused epoch, reason and observation time in `memory_embedding_state` before
 returning the refusal; only successful activation clears it. An empty corpus
 requires a validated provider probe passed to that same gate. Doctor's
-`coreml_embedder` reads this recorded outcome from the canonical storage owner:
+`coreml_embedder`, when meaning-based memory is On, reads this recorded outcome
+from the canonical storage owner:
 a matching refusal is a failure even when the fixed probe would embed. Its
 compile-cache repair releases the resident model and requests convergence through
 the canonical runtime, then reads the outcome again; a persistent refusal retains
@@ -820,6 +912,8 @@ change, even if it arrives during transfer; inspection never stamps
 still requests checked convergence. Optional staging cleanup cannot revoke an
 install result: its separate
 failure remains in download status, Doctor and the runtime log.
+A running transfer is an unmeasured Doctor reading, not an installed-model
+health verdict; the installed target and matching search epoch establish that verdict.
 
 `SwiftNativeMemoryV2` also owns derived `action_embeddings`, keyed by epoch and
 exact-text SHA-256, outside the canonical corpus and recall generation.
@@ -836,6 +930,10 @@ actions; exact-id discovery still reads the action directly. A bad query, shared
 prediction failure, or cold/incomplete index refuses discovery with its remedy.
 
 ## Knowledge graph
+
+Entity projection does not generate `embedding_text` metadata: no embedder
+consumes it. Existing opaque metadata remains in `metadata_json`; no column or
+saved-row migration is required.
 
 MemoryStorage owns `memory.sqlite`'s `kg_*` schema. Graph wakes carry only memory
 IDs; `SwiftNativeKnowledgeGraphIndexer` reads canonical facts in its write transaction.
@@ -912,8 +1010,10 @@ observation gap; it does not establish that the graph is unchanged.
 The phone snapshot requests the `ios` audience. Its source-backed nodes and
 edges must pass `MemoryRecordDisclosurePolicy` against canonical memory rows
 read in the same SQLite transaction as the graph. Edges also require both
-endpoints to survive. Graph tools use the same source-reference disclosure
-mechanism for their caller's surface. A missing source grants no disclosure;
+endpoints to survive. The audience read uses the content-and-evidence projection
+without selecting or decoding embeddings or recall usage. Graph tools use the
+same source-reference disclosure mechanism for their caller's surface.
+A missing source grants no disclosure;
 an unreadable required memory read fails the snapshot. Independently owned
 Studio, GROWTH and manual rows without memory overlays retain their own graph
 projection. The phone envelope and keys are unchanged; only permitted rows
@@ -985,7 +1085,8 @@ the app have no contact-write signal; they are detected when recall next verifie
 the affected memory (or on an explicit fresh page read).
 
 `MemoryRecordDisclosurePolicy` filters records by status, lifecycle and allowed
-surface; both explicit recall and automatic projection consume that policy.
+surface. Explicit recall, automatic projection and after-turn memory comparisons
+use that policy.
 The `memories.json` phone snapshot applies this same classification for `ios`
 and the snapshot's current time before flattening canonical records. Chat-only,
 expired and otherwise ineligible rows are withheld. Secret-bearing fragments
@@ -1005,7 +1106,8 @@ clusters derive only from the redacted facts. Native memory and proposal lever
 text uses the same policy before any clipping, including when the part cannot
 draw. Both Mac and phone receive these safe words; stored memory is unchanged.
 Both projections reread on memory/profile/Trust changes and after a Memories
-tap; phone taps resolve only against the disclosed snapshot. Missing phone presentation never
+tap; phone taps resolve only against the disclosed snapshot. The phone projection
+has no Mac window feed. Missing phone presentation never
 substitutes the Mac face. Wire field names and types remain unchanged.
 `ContextBudgetPolicy` sizes the turn's memory/context allowance, while
 `ContextSelectionConfiguration.swift` owns selector limits.
@@ -1033,8 +1135,11 @@ numbers in `ContextSelectionConfiguration.swift`):
   `VectorMath.standout` uses centered aggregate moments to remove each
   candidate in constant time, sharing one linear pass with find and cares. The
   deviations assume roughly independent Gaussian background scores; they rank,
-  they are not a calibrated probability. Or half the message's words
-  are in it, or the whole message is.
+  they are not a calibrated probability. Lexical touch instead requires half
+  the message's words, or the whole message. Both admission paths also require
+  the best query-reading cosine to exceed the model's unrelated mark
+  (`memorySemanticFloor`, 0.55 for `bge-large-en-v1.5`; zero for an unlisted model).
+  No comparable reading means no dynamic memory admission.
   With only one or two comparable vectors, relevance uses the ordinary
   model-scaled semantic score (weight 4) against `minimumRelevance` (0.05),
   rather than applying the relative floor to that different scale. Recent
@@ -1044,11 +1149,15 @@ numbers in `ContextSelectionConfiguration.swift`):
   or expiry of the bounded wait withholds semantic recall and names the cause in
   the turn's context instead of failing the turn or using lexical-only recall.
   The wait's deadline leaves the runtime-owned embedding batch running to settlement.
-- **Reachability.** The touched rank by relevance times reachability, the
-  power-law sum over past uses (each turn that served it, and its creation):
+- **Reachability.** The touched rank by relevance times reachability. Every
+  memory starts at 0.5, independent of creation, first-known or return date.
+  Confirmed uses add a power-law boost above that baseline:
   serve feedback is written at `ContextPreparedTurn.recordDelivery`'s once-only
   confirmed-delivery boundary. Preparation retains its selection receipt without
   crediting a use or resting a memory that never reached the provider.
+  Reply completion alone writes no context feedback: it provides no evidence of
+  usefulness. Delivered selections, expansions and applied corrections retain
+  their own feedback boundaries.
   Reachability remains global; rest requires a delivery event in the current
   session whose message fingerprint is still in the retained transcript exchanges.
   Distance comes from the transcript owner's ordered retained exchanges: a user
@@ -1057,13 +1166,11 @@ numbers in `ContextSelectionConfiguration.swift`):
   count are not exchange clocks. Repeated rows from one run share its exchange;
   nonconversation rows do not invent one.
   Legacy feedback without that evidence supplies no rest.
-  Σ age_days^-0.5, read as odds of need, odds / (1 + odds)
+  odds = 1 + Σ use_age_days^-0.5; reachability = odds / (1 + odds)
   (`ContextFeedbackReducer`, from the context feedback log, preserving append
   sequence within each five-minute bucket). In a small population the actual
-  model-scaled score ranks semantic matches; a lexical-only match without a
-  positive score ranks at `minimumRelevance`. What they keeps
-  using stays reachable; disuse fades recall without deleting the row. A fitting
-  cue still brings a retained row; [capacity eviction](data-bounds.md) is separate.
+  model-scaled score ranks semantic matches. Use boosts fade toward 0.5;
+  age alone never discounts an unused memory. [Capacity eviction](data-bounds.md) is separate.
 - **Rest.** A memory served on one of the last `memoryRestTurns` (3) exchanges is
   already in the conversation; it comes again only at `memoryRestFloor`, one
   deviation over the relevance bar, when the message singles it out.
@@ -1085,9 +1192,14 @@ the shared nonmandatory memory/correction row allowance (`maximumAtomsPerKindOve
 budget, and are taken before the ordinary lane. Scoped corrections keep their
 rule: a correction whose `context_topics` the message triggers is mandatory,
 outside this lane. The person picture (`userPromptCore`, USER.md) rides every
-turn within its own byte cap, with pins first and the remaining facts newest
-first. The coordinator suppresses only canonical memory facts actually
-carried in that turn's USER block. The SOUL/VOICE kernel carries no USER.
+turn within its own byte cap, carrying only pinned person facts. Unpinned
+person facts compete here by relevance to the message. The coordinator
+suppresses only canonical memory facts actually carried in that turn's USER
+block, excluding preamble mentions. The SOUL/VOICE kernel carries no USER.
+The weighted `total`, diversity and redundancy scores rank the ordinary lane;
+they do not set the final memory/correction order. Lexical query tokens carry
+the message and its task, project, execution, follow-up and entity context;
+the session ID supplies identity matching and rest, not query words.
 `mind.why` lane `memory` gives each winner's `relevance` and
 `reachability`, and lists what the message touched but `rested`.
 See [personality-ablation.md](personality-ablation.md) for the mechanism
@@ -1134,8 +1246,8 @@ leftover `memory/consolidation/` directories or `hygiene_last_run.json`.
 Saved `consolidation_enabled`, `auto_promote_consolidated` and
 `hygiene_enabled` keys are ignored on read.
 
-Fading leaves storage intact; the [capacity bound](data-bounds.md) can evict
-eligible rows. Supersession closes a fact's interval and protects the old record
+Fading leaves storage intact; the [active capacity bound](data-bounds.md) archives
+eligible active rows. Supersession closes a fact's interval and protects the old record
 from eviction; deliberate forgetting remains explicit.
 Derived knowledge is rebuilt from the record, never by bulk merging,
 archiving or swapping canonical rows. Integrity checks,
@@ -1155,7 +1267,24 @@ healthy sibling sources proceed. A successful checked read clears previous sourc
 degradation even when the content hash is unchanged. Existing invalid source timestamps are unavailable
 evidence, never replaced by a different timestamp or by distant past.
 
-Context arena byte counts are logical admission estimates for the resident
-generation, not measured physical allocations. Pressure disables optional
-prewarming; it leaves retained payloads and logical byte counts intact and reports
-no warm payload evictions. Removing descriptors cannot free their owner's atoms.
+Resident-work, graph and Studio verification reread their canonical owners,
+then assemble only the selected sources for hash comparison. Inventory ordering,
+eligibility and global caps apply before narrowing to selected sources, so a
+source outside the current inventory cannot pass verification. Studio reads
+only the selected journal, canon or shelf stores; journal eligibility and its
+shared pointer allowance still cover the complete journal inventory. Full
+projection publication uses the same preparation without a source restriction.
+
+Persona documents are mirrored for the stable segment; Context no longer compiles,
+matches or embeds them as atoms. Existing stored persona atoms stay covered by that
+segment; this change does not purge them. Canonical memory projection and recall
+remain unchanged, including suppression of pins already carried in USER.md.
+
+Context arena byte accounting, hot/warm descriptors, logical budget admission and
+trim receipts are removed. The immutable snapshot, lexical index and turn leases
+remain. Pressure disables optional prewarming and leaves retained payloads intact.
+Required mirror rehydration remains available at every pressure level, subject
+to the published generation and source-fingerprint checks.
+A new store can publish its initial generation without projected sources so the
+persona mirror remains available before any memory exists; later empty publications
+are refused.

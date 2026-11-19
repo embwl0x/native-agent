@@ -84,33 +84,13 @@ public final class OpenAITransport: LLMTransport {
 
     // MARK: - Structured messages (native vision)
 
-    /// Images and tool blocks require structured Chat Completions messages; text-only calls preserve their role-prefixed wire bytes.
+    /// Every message retains its role on the selected OpenAI wire.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
         tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
-        let hasImage = messages.contains { m in
-            m.content.contains { if case .image = $0 { return true }; return false }
-        }
-        // Tool-use and tool-result blocks require structured assistant.tool_calls and role:"tool" messages.
-        let hasToolBlocks = messages.contains { m in
-            m.content.contains {
-                switch $0 {
-                case .toolUse, .toolResult: return true
-                default: return false
-                }
-            }
-        }
-        guard hasImage || hasToolBlocks || OpenAIExecutionControls.usesResponses(model: model, dataRoot: credentialRoot) else {
-            let flattened = try llmCompatibilityPrompt(messages: messages) { role in
-                role == .user ? "USER:" : "ASSISTANT:"
-            }
-            let combined = flattened.text
-            return try await complete(prompt: combined, system: system, model: model, tools: tools, call: call)
-        }
-
         return try await LLMMessageStreamEvent.reply(collecting:
             { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
@@ -178,7 +158,7 @@ public final class OpenAITransport: LLMTransport {
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: providerLabel)
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
-                        request: req, providerID: providerId, model: model, idPrefix: "openai",
+                        request: req, providerID: providerId, model: model,
                         started: requestStartNs, telemetry: telemetry, call: call
                     )
                     continuation.finish()
@@ -245,7 +225,6 @@ public final class OpenAITransport: LLMTransport {
                     if !(200..<300).contains(status) {
                         let data = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096)
                         try throwIfChatCompletionsError(status: status, data: data, response: response)
-                        throw LLMError.invalidResponse(status: status)
                     }
                     try await ChatGPTTransport.consumeResponsesStream(
                         bytes: bytes, request: req, model: model,

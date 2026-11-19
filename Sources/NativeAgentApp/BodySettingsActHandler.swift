@@ -30,7 +30,6 @@ final class BodySettingsActHandler: FaceActHandler {
     private var cards: BodyCardActions?
     private lazy var services = BodyFaceServices(engine: engine)
     private var palette: BodyFacePalette?
-    private var observedKeys: [UUID: FaceKey] = [:]
     private var composerObservations: [UUID: Task<Void, Never>] = [:]
 
     private func cardActions() throws -> BodyCardActions {
@@ -63,7 +62,6 @@ final class BodySettingsActHandler: FaceActHandler {
         BodyFacePresentation.disconnect(connection)
         await SettingsDock.shared.close()
         cards = nil
-        observedKeys.removeAll()
         let composers = composerObservations
         composerObservations.removeAll()
         for task in composers.values { task.cancel() }
@@ -136,13 +134,11 @@ final class BodySettingsActHandler: FaceActHandler {
             case .settings:
                 _ = try await BodySettingsPreferences.refreshPreferences(engine: engine)
                 try await engine.settingsFeed.deliverFaces()
-            case .page(let page):
-                // The window can ask before a restarted body has finished registering; only an unknown page is unregistered.
-                await engine.pages.registration()
-                guard let reading = await engine.pages.refresh(page: page) else {
-                    throw PartCallError(code: "page_unavailable", message: "That page is not registered by its body owner.")
-                }
-                if let error = reading.error { throw error }
+            case .page(let page), .pageTitle(let page):
+                await engine.pages.observe(page: page, reader: id,
+                    renderer: try BodyFacePresentation.current(model: requireModel()).connection, titleOnly: key == .pageTitle(page))
+                await engine.pages.refresh(page: page)
+                return .observation(id: id)
             case .sessions, .sessionPalette, .sessionSearch:
                 _ = try await engine.transcripts.readSessionIndex()
             case .sessionNavigation:
@@ -155,13 +151,12 @@ final class BodySettingsActHandler: FaceActHandler {
             default:
                 throw PartCallError(code: "observation_owner_unmounted", message: "This presentation has not been mounted in the body.")
             }
-            observedKeys[id] = key
             return .observation(id: id)
         case .unobserve(let id):
+            await engine.pages.release(reader: id)
             let composer = composerObservations.removeValue(forKey: id)
             composer?.cancel()
             await composer?.value
-            observedKeys.removeValue(forKey: id)
             return .acknowledged
         case .refresh(let scope):
             try await refresh(scope)
@@ -395,14 +390,7 @@ final class BodySettingsActHandler: FaceActHandler {
             case "button": scope = .button
             default: throw PartCallError(code: "unknown_doctor_scope", message: "The requested repair scope is not recognized.")
             }
-            var report = try await AppDoctorPort(dataRoot: engine.dataRoot).runtime.runDoctor(repair: request.repair, repairScope: scope)
-            let checks = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals,
-                repairDesk: request.repair && request.scope == "button", stuckReason: DeskPageContent.stuckReason,
-                safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail)
-            report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(report, liveChecks: checks.checks)
-            report.repaired = report.repaired || checks.repaired
-            report.checks = await DoctorReadout.repairProjection(report.checks, dataRoot: engine.dataRoot)
-            report.status = DoctorReadout.doctorRollup(report.checks.map(\.status))
+            let report = try await AppDoctorPort(dataRoot: engine.dataRoot).runtime.runDoctor(repair: request.repair, repairScope: scope)
             engine.doctor.finishRun(report)
             return .result(try Self.value(report))
         } catch {

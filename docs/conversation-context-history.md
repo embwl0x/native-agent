@@ -14,8 +14,11 @@ Older words are reached through the existing leads and
 
 Every provider uses one layout: stable system material, held conversation
 history, then the current user turn with its public context block as a
-leading text block. A held private choice precedes that public block only in
-live provider input; its owner remains conversation scratch.
+leading text block. The last clean thought, body line and cognitive capsule lead
+that block, outside selection and budgets. A held private choice follows those
+inner words and precedes the world/work block only in live provider input; its
+owner remains conversation scratch. The thought's closing 600 characters come
+from the shared record reading on every turn; peer-steered turns receive none.
 `ConversationPrefixSeeding` lifts the full built dynamic block, including the
 text-tool catalog appendix when present. It does not use a
 system-message delivery ladder or `clear_at`.
@@ -145,7 +148,7 @@ the physical limit for result pointers and final admission. The 200,000-token
 budget bounds held conversation, not what current input may send.
 `SessionContextMeasurement` sizes
 the composed request, using its matching provider receipt's characters/input-token
-ratio or an explicitly labelled 3.5-character estimate when that calibration is
+ratio or an explicitly labelled 2.5-character estimate when that calibration is
 absent. The adapter owns the response allowance. Missing window or unreadable
 sizing evidence is unavailable and stops preparation. The composer ring reports
 the last observed provider input against the model's default window; missing
@@ -155,9 +158,9 @@ usage remains unavailable.
 already admitted for replay and its existing row character counts. At each
 multiple of half the input budget, the first whole-turn start whose cumulative
 size from the transcript's start reaches that multiple becomes a checkpoint.
-The grid uses half the shared input budget at the fixed transcript character
-ratio; changing provider calibration does not
-move that grid. A run spanning several user rows cannot be split. The end of
+The grid uses half the shared input budget at the request measurement's character
+ratio, including its matching provider calibration or the 2.5-character estimate
+when uncalibrated. A run spanning several user rows cannot be split. The end of
 prior history is also a whole-turn start, so a large prior turn can drop whole.
 
 When measured input exceeds the input budget, `fitSessionRequest` skips directly
@@ -201,10 +204,11 @@ Within one turn, `TurnToolResultPointers` visits oldest tool-result bodies only
 when the complete request exceeds the physical limit. It delegates retention
 and the bounded view to `ProviderToolResultPage` / `ProviderToolResultRecoveryStore`, the same
 owner as live results and dispatch previews. Each replaced body is written
-verbatim to `chat/tool_results/<turn-hash>/<result-hash>.txt` before its pointer
-replaces it in the provider context. The pointer names its live `result_handle`,
-`result.page` continuation and `saved_result_path`; the file remains with chat
-after turn-scoped handles are released, including across app restart.
+in the engine root's `tool_results/<handle>` JSON file before its pointer replaces it in the provider context.
+Its `content` field holds the structurally and text-redacted body, up to a 4 MiB head with any cut named in both body and pointer;
+metadata rebuilds paging after relaunch. The pointer names `result_handle`, `result.page` and `saved_result_path`,
+kept for `ExperienceStore.detailHorizon` (14 days). Only untrusted-steered turns are restricted to handles
+their own conversation produced; every other turn reads any handle. Pruning removes the saved file too.
 Call IDs, error flags, calls, speech and
 images keep their order. Native and text-marker transports share the typed
 result boundary; marker encoding happens at request delivery. Resident and

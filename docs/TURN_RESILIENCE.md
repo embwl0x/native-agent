@@ -206,8 +206,6 @@ its ceilings, progress callback and preview state, through both action and
 preflight paths. Human waits pause active-work ceilings until
 the person answers or the wait ends; Stop and enclosing wall-clock limits
 still apply. Missing answers cannot count as approval or completion.
-Expansion's speculative delivery instead uses a wall-clock ceiling: progress
-and a person's wait cannot renew or pause the bound on the original result.
 
 An ended call takes Stop's path: its body is cancelled and the caller released
 at once, even when the body ignores cancellation. A call found dead reads
@@ -220,8 +218,11 @@ receipts. A nested call's receipt reaches its batch or program as that step's
 failed result. The original body retains its checkpoint and records its actual
 receipt through `settle`; `tool.dispatch.settled` carries that receipt with the
 same IDs after actual exit. If it never returns, no settled trace is invented
-and the checkpoint remains unresolved. A wait that does not answer
-cancellation (a blocked `flock`, a semaphore) still holds its own body after
+and the checkpoint remains unresolved. The turn engine retains the dispatch's
+settlement independently of its caller; Quit joins these bodies and drains
+accepted trace writes before the final mind save and dependency retirement.
+A body that never returns keeps Quit held without a clock. A wait that does not
+answer cancellation (a blocked `flock`, a semaphore) still holds its own body after
 the caller is released.
 Its resolved state carries the value directly, including cancellation before
 the waiter arrives; nested human waits keep tokens rather than an integer
@@ -322,6 +323,10 @@ settle independently. The HTTP request observes cancellation; Codex runs to its
 own exit and pipe EOF and retains its produced output, even after cancellation
 has returned to a buffered or streaming caller.
 The provider path performs no automatic redelivery or HTTP 401 replay.
+OpenAI structured completions retain message roles for text, images and tools
+through the same streaming serializer. Responses leaves text verbosity to the
+provider default. Failure normalization has no empty-reply exception inferred
+from diagnostic prose.
 Provider failures give the turn part the cause and remedy; they authorize no
 automatic re-request. A retry chosen by the agent may be paced only by the
 server's explicit `retry_after`, never by a computed backoff or an assumed
@@ -374,6 +379,8 @@ Malformed nonempty JSON data fails Responses, Chat Completions and Anthropic
 SSE decoding even before first output. Empty SSE data and protocol control
 frames remain explicit; the shared framer consumes comments as keep-alives.
 A malformed frame is not a network outage and does not admit a redial.
+After transport control debris is removed, literal markup is answer text;
+emptiness depends on whitespace, not on removing HTML or XML tags.
 `LLMCall.allowsSilentCompletion` declares whether a clean provider terminal
 without answer text or calls is a complete answer. The stem declares it for a
 thought from its native opening message's `attended` object, including checkpoint
@@ -469,9 +476,13 @@ input and session are durable before preparation, so approval recovery uses that
 Telegram's stopped turn retains and joins its settlement task without a timeout.
 Stop-button polling requests that task without awaiting its result; slash commands
 await confirmation in their command task after releasing polling admission.
-The person's explicit `/retry` retains its meaning. A Telegram API rejection
-returns to the caller without an automatic retry; a server's `retry_after`
-paces later admitted sends. Streaming surfaces keep editing the same reply after cuts.
+Telegram restart repair edits an interrupted progress card in place, clears its
+buttons and removes its ledger row. A saved-answer `/retry` delivers to the same
+chat and topic and leaves the interruption notice in chat.
+A Telegram API rejection returns to the caller without an automatic retry.
+A server's `retry_after` paces later admitted sends in the same chat. Ordinary
+and notification-disabled replies share that chat's send order and pacing across its topics.
+Streaming surfaces keep editing the same reply after cuts.
 Telegram and Slack previews coalesce while the admitted send is in flight;
 producer progress and send completion drive publication, without a spacing clock.
 Reply producers own secret masking. Slack retains and sends their canonical reply
@@ -523,7 +534,8 @@ durable receipts update that presence and the turn's steering peers together.
 Receipts retain their results' labelled sources (provenance); a checkpoint
 keeps steering peers and the person's answer so a resume uses the same card.
 It keeps identity, input, envelope, reply route, kept prose and replay evidence, never the
-provider message array. Input attachment bytes stay in `chat/attachments/`;
+provider message array; capture accepts only the prose, commentary count, part log,
+call presence and held turn. Input attachment bytes stay in `chat/attachments/`;
 their existing transcript metadata supplies the saved paths.
 
 The reconciliation hook discovers checkpoints independently of the legacy
@@ -558,6 +570,8 @@ observation names each call their part's log shows started without a receipt
 call proposed again (tool and argument digest) as that unresolved step, so its
 receipt settles it instead of a fresh step beside it. Oversize-result
 pages cannot survive the process; the observation says they are unavailable.
+Contact sends follow [their retained-handle restart law](agent-communication.md#honest-states):
+read existing work without a prompt or resend, or settle the send with its restart cause.
 
 Terminal settlement retains a checkpoint when status is completed or waiting
 and `hasRedeliveryOwner` holds: no stopped reason or helper owner, and a

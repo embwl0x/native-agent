@@ -4,7 +4,7 @@ import JavaScriptCore
 import Senses
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Resident JSC contexts, exact-source turn leases and bounded execution |
+// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | JSC contexts, sense SDK and prelude, exact-source leases and bounded execution |
 
 /// Resident programs retain context; rehearsal needs a fresh realm. Both share the exception latch, exchange and watchdog.
 final class JavaScriptProgramRuntime {
@@ -61,7 +61,6 @@ final class JavaScriptProgramRuntime {
     }
 
     private let io: PlugIO
-    private let shim: String
     private let progress: ProgressWindow
     private var progressCell: UnsafeMutableRawPointer { Unmanaged.passUnretained(progress).toOpaque() }
     private var context: JSContext?
@@ -82,8 +81,8 @@ final class JavaScriptProgramRuntime {
     private var thrown: JSValue?
     private var latched: SenseFailure?
 
-    init(io: PlugIO, shim: String) {
-        self.io = io; self.shim = shim; progress = ProgressWindow(io: io)
+    init(io: PlugIO) {
+        self.io = io; progress = ProgressWindow(io: io)
     }
 
     deinit {
@@ -146,7 +145,7 @@ final class JavaScriptProgramRuntime {
             initialMaterial = try (message["material"] as? [String: Any]).map(checkedMaterial)
         }
         if context == nil {
-            let created = try createContext(sdk: shim, inputJSON: nil, kind: .sense)
+            let created = try createContext(program: program, actionIDs: [], inputJSON: nil)
             if thrown == nil { created.evaluateScript(program.source, withSourceURL: URL(string: "sense-entry.js")) }
             if thrown == nil, created.evaluateScript("typeof read === 'function'")?.toBool() != true {
                 throw failure("bad_output", "Sense must define read(request).")
@@ -178,10 +177,9 @@ final class JavaScriptProgramRuntime {
     }
 
     private func createContext(
-        sdk: String,
+        program: OwnedProgram,
+        actionIDs: [String],
         inputJSON: String?,
-        kind: OwnedProgram.Kind,
-        part: Bool = false,
         home: String? = nil,
         workspace: String? = nil,
         dataRoot: String? = nil,
@@ -199,11 +197,26 @@ final class JavaScriptProgramRuntime {
         let call: @convention(block) (String, String) -> String = { [unowned self] type, fields in
             self.bridge(type: type, fields: fields)
         }
+        let kind = program.kind
         created.setObject(call, forKeyedSubscript: (kind == .sense ? "__senseCall" : "__call") as NSString)
+        let sdk: String
         if kind == .sense {
+            let installedSDK = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+                .deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("Resources/Senses/sense.js")
+            #if SWIFT_PACKAGE
+            let url = FileManager.default.isReadableFile(atPath: installedSDK.path) ? installedSDK
+                : Bundle.module.bundleURL.appendingPathComponent("Senses/sense.js")
+            #else
+            let url = installedSDK
+            #endif
+            sdk = try String(contentsOf: url, encoding: .utf8)
             let redact: @convention(block) (String) -> String = { ContextSecretContentPolicy.redactedFragment($0) }
             created.setObject(redact, forKeyedSubscript: "__senseRedactText" as NSString)
         } else {
+            let names = String(decoding: try JSONSerialization.data(withJSONObject: actionIDs), as: UTF8.self)
+            sdk = OwnedProgramRunner.prelude(ids: names, strict: program.isStrict,
+                                            input: inputJSON != nil, primitives: program.isPart, turn: kind == .turn)
             let say: @convention(block) (String) -> Void = { [unowned self] text in
                 guard self.logBytes < OwnedProgramRunner.logLimit else { return }
                 let kept = String(text.prefix(OwnedProgramRunner.logLimit - self.logBytes))
@@ -211,7 +224,7 @@ final class JavaScriptProgramRuntime {
                 _ = self.bridge(type: "script_log", fields: (try? self.jsonString(["text": kept])) ?? "{}")
             }
             created.setObject(say, forKeyedSubscript: "__log" as NSString)
-            if part {
+            if program.isPart {
                 guard let home, let workspace, let dataRoot, let measurementSystem else {
                     throw failure("bad_input", "An ability requires its home, workspace, data paths and measurement system from the app.")
                 }
@@ -267,16 +280,12 @@ final class JavaScriptProgramRuntime {
         let inputJSON = try message["input"].map {
             try JSONValue(fromFoundation: $0).serialize(pretty: false)
         } ?? ([.run, .face].contains(program.entry) ? "{}" : nil)
-        let names = String(decoding: try JSONSerialization.data(withJSONObject: ids), as: UTF8.self)
-        let sdk = OwnedProgramRunner.prelude(ids: names, strict: program.isStrict,
-                                            input: inputJSON != nil, primitives: program.isPart, turn: program.kind == .turn)
         let fresh = context == nil
         if fresh {
             _ = try createContext(
-                sdk: sdk,
+                program: program,
+                actionIDs: ids,
                 inputJSON: inputJSON,
-                kind: program.kind,
-                part: program.isPart,
                 home: message["home"] as? String,
                 workspace: message["workspace"] as? String,
                 dataRoot: message["dataRoot"] as? String,

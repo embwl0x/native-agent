@@ -77,8 +77,6 @@ public struct AppActionBinding: Sendable {
     public let rename: [String: String]
     public let folded: Bool
     public let descriptor: ToolDescriptor?
-    /// The person's authority over the agent this action is (Trust, consent, models, keys, approvals, forgetting, reset): `why` it is
-    /// theirs, and whether a card can carry the agent's ask for it (`asks`). Only the person's own act decides a lever.
     public struct Lever: Sendable, Equatable {
         public let why: String
         public let asks: Bool
@@ -89,7 +87,6 @@ public struct AppActionBinding: Sendable {
         public init(why: String, asks: Bool, freely: [String: JSONValue] = [:], name: String = "") {
             self.why = why; self.asks = asks; self.freely = freely; self.name = name
         }
-        /// Whether this call, with these arguments, is the person's. Arguments that are missing or differ leave it theirs.
         public func holds(_ args: [String: JSONValue]) -> Bool {
             freely.isEmpty || !freely.allSatisfy { args[$0.key] == $0.value }
         }

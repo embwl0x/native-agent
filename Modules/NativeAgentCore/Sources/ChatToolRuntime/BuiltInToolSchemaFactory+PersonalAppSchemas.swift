@@ -264,12 +264,16 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(name: "mac_calendar_modify_event", toolClass: .write, reach: .person,
                 macIntegration: .init(MacIntegrationID.calendar, .write),
                 description: """
-                    Modify an existing calendar event. Requires id from a prior calendar.upcoming. Pass only the fields to change. Requires \
+                    Modify one calendar event occurrence. Requires id from calendar.upcoming; recurring events also require its startAt as \
+                    expected_start. A moved occurrence is refused. Pass only the fields to change. Requires \
                     Calendar → Write permission.
                     """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("id", ToolSchema.strSchema("EKEvent identifier from calendar.upcoming (required).")),
+                        ("expected_start", stringOrIntSchema("""
+                            Observed startAt from calendar.upcoming; required for recurring occurrences. ISO-8601 or epoch seconds.
+                            """)),
                         ("title", ToolSchema.strSchema("New event title.")),
                         ("start", stringOrIntSchema("New start time — ISO-8601 string or epoch seconds.")),
                         ("end", stringOrIntSchema("New end time — ISO-8601 string or epoch seconds.")),

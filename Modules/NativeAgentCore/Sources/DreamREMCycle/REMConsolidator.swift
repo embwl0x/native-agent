@@ -18,7 +18,7 @@ import Transcripts
 public enum REMConstants {
     public static let minimumEvidenceCount: Int = 2
     public static let _REM_MAX_PROPOSALS: Int = 5
-    public static let _REM_GROWTH_CHAR_CAP: Int = 20_000
+    public static let _REM_APPROVED_GROWTH_CHAR_CAP: Int = 20_000
     public static let _REM_GROWTH_EVICT_CHARS: Int = 5_000
     public static let _REM_ARCHIVE_DAYS: Int = 14
     // Keep proposals in the agent's voice and end at a lesson-bearing sentence.
@@ -274,15 +274,15 @@ public actor REMConsolidator {
         // Rank by supporting experiences and stable emission order while reserving a slot for labelled dwelling.
         let kept = Self.rankedByRecurrence(passTomb, identities: identities)
 
-        // Check cancellation before commits even after model response.
-        // Only pre-persistence failure releases weekly exclusion; durable proposals keep their IDs for staging catch-up.
-
-        // Append pending proposals through the shared locked, identity-deduplicated store.
         try Task.checkCancellation()
-        // Refuse non-GROWTH targets and carry their names into receipts so drops remain actionable.
-        let appendReceipt = try await store.appendPendingWithReceipt(kept)
-        // Once proposals are durable, retries must use existing IDs.
-        if appendReceipt.appended > 0 { rollback = nil }
+        let saved: Result<(REMProposalStore.AppendReceipt, (@Sendable () async -> Void)?), Error> = await settle { [rollback] in
+            do {
+                let appendReceipt = try await store.appendPendingWithReceipt(kept)
+                return .success((appendReceipt, appendReceipt.appended > 0 ? nil : rollback))
+            } catch { return .failure(error) }
+        }
+        let appendReceipt: REMProposalStore.AppendReceipt
+        (appendReceipt, rollback) = try saved.get()
 
         // Stage and stamp under the shared owner so retries cannot create duplicate cards; failed stages remain owed.
         try Task.checkCancellation()
@@ -304,7 +304,7 @@ public actor REMConsolidator {
         let dweltOnKept = kept.filter { $0.support == .dweltOn }.count
         let unavailableKept = kept.filter { $0.support == .provenanceUnavailable }.count
         var report = REMReport(
-            proposalsGenerated: kept.count,
+            proposalsGenerated: appendReceipt.appended,
             evidenceDatesMin: REMConstants.minimumEvidenceCount,
             tombstoneSkips: tombSkips,
             growthMDEvicted: evicted,

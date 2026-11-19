@@ -231,7 +231,3 @@ enum SkillBuildRequestPresentation {
             : .existingDraftPreserved
     }
 }
-
-extension Notification.Name {
-    static let skillBuildRequest = Notification.Name("NativeAgent.skillBuildRequest")
-}

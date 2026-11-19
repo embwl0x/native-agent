@@ -340,12 +340,6 @@ repeat with titleCharacter in characters of ((name of targetNote) as text)
     set titleHTML to titleHTML & titleText
 end repeat`;
 
-// The first line ends at a lone line feed; a carriage return and line feed pair is one character.
-function firstLine(value) {
-    for (let index = 0; index < value.length; index++) if (value[index] === "\n" && value[index - 1] !== "\r") return value.slice(0, index);
-    return value;
-}
-
 // Updates and reversible deletion require one exact note. The whole change happens inside one script, so no note text
 // is ever read into the part and written back.
 function modify(input, deleting) {
@@ -364,9 +358,10 @@ function modify(input, deleting) {
     if (body !== undefined) {
         if (body === "") bodyStatement = TITLE_HTML + '\nset body of targetNote to "<div>" & titleHTML & "</div>"';
         else {
+            const firstLine = body.split(/\r\n?|\n/, 1)[0];
             const bodyText = escape(html(body));
             bodyStatement = TITLE_HTML + `
-if "${escape(firstLine(body))}" is ((name of targetNote) as text) then
+if "${escape(firstLine)}" is ((name of targetNote) as text) then
     set body of targetNote to "<div>${bodyText}</div>"
 else
     set body of targetNote to "<div>" & titleHTML & "</div><div>${bodyText}</div>"

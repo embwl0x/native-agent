@@ -62,7 +62,11 @@ enum EngineDaySense {
             return
         } catch {
             nativeLog("Day calendar unavailable: %@", error.localizedDescription)
-            line += " The calendar is unavailable: \(error.localizedDescription)"
+            guard !Task.isCancelled, start == calendar.startOfDay(for: Date()) else { return }
+            Attention.post(Happening(.world, subject: "clock:day", door: "clock:day",
+                words: line + " The calendar is unavailable: \(error.localizedDescription)",
+                once: "clock:day:" + dayKey(start) + ":calendar-unavailable"), dataRoot: dataRoot)
+            return
         }
         guard !Task.isCancelled, start == calendar.startOfDay(for: Date()) else { return }
         Attention.post(Happening(.world, subject: "clock:day", door: "clock:day", words: line, once: "clock:day:" + dayKey(start)), dataRoot: dataRoot)

@@ -223,16 +223,23 @@ public final class NativeOAuthLoopbackCallbackServer: Sendable {
     }
 
     private func finish(_ result: Result<URL, Error>) {
-        let cont = state.withLock { state -> CheckedContinuation<URL, Error>? in
-            guard !state.didFinish else { return nil }
+        let (cont, wake) = state.withLock { state -> (CheckedContinuation<URL, Error>?, Bool) in
+            guard !state.didFinish else { return (nil, false) }
             state.didFinish = true
             let continuation = state.continuation
             state.continuation = nil
-            // Shutdown interrupts I/O; the worker retains each descriptor until it exits.
             for client in state.activeClients { Darwin.shutdown(client, SHUT_RDWR) }
-            Darwin.shutdown(fd, SHUT_RDWR)
             if !state.workerStarted { Darwin.close(fd) }
-            return continuation
+            return (continuation, state.workerStarted)
+        }
+        if wake {
+            let poke = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+            let addr = sockaddr_in(sin_len: UInt8(MemoryLayout<sockaddr_in>.size), sin_family: sa_family_t(AF_INET),
+                sin_port: in_port_t(port).bigEndian, sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (0, 0, 0, 0, 0, 0, 0, 0))
+            _ = withUnsafePointer(to: addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(poke, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            }
+            Darwin.close(poke)
         }
         switch result {
         case .success(let url):

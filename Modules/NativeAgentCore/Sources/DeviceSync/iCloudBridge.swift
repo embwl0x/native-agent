@@ -11,14 +11,12 @@ import PersistenceCore
 import ProviderRouting
 import OSLog
 // Blueprint: | `iCloudBridge.swift` | Canonical chat ledger; push/lifecycle receives never select a timed alternate reader. |
-typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
-typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 /// Serial checks never suspend; cancellation can still run while delivery awaits a chat reply.
 @MainActor
 public final class iCloudBridge: ObservableObject {
     static let pushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "push")
     enum DrainTrigger: String {
-        case cloudKitPush, kvsNudge, coalesced, repair, wake, network, beat, phoneOpen
+        case cloudKitPush, coalesced, repair, wake, network, beat, phoneOpen
     }
     unowned let sync: DeviceSync
     @Published public internal(set) var available: Bool = false
@@ -72,8 +70,6 @@ public final class iCloudBridge: ObservableObject {
         let root = SHA256.hash(data: Data(sync.dataRoot.standardizedFileURL.path.utf8))
         return "NativeAgent.pairing.cloudKitPublicationOwed.v1." + root.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
-    var driveURL: URL?
-    var metadataQuery: NSMetadataQuery?
     var messageHandler: ((BridgeMessage, ICloudPhoneRoute) async -> Bool)?
     // Only the entitlement-checked resolver installs this CloudKit transport.
     var deviceTransport: CloudKitDeviceTransport?
@@ -128,16 +124,8 @@ public final class iCloudBridge: ObservableObject {
     var incomingObserverTaskID = UUID()
     var transportSetupTask: Task<Void, Never>?
     var transportSetupTaskID = UUID()
-    var outboxScanTask: Task<Void, Never>?
-    var outboxScanQueued = false
-    /// Teardown closes backlog dispatch without cancelling accepted human turns; each owner still settles.
-    var outboxBacklogTasks: [UUID: Task<Void, Never>] = [:]
-    /// Retired scans cannot clear or replay work belonging to a newer lifecycle.
-    var outboxScanGeneration: UInt64 = 0
-    // Idempotent setup prevents stacked observers from delivering each KVS change multiple times.
     var isSetUp: Bool = false
     let incomingVerifier = ICloudIncomingVerifier()
-    var deliveryNudgeQueue: ICloudDeliveryNudgeQueue?
     init(sync: DeviceSync) {
         self.sync = sync
         let url = ICloudSyncStatePaths.accountFailure(dataRoot: sync.dataRoot)
@@ -177,23 +165,14 @@ public final class iCloudBridge: ObservableObject {
         guard isSetUp || setupTask != nil else { return nil }
         // The pairing owner's checked count, so Doctor can tell phone sync never set up from phone sync broken; unreadable stays unknown.
         let pairedPhones = try? PairedPhoneStore.pairedCountChecked(at: sync.dataRoot.appendingPathComponent("paired_phones.json"))
-        if usesCloudKitDeviceTransport {
-            let health: ICloudBridgeHealthSnapshot.Health
-            if let accountFailure {
-                health = .accountFailure(code: accountFailure.code, detail: accountFailure.detail)
-            } else {
-                health = doctorTransportHealth
-            }
-            return .init(transport: .cloudKit, health: health,
-                         sendMeasured: doctorSendMeasured, sendFailures: doctorSendFailures, pairedPhones: pairedPhones)
+        let health: ICloudBridgeHealthSnapshot.Health
+        if let accountFailure {
+            health = .accountFailure(code: accountFailure.code, detail: accountFailure.detail)
+        } else {
+            health = doctorTransportHealth
         }
-        guard deviceTransport == nil else { return nil }
-        return .init(
-            transport: .iCloudDrive,
-            health: doctorTransportHealth,
-            documentsURL: driveURL,
-            pairedPhones: pairedPhones
-        )
+        return .init(health: health, sendMeasured: doctorSendMeasured,
+                     sendFailures: doctorSendFailures, pairedPhones: pairedPhones)
     }
     static func transportHealth(_ error: Error) -> ICloudBridgeHealthSnapshot.Health {
         switch error as? DeviceSyncError {
@@ -227,8 +206,7 @@ public final class iCloudBridge: ObservableObject {
             seenMessageIDs.remove(oldest)
         }
     }
-    // Synchronous MainActor persistence prevents replay inside CloudKit's 30-second repull window. CloudKit and Drive stores remain separate but restore into
-    // the same insertion-ordered set.
+    // Synchronous MainActor persistence prevents replay inside CloudKit's 30-second repull window.
     private static let ckProcessedIDsDefaultsKey = "NativeAgent.iCloud.ckProcessedIDs.v1"
     func persistCKSeenIDs() {
         ICloudSeenIDDefaultsStore.save(
@@ -259,22 +237,6 @@ public final class iCloudBridge: ObservableObject {
         trimSeenMessageIDsIfNeeded()
         return true
     }
-    @objc nonisolated func kvsDidChange(_ note: Notification) {
-        let changedKeys = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
-        Task { @MainActor in
-            guard self.isSetUp else { return }
-            let messageChanged = changedKeys == nil
-                || changedKeys?.contains(KVSKey.newMessageInDrive) == true
-            if messageChanged {
-                if self.deviceTransport != nil {
-                    _ = await self.drainDeviceTransport(trigger: .kvsNudge)
-                } else {
-                    self.syncStatus = "KVS trigger received — checking Drive…"
-                    self.checkIosOutbox()
-                }
-            }
-        }
-    }
     public func tearDown() {
         phoneOpenReadTask?.cancel()
         deviceReceiveBeatTask?.cancel()
@@ -288,12 +250,6 @@ public final class iCloudBridge: ObservableObject {
         incomingObserverGeneration &+= 1
         incomingObserverTask?.cancel()
         transportSetupTask?.cancel()
-        outboxScanGeneration &+= 1
-        outboxScanTask?.cancel()
-        // Retain the scanner slot until physical file work exits; backlog owners settle before lifecycle retirement.
-        outboxScanQueued = false
-        metadataQuery?.stop()
-        metadataQuery = nil
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         deviceNetworkChanges?.cancel()
@@ -314,10 +270,6 @@ public final class iCloudBridge: ObservableObject {
         deviceDrainQueued = false
         deviceMetadataDrainQueued = false
         deviceRetentionSweepTask?.cancel()
-        if let deliveryNudgeQueue {
-            Task { await deliveryNudgeQueue.cancelAll() }
-            self.deliveryNudgeQueue = nil
-        }
         // Clear setup ownership so teardown cannot leave all future setup calls permanently refused.
         isSetUp = false
         sync.engine.stop()

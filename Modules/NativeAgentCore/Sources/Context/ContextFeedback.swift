@@ -61,18 +61,14 @@ public struct ContextFeedbackSeed: Codable, Equatable, Sendable {
     public let baseUtility: Double
     public let baseActivation: Double
     public let baseDecay: Double
-    /// When the atom's content came to be: its first use (encoding counts).
-    public let createdBucket: Int64?
 
     public init(
         atomID: ContextAtomID,
         baseUtility: Double = 0,
         baseActivation: Double = 0,
-        baseDecay: Double = 1,
-        createdBucket: Int64? = nil
+        baseDecay: Double = 1
     ) {
         self.atomID = atomID
-        self.createdBucket = createdBucket
         self.baseUtility = Self.clamp(baseUtility, to: -1 ... 1)
         self.baseActivation = Self.clamp(baseActivation, to: -1 ... 1)
         self.baseDecay = Self.clamp(baseDecay, to: 0 ... 1)
@@ -102,7 +98,6 @@ public struct ContextFeedbackAtomState: Equatable, Sendable {
     public let utility: Double
     public let temporaryActivation: Double
     public let decay: Double
-    /// Power-law use history maps odds of need to odds / (1 + odds): recent, frequent and spaced use sustain reachability; disuse never deletes it.
     public let reachability: Double
 }
 
@@ -191,11 +186,10 @@ private extension ContextFeedbackReducer {
         var temporaryActivation: Double
         var decay: Double
         var lastTimeBucket: Int64?
-        var uses: [Int64]
+        var uses: [Int64] = []
 
         init(seed: ContextFeedbackSeed, configuration: ContextFeedbackConfiguration) {
             atomID = seed.atomID
-            uses = seed.createdBucket.map { [$0] } ?? []
             outcomeUtility = Self.clamp(
                 seed.baseUtility,
                 configuration.minimumUtility ... configuration.maximumUtility
@@ -284,7 +278,7 @@ private extension ContextFeedbackReducer {
             configuration: ContextFeedbackConfiguration, at bucket: Int64?
         ) throws -> ContextFeedbackAtomState {
             let now = bucket ?? uses.max() ?? 0
-            let odds = try uses.reduce(0.0) { sum, use in
+            let odds = try uses.reduce(1.0) { sum, use in
                 let (elapsed, overflow) = now.subtractingReportingOverflow(use)
                 guard !overflow else { throw ContextFeedbackError.elapsedOverflow(atomID) }
                 return sum + pow(Double(max(1, elapsed)) / configuration.bucketsPerDay, -configuration.useDecay)

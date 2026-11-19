@@ -252,7 +252,7 @@ extension SwiftNativeMacControl {
             }
         }
         var coverageFailure: String?
-        if pictured {
+        if pictured || recognizesText {
             do { redactionNodes = try inspectPixelOwner() }
             catch { coverageFailure = (error as? SenseFailure)?.message ?? error.localizedDescription }
         }
@@ -272,7 +272,7 @@ extension SwiftNativeMacControl {
             }
         }
         guard !Task.isCancelled else { return cancelledResult() }
-        if pictured, coverageFailure == nil, let shot {
+        if pictured || recognizesText, coverageFailure == nil, let shot {
             do {
                 postRedactionNodes = try inspectPixelOwner()
                 guard now() < disclosureDeadline, MacAXWindowIdentity.rectsMatch(shot.bounds, windowRect),
@@ -284,8 +284,8 @@ extension SwiftNativeMacControl {
                     throw SenseFailure(code: "redaction_coverage_unavailable",
                         message: "The capture cannot be bound to the inspected window and lifetime.")
                 }
-                imageTargets = MacImageCapture.pointTargets(nodes: postRedactionNodes,
-                    pid: capturedWindow.pid, deadline: disclosureDeadline, source: accessibilityActSource(context: context), context: context)
+                if pictured { imageTargets = MacImageCapture.pointTargets(nodes: postRedactionNodes,
+                    pid: capturedWindow.pid, deadline: disclosureDeadline, source: accessibilityActSource(context: context), context: context) }
             } catch {
                 coverageFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
             }
@@ -331,9 +331,8 @@ extension SwiftNativeMacControl {
         let geometry = shot.map { MacScreenViewGeometry(shot: $0) } ?? axGeometry
         if !semanticRawFrame { select(in: geometry) }
         guard !Task.isCancelled else { return cancelledResult() }
-        // A released picture walks the whole window twice; recognized text alone runs on every look, under caption redaction, and never pays for that walk.
         var secrets: [MacAXFrame] = []
-        if pictured, coverageFailure == nil, let shot {
+        if pictured || recognizesText, coverageFailure == nil, let shot {
             let renderGeometry = MacScreenViewGeometry(shot: shot)
             if let beforeMasks = MacScreenViewTextRedaction.secretFrames(
                 nodes: redactionNodes, geometry: renderGeometry, deadline: disclosureDeadline, context: context),

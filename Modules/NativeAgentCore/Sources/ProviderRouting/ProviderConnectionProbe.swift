@@ -161,12 +161,14 @@ public extension SwiftNativeProviderRouting {
             if (200..<300).contains(code) {
                 var catalogDetail = ""
                 if id == "moonshot" {
-                    let models = try MoonshotModelCatalog.parseModelsResponse(body)
-                    let result = await MoonshotModelCatalog.cache.publish(
-                        ModelCatalogFetch(models: models, isComplete: true), credential: apiKey, dataRoot: dataRoot)
-                    if case .failure(let failure) = result, !failure.superseded {
-                        catalogDetail = "; catalog not saved: \(failure.reason)"
-                    }
+                    do {
+                        let models = try MoonshotModelCatalog.parseModelsResponse(body)
+                        let result = await MoonshotModelCatalog.cache.publish(
+                            ModelCatalogFetch(models: models, isComplete: true), credential: apiKey, dataRoot: dataRoot)
+                        if case .failure(let failure) = result, !failure.superseded {
+                            catalogDetail = "; catalog not saved: \(failure.reason)"
+                        }
+                    } catch { catalogDetail = "; catalog not read: \(ProviderFailure.diagnosticDescription(error))" }
                 } else if draftKey == nil, FirstPartyModelDiscovery.isLiveRoute(id),
                           let failure = await FirstPartyModelDiscovery.publishChecked(route: id, firstPage: body, key: apiKey, dataRoot: dataRoot) {
                     // The check fetched this key's model list: it is published through the same owner a refresh uses.

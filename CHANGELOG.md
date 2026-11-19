@@ -4,6 +4,17 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.20 — one table, its own plans (2026-11-19)
+
+- Desk: one standing table with notes, shapes, arrows, pen strokes and live cards; a card reads its item live and crossing it closes the item; the table pops
+  out; any saved agent reads it, a trusted one writes, signed
+- Scheduling: a step the agent sets for itself wakes it at its time, re-offered if the turn fails; "in N minutes"; deferring moves the time; phone and Mac
+  state changes reach the agent
+- Other agents: conversations read as conversations; sends tracked across relaunch; ACP agents stay connected; Telegram groups trust only allowed senders
+- Memory: the dream reads oldest first and never stalls; a full memory archives; recall can be empty; age does not bury
+- Mac and steadiness: Save-panel saves confirmed; menus in background apps; idle work only on change; a long-uptime crash fixed; Stop keeps the sign-in
+- Removed: the scheduled morning brief; scan findings go to the agent, not the Inbox
+
 ## 0.6.19 — cards you can count on (2026-11-15)
 
 - Cards: every control takes its click and a key field takes a paste in the chat; an answered card continues its turn once, from any door; a one-request model

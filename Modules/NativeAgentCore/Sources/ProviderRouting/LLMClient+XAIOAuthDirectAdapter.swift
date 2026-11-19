@@ -102,24 +102,33 @@ public final class XAIOAuthTransport: LLMTransport {
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
                     let requestStartNs = DispatchTime.now().uptimeNanoseconds
-                    let bytes: ProviderHTTPBytes
-                    let response: URLResponse
+                    var bytes: ProviderHTTPBytes
+                    var response: URLResponse
                     do {
                         (bytes, response) = try await ProviderWire.open(session, req, call: call)
+                        if (response as? HTTPURLResponse)?.statusCode == 401 {
+                            bytes.cancel()
+                            let refreshed = try await self.refreshSerial.run { [self] in
+                                let state = try Self.loadTokenState(path: tokenPath, requestAccount: requestAccount)
+                                if state.accessToken != access { return state }
+                                return try await refreshTokens(state: state, requestAccount: requestAccount)
+                            }
+                            req.setValue("Bearer \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
+                            (bytes, response) = try await ProviderWire.open(session, req, call: call)
+                        }
                     } catch {
                         throw mapTransportError(error, fallback: self.transientNetworkError(error, operation: "streamMessages"))
                     }
                     defer { bytes.cancel() }
                     guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-                    let status = http.statusCode
-                    if status == 401 {
+                    if http.statusCode == 401 {
                         throw LLMError.authRejected(provider: "xai_oauth_direct", detail: XAIOAuthDirectExhaustedMarker)
                     }
                     try await ProviderWire.validateChatCompletions(bytes, response)
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI")
                     try await decoder.consume(
                         SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
-                        request: req, providerID: providerId, model: effectiveModel, idPrefix: "xai_tool",
+                        request: req, providerID: providerId, model: effectiveModel,
                         started: requestStartNs, telemetry: telemetry, call: call
                     )
                     continuation.finish()
@@ -180,7 +189,7 @@ public final class XAIOAuthTransport: LLMTransport {
         return try await refreshSerial.run { [self] in
             let state = try Self.loadTokenState(path: self.tokenPath, requestAccount: requestAccount)
             let access = state.accessToken
-            let shouldRefresh = Self.accessTokenIsExpiring(state, skew: OAuthGrantOperations.renewalMargin)
+            let shouldRefresh = Self.effectiveExpiry(access, saved: state.savedExpiry).map { $0.timeIntervalSinceNow <= OAuthGrantOperations.renewalMargin } ?? false
             guard shouldRefresh else { return access }
             let refreshed = try await self.refreshTokens(state: state, requestAccount: requestAccount)
             return refreshed.accessToken
@@ -331,14 +340,8 @@ public final class XAIOAuthTransport: LLMTransport {
                 """)
     }
 
-    /// Expiry is the earlier of persisted expires_at and JWT exp, including opaque-token support.
-    private static func accessTokenIsExpiring(_ state: TokenState, skew: TimeInterval) -> Bool {
-        guard let effective = [jwtExpiry(state.accessToken), state.savedExpiry].compactMap({ $0 }).min() else { return false }
-        return effective.timeIntervalSinceNow <= skew
-    }
-
-    private static func effectiveExpiry(_ access: String, object: [String: Any]) -> Date? {
-        [jwtExpiry(access), persistedExpiry(object)].compactMap { $0 }.min()
+    private static func effectiveExpiry(_ access: String, saved: Date?) -> Date? {
+        [jwtExpiry(access), saved].compactMap { $0 }.min()
     }
 
     private static func tokenEndpoint(in object: [String: Any]) -> URL? {
@@ -355,7 +358,7 @@ public final class XAIOAuthTransport: LLMTransport {
         }
         let access = OAuthRefreshBinding.string(tokens["access_token"])
         let refresh = OAuthRefreshBinding.string(tokens["refresh_token"])
-        let expiry = effectiveExpiry(access ?? "", object: object)
+        let expiry = effectiveExpiry(access ?? "", saved: persistedExpiry(object))
         let canRefresh = refresh != nil && OAuthRefreshBinding.permitsRefresh(object, provider: "xai_oauth_direct")
         let needsRefresh = expiry.map { $0.timeIntervalSinceNow <= OAuthGrantOperations.renewalMargin } ?? false
         let usable = access != nil && refresh != nil && (!needsRefresh || canRefresh)

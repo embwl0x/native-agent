@@ -20,8 +20,6 @@ public struct MacChatTurnActivity: Sendable, Equatable {
     public let source: MacChatTurnActivitySource
     public let phase: TurnPresentationPhase
     public let actionSummary: String?
-    /// Redact and cap toast text independently; the shared kernel retains its tighter summary limit.
-    public let userVisibleNoticeText: String?
     public let delegateDisplayName: String?
     public let outcome: TurnPresentationActivity.Outcome?
     public let occurredAt: Date
@@ -70,7 +68,6 @@ public enum MacChatTurnActivityBoundary {
             source: .notice(kind: safeKind),
             phase: noticePhase(kind: kind),
             actionSummary: safeText,
-            userVisibleNoticeText: boundedNoticeText(text),
             delegateDisplayName: nil,
             outcome: nil,
             occurredAt: instant,
@@ -90,7 +87,6 @@ public enum MacChatTurnActivityBoundary {
             source: .toolUse,
             phase: delegate == nil ? .tool : .delegation,
             actionSummary: sanitized(ToolActivityPresentation.progress(name, args: args)),
-            userVisibleNoticeText: nil,
             delegateDisplayName: delegate,
             outcome: nil,
             occurredAt: instant,
@@ -117,7 +113,6 @@ public enum MacChatTurnActivityBoundary {
             source: .toolResult,
             phase: .working,
             actionSummary: sanitized(ToolActivityPresentation.finished(name, outcome: result.rawValue)),
-            userVisibleNoticeText: nil,
             delegateDisplayName: nil,
             outcome: outcome,
             occurredAt: instant,
@@ -150,16 +145,5 @@ public enum MacChatTurnActivityBoundary {
             raw,
             additionalRedactor: { NativeAppSecretRedactor.redactText($0) }
         )
-    }
-
-    private static func boundedNoticeText(_ raw: String) -> String? {
-        let redacted = NativeAppSecretRedactor.redactText(raw)
-        let singleLine = redacted
-            .split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-        guard !singleLine.isEmpty else { return nil }
-        let limit = 512
-        guard singleLine.count > limit else { return singleLine }
-        return String(singleLine.prefix(limit - 1)) + "…"
     }
 }

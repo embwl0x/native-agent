@@ -316,7 +316,6 @@ extension MacSyncEngine {
             if let skills { await write(skills, to: "skills_snapshot.json") }
             if let toolCatalog { await write(toolCatalog, to: "tools_snapshot.json") }
             if let memories { await write(memories, to: "memories.json") }
-            async let trustData = try? api.trustSnapshotData()
             async let personalityFetch: PersonalityProfile? = {
                 do { return try await api.getPersonality() } catch {
                     nativeLog("[MacSyncEngine] snapshot fetch failed for personality — keeping last good file: %@", "\(error)")
@@ -325,17 +324,13 @@ extension MacSyncEngine {
             }()
             async let approvalsData: SnapshotGroupBuild = self.nativeApprovalsSnapshotData(approvals)
             async let inboxData: SnapshotGroupBuild = self.nativeInboxSnapshotData(inbox)
-            let (trustRaw, personalityProfile, approvalsRaw, inboxRaw) = await (
-                trustData,
+            let (personalityProfile, approvalsRaw, inboxRaw) = await (
                 personalityFetch,
                 approvalsData,
                 inboxData
             )
-            if let trustRaw {
-                await writeData(trustRaw, to: "trust_policy.json")
-            } else {
-                recordGroupSkip("trust_policy", "native trust snapshot unavailable")
-            }
+            do { await writeData(try await api.trustSnapshotData(), to: "trust_policy.json") }
+            catch { recordFetchFailure("trust_policy", error) }
             do {
                 await write(try await api.macIntegrationPermissionsSnapshot(), to: "mac_integration_permissions.json")
             } catch {
@@ -380,7 +375,7 @@ extension MacSyncEngine {
                         guard let s, s.count > cap else { return s }
                         return String(s.prefix(cap)) + "… [clipped for sync]"
                     }
-                    let runsData = await MobileSnapshotBuilder.shared.build { () -> Data? in
+                    let runsData = await MobileSnapshotBuilder.shared.build { () -> SnapshotGroupBuild in
                         let encoder = MobileSnapshotBuilder.encoder()
                         let recent = runsAll
                             .sorted { $0.createdAt > $1.createdAt }
@@ -392,13 +387,16 @@ extension MacSyncEngine {
                                 r.error = clip(r.error, 2_000)
                                 return r
                             }
-                        guard let bounded = try? EncodedPrefix.largestPrefix(
-                            count: recent.count, maximumEncodedBytes: 6 * 1024 * 1024,
-                            encode: { try encoder.encode(Array(recent.prefix($0))) }
-                        ), recent.isEmpty || bounded.included > 0 else { return nil }
-                        return bounded.data
+                        do {
+                            let bounded = try EncodedPrefix.largestPrefix(
+                                count: recent.count, maximumEncodedBytes: 6 * 1024 * 1024,
+                                encode: { try encoder.encode(Array(recent.prefix($0))) }
+                            )
+                            guard recent.isEmpty || bounded.included > 0 else { return .skipped("Run snapshot exceeds 6 MiB") }
+                            return .built(bounded.data)
+                        } catch { return .skipped(error.localizedDescription) }
                     }
-                    if let runsData { await writeData(runsData, to: "runs.json") }
+                    await publish(runsData, to: "runs.json")
                 } else {
                     recordGroupSkip("runs", "run ledger unavailable or unreadable")
                 }
@@ -443,7 +441,6 @@ extension MacSyncEngine {
             if let memProposals { await write(memProposals, to: "memory_proposals.json") }
             await write([JSONValue](), to: "training_proposals.json")
             if let providers { await write(providers.providers, to: "providers.json") }
-            await write(api.providerSignInStates(), to: "provider_sign_ins.json")
 
             // Publish canonical surface routing so both phone pickers use the Mac's model and effort under one revision.
             if includeHeavySnapshots {
@@ -604,7 +601,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Publish before signalling and checkpointing; failed groups must invalidate their digests for retry.
+    /// Publish before checkpointing; failed groups must invalidate their digests for retry.
     @discardableResult
     func publishChangedSnapshots(
         _ committed: [String: Data],
@@ -613,7 +610,7 @@ extension MacSyncEngine {
     ) async -> [NAMobileSnapshotGroup: DeviceSyncError] {
         let changedFilenames = Set(committed.keys)
         let groups = NAMobileSnapshotGroup.groups(containingAny: changedFilenames)
-        var failures = await sync.bridge.publishMobileSnapshotStatus(
+        let failures = await sync.bridge.publishMobileSnapshotStatus(
             groups: groups,
             snapshotDirectory: snapshotDir,
             committed: committed,
@@ -624,19 +621,6 @@ extension MacSyncEngine {
             let messages = NAMobileSnapshotGroup.stalenessMessages(Self.publishFailureSkips(failures, changed: changedFilenames))
             syncError = messages.keys.sorted().first.flatMap { messages[$0] }
             forgetSnapshotDigests(for: changedFilenames)
-        }
-        if !sync.bridge.usesCloudKitDeviceTransport {
-            syncError = "Waiting on iCloud to synchronize the snapshot signal."
-            let signaled = await signalSnapshotGroups(groups)
-            guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return [:] }
-            if !signaled {
-                let reason = """
-                    iCloud could not synchronize the snapshot signal. Delivery to the iPhone is unconfirmed; keep NativeAgent open and check iCloud access.
-                    """
-                syncError = reason
-                for group in groups { failures[group] = .transient(message: reason) }
-                forgetSnapshotDigests(for: changedFilenames)
-            }
         }
         await saveSnapshotDigests()
         return failures
@@ -654,17 +638,6 @@ extension MacSyncEngine {
             }
         }
         return skips
-    }
-
-    private func signalSnapshotGroups(_ groups: Set<NAMobileSnapshotGroup>) async -> Bool {
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        let names = groups.map(\.rawValue).sorted().joined(separator: ",")
-        let signal = "\(stamp)|groups=\(names)"
-        return await Task.detached(priority: .utility) {
-            let kvs = NSUbiquitousKeyValueStore.default
-            kvs.set(signal, forKey: KVSKey.snapshotUpdated)
-            return kvs.synchronize()
-        }.value
     }
 
     private func transcriptSnapshotSessions(from sessions: [ChatSession], navigation: ChatSessionNavigation) throws -> [ChatSession] {
@@ -861,33 +834,7 @@ extension MacSyncEngine {
         let digest = await MobileSnapshotBuilder.shared.build { [data] in MacSyncSnapshotIntegrity.digest(data) }
         guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
         let url = snapshotDir.appendingPathComponent(filename)
-        // Digests narrow the read; only equal payload bytes in the last committed file can suppress a write.
-        if let previous = snapshotFileDigests[filename], previous.payload == digest {
-            do {
-                let equal = try await VolumeIO.run { [data] in
-                    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-                    guard attributes[.type] as? FileAttributeType == .typeRegular,
-                          let size = attributes[.size] as? NSNumber,
-                          size.intValue >= 0, size.intValue <= MacSyncSnapshotIntegrity.maximumSnapshotBytes else {
-                        throw CocoaError(.fileReadCorruptFile)
-                    }
-                    let written = try VolumeIO.contents(of: url)
-                    guard MacSyncSnapshotIntegrity.digest(written) == previous.wire else { return false }
-                    if Self.revisionedSnapshotFiles.contains(filename) {
-                        guard let envelope = try JSONSerialization.jsonObject(with: written) as? [String: Any],
-                              let payload = envelope["value"] else { throw CocoaError(.fileReadCorruptFile) }
-                        return try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) == data
-                    }
-                    return written == data
-                }
-                guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
-                if equal { return .unchanged }
-            } catch {
-                // Proven absence is recreated; an unreadable copy is neither equal nor empty.
-                if !Self.isNoSuchFileError(error) { return .failed(error.localizedDescription) }
-            }
-        }
-        guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
+        if snapshotFileDigests[filename]?.payload == digest { return .unchanged }
         if Self.revisionedSnapshotFiles.contains(filename) {
             do { data = try await MobileSnapshotBuilder.shared.build { [data] in try Self.revisionedSnapshotData(data, revision: readRevision) } }
             catch { return .failed(error.localizedDescription) }

@@ -51,6 +51,11 @@ origin predates the watermark; wholly consumed exchanges remain excluded.
 | `agent` | Their conversation with another agent or one of their helpers |
 | `builder` | The agent's own work: its mind stream (`mind`, titled Thoughts), lines and workers; no person is in it |
 
+A contact's session opened in the Mac chat page is headed with the contact's
+name. A session a caller opens is titled, when it is first titled, with the
+contact, when the caller opened and its process. Rows are seated and labelled
+as in any session, and the composer there messages the agent in that session.
+
 `NativeAgentShared.ChatThreadKind.isPersonConversation`, `isPeerConversation` and `isOwnWork` are
 the shared questions. A stored `legacy` kind, like a row without a kind, reads
 as the effective kind an unambiguous recorded source proves: recognized app
@@ -127,6 +132,10 @@ conversation's in-memory rows without loading that conversation from disk;
 other conversations use the existing plain transcript read, without publishing
 saved rows, building cards or decoding thumbnails. Whole-file transcript
 reads and JSON decoding run off the main actor, including mirror-card reads.
+An opening read with a missing transcript, or without conclusive speech within
+200 rows or 1 MiB, carries an issue. That reading cannot classify the conversation
+as the agent's own work: an otherwise eligible conversation stays on Today,
+beside its named opening-read gap.
 Displayed image previews share one thumbnail per inspected attachment file
 identity (device, inode, size, mtime and ctime), with only that path's current
 identity retained. Missing or uninspectable files supply no preview and no

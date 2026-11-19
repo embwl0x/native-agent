@@ -23,7 +23,7 @@ canonical subsystem owners and never choose between runtimes.
 Core package products include persistence, approvals, tool discovery and
 execution, persona, doctor checks, chat orchestration, memory, dreams/REM,
 self-improvement, trust, provider routing, background cognition, connectors,
-workflows, and the cognition/organism runtime.
+and the cognition/organism runtime.
 
 `Sources/` groups implementations by module, and `Package.swift` defines the
 actual products and dependency graph. `NativeAgentEvaluation` and ChatDrive
@@ -47,7 +47,7 @@ Key ownership boundaries:
   **BackgroundWork** own unattended work from the Swift app. **EngineRuntime**
   owns the evaluation artifact reads and manual diagnostic support projections.
 - **PersonaEngine** owns built-in skill guidance and its display inventory;
-  **TrustCenter** owns capability-pack admission, saved workflow templates and the part-installation port.
+  **TrustCenter** owns capability-pack admission and the part-installation port.
 - **ToolRegistry**,
   **Research**, **Connectors**, and **MacControl** serve their
   runtime surfaces directly from Swift modules and the shared data root.

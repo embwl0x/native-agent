@@ -138,9 +138,15 @@ enum EngineFaceThreadProjection {
     @MainActor private static func runsInput(_ id: UUID, engine: NativeAgentEngine) -> (AgentContactThreads.HelperResults?, FaceReadState) {
         let owner = engine.contactThreads
         let helper = owner.helpers.first { $0.id == id }
-        let results = owner.helperRuns[id]
+        let results: AgentContactThreads.HelperResults?
+        let readIssue: String?
+        switch owner.helperRuns[id] {
+        case .success(let value)?: results = value; readIssue = nil
+        case .failure(let issue)?: results = nil; readIssue = issue.localizedDescription
+        case nil: results = nil; readIssue = nil
+        }
         let state: FaceReadState
-        if let issue = owner.helpersRefreshError ?? owner.contactRefreshError ?? helper?.runReadIssue {
+        if let issue = owner.helpersRefreshError ?? owner.contactRefreshError ?? helper?.runReadIssue ?? readIssue {
             state = .unavailable(failure("helper_history_unavailable", issue))
         } else if !owner.helpersLoaded || !owner.loaded { state = .waiting(on: "helper history") }
         else if helper == nil {

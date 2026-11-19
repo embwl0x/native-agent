@@ -100,13 +100,12 @@ extension NativeAgentNotificationActions {
     }
 
     @MainActor
-    static func openConversation(_ sessionID: String, messageID: String? = nil) async {
+    static func openConversation(_ sessionID: String) async {
         _ = ApplicationLifetime.shared.request(.sidebar(.chat))
         guard let appModel = ApplicationLifetime.shared.appModel else { return }
         await appModel.refreshChatSessionIndex()
         if let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionID }) {
             await appModel.selectChatSession(session)
-            appModel.pendingChatMessageID = messageID
         }
     }
 
@@ -119,10 +118,6 @@ extension NativeAgentNotificationActions {
 @MainActor
 enum NativeAgentApprovalNotifications {
     static func observe() async {
-        await observeApprovals()
-    }
-
-    private static func observeApprovals() async {
         let engine = NativeAgentEngine.live
         let delivery = ApprovalNotificationDelivery(engine: engine)
         for await _ in await ForPerson.at(engine.dataRoot).changes() {

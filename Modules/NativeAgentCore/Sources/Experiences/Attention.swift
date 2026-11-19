@@ -1,7 +1,8 @@
 import Foundation
+import GRDB
 import NativeAgentCore
 import os
-// Blueprint: | `Attention.swift` | `Attention`: committed happening intake and checked membership, weighing and thought records |
+// Blueprint: | `Attention.swift` | Committed happening intake and settled thoughts carry birth steering in the one record |
 
 /// What takes a written happening into the agent's attention: the cognition runtime, installed at launch. A happening written before it is installed
 /// waits in the record and is taken when it opens.
@@ -10,6 +11,20 @@ public protocol AttentionIntake: Sendable {
     func took(_ experience: Experience) async
     /// A message or a return was admitted to one of the agent's conversations.
     func arrived() async
+}
+
+extension ExperienceStore {
+    /// Only committed weighing of this watch on this subject consumes its first-news floor.
+    public func weighed(watch: String, subject: String) throws -> Bool {
+        try database().read { db in
+            guard let found = try Bool.fetchOne(db, sql: """
+                SELECT EXISTS (SELECT 1 FROM detail d JOIN experience e ON e.id = d.subject
+                    WHERE d.source = ? AND d.kind = ? AND json_extract(e.born, '$.happening.subject') = ?
+                      AND json_extract(e.born, '$.happening.watch') = ?)
+                """, arguments: [Attention.detailSource, Attention.weighKind, subject, watch]) else { throw CocoaError(.coderReadCorrupt) }
+            return found
+        }
+    }
 }
 
 /// One intake. Every change the agent's attention takes in is a `Happening` posted here: it is written once under its key, then owed ones open a thought
@@ -39,14 +54,13 @@ public enum Attention {
         Task.detached {
             let store = ExperienceStore.at(dataRoot)
             let born = Experience(id: happening.id, kind: .happening, cause: [happening.door], addressedTo: [happening.destination],
-                owes: happening.owed ? [happening.destination: .init(to: happening.destination)] : [:], happening: happening)
+                owes: happening.owed ? [happening.destination: .init(to: happening.destination)] : [:], happening: happening, steeredBy: Array(Set((happening.peers ?? []) + (happening.elevated ?? []))).sorted())
             do {
                 guard try await store.begin(born) else { return }
                 guard let taken = try await store.experience(happening.id) else { throw RecordError.missingHappening(happening.id) }
                 await installed?.took(taken)
             } catch {
                 log("happening %@ handoff did not complete: %@", happening.id, error.localizedDescription)
-                if !(error is ExperienceStore.LawError) { await store.failed(error) }
                 await RepairOwed.owe(dataRoot, id: happening.id, kind: .act, operation: "attention.post:" + happening.id,
                     owner: happening.id, words: "The happening was not handed to attention: " + error.localizedDescription,
                     lever: "Repair the experience record, then have this happening's source publish its unresolved input.").value
@@ -299,14 +313,9 @@ public enum Attention {
 
     /// The agent's thoughts within the horizon, oldest first; a thought that will not fold is this read's failure.
     public static func thoughts(dataRoot: URL, now: Date = Date()) async throws -> [Experience] {
-        let read = try await thoughtsRead(dataRoot: dataRoot, now: now)
+        let read = try await ExperienceStore.at(dataRoot).born(kinds: [.thought], after: now.addingTimeInterval(-horizon), limit: 4_096)
         if let first = read.unreadable.first { throw first.cause }
         return read.experiences
-    }
-
-    /// Every readable thought within the horizon, oldest first, and each one that will not fold, named.
-    public static func thoughtsRead(dataRoot: URL, now: Date = Date()) async throws -> ExperienceStore.Folded {
-        try await ExperienceStore.at(dataRoot).born(kinds: [.thought], after: now.addingTimeInterval(-horizon), limit: 4_096)
     }
 
     /// Write one detail of what attention noticed; the caller owns an unsuccessful recording.
@@ -315,11 +324,17 @@ public enum Attention {
     }
 
     /// Write a settled thought once.
-    public static func record(thought: Thought, id: String, status: String, cause: [String], dataRoot: URL) async {
+    public static func record(thought: Thought, id: String, status: String, cause: [String], dataRoot: URL, steeredBy: [String]) async {
         let experience = Experience(id: id, kind: .thought, cause: cause, evidence: thought.run.map { [.init(source: "turn", id: $0)] } ?? [],
             outcome: .init(domain: "attention", status: status, effects: status == "hit" ? .occurred : Experience.Effects.none),
-            addressedTo: ["conversation:" + stream], thought: thought)
-        await ExperienceStore.record(dataRoot, id) { store in _ = try await store.begin(experience) }.value
+            addressedTo: ["conversation:" + stream], thought: thought, steeredBy: steeredBy)
+        await ExperienceStore.record(dataRoot, id) { store in
+            _ = try await store.begin(experience)
+            // A thought that read and settled proves the stream reads: every repair the stream owes is met, including per-run debts.
+            if ["hit", "empty", "withheld"].contains(status) {
+                await RepairOwed.settle(dataRoot, owner: stream, after: "thought.read", evidence: .init(source: "thought", id: id)).value
+            }
+        }.value
     }
 
     /// A care moving after a thought about it amends that thought: it mattered.

@@ -181,7 +181,7 @@ extension SwiftNativePersonaEngine {
             at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
         )
         let backups = entries
-            .filter { $0.lastPathComponent.hasPrefix(prefix) && $0.lastPathComponent.hasSuffix(".bak") }
+            .filter { $0.lastPathComponent.hasPrefix(prefix) && $0.lastPathComponent.hasSuffix(".bak") && !$0.lastPathComponent.contains(".pre-reset-") }
             .sorted { $0.lastPathComponent > $1.lastPathComponent }
         guard backups.count > keeping else { return }
         for stale in backups.dropFirst(keeping) {

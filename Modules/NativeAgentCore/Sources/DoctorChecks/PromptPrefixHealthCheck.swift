@@ -9,14 +9,12 @@ import TurnTrace
 // MARK: - Prompt prefix health (Runtime)
 // Stable system material precedes a transcript whose cursor moves only at 1.15/0.70 hysteresis; changing context follows. Anthropic breakpoints and OpenAI
 // routing use this layout, but provider limits still govern cache hits. Silent cache misses cost full input reads, so measure from bounded traces only during
-// explicit Doctor runs. Start at this build's launch: older turns cannot describe the running build. Failed reads fail; no eligible turns stay unmeasured.
+// explicit Doctor runs. Read from this build's first launch, across its relaunches. Failed reads fail; no eligible turns stay unmeasured.
 // Name the window and uncached block to avoid misleading hit rates.
 
 public struct PromptPrefixHealthCheck: DoctorCheck {
     public let id: String = "prompt_prefix_health"
     public let title: String = "Prompt Prefix Cache"
-    /// Measurement-window verdicts stay Doctor-only and never trigger unattended pushes.
-    public let heartbeatEligible: Bool = false
 
     private let root: URL
     private let cache: DoctorScanCache
@@ -104,10 +102,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         guard let window = DoctorWindowFloor.resolve(root: root, now: moment) else {
             return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
                 id: id, title: title, status: "unmeasured",
-                detail: """
-                    This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring \
-                    this build.
-                    """)
+                detail: "build_launch.json does not name the running build, so its window cannot be measured; the next launch writes it.")
         }
         let summary: TurnTraceScanSummary
         do {

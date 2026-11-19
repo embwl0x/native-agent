@@ -12,10 +12,6 @@ enum ChatSessionTabPresentation {
 }
 
 enum ChatRuntimeControlPresentation {
-    static func processingModeTitle(fastMode: Bool) -> String {
-        fastMode ? "Fast" : "Normal"
-    }
-
     static func normalizedFileAccessID(_ id: String) -> String {
         ICloudChatFileAccessPolicy.normalized(id)
     }

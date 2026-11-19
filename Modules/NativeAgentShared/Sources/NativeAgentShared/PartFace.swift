@@ -313,6 +313,9 @@ public struct PartFace: Codable, Sendable, Equatable {
         public let leaf: String?
         public let ref: String?
         public let alt: String?
+        /// Live board card facts keyed by element id, joined by the page owner.
+        public let cards: [String: Value]?
+        public let choices: [[String: Value]]?
         public let fields: [FormField]?
         public var submit: [Action]?
         public let protected: Bool?
@@ -324,12 +327,14 @@ public struct PartFace: Codable, Sendable, Equatable {
                     language: String? = nil, copy: Bool? = nil, read: Call? = nil, revision: String? = nil,
                     leaf: String? = nil, ref: String? = nil, alt: String? = nil,
                     fields: [FormField]? = nil, submit: [Action]? = nil, protected: Bool? = nil,
-                    receiver: String? = nil, doors: [String]? = nil) {
+                    receiver: String? = nil, doors: [String]? = nil, cards: [String: Value]? = nil, choices: [[String: Value]]? = nil) {
             self.kind = kind; self.key = key; self.text = text; self.format = format
             self.language = language; self.copy = copy; self.read = read; self.revision = revision
             self.leaf = leaf; self.ref = ref; self.alt = alt
             self.fields = fields; self.submit = submit; self.protected = protected; self.doors = doors
             self.receiver = receiver
+            self.cards = cards
+            self.choices = choices
         }
         public func formIssues(values: [String: Value]) -> [String: String] {
             var issues: [String: String] = [:]
@@ -479,6 +484,12 @@ public struct PartFace: Codable, Sendable, Equatable {
     }
 }
 
+/// A page label reads only its owner's title, without holding the page's rows or levers.
+public struct PageTitleFace: FaceValue {
+    public let title: String?
+    public init(title: String?) { self.title = title }
+}
+
 /// Native owners supply status, owed state and the person's levers beside the authored face.
 public struct PartFaceSnapshot: FaceValue {
     public enum Status: String, Codable, Sendable { case ready, unavailable, failed }
@@ -554,7 +565,6 @@ public struct PartFaceSnapshot: FaceValue {
 public enum PageFaceKey {
     public static func item(_ page: String, _ item: String) -> FaceKey { .page(page + "/" + item) }
     public static let catalog = FaceKey.page("catalog/own-pages")
-    public static func phone(_ page: String) -> FaceKey { .page("phone/" + page) }
     public static func copy(_ key: String) -> FaceKey { .page("copy/" + key) }
     public static func makeTitle(file: URL, revision: Int) -> FaceKey { .page("make-title/\(revision)/" + file.path) }
 }

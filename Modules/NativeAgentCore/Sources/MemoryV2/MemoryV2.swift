@@ -441,11 +441,11 @@ public actor SwiftNativeMemoryV2 {
 
     public func embedderDimensions() -> Int? { embedder?.dimensions }
 
-    public func embeddingEpoch() -> MemoryEmbeddingEpoch? { embedder?.embeddingEpoch }
+    public func embeddingEpoch() throws -> MemoryEmbeddingEpoch? { try embedder?.embeddingEpoch }
 
     /// Writes never load a cold model; nil vectors leave a durable owedVector record.
     func residentWriteEmbedding(_ text: String) async throws -> (vector: [Float], epoch: MemoryEmbeddingEpoch)? {
-        guard residentEmbeddingEpoch() != nil else { return nil }
+        guard try residentEmbeddingEpoch() != nil else { return nil }
         return try await embedOneWithEpoch(text)
     }
 
@@ -461,14 +461,14 @@ public actor SwiftNativeMemoryV2 {
     }
 
     /// The vector space a turn can query now. Nil while the managed model is cold: a read names that instead of loading the model itself.
-    func residentEmbeddingEpoch() -> MemoryEmbeddingEpoch? {
-        guard let managed = embedder as? ManagedEmbeddingProvider else { return embedder?.embeddingEpoch }
-        return managed.residentEmbeddingEpoch
+    func residentEmbeddingEpoch() throws -> MemoryEmbeddingEpoch? {
+        guard let managed = embedder as? ManagedEmbeddingProvider else { return try embedder?.embeddingEpoch }
+        return try managed.residentEmbeddingEpoch
     }
 
     /// The resident vector space's identity, or nil while cold. Vectors kept outside memory (the agent's habits' examples) are valid only within it.
-    public func warmEmbeddingEpoch() -> String? {
-        residentEmbeddingEpoch()?.rawValue
+    public func warmEmbeddingEpoch() throws -> String? {
+        try residentEmbeddingEpoch()?.rawValue
     }
 
     /// Vectors from the already-resident model, or nil; never loads.
@@ -495,19 +495,22 @@ public actor SwiftNativeMemoryV2 {
         if let managed = embedder as? ManagedEmbeddingProvider {
             return managed.snapshot()
         }
-        // A fail-closed embedder reports not loaded.
+        let epoch: MemoryEmbeddingEpoch?
+        let epochError: String?
+        do { epoch = try embedder.embeddingEpoch; epochError = nil }
+        catch { epoch = nil; epochError = error.localizedDescription }
+        // An unavailable epoch reports its cause, never a fabricated identity.
         let isMock = embedder.modelId == "mock"
-        let isFailClosed = embedder.modelId == ManagedEmbeddingProvider.failClosedBackend
+        let isFailClosed = epochError != nil
         let coreMLUp = !isMock && !isFailClosed
         return EmbeddingRuntimeSnapshot(
             requestedBackend: isMock ? ManagedEmbeddingProvider.mockBackend : ManagedEmbeddingProvider.coreMLBackend,
-            effectiveBackend: isMock
-                ? ManagedEmbeddingProvider.mockBackend
-                : (isFailClosed ? ManagedEmbeddingProvider.failClosedBackend : ManagedEmbeddingProvider.coreMLBackend),
+            effectiveBackend: isFailClosed ? ManagedEmbeddingProvider.failClosedBackend
+                : (isMock ? ManagedEmbeddingProvider.mockBackend : ManagedEmbeddingProvider.coreMLBackend),
             mode: ManagedEmbeddingProvider.performanceMode,
             modelId: embedder.modelId,
             dimensions: embedder.dimensions,
-            embeddingEpoch: embedder.embeddingEpoch.rawValue,
+            embeddingEpoch: epoch?.rawValue,
             coreMLResourcesAvailable: coreMLUp,
             coreMLLoaded: coreMLUp,
             modelLoadable: coreMLUp,
@@ -515,7 +518,7 @@ public actor SwiftNativeMemoryV2 {
             lastLoadedAt: nil,
             lastUnloadedAt: nil,
             unloadReason: nil,
-            lastLoadError: nil,
+            lastLoadError: epochError,
             loadCount: coreMLUp ? 1 : 0,
             unloadCount: 0
         )
@@ -541,7 +544,7 @@ public actor SwiftNativeMemoryV2 {
     public func embedForDerivedContextWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         guard let embedder else { throw MemoryV2Error.storageUnavailable }
         guard !texts.isEmpty else {
-            return MemoryEmbeddingBatch(epoch: embedder.embeddingEpoch, vectors: [])
+            return MemoryEmbeddingBatch(epoch: try embedder.embeddingEpoch, vectors: [])
         }
         return try await embedder.embedWithEpoch(texts)
     }
@@ -555,7 +558,7 @@ public actor SwiftNativeMemoryV2 {
     public func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         guard let embedder else { throw MemoryV2Error.storageUnavailable }
         guard !texts.isEmpty else {
-            return MemoryEmbeddingBatch(epoch: embedder.embeddingEpoch, vectors: [])
+            return MemoryEmbeddingBatch(epoch: try embedder.embeddingEpoch, vectors: [])
         }
         return try await embedder.embedQueriesWithEpoch(texts)
     }
@@ -608,7 +611,7 @@ public actor SwiftNativeMemoryV2 {
         staged.reserveCapacity(corpus.count)
         var candidateEpoch: MemoryEmbeddingEpoch?
         var activationProbe: [Float]?
-        let providerEpoch = embedder.embeddingEpoch
+        let providerEpoch = try embedder.embeddingEpoch
         let liveKeys = Set(corpus.map { EmbeddingRetryKey(epoch: providerEpoch, row: $0) })
         reusable = reusable.filter { liveKeys.contains($0.key) }
 
@@ -658,7 +661,7 @@ public actor SwiftNativeMemoryV2 {
             throw MemoryV2Error.underlying("The memory search model did not identify its vector space.")
         }
         try Task.checkCancellation()
-        guard embedder.embeddingEpoch == candidateEpoch else {
+        guard try embedder.embeddingEpoch == candidateEpoch else {
             throw MemoryV2Error.underlying("The memory search model changed vector spaces while building the index.")
         }
         do {

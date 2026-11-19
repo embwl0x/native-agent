@@ -8,6 +8,8 @@ import Foundation
 /// width). Colours are green, yellow, purple, blue, peach, white and ink. Every element keeps every field as written, the ones this
 /// reader does not know included, so a change by hand rewrites only the fields it changed.
 public struct BoardDocument: Sendable, Equatable {
+    /// The Desk's standing board in the Make store.
+    public static let tableRef = "table"
     /// The file type a board is kept as.
     public static let type = "board"
     public static func isBoard(type: String) -> Bool { type.lowercased() == Self.type }
@@ -118,14 +120,14 @@ public struct BoardDocument: Sendable, Equatable {
 
     /// An id for an element the person adds by hand: unique, so no version laid meanwhile by anyone else can hold it, and what the person
     /// chose or is writing on stays theirs however their change is laid.
-    public static func mintID() -> String { "p" + UUID().uuidString.lowercased().prefix(8) }
+    public static func mintID() -> String { "p" + UUID().uuidString.lowercased() }
 
-    /// The next free id: `e` and a number past every such id on the board.
+    /// The next free id: `e` and twelve lowercase hexadecimal digits from a fresh UUID.
     public var nextID: String {
-        let taken = elements.compactMap { element -> Int? in
-            element.id.hasPrefix("e") ? Int(element.id.dropFirst()) : nil
-        }.max() ?? 0
-        return "e\(taken + 1)"
+        while true {
+            let id = "e" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12).lowercased()
+            if element(id) == nil { return id }
+        }
     }
 
     /// Lays a new element under the id it carries while that id is free, else under the next free one, and returns the id it got.

@@ -5,15 +5,17 @@ import NativeAgentCore
 import PersistenceCore
 import Senses
 import SQLite3
-// Blueprint: | `PartFileReads.swift` | `PartFileReads`: a part's readPaths admission, `files.query` over a private snapshot, `files.mime`'s budget |
+import struct NativeAgentShared.ModuleLog
+import TrustCenter
+// Blueprint: | `PartFileReads.swift` | `PartFileReads`: readPaths admission; `files.query` over a private snapshot, `files.mime`'s budget, `files.names` |
 
 /// The stem's file readers for a part: the part names a file its reach grants; the stem reads a consistent snapshot and returns what it read.
 package enum PartFileReads {
-    static let queryRows = 1...1000, querySeconds = 1...30
+    static let queryRows = 1...1000
 
     /// A file the part's reach grants: computer_files, and a readPaths entry covering the resolved path (`*` is one component; a directory covers
-    /// everything beneath it).
-    static func admitted(_ given: JSONValue?, readPaths: [String], permissions: [String]) throws -> URL {
+    /// everything beneath it), excluding credentials and the admission signing key.
+    static func admitted(_ given: JSONValue?, readPaths: [String], permissions: [String], dataRoot: URL) throws -> URL {
         guard case .string(let raw)? = given, !raw.isEmpty else { throw SenseFailure(code: "bad_input", message: "path names the file to read.") }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         func expanded(_ path: String) -> String { path == "~" ? home : path.hasPrefix("~/") ? home + path.dropFirst(1) : path }
@@ -29,17 +31,27 @@ package enum PartFileReads {
         guard covered else {
             throw SenseFailure(code: "undeclared_path", message: "\(url.path) is not under this part's readPaths; declare it in reach.readPaths.")
         }
+        guard try !MacControlSensitivePathFence.isCredentialPath(url, dataRoot: dataRoot) else {
+            throw SenseFailure(code: "source_denied", message: "A part cannot read credentials or the admission signing key.")
+        }
         return url
     }
 
     /// A message file read whole: a missing or unreadable file says which, before any decoding.
-    static func mime(_ url: URL, _ arguments: [String: JSONValue]) throws -> JSONValue {
+    static func mime(_ url: URL, _ arguments: [String: JSONValue], readPaths: [String], permissions: [String], dataRoot: URL) throws -> JSONValue {
         let budget = try textBudget(arguments)
-        do { return try PartMIMERead.read(url, maxTextBytes: budget) }
+        do { return try PartMIMERead.read(url, maxTextBytes: budget, readPaths: readPaths, permissions: permissions, dataRoot: dataRoot) }
         catch let error as NSError {
             guard let path = error.userInfo[NSFilePathErrorKey] as? String else { throw error }
             throw reading(URL(fileURLWithPath: path), error)
         }
+    }
+
+    /// A directory's immediate names, sorted; nothing beneath it is opened.
+    static func names(_ url: URL, _ arguments: [String: JSONValue]) throws -> JSONValue {
+        guard Set(arguments.keys) == ["path"] else { throw SenseFailure(code: "bad_input", message: "files.names takes {path}.") }
+        do { return .object(["names": .array(try FileManager.default.contentsOfDirectory(atPath: url.path).sorted().map { .string($0) })]) }
+        catch { throw reading(url, error) }
     }
 
     /// files.mime's text budget: max_text_bytes from 1 KiB through 16 MiB, 1 MiB when omitted.
@@ -75,11 +87,11 @@ package enum PartFileReads {
         return SenseFailure(code: "read_failed", message: "Could not read \(url.path): \(error.localizedDescription). Nothing was read.")
     }
 
-    /// One read-only statement over SQLite's consistent backup of a read-only source connection.
+    /// One read-only statement over a private point-in-time clone of the source and its journal files.
     static func query(_ url: URL, _ arguments: [String: JSONValue]) throws -> JSONValue {
-        guard Set(arguments.keys).isSubset(of: ["path", "sql", "params", "limit", "seconds"]), case .string(let sql)? = arguments["sql"], !sql.isEmpty,
+        guard Set(arguments.keys).isSubset(of: ["path", "sql", "params", "limit"]), case .string(let sql)? = arguments["sql"], !sql.isEmpty,
               !sql.utf8.contains(0) else {
-            throw SenseFailure(code: "bad_input", message: "files.query takes {path, sql, params?, limit?, seconds?}.")
+            throw SenseFailure(code: "bad_input", message: "files.query takes {path, sql, params?, limit?}.")
         }
         func bounded(_ key: String, _ range: ClosedRange<Int>, _ fallback: Int) throws -> Int {
             guard let given = arguments[key] else { return fallback }
@@ -88,71 +100,81 @@ package enum PartFileReads {
             }
             return Int(value)
         }
-        let limit = try bounded("limit", queryRows, 200), seconds = try bounded("seconds", querySeconds, 10)
+        let limit = try bounded("limit", queryRows, 200)
         let params: [JSONValue] = if case .array(let list)? = arguments["params"] { list } else if arguments["params"] == nil { [] } else {
             throw SenseFailure(code: "bad_input", message: "params is a list of strings, numbers, Booleans or nulls.")
         }
-        let watch = Watch(deadline: Date().addingTimeInterval(TimeInterval(seconds)))
-        let db = try snapshot(url, watch: watch)
-        defer { sqlite3_close(db) }
-        guard sqlite3_exec(db, "PRAGMA query_only = ON", nil, nil, nil) == SQLITE_OK else {
-            throw SenseFailure(code: "sqlite_error", message: "The snapshot could not be held read-only. Nothing was read.")
-        }
-        foldedContains(db)
-        let box = Unmanaged.passRetained(watch)
-        defer { box.release() }
-        sqlite3_progress_handler(db, 1000, { context in
-            guard let context else { return 1 }
-            return Unmanaged<Watch>.fromOpaque(context).takeUnretainedValue().deadline < Date() || Task.isCancelled ? 1 : 0
-        }, box.toOpaque())
-        var statement: OpaquePointer?
-        // SQLite's tail borrows sql's C buffer. Copy it while that buffer is alive.
-        let (prepared, remainder) = sql.withCString { source in
-            var tail: UnsafePointer<CChar>?
-            let result = sqlite3_prepare_v2(db, source, -1, &statement, &tail)
-            return (result, tail.map { String(cString: $0) })
-        }
-        defer { sqlite3_finalize(statement) }
-        guard prepared == SQLITE_OK, let statement else {
-            throw SenseFailure(code: "sqlite_error", message: "The query did not prepare: \(String(cString: sqlite3_errmsg(db))). Nothing was read.")
-        }
-        guard let remainder, remainder.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ";"))).isEmpty,
-              sqlite3_stmt_readonly(statement) != 0 else {
-            throw SenseFailure(code: "not_read_only", message: "files.query runs one read-only statement. Nothing was read.")
-        }
-        for (index, value) in params.enumerated() {
-            let slot = Int32(index + 1)
-            switch value {
-            case .string(let text): sqlite3_bind_text(statement, slot, text, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-            case .int(let number): sqlite3_bind_int64(statement, slot, number)
-            case .double(let number): sqlite3_bind_double(statement, slot, number)
-            case .bool(let flag): sqlite3_bind_int64(statement, slot, flag ? 1 : 0)
-            case .null: sqlite3_bind_null(statement, slot)
-            default: throw SenseFailure(code: "bad_input", message: "params[\(index)] is not a string, number, Boolean or null.")
+        let (db, folder) = try snapshot(url)
+        func read() throws -> [String: JSONValue] {
+            guard sqlite3_exec(db, "PRAGMA query_only = ON", nil, nil, nil) == SQLITE_OK else {
+                throw SenseFailure(code: "sqlite_error", message: "The snapshot could not be held read-only. Nothing was read.")
             }
-        }
-        let columns = (0..<sqlite3_column_count(statement)).map { JSONValue.string(String(cString: sqlite3_column_name(statement, $0))) }
-        var rows: [JSONValue] = [], truncated = false
-        while true {
-            let step = sqlite3_step(statement)
-            if step == SQLITE_DONE { break }
-            guard step == SQLITE_ROW else {
-                if step == SQLITE_INTERRUPT {
-                    if Task.isCancelled { throw CancellationError() }
-                    throw SenseFailure(code: "deadline", message: "The query ran past \(seconds) s and was stopped. Narrow it or raise seconds.")
+            foldedContains(db)
+            sqlite3_progress_handler(db, 1000, { _ in Task.isCancelled ? 1 : 0 }, nil)
+            var statement: OpaquePointer?
+            // SQLite's tail borrows sql's C buffer. Copy it while that buffer is alive.
+            let (prepared, remainder) = sql.withCString { source in
+                var tail: UnsafePointer<CChar>?
+                let result = sqlite3_prepare_v2(db, source, -1, &statement, &tail)
+                return (result, tail.map { String(cString: $0) })
+            }
+            defer { sqlite3_finalize(statement) }
+            guard prepared == SQLITE_OK, let statement else {
+                throw SenseFailure(code: "sqlite_error", message: "The query did not prepare: \(String(cString: sqlite3_errmsg(db))). Nothing was read.")
+            }
+            guard let remainder, remainder.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ";"))).isEmpty,
+                  sqlite3_stmt_readonly(statement) != 0 else {
+                throw SenseFailure(code: "not_read_only", message: "files.query runs one read-only statement. Nothing was read.")
+            }
+            let slots = sqlite3_bind_parameter_count(statement)
+            guard Int(slots) == params.count else {
+                throw SenseFailure(code: "sqlite_error", message: "The query requires \(slots) parameter slots and received \(params.count). Nothing was read.")
+            }
+            for (index, value) in params.enumerated() {
+                let slot = Int32(index + 1)
+                switch value {
+                case .string(let text): sqlite3_bind_text(statement, slot, text, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                case .int(let number): sqlite3_bind_int64(statement, slot, number)
+                case .double(let number): sqlite3_bind_double(statement, slot, number)
+                case .bool(let flag): sqlite3_bind_int64(statement, slot, flag ? 1 : 0)
+                case .null: sqlite3_bind_null(statement, slot)
+                default: throw SenseFailure(code: "bad_input", message: "params[\(index)] is not a string, number, Boolean or null.")
                 }
-                throw SenseFailure(code: "sqlite_error", message: "The query failed: \(String(cString: sqlite3_errmsg(db))). Nothing more was read.")
             }
-            guard rows.count < limit else { truncated = true; break }
-            rows.append(.array((0..<Int32(columns.count)).map { cell(statement, $0) }))
+            let columns = (0..<sqlite3_column_count(statement)).map { JSONValue.string(String(cString: sqlite3_column_name(statement, $0))) }
+            var rows: [JSONValue] = [], truncated = false
+            while true {
+                let step = sqlite3_step(statement)
+                if step == SQLITE_DONE { break }
+                guard step == SQLITE_ROW else {
+                    if step == SQLITE_INTERRUPT, Task.isCancelled { throw CancellationError() }
+                    throw SenseFailure(code: "sqlite_error", message: "The query failed: \(String(cString: sqlite3_errmsg(db))). Nothing more was read.")
+                }
+                guard rows.count < limit else { truncated = true; break }
+                rows.append(.array((0..<Int32(columns.count)).map { cell(statement, $0) }))
+            }
+            return ["columns": .array(columns), "rows": .array(rows), "count": .int(Int64(rows.count)), "truncated": .bool(truncated),
+                    "path": .string(url.path), "snapshot": .string(folder == nil ? "sqlite_backup" : "file_clone")]
         }
-        return .object(["columns": .array(columns), "rows": .array(rows), "count": .int(Int64(rows.count)), "truncated": .bool(truncated),
-                        "path": .string(url.path)])
+        let outcome = Result(catching: read)
+        sqlite3_close(db)
+        let left = folder.flatMap(discard)
+        if case .failure = outcome, let left { log("files.query: the private snapshot was not removed: %@", left) }
+        var reply = try outcome.get()
+        // A clone that could not be removed is part of what happened, beside the rows it gave.
+        if let left {
+            reply["snapshot_left"] = .string(left)
+            log("files.query: the private snapshot was not removed: %@", left)
+        }
+        return .object(reply)
     }
 
-    /// SQLite's backup API reads one database generation, including committed WAL pages; no independently copied sidecars.
-    /// Busy writers or a continually changing source spend the same deadline as the query, never an unbounded wait.
-    private static func snapshot(_ url: URL, watch: Watch) throws -> OpaquePointer {
+    /// SQLite's backup API copies one consistent generation (committed WAL pages included) in a single read transaction. A source its app
+    /// holds under an exclusive lock (Chrome's History while Chrome runs) refuses that read; then the file and its journal are cloned
+    /// instead: APFS clonefile is instant copy-on-write and takes no SQLite lock. The database is cloned before its journal, so a hot
+    /// journal rolls the clone back to its last committed state when SQLite opens it; the clone opens read-write only for that recovery.
+    /// A source that can be neither read nor cloned reports the lock by name.
+    private static func snapshot(_ url: URL) throws -> (db: OpaquePointer, folder: URL?) {
         do { try FileHandle(forReadingFrom: url).close() } catch { throw reading(url, error) }
         var source: OpaquePointer?
         let opened = sqlite3_open_v2(url.path, &source, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil)
@@ -169,32 +191,81 @@ package enum PartFileReads {
             sqlite3_close(destination)
             throw SenseFailure(code: "sqlite_error", message: "The private SQLite snapshot could not open. Nothing was read.")
         }
-        do {
-            guard let backup = sqlite3_backup_init(destination, "main", source, "main") else {
-                let reason = String(cString: sqlite3_errmsg(destination))
-                throw SenseFailure(code: "sqlite_error", message: "The snapshot could not start: \(reason). Nothing was read.")
-            }
-            var result: Int32 = SQLITE_OK
+        guard let backup = sqlite3_backup_init(destination, "main", source, "main") else {
+            let reason = String(cString: sqlite3_errmsg(destination))
+            sqlite3_close(destination)
+            throw SenseFailure(code: "sqlite_error", message: "The snapshot could not start: \(reason). Nothing was read.")
+        }
+        do { try Task.checkCancellation() } catch { sqlite3_backup_finish(backup); sqlite3_close(destination); throw error }
+        let result = sqlite3_backup_step(backup, -1)
+        let finished = sqlite3_backup_finish(backup)
+        if result == SQLITE_DONE, finished == SQLITE_OK { return (destination, nil) }
+        sqlite3_close(destination)
+        guard result == SQLITE_BUSY || result == SQLITE_LOCKED else {
+            let code = result == SQLITE_DONE ? finished : result
+            throw SenseFailure(code: "sqlite_error", message: "The snapshot failed: \(String(cString: sqlite3_errstr(code))). Nothing was read.")
+        }
+        return try clone(url)
+    }
+
+    private static func clone(_ url: URL) throws -> (db: OpaquePointer, folder: URL?) {
+        func failed(_ why: String) -> SenseFailure {
+            SenseFailure(code: "sqlite_error", message: """
+                \(url.lastPathComponent) is locked by the app that writes it and \(why), so no snapshot was taken. Nothing was read.
+                """)
+        }
+        // SQLite's header change counter moves on every commit: the same value before and after the clones proves they are one generation.
+        func generation() throws -> Data {
+            let handle = try FileHandle(forReadingFrom: url)
+            let counter: Data
             do {
-                repeat {
-                    try Task.checkCancellation()
-                    guard Date() < watch.deadline else {
-                        throw SenseFailure(code: "deadline", message: "The SQLite snapshot exceeded the query deadline. Nothing was read.")
-                    }
-                    result = sqlite3_backup_step(backup, 128)
-                    if result == SQLITE_BUSY || result == SQLITE_LOCKED { sqlite3_sleep(10) }
-                } while result == SQLITE_OK || result == SQLITE_BUSY || result == SQLITE_LOCKED
+                try handle.seek(toOffset: 24)
+                counter = try handle.read(upToCount: 4) ?? Data()
             } catch {
-                sqlite3_backup_finish(backup)
+                try handle.close()
                 throw error
             }
-            let finished = sqlite3_backup_finish(backup)
-            guard result == SQLITE_DONE, finished == SQLITE_OK else {
-                throw SenseFailure(code: "sqlite_error", message: "The snapshot failed: \(String(cString: sqlite3_errmsg(destination))). Nothing was read.")
+            try handle.close()
+            return counter
+        }
+        let before: Data
+        do { before = try generation() } catch { throw reading(url, error) }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("files-query-" + UUID().uuidString, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let copy = folder.appendingPathComponent(url.lastPathComponent)
+            for suffix in ["", "-journal", "-wal"] {
+                // clonefile only: an ordinary copy is neither instant nor a single instant's bytes.
+                if clonefile(url.path + suffix, copy.path + suffix, 0) != 0 {
+                    let code = errno
+                    if !suffix.isEmpty, code == ENOENT { continue }
+                    throw failed("its \(suffix.isEmpty ? "file" : String(suffix.dropFirst())) could not be cloned (\(String(cString: strerror(code))))")
+                }
             }
-            return destination
-        } catch { sqlite3_close(destination); throw error }
+            let after: Data
+            do { after = try generation() } catch { throw reading(url, error) }
+            guard after == before else { throw failed("committed a change while it was being cloned; read it again") }
+            try Task.checkCancellation()
+            var db: OpaquePointer?
+            guard sqlite3_open_v2(copy.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else {
+                let detail = db.map { String(cString: sqlite3_errmsg($0)) } ?? "No SQLite connection."
+                sqlite3_close(db)
+                throw SenseFailure(code: "sqlite_error", message: "The clone of \(url.lastPathComponent) could not open: \(detail). Nothing was read.")
+            }
+            return (db, folder)
+        } catch {
+            if let left = discard(folder) { log("files.query: the private snapshot was not removed: %@", left) }
+            throw error
+        }
     }
+
+    /// The clone's removal; a failure names the folder and its cause for the caller to report.
+    private static func discard(_ folder: URL) -> String? {
+        guard FileManager.default.fileExists(atPath: folder.path) else { return nil }
+        do { try FileManager.default.removeItem(at: folder); return nil }
+        catch { return folder.path + ": " + error.localizedDescription }
+    }
+    private static let log = ModuleLog(category: "ToolExecution")
 
     /// Each cell as read: text as text, a blob as its bytes in base64.
     private static func cell(_ statement: OpaquePointer, _ column: Int32) -> JSONValue {
@@ -232,8 +303,4 @@ package enum PartFileReads {
         }, nil, nil, nil)
     }
 
-    private final class Watch: Sendable {
-        let deadline: Date
-        init(deadline: Date) { self.deadline = deadline }
-    }
 }

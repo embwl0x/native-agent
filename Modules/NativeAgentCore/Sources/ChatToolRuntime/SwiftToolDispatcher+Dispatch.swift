@@ -68,18 +68,6 @@ extension SwiftToolDispatcher {
                 "tool": .string(tool),
             ])
         }
-        // Internal Mac organs are unavailable at a conversational ingress.
-        if Self.internalMacToolNames.contains(tool),
-           !ChatToolSessionInjection.explicitSessionId(in: input).isEmpty {
-            return .object([
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "reason": .string("internal_tool"),
-                "detail": .string("\(tool) is internal now, so nothing ran. Use one of \(Self.fourVerbToolNames.joined(separator: ", ")) instead."),
-                "tool": .string(tool),
-                "replacement": .array(Self.fourVerbToolNames.map { .string($0) }),
-            ])
-        }
         var deskState: DeskState?
         if Self.deskItemTools.contains(tool) {
             if tool == "desk_wait" {
@@ -329,7 +317,9 @@ extension SwiftToolDispatcher {
         case "desk_set_status": return try await impl_desk_set_status(invocation: invocation, input: input, state: deskState!)
         case "desk_wait": return try await impl_desk_wait(invocation: invocation, input: input, state: deskState!)
         case "desk_update_item": return try await impl_desk_update_item(input: input)
-        case "desk_note": return try await impl_desk_note(input: input)
+        case "desk_note":
+            if case .tap? = turn.personAct?.by { return try await impl_desk_note(input: input, byPerson: true) }
+            return try await impl_desk_note(input: input, byPerson: false)
         case "desk_add_ref": return try await impl_desk_add_ref(input: input)
         case "desk_set_cadence": return try await impl_desk_set_cadence(input: input)
         case "desk_set_notify": return try await impl_desk_set_notify(input: input)
@@ -356,9 +346,6 @@ extension SwiftToolDispatcher {
             return try await impl_studio_canon_resolve(turn: turn, input: input, surface: surface)
         case "search_kg":       return try await impl_search_kg(input: input, surface: surface)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
-        case "workspace":
-            // The outer verified-session facade consumes this preparation; Core alone never turns a button into an ungated nested action.
-            return .object(["status": .string("prepared"), "execution": .string("requires_workspace_runtime")])
         case "work_context": return try await impl_work_context(turn: turn, invocation: invocation, input: input, surface: surface)
         case "artifact_find": return try await impl_artifact_find(turn: turn, input: input)
         case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)

@@ -24,7 +24,7 @@ extension AgentConversationSession {
             if row.readInput == nil { current = row }
             else { current = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform) }
             result = AgentConversationView.view(current, details: false, read: true, dataRoot: dataRoot, includeHistory: conversation.returnsHistory)
-            consumeRead(result, peer: peer, message: string(current.readInput?["message_id"]), scope: scope, conversation: conversation,
+            consumeRead(result, turn: turn, peer: peer, message: string(current.readInput?["message_id"]), scope: scope, conversation: conversation,
                             dataRoot: dataRoot)
         }
         // Deduplicate identical replies within ten minutes when merging contact and asking-chat history.
@@ -90,7 +90,7 @@ extension AgentConversationSession {
     }
     /// A read that returns a routine's saved answer to the asking chat consumes it, so its hand-over turn does not tell the same answer again.
     /// The read has already answered: a consumption that cannot be recorded owes its repair and never fails the read it rides on.
-    static func consumeRead(_ result: JSONValue, peer: AgentPeerContact?, message: String?, scope: String, conversation: AgentConversationContext,
+    static func consumeRead(_ result: JSONValue, turn: Turn, peer: AgentPeerContact?, message: String?, scope: String, conversation: AgentConversationContext,
                             dataRoot: URL) {
         guard conversation.consumesAnswer, let peer, peer.transport == .grokBot, let message, case .object(let fields) = result,
               let reply = string(fields["reply"]) else { return }
@@ -98,7 +98,7 @@ extension AgentConversationSession {
             try GrokRequestStore(dataRoot: dataRoot).shown(byReadIn: scope, message, peer: peer.id, reply: reply,
                                                            truncated: fields["reply_truncated"] == .bool(true))
         } catch {
-            RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message, operation: "agent.read.consume:" + message,
+            RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message, steeredBy: turn.steeringStamp(), operation: "agent.read.consume:" + message,
                 owner: GrokRequestStore(dataRoot: dataRoot).root.path,
                 words: "A read returned \(peer.name)'s saved answer but could not record it as taken: " + error.localizedDescription
                     + "; its hand-over may tell the same answer again.",
@@ -112,8 +112,6 @@ extension AgentConversationSession {
         try store.update(id: row.id, operationID: row.operationID) {
             // Preserve an already-settled answer; a background send settles only its own running exchange.
             guard $0.phase == "sending" || background && backgroundSend($0) else { return }
-            // Don't keep a previous request locator for a new uncertain send.
-            $0.readInput = nil
             absorb(receipt, into: &$0)
             // A held send's record begins before the row that hands it out is saved: no held message goes out without its record.
             if heldSend($0) {
@@ -235,7 +233,7 @@ extension AgentConversationSession {
                         && AgentConversationDelivery.accepted(row) {
             row.phase = "ready"
         } else if ["enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending", "delivered", "sent",
-            "delivery_unknown"].contains(state) {
+            "delivery_unknown", "waiting"].contains(state) {
             row.phase = "waiting"
         } else if AgentConversationView.reply(value) != nil {
             row.phase = "ready"

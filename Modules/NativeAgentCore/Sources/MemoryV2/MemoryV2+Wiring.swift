@@ -40,6 +40,11 @@ extension SwiftNativeMemoryV2 {
 
         // Roots are unioned by the landing itself (`MemoryStorage.foldDuplicate`), never patched here.
         var out = MemorySenseProvenance.merging(existing: existing.extras, incoming: newMetadata)
+        // Fact readers use the row's subject, not the bounded occurrence preview. Keep any subject already held.
+        if extras["correction_subject"] == nil || extras["correction_subject"] == .null,
+           case .string(let subject)? = newMeta["correction_subject"] {
+            out["correction_subject"] = .string(subject)
+        }
 
         // Seed source lineage from the row's own source so its first writer cannot disappear.
         var sources: [String] = []
@@ -71,7 +76,6 @@ extension SwiftNativeMemoryV2 {
             var occurrences: [JSONValue] = []
             if case .array(let arr)? = extras["duplicate_occurrences"] { occurrences = arr }
             let entry = JSONValue.object(identity)
-            // Identical occurrence IDs and times mean retry: count it without listing a second run.
             if occurrences.last != entry {
                 occurrences.append(entry)
                 if occurrences.count > duplicateProvenanceCap {
@@ -107,16 +111,6 @@ extension SwiftNativeMemoryV2 {
         return try await storage.matchesTombstone(content: content, embedding: embedded.vector, embeddingEpoch: embedded.epoch)
     }
 
-    /// Show nearest forgotten claims under the recall embedding so the manager judges restated denials.
-    public func forgottenClaims(near text: String, limit: Int) async throws -> [String] {
-        guard !text.isEmpty, limit > 0 else { return [] }
-        try await ensureCanonicalAttachment()
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        let embedded = try await embedQueriesWithEpoch([text])
-        guard let vector = embedded.vectors.first else { return [] }
-        return try await storage.nearestTombstones(embedding: vector, embeddingEpoch: embedded.epoch, limit: limit)
-    }
-
     /// Tombstones refuse forgotten claims; cold writes stay unadmitted until their vector is ready.
     public func store(
         content: String,
@@ -126,6 +120,7 @@ extension SwiftNativeMemoryV2 {
         corrects: String? = nil,
         correctionReason: String? = nil,
         id: String? = nil,
+        status: String = "active",
         context: MemoryWriteContext
     ) async throws -> MemoryRecord {
         let metadata = try context.stamping(metadata)
@@ -168,6 +163,8 @@ extension SwiftNativeMemoryV2 {
             confidence: liftedConfidence ?? 1,
             createdAt: now,
             updatedAt: now,
+            status: status,
+            lifecycle: context.lifecycle ?? MemoryLifecycle.confirmed,
             validFrom: liftedValidFrom,
             validTo: liftedValidTo,
             observedAt: liftedObservedAt,

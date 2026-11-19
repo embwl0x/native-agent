@@ -46,21 +46,20 @@ extension SwiftNativeOnboardingClient {
     }
     /// USER.md is either the onboarding template or a bounded memory projection with an optional preamble. Its content identifies the writer, never completion.
     enum UserDocShape: Equatable {
-        /// No file. Nothing to protect, nothing to prove.
-        case absent
-        /// Exact autogen body plus optional empty preamble; reproducible from SQLite.
-        case generatorProjection
+        case replaceable(baseSHA256: String?)
         /// Foreign text or edited preamble; reset must back it up before replacement.
         case authored
     }
     /// Classify only the generator's exact section structure as reproducible. Foreign headings/comments and malformed markers are authored content. A file that
     /// is there but cannot be read throws: unreadable is not absent.
     static func classifyUserDoc(at path: URL) throws -> UserDocShape {
-        guard FileManager.default.fileExists(atPath: path.path) else { return .absent }
-        let text: String
-        do { text = try String(contentsOf: path, encoding: .utf8) }
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch let error as CocoaError where error.isFileAbsent { return .replaceable(baseSHA256: nil) }
         catch { throw OnboardingError.ioFailure("read \(path.path) failed: \(error.localizedDescription)") }
-        var remainder = text
+        guard var remainder = String(data: data, encoding: .utf8) else {
+            throw OnboardingError.ioFailure("read \(path.path) failed: invalid UTF-8")
+        }
         guard remainder.components(separatedBy: UserMDAutogenMarkers.bodyStart).count == 2,
               remainder.components(separatedBy: UserMDAutogenMarkers.bodyEnd).count == 2,
               let start = remainder.range(of: UserMDAutogenMarkers.bodyStart),
@@ -78,7 +77,7 @@ extension SwiftNativeOnboardingClient {
             else { return .authored }
             remainder.removeSubrange(start.lowerBound..<end.upperBound)
         }
-        return remainder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .generatorProjection : .authored
+        return remainder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .replaceable(baseSHA256: sha256(data)) : .authored
     }
     static func expectedTargetURLs(
         personaRoot: URL,

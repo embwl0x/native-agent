@@ -22,9 +22,7 @@ public enum WorkOverviewRead {
         typealias Candidate = (reference: WorkOverviewReference, updatedAt: String, render: () -> WorkOverviewRow)
         var needs: [Candidate] = pending.map { approval in
             (.init(kind: .approval, id: approval.id), approval.lastRequestedAt ?? approval.createdAt, {
-                // Redact retained asks before phone publication.
-                row(.approval, approval.id, approval.title,
-                    TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(approval.readableAsk)), "Decision needed",
+                row(.approval, approval.id, approval.title, approval.readableAsk, "Decision needed",
                     approval.lastRequestedAt ?? approval.createdAt, detail: 1_000)
             })
         }
@@ -86,9 +84,13 @@ public enum WorkOverviewRead {
     private static func row(_ kind: WorkOverviewReference.Kind, _ id: String, _ title: String,
              _ text: String, _ state: String, _ updated: String,
              location: String? = nil, movement: String? = nil, detail: Int = 4_000) -> WorkOverviewRow {
-        .init(reference: .init(kind: kind, id: id), title: MobileDeskProjectionBounds.clipped(title, to: 240),
-              summary: MobileDeskProjectionBounds.clipped(text, to: 360), detail: MobileDeskProjectionBounds.clipped(text, to: detail), state: state,
-              updatedAt: updated, location: location, movementAt: movement)
+        // Named secrets (`password=…`) as well as token shapes are cut before phone publication.
+        let safe = TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(text))
+        return .init(reference: .init(kind: kind, id: id),
+              title: MobileDeskProjectionBounds.clipped(NativeAppSecretRedactor.redactText(title), to: 240),
+              summary: MobileDeskProjectionBounds.clipped(safe, to: 360), detail: MobileDeskProjectionBounds.clipped(safe, to: detail),
+              state: NativeAppSecretRedactor.redactText(state), updatedAt: updated,
+              location: location.map(NativeAppSecretRedactor.redactText), movementAt: movement)
     }
 
     /// Overview and id-based detail read the same job record.

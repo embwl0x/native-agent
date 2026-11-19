@@ -21,14 +21,11 @@ final class AppModel {
     @ObservationIgnored var chatComposerDrafts: [String: ChatComposerDraft] = [:]
     var chatPendingAttachments: [String: [FaceAttachment]] = [:]
     var pendingChatMessageID: String?
-    var pendingChatBrainSelection: ProviderTurnChoice?
     var pendingMemoryFaceTarget: FaceDestination?
     var pendingPaletteDestination: PaletteSavedDestination?
     var pendingDeskHandle: String?
     var pendingActivitySectionRaw: String?
     var diagnosticsRunID: String?
-    var trustCenterActionOutcome: TrustCenterActionOutcome?
-    var dreamError: String?
     var chatRestoreIssue: String?
     private let editDrafts = FaceEditDrafts()
     /// Each page's ask bar, beside its draft: the words in flight, the last accepted send, or why the last one was refused.
@@ -38,9 +35,6 @@ final class AppModel {
 
     init(client: PipeFaceClient) {
         self.client = client
-        client.face.onPageApplied = { page, snapshot, elapsed in
-            FacePageDiagnostics.arrival(page: page, snapshot: snapshot, elapsed: elapsed)
-        }
         client.onReceiptFailure = { [weak self] failure in
             self?.setFailureStatus(failure, action: "confirm this window's update")
             self?.faceLinkIssue = failure.localizedDescription
@@ -49,20 +43,6 @@ final class AppModel {
 
     var agentDisplayName: String { settingsPersonaDisplayName }
     var agentAddressName: String { agentDisplayName }
-    var chatModel: String {
-        get { currentChatBrainSelection?.model ?? "" }
-        set { stageChatBrainSelection(model: newValue) }
-    }
-    var chatReasoningEffort: String {
-        get { currentChatBrainSelection?.reasoningEffort ?? "" }
-        set { stageChatBrainSelection(reasoningEffort: newValue) }
-    }
-    var chatFastMode: Bool {
-        get { currentChatBrainSelection?.fast == true }
-        set { stageChatBrainSelection(fast: newValue) }
-    }
-    var chatProvider: String { currentChatBrainSelection?.provider ?? "" }
-    var isSavingChatBrain: Bool { providerSavingChatBrain }
 
     func setFailureStatus(_ error: any Error, action: String) {
         setFailureStatus(FaceActionFeedback.message(error, action: action), cause: error)
@@ -87,9 +67,6 @@ final class AppModel {
     func editDraft<Value>(_ subject: String, seed: @autoclosure () -> Value) -> Value {
         editDrafts.value(subject, seed: seed())
     }
-    func editDraftBaseline<Value>(_ subject: String, seed: Value) -> Value {
-        editDrafts.baseline(subject, seed: seed)
-    }
     func setEditDraft<Value>(_ value: Value, for subject: String, baseline: Value? = nil) {
         editDrafts.set(value, for: subject, baseline: baseline)
     }
@@ -98,11 +75,6 @@ final class AppModel {
     }
     func acceptEditDraft<Value: Codable & Equatable>(_ subject: String, submitted: Value, rebasingOn saved: Value) throws {
         try editDrafts.accept(subject, submitted: submitted, rebasingOn: saved)
-    }
-    func mergingEditDraft<Value: Codable>(
-        _ subject: String, edited: Value, into current: Value, baseline originalBaseline: Value? = nil
-    ) throws -> Value {
-        try editDrafts.merging(subject, edited: edited, into: current, baseline: originalBaseline)
     }
     func editBinding<Value>(_ subject: String, seed: @autoclosure @escaping () -> Value) -> Binding<Value> {
         Binding(get: { self.editDraft(subject, seed: seed()) }, set: { self.setEditDraft($0, for: subject) })

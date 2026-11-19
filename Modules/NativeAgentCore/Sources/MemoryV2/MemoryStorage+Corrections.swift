@@ -19,11 +19,10 @@ extension MemoryStorage {
         let history: String?
     }
 
-    /// Called inside the memory write, before any turn payload is settled. Replaying the same origin on the same correction adds no second miss.
+    @discardableResult
     static func recordCorrectionOccurrence(metadata: JSONValue?, rowID: String, createdAt: String, on id: String,
-                                           proposal: Bool = false, in db: Database) throws {
-        guard case .object(let metadata)? = metadata,
-              metadata["kind"] == .string("correction") else { return }
+                                           proposal: Bool = false, in db: Database) throws -> Bool {
+        guard case .object(let metadata)? = metadata, metadata["kind"] == .string("correction") else { return false }
         let at: String
         if let supplied = metadata["turn_at"] {
             guard case .string(let value) = supplied else {
@@ -67,12 +66,13 @@ extension MemoryStorage {
             guard priorDate == date.timeIntervalSince1970, priorSession == session, priorHistory == history else {
                 throw MemoryStorageError.invalidTemporalEvidence("correction origin already has different occurrence evidence")
             }
-            return
+            return false
         }
         try db.execute(sql: """
             INSERT INTO \(table) (\(owner), origin_id, at, occurred_at, session_id, history)
             VALUES (?, ?, ?, ?, ?, ?)
             """, arguments: [id, origin, at, date.timeIntervalSince1970, session, history])
+        return true
     }
 
     static func recordProposedCorrection(_ proposal: StoredProposal, on id: String, in db: Database) throws {
@@ -80,19 +80,20 @@ extension MemoryStorage {
                                        on: id, proposal: true, in: db)
     }
 
-    /// A repeat uses the same canonical duplicate transaction as a save, with the incoming turn intact rather than encoded into a preview patch.
     func repeatCorrection(id: String, source: String, metadata: JSONValue, context: MemoryWriteContext) async throws {
         let metadata = try context.stamping(metadata)
-        let saved = try await dbPool.write { db -> StoredMemory in
+        let saved = try await dbPool.write { db -> StoredMemory? in
             guard let row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
                 .map(Self.decodeMemory), row.metadata?.objectValue?["kind"] == .string("correction") else {
                 throw MemoryV2Error.recordNotFound
             }
+            guard try Self.recordCorrectionOccurrence(metadata: metadata, rowID: id, createdAt: row.createdAt, on: id, in: db) else { return nil }
             var incoming = row
             incoming.source = source
             incoming.metadata = metadata
             return try Self.foldDuplicate(incoming, into: row, in: db)
         }
+        guard let saved else { return }
         invalidateRecallCache()
         pokeUserMDRegen(persona: saved.personaId)
         await pokeProjectionHooks(saved)

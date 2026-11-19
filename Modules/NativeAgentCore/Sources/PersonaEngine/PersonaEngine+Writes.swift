@@ -225,7 +225,7 @@ extension SwiftNativePersonaEngine {
     // MARK: - Document writes
 
     /// Require checked existing documents for edits and keep USER under MemoryV2.
-    /// Hold the document lock across prior read, bounded mutation, backup and durable write.
+    /// Hold the document lock across prior read, edit, backup and durable write.
     /// Return saved content and its modification time.
     public func savePersonalityDoc(id: String, content: String, appending: Bool = false,
                                    expectedContent: String? = nil) async throws -> PersonaDocSpec {
@@ -256,9 +256,7 @@ extension SwiftNativePersonaEngine {
                 throw PersonaWriteError.invalidInput(
                     "The combined document exceeds 30,000 code points. Nothing was appended; shorten the draft or edit the document explicitly.")
             }
-            // Enforce the editor's 30,000-scalar bound on the combined document.
-            let cappedContent = Self.capByCodePoints(nextContent, cap: 30000)
-            if cappedContent == existing.text {
+            if nextContent == existing.text {
                 let values = try path.resourceValues(forKeys: [.contentModificationDateKey])
                 return PersonaDocSpec(id: spec.id, title: spec.title, filename: spec.filename, path: path.path,
                     content: existing.text, updatedAt: values.contentModificationDate.map { NativeTimestampFormat.fractionalZulu($0) })
@@ -268,7 +266,7 @@ extension SwiftNativePersonaEngine {
                 existing.data,
                 to: path.appendingPathExtension("bak")
             )
-            try Self.atomicWriteText(cappedContent, to: path)
+            try Self.atomicWriteText(nextContent, to: path)
 
             // Invalidate committed bytes even if later metadata reads fail.
             await self.publishDerivedPersonaChange(path, reason: "persona_document_saved")
@@ -370,13 +368,6 @@ extension SwiftNativePersonaEngine {
             obj[key] = value
         }
         return obj
-    }
-
-    /// Bound Unicode scalars rather than grapheme clusters.
-    static func capByCodePoints(_ s: String, cap: Int) -> String {
-        let scalars = s.unicodeScalars
-        if scalars.count <= cap { return s }
-        return String(String.UnicodeScalarView(scalars.prefix(cap)))
     }
 
     /// Flush a private temporary file before rename, then fsync its parent so durable acknowledgement includes directory publication.

@@ -23,7 +23,7 @@ extension MacFourVerbs {
             }
         }
         let asHandle = target.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let byHandle = targets.first(where: { $0.handle == asHandle }) { return .hit(byHandle) }
+        if !asHandle.isEmpty, let byHandle = targets.first(where: { $0.handle == asHandle }) { return .hit(byHandle) }
         let hint = roleHint(in: target)
         let identityTarget = stripWithinTargetAimQualifier(target)
         let qualifier = trailingRoleQualifier(in: identityTarget)

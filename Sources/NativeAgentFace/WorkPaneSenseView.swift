@@ -237,9 +237,9 @@ private struct SealedSenseWebView: NSViewRepresentable {
                     guard let self else { return }
                     defer { eventTasks[id] = nil }
                     do {
-                        let message = try FaceWindowReply.message(await client.act(.senseViewEvent(
+                        _ = try FaceWindowReply.message(await client.act(.senseViewEvent(
                             presentation: identity, revision: revision, event: event)))
-                        if !cancelled { report(message) }
+                        if !cancelled { report(nil) }
                     } catch { if !cancelled { report(error.localizedDescription) } }
                 }
             } catch {

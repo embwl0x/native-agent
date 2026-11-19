@@ -21,8 +21,6 @@ public actor BotRunnerScheduler {
     private let isAutonomyEnabled: @Sendable () async -> Bool
     private var inFlight: [UUID: Task<Void, Never>] = [:]
     private var attached = false
-    /// Failed rows keep only their own cadence undeclared this launch; nil means the shared migration input could not be read at all.
-    private var carryOverHeld: Set<UUID>? = []
     /// Retain the gate's observed reason; rereading a toggled switch could invent a different refusal.
     private var lastUnattendedHold: [UUID: (reason: BotMissedRun.Reason, detail: String?)] = [:]
 
@@ -75,23 +73,15 @@ public actor BotRunnerScheduler {
         }
     }
 
-    /// Once, at launch: the clock delivers each helper's time here, the clock's helper times follow the definitions from now on, and requested runs
-    /// left queued run. On the first launch on the clock, each helper keeps the next occurrence bots/runner-jobs.json held.
-    public func attach(carryingOver: Bool?) async -> Bool {
-        guard !attached else { return false }
+    /// The clock delivers helper times here; definitions declare cadences and queued requests run.
+    public func attach() async {
+        guard !attached else { return }
         attached = true
-        var carried = true
-        switch carryingOver {
-        case true?: carried = await carryOver()
-        case false?: break
-        case nil: carryOverHeld = nil; carried = false
-        }
         await OneClock.at(dataRoot).handle(Self.clockOwner) { [weak self] time, occurrence in await self?.deliver(time, occurrence: occurrence) }
         await changed()
         Task.detached { [weak self] in
             for await _ in NotificationCenter.default.notifications(named: BotRunQueue.didChange) { await self?.changed() }
         }
-        return carried
     }
 
     /// A definition or the queue changed: the clock follows the definitions, and queued requests run.
@@ -105,7 +95,6 @@ public actor BotRunnerScheduler {
     /// Each helper that runs on a cadence (not paused, not deleted, not manual) holds one time; a time whose definition changed is declared again from
     /// the new definition, and a time with no such helper is withdrawn.
     private func declareTimes() async {
-        guard let held = carryOverHeld else { return }
         let clock = OneClock.at(dataRoot)
         do {
             let bots = try definitions.list()
@@ -114,7 +103,6 @@ public actor BotRunnerScheduler {
             for bot in bots where !bot.paused && bot.deleted != true && bot.cadence != .manual {
                 let id = Self.timeID(bot.id)
                 wanted.insert(id)
-                if held.contains(bot.id) { continue }
                 let revision = JSONValue.double(bot.updatedAt.timeIntervalSince1970)
                 let rhythm = Self.rhythm(bot.cadence)
                 do {
@@ -287,45 +275,5 @@ public actor BotRunnerScheduler {
         inFlight.removeValue(forKey: id)
         lastUnattendedHold.removeValue(forKey: id)
         NotificationCenter.default.post(name: BotRunQueue.didChange, object: disk.root.deletingLastPathComponent())
-    }
-
-    // MARK: - Carrying runner-jobs.json over
-
-    /// The first launch on the clock, once: each helper's next occurrence (and its last missed one) in bots/runner-jobs.json becomes its clock time, so
-    /// nothing fires twice or is skipped. A helper already on the clock keeps its time; the file is never read again.
-    private func carryOver() async -> Bool {
-        struct Saved: Decodable { let revision: Date; let next: Date; let missed: BotMissedRun? }
-        do {
-            let saved = try disk.locked { try disk.read([String: Saved].self, at: disk.root.appendingPathComponent("runner-jobs.json")) } ?? [:]
-            let clock = OneClock.at(dataRoot)
-            let declared = Set(try await clock.times(owner: Self.clockOwner).map(\.id))
-            let bots = try definitions.list()
-            var complete = true
-            for (key, job) in saved {
-                guard let id = UUID(uuidString: key) else {
-                    complete = false
-                    nativeLog("helper %@ carry-over has an unreadable id; its source stays intact for repair and relaunch", key)
-                    continue
-                }
-                guard let bot = bots.first(where: { $0.id == id }), !declared.contains(Self.timeID(id)) else { continue }
-                do {
-                    if let missed = job.missed { try recordMissed(id, due: missed.dueAt, reason: missed.reason, detail: missed.detail) }
-                    // A next occurrence planned for an older definition is planned again from the current one.
-                    guard job.revision == bot.updatedAt, job.next != .distantFuture else { continue }
-                    try await clock.carryOver(.init(id: Self.timeID(id), rhythm: Self.rhythm(bot.cadence), next: job.next,
-                                                  payload: .object(["revision": .double(bot.updatedAt.timeIntervalSince1970)])))
-                } catch {
-                    complete = false
-                    carryOverHeld?.insert(id)
-                    nativeLog("helper %@ carry-over is incomplete; its cadence awaits repair and relaunch: %@", key, String(describing: error))
-                }
-            }
-            return complete
-        } catch {
-            carryOverHeld = nil
-            nativeLog("helper carry-over is incomplete; saved times stay intact and undeclared cadences wait for repair and relaunch: %@",
-                      String(describing: error))
-            return false
-        }
     }
 }

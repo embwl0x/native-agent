@@ -1,4 +1,7 @@
 import Foundation
+import Darwin
+import NativeAgentCore
+import NativeAgentShared
 
 // Blueprint: | `BoundedResearchDownload.swift` | `BoundedResearchDownload`: bound bytes before appending |
 
@@ -7,6 +10,7 @@ final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecke
     private let lock = NSLock()
     private var limit: Int
     private let pdfLimit: Int?
+    private let publicOrigin: Bool
     private var continuation: CheckedContinuation<ResearchHTTPResponse, Error>?
     private var session: URLSession?
     private var task: URLSessionDataTask?
@@ -16,9 +20,78 @@ final class BoundedResearchDownload: NSObject, URLSessionDataDelegate, @unchecke
     private var body = Data()
     private var observedBytes = 0
 
-    init(limit: Int, pdfLimit: Int?) {
+    init(limit: Int, pdfLimit: Int?, publicOrigin: Bool) {
         self.limit = limit
         self.pdfLimit = pdfLimit
+        self.publicOrigin = publicOrigin
+    }
+
+    /// Stop releases the caller without awaiting synchronous DNS; its late result cannot replace cancellation.
+    static func resolving<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try Task.checkCancellation()
+        let result = ContinuationOnce<Result<T, Error>>()
+        let lookup = Task.detached {
+            result.resume(Result {
+                try Task.checkCancellation()
+                let value = try work()
+                try Task.checkCancellation()
+                return value
+            })
+        }
+        return try await withTaskCancellationHandler {
+            let value = try await result.wait().get()
+            try Task.checkCancellation()
+            return value
+        } onCancel: {
+            result.resume(.failure(CancellationError())) { lookup.cancel() }
+        }
+    }
+
+    static func publicAddress(_ url: URL) throws -> Bool {
+        guard let host = url.host, !host.isEmpty else { throw ResearchClientError.transport("Missing host: \(url)") }
+        var hints = addrinfo(); hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM
+        var first: UnsafeMutablePointer<addrinfo>?
+        let resolved = getaddrinfo(host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")), nil, &hints, &first)
+        guard resolved == 0 else {
+            let cause = "getaddrinfo EAI \(resolved): \(String(cString: gai_strerror(resolved)))"
+            if resolved == EAI_NONAME { throw ResearchClientError.noSuchHost(host, resolverFailure: cause) }
+            throw ResearchClientError.transport("DNS for \(host) failed: \(cause)")
+        }
+        guard let start = first else { throw ResearchClientError.transport("DNS for \(host) returned no addresses.") }
+        defer { freeaddrinfo(start) }
+        var cursor: UnsafeMutablePointer<addrinfo>? = start
+        while let at = cursor {
+            var bytes = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let named = getnameinfo(at.pointee.ai_addr, at.pointee.ai_addrlen, &bytes, socklen_t(bytes.count),
+                                    nil, 0, NI_NUMERICHOST)
+            guard named == 0 else {
+                throw ResearchClientError.transport("Could not read resolved address for \(host): getnameinfo EAI \(named): \(String(cString: gai_strerror(named)))")
+            }
+            let numeric = String(decoding: bytes.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            let address = String(numeric.prefix { $0 != "%" })
+            if NetworkAddress.loopback(address) || NetworkAddress.privateNetwork(address) { return false }
+            cursor = at.pointee.ai_next
+        }
+        return true
+    }
+
+    static func checkRedirect(_ url: URL, publicOrigin: Bool) throws {
+        guard publicOrigin else { return }
+        do {
+            guard try publicAddress(url) else { throw ResearchClientError.transport("A public fetch cannot enter a local or private network.") }
+        } catch { throw ResearchClientError.transport("Refused redirect to \(url): \(error.localizedDescription) Use a public URL.") }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        do {
+            guard let url = request.url else { throw ResearchClientError.transport("Redirect has no URL") }
+            try Self.checkRedirect(url, publicOrigin: publicOrigin)
+            completionHandler(request)
+        } catch {
+            finish(.failure(error))
+            completionHandler(nil)
+        }
     }
 
     func start(request: URLRequest, configuration: URLSessionConfiguration,

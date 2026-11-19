@@ -13,11 +13,6 @@ source "$ROOT/script/lib/build_source_inventory.sh"
 source "$ROOT/script/lib/embedding_model_contract.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
-APP_LOG="$ROOT/.runtime/nativeagent-app.log"
-# Modes: (default) build+sign+launch ·
-# --logs launch+tail · --build-only build+sign ONLY (no kill, no launch —
-# install_app.sh uses this so the running app stays untouched until the new
-# bundle is fully proven).
 FORCE_CHECKOUT_SWITCH=0
 MODE=""
 for arg in "$@"; do
@@ -25,19 +20,17 @@ for arg in "$@"; do
     --force-checkout-switch)
       FORCE_CHECKOUT_SWITCH=1
       ;;
-    --logs|--build-only)
+    --build-only)
       if [[ -n "$MODE" ]]; then
         echo "[build_and_run.sh] ERROR: too many arguments: $*" >&2
-        echo "Usage: ./script/build_and_run.sh [--logs|--build-only] [--force-checkout-switch]" >&2
+        echo "Usage: ./script/build_and_run.sh [--build-only] [--force-checkout-switch]" >&2
         exit 2
       fi
       MODE="$arg"
       ;;
     *)
-      # Fail loud on typos: an unknown flag must not silently fall through to
-      # the default kill+launch path (--build-only is a downtime-safety mode).
       echo "[build_and_run.sh] ERROR: unknown argument: $arg" >&2
-      echo "Usage: ./script/build_and_run.sh [--logs|--build-only] [--force-checkout-switch]" >&2
+      echo "Usage: ./script/build_and_run.sh [--build-only] [--force-checkout-switch]" >&2
       exit 2
       ;;
   esac
@@ -47,7 +40,7 @@ done
 INSTALLED_APP_BUNDLE="$HOME/Applications/$APP_NAME.app"
 if [[ "$MODE" != "--build-only" ]]; then
   nativeagent_require_installed_checkout "$INSTALLED_APP_BUNDLE" "$ROOT" "$FORCE_CHECKOUT_SWITCH" \
-    "[build_and_run.sh]" "Kill+launch from here would bounce the live app and repoint its data root."
+    "[build_and_run.sh]" "Quit+launch from here would bounce the live app and repoint its data root."
 fi
 
 # A Codex/agent workspace sandbox cannot register an AppKit process. Launching
@@ -65,7 +58,6 @@ if ! command -v xcodegen >/dev/null 2>&1; then
   echo "[build_and_run.sh] ERROR: xcodegen is required; install it with: brew install xcodegen" >&2
   exit 1
 fi
-# Turn upgrades consume the committed table; regeneration is a maintainer step.
 ruby "$ROOT/script/sync_build_declarations.rb"
 xcodegen --spec "$ROOT/project.yml"
 
@@ -186,9 +178,6 @@ nativeagent_assert_no_python_artifacts "$BUNDLE" "[swift-native]" staged app
 nativeagent_sign_development_bundle "$BUNDLE" "$ROOT" "$NATIVEAGENT_MAC_BUNDLE_ID" "[sign]"
 rm -rf "$NATIVEAGENT_SIGNING_WORK"
 
-# ─── POINT OF NO RETURN ─────────────────────────────────────────────────────
-# The staged bundle is built, signed, and codesign-verified. Only now do we
-# kill the running app (never in --build-only) and swap dist/NativeAgent.app.
 if [[ "$MODE" != "--build-only" ]]; then
   # Match the app's duplicate-instance rule: same bundle ID, current login session.
   staged_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$BUNDLE/Contents/Info.plist")"
@@ -212,21 +201,13 @@ JAVASCRIPT
       exit 1
     fi
   done
-  # A running dist-launched instance must not have its bundle swapped
-  # underneath it, and the launch below needs the old instance gone.
-  # Skipped in --build-only: install_app.sh verifies its transferred copy
-  # before quitting the app.
-  pkill -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
-  # Wait (up to ~5s) for the app to exit before touching the bundle, then
-  # hard-kill any survivor.
-  for _ in $(seq 1 25); do
-    if pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
-      sleep 0.2
-    else
-      break
-    fi
+  for app_pid in $matching_app_pids; do
+    /usr/bin/osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($app_pid).terminate"
   done
-  pkill -9 -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
+  for app_pid in $matching_app_pids; do
+    echo "[build_and_run.sh] Waiting for NativeAgentApp (pid $app_pid) to exit; Ctrl-C cancels."
+    /usr/bin/caffeinate -w "$app_pid"
+  done
 fi
 
 # Retain the prior artifact until the selected bundle lands. A failed move
@@ -251,13 +232,8 @@ case "$MODE" in
     # quit → swap → relaunch sequence after proving its own signed copy.
     echo "Built + signed $BUNDLE (--build-only: no kill, no launch)"
     ;;
-  --logs)
-    /usr/bin/open -n "$BUNDLE"
-    tail -f "$APP_LOG"
-    ;;
   *)
     /usr/bin/open -n "$BUNDLE"
     echo "Launched $BUNDLE"
-    echo "App log: $APP_LOG"
     ;;
 esac

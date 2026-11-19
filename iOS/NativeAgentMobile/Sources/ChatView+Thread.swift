@@ -332,15 +332,13 @@ extension ChatView {
             .onAppear(perform: conversationAppeared)
             .onChange(of: scenePhase, conversationSceneChanged)
             .onDisappear(perform: conversationDisappeared)
-            .onChange(of: store.isSwitchingSession) { _, switching in
-                if !switching { importSharedItems() }
-            }
             .onChange(of: notifiedSessionID) { _, _ in consumeNotifiedChatSessionIfNeeded() }
             .onReceive(NotificationCenter.default.publisher(for: MobileQuickAskRoute.notification)) { _ in
                 if MobileQuickAskRoute.consume() { composerIsFocused = true }
             }
             .onChange(of: store.isSwitchingSession) { _, switching in
                 guard !switching else { return }
+                importSharedItems()
                 consumeNotifiedChatSessionIfNeeded()
                 adoptMainSessionFromSnapshots()
             }

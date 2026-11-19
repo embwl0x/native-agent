@@ -13,8 +13,4 @@ extension AppModel {
         return face.slot(.counts).select("panel.notice.\(id)", as: CountsFace.self) { $0?.panels.panels[id]?.staleNotice }
     }
 
-    @discardableResult
-    func refreshSidebarActivityBadge() async -> Bool {
-        await requestFaceRefresh(.panel("sidebar"))
-    }
 }

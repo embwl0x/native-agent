@@ -39,7 +39,6 @@ import SchedulerExecution
 import SlackBot
 import StandingBots
 import TelegramBot
-import TriggerScheduler
 import TrustCenter
 import TrustPersistence
 import AgentWorkspace
@@ -49,7 +48,7 @@ import NativeAgentShared
 import Senses
 import ToolExecution
 import Studio
-// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`; Ordered bring-up, ingress and retained settlement |
+// Blueprint: | `EngineLaunch.swift` | Ordered bring-up, sealed program seeds, launch identities, ingress and retained settlement |
 
 /// Native ports supply effects; existing engine and background owners retain scheduling, admission and reconciliation.
 public protocol EngineBackgroundWorkHost: Sendable {
@@ -65,7 +64,6 @@ public protocol EngineBackgroundWorkHost: Sendable {
     func requestSpeechPermissionIfNotDetermined() async -> SpeechPermissionSnapshot
     var voiceName: String { get }
     var agentSubject: String { get }
-    var triggerNotifier: TriggerNotifier { get }
 }
 
 private struct EngineDerivedStateInvalidationSink: DerivedStateInvalidationSink {
@@ -176,6 +174,19 @@ extension NativeAgentEngine {
             if !missing.isEmpty, !(await confirmMissingRoots(missing)) { return false }
         }
         do {
+            try await Task.detached {
+                let directory = dataRoot.appendingPathComponent("skills/runs", isDirectory: true)
+                let paths: [URL]
+                do { paths = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
+                catch CocoaError.fileReadNoSuchFile { return }
+                for path in paths where path.lastPathComponent.range(of: "^run-[0-9a-f]{8}\\.claimed$", options: .regularExpression) != nil {
+                    try FileManager.default.moveItem(at: path, to: path.deletingPathExtension().appendingPathExtension("json"))
+                }
+            }.value
+        } catch {
+            ModuleLog.app("[runs] Saved-run recovery unavailable: %@", error.localizedDescription)
+        }
+        do {
             let recovered = try await MacControlOperationStore(dataRoot: dataRoot).recoverInterruptedOperations()
             ModuleLog.app("[mac-control] startup recovered interrupted operations: %d", recovered)
         } catch {
@@ -190,7 +201,7 @@ extension NativeAgentEngine {
             ModuleLog.app("[browser] Browser actions unavailable after recovery failure; app will start: %@", error.localizedDescription)
         }
         await withTaskGroup(of: Void.self) { group in
-            group.addTask(priority: .utility) { if let resources { await installBundledParts(dataRoot: dataRoot, resources: resources) } }
+            group.addTask(priority: .utility) { await installBundledParts(dataRoot: dataRoot, resources: resources) }
             group.addTask(priority: .utility) {
                 do { try NativeAgentBuildIdentity.current.writeLaunchStamp(root: dataRoot) }
                 catch { ModuleLog.app("[launch] Could not record app start time: %@", error.localizedDescription) }
@@ -209,12 +220,15 @@ extension NativeAgentEngine {
         return true
     }
 
-    private static func installBundledParts(dataRoot: URL, resources: URL) async {
+    private static func installBundledParts(dataRoot: URL, resources: URL?) async {
         let abilities = AbilityStore(dataRoot: dataRoot)
         var failures: [String] = []
         var moved: [(id: String, from: String, to: String)] = []
         var currentSeeds = 0, preparedAdmissions = 0
         do {
+            guard let resources else {
+                throw ToolFailureError("The app's resource directory is unavailable; bundled programs could not be installed.", effects: .none)
+            }
             let bundled = AbilityStore(dataRoot: resources)
             let seeds = try AbilityStore.seedCatalog(resources: resources).sorted { $0.path < $1.path }.map { url in (url, Result { try AbilityStore.decode(
                 url) }) }
@@ -238,27 +252,37 @@ extension NativeAgentEngine {
                     guard try bundled.path(id: seed.id, pathExtension: seed.pathExtension) == url else {
                         throw CocoaError(.fileReadCorruptFile)
                     }
-                    // Preserve authored versions; compare the full unsigned seed contract and recheck at installation.
+                    var bundle = seed.bodyDigest
+                    defer { recordSeed(seed, bundle: bundle, source: url, abilities: abilities) }
                     let current = try abilities.read(id: seed.id, slot: .current)
                     if current == nil, try abilities.contains(id: seed.id) { continue }
-                    let kept: AbilityStore.File, shipped: OwnedProgramStore.Candidate?
+                    let candidate = try seed.kind == .part ? parts.seedCandidate(seed, invocation: admission) : OwnedProgramStore.turnSeed(seed)
+                    bundle = candidate.digest
+                    let unsealed = ["proof", "record", "candidate"]
+                    let shippedUnsealed = current.map { !AbilityStore.isSeed($0) && $0.body == seed.body
+                        && $0.metadata.filter { !unsealed.contains($0.key) } == seed.metadata.filter { !unsealed.contains($0.key) } } ?? false
+                    if let current, !AbilityStore.isSeed(current), !shippedUnsealed,
+                       try seed.kind != .part || !programs.samePart(current, as: candidate) {
+                        try tellShippedBeside(current, shipped: seed, digest: candidate.digest, source: url, dataRoot: dataRoot)
+                        continue
+                    }
+                    let kept: AbilityStore.File
                     if seed.kind == .part {
-                        let candidate = try parts.seedCandidate(seed, invocation: admission)
-                        // A version of the agent's own follows the shipped part while it is that part; any other stays its own.
-                        if let current, !AbilityStore.isSeed(current), try !programs.samePart(current, as: candidate) {
-                            tellShippedBeside(current, shipped: candidate, source: url, dataRoot: dataRoot)
-                            continue
-                        }
                         guard let admitted = try await parts.bundledSeed(seed, candidate: candidate, invocation: admission) else {
                             currentSeeds += 1
                             continue
                         }
-                        preparedAdmissions += 1
-                        kept = admitted; shipped = candidate
+                        kept = admitted
                     } else {
-                        if let current, !AbilityStore.isSeed(current) { continue }
-                        kept = seed; shipped = nil
+                        guard case .int(let version)? = seed.metadata["version"] else { throw CocoaError(.fileReadCorruptFile) }
+                        if try programs.isCurrentSeed(candidate, version: version) {
+                            currentSeeds += 1
+                            continue
+                        }
+                        kept = try programs.bundledSeed(candidate, version: version,
+                            key: await SwiftNativeManifestSigner(dataRoot: dataRoot).loadOrCreateSigningKey())
                     }
+                    preparedAdmissions += 1
                     var followed: String?
                     let displaced = try abilities.installSeed(kept, turn: nil) { current in
                         if AbilityStore.isSeed(current) {
@@ -274,13 +298,12 @@ extension NativeAgentEngine {
                             guard let key = try SwiftNativeManifestSigner(dataRoot: dataRoot).existingSigningKey() else {
                                 throw ManifestSigningError.keyUnavailable("Installed seed authority is missing")
                             }
-                            _ = try programs.proof(try programs.load(id: current.id, digest: digest), key: key)
+                            _ = try programs.proof(current, key: key)
                             followed = digest
                         }
-                        guard let shipped else { return false }
-                        return try programs.samePart(current, as: shipped)
+                        return try shippedUnsealed || seed.kind == .part && programs.samePart(current, as: candidate)
                     }
-                    if displaced != nil, let followed, let shipped { moved.append((seed.id, followed, shipped.digest)) }
+                    if displaced != nil, let followed { moved.append((seed.id, followed, candidate.digest)) }
                 } catch {
                     failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
                 }
@@ -299,7 +322,6 @@ extension NativeAgentEngine {
         }
     }
 
-    /// Parts the agent follows changed under it: one note for the launch, each part with its version from and to. Told once per set of versions.
     private static func tellFollowedChanged(_ moved: [(id: String, from: String, to: String)], dataRoot: URL) {
         guard !moved.isEmpty else { return }
         let lines = moved.map { "\($0.id) \($0.from.prefix(12)) → \($0.to.prefix(12))" }.joined(separator: "; ")
@@ -308,15 +330,32 @@ extension NativeAgentEngine {
             once: "shipped:" + moved.map { $0.id + ":" + $0.to }.joined(separator: ",")), dataRoot: dataRoot)
     }
 
-    /// The agent's own version of a shipped part stays as it is; it is told once of each shipped version, to merge from or leave.
-    private static func tellShippedBeside(_ own: AbilityStore.File, shipped: OwnedProgramStore.Candidate, source: URL, dataRoot: URL) {
+    private static func tellShippedBeside(_ own: AbilityStore.File, shipped: AbilityStore.File, digest: String, source: URL, dataRoot: URL) throws {
+        guard let description = shipped.record["description"]?.stringValue, !description.isEmpty else {
+            throw ToolFailureError("Bundled program \(shipped.id) needs a description of what it changes in its record.", effects: .none)
+        }
         let id = own.id
         Attention.post(Happening(.body, subject: "part:" + id, door: "stem", who: "self",
             words: """
-                The shipped \(id) is at version \(shipped.digest.prefix(12)); yours is your own and stays as it is. ability.read {id:"\(id)"} shows \
-                yours; merge from the shipped one or leave it.
+                The shipped \(id) is at version \(digest.prefix(12)); yours is your own and stays as it is. \
+                \(description) ability.read {id:"\(id)"} shows yours; read the shipped source beside it, \
+                merge from it or leave it.
                 """,
-            once: "shipped:" + id + ":" + shipped.digest, shows: "Shipped source: " + source.path), dataRoot: dataRoot)
+            once: "shipped:" + id + ":" + digest, shows: "Shipped source: " + source.path), dataRoot: dataRoot)
+    }
+
+    private static func recordSeed(_ seed: AbilityStore.File, bundle: String, source: URL, abilities: AbilityStore) {
+        do {
+            guard let installed = try abilities.read(id: seed.id, slot: .current) else {
+                ModuleLog.app("[seeds] resource=%@ installed=missing bundle=%@; selection unavailable", source.lastPathComponent, bundle)
+                return
+            }
+            let sealed = installed.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"]?.stringValue
+            let state = AbilityStore.isSeed(installed) ? "follows" : installed.bodyDigest == seed.bodyDigest ? "hers" : "beside"
+            ModuleLog.app("[seeds] resource=%@ installed=%@ bundle=%@ %@", source.lastPathComponent, AbilityStore.isSeed(installed) ? sealed ?? "unidentified" : installed.bodyDigest, bundle, state)
+        } catch {
+            ModuleLog.app("[seeds] resource=%@ installed=unavailable bundle=%@; %@", source.lastPathComponent, bundle, error.localizedDescription)
+        }
     }
 
     // Disable only untouched unbundled seeds; edited or re-enabled parts belong to the agent.
@@ -419,7 +458,19 @@ extension NativeAgentEngine {
         // Deliver callbacks owed before relaunch without waiting for a task read.
         retainLaunchWork { await NativeAgentEngine.live.agents.tasks.redeliverOwedCallbacks() }
         // A job a relaunch left working resumes through its door or ends stopped, so none waits on a flight that is gone. Its doors are open first.
-        JobDoors.install(dataRoot: dataRoot)
+        JobDoors.install(dataRoot: dataRoot) { id, executable, arguments in
+            let job = try AgentJobStore(dataRoot: dataRoot).job(id)
+            guard let origin = job.commission.origin else { throw JobRefusal("This job has no commissioning origin proof. Nothing ran.") }
+            var permission = await SwiftNativeSecurityCenter(dataRoot: dataRoot).drivenAgentLaunchPermission(origin: origin, turn: nil)
+            let steering = PeerDataTaint(restoring: job.peers ?? [], elevated: job.elevated ?? [])
+            if permission == .fullMac, steering.isTainted
+                || (PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface) && steering.checkpointSources.isEmpty) { permission = .restricted }
+            let rule = await SwiftToolDispatcher.agentProgramLaunch(permission, dataRoot: dataRoot)
+            switch rule.launch {
+            case .run(let wrap): return wrap(executable, arguments)
+            case .refused(let detail): throw JobRefusal(detail)
+            }
+        }
         AgentJobDoors.install(own: NativeAgentEngine.live.agents.ownLineDoor())
         AgentJobs.installGlance()
         retainLaunchWork { await AgentJobs.resume(dataRoot: dataRoot, register: AppToolExecutor.jobRegistrar(dataRoot: dataRoot)) }
@@ -618,9 +669,6 @@ extension NativeAgentEngine {
             async let interactions: Void = InlineInteractionDelivery.observe(dataRoot: dataRoot)
             _ = await (desk, grants, interactions)
         }), !Task.isCancelled else { return }
-        // Refresh restart heartbeat without blocking startup.
-        await retainLaunchWork { await manager.runTickOnce(loopId: "heartbeat") }
-        guard !Task.isCancelled else { return }
         let config = DoctorReadout.readAutoDoctorConfig(dataRoot: dataRoot)
         if (config.enabled ?? true) && (config.runOnStartup ?? true) {
             await retainLaunchWork { await manager.runTickOnce(loopId: "doctor_auto_run") }
@@ -680,6 +728,8 @@ extension NativeAgentEngine {
                 }
             }
             ModuleLog.app("[quit] drained admitted turns")
+            await quitDrained("tool dispatch settlement") { await SwiftNativeTurnEngine.joinDispatchSettlements() }
+            await TurnTraceBus.shared.drainForProcessExit()
             await quitDrained("memory promoter") { await AdaptiveMemoryPromoter.shared.sleep() }
             let slept = await NativeAgentEngine.live.mind?.end() ?? .noMind
             ModuleLog.app("[quit] drained mind")

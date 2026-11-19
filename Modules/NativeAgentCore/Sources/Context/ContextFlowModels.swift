@@ -201,11 +201,13 @@ public struct ContextSourceRange: Codable, Equatable, Hashable, Sendable {
 
 public struct ContextFreshness: Codable, Equatable, Sendable {
     public let createdAt: Date?
+    public let recallSeedAt: Date?
     public let updatedAt: Date
     public let expiresAt: Date?
 
-    public init(updatedAt: Date, expiresAt: Date? = nil, createdAt: Date? = nil) {
+    public init(updatedAt: Date, expiresAt: Date? = nil, createdAt: Date? = nil, recallSeedAt: Date? = nil) {
         self.createdAt = createdAt
+        self.recallSeedAt = recallSeedAt
         self.updatedAt = updatedAt
         self.expiresAt = expiresAt
     }
@@ -502,7 +504,7 @@ public enum ContextFlowStoreError: Error, Equatable, Sendable, CustomStringConve
     public var description: String {
         switch self {
         case .emptyGeneration:
-            "generation has no source changes or removals"
+            "a noninitial generation has no source changes or removals"
         case .duplicateSource(let id):
             "duplicate source in generation: \(id)"
         case .sourceRemovedAndChanged(let id):

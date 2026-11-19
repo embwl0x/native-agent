@@ -45,7 +45,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
         let fm = FileManager.default
         let targets = Self.expectedTargetURLs(personaRoot: personaRoot, profilePath: profileJSONPath, dataRoot: dataRoot)
         guard let soulPath = targets["soul"], let voicePath = targets["voice"], let growthPath = targets["growth"],
-              let agentsPath = targets["agents"], let onboardedSentinel = targets["sentinel"] else {
+              let agentsPath = targets["agents"], let userPath = targets["user"] else {
             throw OnboardingError.ioFailure("The persona target catalog is incomplete.")
         }
         let personaPaths = [soulPath, voicePath, growthPath, agentsPath]
@@ -54,13 +54,11 @@ public struct SwiftNativeOnboardingClient: Sendable {
             personaRoot: personaRoot,
             profilePath: profileJSONPath
         )
-        let hasExisting = pending != nil
-            || personaPaths.contains { fm.fileExists(atPath: $0.path) }
-            || fm.fileExists(atPath: onboardedSentinel.path)
         let hasCompletionAnchor = NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
-        // Persona bytes without completion proof require reset; a generator-only USER.md remains fresh state.
-        let hasPartialPersonaState = !hasCompletionAnchor
-            && personaPaths.contains { fm.fileExists(atPath: $0.path) }
+        let hasExisting = try pending != nil || hasCompletionAnchor
+            || personaPaths.contains { fm.fileExists(atPath: $0.path) }
+            || Self.classifyUserDoc(at: userPath) == .authored
+        let resetRequired = pending == nil && !hasCompletionAnchor && hasExisting
         let profileRepairRequired = pending == nil
             && hasCompletionAnchor
             && !fm.fileExists(atPath: profileJSONPath.path)
@@ -68,7 +66,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
         var profileUnreadable: String?
         if let pending {
             currentName = pending.agentName
-        } else if hasExisting && !profileRepairRequired && !hasPartialPersonaState {
+        } else if hasExisting && !profileRepairRequired && !resetRequired {
             do { currentName = try PersonaCompiler.compileProfile(dataRoot: dataRoot).name }
             catch {
                 profileUnreadable = """
@@ -82,7 +80,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
             currentPersonaName: currentName,
             abilityOverview: Self.abilityOverview,
             pendingRecovery: pending != nil,
-            resetRequired: pending == nil && hasPartialPersonaState,
+            resetRequired: resetRequired,
             profileRepairRequired: profileRepairRequired,
             profileUnreadable: profileUnreadable
         )

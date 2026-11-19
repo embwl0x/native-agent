@@ -4,6 +4,7 @@ import PersistenceCore
 import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
+import Experiences
 // Blueprint: | `ModelCatalogCache.swift` | Credential-bound catalog reads, route-supplied credentials and explicitly refreshed, ordered publication |
 
 /// Catalog freshness records where the rows came from and whether the response is complete.
@@ -92,7 +93,7 @@ public struct ModelCatalogRead: Sendable {
             return "Couldn't load models: \(failure ?? "no list has been fetched yet"). \(remedy ?? "Refresh to try again.")"
         case .staleAfterFailedRefresh:
             let when = fetchedAt.map { " from \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
-            return "Couldn't load models: \(failure ?? "the refresh failed"). The saved list\(when) is historical; refresh before choosing a model."
+            return "Couldn't load models: \(failure ?? "the refresh failed"). The saved list\(when) is still used; refresh to update it."
         case .live, .liveIncomplete, .cached:
             return nil
         }
@@ -151,6 +152,7 @@ struct ModelCatalogCredential: Sendable {
 }
 
 struct ModelCatalogCache: Sendable {
+    var route: String
     /// The cache path scopes refresh ownership and its latest failure.
     var cachePath: @Sendable (URL) -> URL
     var endpoint: URL?
@@ -191,7 +193,7 @@ struct ModelCatalogCache: Sendable {
             } catch { return .failure(FetchFailure(error.localizedDescription)) }
             let fingerprint = SHA256.hash(data: Data(((credential ?? "") + "\n" + (token ?? "")).utf8)).description
             if let flight = flights[fingerprint] {
-                return await withTaskCancellationHandler { await flight.value } onCancel: { flight.cancel() }
+                return await flight.value
             }
             let flight = Task<Result<ModelCatalogFetch, FetchFailure>, Never> {
                 defer { flights.removeValue(forKey: fingerprint) }
@@ -260,13 +262,8 @@ struct ModelCatalogCache: Sendable {
         }
     }
 
-    /// Synchronous routing and passive reads share credential binding and refresh-failure provenance. Nil is confirmed absence.
     func currentCache(dataRoot: URL) throws -> DecodedModelCatalog? {
-        let decoded = try checkedCache(dataRoot: dataRoot)
-        if let reason = lastFailureReason(dataRoot: dataRoot) {
-            throw ProviderRoutingError.configurationFailed(reason)
-        }
-        return decoded
+        try checkedCache(dataRoot: dataRoot)
     }
 
     private func ownerKey(_ dataRoot: URL) -> String {
@@ -276,14 +273,6 @@ struct ModelCatalogCache: Sendable {
     func lastFailureReason(dataRoot: URL) -> String? {
         let key = ownerKey(dataRoot)
         return Self.lastFailedByPath.withLock { $0[key] }
-    }
-
-    func models(
-        dataRoot: URL,
-        session: URLSession,
-        refresh: Bool
-    ) async -> [ProviderModelInfo] {
-        await modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh).models
     }
 
     /// Unavailable rows retain the failure reason rather than becoming an empty successful catalog.
@@ -303,11 +292,11 @@ struct ModelCatalogCache: Sendable {
         }
         let fetchedAt = decoded?.fetchedAt
         if !refresh {
-            if let reason = cacheFailure ?? lastFailureReason(dataRoot: dataRoot) {
-                return ModelCatalogRead(models: [], freshness: .unavailable, failure: reason, fetchedAt: fetchedAt)
-            }
-            guard let decoded else { return ModelCatalogRead(models: [], freshness: .unavailable) }
-            return ModelCatalogRead(models: decoded.models, freshness: .cached, fetchedAt: fetchedAt)
+            if let cacheFailure { return ModelCatalogRead(models: [], freshness: .unavailable, failure: cacheFailure, fetchedAt: fetchedAt) }
+            let refreshFailure = lastFailureReason(dataRoot: dataRoot)
+            guard let decoded else { return ModelCatalogRead(models: [], freshness: .unavailable, failure: refreshFailure) }
+            return ModelCatalogRead(models: decoded.models, freshness: refreshFailure == nil ? .cached : .staleAfterFailedRefresh,
+                failure: refreshFailure, fetchedAt: fetchedAt)
         }
         switch await Self.refreshOwner(key: ownerKey(dataRoot)).refresh(self, dataRoot: dataRoot, session: session) {
         case .success(let live):
@@ -352,6 +341,11 @@ struct ModelCatalogCache: Sendable {
                     guard current == credential else { return .failure(.supersededRefresh) }
                     switch result {
                     case .success(let fetched):
+                        var previous: DecodedModelCatalog?
+                        if route != "openrouter", fetched.isComplete, credential != nil {
+                            do { previous = try readCache(dataRoot) }
+                            catch { nativeLog("Previous %@ model catalog could not be read: %@", route, ProviderFailure.diagnosticDescription(error)) }
+                        }
                         do {
                             try writeCache(fetched.models, dataRoot: dataRoot, credential: credential, isComplete: fetched.isComplete,
                                            rowExtras: fetched.rowExtras)
@@ -362,6 +356,16 @@ struct ModelCatalogCache: Sendable {
                             return .failure(failure)
                         }
                         failures.removeValue(forKey: key)
+                        if let previous, previous.isComplete == true, previous.credentialBinding == credentialBinding(current) {
+                            var known = Set(previous.models.map { $0.id.lowercased() })
+                            let provider = FirstPartyModelDiscovery.providerName(route)
+                            let account = self.credential.kind == "api_key" ? "API key" : "sign-in"
+                            for model in fetched.models where known.insert(model.id.lowercased()).inserted {
+                                Attention.post(Happening(.world, subject: "providers:\(route)", door: "providers",
+                                    words: "\(provider) lists a new model for your \(account): \(model.name)",
+                                    once: "model:\(route):\(model.id.lowercased())"), dataRoot: dataRoot)
+                            }
+                        }
                     case .failure(let failure):
                         failures[key] = failure.reason
                     }

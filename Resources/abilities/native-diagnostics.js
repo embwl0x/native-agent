@@ -317,7 +317,7 @@ function face(input) {
     }
     mac.push({id: "mac.runs", title: "Runs", value: input.runs.read === true ? String(input.runs.count) : "Unavailable"});
     mac.push({id: "mac.sessions", title: "Sessions", detail: input.sessions.error === null ? undefined : input.sessions.error,
-        value: input.sessions.error === null ? input.sessions.count + " loaded" : "Unavailable"});
+        value: input.sessions.error !== null ? "Unavailable" : input.sessions.count === null ? "Being read" : input.sessions.count + " loaded"});
     sections.push({id: "mac", title: "This Mac", style: "values", rows: mac});
 
     const living = input.living, snapshot = living.snapshot;

@@ -83,7 +83,7 @@ extension BuiltInToolSchemaFactory {
                             Who told you (told), e.g. \"Sam\", or where your own past was kept (remembered), e.g. \"my backup\" or the app name.
                             """)),
                         ("since", ToolSchema.strSchema("""
-                            When you first knew this, as an ISO-8601 date-time such as 2026-10-20T00:16:38Z; never after now. For your own past \
+                            When you first knew this, as an ISO-8601 date-time such as 2026-10-20T00:16:38Z or a date; never after now. For your own past \
                             carried from a backup or another app. Omit for what you learn now.
                             """)),
                         ("kind", ToolSchema.enumStringSchema(MemoryKindStamp.commitKinds, """

@@ -7,7 +7,7 @@ import StandingBots
 import NativeAgentShared
 import Desk
 import TriggerScheduler
-// Blueprint: | `DeskPagePresentation.swift` | Desk page snapshots and what one frozen board read measures for the Desk packet (live activity, parking, the next change); the stuck-reason and chat-draft words other owners read |
+// Blueprint: | `DeskPagePresentation.swift` | Desk page snapshots, measured activity, parking and next state deadline; stuck-reason and chat-draft words |
 public struct DeskPageSnapshot: Sendable {
     public let id = UUID()
     public var board: DeskBoardRead?
@@ -63,8 +63,7 @@ public enum DeskWanderHourPresentation {
 }
 
 public enum DeskPageContent {
-    /// What one Desk read measures from its frozen board and clock: live activity, the top-level work `DeskParking` parks, and the next
-    /// moment a fact the page is given changes.
+    /// Activity, top-level parking and the next state change measured from one board revision.
     public typealias Content = (activity: DeskLiveActivityPresentation.State, parked: Set<String>, deadline: Date?)
 
     public static func active(_ items: [DeskItem]) -> [DeskItem] {
@@ -101,11 +100,7 @@ public enum DeskPageContent {
         return draft
     }
 
-    static func project(
-        snapshot loaded: DeskPageSnapshot, now presentationNow: Date,
-        nags loadedNags: DeskNagConfig, timedBots timedSnapshot: [DeskTimedBot],
-        jobStamps: [String], hourExpiry: Date?
-    ) -> Content {
+    static func project(snapshot loaded: DeskPageSnapshot, now presentationNow: Date) -> Content {
         let evidence = DeskMovementPresentation.evidence(loaded.agentJobs.items)
         let items = loaded.boardItems
         var parked: Set<String> = []
@@ -131,55 +126,14 @@ public enum DeskPageContent {
         }.filter { $0 > presentationNow }.min()
         let deferExpiry = items.compactMap { $0.deferUntil.flatMap(DeskSequencing.parseDeferStamp) }
             .filter { $0 > presentationNow }.min()
-        let muteExpiry = loadedNags.mutedUntil == DeskNagConfig.indefiniteMuteSentinel
-            ? nil : loadedNags.mutedUntil.flatMap(DeskSequencing.parseDeferStamp)
+        let muteExpiry = loaded.nagConfigError == nil && loaded.nagConfig.mutedUntil != DeskNagConfig.indefiniteMuteSentinel
+            ? loaded.nagConfig.mutedUntil.flatMap(DeskSequencing.parseDeferStamp) : nil
         let nowExpiry = items.filter { $0.status == .now }.compactMap {
             DeskActivityState.movementDate($0.updatedAt)?.addingTimeInterval(DeskActivityState.movementWindow)
         }.filter { $0 > presentationNow }.min()
-        let relativeStamps = items.map(\.updatedAt)
-            + items.compactMap { $0.pursuit?.lastWorkedAt }
-            + loaded.agentJobs.items.map { NativeTimestampFormat.fractionalZulu($0.updatedAt) }
-            + jobStamps
-            + [loaded.generatedTs].compactMap { $0 }
-        let relativeDates = relativeStamps.compactMap(UserDisplayFormatters.parseISOTimestamp)
-            + timedSnapshot.compactMap(\.nextRun)
-        let relativeExpiry = relativeDates.map {
-            DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: presentationNow)
-        }.min()
-        // The local day is a fact of the page (done today, defer and snooze days, today's sessions), so midnight reads it again.
-        let dayExpiry = Calendar.current.dateInterval(of: .day, for: presentationNow)?.end
-        let deadline = [activity.nextRefreshAt, movementExpiry, deferExpiry, muteExpiry,
-                        nowExpiry, parkingExpiry, relativeExpiry, hourExpiry, dayExpiry]
+        let deadline = [activity.nextRefreshAt, movementExpiry, deferExpiry, muteExpiry, nowExpiry, parkingExpiry]
             .compactMap { $0 }.filter { $0 > presentationNow }.min()
         return (activity, parked, deadline)
-    }
-}
-
-/// Use the caller’s frozen clock so every reading changes at the same boundary.
-public enum DeskRelativeTimePresentation {
-    /// Read again at the next minute, hour or day boundary of `date` rather than polling.
-    public static func nextRefreshAt(for date: Date, now: Date) -> Date {
-        let remaining = date.timeIntervalSince(now)
-        if remaining > 0 {
-            let unit: TimeInterval
-            switch remaining {
-            case ..<60: return date
-            case ..<3_600: unit = 60
-            case ..<86_400: unit = 3_600
-            default: unit = 86_400
-            }
-            let boundary = max(unit, (ceil(remaining / unit) - 1) * unit)
-            return date.addingTimeInterval(-boundary + 0.001)
-        }
-        let seconds = max(0, now.timeIntervalSince(date))
-        let boundary: TimeInterval
-        switch seconds {
-        case ..<90: boundary = 90
-        case ..<3_600: boundary = (floor(seconds / 60) + 1) * 60
-        case ..<86_400: boundary = (floor(seconds / 3_600) + 1) * 3_600
-        default: boundary = (floor(seconds / 86_400) + 1) * 86_400
-        }
-        return date.addingTimeInterval(boundary)
     }
 }
 

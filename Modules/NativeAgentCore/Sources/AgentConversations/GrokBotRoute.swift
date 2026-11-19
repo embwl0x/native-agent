@@ -6,7 +6,7 @@ import NativeAgentShared
 // Blueprint: | `GrokBotRoute.swift` | `GrokBotRoute` enum; `withHistory`, `takenByWaiter`; cancellation ends the waiter handoff without resampling |
 
 /// Only nonsecret correlation and delivery state are persisted here.
-public struct GrokPendingRequest: Codable, Sendable {
+public struct GrokPendingRequest: Codable, Sendable, Equatable {
     public var lifeID: String?
     public let messageID: String
     public let peerID: String
@@ -90,8 +90,10 @@ public struct GrokRequestStore: Sendable {
         return try CredentialFileLock.withLock(file) {
             var value = try load(file)
             guard value.peerID == peer else { throw GrokLinkCredential.Failure.invalid }
+            let before = value
             try edit(&value)
             value.settledAt = Self.isSettled(value) ? (value.settledAt ?? Date()) : nil
+            guard value != before else { return value }
             try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(value), to: file)
             return value
         }
@@ -282,7 +284,6 @@ public enum GrokBotRoute {
         guard let address = credential.webhookURL,
               let key = credential.webhookKey, let url = URL(string: address) else { throw GrokLinkCredential.Failure.unavailable }
         let store = GrokRequestStore(dataRoot: dataRoot)
-        _ = try store.create(id: messageID, peer: peer.id, askedIn: askedIn, route: route, quiet: quiet)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
@@ -290,6 +291,7 @@ public enum GrokBotRoute {
         // Sorted keys keep IDs before potentially truncated webhook text.
         request.httpBody = try JSONSerialization.data(withJSONObject: ["message_id": messageID, "conversation_id": conversation(peer: peer.id),
             "text": try withHistory(text, peer: peer.id, messageID: messageID, dataRoot: dataRoot)], options: [.sortedKeys])
+        _ = try store.create(id: messageID, peer: peer.id, askedIn: askedIn, route: route, quiet: quiet)
         let state: String
         do {
             let code = try await post(request)

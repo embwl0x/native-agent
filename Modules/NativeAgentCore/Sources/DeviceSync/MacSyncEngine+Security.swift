@@ -36,11 +36,6 @@ extension MacSyncEngine {
     public func finishPairingSecretRotation(with persistedSecret: Data?) async {
         _pairingSecret = persistedSecret
         pairingSecretRotation = nil
-        // Revoke the old write generation; captured URLs confine late writes to the old key's directory.
-        if inboxDir != nil, let docsURL = activeDocsURL {
-            stop()
-            await start(docsURL: docsURL)
-        }
     }
 
     func actionResponse(_ response: [String: String], for action: InboxAction) throws -> [String: String] {
@@ -104,83 +99,10 @@ extension MacSyncEngine {
         return BridgeMessage.constantTimeEqual(signature.lowercased(), expected)
     }
 
-    @discardableResult
-    func writeRejectedResponseIfNeeded(
-        action: InboxAction,
-        transactionId: String,
-        message: String
-    ) async -> Bool {
-        guard let responsesDir,
-              let responseURL = InboxActionFileBoundary.jsonURL(
-                in: responsesDir,
-                validatedID: action.msgId
-              ) else { return false }
-        guard !FileManager.default.fileExists(atPath: responseURL.path) else { return true }
-        let code = message.hasPrefix("message too old:") ? "expired_before_execution" : "timestamp_invalid"
-        guard let response = try? signedResponse([
-            "status": "error",
-            "ok": "false",
-            "code": code,
-            "message": message,
-            "msgId": action.msgId,
-            "transactionId": transactionId,
-            "action": action.action,
-            "createdAt": ISO8601DateFormatter().string(from: Date()),
-        ]) else {
-            syncError = "Pairing secret unavailable; rejection response was not written."
-            return false
-        }
-        guard let responseData = try? JSONEncoder().encode(response) else { return false }
-        let msgId = action.msgId
-        // Await off-main writes so KVS signalling and caller transitions remain ordered.
-        let writeError = await Task.detached(priority: .utility) { [responseURL, responseData] in
-            Self.atomicWrite(data: responseData, to: responseURL)
-        }.value
-        if let writeError {
-            syncError = "Could not write rejection response for \(msgId): \(writeError)"
-            return false
-        } else {
-            await signalInboxResponse(msgId)
-            return true
-        }
-    }
-
-    /// The durable response remains authoritative when its wake signal is unconfirmed.
-    func signalInboxResponse(_ messageID: String) async {
-        let key = inboxResponseKeyPrefix + messageID
-        let synchronized = await Task.detached(priority: .utility) {
-            let kvs = NSUbiquitousKeyValueStore.default
-            kvs.set(messageID, forKey: key)
-            return kvs.synchronize()
-        }.value
-        if !synchronized {
-            syncError = "Response \(messageID) is saved; iCloud KVS did not accept its wake signal. Remote receipt is unconfirmed."
-        }
-    }
-
-    /// Nonisolated for detached storage work; report atomic write failure rather than losing it.
-    nonisolated static func atomicWrite(data: Data, to url: URL) -> String? {
-        do {
-            try data.write(to: url, options: .atomic)
-            return nil
-        } catch {
-            return error.localizedDescription
-        }
-    }
-
-    /// Apply the ±5-minute freshness window only to new work, after HMAC verification and ledger lookup.
+    /// A phone tap is admitted by its signature, the ledger's once-only record and the envelope's own window, never by how late it arrives:
+    /// a tap made while the Mac slept is still the person's decision. Only an unreadable timestamp is refused here.
     func inboxActionFreshnessError(_ action: InboxAction) -> String? {
-        guard let ts = NativeTimestampFormat.parseISO8601FractionalFirst(action.createdAt) else {
-            return "invalid timestamp: \(action.createdAt)"
-        }
-        let age = Date().timeIntervalSince(ts)
-        if age > 300 {
-            return "message too old: \(Int(age))s"
-        }
-        if age < -300 {
-            return "timestamp is too far in the future: \(Int(-age))s"
-        }
-        return nil
+        NativeTimestampFormat.parseISO8601FractionalFirst(action.createdAt) == nil ? "invalid timestamp: \(action.createdAt)" : nil
     }
 
 }

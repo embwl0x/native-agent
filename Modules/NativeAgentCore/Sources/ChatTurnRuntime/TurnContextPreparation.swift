@@ -1,4 +1,5 @@
 import AgentWorkspace
+import ChatTurnContracts
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -132,9 +133,10 @@ extension SwiftNativeTurnEngine {
         trace.setFlag("budget.packetDerived", turnBudget.isDerived)
         // Read the automatic recall switch once per turn for both paths; explicit memory requests remain outside that switch.
         let gateStartNs = DispatchTime.now().uptimeNanoseconds
+        // A turn an untrusted contact steers recalls none of the person's memories or person facts on its own.
         let crossSessionRecall = try MemoryPolicyGate.crossSessionRecallEnabled(
             dataRoot: remPinsDataRoot
-        )
+        ) && turn.peerSteering?.isTainted != true
         trace.record(.recallGate, since: gateStartNs, of: .contextBase)
         trace.setFlag("memory.crossSessionRecall", crossSessionRecall)
         // An unread recall input is a fact of this turn, never an empty successful
@@ -181,6 +183,7 @@ extension SwiftNativeTurnEngine {
             || semanticQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || readyQueryEmbedding != nil)
         let userMemoryCore: [String]
+        var userEstablished: JSONValue = .null
         var userCoreUnavailable = false
         let userCoreStartNs = DispatchTime.now().uptimeNanoseconds
         if !crossSessionRecall {
@@ -189,6 +192,7 @@ extension SwiftNativeTurnEngine {
             do {
                 let core = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).userPromptCoreTimed(surface: surface)
                 userMemoryCore = core.facts
+                userEstablished = .bool(core.established)
                 // The stage below is the whole call; this is the read itself, so the difference is the wait for the memory actor.
                 trace.setCount("memory.userCoreWorkMs", Int(core.workNanoseconds / 1_000_000))
             } catch {
@@ -238,7 +242,6 @@ extension SwiftNativeTurnEngine {
             maximumCharacterBudget: turnBudget.packetExpandedChars,
             postMandatoryCharacterReserve: turnBudget.packetPostMandatoryReserve,
             // Required persona documents already ride the stable segment; do not duplicate them in the volatile packet.
-            stableSegmentCarriesRequiredDocuments: true,
             userMemoryCore: userMemoryCore,
             memoryRecallEnabled: semanticRecallEnabled,
             // The same number the renderer cuts at, so the selector publishes a
@@ -526,8 +529,6 @@ extension SwiftNativeTurnEngine {
         }
         let renderStartNs = DispatchTime.now().uptimeNanoseconds
         trace.record(.intentions, since: intentionsStartNs, until: renderStartNs, of: .contextBase)
-        // A person picture establishes the person and suppresses first-run invitations.
-        let established = !userMemoryCore.isEmpty
         let deliveredRows = Self.deliveredRecalledMemoryRows(recalled, budget: turnBudget)
         let personaPrompt = Self.renderPersonaPrompt(
             compiledPersonaPrompt: compiledPersonaPrompt,
@@ -555,7 +556,7 @@ extension SwiftNativeTurnEngine {
         // The agent's own line with written instructions is the one they write; everything else it reaches is the agent's.
         let reach = TurnReach(
             persona: turn.lineInstructions ?? personaPrompt,
-            expression: .object(["established": userCoreUnavailable ? .null : .bool(established)]),
+            expression: .object(["established": userEstablished]),
             pins: remPins.map(\.text),
             recall: Self.renderRecalledMemoryBlock(deliveredRows) ?? "",
             packet: packet

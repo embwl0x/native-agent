@@ -187,7 +187,8 @@ enum TrustLockCard {
     /// The deciders that answer from a call's own input (where it came from, which limit it widens, which ability it keeps), by kind. True
     /// at every setting; their owners are named in the Trust doc.
     static let caseByCase = "A few things can still ask case by case: a request from another device, chat or agent; a change that widens "
-        + "my own limits, such as turning an app's Read or Write switch on, unless you asked me for it; and keeping an ability, my turn "
+        + "my own limits below Full Mac or under an untrusted voice, such as turning an app's Read or Write switch on, unless you asked me for it; "
+        + "and keeping an ability, my turn "
         + "program included."
 
     /// Names in one sentence, as they are declared.

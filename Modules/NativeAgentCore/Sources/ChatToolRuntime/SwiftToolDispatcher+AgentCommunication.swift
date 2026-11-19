@@ -66,7 +66,6 @@ extension SwiftToolDispatcher {
                 peers = allPeers
                 bots = allBots
                 refresh = refresh || named != nil
-                Task.detached(priority: .utility) { [dataRoot] in await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
             }
             if peers.contains(where: ChatGPTDotIPCTransport.owns) { _ = await chatGPTDotReadiness() }
             var contacts = Self.agentLaneContacts(peers: allPeers, selectedPeers: peers)
@@ -118,8 +117,8 @@ extension SwiftToolDispatcher {
                 launch = .refused("running a found program needs this app's Full Mac file access on this surface")
                 if usesCanonicalBody, try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
                     let origin = SecurityOriginContext.currentTurn(turn: turn, surface: surface)
-                    launch = await agentProgramLaunch(SwiftNativeSecurityCenter(dataRoot: dataRoot)
-                        .drivenAgentLaunchPermission(origin: origin, turn: turn)).launch
+                    launch = await Self.agentProgramLaunch(SwiftNativeSecurityCenter(dataRoot: dataRoot)
+                        .drivenAgentLaunchPermission(origin: origin, turn: turn), dataRoot: dataRoot).launch
                 }
             }
             let found = savedMatch ? [] : await AgentDiscoverySession.shared.candidates(refresh: refresh, launch: launch, dataRoot: dataRoot)
@@ -421,15 +420,17 @@ extension SwiftToolDispatcher {
             return .object(plan)
         }
         if peer.transport == .acp {
-            guard sending else {
+            let conversationID = try Self.peerString(args, "conversation_id", max: 1024, required: false)
+            guard sending || invocation.internalRead && turn.envelope?.workIdentity == "contact.reply.read" && conversationID != nil else {
                 return .object(["status": .string("nothing_to_read"), "completed": .bool(false),
                     "detail": .string("The answer returns with the message; there is no saved answer to recover here.")])
             }
             guard args["message_id"] == nil, args["task_id"] == nil else {
                 throw AgentCommunicationError.invalid("This contact takes text and conversation_id only.")
             }
-            return try await hostACPRun(turn: turn, invocation: invocation, contact: peer, message: Self.peerString(args, "text", max: 64000)!,
-                                        conversationID: Self.peerString(args, "conversation_id", max: 1024, required: false),
+            return try await hostACPRun(turn: turn, invocation: invocation, contact: peer,
+                                        message: sending ? Self.peerString(args, "text", max: 64000) : nil,
+                                        conversationID: conversationID,
                                         store: store, surface: surface)
         }
         if peer.transport == .mcpHost {
@@ -476,7 +477,7 @@ extension SwiftToolDispatcher {
             // Nothing to page through: the reply came back in the same call as the message that asked for it, and there is no second copy here.
             guard sending else {
                 let (current, peers) = try Self.checkedPeerSnapshot(peer.id, store: store)
-                let state = try Self.currentPeerState(current, peers: peers)
+                let state = try Self.currentPeerState(current, credentials: AgentPeerCredentials.credentialReads(peers))
                 return .object(["status": .string("nothing_to_read"), "agent": .string(agent),
                     "transport": .string("mcpHost"), "host": .string(row.id),
                     "state": .string(state.rawValue), "state_detail": .string(state.detail),
@@ -597,14 +598,25 @@ extension SwiftToolDispatcher {
                     """)
             }
         }
-        var available = false
-        defer { if !available { store.recordUnavailable(peerID: peer.id) } }
         guard peer.credentialKey == nil || usesCanonicalBody else {
             throw AgentCommunicationError.invalid("peer credentials are unavailable outside the canonical app")
         }
         let token = peer.credentialKey == nil ? nil : try AgentPeerCredentials.read(peerID: peer.id)
         if peer.credentialKey != nil && token == nil { throw AgentCommunicationError.invalid("configured peer credential is unavailable") }
+        var available = false
+        defer { if !available { store.recordUnavailable(peerID: peer.id) } }
         let localRequestID = UUID().uuidString.lowercased()
+        func handle(message: String?, conversation: String?, task: String? = nil) throws {
+            guard sending, let target = invocation.liveTarget else { return }
+            var read: [String: JSONValue] = [:]
+            if peer.transport == .nativeAgent || task != nil,
+               case .object(let action)? = AgentConversationRouting.readLocator(agent: agent,
+                   message: message.map(JSONValue.string), conversation: conversation.map(JSONValue.string), task: task.map(JSONValue.string)),
+               case .object(let input)? = action["input"] {
+                read = input; read["details"] = .bool(true)
+            }
+            try AgentConversationStore(dataRoot: target.dataRoot).handle(target, conversationID: conversation, messageID: message, readInput: read)
+        }
         // The attested door id rides beside the display name: the taint latch keys trust by it.
         var envelope: [String: JSONValue] = ["agent": .string(agent), "agent_id": .string("peer:" + peer.id),
             "transport": .string(peer.transport.rawValue),
@@ -637,6 +649,7 @@ extension SwiftToolDispatcher {
             a2aRecipe = checked.recipe
             if sending {
                 let outgoingID = message ?? UUID().uuidString.lowercased()
+                try handle(message: outgoingID, conversation: conversation, task: task)
                 envelope["outgoing_message_id"] = .string(outgoingID)
                 let push: JSONValue?
                 if selected.version == "1.0", selected.pushNotifications, AgentA2AWire.isLoopback(selected.endpoint), usesCanonicalBody {
@@ -693,6 +706,7 @@ extension SwiftToolDispatcher {
             if sending {
                 body["text"] = .string(text!)
                 let remoteRequestID = message ?? localRequestID
+                try handle(message: remoteRequestID, conversation: conversation)
                 body["request_id"] = .string(remoteRequestID)
                 envelope["message_id"] = .string(remoteRequestID)
                 if let conversation { body["sessionId"] = .string(conversation) }

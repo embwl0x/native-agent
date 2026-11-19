@@ -157,7 +157,8 @@ public struct TelegramAPIResponse<Result: Decodable & Sendable>: Sendable, Decod
         description = try values.decodeIfPresent(String.self, forKey: .description)
         errorCode = try values.decodeIfPresent(Int.self, forKey: .errorCode)
         parameters = try values.decodeIfPresent(TelegramAPIResponseParameters.self, forKey: .parameters)
-        result = try? values.decode(Result.self, forKey: .result)
+        if ok { result = try values.decode(Result.self, forKey: .result) }
+        else { result = nil }
     }
 
 }
@@ -245,7 +246,6 @@ public enum TelegramBotError: Error, LocalizedError {
     case invalidRequest
     case notConfigured
     case invalidResponse(status: Int)
-    case unavailable
     case underlying(String)
 
     public var errorDescription: String? {
@@ -259,7 +259,6 @@ public enum TelegramBotError: Error, LocalizedError {
             telegram_http_failed: Transport returned HTTP \(s). Inspect Telegram connection status and the delivery receipt \
             before resending.
             """
-        case .unavailable: return "telegram_delivery_unavailable: Delivery cannot proceed. Inspect the saved reply and destination in Telegram setup."
         case .underlying(let m): return "telegram: \(m)"
         }
     }

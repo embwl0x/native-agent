@@ -14,15 +14,8 @@ public extension NativeAgentEngine {
         policyChanged: @escaping @MainActor () -> Void,
         memoryProposalsChanged: @escaping @MainActor () -> Void
     ) {
-        Task { [approvals] in
-            for await _ in await approvals.changes() {
-                guard !Task.isCancelled else { return }
-                await publishWorkStatus()
-            }
-        }
-        Task { [inbox] in
-            for await _ in await inbox.changes() {
-                guard !Task.isCancelled else { return }
+        Task { [desk] in
+            await EngineFaceProjection.watch(read: { desk.page.id }) { _ in
                 await publishWorkStatus()
             }
         }

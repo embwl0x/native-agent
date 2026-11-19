@@ -8,18 +8,15 @@ public struct ContextSourceRegistration: Sendable, Equatable {
     public let descriptor: ContextSourceDescriptor
     public let fileURL: URL
     public let allowedRoot: URL
-    public let maximumUTF8Bytes: Int
 
     public init(
         descriptor: ContextSourceDescriptor,
         fileURL: URL,
-        allowedRoot: URL,
-        maximumUTF8Bytes: Int = 1_048_576
+        allowedRoot: URL
     ) {
         self.descriptor = descriptor
         self.fileURL = fileURL
         self.allowedRoot = allowedRoot
-        self.maximumUTF8Bytes = max(1, maximumUTF8Bytes)
     }
 }
 
@@ -134,13 +131,12 @@ public actor ContextSourceRegistry {
         return ContextSourceRegistration(
             descriptor: registration.descriptor,
             fileURL: source,
-            allowedRoot: declaredRoot,
-            maximumUTF8Bytes: registration.maximumUTF8Bytes
+            allowedRoot: declaredRoot
         )
     }
 }
 
-/// Process-owned directory watcher group. It emits only dirty-directory signals; the coordinator rereads registered canonical sources afterward.
+/// Process-owned directory watcher group. Dirty-directory signals refresh the required-document mirrors.
 public actor ContextSourceMonitor {
     public typealias DirectoryChangeSink = @Sendable (URL) async -> Void
 

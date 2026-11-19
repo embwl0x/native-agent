@@ -160,7 +160,6 @@ package struct BuiltInToolSchemaFactory {
         var schemas = webSchemas()
         schemas.append(contentsOf: fileSchemas())
         schemas.append(contentsOf: memoryReadSchemas())
-        schemas.append(contentsOf: workspaceSchemas())
         schemas.append(contentsOf: historySchemas())
         schemas.append(contentsOf: personaSchemas())
         schemas.append(contentsOf: turnSchemas())

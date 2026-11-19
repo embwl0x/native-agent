@@ -220,6 +220,11 @@ The first admitting event releases the read without a quiet interval or clock.
 There is no snapshot, navigation, picture or frame-layout deadline. A required
 reader wait ends on readiness, document replacement, navigation error, Stop,
 takeover or connection loss; absent events leave the request pending.
+On Stop, Swift releases pending read requests and their conversation admission
+without awaiting the extension's cancellation reply. A dispatched navigation
+also releases admission with `outcome_unknown`; its effect is not declared
+undone. Cancellation still goes to the extension, and late replies cannot
+complete or publish a removed request.
 The existing node, text, frame and transport budgets apply to one DOM capture.
 No replacement read or empty-content retry runs. Completion and newer reads
 fence publication, including cancellation of a superseded layout observation.

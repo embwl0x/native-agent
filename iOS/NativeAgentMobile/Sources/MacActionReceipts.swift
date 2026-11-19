@@ -52,7 +52,6 @@ struct RemoteActionCard: Identifiable, Equatable {
     var subtitle: String
     var state: RemoteActionState
     var detail: String
-    var createdAt: Date
     var updatedAt: Date
     var approvalID: String?
     var operationID: UUID
@@ -64,7 +63,6 @@ struct RemoteActionCard: Identifiable, Equatable {
         self.subtitle = subtitle
         self.state = state
         self.detail = detail
-        self.createdAt = Date()
         self.updatedAt = Date()
         self.operationID = operation
     }
@@ -170,10 +168,11 @@ final class RemoteActionLedger: ObservableObject {
 
     private func trimOrdinaryActions() {
         var ordinaryCount = 0
-        actions = actions.sorted { $0.updatedAt > $1.updatedAt }.filter { action in
+        let trimmed = actions.sorted { $0.updatedAt > $1.updatedAt }.filter { action in
             if [.waiting, .running, .waitingApproval, .unconfirmed].contains(action.state) { return true }
             ordinaryCount += 1
             return ordinaryCount <= maximumOrdinaryActions
         }
+        if actions != trimmed { actions = trimmed }
     }
 }

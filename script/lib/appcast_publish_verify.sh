@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # Publication requires the advertised feed and enclosure to match the local bytes.
 
-# shellcheck disable=SC2034
-NATIVEAGENT_APPCAST_PUBLISH_VERIFY_LIB_LOADED=1
-
 # Result fields are deliberately data, not success prose: callers decide how
 # to quarantine/report a failed publication.
 NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON=""

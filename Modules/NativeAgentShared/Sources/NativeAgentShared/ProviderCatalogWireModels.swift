@@ -46,7 +46,6 @@ public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
     public var default_reasoning_effort: String? = nil
     public var supported_reasoning_efforts: [String]? = nil
     public var supports_fast: Bool? = nil
-    /// Why this row's controls cannot yet be selected; nil when declared.
     public var controls_note: String? = nil
     /// False for a row the build knows that stands where the provider's list is missing: its contract still runs, shows and adjusts the model,
     /// but no picker offers it. Nil and true are offered.
@@ -251,7 +250,6 @@ public enum ProviderSurfaceGroups {
             .init("workshop", "Task execution"),
             .init("autonomy", "Independent tasks"),
             .init("training", "Skill practice"),
-            .init("heartbeat", "Background check-ins"),
             .init("diagnostics", "Diagnostics"),
         ]
     )

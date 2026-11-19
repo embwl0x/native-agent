@@ -13,15 +13,6 @@ extension AppQuietToolHost {
     // MARK: - mind_run
 
     func runMind(verb: String, input: [String: JSONValue], turn: Turn) async -> QuietMindOutcome {
-        if verb == "trigger_fire" {
-            guard case .string(let name)? = input["name"], !name.isEmpty else {
-                return (false, "Pass the trigger's name from its repair obligation.", [:])
-            }
-            do {
-                let result = try await NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: appModel.engine.dataRoot).fireInboxTrigger(name: name)
-                return (result.status == "fired", result.error ?? "Trigger \(name): \(result.status).", [:])
-            } catch { return (false, error.localizedDescription, [:]) }
-        }
         if verb == "rem", input["repair"] == .bool(true) {
             do {
                 _ = try await NativeAgentEngine.runRem(dataRoot: appModel.engine.dataRoot, repair: true)

@@ -86,7 +86,7 @@ extension iCloudBridge {
         kind == nil || ["reply", "final", "codex_completion"].contains(kind ?? "")
             || canonicalRun != nil && ["rejection", "error", "cancelled", "incomplete"].contains(kind ?? "")
     }
-    // MARK: - Send chat message (Drive for payload + KVS trigger)
+    // MARK: - Send chat message through CloudKit
 
     nonisolated public static func failedReplyClaims(dataRoot: URL, changedPath: URL? = nil) throws -> [(path: URL, at: String)] {
         let directory = dataRoot.appendingPathComponent("icloud/chat_transactions", isDirectory: true)
@@ -209,9 +209,8 @@ extension iCloudBridge {
             return status
         }
         if statuses.contains("accepted_by_transport") || statuses.contains("confirmed_by_peer") { return "completed" }
-        // Unverified commits remain owed; recovery reuses correlation so the phone retains one reply.
-        if statuses.contains("queued_for_icloud_sync")
-            || statuses.contains("submission_unknown") || statuses.contains("commit_unverified") { return "sent_unconfirmed" }
+        // Unconfirmed submissions remain owed; recovery reuses correlation so the phone retains one reply.
+        if statuses.contains("submission_unknown") { return "sent_unconfirmed" }
         return statuses.contains("dispatch_reserved") ? "reserved" : nil
     }
 
@@ -352,7 +351,8 @@ extension iCloudBridge {
         }
 
         // Preserve signed payloadJSON verbatim for phone verification; reject oversized records before CloudKit's opaque server failure.
-        if let ck = deviceTransport {
+        guard let ck = deviceTransport else { throw BridgeError.containerUnavailable }
+        do {
             do {
                 try await requireDeliveryAdmission()
                 try await ck.send(msg) {
@@ -392,68 +392,10 @@ extension iCloudBridge {
             } catch {
                 throw DeviceSyncSendOutcomeUnknown(message: "CloudKit accepted the message, but local settlement failed: " + error.localizedDescription)
             }
-            await scheduleDeliveryNudges(for: msg.id)
             lastSyncAt = Date()
             syncStatus = "CloudKit accepted message — waiting for iOS"
             return msg
         }
-
-        // Drive cannot render CloudKit's visible-subscription alert, so it cannot claim one was queued.
-        if metadata?["kind"] == "notification", metadata?["userInfo.source"] != "requested_result" {
-            throw DeviceSyncError.notConfigured
-        }
-
-        // Retained Drive messages use their existing signed reader.
-        guard let docsURL = driveURL else {
-            throw BridgeError.containerUnavailable
-        }
-        let outboxURL = docsURL
-            .appendingPathComponent(DriveFolder.outboxMac)
-            .appendingPathComponent("\(msg.id).json")
-        let data = try await sync.storage.perform {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            return try encoder.encode(msg)
-        }
-        if finalReply {
-            guard await Self.appendChatDeliveryReceipt(msg, direction: "mac_to_ios", transport: "icloud_drive",
-                status: .commitUnverified, secret: secret, dataRoot: root) else { throw CocoaError(.fileWriteUnknown) }
-        }
-        try await requireDeliveryAdmission()
-        try await VolumeIO.run { [outboxURL] in
-            try FileManager.default.createDirectory(at: outboxURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        }
-        do {
-            try await VolumeIO.run { [data, outboxURL] in
-                try data.write(to: outboxURL, options: .atomic)
-            }
-        } catch {
-            syncStatus = "Could not queue iCloud message: \(error.localizedDescription)"
-            if finalReply {
-                guard await Self.appendChatDeliveryReceipt(msg, direction: "mac_to_ios", transport: "icloud_drive",
-                    status: .commitUnverified,
-                    secret: secret, dataRoot: root, detail: error.localizedDescription) else {
-                    throw DeviceSyncSendOutcomeUnknown(message: "iCloud file commit and diagnostic receipt are unconfirmed: " + error.localizedDescription)
-                }
-            }
-            throw DeviceSyncSendOutcomeUnknown(message: "iCloud file commit is unconfirmed: " + error.localizedDescription)
-        }
-        do {
-            try await recordChatDeliveryReceipt(
-                msg,
-                transport: "icloud_drive",
-                status: .queuedForICloudSync,
-                secret: secret
-            )
-        } catch {
-            throw DeviceSyncSendOutcomeUnknown(message: "The iCloud file was committed, but its local receipt failed: " + error.localizedDescription)
-        }
-
-        await scheduleDeliveryNudges(for: msg.id)
-
-        lastSyncAt = Date()
-        syncStatus = "Queued for iCloud sync — waiting for iOS"
-        return msg
     }
 
     func cloudKitActionResponseMessage(_ response: [String: String], correlationID: String) throws -> BridgeMessage {
@@ -493,8 +435,6 @@ extension iCloudBridge {
                 dataRoot: PersistenceCore.defaultDataRoot()
             ) else { throw CocoaError(.fileWriteUnknown) }
             try await Self.completePublication(signed.id, dataRoot: sync.dataRoot)
-            // A phone waiting on this answer wakes on the same nudge as a chat reply, not only on a silent push that may never come.
-            await scheduleDeliveryNudges(for: signed.id)
             lastSyncAt = Date()
             syncStatus = "Sent action response via CloudKit"
         } catch {
@@ -525,51 +465,4 @@ extension iCloudBridge {
         }
     }
 
-    private func scheduleDeliveryNudges(for messageID: String) async {
-        // Without the key-value store entitlement no nudge can synchronize; CloudKit's own push is this build's only wake, and the phone
-        // connection says so once instead of a failure per message.
-        guard DeviceCloudKitPreflight.hasKeyValueStoreEntitlement() else { return }
-        let queue: ICloudDeliveryNudgeQueue
-        if let deliveryNudgeQueue {
-            queue = deliveryNudgeQueue
-        } else {
-            let generation = setupGeneration
-            queue = ICloudDeliveryNudgeQueue(
-                isAvailable: { [weak self] in
-                    guard let self else { return false }
-                    return await self.canSendMessageNudge(generation: generation)
-                },
-                sendNudge: { messageID in
-                    let triggerValue = "\(ISO8601DateFormatter().string(from: Date())):\(messageID)"
-                    return await Task.detached(priority: .utility) {
-                        let kvs = NSUbiquitousKeyValueStore.default
-                        kvs.set(triggerValue, forKey: KVSKey.newMessageInDrive)
-                        return kvs.synchronize()
-                    }.value
-                },
-                observeOutcome: { [weak self] outcome in
-                    await self?.recordDeliveryNudgeOutcome(outcome, generation: generation)
-                }
-            )
-            deliveryNudgeQueue = queue
-        }
-        await queue.schedule(for: messageID)
-    }
-
-    private func canSendMessageNudge(generation: Int) -> Bool {
-        isSetUp && setupGeneration == generation && available
-    }
-
-    private func recordDeliveryNudgeOutcome(_ outcome: ICloudDeliveryNudgeOutcome, generation: Int) {
-        guard setupGeneration == generation, isSetUp else { return }
-        switch outcome.disposition {
-        case .synchronized:
-            break
-        case .unavailable:
-            syncStatus = "iCloud delivery nudge skipped: iCloud unavailable"
-        case .synchronizeFailed:
-            syncStatus = "iCloud wake synchronization failed for \(outcome.messageID); recipient delivery is unknown. Check the iCloud connection."
-            nativeLog("[iCloudBridge] wake synchronization failed msg=%@; recipient delivery is unknown", outcome.messageID)
-        }
-    }
 }

@@ -156,8 +156,7 @@ public enum MyQueueReady {
         return entry.step.rhythm
     }
 
-    /// What the agent meant, as the agent reads it when it comes: `head` names it, `rest` says when it comes back or what it is done when. A step
-    /// closes by itself when the after-turn judgment sees its deed; nothing here teaches closing it by hand.
+    /// The opening names the row. For a step without a rhythm, the detail says it is open on the Desk.
     package static func line(_ item: DeskItem, at: Date) -> (head: String, rest: String) {
         let step = item.step
         let peers = (step?.peers ?? []).filter { !CapabilityLifecycle.ownerTrusts($0) }
@@ -176,7 +175,7 @@ public enum MyQueueReady {
             rest = IntentionClock.next(step, after: at).map { "It comes back " + MyQueue.shown($0) + "." } ?? "This is its last time."
         } else if step != nil {
             head = "You meant to (\(name)): \(words)."
-            rest = doIt + "It closes by itself once the work is seen done." + wait
+            rest = doIt + "\(name) is open on your Desk." + wait
         } else {
             // A carried row with no step is outside the after-turn settlement: say only that it stays hers.
             head = "Yours to carry, \(name): \(item.title) — \(words)."
@@ -187,7 +186,11 @@ public enum MyQueueReady {
         case .time(let ends): rest += " It ends by itself " + MyQueue.shown(ends) + "."
         case .once, .standing: break
         }
-        if let say = step?.say { rest += " Say this as it is, nothing added: \"\(say)\"" }
+        if let say = step?.say {
+            rest += item.notes.contains { $0.author == "agent" && $0.text.hasPrefix("Said ") && $0.text.hasSuffix(": \"\(say)\"") }
+                ? " These words were said to the person for you at its moment; do not say them again: \"\(say)\""
+                : " Say this as it is, nothing added: \"\(say)\""
+        }
         return (head, released + rest + provenance)
     }
 }

@@ -11,9 +11,11 @@ public struct TurnTraceEvent: Sendable, Equatable {
     public enum TerminalState: String, Sendable, Codable {
         case completed, stopped, interrupted, waiting, failed
     }
-    /// Per-string payload cap, except for model-call receipts and the first-class feeling frame.
+    /// Per-string payload cap, except for projected tool results, model-call receipts and the first-class feeling frame.
     public static let maxPayloadStringChars = 2000
-    /// Ordinary row budget includes the envelope; model calls and full feeling frames share the detail owner's larger row ceiling.
+    /// Shared with result projection: larger bodies are durable references before reaching the trace.
+    public static let toolResultInlineUTF8Bytes = 8_000
+    /// Ordinary row budget includes the envelope; tool results reserve escaping space, model calls and feeling frames use the detail ceiling.
     public static let maxPayloadBytes = 12 * 1024
     // Keep hostile envelope metadata from consuming the space reserved for the frozen context.snapshot scalar manifest.
     private static let maxEnvelopeFieldUTF8Bytes = 480
@@ -22,10 +24,13 @@ public struct TurnTraceEvent: Sendable, Equatable {
 
     /// The engine projects steering from the supplied turn; never from the emitting task.
     public static var steer: @Sendable (Turn) -> String? {
-        get { steerHook.withLock { $0 } }
-        set { steerHook.withLock { $0 = newValue } }
+        get { steerHook.withLock { $0 }.read }
+        set { steerHook.withLock { $0 = Steering(read: newValue) } }
     }
-    private static let steerHook = OSAllocatedUnfairLock<@Sendable (Turn) -> String?>(initialState: { _ in nil })
+    private struct Steering: Sendable {
+        let read: @Sendable (Turn) -> String?
+    }
+    private static let steerHook = OSAllocatedUnfairLock(initialState: Steering(read: { _ in nil }))
 
     public let turnId: String
     public let ts: Date
@@ -154,10 +159,12 @@ public struct TurnTraceEvent: Sendable, Equatable {
         let leafBound: JSONValue
         if kind == "llm.call" {
             leafBound = value
-        } else if kind == "context.snapshot", case .object(let fields) = value {
+        } else if ["context.snapshot", "tool.dispatch"].contains(kind), case .object(let fields) = value {
             var bounded: [String: JSONValue] = [:]
             for (key, field) in fields {
-                bounded[key] = key == "feelingFrame" ? field : field.mapStrings(boundString)
+                let result = kind == "tool.dispatch" && key == "result"
+                    && field.stringValue.map { $0.utf8.count <= toolResultInlineUTF8Bytes } == true
+                bounded[key] = (kind == "context.snapshot" && key == "feelingFrame") || result ? field : field.mapStrings(boundString)
             }
             leafBound = .object(bounded)
         } else {
@@ -191,6 +198,10 @@ public struct TurnTraceEvent: Sendable, Equatable {
             ),
         ]
         if case .object(let object) = leafBound {
+            if kind == "tool.dispatch", let result = object["result"] {
+                // A whole result or its reference survives row summarization, including JSON escaping.
+                summary["result"] = result
+            }
             if kind == "context.snapshot", let frame = object["feelingFrame"] {
                 // The complete paragraph has its own place; preview and cue bounds cannot clip or evict it.
                 summary["feelingFrame"] = frame
@@ -279,6 +290,9 @@ public struct TurnTraceEvent: Sendable, Equatable {
     }
 
     private static func rowByteLimit(kind: String, payload: JSONValue) -> Int {
+        if kind == "tool.dispatch" {
+            return maxPayloadBytes + 6 * toolResultInlineUTF8Bytes
+        }
         if kind == "llm.call" || (kind == "context.snapshot" && payload.objectValue?["feelingFrame"] != nil) {
             return JSONLLineCaps.traceMaximumBytes
         }

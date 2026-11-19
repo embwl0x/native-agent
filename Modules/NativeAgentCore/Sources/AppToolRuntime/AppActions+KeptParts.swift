@@ -42,8 +42,8 @@ extension AppActions {
         do {
             let snapshot = try await inventory(dataRoot: dataRoot, turn: turn)
             measured("inventory")
-            let own = snapshot.actions.compactMap { action in call(action).map { ($0, action) } }
-            if own.isEmpty {
+            let callable = snapshot.actions.compactMap { action in call(action).map { ($0, action) } }
+            if callable.isEmpty {
                 return PreparedWorkspaceGlance(try AbilityStore(dataRoot: dataRoot).files(kind: .part).isEmpty
                     ? "Your abilities: no saved abilities."
                     : "Your abilities: none callable. Read ability.list for saved versions and their status.")
@@ -62,6 +62,10 @@ extension AppActions {
             let states = catalog.states
             let recent = Dictionary(uniqueKeysWithValues: states.compactMap { id, state in usedAt(state).map { (id, $0) } })
             let files = Dictionary(uniqueKeysWithValues: catalog.files.filter { $0.kind == .part }.map { ($0.id, $0) })
+            let own = callable.filter { _, action in
+                guard let file = files[action.tool] else { return true }
+                return !AbilityStore.isSeed(file)
+            }
             let clock = DateFormatter()
             clock.locale = Locale(identifier: "en_US_POSIX"); clock.dateFormat = "h:mm a"
             let failures = Dictionary(uniqueKeysWithValues: files.values.compactMap { file in
@@ -141,11 +145,12 @@ extension AppActions {
         let outcome = AbilityStore.runOutcome(.object(last))
         guard outcome != "ok" else { return nil }
         let fault = last["error"]?.objectValue ?? last["stopped"]?.objectValue ?? last
+        let label = outcome == "cut" && (fault["reason"]?.stringValue ?? last["reason"]?.stringValue) == "cancelled" ? "cancelled" : "failed"
         let detail = fault["message"]?.stringValue ?? fault["detail"]?.stringValue ?? fault["reason"]?.stringValue
             ?? last["error"]?.stringValue ?? outcome
         let reason = ContextSecretContentPolicy.redactedFragment(detail).split(whereSeparator: \.isWhitespace).prefix(8).joined(separator: " ")
         let at = last["at"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601) ?? usedAt(state)
         let when = at.map { clock.string(from: $0) } ?? "(time unknown)"
-        return "failed last run " + when + ": " + (reason.isEmpty ? outcome : reason)
+        return label + " last run " + when + ": " + (reason.isEmpty ? outcome : reason)
     }
 }

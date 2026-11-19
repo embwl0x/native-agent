@@ -35,17 +35,18 @@ extension MacFourVerbs {
         let scope = flowSession.map(Self.actFlowScope)
         let keptLine = Self.keptLine(flow)
         let evidence = Experience.Ref(source: "act", id: turn.id)
-        // Retain optional-miss markers alongside landed digests so continuation knows which absent steps need rechecking.
         var outcomes: [String] = []
         var lines: [String] = []
         var screen: String?
         var frontChanged = false
+        var unverified: [JSONValue] = []
         for (index, asked) in steps.enumerated() {
             if let flow, flow.kept(index) {
                 lines.append("\(index + 1) \(asked.target) " + (flow.landed[index].hasPrefix("~")
                     ? "~ (its effect was unknown when the batch stopped at \(Self.clockTime(flow.at)); not repeated)"
                     : "✓ (landed \(Self.clockTime(flow.at)), not repeated)"))
                 outcomes.append(flow.landed[index])
+                if flow.landed[index].hasPrefix("~") { unverified.append(.int(Int64(index + 1))) }
                 continue
             }
             // Optional missing confirmations skip without failing; their absence does not establish a completed effect.
@@ -107,7 +108,7 @@ extension MacFourVerbs {
                 let landed = outcomes + (flow?.landed.dropFirst(outcomes.count) ?? [])
                 if let root = flowRoot, let scope, landed.contains(where: { !$0.hasPrefix("?") }) {
                     Flow.stopped(root, scope: scope, landed: landed,
-                        words: "mac.act stopped at step \(index + 1) (\(why)); \(landed.filter { !$0.hasPrefix("?") }.count) steps had landed.",
+                        words: "mac.act stopped at step \(index + 1) (\(why)). Kept \(landed.filter { !$0.hasPrefix("?") }.count) step outcomes.",
                         evidence: evidence, cause: [evidence.id])
                 }
                 return MacFourVerbsReply(
@@ -117,17 +118,19 @@ extension MacFourVerbs {
                     detail: detail
                 )
             }
-            if let flow { outcomes.append(flow.digests[index]) }
+            if let flow { outcomes.append((verified ? "" : "~") + flow.digests[index]) }
+            if !verified { unverified.append(.int(Int64(index + 1))) }
         }
         if screen == nil, case .seen(let hit) = await sight(part: nil, app: app, turn: turn, context: context) { screen = hit.render }
         if let root = flowRoot, let scope { Flow.finished(root, scope: scope, evidence: evidence) }
         return MacFourVerbsReply(
             ok: true,
-            text: (keptLine.isEmpty ? "Did all \(steps.count) steps." : keptLine + "did the rest.")
+            text: (keptLine.isEmpty ? "Did all \(steps.count) steps." : keptLine + "Did the rest.")
                 + "\n" + lines.joined(separator: "\n") + (screen.map { "\n" + $0 } ?? ""),
             detail: [
                 "steps_completed": .int(Int64(steps.count)),
                 "steps_total": .int(Int64(steps.count)),
+                "unverified_steps": .array(unverified),
                 "owner_front_changed": .bool(frontChanged),
                 "background": .bool(app != nil),
             ]
@@ -156,7 +159,8 @@ extension MacFourVerbs {
 
     static func keptLine(_ flow: ActFlow?) -> String {
         guard let flow, flow.keptCount > 0 else { return "" }
-        return "Kept \(flow.keptCount) steps that already landed at \(clockTime(flow.at)) (again:true runs them all again); "
+        let unverified = flow.landed.filter { $0.hasPrefix("~") }.count
+        return "Kept \(flow.keptCount) steps from \(clockTime(flow.at)) (\(unverified) unverified). Use again:true to run them all again. "
     }
 
     /// The app is part of each step: the same steps in another app never landed there.

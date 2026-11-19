@@ -158,7 +158,7 @@ extension SwiftToolDispatcher {
     """
     enum BuilderShellSandboxMode: String, Sendable {
         case readOnly = "read_only"
-        /// Strict / locked-down posture: workspace-confined AND the off-ramps (env break-glass, `securityPolicy.shellSandboxEnabled`) do not apply.
+        /// Strict / locked-down posture keeps workspace confinement regardless of `securityPolicy.shellSandboxEnabled`.
         case lockedDown = "locked_down"
         case workspaceWrite = "workspace_write"
         case developerFullMac = "developer_full_mac"
@@ -168,10 +168,9 @@ extension SwiftToolDispatcher {
     static let builderYoloPermissionLevels: Set<String> = [
         "full_mac_os",
     ]
-    /// Trust selects confinement; locked-down mode overrides all environment and policy escape hatches.
+    /// Trust selects confinement; locked-down mode overrides the saved sandbox-off setting.
     static func builderShellSandboxMode(
-        dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        dataRoot: URL
     ) async throws -> BuilderShellSandboxMode {
         let policy = try await SwiftNativeTrustCenter(
             dataRoot: dataRoot
@@ -181,16 +180,12 @@ extension SwiftToolDispatcher {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { permissionLevel = trimmed }
         }
-        // Locked-down posture outranks policy and environment escape hatches.
+        // Locked-down posture outranks the saved sandbox-off setting.
         if permissionLevel == "strict" {
             return .lockedDown
         }
         // Full Mac requires both explicit permission level and current authority.
         if Self.builderYoloPermissionLevels.contains(permissionLevel), PermissionLaw.posture(policy) == .fullMac {
-            return .off
-        }
-        if let v = environment["NATIVE_AGENT_SHELL_SANDBOX"],
-           v == "0" || v.lowercased() == "false" {
             return .off
         }
         if case .bool(true)? = policy["developerMode"] {
@@ -303,7 +298,7 @@ extension SwiftToolDispatcher {
         process.executableURL = URL(fileURLWithPath: launch.executable)
         process.arguments = launch.arguments
         // SwiftPM's manifest sandbox cannot nest. Put the --disable-sandbox shim first on PATH while the outer profile retains write confinement.
-        var env = launch.environment ?? environmentOverride ?? ProcessInfo.processInfo.environment
+        var env = launch.environment ?? environmentOverride ?? ManagedProcess.agentEnvironment()
         var effectiveCompatRewrites: [String] = []
         let developerDirectory = await Self.builderSelectedDeveloperDirectory(environment: env)
         let developerPromptPolicy = Self.builderEnvironmentSuppressingDeveloperToolsPrompt(

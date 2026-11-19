@@ -82,7 +82,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let parent = turn.act
         let enclosing = invocation.surfacedNos, inside = SurfacedNos(parent: enclosing)
         // The begin event lets Inspector show an in-flight dispatch.
-        Self.fireBusEvent(turn: turn,
+        await Self.fireBusEvent(dataRoot: dataRoot, turn: turn,
             tool: tool, input: input, surface: surface,
             phase: "begin", status: "running", durationMs: nil, result: nil, resultView: nil,
             evidence: Self.dispatchEvidence(turn: turn, tool: tool, input: input, status: "running", result: nil, receiptID: receiptID),
@@ -204,11 +204,11 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let receiptID = UUID().uuidString.lowercased()
         let ability = abilityName(tool: tool, input: input)
         if ability == nil {
-            let view = await resultView(turn: turn, tool: tool, input: input, result: result, receiptID: receiptID)
+            let view = await resultView(turn: turn, tool: tool, input: input, result: result, receiptID: receiptID, dataRoot: dataRoot)
             var evidence = dispatchEvidence(turn: turn, tool: tool, input: input, status: "failed", result: result, receiptID: receiptID)
             evidence["result_recovery"] = view.recovery
             if view.failed { evidence["result_retention_failed"] = .bool(true) }
-            fireBusEvent(turn: turn, tool: tool, input: input, surface: surface, phase: "end", status: "failed", durationMs: nil,
+            await fireBusEvent(dataRoot: dataRoot, turn: turn, tool: tool, input: input, surface: surface, phase: "end", status: "failed", durationMs: nil,
                 result: result, resultView: view, evidence: evidence, parent: nil)
             return result
         }
@@ -229,7 +229,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     }
 
     @concurrent private static func resultView(turn: Turn, tool: String, input: [String: JSONValue], result: JSONValue,
-        receiptID: String) async -> ProviderToolResultPage.View {
+        receiptID: String, dataRoot: URL) async -> ProviderToolResultPage.View {
         do {
             let ran = ToolNameAliases.ranTool(tool, input: input)
             var redacted = TurnTraceRedactor.redactValue(MacInjectionResultRedaction.redacted(tool: ran,
@@ -241,15 +241,17 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             }
             let content = ChatSecretRedactor.redactText(try redacted.serialize(pretty: false))
             return await ProviderToolResultPage.project(toolName: tool, content: content,
-                sessionId: turn.resultRecoveryScope?.sessionId, turnId: turn.id,
-                originalResultClass: ToolResult(result).outcome, appDoor: true, inlineLimit: 500, includeSections: false)
+                dataRoot: dataRoot, turn: turn,
+                originalResultClass: ToolResult(result).outcome, appDoor: true,
+                inlineLimit: TurnTraceEvent.toolResultInlineUTF8Bytes, includeSections: false)
         } catch {
-            return .init(content: "The result could not be encoded for retention: \(error.localizedDescription). Inspect its effect before repeating it.",
+            let cause = String(error.localizedDescription.prefix(300))
+            return .init(content: "The result could not be encoded for retention: \(cause). Inspect its effect before repeating it.",
                 recovery: nil, failed: true)
         }
     }
 
-    private static func fireBusEvent(turn: Turn,
+    private static func fireBusEvent(dataRoot: URL, turn: Turn,
         tool: String,
         input: [String: JSONValue],
         surface: String,
@@ -261,8 +263,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         evidence: [String: JSONValue],
         parent: String?,
         recordedAt: Date = Date()
-    ) {
-        guard let turnId = TurnTraceContext.turnId else { return }
+    ) async {
         var payload: [String: JSONValue] = [
             "name": .string(tool),
             "phase": .string(phase),
@@ -293,10 +294,12 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             payload["result"] = resultView.map { JSONValue.string($0.content) }
             payload["result_recovery"] = resultView?.recovery
         }
-        TurnTraceBus.fire(TurnTraceEvent(
-            turnId: turnId, ts: recordedAt, kind: "tool.dispatch",
+        let event = TurnTraceEvent(
+            turnId: TurnTraceContext.turnId ?? turn.id, ts: recordedAt, kind: "tool.dispatch",
             sessionId: traceSessionID(turn: turn, input), surface: surface, payload: .object(payload), turn: turn
-        ), on: TurnTraceContext.bus ?? .shared)
+        )
+        if TurnTraceContext.turnId != nil { TurnTraceBus.fire(event, on: TurnTraceContext.bus ?? .shared) }
+        else if phase == "end" { await TurnTracePersistLane(dataRootOverride: dataRoot).append(event) }
         // Emit redacted file.touch paths only after successful file-tool dispatches.
         if phase == "end", status == "ok" {
             Self.fireFileTouchEvent(turn: turn, tool: tool, input: input, surface: surface, status: status)
@@ -506,7 +509,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         errorClass: String? = nil,
         errorDetail: String? = nil
     ) async {
-        let resultView = await Self.resultView(turn: turn, tool: tool, input: input, result: result, receiptID: receiptID)
+        let resultView = await Self.resultView(turn: turn, tool: tool, input: input, result: result, receiptID: receiptID, dataRoot: dataRoot)
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         let recordedAt = Date()
         let argKeys = input.keys.sorted()
@@ -519,13 +522,17 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         let projected = evidence["resultClass"] == .string("preview") ? ChatToolOutcome.ExactResultClass.unknown : verdict
         let ok = projected == .succeeded
         let waiting = status == "waiting"
+        let pending = projected == .unknown
+            && ChatToolOutcome.displayOutcome(result: result, ok: nil, hasResult: true) == .pending
+        let outcome = ok ? "completed" : waiting ? "waiting" : pending ? "pending" : projected.rawValue
+        let reason = ok ? "tool dispatch completed" : waiting ? "waiting on you" : "tool dispatch \(outcome)"
         var receiptEvidence: [String: JSONValue] = [
             "action": .string("tool_dispatch"),
             "surface": .string(surface),
             "target": .string(tool),
             "decision": .string("attempted"),
-            "outcome": .string(ok ? "completed" : (waiting ? "waiting" : projected.rawValue)),
-            "reason": .string(ok ? "tool dispatch completed" : (waiting ? "waiting on you" : "tool dispatch \(projected.rawValue)")),
+            "outcome": .string(outcome),
+            "reason": .string(reason),
             "changedFields": .array([]),
             "proof": .array([
                 "detail:tool.dispatch:\(receiptID)",
@@ -548,7 +555,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         receiptEvidence["source"] = .string("detail")
         receiptEvidence["result_recovery"] = resultView.recovery
         if resultView.failed { receiptEvidence["result_retention_failed"] = .bool(true) }
-        Self.fireBusEvent(turn: turn,
+        await Self.fireBusEvent(dataRoot: dataRoot, turn: turn,
             tool: tool, input: input, surface: surface, phase: "end",
             status: status, durationMs: durationMs, result: result, resultView: resultView,
             evidence: receiptEvidence, parent: parent, recordedAt: recordedAt
@@ -621,29 +628,5 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             try await store.begin(act)
             if worked { try await RepairOwed.settle(store, operation: operation, evidence: .init(source: "act", id: receiptID)) }
         }
-        await recordStandaloneTrace(dataRoot: dataRoot, turn: turn, tool: tool, surface: surface, status: status, argKeys: argKeys,
-            durationMs: durationMs, receiptID: receiptID, receiptEvidence: receiptEvidence, result: result, recordedAt: recordedAt)
-    }
-
-    private static func recordStandaloneTrace(dataRoot: URL, turn: Turn, tool: String, surface: String, status: String, argKeys: [String],
-        durationMs: Int, receiptID: String, receiptEvidence: [String: JSONValue], result: JSONValue, recordedAt: Date) async {
-        guard TurnTraceContext.turnId == nil else { return }
-        var payload: [String: JSONValue] = [
-            "name": .string(tool),
-            "phase": .string("end"),
-            "status": .string(status),
-            "argKeys": .array(argKeys.map { .string($0) }),
-            "durationMs": .int(Int64(durationMs)),
-            "surface": .string(surface),
-            "turnId": .string(turn.id),
-            "receipt": .object(receiptEvidence),
-        ]
-        payload["result_recovery"] = receiptEvidence["result_recovery"]
-        if status == "failed" { payload.merge(Self.failureFields(result)) { _, field in field } }
-        let event = TurnTraceEvent(kind: "tool.dispatch", title: tool, status: status,
-            // Keep argument and result bodies out of compact repair evidence.
-            payload: .object(payload), id: receiptID, createdAt: NativeTimestampFormat.plainZulu(recordedAt), ts: recordedAt,
-            turnId: turn.id, sessionId: turn.session, surface: surface, turn: turn)
-        await TurnTracePersistLane(dataRootOverride: dataRoot).append(event)
     }
 }

@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `AppModel+GraphCapabilityActions.swift` | Research and export commands consume typed body replies |
+// Blueprint: | `AppModel+GraphCapabilityActions.swift` | Research commands consume typed body replies |
 
 enum ResearchSearchFailure: Error, Equatable {
     case blankQuery
@@ -51,16 +51,6 @@ struct ResearchReplyFace: Equatable, Sendable {
     }
 }
 
-struct ProductionExportReceipt: Equatable {
-    let id: String
-    let path: String
-    let sizeBytes: Int?
-}
-
-enum ProductionExportCreationOutcome: Equatable {
-    case verified(ProductionExportReceipt)
-    case failed(support: Bool, detail: String)
-}
 
 @MainActor extension AppModel {
     func search(_ query: String) async -> Result<ResearchReplyFace, ResearchSearchFailure> {
@@ -75,26 +65,4 @@ enum ProductionExportCreationOutcome: Equatable {
         }
     }
 
-    func showVisibleBrowser() async {
-        do {
-            try FaceWindowReply.check(await client.act(.pageAct(.init(
-                page: "browser", row: "", action: "open", value: nil, expectedRevision: nil, expectedCall: nil))))
-        } catch { statusText = error.localizedDescription }
-    }
-
-    func createProductionExport(support: Bool = false) async -> ProductionExportCreationOutcome {
-        do {
-            let value = try FaceWindowReply.value(await client.act(.createProductionExport(support: support)))
-            guard case .object(let row) = value, case .string(let id)? = row["id"],
-                  case .string(let path)? = row["path"], case .int(let bytes)? = row["sizeBytes"],
-                  let size = Int(exactly: bytes), size > 0 else {
-                throw PartCallError(code: "export_reply_invalid", message: "The body did not return a verified export receipt.")
-            }
-            statusText = "Created and verified: " + path
-            return .verified(.init(id: id, path: path, sizeBytes: size))
-        } catch {
-            statusText = error.localizedDescription
-            return .failed(support: support, detail: error.localizedDescription)
-        }
-    }
 }

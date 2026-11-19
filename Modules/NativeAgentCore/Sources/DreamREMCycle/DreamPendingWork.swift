@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import CognitiveSubstrate
+import MemoryV2
 
 // Blueprint: | `DreamPendingWork.swift` | DreamPendingWork owner. |
 
@@ -200,7 +201,7 @@ extension DreamCycleRunner {
         let journalIDs = Set(records.map { $0.1.id })
         do {
             let diary = FileBackedDreamDiary(dataRoot: dataRoot)
-            for file in try diary.discover(in: .includingArchives, matching: .dated) {
+            for file in try diary.discover(in: .active, matching: .dated) {
                 do {
                     let content = try String(contentsOf: file.url, encoding: .utf8)
                     let identities = content.components(separatedBy: "\n").filter { $0.hasPrefix(DreamPendingWork.identityPrefix) }
@@ -231,26 +232,36 @@ extension DreamCycleRunner {
                 do { try publishPendingDream(&work) }
                 catch { publicationUnavailable = true; throw error }
                 let offered = work.lessons.count
+                var saved = 0
                 for index in work.lessons.indices.reversed() {
                     try Task.checkCancellation()
-                    do { try await commitLesson(work.lessons[index], dateKey: work.date, sourcePeerIds: work.sourcePeerIds) }
-                    catch {
-                        work.note("lessons", error: error)
-                        errors.append("\(file.path) lesson \(work.lessons[index].from): \(error)")
-                        continue
+                    let lesson = work.lessons[index]
+                    do {
+                        try await commitLesson(lesson, dateKey: work.date, sourcePeerIds: work.sourcePeerIds)
+                        saved += 1
+                    } catch {
+                        let failure = (error as? ToolFailureError) ?? (error as? MemoryStorageError)?.failure
+                        guard let failure, failure.status == .refused, failure.effects == .none, failure.recovery == .terminal else {
+                            work.note("lessons", error: error)
+                            errors.append("\(file.path) lesson \(lesson.from): \(error)")
+                            continue
+                        }
+                        let input = JSONValue.array([.string(lesson.lesson), .string(lesson.from), .string(lesson.kind)])
+                        work.finish("lesson:" + (try input.serialize(pretty: false)), result: "refused: \(failure.message)")
+                        errors.append("\(file.path) lesson \(lesson.from) refused: \(failure.message)")
                     }
                     work.lessons.remove(at: index)
                     if work.lessons.isEmpty { work.finish("lessons") }
                     try work.save(in: dataRoot)
                 }
                 if offered > 0 { try work.save(in: dataRoot) }
-                lessonsSaved += offered - work.lessons.count
+                lessonsSaved += saved
                 if offered > 0 {
                     do {
                         try await receiptSink("dream.lessons", .object([
                             "date": .string(work.date), "dreamId": .string(work.id.uuidString),
-                            "offered": .int(Int64(offered)), "saved": .int(Int64(offered - work.lessons.count)),
-                            "failed": .int(Int64(work.lessons.count))]))
+                            "offered": .int(Int64(offered)), "saved": .int(Int64(saved)),
+                            "failed": .int(Int64(offered - saved))]))
                     } catch { errors.append("\(file.path) lesson receipt failed: \(error)") }
                 }
                 // Failure notes cannot block another attempt; only Stop or shared-journal failure prevents sibling steps.
@@ -324,8 +335,7 @@ extension DreamCycleRunner {
                 if let affect = work.affect {
                     try Task.checkCancellation()
                     do {
-                        let skipped = try await integrateMood(affect: affect,
-                            in: dataRoot.appendingPathComponent("dream_diary", isDirectory: true), dateKey: work.date)
+                        let skipped = try await integrateMood(affect: affect, dateKey: work.date)
                         work.affect = nil
                         work.finish("mood", result: skipped.map { "skipped: " + $0 } ?? "done")
                     } catch {

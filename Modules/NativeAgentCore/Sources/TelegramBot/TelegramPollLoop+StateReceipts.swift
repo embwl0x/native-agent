@@ -208,12 +208,16 @@ extension TelegramPollLoop {
         if let preview = _tgPreview(text) {
             row["textPreview"] = .string(preview)
         }
-        try? await appendJSONLCapped(
-            .object(row),
-            to: telegramDir.appendingPathComponent("blocked.jsonl"),
-            maxLines: JSONLLineCaps.telegramBlocked,
-            logLabel: "TelegramPollLoop.blocked"
-        )
+        do {
+            try await appendJSONLCapped(
+                .object(row),
+                to: telegramDir.appendingPathComponent("blocked.jsonl"),
+                maxLines: JSONLLineCaps.telegramBlocked,
+                logLabel: "TelegramPollLoop.blocked"
+            )
+        } catch {
+            await recordError(context: "blocked_receipt_write", error: String(describing: error), update: update, message: message)
+        }
     }
 
     /// Retain setup pages before advancing so enabling later still admits them normally; discovery never grants sender authority.
@@ -369,12 +373,17 @@ extension TelegramPollLoop {
         if let preview = _tgPreview(reply) {
             row["replyPreview"] = .string(preview)
         }
-        try? await appendJSONLCapped(
-            .object(row),
-            to: telegramDir.appendingPathComponent("receipts.jsonl"),
-            maxLines: JSONLLineCaps.telegramReceipts,
-            logLabel: "TelegramPollLoop.receipts"
-        )
+        do {
+            try await appendJSONLCapped(
+                .object(row),
+                to: telegramDir.appendingPathComponent("receipts.jsonl"),
+                maxLines: JSONLLineCaps.telegramReceipts,
+                logLabel: "TelegramPollLoop.receipts"
+            )
+        } catch {
+            await recordError(context: "receipt_write", error: String(describing: error), update: update, message: message)
+            return
+        }
         await writeStatePatch([
             "lastReplyAt": .string(at),
             "lastError": .null,

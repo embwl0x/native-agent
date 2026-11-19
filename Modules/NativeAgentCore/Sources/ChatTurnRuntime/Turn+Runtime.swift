@@ -56,7 +56,6 @@ public struct ChatTurnWork: Sendable {
     var thinking = false
     var botAncestry: Set<UUID> = []
     var botOptions = BotRunOptions()
-    var expansionInside = false
     var fit: SessionRequestFit.Handler?
     var prefixTelemetry: ConversationPrefixTelemetrySink?
     package var toolInvocation = ChatToolInvocation()

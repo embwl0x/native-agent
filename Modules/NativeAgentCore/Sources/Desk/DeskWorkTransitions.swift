@@ -322,55 +322,6 @@ extension SwiftNativeDeskStore {
             return created
         }
     }
-    @discardableResult
-    public func reserveWorkAttempt(
-        _ handle: String,
-        lane: DeskWorkAttempt.Lane,
-        day: String,
-        slot: String
-    ) async throws -> String {
-        try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            let feed = try await readFeedUnlocked()
-            let state = Self.compact(base: feed.base, feed.ops)
-            guard let item = state.items.first(where: { $0.handle == handle }) else {
-                throw DeskError.unknownHandle(handle)
-            }
-            guard !item.status.isTerminal, item.isPursuit == (lane == .pursuit) else {
-                throw DeskError.notAPursuit(handle: handle)
-            }
-            let attemptId = DeskClock.workAttemptId(handle: handle, lane: lane, day: day, slot: slot)
-            if state.hasWorkSlot(handle: handle, id: attemptId) { return attemptId }
-            let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
-                handle: handle,
-                body: .reserveWorkAttempt(attemptId: attemptId, lane: lane, day: day, slot: slot)
-            )
-            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return attemptId
-        }
-    }
-    @discardableResult
-    public func handOffWorkReceipt(_ handle: String, reservationId: String) async throws -> DeskOp? {
-        try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            let feed = try await readFeedUnlocked()
-            let state = Self.compact(base: feed.base, feed.ops)
-            guard let item = state.items.first(where: { $0.handle == handle }) else {
-                throw DeskError.unknownHandle(handle)
-            }
-            let handedOff = item.workAttempts.first(where: { $0.attemptId == reservationId })?.receiptHandedOff
-            if handedOff == true { return nil }
-            if handedOff == nil, state.hasWorkSlot(handle: handle, id: reservationId) { return nil }
-            let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
-                handle: handle,
-                body: .handOffWorkReceipt(reservationId: reservationId)
-            )
-            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return op
-        }
-    }
     /// Select receipt or note by item kind under one lock; failure cannot select another tool.
     @discardableResult
     public func appendWorkReceipt(_ handle: String, receipt: String) async throws -> DeskOp {
@@ -422,27 +373,6 @@ extension SwiftNativeDeskStore {
                 laneOf: normalizedLaneOf
             )
         ))
-    }
-    @discardableResult
-    /// Match the caller's open revision; commit any note under the same lock and revision stamp.
-    public func setStatusIfUnchanged(
-        _ handle: String,
-        expectedUpdatedAt: String,
-        status: DeskStatus,
-        blockedReason: String? = nil,
-        note: String? = nil
-    ) async throws -> DeskOp? {
-        try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            let feed = try await readFeedUnlocked()
-            let state = Self.compact(base: feed.base, feed.ops)
-            guard let item = state.items.first(where: { $0.handle == handle }) else {
-                throw DeskError.unknownHandle(handle)
-            }
-            guard !item.status.isTerminal, item.updatedAt == expectedUpdatedAt else { return nil }
-            let op = try await setStatus(handle, status: status, blockedReason: blockedReason)
-            if let note, let noted = try? await appendNote(handle, text: note) { return noted }
-            return op
-        }
     }
     @discardableResult
     public func updateTitle(_ handle: String, title: String? = nil, summary: String? = nil) async throws -> DeskOp {

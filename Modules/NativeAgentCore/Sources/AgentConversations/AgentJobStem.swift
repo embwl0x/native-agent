@@ -5,6 +5,7 @@ import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Senses
 import TrustCenter
 // Blueprint: | `AgentJobStem.swift` | `AgentJobs`: commission, read, stop, required checks, deliverables and settlement |
 
@@ -32,7 +33,7 @@ public enum AgentJobs {
     /// own line. `ceiling` is the agent's Trust posture for driving another agent, read at the door; `limits` are the commissioning turn's peer steering and
     /// file access.
     public static func commission(_ input: [String: JSONValue], session: String?, surface: String, ceiling: DrivenAgentLaunchPermission,
-                                  limits: (peers: [String], elevated: [String], fileAccess: String?), dataRoot: URL,
+                                  limits: (peers: [String], elevated: [String], fileAccess: ICloudChatFileAccessPolicy.Ceiling), origin: SecurityOriginContext? = nil, dataRoot: URL,
                                   register: @escaping AgentJobRegistrar) async -> JSONValue {
         let to = (input["agent"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let brief = (input["brief"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -61,7 +62,7 @@ public enum AgentJobs {
         case .failure(let refusal): return refused("invalid_where", refusal.message, path: "where")
         }
         var envelope: AgentJob.Envelope
-        switch self.envelope(input["reach"], place: place, ceiling: ceiling) {
+        switch self.envelope(input["reach"], place: place, ceiling: ceiling, fileAccess: limits.fileAccess) {
         case .success(let found): envelope = found
         case .failure(let refusal): return refused("outside_posture", refusal.message, path: "reach")
         }
@@ -89,7 +90,7 @@ public enum AgentJobs {
             peers: limits.peers.isEmpty ? nil : limits.peers, elevated: limits.elevated.isEmpty ? nil : limits.elevated,
             fileAccess: limits.fileAccess, place: place, worktree: worktree,
             envelope: envelope, done: done, desk: desk?.isEmpty == false ? desk : nil, state: .working, deliverables: [],
-            commission: .init(session: session, surface: surface), startedAt: now, updatedAt: now)
+            commission: .init(session: session, surface: surface, origin: origin), startedAt: now, updatedAt: now)
         let store = AgentJobStore(dataRoot: dataRoot)
         // The commission is kept before the door runs, so an organ never works with no record of it.
         do { try store.insert(job) }
@@ -103,7 +104,7 @@ public enum AgentJobs {
         }
         let runner = AgentJobDoors.runner(for: peer)
         let events: AsyncThrowingStream<JobEvent, Error>
-        do { events = try await runner.start(start(job, peer: peer)) }
+        do { events = try await runner.start(start(job, peer: peer, dataRoot: dataRoot)) }
         catch let refusal as JobRefusal {
             do { try store.withdraw(job.id) }
             catch { owe(job.id, "withdraw a refused commission", error, store: store, dataRoot: dataRoot) }
@@ -136,7 +137,7 @@ public enum AgentJobs {
     /// The agent's own line: a turn in its own work conversation under the agent's own Trust, so where and reach (which bound another agent) do not apply. A
     /// done check of a file or grep still judges what the line made.
     static func line(_ input: [String: JSONValue], brief: String, session: String?, surface: String,
-                     limits: (peers: [String], elevated: [String], fileAccess: String?), dataRoot: URL,
+                     limits: (peers: [String], elevated: [String], fileAccess: ICloudChatFileAccessPolicy.Ceiling), dataRoot: URL,
                      register: @escaping AgentJobRegistrar) async -> JSONValue {
         for key in ["where", "reach"] where input[key] != nil && input[key] != .null {
             return refused("invalid_args", "Your own line works with your own hands under your Trust; \(key) bounds another agent. Nothing was started.",
@@ -205,7 +206,7 @@ public enum AgentJobs {
 
     /// Home's WORKING block and crews room read the agent's jobs through their store, newest first.
     public static func installGlance() {
-        AgentScreen.jobGlances.withLock { $0 = { root in
+        AgentScreen.jobGlances.withLock { $0 = .init { root in
             try AgentJobStore(dataRoot: root).jobs().sorted { $0.startedAt > $1.startedAt }.map { job in
                 AgentScreen.JobGlance(id: job.id, agent: job.agent, name: job.name, own: job.isOwn, state: job.state.rawValue,
                     working: !job.state.isTerminal, brief: job.brief, desk: job.desk, at: job.startedAt)
@@ -249,7 +250,7 @@ public enum AgentJobs {
                 if let peer = peers.first(where: { $0.id == job.contact }) {
                     let runner = AgentJobDoors.runner(for: peer)
                     do {
-                        let events = try await runner.resume(start(job, peer: peer), session: session)
+                        let events = try await runner.resume(start(job, peer: peer, dataRoot: dataRoot), session: session)
                         keep(job.id, store: store, dataRoot: dataRoot) { $0.detail = "Resumed by its session after the app restarted." }
                         await AgentJobFlights.shared.fly(job.id, runner: runner) {
                             await consume(job.id, events, dataRoot: dataRoot, register: register)
@@ -268,12 +269,22 @@ public enum AgentJobs {
         }
     }
 
-    static func start(_ job: AgentJob, peer: AgentPeerContact) -> JobStart {
-        JobStart(job: job.id, contact: peer, brief: job.brief, folder: job.envelope.folder.map { URL(fileURLWithPath: $0, isDirectory: true) },
-                 envelope: job.envelope)
+    static func start(_ job: AgentJob, peer: AgentPeerContact, dataRoot: URL) throws -> JobStart {
+        if let folder = job.envelope.folder {
+            _ = try place(.string(folder), dataRoot: dataRoot).get()
+        }
+        let access = job.fileAccess ?? .init()
+        guard access.invalidMode == nil, !access.noPathfulReads else {
+            throw JobRefusal("The commissioning turn's fileAccess does not allow a job to read files. Nothing ran.")
+        }
+        let kept = try AgentJobStore(dataRoot: dataRoot).update(job.id) { if access.readOnly { $0.envelope.writes = false } }
+        return JobStart(job: kept.id, contact: peer, brief: kept.brief, folder: kept.envelope.folder.map { URL(fileURLWithPath: $0, isDirectory: true) },
+                        envelope: kept.envelope, handle: { session in
+                            try AgentJobStore(dataRoot: dataRoot).update(kept.id) { $0.session = session }
+                        })
     }
 
-    /// A folder or a repo's folder, never inside the agent's own data root.
+    /// A folder or repo disjoint from the agent's data and credentials, judged by filesystem identity.
     static func place(_ value: JSONValue?, dataRoot: URL) -> Result<AgentJob.Place?, JobRefusal> {
         guard let value, value != .null else { return .success(nil) }
         guard let raw = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
@@ -286,25 +297,39 @@ public enum AgentJobs {
         guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             return .failure(JobRefusal("\(folder.path) is not a folder on this Mac. Nothing was sent."))
         }
-        let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
-        guard folder.path != root, !folder.path.hasPrefix(root + "/"), !root.hasPrefix(folder.path + "/") else {
-            return .failure(JobRefusal("\(folder.path) holds your own data; another agent never works there. Nothing was sent."))
+        do {
+            let roots = [dataRoot] + MacControlSensitivePathFence.credentialRoots(dataRoot: dataRoot)
+            if try SenseSandboxProfile.containsResolved(folder, roots: roots)
+                // A protected root is judged where it really lives, so a symlinked ~/.ssh inside the folder still counts.
+                || roots.contains(where: { try SenseSandboxProfile.containsResolved($0.resolvingSymlinksInPath(), roots: [folder]) }) {
+                return .failure(JobRefusal(
+                    "\(folder.path) overlaps your own data or credentials; another agent never works there. Nothing was sent."))
+            }
+        } catch {
+            return .failure(JobRefusal(
+                "\(folder.path)'s data and credential boundary could not be checked: \(error.localizedDescription). Nothing was sent."))
         }
         let repo = FileManager.default.fileExists(atPath: folder.appendingPathComponent(".git").path)
         return .success(.init(kind: repo ? .repo : .folder, path: folder.path))
     }
 
     /// Writes default to the job's one folder; network defaults off. The agent's posture is the ceiling: below Full Mac the organ has no network.
-    static func envelope(_ value: JSONValue?, place: AgentJob.Place?, ceiling: DrivenAgentLaunchPermission) -> Result<AgentJob.Envelope, JobRefusal> {
+    static func envelope(_ value: JSONValue?, place: AgentJob.Place?, ceiling: DrivenAgentLaunchPermission,
+                         fileAccess: ICloudChatFileAccessPolicy.Ceiling) -> Result<AgentJob.Envelope, JobRefusal> {
         if case .denied(let reason) = ceiling { return .failure(JobRefusal("Driving another agent is not allowed now: \(reason). Nothing was sent.")) }
+        let access = fileAccess
+        guard access.invalidMode == nil, !access.noPathfulReads else {
+            return .failure(JobRefusal("The commissioning turn's fileAccess does not allow a job to read files. Nothing was sent."))
+        }
         let fields = value?.objectValue ?? [:]
         guard value == nil || value == .null || value?.objectValue != nil,
               fields.keys.allSatisfy({ ["writes", "network"].contains($0) }),
               fields.values.allSatisfy({ $0.boolValue != nil }) else {
             return .failure(JobRefusal("reach takes {writes: true|false, network: true|false}. Nothing was sent."))
         }
-        let writes = fields["writes"]?.boolValue ?? (place != nil)
+        let writes = fields["writes"]?.boolValue ?? (place != nil && !access.readOnly)
         let network = fields["network"]?.boolValue ?? false
+        if writes, access.readOnly { return .failure(JobRefusal("fileAccess=read_only blocks job writes. Nothing was sent.")) }
         if writes, place == nil { return .failure(JobRefusal("writes:true needs where: the one folder it may write in. Nothing was sent.")) }
         if network, ceiling != .fullMac {
             return .failure(JobRefusal("network:true needs Full Mac; below it a job has no network. Nothing was sent."))
@@ -477,7 +502,7 @@ public enum AgentJobs {
             for try await event in events {
                 switch event {
                 case .started(let session):
-                    keep(id, store: store, dataRoot: dataRoot) { $0.session = session }
+                    if runner == nil { keep(id, store: store, dataRoot: dataRoot) { $0.session = session } }
                     // A stop that landed while the door was still starting found no run to end. Its session is known only now, so it is
                     // ended here: her stop owns the record, and the organ must not go on working behind it.
                     do {
@@ -696,7 +721,11 @@ public enum AgentJobs {
         }
         var profile = ["(version 1)", "(allow default)", "(deny file-write*)",
                        "(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\"))"]
-        if envelope.writes, let folder = envelope.folder { profile.append("(allow file-write* (subpath \(literal(folder))))") }
+        if envelope.writes, let folder = envelope.folder {
+            profile.append("(allow file-write* (subpath \(literal(folder))))")
+            let git = URL(fileURLWithPath: folder).appendingPathComponent(".git").resolvingSymlinksInPath().path
+            profile.append("(deny file-write* (subpath \(literal(git))))")
+        }
         if !envelope.network { profile.append("(deny network*)") }
         return profile.joined(separator: "\n")
     }

@@ -140,7 +140,6 @@ extension QuietLowerOnlySettingsHost {
                 await self.setActivityModelAccessEnabled(enabled)
             }
         ).onTab("features"))
-        // How much activity capture records and keeps, and the Mac's access preset, are the person's to set: the agent reads them.
         rows.append(QuietSetting(
             id: "trust.activity_titles", page: "trust", label: "Window titles recorded", kind: .choice,
             choices: QuietSettings.activityTitleChoices,
@@ -239,12 +238,11 @@ extension QuietLowerOnlySettingsHost {
         }
 
         let store = MacIntegrationPermissionStore(dataRoot: root)
-        // One writer for an app's access (nil leaves an axis as saved). The person's decided change records the door it came from; any other
-        // change, at any posture, may only take access away, which the store enforces under its lock.
         let setIntegration: @MainActor @Sendable (String, String, String, JSONValue, Bool?, Bool?, QuietSettingWrite) async throws -> Void = {
             integration, name, setting, value, read, write, context in
             let decided = QuietSettings.personDecided(setting: setting, value: value, turn: context.turn)
-            let onlyRemovingAxes = !decided
+            let owns = try await SwiftNativeTrustCenter(dataRoot: root).agentOwnsLevers(turn: context.turn)
+            let onlyRemovingAxes = !decided && !owns
             let act = decided ? context.turn.personAct : nil
             let door = act?.door
             do {
@@ -261,8 +259,8 @@ extension QuietLowerOnlySettingsHost {
                     try await store.set(integrationId: integration, read: read, write: write, onlyRemovingAxes: onlyRemovingAxes)
                 }
             } catch MacIntegrationPermissionStoreError.wouldGainAxes(let gained) {
-                if let refused = QuietSettings.usersCall("Giving \(name) \(gained.joined(separator: " and ")) access", "Trust → Mac → \(name)",
-                                                         setting: setting, value: value, turn: context.turn) {
+                if let refused = await QuietSettings.usersCall("Giving \(name) \(gained.joined(separator: " and ")) access", "Trust → Mac → \(name)",
+                    setting: setting, value: value, dataRoot: root, turn: context.turn) {
                     throw refused
                 }
                 throw MacIntegrationPermissionStoreError.wouldGainAxes(gained)
@@ -287,17 +285,17 @@ extension QuietLowerOnlySettingsHost {
                 return wanted == "read_write" ? ["read", "write"] : wanted == "off" ? [] : [wanted]
             }
             let id = "trust.mac_integration_\(integration)"
-            // Preview refuses access gains; the writer enforces the subset against current access under its file lock.
-            let users: @Sendable (Set<String>, Set<String>, JSONValue, Turn) -> QuietSettingError? = { want, now, value, turn in
+            let users: @Sendable (Set<String>, Set<String>, JSONValue, Turn) async -> QuietSettingError? = { want, now, value, turn in
                 let gained = want.subtracting(now)
-                return gained.isEmpty ? nil : QuietSettings.usersCall(
+                return gained.isEmpty ? nil : await QuietSettings.usersCall(
                     "Giving \(name) \(gained.sorted().joined(separator: " and ")) access", "Trust → Mac → \(name)",
-                    setting: id, value: value, turn: turn)
+                    setting: id, value: value, dataRoot: root, turn: turn)
             }
             rows.append(QuietSetting(
                 id: id, page: "trust",
                 label: "\(name) access", kind: .choice, choices: choices,
-                note: "You may take access away; giving any back is the person's at every posture (your call asks them). "
+                note: "You may take access away; giving it back is yours under Full Mac unless an untrusted voice steers the turn; "
+                    + "below Full Mac your call asks the person. "
                     + "Full Mac respects these switches, including their shipped defaults.",
                 read: { _ in
                     let on = try await current()
@@ -312,7 +310,7 @@ extension QuietLowerOnlySettingsHost {
                     guard let want = wants(value) else {
                         return .badValue("\(name) access takes one of: \(choices.joined(separator: ", ")).")
                     }
-                    do { return users(want, try await current(), value, turn) }
+                    do { return await users(want, try await current(), value, turn) }
                     catch { return .unavailable(error.localizedDescription) }
                 }
             ))
@@ -322,8 +320,8 @@ extension QuietLowerOnlySettingsHost {
                 let label = "\(name) \(mode == "read" ? "Read" : "Write")"
                 rows.append(QuietSetting(
                     id: axisID, page: "trust", label: label, kind: .boolean,
-                    note: "One axis of \(name) access. You may turn it off; turning it on is the person's at every posture (your call asks them "
-                        + "on a card). Off fences Full Mac too.",
+                    note: "One axis of \(name) access. You may turn it off; turning it on is yours under Full Mac unless an untrusted voice "
+                        + "steers the turn; below Full Mac your call asks the person. Off fences Full Mac too.",
                     read: { _ in .bool(try await current().contains(mode)) },
                     write: { _, value, context in
                         let on = try QuietSettings.boolValue(value, label)
@@ -336,7 +334,8 @@ extension QuietLowerOnlySettingsHost {
                         guard on else { return nil }
                         do {
                             guard !(try await current().contains(mode)) else { return nil }
-                            return QuietSettings.usersCall("Turning \(label) on", "Trust → Mac → \(name)", setting: axisID, value: value, turn: turn)
+                            return await QuietSettings.usersCall("Turning \(label) on", "Trust → Mac → \(name)", setting: axisID, value: value,
+                                                                 dataRoot: root, turn: turn)
                         } catch { return .unavailable(error.localizedDescription) }
                     }
                 ))

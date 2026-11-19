@@ -11,7 +11,7 @@ import DreamREMCycle
 import TrustCenter
 // Blueprint: | `ApprovalSubjects.swift` | Domain outcomes feed shared settlement. |
 extension ApprovalExecution {
-    private static func notDone(_ reason: String) -> ApprovalExecutionOwners.Settlement {
+    static func notDone(_ reason: String) -> ApprovalExecutionOwners.Settlement {
         .init(action: .object(["status": .string("refused"), "effects": .string("none"),
             "error": .string(reason)]), detail: "Not done: " + reason)
     }
@@ -34,13 +34,13 @@ extension ApprovalExecution {
             guard case .object(let payload) = rec.payload,
                   case .object(let proposal)? = payload["proposal"],
                   case .string(let proposalID)? = proposal["id"], !proposalID.isEmpty else {
-                throw ApprovalInboxError.malformedResponse("REM approval carries no proposal id")
+                return Self.notDone("REM approval carries no proposal id")
             }
             let store = REMProposalStore(dataRoot: dataRoot)
             switch decision {
             case "approved":
                 guard case .string(let reviewedText)? = proposal["proposalText"], !reviewedText.isEmpty else {
-                    throw ApprovalInboxError.malformedResponse("REM approval carries no reviewed proposal text")
+                    return Self.notDone("REM approval carries no reviewed proposal text")
                 }
                 // The resolved card applies durable lesson evidence; no live turn or sense read owns this reconciliation.
                 let application = try await store.applyApprovedLesson(proposalId: proposalID, expectedProposalText: reviewedText,

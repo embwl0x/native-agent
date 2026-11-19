@@ -151,7 +151,7 @@ extension ChatGPTTransport {
         guard childHome.standardizedFileURL == codexHome.standardizedFileURL else {
             throw LLMError.underlying(message: "Codex child home does not match the selected credential.")
         }
-        if let blob = try loadAuthBlob(at: authPath),
+        if let blob = auth,
            let access = (blob["tokens"] as? [String: Any])?["access_token"] as? String,
            !access.isEmpty,
            !accessTokenIsFresh(effectiveExpiry(access, blob: blob), buffer: codexChildRefreshBufferSec) {
@@ -225,12 +225,9 @@ extension ChatGPTTransport {
         if let idToken = payload["id_token"] as? String, !idToken.isEmpty {
             merged["id_token"] = idToken
         }
-        // Fresh sign-ins may need account_id extracted from the new access token.
-        if let access = merged["access_token"] as? String,
-           (merged["account_id"] as? String)?.isEmpty ?? true {
-            if let acct = Self.extractAccountIDFromJWT(access) {
-                merged["account_id"] = acct
-            }
+        if (merged["account_id"] as? String)?.isEmpty ?? true,
+           let acct = Self.extractAccountIDFromJWT(newAccess) {
+            merged["account_id"] = acct
         }
         newBlob["last_refresh"] = NativeTimestampFormat.plainZulu(Date())
         newBlob["tokens"] = merged

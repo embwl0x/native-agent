@@ -80,7 +80,6 @@ extension CheckResult {
     }
 
     public var repairOwner: String? {
-        if repairExperience != nil { return source }
         return owner == .builder ? "NativeAgent code: " + checkID : source
     }
 
@@ -95,7 +94,7 @@ extension CheckResult {
     }
 
     public var repairTap: String? {
-        if repairExperience != nil { return human_action }
+        if repairExperience != nil, owner != .builder { return human_action }
         guard DoctorSafeRepairPolicy.isAdverse(status), ask != nil || repairCall == nil else { return nil }
         if owner == .builder {
             return "Ask the person to resolve \(repairOwner ?? checkID). " + (recoveryAction()

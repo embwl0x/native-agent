@@ -163,6 +163,7 @@ public actor ChromeControlRuntime {
     var releasedTabs: [JSONValue] = []
     var busyConversations: Set<String> = []
     private var connectionObservers: [UUID: AsyncStream<ChromeControlConnectionState>.Continuation] = [:]
+    private var lastPublishedConnectionState: ChromeControlConnectionState?
     var extensionFileReader = ChromeExtensionFiles()
     var extensionFiles: (path: String, diskVersion: String, shippedVersion: String, code: String?)?
     var extensionFilesError: String?
@@ -203,8 +204,10 @@ public actor ChromeControlRuntime {
 
     func publishConnectionState() {
         let state = connectionState
-        BrowserConnectionMirror.set(connected: state == .connected)
         for observer in connectionObservers.values { observer.yield(state) }
+        guard state != lastPublishedConnectionState else { return }
+        lastPublishedConnectionState = state
+        BrowserConnectionMirror.set(connected: state == .connected)
         NotificationCenter.default.post(name: Self.connectionDidChange, object: nil)
     }
 
@@ -305,7 +308,15 @@ public actor ChromeControlRuntime {
             if let failure = transportAuthorityFailure as? ToolFailureError {
                 OrganPulse.record("chrome_relay", .failed, note: failure.message)
             } else {
-                if manageNativeHostRegistration { try? ChromeNativeHostRegistration.uninstall() }
+                do {
+                    if manageNativeHostRegistration { try ChromeNativeHostRegistration.uninstall() }
+                    listenerFailure = nil
+                } catch {
+                    let reason = "Chrome native-host removal failed: \(error.localizedDescription)"
+                    listenerFailure = reason
+                    OrganPulse.record("chrome_relay", .failed, note: reason)
+                    return
+                }
                 OrganPulse.recordOff("chrome_relay", because: "Chrome control is turned off")
             }
             return
@@ -426,7 +437,11 @@ public actor ChromeControlRuntime {
             chmod(socketPath, 0o600)
         } catch {
             Darwin.close(descriptor)
-            try? unlinkSocketIfPresent(path: socketPath)
+            do { try unlinkSocketIfPresent(path: socketPath) }
+            catch let cleanup {
+                throw ToolFailureError("Chrome listener setup failed: \(error.localizedDescription); socket cleanup failed: \(cleanup.localizedDescription)",
+                    effects: .unknown, owner: socketPath, instruction: "Repair access to the Chrome control socket, then enable Chrome control again.")
+            }
             throw error
         }
         listenerDescriptor = descriptor

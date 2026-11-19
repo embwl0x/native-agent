@@ -484,7 +484,14 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         let components = path.dropFirst().split(separator: "/", maxSplits: 1).map(String.init)
         let lane = components.first ?? ""
         let operation = components.count == 2 ? "/" + components[1] : path
-        let principal = bridgeCallerPrincipal(headers: headers)
+        let principal: AgentBridgePrincipal?
+        do { principal = try bridgeCallerPrincipal(headers: headers) }
+        catch {
+            nativeLog("Bridge caller identity store could not be read: %@", error.localizedDescription)
+            writeJSON(conn, status: 503, obj: ["error": "contact_identity_unavailable",
+                "detail": "The saved contacts could not be read. Repair agents/peers.json before using the bridge."])
+            return
+        }
         if let peerID = principal?.peerID { AgentPeerStore(dataRoot: host.dataRoot).recordProof(peerID: peerID, inbound: true) }
 
         switch operation {
@@ -530,7 +537,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             let tasks = self.tasks
             Task {
                 let reply = await AgentContactRoutes.retainedReply(requestID: request, sessionID: session,
-                    taskID: AgentContactRoutes.taskID(requestID: request, sessionID: session, principal: principal), receiptSessionID: session,
+                    taskID: AgentContactRoutes.taskID(requestID: request, sessionID: session, principal: principal),
                         offset: offset, maxChars: maxChars,
                     principal: principal, tasks: tasks)
                 let held: AgentContactHeldResponse

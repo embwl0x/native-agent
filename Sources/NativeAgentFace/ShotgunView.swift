@@ -65,9 +65,11 @@ struct ShotgunView: View {
                     )
                     .accessibilityLabel("What I am looking at: \(preview.caption)")
             }
-            TranscriptDocumentView(sessionID: sessionId, presentation: "shotgun")
-            .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
-            .frame(maxHeight: .infinity)
+            if ShotgunController.shared.isShown {
+                TranscriptDocumentView(sessionID: sessionId, presentation: "shotgun")
+                    .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
+                    .frame(maxHeight: .infinity)
+            }
             composer(sessionId: sessionId, running: running)
         }
         .padding(14)

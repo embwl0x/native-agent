@@ -37,7 +37,7 @@ public struct ChatCompletionsStreamDecoder {
     /// Read failures share EOF's finalizer; cancellation and provider verdicts remain errors rather than permission to execute retained calls.
     mutating func consume<Events: AsyncSequence>(
         _ events: Events, continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation,
-        request: URLRequest, providerID: String, model: String, idPrefix: String,
+        request: URLRequest, providerID: String, model: String,
         started: UInt64, telemetry: LLMCallTraceRecorder, call: LLMCall,
         onCalls: ([LLMStreamToolCall], String) async -> Void = { _, _ in }
     ) async throws where Events.Element == SSEEvent {
@@ -65,7 +65,6 @@ public struct ChatCompletionsStreamDecoder {
                 } else if frame.finishReason == "tool_calls" || frame.finishReason == "stop" {
                     continuation.yield(.keepAlive)
                 }
-                if toolBoundaryReason != nil { break }
             }
         } catch {
             try Task.checkCancellation()
@@ -76,7 +75,7 @@ public struct ChatCompletionsStreamDecoder {
         }
         try Task.checkCancellation()
         let terminal = Result {
-            try finalizedToolCalls(idPrefix: idPrefix, providerID: providerID, sawContent: sawContent,
+            try finalizedToolCalls(providerID: providerID, sawContent: sawContent,
                                    allowsSilentCompletion: call.allowsSilentCompletion)
         }
         await telemetry.record(call: call,
@@ -107,10 +106,6 @@ public struct ChatCompletionsStreamDecoder {
 
     public mutating func consume(payload: String) throws -> DecodedFrame {
         var frame = DecodedFrame()
-        if toolBoundaryReason != nil {
-            frame.isDone = true
-            return frame
-        }
         if payload.isEmpty { return frame }
         if payload == "[DONE]" {
             sawDone = true
@@ -209,7 +204,6 @@ public struct ChatCompletionsStreamDecoder {
 
     /// Return committed calls with their boundary, or retain the read failure when no calls survived. Wire provider IDs preserve existing diagnostics.
     mutating func finalizedToolCalls(
-        idPrefix: String,
         providerID: String,
         sawContent: Bool,
         allowsSilentCompletion: Bool
@@ -256,12 +250,10 @@ public struct ChatCompletionsStreamDecoder {
 // MARK: - Shared adapter helpers
 
 extension Result where Failure == Error {
-    /// Length terminals retain their usage receipt without claiming success. Other parse failures keep their existing no-success-receipt behavior.
     func chatCompletionsTerminalStatus() throws -> String {
         switch self {
         case .success: return "ok"
         case .failure(let error):
-            if case .outputLengthLimit = error as? LLMError { return "incomplete" }
             throw error
         }
     }

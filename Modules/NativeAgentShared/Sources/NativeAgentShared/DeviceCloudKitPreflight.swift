@@ -37,18 +37,6 @@ public enum DeviceCloudKitPreflight {
         #endif
     }
 
-    /// Whether this process may write the iCloud key-value store. macOS reads the signed entitlement; iOS provisioning enforces the declared one.
-    public static func hasKeyValueStoreEntitlement() -> Bool {
-        #if os(macOS)
-        guard let task = SecTaskCreateFromSelf(nil),
-              let raw = SecTaskCopyValueForEntitlement(task, "com.apple.developer.ubiquity-kvstore-identifier" as CFString, nil),
-              let identifier = raw as? String else { return false }
-        return !identifier.isEmpty
-        #else
-        return true
-        #endif
-    }
-
     /// Exact container gate. True iff the process entitlements list the selected `containerIdentifier` (macOS), or install-time provisioning has
     /// already enforced the declared container entitlement (iOS).
     public static func entitlementGrantsContainer(_ containerIdentifier: String) -> Bool {

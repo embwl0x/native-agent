@@ -9,10 +9,8 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import Synchronization
-// Blueprint: | `ConversationPrefixSeeding.swift` | Public moment context is retained on its sent row; private choices join only live provider input |
+// Blueprint: | `ConversationPrefixSeeding.swift` | Thought, body, capsule, private choice, then the world; private words stay out of sent evidence |
 
-/// Every provider receives history, the private choice, public moment context and the person's words in that order.
-/// Public context is retained once; later turns replay speech and receipts, never either context block.
 enum ConversationPrefixSeeding {
     private struct PreviewKey: Hashable, Sendable {
         let bytes: Data
@@ -40,23 +38,33 @@ enum ConversationPrefixSeeding {
     static func seed(_ ctx: TurnContext, textToolCatalogAppendix: String? = nil) -> Seed {
         // Fitting changes the held bodies. Select their complement anew before measuring or sending this exact request.
         let historyLeads = ctx.historyReplaySpec?.historyLeads?(Set(ctx.historyRowCharacters.keys))
-        let trailing = [historyLeads, textToolCatalogAppendix].compactMap { $0 }.joined(separator: "\n\n")
+        let catalog = textToolCatalogAppendix
+            ?? ctx.toolSchemas.map(\.volatileCatalogAppendix).filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let trailing = [historyLeads, catalog].compactMap { $0 }.joined(separator: "\n\n")
         let split = ctx.splittingVolatileBlock(appending: trailing)
-        let request = SessionRequestMessages.seed(history: split.historyMessages,
-            block: split.turnVolatileBlock ?? "", model: split.modelId,
-            provider: split.providerId, userText: split.userMessage, images: split.imageBlocks)
-        let sent = request.sent
-        var messages = request.messages
-        if !split.privateWorkingMemory.isEmpty, messages.indices.contains(request.currentUserIndex) {
-            let current = messages[request.currentUserIndex]
-            messages[request.currentUserIndex] = LLMMessage(role: current.role,
-                content: [.text(split.privateWorkingMemory)] + current.content)
+        let block = split.turnVolatileBlock ?? ""
+        let liveBlocks: [LLMContentBlock]?
+        if split.privateWorkingMemory.isEmpty { liveBlocks = nil }
+        else {
+            let inner = split.innerStream.filter { !$0.isEmpty }.joined(separator: "\n\n")
+            var rest = block
+            var blocks: [LLMContentBlock] = []
+            if !inner.isEmpty {
+                rest = String(rest.dropFirst(inner.count))
+                blocks.append(.text(inner + (rest.isEmpty ? "" : "\n\n")))
+                if !rest.isEmpty { rest = String(rest.dropFirst(2)) }
+            }
+            blocks.append(.text(split.privateWorkingMemory))
+            if !rest.isEmpty { blocks.append(.text(rest)) }
+            liveBlocks = blocks
         }
-        return Seed(context: split, messages: messages,
-            delivery: sent.block.isEmpty ? .none : .userLeadingBlock,
+        let request = SessionRequestMessages.seed(history: split.historyMessages, block: block, liveBlocks: liveBlocks, model: split.modelId,
+            provider: split.providerId, userText: split.userMessage, images: split.imageBlocks)
+        return Seed(context: split, messages: request.messages,
+            delivery: request.sent.block.isEmpty ? .none : .userLeadingBlock,
             currentUserIndex: request.currentUserIndex,
             textToolCatalogRidesVolatileBlock: textToolCatalogAppendix != nil,
-            sentContext: sent)
+            sentContext: request.sent)
     }
 
     struct Request: Sendable {

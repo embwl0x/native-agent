@@ -140,7 +140,7 @@ public final class ProvidersFacade {
                 notifications: [ChatGPTAccountModelRefresh.didRefresh])
             self.accountModelUpdatesTask = Task { [weak self] in
                 _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
-                // Launch starts asking, once, each connected provider with no complete list for its current credential (an install upgraded
+                // Launch starts asking, once, each connected provider with no complete list under a day old for its current credential (an install upgraded
                 // with a credential and no list). File events below only read again, never ask.
                 self?.startAskingMissingModelLists()
                 for await _ in events {
@@ -181,13 +181,13 @@ public final class ProvidersFacade {
         SwiftNativeProviderRouting(dataRoot: dataRoot)
     }
 
-    /// Entering Providers starts asking a connected provider for its models only when no complete list is saved for its current credential. File
-    /// events and writes never ask: they only read again.
+    /// Entering Providers starts asking a connected provider for its models only when no complete list under a day old is saved for its current credential.
+    /// File events and writes never ask: they only read again.
     public nonisolated func fetchMissingModelListsInBackground() {
         Task { @MainActor [weak self] in self?.startAskingMissingModelLists() }
     }
 
-    /// Starts asking and returns at once: each connected provider with no complete list for its current credential is asked once, the same
+    /// Starts asking and returns at once: each connected provider with no complete list under a day old for its current credential is asked once, the same
     /// per-provider ask a Refresh makes, through the one fetch owner, as the catalog's one refresh in flight (Providers shows it refreshing;
     /// `provider.cancel_refresh` stops it). While it runs those accounts say "Asking <provider> for its models…"; when it lands, or is cancelled,
     /// settings are read again in a task of their own and show the list or the plain sentence. A read never waits for it, and nothing here reads a

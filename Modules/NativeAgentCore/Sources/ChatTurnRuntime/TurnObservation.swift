@@ -76,7 +76,7 @@ enum TurnObservation {
         case .restarted(let steps, let unknown, let started):
             happened = "The app restarted after step \(steps); the recorded results are below"
                 + (unknown.map { "; step \($0)'s effect is unknown" } ?? "") + "."
-                + " Oversize result pages from before the restart are unavailable."
+                + " Oversize results from before the restart still read through result.page."
                 + (started.isEmpty ? "" : " Started without a receipt: " + started.joined(separator: "; ") + ".")
                 + " Calls without receipts may have taken effect; inspect their affected state before repeating them."
         case .healed(let from, let to, let why):

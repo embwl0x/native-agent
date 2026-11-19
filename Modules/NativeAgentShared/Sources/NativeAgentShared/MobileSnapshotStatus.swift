@@ -37,7 +37,6 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "connectors.json",
                 "telegram.json",
                 "providers.json",
-                "provider_sign_ins.json",
                 "model_preferences.json",
                 "approvals.json",
                 // How the surfaces are laid out (ui/layout.json); the phone's More reads its blocks under the layout's phone profile.

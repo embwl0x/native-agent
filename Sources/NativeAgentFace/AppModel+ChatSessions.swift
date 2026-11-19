@@ -73,13 +73,8 @@ extension AppModel {
             setFailureStatus(error, action: "restore the conversation")
         }
     }
-    func reloadChatState() async { await loadChatState() }
-    func refreshChatSessionIndex() async { await refreshChatFace(.panel("chat.sessions")) }
-    func readActiveTranscript(sessionId: String) async { await refreshChatFace(.session(sessionId)) }
-    func readDetachedTranscript(sessionId: String) async { await refreshChatFace(.session(sessionId)) }
 
     func selectChatSession(id: String) async { await selectChatSession(id: id, userInitiated: true) }
-    func selectChatSession(_ session: ChatSession) async { await selectChatSession(id: session.id) }
 
     @discardableResult
     func selectChatSession(id: String, userInitiated: Bool) async -> Bool {
@@ -97,6 +92,7 @@ extension AppModel {
         } catch {
             if chatSelectionGeneration == generation { commitChatSessionSelection(previous) }
             setFailureStatus(error, action: "open your conversation")
+            systemToasts.push(error: statusText)
             return false
         }
     }
@@ -109,10 +105,10 @@ extension AppModel {
 
     func newChatSession() async {
         do { _ = try await createFaceConversation() }
-        catch { setFailureStatus(error, action: "start a new chat") }
+        catch { setFailureStatus(error, action: "start a new chat"); systemToasts.push(error: statusText) }
     }
 
-    private func createFaceConversation() async throws -> String {
+    func createFaceConversation(beforeSelection: () -> Void = {}) async throws -> String {
         chatSelectionGeneration = UUID()
         let generation = chatSelectionGeneration
         let reply = try await chatAct(.createConversation)
@@ -121,6 +117,7 @@ extension AppModel {
             throw WireFailure(code: "conversation_selection_changed", message: "The conversation was created, but the selection changed.",
                 cause: "The new conversation is in the list. The current selection and its draft were preserved.", effects: .known)
         }
+        beforeSelection()
         commitChatSessionSelection(session)
         return session
     }
@@ -150,7 +147,8 @@ extension AppModel {
     }
 
     func renameChatSession(id sessionId: String, title: String) async {
-        await performChatMutation(.renameConversation(session: sessionId, title: title), success: "Chat renamed")
+        let result = await performChatMutation(.renameConversation(session: sessionId, title: title), success: "Chat renamed")
+        if !result.succeeded { systemToasts.push(error: statusText) }
     }
 
     func readFaceComposer(session: String) -> ComposerSnapshot {

@@ -3,7 +3,7 @@
  "reach": {"capabilities": ["computer_files"], "readPaths": ["~/Library/Application Support/Google/Chrome/Default/History"]},
  "record": {"description": "Read Chrome's Default profile history from a private snapshot: recent pages, title/URL search, or the most visited domains since a time.", "actions": []},
  "answers": {
- "chrome.history": {"summary": "Read visited sites and browsing history in Chrome (the whole Default profile, every tab and window, not just the agent's own tab): most visited domains, title/URL search or recent pages", "description": "Read visited sites and browsing history in Chrome (the whole Default profile, every tab and window, not just the agent's own tab): most visited domains, title/URL search or recent pages", "warn": "mode: recent (default when omitted), top_domains (since required) or search (query required, since optional). since: inclusive ISO 8601 with timezone. limit: default 15, max 50. Chrome Default profile only, independent of extension/tab group; local ISO 8601 times. Domain counts: visits since since; page counts: lifetime visits. Requires Full Mac and file-read permission; no card. Deadline: 2 seconds.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {"mode": {"type": "string"}, "query": {"type": "string"}, "since": {"type": "string"}, "limit": {"type": "integer"}}, "required": []}}
+ "chrome.history": {"summary": "Read visited sites and browsing history in Chrome (the whole Default profile, every tab and window, not just the agent's own tab): most visited domains, title/URL search or recent pages", "description": "Read visited sites and browsing history in Chrome (the whole Default profile, every tab and window, not just the agent's own tab): most visited domains, title/URL search or recent pages", "warn": "mode: recent (default when omitted), top_domains (since required) or search (query required, since optional). since: inclusive ISO 8601 with timezone. limit: default 15, max 50. Chrome Default profile only, independent of extension/tab group; local ISO 8601 times. Domain counts: visits since since; page counts: lifetime visits. Requires Full Mac and file-read permission; no card.", "class": "read", "irreversible": false, "screen": false, "args": {"type": "object", "properties": {"mode": {"type": "string"}, "query": {"type": "string"}, "since": {"type": "string"}, "limit": {"type": "integer"}}, "required": []}}
  }}
 */
 const HISTORY = "~/Library/Application Support/Google/Chrome/Default/History";
@@ -49,7 +49,7 @@ function domain(url) {
 }
 
 function query(sql, params, limit) {
-    return host.files.query({path:HISTORY, sql, params, limit, seconds:2});
+    return host.files.query({path:HISTORY, sql, params, limit});
 }
 
 // Every qualifying visit counts before domains are limited, so URL groups are read in id order until none remain.

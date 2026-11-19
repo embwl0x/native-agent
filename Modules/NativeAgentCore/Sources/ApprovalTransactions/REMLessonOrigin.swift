@@ -4,6 +4,7 @@ import DreamREMCycle
 import Foundation
 import MemoryV2
 import NativeAgentCore
+import enum NativeAgentShared.ChatThreadKind
 import PersistenceCore
 import Transcripts
 
@@ -36,17 +37,17 @@ public enum REMLessonOrigin {
         moments: [MemoryRecord],
         peerSessionTrusted: (String) -> Bool,
         dataRoot: URL = defaultDataRoot()
-    ) -> [MemoryRecord] {
+    ) throws -> [MemoryRecord] {
         let days = sourceDays(row)
         guard !days.isEmpty else { return [] }
         let about = words(((row.supportingPassages ?? []).map(\.quote) + [row.whatChanged ?? "", row.proposalText])
             .joined(separator: " "))
-        let ranked: [(MemoryRecord, Int)] = moments.compactMap { record in
+        let ranked: [(MemoryRecord, Int)] = try moments.compactMap { record in
             guard (record.status ?? "active") == "active", MemoryMoments.isMoment(record.extras),
                   let session = record.extras?.objectValue?["session_id"]?.stringValue,
                   let at = MemoryDataProvenance.parseTimestamp(record.observedAt ?? record.createdAt),
                   days.contains("\(session)|\(MemoryDataProvenance.dayKey(at))"),
-                  ownExchange(record, session: session, peerSessionTrusted: peerSessionTrusted, dataRoot: dataRoot) else { return nil }
+                  try ownExchange(record, session: session, peerSessionTrusted: peerSessionTrusted, dataRoot: dataRoot) else { return nil }
             let shared = words(record.text).intersection(about).count
             return shared > 0 ? (record, shared) : nil
         }
@@ -55,9 +56,10 @@ public enum REMLessonOrigin {
     }
 
     /// Only the person's exchange or a peer they trusted may supply a lesson origin.
-    static func ownExchange(_ record: MemoryRecord, session: String, peerSessionTrusted: (String) -> Bool, dataRoot: URL) -> Bool {
+    static func ownExchange(_ record: MemoryRecord, session: String, peerSessionTrusted: (String) -> Bool, dataRoot: URL) throws -> Bool {
+        guard let kind = try SessionConversation.checkedKind(session, dataRoot: dataRoot, includingArchived: true), kind != .unclassified else { return false }
         let author = record.extras?.objectValue?["author"]?.stringValue ?? "user"
-        let peer = author != "user" || SessionConversation.kind(session, dataRoot: dataRoot, includingArchived: true)?.isPeerConversation == true
+        let peer = author != "user" || kind.isPeerConversation
         return !peer || peerSessionTrusted(session)
     }
 
@@ -90,7 +92,7 @@ public enum REMLessonOrigin {
         if let kept = try await memory.authorityRecord(id: id) { return kept }
         let moments = try await memory.listMemory(kind: MemoryMoments.kind)
         var peerOwners: [(id: String, prefix: String)]?
-        let behind = originMoments(for: row, moments: moments, peerSessionTrusted: { session in
+        let behind = try originMoments(for: row, moments: moments, peerSessionTrusted: { session in
             // Read contacts once when a peer candidate needs them; trust is still checked for each candidate against the live authority.
             if peerOwners == nil {
                 var owners = ["claude", "codex", "omp"]

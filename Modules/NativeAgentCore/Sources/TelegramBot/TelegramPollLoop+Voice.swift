@@ -34,12 +34,16 @@ extension TelegramPollLoop {
         if let preview = _tgPreview(transcription.text) {
             row["transcriptPreview"] = .string(preview)
         }
-        try? await appendJSONLCapped(
-            .object(row),
-            to: telegramDir.appendingPathComponent("receipts.jsonl"),
-            maxLines: JSONLLineCaps.telegramReceipts,
-            logLabel: "TelegramPollLoop.receipts"
-        )
+        do {
+            try await appendJSONLCapped(
+                .object(row),
+                to: telegramDir.appendingPathComponent("receipts.jsonl"),
+                maxLines: JSONLLineCaps.telegramReceipts,
+                logLabel: "TelegramPollLoop.receipts"
+            )
+        } catch {
+            await recordError(context: "voice_receipt_write", error: String(describing: error), update: update, message: message)
+        }
     }
 
     static func voiceTranscriptionNotice(for error: Error) -> String {

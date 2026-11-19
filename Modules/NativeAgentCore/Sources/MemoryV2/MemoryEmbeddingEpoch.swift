@@ -218,7 +218,7 @@ extension SwiftNativeMemoryV2 {
             try checkEmbeddingConvergence()
             let state = try await memoryEmbeddingEpochState()
             try checkEmbeddingConvergence()
-            guard let providerEpoch = embeddingEpoch() else {
+            guard let providerEpoch = try embeddingEpoch() else {
                 return false
             }
             if state.activeEpoch != providerEpoch.rawValue || state.dimensions != embedder?.dimensions

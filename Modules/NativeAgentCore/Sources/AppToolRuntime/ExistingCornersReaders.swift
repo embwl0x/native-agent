@@ -122,7 +122,7 @@ extension ExistingCornersSourceProvider {
                 }
                 snapshotInput.merge(address) { supplied, _ in supplied }
                 let readInput = snapshotInput
-                let snapshot = try await rawRead(tool, readInput, turn, .init(sense: operation, lookSource: "workspace"))
+                let snapshot = try await rawRead(tool, readInput, turn, .init(sense: operation, lookSource: "app"))
                 guard case .object(let page) = snapshot,
                       ExistingCornersReaders.string(page["snapshotId"]) != nil,
                       case .array? = page["nodes"] else {
@@ -452,7 +452,7 @@ actor NativeChromeNews {
                 url: ContextSecretContentPolicy.redactedFragment(url))
             let summary = try Self.delta(previous, fields)
             let news = SenseNews(senseID: record.id, version: record.version, address: address,
-                summary: summary, at: Date(), observationID: String(tab), changeID: previousVersion + "→" + version)
+                summary: summary, at: Date(), observationID: String(tab), changeID: previousVersion + "→" + version, watch: id.uuidString)
             _ = await accept(news, snapshot: fields, version: version, tab: tab, id: id)
         } catch { await unavailable(error.localizedDescription, tab: tab) }
     }

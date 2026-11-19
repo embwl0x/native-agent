@@ -523,7 +523,7 @@ public actor MacAttentionSessionStore {
 
     /// Driver revocation happened synchronously at the observer. This actor projects the pulse into the current optional view session.
     func record(_ activity: MacAttentionActivity) async {
-        await screenViewStore.invalidate()
+        await screenViewStore.invalidate(for: activity)
         guard var current = session else { return }
         if activity.occurredAt >= current.expiresAt {
             stopInternal()
@@ -536,9 +536,7 @@ public actor MacAttentionSessionStore {
         current.lastActivity = activity
         session = current
 
-        // The frozen marks no longer describe the same scene. Physical input additionally invokes human takeover; app activation requires a refresh without
-        // falsely claiming the human caused it.
-        await screenViewStore.invalidate()
+        await screenViewStore.invalidate(for: activity)
         guard session?.id == current.id else { return }
         resumeReadyWaiters(sequence: current.sequence)
     }

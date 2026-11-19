@@ -20,17 +20,8 @@ extension AppModel {
 
     func loadDetachedSessionMessages(_ sessionId: String) async { await refreshChatFace(.session(sessionId)) }
 
-    func pinChatSessionForDetachedWindow(_ sessionId: String) async -> Bool {
-        await performChatMutation(.pinConversation(session: sessionId), success: "Conversation pinned").succeeded
-    }
 
     var isBusy: Bool { turnPart("isBusy", for: activeChatSessionId) { $0?.isBusy == true } }
     var isChatStreaming: Bool { turnPart("isStreaming", for: activeChatSessionId) { $0?.isStreaming == true } }
 
-    var otherRunningChatSessionIDs: [String] {
-        let active = activeChatSessionId
-        return face.slot(.turns).select("otherRunning:\(active)", as: TurnSessionsFace.self) {
-            $0?.streamingSessionIDs.filter { $0 != active }.sorted() ?? []
-        }
-    }
 }

@@ -375,8 +375,6 @@ extension AnthropicTransport {
             let usesPrefix = system.map { call.systemSegments?.reassembles(into: $0) == true } ?? false
             AnthropicOAuthTransport.cacheConversationPrefix(&body, sourceMessages: messages,
                 wireSourceIndices: encoded.map { $0.0 }, usesPrefixShape: usesPrefix, call: call)
-        }
-        if firstPartyAnthropicToolContract {
             try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model, call: call, providerID: providerId, dataRoot: credentialRoot)
         }
         try applyThinkingControls(to: &body, model: model, call: call)
@@ -480,12 +478,16 @@ extension AnthropicTransport {
             var committed = false
             while let call = pendingToolCalls.first {
                 if call.inputJSON.isEmpty && !terminal { break }
+                let json = call.inputJSON.isEmpty ? Data("{}".utf8) : call.inputJSON
+                guard let input = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any] else {
+                    if !terminal { break }
+                    if stopReason != "max_tokens" { throw LLMError.failure(.malformedResponse) }
+                    pendingToolCalls.removeFirst()
+                    continue
+                }
                 pendingToolCalls.removeFirst()
                 if call.inputJSON.isEmpty,
                    !["end_turn", "tool_use", "stop_sequence", "pause_turn"].contains(stopReason ?? "") { continue }
-                let json = call.inputJSON.isEmpty ? Data("{}".utf8) : call.inputJSON
-                guard let input = try JSONSerialization.jsonObject(with: json) as? [String: Any]
-                else { throw LLMError.failure(.malformedResponse) }
                 let calls = try Self.nativeToolCalls([
                     ["type": "tool_use", "id": call.id, "name": call.name, "input": input]
                 ])

@@ -2,7 +2,7 @@
 import Foundation
 import PackageDescription
 
-// Blueprint: | `Package.swift` | Core package products, target boundaries and direct dependencies, including the runtime-gated ActivityWatch target |
+// Blueprint: | `Package.swift` | Core products and direct owner dependencies, including recent-life turn provenance |
 
 let subsystems: [String] = [
     "EngineRuntime",
@@ -77,14 +77,15 @@ let products: [Product] =
 let extraDeps: [String: [String]] = [
     "AgentConversations": ["PersonaEngine", "Experiences", "AuthoredCapabilities", "AgentWorkspace", "MacControl", "Privacy", "PersistenceCore",
         "ApprovalInbox", "StandingBots", "AgentLinkTransport", "ProviderRouting", "TurnTrace", "ChatTurnContracts", "ChatToolParsing", "Desk", "TrustCenter",
-        "Transcripts", "MemoryV2"],
-    "ChatTurnContracts": ["PersistenceCore", "ProviderRouting", "TurnTrace", "ApprovalInbox", "ChatToolParsing", "CognitiveSubstrate", "MacControl"],
+        "Transcripts", "MemoryV2", "Senses"],
+    "ChatTurnContracts": ["AuthoredCapabilities", "PersistenceCore", "ProviderRouting", "TurnTrace", "ApprovalInbox", "ChatToolParsing", "CognitiveSubstrate",
+        "MacControl"],
     "ChatToolRuntime": ["Experiences", "AuthoredCapabilities", "Senses", "ChatTurnContracts", "AgentConversations", "AgentWorkspace", "ChatSessionWork",
         "ChatToolParsing", "Research", "StandingBots", "PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle",
         "ApprovalInbox", "Dispatcher", "MacControl", "Context", "SwarmRuns", "MacIntegration", "SystemOps", "CognitiveSubstrate",
         "ToolExecution", "ActivityWatch", "ToolRegistry", "Transcripts", "TurnTrace", "Studio", "Desk", "ChromeControl", "Privacy",
         "NotificationInbox"],
-    "AgentWorkspace": ["Experiences", "AuthoredCapabilities", "ChatToolParsing", "ChatSessionWork", "PersistenceCore", "ApprovalInbox", "MacControl",
+    "AgentWorkspace": ["ChatTurnContracts", "Experiences", "AuthoredCapabilities", "ChatToolParsing", "ChatSessionWork", "PersistenceCore", "ApprovalInbox", "MacControl",
         "MemoryV2", "ChromeControl", "Desk", "StandingBots", "MacIntegration", "Transcripts", "NotificationInbox", "Senses", "SwarmRuns",
         "Dispatcher", "TriggerScheduler", "PersonaEngine"],
     "ChatSessionWork": ["Experiences", "MemoryV2", "MacControl", "Context", "PersistenceCore", "Transcripts", "TurnTrace", "ProviderRouting", "ChatToolParsing",
@@ -120,7 +121,7 @@ let extraDeps: [String: [String]] = [
     "Senses": ["Experiences", "AuthoredCapabilities", "PersistenceCore"],
     "TurnTrace": ["Experiences", "AuthoredCapabilities", "PersistenceCore"],
     "Transcripts": ["PersistenceCore"],
-    "StandingBots": ["Experiences", "PersistenceCore", "TriggerScheduler", "ApprovalInbox", "Dispatcher"],
+    "StandingBots": ["Experiences", "PersistenceCore", "TriggerScheduler", "ApprovalInbox", "Dispatcher", "ChatTurnContracts"],
     // TrustCenter supplies canonical origin-surface authority; Experiences records decisions owed to the person.
     "ApprovalInbox": ["AuthoredCapabilities", "ChatToolParsing", "PersistenceCore", "TrustCenter", "Experiences", "Transcripts"],
     "ToolRegistry": ["AuthoredCapabilities", "PersistenceCore", "TurnTrace"],
@@ -157,7 +158,7 @@ let extraDeps: [String: [String]] = [
     "Agents": ["Experiences", "AgentLinkTransport", "AgentWorkspace", "Cognition", "CognitiveSubstrate", "Context", "ContextFlow",
         "PersistenceCore", "ProviderRouting", "ApprovalInbox", "TrustCenter", "PersonaEngine", "StandingBots", "BackgroundLoops", "MacControl",
         "MacIntegration", "Privacy", "Transcripts", "ToolExecution", "AgentConversations", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts",
-        "ChatTurnRuntime", "Desk", "Senses", "ToolRegistry", "TurnTrace", "NotificationInbox"],
+        "ChatTurnRuntime", "Desk", "Senses", "ToolRegistry", "TurnTrace", "NotificationInbox", "TriggerScheduler"],
     // The engine owns cognition and injects ContextFlow; platform effects arrive through CognitionHost to avoid reverse imports.
     "Cognition": ["Experiences", "AuthoredCapabilities", "PersistenceCore", "CognitiveSubstrate", "Context", "ContextFlow", "MemoryV2", "PersonaEngine",
         "ProviderRouting", "BackgroundLoops", "ApprovalInbox", "TriggerScheduler", "NotificationInbox", "DreamREMCycle", "TurnTrace", "Studio", "Desk",
@@ -216,6 +217,7 @@ let externalDeps: [String: [Target.Dependency]] = [
     "PersistenceCore": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "AgentConversations": [.product(name: "Yams", package: "Yams"), .product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "AgentLinkTransport": [
+        .product(name: "NativeAgentShared", package: "NativeAgentShared"),
         .product(name: "GRPCCore", package: "grpc-swift-2"),
         .product(name: "GRPCNIOTransportHTTP2TransportServices", package: "grpc-swift-nio-transport"),
         .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),

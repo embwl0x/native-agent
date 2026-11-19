@@ -5,8 +5,7 @@ import NativeAgentShared
 // Group by recorded kind so presentation cannot recategorize conversations.
 
 let chatSessionDragType = "com.nativeagent.chat-session"
-let chatSessionDragPlainTextPrefix = "nativeagent-chat-session:"
-let chatSessionDropTypes = [chatSessionDragType, "public.plain-text"]
+let chatSessionDropTypes = [chatSessionDragType]
 
 private struct SidebarSessionSections: Equatable {
     var rows: [String]
@@ -177,7 +176,9 @@ extension ChatView {
         guard case .available(let document) = layout else { return .constant(true) }
         return Binding(get: { forced || document.expanded("chat", block) },
                 set: { open in Task {
-                    await appModel.performChatMutation(.setSurfaceExpanded(surface: "chat", block: block, open: open), success: "Conversation section saved")
+                    let result = await appModel.performChatMutation(.setSurfaceExpanded(surface: "chat", block: block, open: open),
+                        success: "Conversation section saved")
+                    if !result.succeeded { appModel.systemToasts.push(error: appModel.statusText) }
                 } })
     }
 
@@ -220,6 +221,11 @@ extension ChatView {
     var shellComposerPlaceholder: String {
         // Observe the agent's name so the placeholder follows identity changes.
         ChatShellCopy.composerPlaceholder(agentName: appModel.agentAddressName)
+    }
+
+    var chatContactName: String? {
+        appModel.face.slot(.conversation(session: appModel.activeChatSessionId))
+            .select("contactName", as: ConversationFace.self) { $0?.contactName }
     }
 }
 

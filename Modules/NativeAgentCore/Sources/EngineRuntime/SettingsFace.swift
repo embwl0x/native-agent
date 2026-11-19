@@ -4,9 +4,8 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-import TriggerScheduler
 import TrustCenter
-// Blueprint: | `SettingsFace.swift` | Settings rows: registry, notification policy and triggers, search service; every control and action is its setting.set or verb call |
+// Blueprint: | `SettingsFace.swift` | Registry, notification policy and search service rows; every control and action calls its owner |
 
 public enum SettingsFaceChange {
     public static let platform = Notification.Name("NativeAgent.settingsFace.platformChanged")
@@ -124,7 +123,6 @@ extension NativeAgentEngine {
         return words.isEmpty ? nil : words.joined(separator: " · ")
     }
 
-    /// Raising things unasked and its triggers read from the Trust and inbox owners; while the master is off its triggers are not offered.
     private func settingsFaceNotifications() async throws -> PartFace.Section {
         let history = PartFace.Row(id: "notifications.history", title: "Notification history",
                                    detail: "Every note raised, archived and dismissed ones included, under Earlier on Inbox.", open: "page:inbox")
@@ -139,43 +137,11 @@ extension NativeAgentEngine {
                 history,
             ])
         }
-        var rows: [PartFace.Row] = [.init(id: Self.notificationsMaster, title: "Raise things unasked",
+        let rows: [PartFace.Row] = [.init(id: Self.notificationsMaster, title: "Raise things unasked",
             detail: "When on, observations, file changes, finished Desk tasks and check-ins arrive without being asked.",
             control: .toggle(master, call: settingSetCall(Self.notificationsMaster)))]
-        var footer: String? = "Nothing is raised unasked while this is off."
-        if master {
-            do {
-                let triggers = try await inbox.triggers()
-                rows += triggers.map {
-                    PartFace.Row(id: QuietSettings.inboxTriggerPrefix + $0.name, title: Self.triggerTitle($0.name), detail: Self.triggerNote($0.name) ?? $0.description,
-                          control: .toggle($0.enabled, call: settingSetCall(QuietSettings.inboxTriggerPrefix + $0.name)))
-                }
-                footer = triggers.isEmpty ? "No notification options are configured yet." : nil
-            } catch is CancellationError { throw CancellationError() }
-            catch {
-                rows.append(.init(id: "notifications.triggers", title: "Notification options unavailable",
-                                  detail: UserFacingError.message(error, action: "load triggers"), tone: .failed))
-                footer = nil
-            }
-        }
-        return .init(id: "notifications", title: "Notifications", style: .list, footer: footer, rows: rows + [history])
-    }
-
-    /// The built-in brief says what it is beside a helper that may also send one; any other trigger keeps its own description.
-    private static func triggerNote(_ name: String) -> String? {
-        name == "morning_brief" ? "My own built-in daily brief at the set hour. A helper that sends a brief is separate and listed on Helpers." : nil
-    }
-
-    /// A trigger's name as the person reads it.
-    private static func triggerTitle(_ name: String) -> String {
-        switch name {
-        case "idle_checkin": return "Idle check-in"
-        case "morning_brief": return "Built-in morning brief"
-        default:
-            let words = name.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
-            guard let first = words.first else { return name }
-            return String(first).uppercased() + words.dropFirst()
-        }
+        return .init(id: "notifications", title: "Notifications", style: .list,
+                     footer: "Nothing is raised unasked while this is off.", rows: rows + [history])
     }
 
     /// The search service is read from its saved configuration; a field sends the address, and Find sends auto, through the registry's write.

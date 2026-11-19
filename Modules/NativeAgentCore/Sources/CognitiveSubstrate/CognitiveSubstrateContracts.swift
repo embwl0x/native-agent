@@ -22,9 +22,9 @@ public struct CognitiveSubstrateDependencies: Sendable {
     public var dreamThemes: @Sendable (_ message: String, _ spent: Set<String>) async -> CognitiveCueRead<[CognitiveDreamTheme]>
     /// The warm local embedder. Nil means no resident model was requested; a resident inference or configuration failure throws its exact cause.
     public var embedTexts: @Sendable (_ texts: [String]) async throws -> CognitiveEmbeddingBatch?
-    public var embeddingEpoch: @Sendable () async -> String?
+    public var embeddingEpoch: @Sendable () async throws -> String?
     /// Only an owner Trust grant elevates a peer identity; an unbound checker grants none.
-    public var peerTrusted: @Sendable (_ peer: String) -> Bool
+    public var trustedPeers: @Sendable (_ peers: [String]) -> Set<String>
     /// Validated AgentPeerStore identity projection, refreshed off the turn path.
     public var carePersonAliases: @Sendable () throws -> [String: String]
     /// Whether a surface is in the local-private disclosure tier (the memory disclosure law, `MemoryRecordDisclosurePolicy`). The agent's words from one
@@ -42,8 +42,8 @@ public struct CognitiveSubstrateDependencies: Sendable {
         dreamThemes: @escaping @Sendable (String, Set<String>) async -> CognitiveCueRead<[CognitiveDreamTheme]>
             = { _, _ in CognitiveCueRead([]) },
         embedTexts: @escaping @Sendable ([String]) async throws -> CognitiveEmbeddingBatch? = { _ in nil },
-        embeddingEpoch: @escaping @Sendable () async -> String? = { nil },
-        peerTrusted: @escaping @Sendable (String) -> Bool = { _ in false },
+        embeddingEpoch: @escaping @Sendable () async throws -> String? = { nil },
+        trustedPeers: @escaping @Sendable ([String]) -> Set<String> = { _ in [] },
         carePersonAliases: @escaping @Sendable () throws -> [String: String] = { [:] },
         surfaceIsPrivate: @escaping @Sendable (String) -> Bool = { _ in false },
         sinceGap: @escaping @Sendable (Date, Date, String) async -> CognitiveCueRead<[String]>
@@ -67,7 +67,7 @@ public struct CognitiveSubstrateDependencies: Sendable {
         self.dreamThemes = dreamThemes
         self.embedTexts = embedTexts
         self.embeddingEpoch = embeddingEpoch
-        self.peerTrusted = peerTrusted
+        self.trustedPeers = trustedPeers
         self.carePersonAliases = carePersonAliases
         self.surfaceIsPrivate = surfaceIsPrivate
         self.sinceGap = sinceGap

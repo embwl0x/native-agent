@@ -84,12 +84,13 @@ public struct RuntimeStatusFace: FaceValue {
 
     public static func project(health: RuntimeHealth?, lastRefreshError: String?) -> RuntimeStatusFace {
         let hasError = lastRefreshError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        let detail = hasError ? "Some sections didn't refresh. The details are in the log." : nil
-        switch health?.ok {
+        let detail = hasError ? "Some sections didn't refresh. The details are in the log." : health?.doctorIssue
+        switch health?.reachable {
         case true:
+            let needsAttention = hasError || health?.ok != true
             return RuntimeStatusFace(text: hasError ? "App is online; some app data is unavailable" : "App is online",
-                detail: detail, tone: hasError ? .warning : .success,
-                systemImage: hasError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                detail: detail, tone: needsAttention ? .warning : .success,
+                systemImage: needsAttention ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
         case false:
             return RuntimeStatusFace(text: "App reported a problem", detail: detail,
                 tone: .failure, systemImage: "xmark.octagon.fill")

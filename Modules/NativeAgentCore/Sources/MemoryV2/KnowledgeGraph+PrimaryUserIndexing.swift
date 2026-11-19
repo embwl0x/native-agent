@@ -214,8 +214,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             report.entitiesRemoved += db.changesCount
         }
 
-        let metadata = primaryUserMetadata(
-            name: primaryUserName, existing: try metadataObject(canonical["metadata_json"]))
+        let metadata = primaryUserMetadata(existing: try metadataObject(canonical["metadata_json"]))
         let aliases = try primaryUserAliases(name: primaryUserName, existingRows: rows)
         let aliasData = try JSONEncoder().encode(aliases)
         let aliasJSON = String(decoding: aliasData, as: UTF8.self)
@@ -260,14 +259,13 @@ extension SwiftNativeKnowledgeGraphIndexer {
 
     /// The shared identity comes from the profile, not the last fact indexed. Source evidence belongs to each fact and relationship separately.
     private static func primaryUserMetadata(
-        name: String, existing: [String: JSONValue] = [:]
+        existing: [String: JSONValue] = [:]
     ) -> [String: JSONValue] {
         var metadata = existing
         for key in ["memory_id", "last_memory_id", "last_memory_source"] {
             metadata.removeValue(forKey: key)
         }
         metadata["role"] = .string("primary_user")
-        metadata["embedding_text"] = .string("person: \(name)")
         metadata["indexer"] = .string(indexVersion)
         return metadata
     }
@@ -297,8 +295,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             guard !overflow else {
                 throw MemoryStorageError.databaseUnavailable("kg_entities mention_count overflow for row \(id)")
             }
-            let metadata = primaryUserMetadata(
-                name: primaryUserName, existing: try metadataObject(row["metadata_json"]))
+            let metadata = primaryUserMetadata(existing: try metadataObject(row["metadata_json"]))
             let aliases = try primaryUserAliases(name: primaryUserName, existingRows: [row])
             let aliasData = try JSONEncoder().encode(aliases)
             try db.execute(sql: """
@@ -326,7 +323,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let id = try uniqueEntityID(db)
         let aliases = try primaryUserAliases(name: primaryUserName)
         let aliasData = try JSONEncoder().encode(aliases)
-        let metadata = primaryUserMetadata(name: primaryUserName)
+        let metadata = primaryUserMetadata()
         try db.execute(sql: """
             INSERT INTO kg_entities
               (id, name, type, summary, aliases_json, mention_count,

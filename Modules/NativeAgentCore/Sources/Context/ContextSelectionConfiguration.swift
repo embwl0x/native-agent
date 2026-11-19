@@ -39,13 +39,9 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// Give memory a larger kind quota so the uniform cap cannot crowd high-scoring memories out of the 12-atom budget.
     public let maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8, .relationship: 4]
     public let minimumRelevance: Double = 0.05
-    /// Per-model floors account for compressed cosine ranges. Fewer than three comparable memories use scaled semantics; larger populations use relative
-    /// relevance.
     public let memorySemanticFloors: [String: Double] = ["bge-large-en-v1.5": 0.55]
     /// Use the coverage damp's token set and short-message boundary so weak coverage cannot earn a full memory allocation.
     public let shortMessageMemoryRowCap: Int = 6
-    /// Require lexical evidence or two leave-one-out deviations after removing general pull. Fewer than three vectors use model-scaled semantics; receipt
-    /// populations never change the floor.
     public static let memoryStandoutDeviations: Double = 2.0
     /// Three deviations reduce chance matches for ambient moments to about one memory per ten moments at a population near 70.
     public static let ambientStandoutDeviations: Double = 3.0

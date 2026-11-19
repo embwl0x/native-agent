@@ -7,15 +7,13 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
         case pending, approved, denied, expired, unresolved
 
         public init(status: String, decision: String?) {
-            let decision = decision?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             switch decision {
-            case "approve", "approved": self = .approved
-            case "deny", "denied", "reject", "rejected": self = .denied
-            case "cancel", "canceled", "cancelled", "expired": self = .expired
+            case "approved": self = .approved
+            case "denied": self = .denied
+            case "canceled": self = .expired
             default:
-                switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                switch status {
                 case "pending": self = decision == nil ? .pending : .unresolved
-                case "cancel", "canceled", "cancelled", "expired", "withdrawn", "orphaned": self = .expired
                 default: self = .unresolved
                 }
             }

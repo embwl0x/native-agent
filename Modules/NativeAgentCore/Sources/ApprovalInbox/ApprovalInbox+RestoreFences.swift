@@ -107,7 +107,7 @@ extension SwiftNativeApprovalInbox {
             }
             // Resolution, execution and continuation facts only move forward. Descriptive payload/title bytes still come from the selected backup.
             for key in [
-                "status", "decision", "resolvedAt", "decidedBy",
+                "status", "decision", "scope", "resolvedAt", "decidedBy",
                 "resolutionProvenance", "executedAction", "detail",
                 "chatContinuation",
             ] where safetyObject[key] != nil {

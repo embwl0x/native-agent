@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `RepairOwed.swift` | `RepairOwed`, `attempt`, `isOwed`. |
+// Blueprint: | `RepairOwed.swift` | Repair births preserve supplied steering and settle on owner evidence |
 
 /// A refusal with an external cause names its owner and an actionable repair lever.
 /// Keep repair owed until that operation or lever works, or its owner explicitly lets it go with a reason.
@@ -26,19 +26,19 @@ public enum RepairOwed {
 
     /// Use the owner's identity for non-tool repair too; repeat failures join open debt.
     @discardableResult
-    public static func owe(_ dataRoot: URL, id: String, kind: Experience.Kind, cause: [String] = [],
+    public static func owe(_ dataRoot: URL, id: String, kind: Experience.Kind, steeredBy: [String] = ["unrecorded"], cause: [String] = [],
                            evidence: [Experience.Ref] = [], operation: String, owner: String, words: String,
                            lever: String? = nil, nextCall: String? = nil, tap: String? = nil) -> Task<Void, Never> {
         // Serialize owe and settle per operation so settlement cannot overtake the obligation it closes.
         ExperienceStore.record(dataRoot, "repair:" + operation) { store in
-            try await owe(store, id: id, kind: kind, cause: cause, evidence: evidence,
+            try await owe(store, id: id, kind: kind, steeredBy: steeredBy, cause: cause, evidence: evidence,
                           operation: operation, owner: owner, words: words,
                           lever: lever, nextCall: nextCall, tap: tap)
         }
     }
 
     /// Inside this repair queue, never enqueue and await a write behind the caller itself.
-    public static func owe(_ store: ExperienceStore, id: String, kind: Experience.Kind, cause: [String] = [],
+    public static func owe(_ store: ExperienceStore, id: String, kind: Experience.Kind, steeredBy: [String] = ["unrecorded"], cause: [String] = [],
                            evidence: [Experience.Ref] = [], operation: String, owner: String, words: String,
                            lever: String? = nil, nextCall: String? = nil, tap: String? = nil) async throws {
         // The caller's key names the failure source, not an immutable birth that can be reopened after settlement.
@@ -46,12 +46,14 @@ public enum RepairOwed {
                              outcome: .init(domain: operation, status: "failed", effects: Experience.Effects.none),
                              face: .init(words: words, artifacts: []),
                              owes: ["repair": .init(to: tap == nil ? "self" : "person")],
-                             claims: RepairDebt(owner: owner, operation: operation, lever: lever, nextCall: nextCall, tap: tap).claims)
+                             claims: RepairDebt(owner: owner, operation: operation, lever: lever, nextCall: nextCall, tap: tap).claims, steeredBy: steeredBy)
         met.addressedTo = [tap == nil ? "self" : "person"]
         if let open = try await openDebt(store, operation: operation, owner: owner) {
             // Open debt always says the current cause: a repeat that fails differently replaces the words Doctor and the agent read.
-            var events: [ExperienceStore.Change] = [.evidence(.init(source: "repeat", id: met.id))]
-            if open.face?.words != words { events.append(.face(.init(words: words, artifacts: []))) }
+            var events: [ExperienceStore.Change] = [.evidence(.init(source: "repeat", id: id))]
+            if open.face?.words != words, Set(steeredBy).isSubset(of: open.steeredBy ?? ["unrecorded"]) {
+                events.append(.face(.init(words: words, artifacts: [])))
+            }
             try await store.append(events, to: open.id)
         } else {
             try await store.begin(met)
@@ -94,6 +96,16 @@ public enum RepairOwed {
         for owed in try await store.open() where owed.owes["repair"]?.phase.isSettled == false
             && RepairDebt(owed).isSettled(by: operation) {
             try await store.append([.obligation(key: "repair", phase: .accepted, evidence: evidence)], to: owed.id)
+        }
+    }
+
+    /// An owner's success that proves the owner itself works settles every repair that owner owes, whatever operation named it.
+    /// It runs in `operation`'s repair queue, so it follows every obligation of that operation already recorded.
+    public static func settle(_ dataRoot: URL, owner: String, after operation: String, evidence: Experience.Ref) -> Task<Void, Never> {
+        ExperienceStore.record(dataRoot, "repair:" + operation) { store in
+            for owed in try await store.open() where owed.owes["repair"]?.phase.isSettled == false && RepairDebt(owed).owner == owner {
+                try await store.append([.obligation(key: "repair", phase: .accepted, evidence: evidence)], to: owed.id)
+            }
         }
     }
 

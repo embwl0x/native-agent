@@ -139,10 +139,6 @@ struct ChatReplyNotificationKeys: Sendable {
 
 @MainActor
 enum ChatReplyNotificationPresentation {
-    static func ownsVisibleConversation(userInfo: [AnyHashable: Any]) -> Bool {
-        ownsVisibleConversation(keys: ChatReplyNotificationKeys(userInfo: userInfo))
-    }
-
     static func ownsVisibleConversation(keys: ChatReplyNotificationKeys) -> Bool {
         guard keys.source == "icloud_chat_reply",
               let store = ChatStore.visibleStore

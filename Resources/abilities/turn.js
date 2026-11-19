@@ -1,7 +1,10 @@
 /* NativeAgent ability
 {"id": "turn", "kind": "turn", "version": 10,
  "reach": {"capabilities": ["model"], "readPaths": [], "hosts": [], "apps": []},
- "wake": [], "face": {}, "resident": false, "learned": {}, "choices": {}}
+ "wake": [], "face": {}, "resident": false, "learned": {}, "choices": {},
+ "record": {
+   "description": "My last clean thought, body, inner cues and private working memory lead every turn; I think, act and stream the answer."
+ }}
 */
 // The agent's turn. The stem hands step one event at a time (message, model,
 // result, observation, provider_failure, resumed) and runs the effects it

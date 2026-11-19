@@ -9,7 +9,7 @@ actor BodyFaceConnection {
     private let source: FaceFeedSource
     private let handler: any FaceActHandler
     private let log: FaceLinkLog
-    private let disconnected: @Sendable (UUID?, String) async -> Void
+    private let disconnected: @Sendable (UUID?, String, Bool) async -> Void
     private let connected: @Sendable (UUID) async throws -> Void
     /// Runs synchronously as the first act of close, before any drain: what must stop reading this connection forgets it here.
     private let ending: @Sendable (UUID?) -> Void
@@ -31,7 +31,7 @@ actor BodyFaceConnection {
     init(link: FaceLink.Connection, source: FaceFeedSource, handler: any FaceActHandler, log: FaceLinkLog,
          connected: @escaping @Sendable (UUID) async throws -> Void,
          ending: @escaping @Sendable (UUID?) -> Void,
-         disconnected: @escaping @Sendable (UUID?, String) async -> Void) {
+         disconnected: @escaping @Sendable (UUID?, String, Bool) async -> Void) {
         self.link = link; self.source = source; self.handler = handler
         self.log = log
         self.connected = connected; self.ending = ending; self.disconnected = disconnected
@@ -70,6 +70,7 @@ actor BodyFaceConnection {
                 self.sink = sink
                 try await connected(sink.epoch)
                 let result = try await handler.handle(act)
+                if let failure { throw failure }
                 switch result {
                 case .acknowledged: break
                 case .failed(let failure), .refused(let failure): throw failure
@@ -253,7 +254,7 @@ actor BodyFaceConnection {
             do { _ = try await handler.handle(.unobserve(id: observation)) }
             catch { releases.append("Observation release: \(error.localizedDescription)") }
         }
-        await disconnected(connection, ([cause.localizedDescription] + releases).joined(separator: "\n"))
+        await disconnected(connection, ([cause.localizedDescription] + releases).joined(separator: "\n"), attached)
         if !releases.isEmpty { await record("release_failed " + releases.joined(separator: "\n")) }
         do { try await log.close() }
         catch { ModuleLog.app("[face] link record close failed: %@", error.localizedDescription, level: .error) }

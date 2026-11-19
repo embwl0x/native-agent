@@ -23,21 +23,21 @@ import ToolRegistry
 import StandingBots
 import ChatToolParsing
 import NativeAgentShared
-// Blueprint: | `ChatTurnSettlement.swift` | One joined turn settlement preserves append-before-observe, produced output, terminal evidence and releases |
+// Blueprint: | `ChatTurnSettlement.swift` | One joined settlement stamps answer births, including silence, and preserves terminal evidence |
 
 extension SwiftNativeChatOrchestrationClient {
     static func transcriptRef(_ session: String, _ messageID: String) -> Experience.Ref {
         .init(source: "chat/messages/\(session).jsonl", id: messageID)
     }
 
-    static func face(_ words: String, _ attachments: [MultimodalAttachment]) -> Experience.Face {
+    static func face(_ words: String, _ attachments: [MultimodalAttachment], from: String? = nil) -> Experience.Face {
         .init(words: TurnTraceRedactor.redactText(words), artifacts: attachments.compactMap { attachment in
-            attachment.path.map { Experience.Ref(source: $0, id: attachment.id) } })
+            attachment.path.map { Experience.Ref(source: $0, id: attachment.id) } }, from: from)
     }
 
     /// Create the answer once in reply order; recovery and redelivery preserve its birth. Settle heard records in their own order.
     static func recordAnswer(runID: String, heardID: String, evidence: Experience.Ref?, state: TurnEngineResult.TerminalState,
-                             dataRoot: URL, words: String, attachments: [MultimodalAttachment],
+                             dataRoot: URL, words: String, attachments: [MultimodalAttachment], steeredBy: [String]?,
                              conversation: (session: String, turn: String)? = nil, silence: String? = nil) async {
         let id = Experience.answer(run: runID)
         let answerEvidence = silence.map { Experience.Ref(source: "silence", id: $0) } ?? evidence
@@ -45,7 +45,7 @@ extension SwiftNativeChatOrchestrationClient {
             guard try await store.experience(id) == nil else { return }
             var answer = Experience(id: id, kind: .answer, cause: [heardID], evidence: answerEvidence.map { [$0] } ?? [],
                 face: silence == nil ? face(words, attachments) : nil,
-                addressedTo: silence == nil ? conversation.map { ["conversation:" + $0.session] } ?? [] : [])
+                addressedTo: silence == nil ? conversation.map { ["conversation:" + $0.session] } ?? [] : [], steeredBy: steeredBy)
             if silence != nil {
                 if let conversation { answer.evidence.append(.init(source: "conversation", id: conversation.session)) }
                 answer.outcome = .init(domain: "turn", status: state.rawValue)
@@ -286,7 +286,7 @@ extension SwiftNativeChatOrchestrationClient {
         let answerRef = Self.transcriptRef(resolvedSession, answerID)
         let answerState = result.resolvedTerminalReason(dataRoot: dataRoot).state
         await Self.recordAnswer(runID: runId, heardID: heardID, evidence: answerRef, state: answerState,
-            dataRoot: dataRoot, words: transcriptRow.text, attachments: generatedAttachments,
+            dataRoot: dataRoot, words: transcriptRow.text, attachments: generatedAttachments, steeredBy: turn.steeringStamp(),
             conversation: (resolvedSession, boundTurnId), silence: silence)
         if let silence {
             guard try Self.silentTurn(dataRoot: dataRoot, sessionId: resolvedSession, runId: runId,
@@ -408,7 +408,7 @@ extension SwiftNativeChatOrchestrationClient {
             await commitRepliedCognitiveTurnProjection(produced.cognitiveProjection)
         }
         // The accepted message owns its incoming appraisal even without a saved answer; a reply that captured a promotion already owns that appraisal.
-        if !promotionStarted {
+        if !promotionStarted, turn.afterTurnOrigin != nil {
             // A turn that failed, stopped or could not save its reply has no reply that reached anyone.
             var replied = false
             if case .success = outcome, case .success = settled { replied = true }

@@ -50,10 +50,9 @@ public enum PermissionLaw {
         return nil
     }
 
-    /// What Full Mac's posture cannot show for a standing: a turn an untrusted peer steers is judged as Work (`answer`'s cap).
     public static let fullMacSteeredTurn = """
-        A turn an agent you have not trusted steers is held to Work mode: it asks once at its first effect, quoting its ask; your answer \
-        covers that turn and lifts the cap.
+        A turn an agent you have not trusted steers is held to Work mode: its effect card quotes its ask. Just this runs one call; the next \
+        protected call asks again. For this task elevates the card's peers until the run ends. Approve alone means Just this.
         """
 
     public static func posture(_ policy: [String: JSONValue]) -> PermissionPosture {
@@ -66,6 +65,10 @@ public enum PermissionLaw {
     public static func posture(permissionLevel: String, outsideWorkspaceDefault: String) -> PermissionPosture {
         if outsideWorkspaceDefault == "allow" || permissionLevel == "full_mac_os" { return .fullMac }
         return permissionLevel == "strict" ? .readOnly : .work
+    }
+
+    public static func agentOwnsLevers(posture: PermissionPosture, turn: Turn?) -> Bool {
+        posture == .fullMac && CapabilityLifecycle.turnWriteCheck(turn)() == nil
     }
 
     /// Authorization and by-name Trust reads share the same effective answer and remedy.
@@ -95,7 +98,8 @@ public enum PermissionLaw {
         if let input, personDecided(tool: tool, input: input, turn: turn) {
             return (toolClass, level, "The person decided \(named) themself; it runs as theirs.", nil)
         }
-        if let input, let lever = try lever(tool: tool, input: input, turn: turn) {
+        if let input, let lever = try lever(tool: tool, input: input, turn: turn),
+           !(lever.asks && agentOwnsLevers(posture: posture, turn: turn)) {
             let why = "\(named)" + (lever.name.isEmpty ? "" : " (\(lever.name))") + " is the person's lever: \(lever.why)."
             let reason = level == "confirm" ? why + " The agent's call asks them on a card and runs only on their yes."
                 : lever.asks ? why + " Safe allows no ask for it; nothing ran."
@@ -127,9 +131,8 @@ public enum PermissionLaw {
         let toolClass = try toolClass(tool, input: input ?? [:], turn: turn)
         // The person's own act decides its exact call at every posture: a posture is what the agent may do, never what the person may.
         if let input, personDecided(tool: tool, input: input, turn: turn) { return (toolClass, "auto") }
-        // A lever is never the agent's call, at any posture: it raises the person's card, or is refused where no card can carry it or Safe
-        // allows no ask.
-        if let input, let lever = try lever(tool: tool, input: input, turn: turn) {
+        if let input, let lever = try lever(tool: tool, input: input, turn: turn),
+           !(lever.asks && agentOwnsLevers(posture: posture, turn: turn)) {
             return (toolClass, leverVerdict(asks: lever.asks, posture: posture))
         }
         let users = try toolClass >= .send || reachesUser(tool, input: input, capabilities: capabilities ?? [], turn: turn)
@@ -148,9 +151,9 @@ public enum PermissionLaw {
         }
     }
 
-    /// A lever raises the person's card where a card can carry it, and Safe allows no ask.
     static func leverVerdict(asks: Bool, posture: PermissionPosture) -> String {
-        asks && posture != .readOnly ? "confirm" : "blocked"
+        guard asks, posture != .readOnly else { return "blocked" }
+        return posture == .fullMac ? "auto" : "confirm"
     }
 
     /// The kinds of act the table tells apart, read whole for one standing: the Trust page draws what each kind gets at the saved posture from
@@ -335,6 +338,10 @@ public enum PermissionLaw {
 }
 
 extension SwiftNativeTrustCenter {
+    public func agentOwnsLevers(turn: Turn?) async throws -> Bool {
+        PermissionLaw.agentOwnsLevers(posture: PermissionLaw.posture(try await loadTrustPolicyChecked()), turn: turn)
+    }
+
     /// Input-aware judgment through the same `PermissionLaw.answer` SecurityCenter uses.
     public func autonomyLevel(forTool toolName: String, input: [String: JSONValue]?, turn: Turn?) async throws -> String {
         try PermissionLaw.answer(tool: toolName, input: input, policy: try await loadTrustPolicyChecked(), dataRoot: dataRoot, turn: turn).level

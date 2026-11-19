@@ -57,7 +57,7 @@ public enum DeskPiece {
     public static func makeRef(address: String) -> String? {
         guard address.hasPrefix(scheme) else { return nil }
         let ref = String(address.dropFirst(scheme.count))
-        return ref.isEmpty ? nil : ref
+        return ref.isEmpty || ref == BoardDocument.tableRef ? nil : ref
     }
 
     /// The Make ref a reference lays, or nil when it is not a piece.

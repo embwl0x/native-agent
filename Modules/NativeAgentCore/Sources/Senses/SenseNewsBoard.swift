@@ -136,7 +136,7 @@ public actor SenseNewsBoard {
         let address = String((fresh.observationID ?? Self.identity(fresh.address)).prefix(16))
         Attention.post(Happening(.world, subject: "sense:" + fresh.senseID + ":" + address, door: "sense:" + fresh.senseID,
             words: fresh.senseID + " at " + Self.updateLine(fresh.address) + ": " + Self.updateLine(fresh.summary),
-            once: "sense:" + fresh.senseID + ":" + fresh.id.uuidString.lowercased()), dataRoot: dataRoot)
+            once: "sense:" + fresh.senseID + ":" + fresh.id.uuidString.lowercased(), watch: fresh.watch), dataRoot: dataRoot)
         return true
     }
     /// Keep a notice for the next turn without posting it to attention (a watch's own availability).

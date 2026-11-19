@@ -48,14 +48,6 @@ extension InboxItemRecord {
         Set(InboxActionVocabulary.actions(declared: actions, approvalLinked: hasLinkedApproval).map(\.id))
     }
 
-    public var isAttentionWorthyBacklogItem: Bool {
-        guard normalizedStatus == "unread", !isProactiveCard else { return false }
-        if ["actionable", "critical"].contains(severity.lowercased()) { return true }
-        if hasLinkedApproval { return true }
-        let passive: Set<String> = ["view", "read", "archive", "dismiss"]
-        return actions.contains { !passive.contains($0.id.lowercased()) }
-    }
-
     public var isForYouLane: Bool { !isSystemLane }
 }
 
@@ -83,7 +75,6 @@ extension InboxItemRecord {
         "background_loop",
         "disk_hygiene",
         "doctor",
-        "heartbeat",
         "provider_vitals",
         "self_test",
         "memory_repair",

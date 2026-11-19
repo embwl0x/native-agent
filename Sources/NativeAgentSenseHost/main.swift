@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import Senses
-// Blueprint: | `Sources/NativeAgentSenseHost/main.swift` | JSON-line entry loop and bundled SDK loading for the shared JavaScript executor |
+// Blueprint: | `Sources/NativeAgentSenseHost/main.swift` | JSON-line entry loop for the shared JavaScript executor |
 
 let io = PlugIO()
 signal(SIGPIPE, SIG_IGN)
@@ -17,19 +17,7 @@ while true {
         case "run":
             fallthrough
         case "changed":
-            if runtime == nil {
-                let installedSDK = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-                    .deletingLastPathComponent().deletingLastPathComponent()
-                    .appendingPathComponent("Resources/Senses/sense.js")
-                #if SWIFT_PACKAGE
-                let sdk = FileManager.default.isReadableFile(atPath: installedSDK.path) ? installedSDK
-                    : Bundle.module.bundleURL.appendingPathComponent("Senses/sense.js")
-                #else
-                let sdk = installedSDK
-                #endif
-                let shim = try String(contentsOf: sdk, encoding: .utf8)
-                runtime = JavaScriptProgramRuntime(io: io, shim: shim)
-            }
+            if runtime == nil { runtime = JavaScriptProgramRuntime(io: io) }
             try runtime?.run(message)
         default: throw SenseFailure(code: "bad_input", message: "Expected run, changed or stop on the sense plug.")
         }

@@ -5,13 +5,8 @@ import PersistenceCore
 import os
 // Blueprint: | `OneClock.swift` | `OneClock`: declared times, checked recurrence and durable consumption before delivery |
 
-/// The one clock. Every declared time (a moment the agent set, a part's schedule, a helper's cadence, the night) lives here with its next occurrence and
-/// is delivered to whoever declared it. The next occurrence moves forward and is saved before delivery, so an occurrence is delivered at most once, and
-/// one that came while the app was quit is delivered once when its owner registers. One deadline is armed at the earliest time an owner handles;
-/// nothing polls.
 public actor OneClock {
     public struct Time: Codable, Sendable, Equatable {
-        /// `<owner>:<key>`. The owner (`moment`, `part`, `helper`, `sleep`, `rem`, `watch`, `scan`, `brief`) is whoever the time is delivered to.
         public var id: String
         /// A recurrence in the scheduler's rhythm grammar (`SchedulerJobNormalizer.rhythm`); nil for one moment.
         public var rhythm: JSONValue?
@@ -101,7 +96,16 @@ public actor OneClock {
         if let previous = times[time.id]?.delivered,
            time.delivered.map({ $0 < previous }) ?? true {
             time.delivered = previous
-            time.ended = time.next <= previous ? true : nil
+            if time.next <= previous, let rhythm = time.rhythm {
+                guard case .object(let fields) = rhythm,
+                      SchedulerJobNormalizer.rhythmKinds.contains(SchedulerJobNormalizer.scheduleType(fields)) else {
+                    throw TriggerSchedulerError.persistenceFailure("Clock time \(time.id) has an invalid recurring rhythm.")
+                }
+                time.next = try SchedulerJobNormalizer.checkedNextOccurrence(fields, after: previous)
+                time.ended = nil
+            } else {
+                time.ended = time.next <= previous ? true : nil
+            }
         }
         guard times[time.id] != time else { return }
         times[time.id] = time

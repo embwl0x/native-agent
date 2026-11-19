@@ -4,7 +4,7 @@ import CloudKit
 import NativeAgentShared
 import PersistenceCore
 import DeviceSyncState
-// Blueprint: | `ICloudChecks.swift` | Active transport and local sync verdicts; repair missing directories without replacing signed evidence |
+// Blueprint: | `ICloudChecks.swift` | CloudKit and local sync verdicts; signed evidence stays with its owner |
 
 public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
     public let id: String = "icloud_bridge_state"
@@ -102,10 +102,9 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
                 detail: "iCloud transport health is unmeasured; the app's bridge has not started."
             ))
         }
-        let cloudKit = snapshot.transport == .cloudKit
         // A container not granted by the build's signature cannot use CloudKit; report that mismatch directly.
         let grantedContainers = Self.entitlementValues(DeviceCloudKitPreflight.iCloudContainersEntitlementKey)
-        if !cloudKit, services.contains("CloudKit"), !grantedContainers.isEmpty, !grantedContainers.contains(containerID) {
+        if services.contains("CloudKit"), !grantedContainers.isEmpty, !grantedContainers.contains(containerID) {
             return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id, title: title, status: "warn",
                 detail: """
@@ -116,108 +115,15 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
                 owner: .builder
             ))
         }
-        let service = cloudKit ? "CloudKit" : "CloudDocuments"
-        let containerKey = cloudKit ? DeviceCloudKitPreflight.iCloudContainersEntitlementKey
-            : "com.apple.developer.ubiquity-container-identifiers"
-        guard services.contains(service), Self.entitlementValues(containerKey).contains(containerID) else {
+        guard services.contains("CloudKit"), grantedContainers.contains(containerID) else {
             return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id, title: title, status: "warn",
-                detail: "The active \(cloudKit ? "CloudKit" : "iCloud Drive") transport lacks its signed \(service) service or container entitlement.",
+                detail: "CloudKit lacks its signed service or container entitlement.",
                 harm: "The phone cannot exchange messages with the agent through iCloud.",
                 owner: .builder
             ))
         }
-        if cloudKit {
-            return merging(cloudKitResult(snapshot, containerID: containerID))
-        }
-        // Launch Doctor may precede the first transfer; unmeasured state is no defect and must not wake the agent or phone.
-        if case .unmeasured = snapshot.health {
-            return merging(CheckResult(source: "iCloud container " + containerID,
-                id: id, title: title, status: "unmeasured", detail: "iCloud Drive is starting; transport health is not measured yet."
-            ))
-        }
-        guard case .available = snapshot.health, let docsURL = snapshot.documentsURL else {
-            let signedIn = FileManager.default.ubiquityIdentityToken != nil
-            if !signedIn, snapshot.pairedPhones == 0 {
-                return merging(Self.phoneSyncOff(containerID: containerID, id: id, title: title))
-            }
-            return merging(CheckResult(source: "iCloud container " + containerID,
-                id: id, title: title, status: "warn",
-                detail: signedIn ? "The active iCloud Drive container is unavailable." : "The active iCloud Drive transport has no signed-in iCloud account.",
-                harm: "The phone cannot exchange messages with the agent through iCloud.",
-                human_action: signedIn
-                    ? """
-                        Open System Settings → Apple Account → iCloud → Drive and turn on Sync this Mac; allow NativeAgent under Apps Syncing to \
-                        iCloud Drive.
-                        """
-                    : "Open System Settings → Apple Account and sign in to iCloud.",
-                ask: signedIn ? .permission : .signIn
-            ))
-        }
-        let bridgeDirs = [
-            "outbox/mac",
-            "outbox/ios",
-            "processing",
-            "processed",
-            "snapshots",
-            "inbox",
-            "inbox/_rejected",
-            "responses",
-            "transactions/mac",
-            "transactions/ios",
-        ]
-        var missing: [String] = []
-        var created: [String] = []
-        for rel in bridgeDirs {
-            let dir = docsURL.appendingPathComponent(rel, isDirectory: true)
-            var isDir: ObjCBool = false
-            if !FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) || !isDir.boolValue {
-                missing.append(rel)
-                if repair {
-                    do {
-                        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                        created.append(rel)
-                    } catch {
-                        return CheckResult(source: docsURL.appendingPathComponent(rel).path,
-                            id: id,
-                            title: title,
-                            status: "fail",
-                            detail: "Could not create \(rel): \(error.localizedDescription)",
-                            harm: "The phone cannot exchange messages with the agent through iCloud.",
-                            repair: created.isEmpty ? nil : "Created: \(created.joined(separator: ", ")).",
-                            repairApplied: !created.isEmpty,
-                            repair_available: true
-                        )
-                    }
-                }
-            }
-        }
-        if repair, !created.isEmpty {
-            return merging(CheckResult(source: "iCloud container " + containerID,
-                id: id,
-                title: title,
-                status: "ok",
-                detail: "iCloud/APNS bridge directories are present after repair.",
-                repair: "Created: \(created.joined(separator: ", ")).", repairApplied: true
-            ))
-        }
-        if !missing.isEmpty {
-            return merging(CheckResult(source: missing.map { docsURL.appendingPathComponent($0).path }.joined(separator: ", "),
-                id: id,
-                title: title,
-                status: "warn",
-                detail: "Missing iCloud/APNS bridge path(s): \(missing.joined(separator: ", ")).",
-                harm: "The phone cannot exchange messages with the agent through iCloud.",
-                repair: "Press Repair in Diagnostics → Health checks to recreate bridge directories.",
-                repair_available: true
-            ))
-        }
-        return merging(CheckResult(source: "iCloud container " + containerID,
-            id: id,
-            title: title,
-            status: "ok",
-            detail: "iCloud/APNS bridge directories are present."
-        ))
+        return merging(cloudKitResult(snapshot, containerID: containerID))
     }
 
     private func cloudKitResult(_ snapshot: ICloudBridgeHealthSnapshot, containerID: String) -> CheckResult {

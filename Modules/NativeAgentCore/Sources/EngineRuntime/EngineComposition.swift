@@ -113,8 +113,6 @@ extension NativeAgentEngine {
             makeDataRootDiskHygieneLoop(dataRoot: dataRoot),
             CognitiveMaintenanceLoop(interval: NativeCognitionRuntime.substrateClockCadence, runtime: cognition),
             CognitiveReplayLoop(interval: NativeCognitionRuntime.substrateClockCadence, runtime: cognition),
-            // Cue authoring requires a live consumer before production scheduling.
-            makeHeartbeatLoop(dataRoot: dataRoot),
             // Desk notifications must not touch cognition.
             makeDeskNotifyLoop(dataRoot: dataRoot),
             // A durable cursor prevents duplicate delegation terminal cards.
@@ -148,11 +146,6 @@ extension NativeAgentEngine {
 }
 
 extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
-    func letGoReplies(deliveryIDs: Set<String>, outcome: String, dataRoot: URL, configRoot: URL) async throws {
-        _ = try await CodexCompletionLifecycle.letGoReplies(deliveryIDs: deliveryIDs, outcome: outcome,
-            dataRoot: dataRoot, configRoot: configRoot)
-    }
-
     /// Run every reply owner independently before reporting failures so one cannot suppress its siblings.
     func reconcileReplyDeliveries(dataRoot: URL) async throws {
         var failures: [String] = []
@@ -203,7 +196,7 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
         await NativeAgentEngine.live.agents.continuation.stop()
     }
 
-    /// Conversation-owner changes wake reconciliation; no clock declares a reply due.
+    /// Conversation-owner changes and the one clock wake reconciliation.
     func nextConversationDeadline(after _: Date) -> Date? { nil }
 }
 
@@ -226,14 +219,6 @@ extension NativeAgentEngine {
                 }
             }
         )
-    }
-}
-
-extension NativeAgentEngine {
-    public static func makeHeartbeatLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> HeartbeatLoop {
-        HeartbeatBackgroundWork(port: EngineBackgroundWorkPort()).makeHeartbeatLoop(dataRoot: dataRoot)
     }
 }
 
@@ -286,9 +271,7 @@ extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
         do {
             let report = try await NativeAgentEngine.live.ports.backgroundWork.runAutoDoctor(checks: checks, dataRoot: dataRoot)
             if owned {
-                let rows = await DoctorReadout.repairProjection(report.checks, dataRoot: dataRoot)
-                await doctor.finishRun(DoctorReport(status: DoctorReadout.doctorRollup(rows.map(\.status)),
-                                                    repaired: report.repaired, checks: rows))
+                await doctor.finishRun(report)
             }
             return report.checks
         } catch {

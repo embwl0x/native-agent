@@ -88,10 +88,16 @@ public enum MacScreenPageCompiler {
         }
         append(SenseScreenThings.accessibilityReadLine, at: [])
         var shellStarted = false
-        var pageNumber = 0
 
-        func ancestors(_ path: [Int]) -> [MacAXNode] {
-            (0..<path.count).reversed().compactMap { byPath[Array(path.prefix($0))] }
+        let ancestorsByPath = Dictionary(ordered.map { node in
+            (node.path, (0..<node.path.count).reversed().compactMap { byPath[Array(node.path.prefix($0))] })
+        }, uniquingKeysWith: { first, _ in first })
+        func ancestors(_ path: [Int]) throws -> [MacAXNode] {
+            guard let ancestors = ancestorsByPath[path] else {
+                throw MacAccessibilityReader.NativeReadFailure(
+                    detail: "Screen page compiler fault: missing ancestry index entry for path \(path).")
+            }
+            return ancestors
         }
         func same(_ lhs: String?, _ rhs: String?) -> Bool {
             guard let lhs, let rhs else { return false }
@@ -112,10 +118,10 @@ public enum MacScreenPageCompiler {
             }
             return false
         }
-        func representedByControl(_ text: String, path: [Int]) -> Bool {
-            ancestors(path).contains { ancestor in
+        func representedByControl(_ text: String, path: [Int]) throws -> Bool {
+            try ancestors(path).contains { ancestor in
                 guard let control = controls[ancestor.path] else { return false }
-                return same(text, controlLabel(ancestor)) || same(text, display(control.valueJSON))
+                return try same(text, controlLabel(ancestor)) || same(text, display(control.valueJSON))
             }
         }
 
@@ -128,9 +134,9 @@ public enum MacScreenPageCompiler {
         func ownName(_ node: MacAXNode) -> String? {
             Self.ownName(node.attributes, text: words[node.path]?.title ?? words[node.path]?.value)
         }
-        func staticRuns(_ node: MacAXNode) -> [MacAXNode] {
-            let leaves = descendants(node).filter { child in
-                child.attributes.role == "AXStaticText"
+        func staticRuns(_ node: MacAXNode) throws -> [MacAXNode] {
+            let leaves = try descendants(node).filter { child in
+                try child.attributes.role == "AXStaticText"
                     && !descendants(child).contains { $0.attributes.role == "AXStaticText" }
                     && !ancestors(child.path).prefix(while: { $0.path != node.path }).contains {
                         $0.attributes.role == "AXWebArea" || $0.attributes.role == "AXImage"
@@ -158,7 +164,7 @@ public enum MacScreenPageCompiler {
 
         var captions: [[Int]: String] = [:]
         var captionPaths: [[Int]: Set<[Int]>] = [:]
-        func controlLabel(_ node: MacAXNode) -> String? {
+        func controlLabel(_ node: MacAXNode) throws -> String? {
             guard !node.attributes.labelUnreadable else { return nil }
             guard let control = controls[node.path] else { return nil }
             if let caption = captions[node.path] { return caption }
@@ -166,7 +172,7 @@ public enum MacScreenPageCompiler {
             let displayedLabel = node.attributes.titleIsHelp ? words[node.path]?.title : display(control.labelJSON)
             if let label = displayedLabel, readable(label),
                label != node.attributes.role, label != kind {
-                let runs = staticRuns(node)
+                let runs = try staticRuns(node)
                 let parts = runs.compactMap(ownName)
                 if parts.count > 1, same(label, parts.first), let text = runText(runs) { return text }
                 return inline(label)
@@ -177,19 +183,30 @@ public enum MacScreenPageCompiler {
                 return MacScreenRender.kindName(role: String(subrole.dropLast("Button".count)))
             }
             // Chromium composite names come from descendant text, not wrapper roles or status images.
-            return runText(staticRuns(node))
+            return try runText(staticRuns(node))
         }
         // Fold presentation descendants only when role, containment, name and actions agree; independently named controls remain distinct.
         let activationActions: Set<String> = ["AXPress", "AXOpen", "AXShowMenu"]
         let labelOwners = MacPerceptionCompiler.controlRoles.union(["AXSwitch"])
         let checkableRoles: Set<String> = ["AXCheckBox", "AXRadioButton", "AXSwitch"]
+        // Control membership is fixed throughout caption ownership; scope readings can be shared within this pass.
+        var captionRuns: [[Int]: [MacAXNode]] = [:]
+        var checkableCounts: [[Int]: Int] = [:]
+        for node in ordered where checkableRoles.contains(node.attributes.role) && controls[node.path] != nil {
+            for scope in try ancestors(node.path) where ["AXGroup", "AXListItem", "AXParagraph"].contains(scope.attributes.role) {
+                guard checkableCounts[scope.path] == nil else { continue }
+                let count = descendants(scope).filter { checkableRoles.contains($0.attributes.role) }.count
+                checkableCounts[scope.path] = count
+                if count == 1 { captionRuns[scope.path] = try staticRuns(scope) }
+            }
+        }
         // Use the smallest label container with exactly one checkable input; larger containers may caption several controls.
         for node in ordered where checkableRoles.contains(node.attributes.role) && controls[node.path] != nil {
-            for scope in ancestors(node.path) where ["AXGroup", "AXListItem", "AXParagraph"].contains(scope.attributes.role) {
+            for scope in try ancestors(node.path) where ["AXGroup", "AXListItem", "AXParagraph"].contains(scope.attributes.role) {
                 let children = descendants(scope)
-                guard children.filter({ checkableRoles.contains($0.attributes.role) }).count == 1 else { break }
-                if let label = controlLabel(node) {
-                    let matches = staticRuns(scope).filter { same(ownName($0), label) }
+                guard checkableCounts[scope.path] == 1, let scopeRuns = captionRuns[scope.path] else { break }
+                if let label = try controlLabel(node) {
+                    let matches = scopeRuns.filter { same(ownName($0), label) }
                     if !matches.isEmpty {
                         captionPaths[node.path] = Set(matches.map(\.path))
                         break
@@ -202,21 +219,21 @@ public enum MacScreenPageCompiler {
                       }),
                       !children.contains(where: { ["AXHeading", "AXWebArea"].contains($0.attributes.role) }),
                       children.filter({ $0.attributes.role == "AXParagraph" }).count <= 1 else { break }
-                let runs = staticRuns(scope).filter { !consumed.contains($0.path) }
+                let runs = scopeRuns.filter { !consumed.contains($0.path) }
                 guard let text = runText(runs) else { continue }
-                if controlLabel(node) == nil { captions[node.path] = text }
-                if same(text, controlLabel(node)) {
+                if try controlLabel(node) == nil { captions[node.path] = text }
+                if try same(text, controlLabel(node)) {
                     captionPaths[node.path] = Set(runs.map(\.path))
                     break
                 }
             }
         }
         // Toolbar captions may precede inputs; match locally rather than deduplicating equal text across the page.
+        let siblingsByParent = Dictionary(grouping: ordered) { Array($0.path.dropLast()) }
         for node in ordered where checkableRoles.contains(node.attributes.role) {
-            guard let label = controlLabel(node) else { continue }
-            let parent = Array(node.path.dropLast())
-            for sibling in ordered where Array(sibling.path.dropLast()) == parent
-                && sibling.attributes.role == "AXStaticText" && same(ownName(sibling), label) {
+            guard let label = try controlLabel(node) else { continue }
+            for sibling in siblingsByParent[Array(node.path.dropLast()), default: []]
+                where sibling.attributes.role == "AXStaticText" && same(ownName(sibling), label) {
                 captionPaths[node.path, default: []].insert(sibling.path)
                 captionPaths[node.path, default: []].formUnion(descendants(sibling).map(\.path))
             }
@@ -262,7 +279,7 @@ public enum MacScreenPageCompiler {
                 controls.removeValue(forKey: node.path)
                 continue
             }
-            if a.role == "AXImage", ancestors(node.path).contains(where: { owner in
+            if a.role == "AXImage", try ancestors(node.path).contains(where: { owner in
                 guard owner.attributes.role == "AXGroup",
                       actions.isSubset(of: Set(owner.attributes.actions).intersection(activationActions)) else { return false }
                 let children = descendants(owner)
@@ -274,11 +291,11 @@ public enum MacScreenPageCompiler {
                 continue
             }
             guard ["AXGroup", "AXStaticText", "AXImage"].contains(a.role),
-                  let owner = ancestors(node.path).first(where: {
+                  let owner = try ancestors(node.path).first(where: {
                       controls[$0.path] != nil && labelOwners.contains($0.attributes.role)
                   }), actions.isSubset(of: Set(owner.attributes.actions)),
-                  ownName(node) == nil || ownName(node).map({ name in
-                      controlLabel(owner).map { names($0, owner: name) } == true
+                  try ownName(node) == nil || ownName(node).map({ name in
+                      try controlLabel(owner).map { names($0, owner: name) } == true
                   }) == true || a.role == "AXImage"
             else { continue }
             controls.removeValue(forKey: node.path)
@@ -288,14 +305,14 @@ public enum MacScreenPageCompiler {
             let actions = descendants(node).filter {
                 controls[$0.path] != nil && (["AXButton", "AXLink"].contains($0.attributes.role) || checkableRoles.contains($0.attributes.role))
             }
-            if actions.contains(where: {
-                (ownName(node) == nil || same(ownName(node), controlLabel($0)))
+            if try actions.contains(where: {
+                try (ownName(node) == nil || same(ownName(node), controlLabel($0)))
                     && Set(node.attributes.actions).intersection(activationActions).isSubset(of: Set($0.attributes.actions))
             }) { controls.removeValue(forKey: node.path) }
         }
-        func headingText(_ node: MacAXNode) -> String? {
+        func headingText(_ node: MacAXNode) throws -> String? {
             // AXHeading numeric values are levels; use static children for names and exclude control-owned captions.
-            let parts = staticRuns(node).compactMap(ownName)
+            let parts = try staticRuns(node).compactMap(ownName)
             if !parts.isEmpty {
                 return parts.joined(separator: " ")
             }
@@ -309,7 +326,7 @@ public enum MacScreenPageCompiler {
             let children = descendants(group)
             let actions = children.filter { controls[$0.path] != nil && labelOwners.contains($0.attributes.role) }
             guard actions.count == 1, let owner = actions.first, labelOwners.contains(owner.attributes.role),
-                  let label = controlLabel(owner),
+                  let label = try controlLabel(owner),
                   !children.contains(where: { ["AXHeading", "AXWebArea", "AXParagraph"].contains($0.attributes.role) }) else { continue }
             for child in children where ["AXStaticText", "AXGroup"].contains(child.attributes.role)
                 && same(ownName(child), label) {
@@ -326,7 +343,7 @@ public enum MacScreenPageCompiler {
                   node.attributes.actions.contains("AXPress") else { return nil }
             return "(unnamed \(MacScreenRender.kindName(role: node.attributes.role)))"
         }
-        for node in ordered where controls[node.path] != nil && controlLabel(node) == nil && unnamedName(node) == nil {
+        for node in ordered where try controls[node.path] != nil && controlLabel(node) == nil && unnamedName(node) == nil {
             controls.removeValue(forKey: node.path)
         }
         var compositeRows: [[Int]: MacAXNode] = [:]
@@ -338,15 +355,15 @@ public enum MacScreenPageCompiler {
             if controls[group.path] != nil { continue }
             let children = descendants(group)
             if children.contains(where: { compositeRows[$0.path] != nil }) { continue }
-            let actions = children.filter { child in
-                controls[child.path] != nil && ["AXButton", "AXLink", "AXPopUpButton", "AXMenuButton"].contains(child.attributes.role)
+            let actions = try children.filter { child in
+                try controls[child.path] != nil && ["AXButton", "AXLink", "AXPopUpButton", "AXMenuButton"].contains(child.attributes.role)
                     && !ancestors(child.path).prefix(while: { $0.path != group.path }).contains {
                         controls[$0.path] != nil && labelOwners.contains($0.attributes.role)
                     }
             }
-            let owners = actions.filter { candidate in
+            let owners = try actions.filter { candidate in
                 guard ["AXButton", "AXLink"].contains(candidate.attributes.role),
-                      let label = controlLabel(candidate) else { return false }
+                      let label = try controlLabel(candidate) else { return false }
                 // Row status must not become session identity; use AX labels rather than a status vocabulary.
                 var statuses = descendants(candidate).filter {
                     ["AXGroup", "AXImage"].contains($0.attributes.role) && controls[$0.path] == nil
@@ -358,28 +375,30 @@ public enum MacScreenPageCompiler {
                         name.removeSubrange(prefix)
                     }
                 }
-                let runName = runText(staticRuns(candidate))
+                let runName = try runText(staticRuns(candidate))
                 let identities = [name, runName].compactMap { $0 }.filter { !$0.isEmpty }
-                return identities.contains { identity in
-                    actions.allSatisfy { $0.path == candidate.path || controlLabel($0).map { names($0, owner: identity) && !same($0, identity) } == true }
+                return try identities.contains { identity in
+                    try actions.allSatisfy {
+                        try $0.path == candidate.path || controlLabel($0).map { names($0, owner: identity) && !same($0, identity) } == true
+                    }
                 }
             }
             guard actions.count > 1, owners.count == 1, let primary = owners.first,
                   children.filter({ controls[$0.path] != nil && $0.path != primary.path && $0.attributes.role != "AXImage" })
                       .allSatisfy({ actions.contains($0) }),
-                  Set(actions.compactMap(controlLabel)).count == actions.count,
+                  Set(try actions.compactMap(controlLabel)).count == actions.count,
                   actions.allSatisfy({ $0.attributes.actions.contains("AXPress") || $0.attributes.actions.contains("AXOpen") }),
-                  !children.contains(where: { child in
-                      child.attributes.role == "AXStaticText" && !ancestors(child.path).prefix(while: { $0.path != group.path })
+                  try !children.contains(where: { child in
+                      try child.attributes.role == "AXStaticText" && !ancestors(child.path).prefix(while: { $0.path != group.path })
                           .contains { controls[$0.path] != nil }
                   }) else { continue }
             compositeRows[group.path] = primary
-            rowRelatedNames[primary.path] = actions.filter { $0.path != primary.path }.compactMap(controlLabel)
-            if let label = controlLabel(primary), let visibleName = runText(staticRuns(primary)),
+            rowRelatedNames[primary.path] = try actions.filter { $0.path != primary.path }.compactMap(controlLabel)
+            if let label = try controlLabel(primary), let visibleName = try runText(staticRuns(primary)),
                !same(label, visibleName), let range = label.range(of: visibleName),
                range.upperBound == label.endIndex,
-               actions.filter({ $0.path != primary.path }).allSatisfy({
-                   controlLabel($0).map { names($0, owner: visibleName) } == true
+               try actions.filter({ $0.path != primary.path }).allSatisfy({
+                   try controlLabel($0).map { names($0, owner: visibleName) } == true
                }) {
                 // Accessible-name status belongs in detail even when no separate status image or value exists.
                 let state = String(label[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -395,21 +414,21 @@ public enum MacScreenPageCompiler {
         }
         var controlNames: [[Int]: String] = [:]
         for node in ordered where controls[node.path] != nil {
-            if let label = controlLabel(node) { controlNames[node.path] = label }
+            if let label = try controlLabel(node) { controlNames[node.path] = label }
             else if let name = unnamedName(node) { controlNames[node.path] = name }
             else { controls.removeValue(forKey: node.path) }
         }
         // Contained activations of one label are aliases; equal independent sibling controls remain distinct.
         for node in ordered where controls[node.path] != nil && labelOwners.contains(node.attributes.role) {
-            guard let owner = ancestors(node.path).first(where: {
+            guard let owner = try ancestors(node.path).first(where: {
                 controls[$0.path] != nil && labelOwners.contains($0.attributes.role)
-            }), same(controlLabel(node), controlLabel(owner)),
+            }), try same(controlLabel(node), controlLabel(owner)),
                   !Set(node.attributes.actions).intersection(activationActions).isEmpty,
                   Set(node.attributes.actions).isSubset(of: Set(owner.attributes.actions)),
                   descendants(node).allSatisfy({ ["AXGroup", "AXStaticText", "AXImage"].contains($0.attributes.role) }) else { continue }
             controls.removeValue(forKey: node.path)
         }
-        func documentName(_ area: MacAXNode) -> String {
+        func documentName(_ area: MacAXNode, number: Int) throws -> String {
             func sectionText(_ text: String?) -> String? {
                 guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       !text.allSatisfy({ $0.isNumber || $0.isWhitespace }) else { return nil }
@@ -424,11 +443,11 @@ public enum MacScreenPageCompiler {
                 let components = title.split(separator: "|").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 if components.count < 2 || Set(components).count > 1 { return title }
             }
-            let ownDocument = descendants(area).filter { child in
-                child.attributes.role != "AXWebArea"
+            let ownDocument = try descendants(area).filter { child in
+                try child.attributes.role != "AXWebArea"
                     && ancestors(child.path).first(where: { $0.attributes.role == "AXWebArea" })?.path == area.path
             }
-            let contentTitle = ownDocument.first(where: { $0.attributes.role == "AXHeading" }).flatMap(headingText)
+            let contentTitle = try ownDocument.first(where: { $0.attributes.role == "AXHeading" }).flatMap(headingText)
                 ?? editors.compactMap { words[$0.path]?.value?.components(separatedBy: .newlines).first(where: readable) }.first
             if titleNamesEditor, let title = sectionText(words[area.path]?.title),
                contentTitle.map({ names(title, owner: $0) }) == true {
@@ -437,7 +456,7 @@ public enum MacScreenPageCompiler {
             }
             if let contentTitle {
                 // Find a full title through its document heading in the nearest pane, never through app or generic-title word lists.
-                for scope in ancestors(area.path) {
+                for scope in try ancestors(area.path) {
                     let candidates = descendants(scope).filter {
                         ["AXWebArea", "AXDocument", "AXButton", "AXPopUpButton"].contains($0.attributes.role)
                             && !($0.path.starts(with: area.path))
@@ -453,20 +472,20 @@ public enum MacScreenPageCompiler {
                     if !distinct.isEmpty { break }
                 }
             }
-            if titleNamesEditor, let enclosing = ancestors(area.path).first(where: {
+            if titleNamesEditor, let enclosing = try ancestors(area.path).first(where: {
                 $0.attributes.role == "AXWebArea" && sectionText(words[$0.path]?.title) != nil
                     && !same(words[$0.path]?.title, words[area.path]?.title)
             }), let title = sectionText(words[enclosing.path]?.title) { return title }
             for heading in ownDocument where heading.attributes.role == "AXHeading" {
-                if let text = sectionText(headingText(heading)) {
+                if let text = try sectionText(headingText(heading)) {
                     return text
                 }
             }
             if let landmark = ownDocument.first(where: {
                 MacPerceptionCompiler.landmarkKinds[$0.attributes.role] != nil && sectionText(words[$0.path]?.title) != nil
             }), let title = words[landmark.path]?.title { return title }
-            if let text = ownDocument.first(where: {
-                $0.attributes.role == "AXStaticText" && sectionText(words[$0.path]?.value ?? words[$0.path]?.title) != nil
+            if let text = try ownDocument.first(where: {
+                try $0.attributes.role == "AXStaticText" && sectionText(words[$0.path]?.value ?? words[$0.path]?.title) != nil
                     && !ancestors($0.path).prefix(while: { $0.path != area.path }).contains { controls[$0.path] != nil }
             })
                 .flatMap({ words[$0.path]?.value ?? words[$0.path]?.title }) {
@@ -474,28 +493,29 @@ public enum MacScreenPageCompiler {
             }
             if let landmark = ownDocument.first(where: { MacPerceptionCompiler.landmarkKinds[$0.attributes.role] != nil }),
                let kind = MacPerceptionCompiler.landmarkKinds[landmark.attributes.role] { return kind.capitalized }
-            return "Page \(pageNumber)"
+            return "Page \(number)"
         }
-        let documentTitles = Dictionary(webAreas.map { ($0.path, documentName($0)) }, uniquingKeysWith: { first, _ in first })
+        let documentTitles = try Dictionary(webAreas.enumerated().map { ($0.element.path, try documentName($0.element, number: $0.offset + 1)) },
+            uniquingKeysWith: { first, _ in first })
         for editor in ordered where editor.attributes.role == "AXDocument"
             || structuredDocuments.contains(editor.path) || aggregateDocuments.contains(editor.path) {
-            if let area = ancestors(editor.path).first(where: { $0.attributes.role == "AXWebArea" }),
+            if let area = try ancestors(editor.path).first(where: { $0.attributes.role == "AXWebArea" }),
                let title = documentTitles[area.path] {
                 captions[editor.path] = title
                 if controls[editor.path] != nil { controlNames[editor.path] = title }
-            } else if let heading = ancestors(editor.path).compactMap({ scope in
-                descendants(scope).first(where: { $0.attributes.role == "AXHeading" }).flatMap(headingText)
+            } else if let heading = try ancestors(editor.path).compactMap({ scope in
+                try descendants(scope).first(where: { $0.attributes.role == "AXHeading" }).flatMap(headingText)
             }).first {
                 captions[editor.path] = heading
                 if controls[editor.path] != nil { controlNames[editor.path] = heading }
             }
         }
-        func rowStates(_ node: MacAXNode) -> [String] {
+        func rowStates(_ node: MacAXNode) throws -> [String] {
             guard ["AXButton", "AXLink"].contains(node.attributes.role) else { return [] }
-            let label = controlLabel(node)
-            var states = descendants(node).filter { child in
+            let label = try controlLabel(node)
+            var states = try descendants(node).filter { child in
                 guard ["AXImage", "AXGroup"].contains(child.attributes.role), controls[child.path] == nil else { return false }
-                if child.attributes.role == "AXImage" || staticRuns(child).isEmpty { return true }
+                if try child.attributes.role == "AXImage" || staticRuns(child).isEmpty { return true }
                 // Related actions distinguish a group’s visible status from the item’s identity.
                 guard let related = rowRelatedNames[node.path], let state = ownName(child),
                       label.map({ names($0, owner: state) }) == true else { return false }
@@ -506,10 +526,10 @@ public enum MacScreenPageCompiler {
             if !node.attributes.valueIsHelp, let value = display(controls[node.path]?.valueJSON), !same(value, label) { states.append(value) }
             return states
         }
-        func identity(_ node: MacAXNode) -> String {
+        func identity(_ node: MacAXNode) throws -> String {
             if let name = rowIdentities[node.path] { return name }
             var name = controlNames[node.path] ?? MacScreenRender.kindName(role: node.attributes.role)
-            let states = rowStates(node)
+            let states = try rowStates(node)
             if node.attributes.role == "AXLink" { name = name.trimmingCharacters(in: CharacterSet(charactersIn: ",")) }
             guard !states.isEmpty else { return name }
             for state in states {
@@ -526,9 +546,9 @@ public enum MacScreenPageCompiler {
             guard let control = controls[node.path] else { return "" }
             let a = node.attributes
             let kind = MacScreenRender.kindName(role: a.role)
-            let label = controlLabel(node)
-            let name = identity(node)
-            var details = extraDetails + rowStates(node)
+            let label = try controlLabel(node)
+            let name = try identity(node)
+            var details = try extraDetails + rowStates(node)
             if includeValue, !a.valueIsHelp, let value = display(control.valueJSON), !same(value, label) { details.append(value) }
             if let state = control.state { details.append(state) }
             if control.enabled == false { details.append("disabled") }
@@ -548,7 +568,7 @@ public enum MacScreenPageCompiler {
             // Print each related action’s own handle so acts address exactly what the page shows.
             var printedVerbs = verbs
             for child in related {
-                guard let action = controls[child.path], let label = controlLabel(child) else { continue }
+                guard let action = controls[child.path], let label = try controlLabel(child) else { continue }
                 if action.enabled != true {
                     details.append(label + (action.enabled == false ? ": disabled" : ": enabled state unavailable"))
                     continue
@@ -584,11 +604,11 @@ public enum MacScreenPageCompiler {
         // A card’s one-heading container owns preceding badges too, despite AX order.
         var cardHeadings: [[Int]: MacAXNode] = [:]
         for image in ordered where image.attributes.role == "AXImage" {
-            for scope in ancestors(image.path) where scope.attributes.role == "AXGroup" {
+            for scope in try ancestors(image.path) where scope.attributes.role == "AXGroup" {
                 let children = descendants(scope)
                 let headings = children.filter { $0.attributes.role == "AXHeading" }
                 if headings.count > 1 { break }
-                guard let heading = headings.first, headingText(heading) != nil,
+                guard let heading = headings.first, try headingText(heading) != nil,
                       children.contains(where: { checkableRoles.contains($0.attributes.role) }),
                       MacPerceptionCompiler.pathIsBefore(image.path, heading.path) else { continue }
                 cardHeadings[scope.path] = heading
@@ -613,10 +633,10 @@ public enum MacScreenPageCompiler {
                 }
                 continue
             }
-            if let heading = cardHeadings[node.path], let text = headingText(heading) {
+            if let heading = cardHeadings[node.path], let text = try headingText(heading) {
                 append("\n### " + text, at: node.path, heading: true)
                 consumed.insert(heading.path)
-                consumed.formUnion(staticRuns(heading).map(\.path))
+                consumed.formUnion(try staticRuns(heading).map(\.path))
             }
             if structuredDocuments.contains(node.path) { continue }
             if aggregateDocuments.contains(node.path) {
@@ -674,7 +694,7 @@ public enum MacScreenPageCompiler {
                 }
                 // Replace owned captions with their control rows; links instead stay inline so sentences remain whole.
                 for child in descendants(node) where controls[child.path] != nil {
-                    guard let label = controlLabel(child) else { unplaced.append(child); continue }
+                    guard let label = try controlLabel(child) else { unplaced.append(child); continue }
                     let pattern = label.split(whereSeparator: \.isWhitespace)
                         .map { NSRegularExpression.escapedPattern(for: String($0)) }.joined(separator: "\\s+")
                     guard !pattern.isEmpty, let range = body.range(of: pattern, options: .regularExpression, range: searchCursor..<body.endIndex) else {
@@ -701,9 +721,8 @@ public enum MacScreenPageCompiler {
                 append("\n## Window controls", at: [], heading: true)
                 shellStarted = true
             }
-            if a.role == "AXWebArea" {
-                pageNumber += 1
-                append("\n## " + (documentTitles[node.path] ?? documentName(node)), at: node.path, heading: true)
+            if a.role == "AXWebArea", let title = documentTitles[node.path] {
+                append("\n## " + title, at: node.path, heading: true)
                 continue
             }
             if let summary = a.listSummary { append(summary, at: node.path) }
@@ -725,9 +744,9 @@ public enum MacScreenPageCompiler {
             if ["AXGroup", "AXParagraph", "AXStaticText"].contains(a.role), controls[node.path] == nil,
                !subtree.contains(where: { !["AXGroup", "AXStaticText", "AXLink"].contains($0.attributes.role) }),
                !subtree.contains(where: { controls[$0.path] != nil && !["AXLink", "AXStaticText"].contains($0.attributes.role) }) {
-                let units = subtree.filter { child in
+                let units = try subtree.filter { child in
                     if child.attributes.role == "AXLink" { return controls[child.path] != nil }
-                    return child.attributes.role == "AXStaticText" && ownName(child) != nil
+                    return try child.attributes.role == "AXStaticText" && ownName(child) != nil
                         && !descendants(child).contains(where: { $0.attributes.role == "AXStaticText" || $0.attributes.role == "AXLink" })
                         && !ancestors(child.path).prefix(while: { $0.path != node.path }).contains(where: { $0.attributes.role == "AXLink" })
                 }
@@ -746,12 +765,12 @@ public enum MacScreenPageCompiler {
                     var handles: [String] = []
                     for unit in units {
                         if unit.attributes.role == "AXLink" {
-                            let name = identity(unit)
-                            let comma = controlLabel(unit)?.hasSuffix(",") == true ? "," : ""
+                            let name = try identity(unit)
+                            let comma = try controlLabel(unit)?.hasSuffix(",") == true ? "," : ""
                             parts.append(name + " (link)" + comma)
                             handles.append(try controlRow(unit, inlineName: ""))
                         }
-                        else if let text = ownName(unit), !representedByControl(text, path: unit.path) { parts.append(text) }
+                        else if let text = ownName(unit), try !representedByControl(text, path: unit.path) { parts.append(text) }
                     }
                     append(parts.joined(separator: " ") + " " + handles.joined(separator: " · "), at: node.path)
                     consumed.formUnion(subtree.map(\.path))
@@ -762,8 +781,8 @@ public enum MacScreenPageCompiler {
                 consumed.formUnion(captionPaths[node.path] ?? [])
                 // Fold repeated composite names into one row while retaining independently named child actions and their original handles.
                 let composite = labelOwners.contains(a.role)
-                let children = composite ? descendants(node).filter {
-                    controls[$0.path] != nil && !ancestors($0.path).prefix(while: { $0.path != node.path })
+                let children = try composite ? descendants(node).filter {
+                    try controls[$0.path] != nil && !ancestors($0.path).prefix(while: { $0.path != node.path })
                         .contains { $0.attributes.role == "AXWebArea" }
                 } : []
                 let states = composite ? descendants(node).filter {
@@ -773,15 +792,15 @@ public enum MacScreenPageCompiler {
                 for child in children {
                     consumed.insert(child.path)
                     // Print the item identity once while retaining every underlying action in the row and native index.
-                    let repeatsOwner = same(controlLabel(child), controlLabel(node))
+                    let repeatsOwner = try same(controlLabel(child), controlLabel(node))
                     let inlineName = repeatsOwner ? "" : nil
                     row += " · " + (try controlRow(child, inlineName: inlineName))
                 }
-                for child in descendants(node) where !ancestors(child.path).prefix(while: { $0.path != node.path })
+                for child in descendants(node) where try !ancestors(child.path).prefix(while: { $0.path != node.path })
                     .contains(where: { $0.attributes.role == "AXWebArea" }) {
                     if controls[child.path] == nil,
                        let text = words[child.path]?.value ?? words[child.path]?.title,
-                       same(text, controlLabel(node)) || children.contains(where: { same(text, controlLabel($0)) })
+                       try same(text, controlLabel(node)) || children.contains(where: { try same(text, controlLabel($0)) })
                         || staticRuns(node).contains(where: { $0.path == child.path }) || child.attributes.role == "AXImage" {
                         consumed.insert(child.path)
                     }
@@ -790,7 +809,7 @@ public enum MacScreenPageCompiler {
                 continue
             }
             // Use styled runs or shared-line geometry to join labels without merging unrelated paragraphs or columns.
-            let runs = staticRuns(node)
+            let runs = try staticRuns(node)
             let runFrames = runs.compactMap { $0.attributes.frame }
             let oneLine = runFrames.count == runs.count && runFrames.first.map { first in
                 runFrames.allSatisfy { $0.w > 0 && $0.h > 0 && $0.y < first.y + first.h && $0.y + $0.h > first.y }
@@ -804,15 +823,15 @@ public enum MacScreenPageCompiler {
                 continue
             }
             if a.role == "AXHeading" {
-                let descendants = descendants(node).filter { child in
-                    child.attributes.role == "AXStaticText"
+                let descendants = try descendants(node).filter { child in
+                    try child.attributes.role == "AXStaticText"
                         && !ancestors(child.path).contains { controls[$0.path] != nil }
                         && !ancestors(child.path).prefix(while: { $0.path != node.path })
                             .contains { $0.attributes.role == "AXWebArea" }
                 }
                 let parts = descendants.compactMap { words[$0.path]?.value ?? words[$0.path]?.title }
-                if let heading = headingText(node) {
-                    let section = ancestors(node.path).compactMap { ancestor in
+                if let heading = try headingText(node) {
+                    let section = try ancestors(node.path).compactMap { ancestor in
                         sectionName(ancestor) ?? documentTitles[ancestor.path]
                     }.first
                     if !same(heading, section) { append("\n### " + heading, at: node.path, heading: true) }
@@ -821,15 +840,15 @@ public enum MacScreenPageCompiler {
                            same(text, heading) || same(parts.joined(separator: " "), heading) { consumed.insert(child.path) }
                     }
                     // Headings own every run used to name them, including aggregate aliases.
-                    consumed.formUnion(staticRuns(node).map(\.path))
+                    consumed.formUnion(try staticRuns(node).map(\.path))
                 }
                 continue
             }
             // Fold only status-shaped wrappers, never repeated prose or independently actionable equal captions.
-            if a.role == "AXGroup", let name = ownName(node), staticRuns(node).count <= 1,
+            if a.role == "AXGroup", let name = ownName(node), try staticRuns(node).count <= 1,
                !descendants(node).contains(where: { controls[$0.path] != nil || !["AXGroup", "AXImage", "AXStaticText"].contains($0.attributes.role) }),
                descendants(node).compactMap(ownName).allSatisfy({ same($0, name) }) {
-                let scope = ancestors(node.path).first { $0.attributes.role == "AXWebArea" || sectionName($0) != nil }?.path ?? []
+                let scope = try ancestors(node.path).first { $0.attributes.role == "AXWebArea" || sectionName($0) != nil }?.path ?? []
                 let identity: String
                 if let frame = node.attributes.frame, frame.w > 0, frame.h > 0 {
                     identity = [frame.x, frame.y, frame.w, frame.h].map { String($0) }.joined(separator: ",")
@@ -844,7 +863,7 @@ public enum MacScreenPageCompiler {
             guard !["AXListMarker", "AXSeparator", "AXSplitter"].contains(a.role),
                   !a.liveRegion, let text = own?.value ?? own?.title, readable(text), text != a.role else { continue }
             if captionPaths.values.contains(where: { $0.contains(node.path) }) { continue }
-            if same(text, windowTitle) || representedByControl(text, path: node.path) { continue }
+            if try same(text, windowTitle) || representedByControl(text, path: node.path) { continue }
             // Aggregate and leaf text within one subtree are one reading; equal sentences in separate paragraphs remain distinct.
             let leaves = subtree.filter { child in
                 guard (words[child.path]?.value ?? words[child.path]?.title) != nil else { return false }
@@ -860,7 +879,7 @@ public enum MacScreenPageCompiler {
                 // Keep complete paragraphs and styled runs together rather than repeating a leaf-text dump.
                 consumed.formUnion(subtree.map(\.path))
             }
-            let listItem = a.role == "AXListItem" || ancestors(node.path).contains { $0.attributes.role == "AXListItem" }
+            let listItem = try a.role == "AXListItem" || ancestors(node.path).contains { $0.attributes.role == "AXListItem" }
             append((listItem ? "- " : "") + text, at: node.path)
         }
         // State frame ownership once so every handle has an unambiguous source.

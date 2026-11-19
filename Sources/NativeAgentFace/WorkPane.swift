@@ -57,7 +57,13 @@ final class WorkPaneState {
         }
     }
 
-    private var transient = false
+    private var transient: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.transientKey) }
+        set {
+            guard transient != newValue else { return }
+            UserDefaults.standard.set(newValue, forKey: Self.transientKey)
+        }
+    }
 
     func snapshot(appModel: AppModel) -> WorkPaneSnapshot {
         let name: String

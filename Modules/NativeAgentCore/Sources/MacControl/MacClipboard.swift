@@ -28,12 +28,14 @@ public struct MacPasteboardType: Sendable, Equatable {
 public struct MacPasteboardContents: Sendable, Equatable {
     /// Keep raw text within the seam; every serialization must apply redaction before text leaves the process.
     public let text: String?
+    public let concealed: Bool
     public let types: [MacPasteboardType]
     /// Use NSPasteboard.changeCount to distinguish fresh reads without comparing or exposing content.
     public let changeCount: Int
 
-    public init(text: String?, types: [MacPasteboardType], changeCount: Int) {
+    public init(text: String?, concealed: Bool, types: [MacPasteboardType], changeCount: Int) {
         self.text = text
+        self.concealed = concealed
         self.types = types
         self.changeCount = changeCount
     }
@@ -52,8 +54,12 @@ public struct SystemMacPasteboardSource: MacPasteboardSource {
 
     public func read() -> MacPasteboardContents? {
         let board = NSPasteboard.general
-        let text = board.string(forType: .string)
-        let types = (board.types ?? []).map { type in
+        let boardTypes = board.types ?? []
+        let concealed = boardTypes.contains {
+            $0.rawValue == "org.nspasteboard.ConcealedType" || $0.rawValue == "org.nspasteboard.TransientType"
+        }
+        let text = concealed ? nil : board.string(forType: .string)
+        let types = boardTypes.map { type in
             MacPasteboardType(
                 identifier: type.rawValue,
                 bytes: type == .string ? text?.utf8.count : nil
@@ -61,6 +67,7 @@ public struct SystemMacPasteboardSource: MacPasteboardSource {
         }
         return MacPasteboardContents(
             text: text,
+            concealed: concealed,
             types: types,
             changeCount: board.changeCount
         )
@@ -117,13 +124,14 @@ public enum MacClipboardRead {
 
     /// Redact each line with its preceding label context before text leaves this boundary. Whole-blob entropy misses embedded secrets; retain redaction reasons
     /// so callers cannot mistake withheld text for a short clipboard and reread forever.
-    public static func redacted(_ raw: String) -> Redaction {
+    public static func redacted(_ raw: String, matchingLine: (String) -> String? = { $0 }) -> Redaction {
         var lines: [String] = []
         var flagged: [RedactedLine] = []
         var previousLine: String?
         for (index, line) in raw.components(separatedBy: "\n").enumerated() {
+            guard let match = matchingLine(line) else { lines.append(line); continue }
             let redacted = MacScreenViewTextRedaction.redactedLegendString(
-                line, valueChars: line.count, under: previousLine
+                match, valueChars: match.count, under: previousLine
             )
             var reason: String?
             if case .object(let details) = redacted,
@@ -132,10 +140,10 @@ public enum MacClipboardRead {
             } else if let label = previousLine?.trimmingCharacters(in: .whitespacesAndNewlines),
                       label.hasSuffix(":"),
                       MacScreenViewTextRedaction.looksLikeSecretLabel(label),
-                      !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                      !match.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 reason = "labeled_secret_nearby"
             }
-            previousLine = line
+            previousLine = match
             if let reason {
                 flagged.append(RedactedLine(line: index + 1, reason: reason))
                 lines.append("[redacted: \(reason)]")

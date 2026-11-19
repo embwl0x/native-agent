@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import MacControl
 import MacIntegration
-// Blueprint: | `ConnectorActionPlatform.swift` | `ConnectorActionPlatform` protocol; `spotlight`, `postMessage`, `statusEvidence`, `runGit` |
+// Blueprint: | `ConnectorActionPlatform.swift` | `ConnectorActionPlatform` protocol; `spotlight`, `postMessage`, `statusEvidence` |
 
 public struct ConnectorActionStatusEvidence: Sendable {
     public let connectorStatus: String?
@@ -23,5 +23,4 @@ public protocol ConnectorActionPlatform: Sendable {
     func postMessage(_ note: NativeAgentNotificationDefaults.Note, turn: Turn) async -> [String: JSONValue]
     func macAssistantStatusClient() -> any MacAssistantStatusClient
     func statusEvidence(actionID: String) async throws -> ConnectorActionStatusEvidence?
-    func runGit(_ arguments: [String], repoRoot: URL, timeout: TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)
 }

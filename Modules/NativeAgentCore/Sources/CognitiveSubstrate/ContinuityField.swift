@@ -422,18 +422,20 @@ struct ContinuityField: Sendable {
         associationTokensByKey.removeAll(keepingCapacity: false)
     }
 
-    mutating func associationEdges(at now: Date, configuration: CognitiveConfiguration) -> [CognitiveAssociationEdge] {
+    mutating func associationEdges(at now: Date, configuration: CognitiveConfiguration)
+        -> (edges: [CognitiveAssociationEdge], missingEndpointCount: Int) {
         applyDecay(at: now)
         enforceCapacity(configuration.maximumActiveNodes)
         var edges: [CognitiveAssociationEdge] = []
+        var missingEndpointCount = 0
         for fromKey in associationWeights.keys.sorted() {
-            guard let from = nodesByKey[fromKey] else { continue }
             for toKey in (associationWeights[fromKey] ?? [:]).keys.sorted() {
-                guard fromKey < toKey,
-                      let to = nodesByKey[toKey],
-                      let weight = associationWeights[fromKey]?[toKey] else {
+                guard fromKey < toKey else { continue }
+                guard let from = nodesByKey[fromKey], let to = nodesByKey[toKey] else {
+                    missingEndpointCount += 1
                     continue
                 }
+                guard let weight = associationWeights[fromKey]?[toKey] else { continue }
                 edges.append(CognitiveAssociationEdge(
                     fromNodeId: from.id,
                     toNodeId: to.id,
@@ -442,10 +444,10 @@ struct ContinuityField: Sendable {
                 ))
             }
         }
-        return edges.sorted {
+        return (edges.sorted {
             if $0.weight != $1.weight { return $0.weight > $1.weight }
             return $0.id < $1.id
-        }
+        }, missingEndpointCount)
     }
 
     private mutating func applyDecay(

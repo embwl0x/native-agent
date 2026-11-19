@@ -3,11 +3,8 @@ import ChatToolParsing
 import PersistenceCore
 import ChatSessionWork
 import Transcripts
-// Blueprint: | `AgentScreenRooms+Life.swift` | `workspace-readout.js`, `lifeRoom`, `lifePulse`, `opening`, `AgentItemPages`: exact control/readback evidence |
-// workspace-readout.js owns playback copy and curation; native readers retain exact identity, failures and the original control receipt.
-// AgentItemPages retains text only, never read-side peer lists.
+// Blueprint: | `AgentScreenRooms+Life.swift` | `workspace-readout.js`, `lifeRoom`, `opening`, `AgentItemPages`: named owner actions and readback |
 
-/// Opening a life room runs its canonical owner read on demand; Home never runs it.
 enum AgentWorkspaceLife {
     static let destinations: [AgentWorkspaceDestination] = [
         .init(id: "music", title: "Music", summary: "What's playing, playback, playlists and the library.", tool: "music.now_playing"),
@@ -17,7 +14,6 @@ enum AgentWorkspaceLife {
         "music.now_playing", "music.search", "music.playlists", "music.library",
     ]
 
-    /// Keep detail reads in their full frame so room rendering cannot clip their content.
     static func room(for tool: String) -> String? {
         if tool == "mac_reminders_read" { return nil }
         if tool.hasPrefix("mac_calendar_") { return "calendar" }
@@ -44,7 +40,6 @@ enum AgentWorkspaceLife {
             let track = playback?["track"]
             let explicitTrack = track == .null || text(track?.objectValue?["name"]) != nil
             if let failure = playback.flatMap(problem) {
-                // The read failed; the original control receipt still owns its separate DONE line in lifeRoom.
                 native["status"] = .string("failed")
                 native["message"] = .string("Couldn't read what's playing: " + failure)
                 native["source"] = result
@@ -82,7 +77,6 @@ enum AgentWorkspaceLife {
             "result":result,"failed":.bool(failed)]),dataRoot:dataRoot,items:items,actions:actions,native:native)
     }
 
-    /// Retain the actual failure reason when a life-room operation cannot complete.
     static func problem(_ row: [String: JSONValue]) -> String? {
         let reply = ToolResult(.object(row))
         guard !reply.hasReadEvidence() else { return nil }
@@ -111,7 +105,6 @@ enum AgentWorkspaceLife {
 }
 
 extension AgentScreen {
-    /// Retain a dated read badge without changing the owner receipt.
     package static func notedLifeRead(_ name: String, _ result: JSONValue, dataRoot: URL) -> JSONValue {
         let row = AgentWorkspaceLife.object(result)
         guard row["status"] == .string("completed"), case .int(let count)? = row["count"] else { return result }
@@ -127,7 +120,6 @@ extension AgentScreen {
         return result
     }
 
-    /// Show a change's result beside its room read; leave unmatched frames to the caller.
     static func lifeRoom(workspace: WorkspaceOperation, _ place: AgentWorkspaceLocation, projection: WorkspacePage, status: JSONValue, dataRoot: URL,
         scope: String) async -> String? {
         let tool: String, receipt: JSONValue?
@@ -146,7 +138,6 @@ extension AgentScreen {
         default: return nil
         }
         guard let room = AgentWorkspaceLife.room(for: tool) else { return nil }
-        // A calendar or reminder change keeps its receipt frame unless its list was read back (the record carries the receipt).
         if case .receipt = place, tool.hasPrefix("mac_") { return nil }
         let readStatus = tool == "music.control" ? (AgentWorkspaceLife.object(shown.content)["status"] ?? status) : status
         var lines = textRoom(workspace: workspace, room, place: place, projection: shown, status: readStatus, dataRoot: dataRoot, scope: scope).components(
@@ -178,26 +169,19 @@ extension AgentScreen {
         }
         return lines.joined(separator: "\n")
     }
-
-    /// Expire calendar and reminder badges each day.
-    static func lifePulse(_ name: String, dataRoot: URL, now: Date = Date()) -> String {
-        guard let seen = AgentReadBadges.shared.latest(name, dataRoot: dataRoot), Calendar.current.isDate(seen.at, inSameDayAs: now) else { return name }
-        return name + ": " + seen.words + " · " + age(now.timeIntervalSince(seen.at))
-    }
 }
 
 extension AgentScreen {
-    /// Distinguish navigation from effects so opening a place cannot replay a write.
     static func opening(_ action: AgentWorkspaceAction) -> Bool {
         switch action {
-        case .open, .window, .configure, .openArrival: return true
+        case .open(.record("app", let input, _)) where input["find"] != nil: return false
+        case .open, .openArrival: return true
         case .perform(_, _, _, _, let isEffect): return !isEffect
         default: return false
         }
     }
 }
 
-/// An actionable row name opens its verbs before acting; retain those bindings only for the room cache's lifetime.
 final class AgentItemPages: @unchecked Sendable {
     static let shared = AgentItemPages()
     struct Page: Sendable { let text: String; let speech: [ContactThread.Line] }

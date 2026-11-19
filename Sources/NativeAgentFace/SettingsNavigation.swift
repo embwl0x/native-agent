@@ -29,8 +29,6 @@ struct ShellPageFrame<Content: View>: View {
     let title: String
     /// A nil page sentence leaves the title alone.
     var subtitle: String?
-    /// Wide pages need the full column for two-column controls.
-    var wide: Bool = false
     var alive: Bool = false
     @ViewBuilder var content: Content
 
@@ -61,12 +59,10 @@ struct ShellPageFrame<Content: View>: View {
                 // Fade scrolled rows over the header gap to avoid a hard clipped edge.
                 .aliveTopDissolve(alive ? 20 : 0)
                 .pageScrollColumn()
-                // Nested pages own their actions; do not duplicate them here.
-                .environment(\.shellTabRowHostsActions, false)
         }
         .padding(.horizontal, NativeAgentSpacing.pageInset)
         .padding(.top, alive ? TodayMetrics.topPadding : 20)
-        .frame(maxWidth: wide ? .infinity : TodayMetrics.contentWidth, alignment: .leading)
+        .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // Lists and Forms paint opaque backgrounds by default; expose the shared room.
         .scrollContentBackground(.hidden)

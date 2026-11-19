@@ -117,7 +117,7 @@ public struct ApprovalExecution: Sendable {
         )
         let decisionEnum: ApprovalDecision
         switch decision {
-        case "approve", "approved": decisionEnum = .approved
+        case "approve", "approved", "approve_task": decisionEnum = .approved
         case "deny", "denied", "reject", "rejected": decisionEnum = .denied
         case "cancel", "canceled": decisionEnum = .canceled
         default:
@@ -139,7 +139,7 @@ public struct ApprovalExecution: Sendable {
             _ = try StudioCanonProposal.draft(of: existing)
         }
         do {
-            rec = try await inbox.resolve(id, decision: decisionEnum, provenance: provenance)
+            rec = try await inbox.resolve(id, decision: decisionEnum, provenance: provenance, scope: decision == "approve_task" ? "task" : nil)
         } catch let error as ApprovalInboxError {
             // The inbox checked the caller's authority before reporting a terminal decision. A matching re-tap may settle its retained result, but must never
             // enter an executor after that result clears.

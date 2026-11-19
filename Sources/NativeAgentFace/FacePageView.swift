@@ -2,107 +2,13 @@ import AppKit
 import Foundation
 import NativeAgentShared
 import SwiftUI
-// Blueprint: | `FacePageView.swift` | Page slots, answering doors, document demands and diagnostics; MacFaceLinks owns destinations |
-
-enum FacePageDiagnostics {
-    private static let log = TranscriptDiagnostics(fileName: "FacePage.log")
-    @MainActor private static var opening: (page: String, uptime: TimeInterval)?
-    static func releaseFailure(page: String, cause: String) {
-        log.append { "page.release.failed page=" + page + " cause=" + cause }
-    }
-
-    static func acting(page: String, submission: FaceActSubmission, outcome: FaceActOutcome? = nil) {
-        log.append {
-            let identity = " operation=\(submission.id.uuidString) page=\(page) checking=\(submission.checking)"
-            guard let outcome else { return "page.act.begin" + identity }
-            return "page.act.end" + identity + " accepted=\(outcome.accepted) effects=\(outcome.effects.rawValue)"
-                + " failure=\(outcome.failure?.code ?? "none")"
-        }
-    }
-
-    @MainActor static func selected(page: String?) {
-        opening = page.map { ($0, ProcessInfo.processInfo.systemUptime) }
-    }
-
-    @MainActor static func opened(page: String) {
-        guard let start = opening, start.page == page else { return }
-        opening = nil
-        let elapsed = (ProcessInfo.processInfo.systemUptime - start.uptime) * 1_000
-        log.append { String(format: "page.open page=%@ elapsed_ms=%.3f", page, elapsed) }
-    }
-
-    static func arrival(page: String, snapshot: PartFaceSnapshot, elapsed: TimeInterval) {
-        log.append {
-            // Decoded feed values have no per-page wire length; count displayed UTF-8 text off main instead.
-            func bytes(_ text: String?) -> Int { text.map { $0.utf8.count } ?? 0 }
-            var count = bytes(snapshot.face?.title) + bytes(snapshot.face?.line) + bytes(snapshot.error?.message)
-            let sections = (snapshot.face?.sections ?? []) + (snapshot.levers ?? []) + (snapshot.keyLevers ?? [])
-            for section in sections {
-                count += bytes(section.title) + bytes(section.footer)
-                if let block = section.block {
-                    if block.kind == "form", block.protected != true, block.fields?.contains(where: { $0.kind == "secret" }) != true {
-                        for field in block.fields ?? [] {
-                            count += bytes(field.label) + bytes(field.placeholder)
-                            if case .string(let text)? = field.value { count += bytes(text) }
-                            for option in field.options ?? [] { count += bytes(option.label) }
-                        }
-                        for action in block.submit ?? [] { count += bytes(action.label) }
-                    } else { count += bytes(block.kind == "document" ? block.text : PartFace.Block.updateNote) }
-                    continue
-                }
-                for row in section.rows {
-                    count += bytes(row.title) + bytes(row.detail) + bytes(row.value)
-                    for action in row.actions ?? [] { count += bytes(action.label) }
-                    if let control = row.control {
-                        count += bytes(control.text) + bytes(control.placeholder) + bytes(control.confirm)
-                        for option in control.options ?? [] { count += bytes(option.label) }
-                    }
-                }
-            }
-            return String(format: "page.arrival page=%@ bytes=%ld elapsed_ms=%.3f bytes_kind=display_text_utf8",
-                          page, count, elapsed * 1_000)
-        }
-    }
-}
-
-/// The one window page host ends its open measurement on the first native draw with content. It reads the page here, so a page's
-/// arrival redraws this and not the shell around it.
-struct FacePagePaintHost: View {
-    let page: String?
-    @Environment(AppModel.self) private var appModel
-
-    var body: some View {
-        FacePagePaint(page: page, hasContent: appModel.settingsViewModeIssue == nil
-            && page.map { appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self) != nil } == true)
-    }
-}
-
-private struct FacePagePaint: NSViewRepresentable {
-    let page: String?
-    let hasContent: Bool
-
-    func makeNSView(context: Context) -> PaintView { PaintView() }
-    func updateNSView(_ view: PaintView, context: Context) {
-        view.page = page
-        view.hasContent = hasContent
-        view.needsDisplay = true
-    }
-
-    final class PaintView: NSView {
-        var page: String?
-        var hasContent = false
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
-        override func draw(_ dirtyRect: NSRect) {
-            super.draw(dirtyRect)
-            guard window != nil, !isHiddenOrHasHiddenAncestor, !bounds.isEmpty, hasContent, let page else { return }
-            FacePageDiagnostics.opened(page: page)
-        }
-    }
-}
+// Blueprint: | `FacePageView.swift` | Page slots, answering doors and document demands; MacFaceLinks owns destinations |
 
 /// Every faced page draws the same description; navigation and owner answers are the Mac's only adapters.
 struct FacePageView: View {
+    static let standaloneInset: CGFloat = 20
     let page: String
+    var only: String? = nil
     /// A tab inside a rail page: the rail already shows the page's title and line, so the face's header and top space are not drawn twice.
     var asTab = false
     var isReading = false
@@ -137,11 +43,23 @@ struct FacePageView: View {
     }
 
     var body: some View {
-        content.authoredSecretEntry(page: page).modifier(FaceObservation(demand: .key(.page(page))))
+        content.authoredSecretEntry(page: page).modifier(FaceObservation(demand: .key(.page(page)))).environment(\.boardPage, page)
     }
 
     @ViewBuilder private var content: some View {
-        if let snapshot, let face = snapshot.drawnFace, face.detail != nil || face.sections.contains(where: { $0.more != nil }) {
+        if let only {
+            VStack(alignment: .leading, spacing: 0) {
+                if let face = snapshot?.drawnFace {
+                    FaceView(face: PartFace(sections: face.sections.filter { $0.id == only }),
+                             door: door, session: session, leaf: { Self.leaf($0) })
+                } else {
+                    Text(snapshot?.error?.message ?? pageIssue ?? "Waiting on the table's reading.").foregroundStyle(.secondary)
+                }
+            }
+            .environment(\.boardFillsWindow, true)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(Self.standaloneInset)
+        } else if let snapshot, let face = snapshot.drawnFace, face.detail != nil || face.sections.contains(where: { $0.more != nil }) {
             collection(snapshot, face: face)
         } else { scrollingContent }
     }
@@ -233,7 +151,10 @@ struct FacePageView: View {
         guard let piece = piece(block) else {
             return AnyView(Text(block.alt ?? PartFace.Block.updateNote).foregroundStyle(.secondary))
         }
-        if block.leaf == BoardDocument.type { return AnyView(PageMakeBoard(reference: piece.reference, version: piece.version)) }
+        if block.leaf == BoardDocument.type {
+            return AnyView(PageMakeBoard(reference: piece.reference, version: piece.version, cards: block.cards ?? [:], choices: block.choices ?? [])
+                .id(piece.reference))
+        }
         return AnyView(PageMakePreview(reference: piece.reference, version: piece.version))
     }
 
@@ -300,9 +221,8 @@ extension AppModel {
             do {
                 try FaceWindowReply.check(await client.act(.requestDocument(.init(id: request.id, subject: .pageItem(page: page, item: request.key),
                                                                                  pageRead: request, release: true))))
-            } catch { FacePageDiagnostics.releaseFailure(page: page, cause: error.localizedDescription) }
+            } catch { self.setFailureStatus(error, action: "release the page") }
         }, scope: { item in self.pageDoor(page: page + "/" + item, open: open) }, perform: { submission in
-            FacePageDiagnostics.acting(page: page, submission: submission)
             let outcome: FaceActOutcome
             do {
                 outcome = try FaceActOutcome.reply(await client.pageAct(.init(
@@ -311,7 +231,6 @@ extension AppModel {
                     expectedRevision: submission.formRevision, expectedCall: submission.expectedCall, answers: true,
                     operation: submission.id, undoOf: submission.undoOf, checking: submission.checking), id: submission.id))
             } catch { outcome = .interrupted(error) }
-            FacePageDiagnostics.acting(page: page, submission: submission, outcome: outcome)
             return outcome
         })
     }

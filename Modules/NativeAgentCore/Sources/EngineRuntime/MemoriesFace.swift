@@ -24,12 +24,9 @@ extension NativeAgentEngine {
         do { kept = try await memory.refreshMemories().filter { permitsMemory($0, surface: surface) } }
         catch is CancellationError { throw CancellationError() }
         catch { facts["kept"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)]) }
-        await memory.refreshSearch()
+        await memory.refreshSearch(surface: surface)
         try Task.checkCancellation()
-        let search = await MainActor.run {
-            (query: memory.searchQuery, results: memory.searchResults, error: memory.searchError,
-             loading: memory.searchIsLoading, resultQuery: memory.searchResultQuery)
-        }
+        let search = await memory.searchSnapshot(surface: surface)
         let query = search.query
         var found: [MemoryV2.MemoryRecord]?
         var searchFailure: String?
@@ -193,7 +190,7 @@ extension NativeAgentEngine {
 
     /// The Memories page's search (`memories.search`): three letters or more, or empty to show every memory (the lookups); the search is
     /// the effect.
-    @MainActor func memoriesSearch(_ input: [String: JSONValue]) throws -> HostVerbEffect {
+    @MainActor func memoriesSearch(_ input: [String: JSONValue], surface: String?) throws -> HostVerbEffect {
         guard case .string(let raw)? = input["value"] else {
             throw PartCallError(code: "invalid_value", message: "Search takes value: the words to search for, or empty; nothing was searched.")
         }
@@ -202,7 +199,7 @@ extension NativeAgentEngine {
             throw PartCallError(code: "short_query", message: "Search needs at least three letters; nothing was searched.")
         }
         return { [self] in
-            await memory.search(query: words)
+            await memory.search(query: words, surface: surface)
             return words.isEmpty ? "Memories shows every memory." : "Memories searched for \u{201C}\(words)\u{201D}."
         }
     }

@@ -156,6 +156,7 @@ public actor AgentDiscoverySession {
                             dataRoot: URL) async -> [AgentDiscoveryCandidate] {
         if !refresh { return cached ?? [] }
         guard observing, !Task.isCancelled else { return cached ?? [] }
+        watchInstalls(dataRoot: dataRoot)
         AgentHostRow.installationsChanged()
         // Spotlight must not delay recipe, program or card discovery.
         return await discover(MacAppIndex.shared.readyApps() ?? [], probe: probe, launch: launch, dataRoot: dataRoot)
@@ -215,7 +216,8 @@ public actor AgentDiscoverySession {
         return await task.value
     }
 
-    /// Each whole installed bundle version is one world happening and the parts' `app.installed` signal; the first scan establishes a silent baseline.
+    /// Each whole installed bundle version except this app's is one world happening and the parts' `app.installed` signal.
+    /// The first scan establishes a silent baseline.
     private func arrived(_ bundles: [AgentPeerDiscovery.Bundle], dataRoot: URL) {
         let url = dataRoot.appendingPathComponent("agents/installed-apps.json")
         let baseline = FileManager.default.fileExists(atPath: url.path)
@@ -228,6 +230,7 @@ public actor AgentDiscoverySession {
             if let sdef = info["OSAScriptingDefinition"] as? String,
                !FileManager.default.fileExists(atPath: app.url.appendingPathComponent("Contents/Resources/" + sdef).path) { continue }
             guard seen.insert(id + " " + app.version).inserted, baseline else { continue }
+            guard id != Bundle.main.bundleIdentifier else { continue }
             if case .object(let payload) = app.json { AbilityStore(dataRoot: dataRoot).signal("app.installed", payload) }
             Attention.post(Happening(.world, subject: "app:" + id, door: "mac:installed",
                 words: app.name + " " + app.version + " arrived on this Mac" + (app.scriptable == true ? "; it can be scripted." : "."),
@@ -249,11 +252,16 @@ public actor AgentDiscoverySession {
             do {
                 for await _ in try await MacAppIndex.shared.changes(context: MacOperationContext(dataRoot: dataRoot)) {
                     guard self.generation == generation, !Task.isCancelled else { return }
-                    let bundles = try await AgentPeerDiscovery.bundles()
-                    guard self.generation == generation, !Task.isCancelled else { return }
-                    indexFailed(nil)
-                    arrived(bundles, dataRoot: dataRoot)
-                    await scheduleInstallationsChanged(dataRoot: dataRoot)
+                    do {
+                        let bundles = try await AgentPeerDiscovery.bundles()
+                        guard self.generation == generation, !Task.isCancelled else { return }
+                        indexFailed(nil)
+                        arrived(bundles, dataRoot: dataRoot)
+                        await scheduleInstallationsChanged(dataRoot: dataRoot)
+                    } catch {
+                        guard self.generation == generation, !Task.isCancelled else { return }
+                        indexFailed(error)
+                    }
                 }
             } catch {
                 guard self.generation == generation, !Task.isCancelled else { return }
@@ -326,11 +334,6 @@ public actor AgentDiscoverySession {
             // Without a checked contact list, absence cannot establish an unconnected host.
             let peers = try AgentPeerStore(dataRoot: dataRoot).list()
             var hosts = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
-            // Remint only definitely missing settings-host keys; unreadable Keychain evidence cannot prove absence.
-            let unkeyed = Set(peers.filter { peer in
-                peer.transport == .mcpHost && peer.hostWorkspace == nil
-                    && (peer.credentialKey == nil || (try? AgentPeerCredentials.read(peerID: peer.id)) == .some(nil))
-            }.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
             guard var offers = AgentDiscoveryOffer.read(dataRoot) else {
                 throw AgentHostConfigWriter.Failure.unreadable("discovery decisions at \(AgentDiscoveryOffer.url(dataRoot).path)")
             }
@@ -340,11 +343,21 @@ public actor AgentDiscoverySession {
                 let row = AgentHostDirectory.rows.first { $0.id == candidate.hostID }
                 // Workspace rows need an explicitly selected folder; offer only recipes that connecting can actually find.
                 guard row?.requiresWorkspace != true, candidate.connectable else { continue }
+                let unkeyed: Bool
+                do {
+                    if let peer = peers.first(where: { $0.transport == .mcpHost && $0.hostWorkspace == nil
+                        && AgentPeerStore.hostRowID($0.endpoint) == candidate.hostID }) {
+                        unkeyed = try peer.credentialKey == nil || AgentPeerCredentials.read(peerID: peer.id) == nil
+                    } else { unkeyed = false }
+                } catch {
+                    setupFailed("Contact credential read failed: " + error.localizedDescription, for: [candidate], dataRoot: dataRoot)
+                    continue
+                }
                 var entry = offers[candidate.id] ?? AgentDiscoveryOffer(name: candidate.name)
                 // Do not recover a saved contact while its owning repair has just failed.
                 var repairFailed = false
                 if let row, row.settingsSupported, row.acp == nil, row.format != .sessionMCP, entry.declinedAt == nil,
-                   unkeyed.contains(row.id) || (!hosts.contains(row.id) && entry.connectedAt == nil) {
+                   unkeyed || (!hosts.contains(row.id) && entry.connectedAt == nil) {
                     do {
                         let store = AgentPeerStore(dataRoot: dataRoot)
                         let proposal = try AgentHostConnection.propose(name: row.id, store: store, dataRoot: dataRoot)

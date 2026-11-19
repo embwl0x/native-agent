@@ -71,11 +71,11 @@ struct StudioContext: ContextCompiledProjectionProvider, Sendable {
         let owned = Set(generation.sources.lazy.filter { $0.descriptor.owner == Self.owner }.map(\.descriptor.id))
         let atoms = chosen.filter { owned.contains($0.draft.sourceID) }
         guard !atoms.isEmpty else { return ContextTurnExclusion() }
+        let selectedSources = Set(atoms.map(\.draft.sourceID))
         do {
-            let read = try await readPrepared(knownSourceIDs: owned)
+            let read = try await readPrepared(knownSourceIDs: selectedSources, sourceIDs: selectedSources)
             let hashes = Dictionary(read.prepared.map { ($0.descriptor.id, $0.sourceHash) },
                                     uniquingKeysWith: { first, _ in first })
-            let selectedSources = Set(atoms.map(\.draft.sourceID))
             return ContextTurnExclusion(atomIDs: Set(atoms.filter {
                 !Self.surfaces.contains(surface) || hashes[$0.draft.sourceID] != $0.draft.sourceHash
             }.map(\.draft.id)), unverified: read.unavailable.compactMap { id, reason in
@@ -88,7 +88,7 @@ struct StudioContext: ContextCompiledProjectionProvider, Sendable {
         }
     }
 
-    private func readPrepared(knownSourceIDs: Set<ContextSourceID>) async throws
+    private func readPrepared(knownSourceIDs: Set<ContextSourceID>, sourceIDs: Set<ContextSourceID>? = nil) async throws
         -> (prepared: [ContextCompiledSource], unavailable: [ContextSourceID: String]) {
         var prepared: [ContextCompiledSource] = []
         var unavailable: [ContextSourceID: String] = [:]
@@ -98,22 +98,28 @@ struct StudioContext: ContextCompiledProjectionProvider, Sendable {
             let failedIDs: Set<ContextSourceID> = ids.isEmpty ? [ContextStableID.source(owner: Self.owner, locator: "studio/" + name)] : ids
             for id in failedIDs { unavailable[id] = reason }
         }
-        do {
-            if let pointer = Self.prepareShelfPointer(try shelf.selections()) { prepared.append(pointer) }
-        } catch is CancellationError { throw CancellationError() }
-        catch { failed([Self.shelfSourceID], "shelf", error) }
-        do {
-            let journal = Self.prepare(try await store.journalEntriesIncludingArchive())
-            prepared += journal.sources
-            unavailable.merge(journal.failures, uniquingKeysWith: { _, current in current })
-        } catch is CancellationError { throw CancellationError() }
-        catch { failed(knownSourceIDs.subtracting([Self.shelfSourceID, Self.canonSourceID]), "journal", error) }
-        do {
-            let canon = StudioCanonLaw.membership(from: try await store.readCanon())
-                .values.sorted { $0.workTitle < $1.workTitle }
-            if let pointer = try Self.prepareCanon(canon) { prepared.append(pointer) }
-        } catch is CancellationError { throw CancellationError() }
-        catch { failed([Self.canonSourceID], "canon", error) }
+        if sourceIDs?.contains(Self.shelfSourceID) != false {
+            do {
+                if let pointer = Self.prepareShelfPointer(try shelf.selections()) { prepared.append(pointer) }
+            } catch is CancellationError { throw CancellationError() }
+            catch { failed([Self.shelfSourceID], "shelf", error) }
+        }
+        if sourceIDs?.subtracting([Self.shelfSourceID, Self.canonSourceID]).isEmpty != true {
+            do {
+                let journal = Self.prepare(try await store.journalEntriesIncludingArchive(), sourceIDs: sourceIDs)
+                prepared += journal.sources
+                unavailable.merge(journal.failures, uniquingKeysWith: { _, current in current })
+            } catch is CancellationError { throw CancellationError() }
+            catch { failed(knownSourceIDs.subtracting([Self.shelfSourceID, Self.canonSourceID]), "journal", error) }
+        }
+        if sourceIDs?.contains(Self.canonSourceID) != false {
+            do {
+                let canon = StudioCanonLaw.membership(from: try await store.readCanon())
+                    .values.sorted { $0.workTitle < $1.workTitle }
+                if let pointer = try Self.prepareCanon(canon) { prepared.append(pointer) }
+            } catch is CancellationError { throw CancellationError() }
+            catch { failed([Self.canonSourceID], "canon", error) }
+        }
         return (prepared, unavailable)
     }
 }
@@ -144,7 +150,7 @@ extension StudioContext {
 
     /// Group entries by work so maximumAtomsPerSource prevents one revisited work consuming the studio budget.
     static func prepare(
-        _ entries: [StudioJournalEntry]
+        _ entries: [StudioJournalEntry], sourceIDs: Set<ContextSourceID>? = nil
     ) -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
         let usable = entries.filter { entry in
             let body = self.body(entry)
@@ -172,6 +178,7 @@ extension StudioContext {
             let locatorDigest = ContextStableID.digest(parts: [key])
             let locator = "studio/journal/works/\(locatorDigest)"
             let sourceID = ContextStableID.source(owner: owner, locator: locator)
+            guard sourceIDs?.contains(sourceID) != false else { continue }
             let sourceHash = ContextStableID.digest(parts: [schemaVersion] + ordered.map {
                 [self.body($0), $0.id, $0.recordedAt, $0.stance.kind.rawValue,
                  $0.amendments.map(\.id).joined(separator: ",")]

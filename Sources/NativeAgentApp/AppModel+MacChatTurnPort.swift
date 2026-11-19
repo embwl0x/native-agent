@@ -87,12 +87,6 @@ extension AppModel: MacChatTurnPresentationPort {
         switch event {
         case .status(let message):
             statusText = message
-        case .activity(let activity):
-            // Keep tool results in the existing notice/toast contract so they do not add duplicate chatter.
-            guard case .notice(let kind) = activity.source,
-                  let text = activity.userVisibleNoticeText, !text.isEmpty else { return }
-            NotificationCenter.default.post(name: .nativeAgentTurnNotice, object: nil,
-                userInfo: ["kind": kind, "text": text, "sessionId": activity.identity.sessionId])
         }
     }
 

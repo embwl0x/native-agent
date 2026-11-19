@@ -26,7 +26,8 @@ extension Parts {
         }
         try await checkDependencies(candidate, invocation: invocation)
         let key = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
-        let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), abilityID: candidate.id, dataRoot: root)
+        let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), abilityID: candidate.id, dataRoot: root,
+            readPaths: Self.strings(Self.fields(Self.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([])))
         let host = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: invocation.openScreenWatch, admission: {})
         let face = Self.fields(Self.fields(candidate.manifest)["face"] ?? .null)["projection"] == .bool(true)
         let schema = face ? Self.faceNeeds(candidate.program.schema) : candidate.program.schema
@@ -223,7 +224,8 @@ struct ToolHost: OwnedProgramHostProfile {
         if let refused = readRefusal(operation, arguments) { return refused }
         do {
             if OwnedProgramRunner.hostFilePrimitives.contains(operation) {
-                _ = try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths, permissions: candidate.program.permissions)
+                _ = try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths,
+                    permissions: candidate.program.permissions, dataRoot: dataRoot)
             } else if operation == "part.call" {
                 _ = try partRequest(arguments)
             } else if operation == "apps.call" {
@@ -336,10 +338,14 @@ struct ToolHost: OwnedProgramHostProfile {
                 try await AppleScriptExecution().callApp(arguments, targets: appTargets, context: execution.macOperation(dataRoot: dataRoot))
             } else if operation == "files.query" {
                 try PartFileReads.query(try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths,
-                    permissions: candidate.program.permissions), Parts.fields(arguments))
+                    permissions: candidate.program.permissions, dataRoot: dataRoot), Parts.fields(arguments))
             } else if operation == "files.mime" {
                 try PartFileReads.mime(try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths,
-                    permissions: candidate.program.permissions), Parts.fields(arguments))
+                    permissions: candidate.program.permissions, dataRoot: dataRoot), Parts.fields(arguments), readPaths: readPaths,
+                    permissions: candidate.program.permissions, dataRoot: dataRoot)
+            } else if operation == "files.names" {
+                try PartFileReads.names(try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths,
+                    permissions: candidate.program.permissions, dataRoot: dataRoot), Parts.fields(arguments))
             } else { try await broker.perform(operation, arguments: arguments, host: base, profile: self, execution: execution,
                 openScreenWatch: openScreenWatch) }
             // The thought's envelope already carries its nested tool effects.

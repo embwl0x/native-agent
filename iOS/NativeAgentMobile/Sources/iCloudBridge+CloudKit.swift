@@ -232,8 +232,9 @@ extension iCloudBridge {
                     guard pairing == self.pairingStore?.iCloudPairingSecret else { continue }
                     if case .failure(.account(let failure), _) = result { self.recordAccountFailure(failure) }
                     self.clearAccountFailureAfterSuccessfulDrain(result, accountGeneration: accountGeneration, source: "foreground")
+                    let wait = switch result { case .failure: NAPhoneForegroundPresence.beat; default: NAPhoneForegroundPresence.receiveInterval }
                     if case .success = result { self.onTransportSucceeded?() }
-                    do { try await Task.sleep(for: .seconds(NAPhoneForegroundPresence.receiveInterval)) }
+                    do { try await Task.sleep(for: .seconds(wait)) }
                     catch { return }
                 }
             }

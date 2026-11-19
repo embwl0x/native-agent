@@ -10,41 +10,6 @@ import TurnTrace
 import NativeAgentShared
 // Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime`: checked admission, joined lifecycle, health events, drain and provenance |
 
-private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
-    let memory: SwiftNativeMemoryV2
-    let modelFingerprint: String
-
-    func embed(_ texts: [String]) async throws -> [[Float]] {
-        let batch = try await memory.embedForDerivedContextWithEpoch(texts)
-        guard batch.epoch.rawValue == modelFingerprint else {
-            throw MemoryV2Error.underlying("Context embedding provider epoch changed during compilation")
-        }
-        return batch.vectors
-    }
-}
-
-private struct NativeContextMarkdownCompiler: ContextMarkdownCompiling {
-    let memory: SwiftNativeMemoryV2
-
-    func compile(
-        sourceData: Data,
-        descriptor: ContextSourceDescriptor,
-        previous: ContextCompiledSource?,
-        updatedAt: Date
-    ) async throws -> ContextCompiledSource {
-        guard let fingerprint = await memory.embeddingEpoch()?.rawValue else {
-            throw MemoryV2Error.storageUnavailable
-        }
-        let provider = NativeContextEmbeddingProvider(memory: memory, modelFingerprint: fingerprint)
-        return try await ContextMarkdownCompiler(embeddingProvider: provider).compile(
-            sourceData: sourceData,
-            descriptor: descriptor,
-            previous: previous,
-            updatedAt: updatedAt
-        )
-    }
-}
-
 public actor NativeContextFlowRuntime: ContextTurnPreparing {
     let dataRoot: URL
     private let healthEvents = ContextHealthEvents()
@@ -123,11 +88,11 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 return
             }
             let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-            guard await memory.embeddingEpoch() != nil else {
+            guard try await memory.embeddingEpoch() != nil else {
                 throw MemoryV2Error.storageUnavailable
             }
             let store = try ContextSQLiteStore(dataRoot: dataRoot)
-            let arena = try ContextArena(budget: configuration.budget, healthEvents: healthEvents)
+            let arena = ContextArena(healthEvents: healthEvents)
             let registry = try ContextSourceRegistry(healthEvents: healthEvents)
             let provider = PersonaContextFlowProvider(dataRoot: dataRoot)
             let coordinator = ContextPreparation(
@@ -135,7 +100,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                 store: store,
                 arena: arena,
                 registry: registry,
-                compiler: NativeContextMarkdownCompiler(memory: memory),
                 mirrorProvider: provider,
                 compiledProjectionProviders: [MemoryContext(
                     memory: memory,
@@ -158,11 +122,10 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             await coordinator.start()
             let health = await coordinator.health()
             nativeLog(
-                "[context-flow] started mode=%@ generation=%lld sources=%d arena_bytes=%d",
+                "[context-flow] started mode=%@ generation=%lld sources=%d",
                 configuration.mode.rawValue,
                 health.activeArenaGenerationID ?? 0,
-                health.registeredSourceCount,
-                health.arenaMetrics.currentLogicalBytes
+                health.registeredSourceCount
             )
         } catch {
             if usesLiveAppBody {

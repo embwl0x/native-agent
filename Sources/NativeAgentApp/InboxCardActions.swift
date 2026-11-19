@@ -78,11 +78,12 @@ struct AppInboxCardActionEffects: InboxCardActionEffects {
         NotificationCenter.default.post(name: .openCommandRouteRequest, object: "desk")
     }
 
-    @MainActor func openChatDraft(_ draft: String) async {
-        NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
+    @MainActor func openChatDraft(_: String) async throws {
+        throw FaceWireError.disconnected
     }
 
-    @MainActor func openSpokenChat(_ sessionID: String) async {
-        NotificationCenter.default.post(name: .openSpokenChatRequest, object: sessionID)
+    @MainActor func openSpokenChat(_ sessionID: String) async throws {
+        guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
+        try await BodyFacePresentation.current(model: model).present(.openConversation(session: sessionID, message: nil))
     }
 }

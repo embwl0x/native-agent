@@ -94,7 +94,6 @@ public enum REMTombstoneStoreError: Error, LocalizedError, Equatable, Sendable {
 
 public actor REMTombstoneStore {
     private let path: URL
-    private let fm = FileManager.default
 
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         let dir = dataRoot.appendingPathComponent("body", isDirectory: true)
@@ -103,16 +102,12 @@ public actor REMTombstoneStore {
 
     /// Only missing storage means no tombstones; unreadable rejection authority remains unavailable.
     public func loadAll() throws -> [String: REMTombstoneRecord] {
-        guard fm.fileExists(atPath: path.path) else { return [:] }
         let data: Data
         do {
             data = try Data(contentsOf: path)
+        } catch CocoaError.fileReadNoSuchFile {
+            return [:]
         } catch {
-            let nsError = error as NSError
-            if nsError.domain == NSCocoaErrorDomain,
-               nsError.code == CocoaError.Code.fileNoSuchFile.rawValue {
-                return [:]
-            }
             throw REMTombstoneStoreError.unreadable(path: path.path)
         }
         do { return try JSONDecoder().decode([String: REMTombstoneRecord].self, from: data) }

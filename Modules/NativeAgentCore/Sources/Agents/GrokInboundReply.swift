@@ -28,29 +28,29 @@ public struct GrokInboundReply: Sendable {
         let answered = try store.claimReply(reply, peer: principal.id)
         let peer = AgentBridgePrincipal(id: principal.id, peerID: principal.id, elevated: contact.elevationAllowed, displayName: contact.name)
         try reconcile(answered, dataRoot: dataRoot)
+        // A correlated reply proves the original outbound message reached this run.
+        AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: answered.peerID, inbound: true)
+        AgentPeerStore(dataRoot: dataRoot).recordRoundTrip(peerID: answered.peerID, workspace: "Grok Bot conversation")
         // Person-requested replies settle in their thread without an agent turn.
         if answered.handOver == "pending" { handOver(answered, text: reply.text, peer: peer, dataRoot: dataRoot, continuation: continuation) }
     }
 
     /// Repeatable projection of the one saved answer, including after launch or a failed webhook response. Never claim another reply to repair it.
+    /// An exchange that already holds its answer is settled: nothing is written.
     private func reconcile(_ answered: GrokPendingRequest, dataRoot: URL) throws {
         guard let text = answered.reply else { throw GrokLinkCredential.Failure.invalid }
         // The journal binds the protocol message to its internal operation UUID.
         let conversations = AgentConversationStore(dataRoot: dataRoot)
         let rows = try conversations.records().filter { $0.agent == "peer:" + answered.peerID }
-        if let row = rows.first(where: { row in
-            row.exchanges?.contains { $0.id == row.operationID && GrokBotRoute.messageID(for: $0) == answered.messageID } == true
-        }) {
+        func owed(_ exchange: AgentConversationExchange) -> Bool { exchange.reply == nil && GrokBotRoute.messageID(for: exchange) == answered.messageID }
+        func owes(_ row: AgentConversationRecord) -> Bool { row.exchanges?.contains { $0.id == row.operationID && owed($0) } == true }
+        if let row = rows.first(where: owes) {
             _ = try conversations.update(id: row.id, operationID: row.operationID) {
-                AgentConversationSession.absorb(GrokBotRoute.projection(answered), into: &$0)
+                if owes($0) { AgentConversationSession.absorb(GrokBotRoute.projection(answered), into: &$0) }
             }
-        } else if let row = rows.first(where: { $0.exchanges?.contains { GrokBotRoute.messageID(for: $0) == answered.messageID } == true }),
-                  let exchange = row.exchanges?.first(where: { GrokBotRoute.messageID(for: $0) == answered.messageID }) {
+        } else if let row = rows.first(where: { $0.exchanges?.contains(where: owed) == true }), let exchange = row.exchanges?.first(where: owed) {
             _ = try conversations.settleExchange(id: row.id, exchange: exchange.id, reply: text)
         }
-        // A correlated reply proves the original outbound message reached this run.
-        AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: answered.peerID, inbound: true)
-        AgentPeerStore(dataRoot: dataRoot).recordRoundTrip(peerID: answered.peerID, workspace: "Grok Bot conversation")
     }
 
     /// After session admission, only a pending, unconsumed answer becomes a turn. The saved `handOver` durably records its outcome.
@@ -111,7 +111,6 @@ public struct GrokInboundReply: Sendable {
         }
     }
 
-    /// Resume pending saved answers once per launch; uncertain mid-handover work cannot start a second turn.
     func resumeHandOvers(dataRoot: URL, continuation: AgentConversationContinuation) throws {
         running.open()
         let store = GrokRequestStore(dataRoot: dataRoot)

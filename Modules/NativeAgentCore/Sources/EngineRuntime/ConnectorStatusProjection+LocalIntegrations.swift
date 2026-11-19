@@ -207,10 +207,4 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     public func statusEvidence(actionID: String) async throws -> ConnectorActionStatusEvidence? {
         try await ConnectorReadiness.actionStatusEvidence(actionID: actionID, root: dataRoot, platform: statusPlatform)
     }
-
-    public func runGit(_ arguments: [String], repoRoot: URL, timeout: TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String) {
-        try await ProcessExecution.runBounded(
-            executable: "/usr/bin/git", arguments: arguments, currentDirectory: repoRoot, timeout: timeout
-        )
-    }
 }

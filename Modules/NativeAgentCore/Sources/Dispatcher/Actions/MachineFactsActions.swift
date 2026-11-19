@@ -136,11 +136,6 @@ extension FileSystemActions {
         } else { failures.append("top_processes: ps did not return a complete bounded snapshot") }
 
         var network: [String: JSONValue] = ["local_ip": .null, "vpn": .null]
-        if let ping = runCommand("/sbin/ping", ["-c", "1", "-W", "1000", "8.8.8.8"]), [0, 2].contains(ping.status) {
-            network["reachable"] = .bool(ping.status == 0)
-        } else {
-            failures.append("network: ping failed")
-        }
         if let store = SCDynamicStoreCreate(nil, "NativeAgent system info" as CFString, nil, nil),
            let primary = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] {
             network["primary_interface"] = (primary["PrimaryInterface"] as? String).map(JSONValue.string) ?? .null
@@ -152,18 +147,6 @@ extension FileSystemActions {
                 }
                 network["local_ip"] = .array(addresses.map(JSONValue.string))
             }
-        }
-        let publicIP = runProcess(
-            "/usr/bin/curl", ["--silent", "--show-error", "--fail", "--connect-timeout", "2", "--max-time", "3", "https://api.ipify.org"], timeout: 5,
-            captureByteLimit: 1024)
-        let address = publicIP.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        var ipv4 = in_addr(), ipv6 = in6_addr()
-        if publicIP.launched, publicIP.status == 0, !publicIP.timedOut, !publicIP.stdoutTruncated,
-           !publicIP.captureReadFailed, inet_pton(AF_INET, address, &ipv4) == 1 || inet_pton(AF_INET6, address, &ipv6) == 1 {
-            network["public_ip"] = .string(address)
-        } else {
-            network["public_ip"] = .null
-            failures.append("public_ip: HTTPS lookup unavailable within its 3-second limit")
         }
         let vpn = runProcess("/usr/sbin/scutil", ["--nc", "list"], timeout: 3, captureByteLimit: 16 * 1024)
         if vpn.launched, vpn.status == 0, !vpn.timedOut, !vpn.stdoutTruncated, !vpn.captureReadFailed {

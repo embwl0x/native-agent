@@ -18,8 +18,9 @@ extension SwiftNativeMemoryV2 {
         while true {
             try Task.checkCancellation()
             let state = try await memoryEmbeddingEpochState()
-            if state.activeEpoch == embedder.embeddingEpoch.rawValue, state.dimensions == embedder.dimensions,
-               state.activationFailure?.epoch != embedder.embeddingEpoch.rawValue { return nil }
+            let epoch = try embedder.embeddingEpoch.rawValue
+            if state.activeEpoch == epoch, state.dimensions == embedder.dimensions,
+               state.activationFailure?.epoch != epoch { return nil }
             do {
                 return try await reindexAllMemoryEmbeddingsForCurrentProvider()
             } catch let error as MemoryStorageError {
@@ -68,7 +69,7 @@ extension SwiftNativeMemoryV2 {
         try Task.checkCancellation()
         // Recall reads the published vector space and never builds one: what is missing is named, and its housekeeping flight requested.
         let epochStarted = ProcessInfo.processInfo.systemUptime
-        guard let residentEpoch = residentEmbeddingEpoch() else {
+        guard let residentEpoch = try residentEmbeddingEpoch() else {
             requestEmbeddingEpochReconcile()
             let failed = embeddingRuntimeSnapshot()?.lastLoadError.map { " Its last load failed: \($0)." } ?? ""
             throw MemoryStorageError.searchFailure("The memory search model is not loaded.\(failed)",

@@ -444,7 +444,7 @@ public final class SurfaceLayoutLive {
                 NotificationCenter.default.post(name: Self.didChange, object: nil)
             }
         case .failure(let failure):
-            SystemToastCenter.shared.push(error: failure.localizedDescription, autoDismissAfter: nil)
+            SystemToastCenter.shared.push(error: failure.localizedDescription)
             await snapshotRead.read {
                 await Task.detached { SurfaceLayoutStore.layout(dataRoot: root) }.value
             } publish: {

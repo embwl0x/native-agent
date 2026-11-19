@@ -35,6 +35,7 @@ public struct CognitiveDoctorRead: Sendable {
     public let substrate: CognitiveSubstrateSnapshot
     public let workspace: CognitiveWorkspaceSnapshot
     public let associations: [CognitiveAssociationEdge]
+    public let associationMissingEndpointCount: Int
     public let receiptRead: CognitiveReceiptRead
     public let organism: OrganismSnapshot
     public let capsulePreviewInfo: CapsulePreviewInfo?

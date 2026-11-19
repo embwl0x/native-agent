@@ -125,7 +125,6 @@ extension ProductionExport {
         "release",
         "activity/events.jsonl",
         "body/learning_receipts.jsonl",
-        "improvements/gauntlet/runs.json",
         "telegram/state.json",
         "cutover",
     ]

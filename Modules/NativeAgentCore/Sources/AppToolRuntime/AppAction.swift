@@ -233,9 +233,8 @@ public struct AppAction: Sendable {
         if irreversible { text += " · irreversible" }
         if !warn.isEmpty { text += " · \(warn)" }
         if case .person(let why, let instead, let asks, let freely, _) = owner {
-            // A lever is the person's at every posture: the agent's call runs on the person's own ask in their turn, or raises their card, or
-            // is refused when no card can carry it.
-            text += (asks ? " · the person's (runs when they ask for it in their turn, else asks them): " : " · the person's: ") + why
+            text += (asks ? " · yours under Full Mac unless an untrusted voice steers; below it, the person's ask or card (Safe refuses): "
+                : " · the person's: ") + why
                 + (instead.map { ". Instead: \($0)" } ?? "")
             if !freely.isEmpty {
                 text += ". Yours with " + freely.sorted { $0.key < $1.key }.map { $0.key + " " + ($0.value.scalarText ?? "") }

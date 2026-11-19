@@ -13,7 +13,7 @@ actor BodyFaceProcess {
     private let handler: any FaceActHandler
     private let dataRoot: URL
     private let connected: @Sendable (UUID) async throws -> Void
-    private let disconnected: @Sendable (UUID?, String) async -> Void
+    private let disconnected: @Sendable (UUID?, String, Bool) async -> Void
     private var child: Process?
     private var childID: UUID?
     private var endpoint: BodyFaceConnection?
@@ -25,7 +25,7 @@ actor BodyFaceProcess {
 
     init(bodyBundle: URL, dataRoot: URL, source: FaceFeedSource, handler: any FaceActHandler,
          connected: @escaping @Sendable (UUID) async throws -> Void,
-         disconnected: @escaping @Sendable (UUID?, String) async -> Void) {
+         disconnected: @escaping @Sendable (UUID?, String, Bool) async -> Void) {
         app = bodyBundle.appendingPathComponent("Contents/Helpers/NativeAgentFace.app")
         executable = app.appendingPathComponent("Contents/MacOS/NativeAgentFace")
         self.source = source; self.handler = handler
@@ -92,7 +92,7 @@ actor BodyFaceProcess {
         var handles = [toFace.fileHandleForReading, toFace.fileHandleForWriting,
                        fromFace.fileHandleForReading, fromFace.fileHandleForWriting]
         process.executableURL = executable
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ManagedProcess.agentEnvironment()
         environment["NATIVEAGENT_FACE_DATA_ROOT"] = dataRoot.path
         process.environment = environment
         process.standardInput = toFace
@@ -126,9 +126,9 @@ actor BodyFaceProcess {
                 }, ending: { connection in
                     // Every renderer ends through its link's close (exit, quit, a lost pipe); Doctor forgets it before anything awaits.
                     BodyFaceDoctor.disconnect(connection)
-                }, disconnected: { connection, detail in
+                }, disconnected: { connection, detail, attached in
                     if let connection { await MacInputRouting.faceDisconnected(connection) }
-                    await self.disconnected(connection, detail)
+                    await self.disconnected(connection, detail, attached)
                     await self.connectionClosed(id)
                 })
             self.endpoint = endpoint

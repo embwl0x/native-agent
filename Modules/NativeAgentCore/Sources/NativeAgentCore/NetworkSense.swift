@@ -2,7 +2,7 @@ import Foundation
 import Network
 import Synchronization
 
-// Blueprint: | `NetworkSense.swift` | One path monitor; network-return waits and body wakes follow path events |
+// Blueprint: | `NetworkSense.swift` | One path monitor; network-return waits, body wakes and attention follow dated path edges |
 
 /// A satisfied path establishes local reachability, never a provider verdict.
 public enum NetworkSense {
@@ -64,7 +64,7 @@ public enum NetworkSense {
             }
             guard edge.changed else { return }
             if !edge.first {
-                NotificationCenter.default.post(name: NetworkSense.changed, object: nil, userInfo: ["is_up": value])
+                NotificationCenter.default.post(name: NetworkSense.changed, object: nil, userInfo: ["is_up": value, "at": Date()])
             }
         }
     }

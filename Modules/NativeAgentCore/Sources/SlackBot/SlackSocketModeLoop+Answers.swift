@@ -193,7 +193,9 @@ extension SlackSocketModeLoop {
             }
             // Durable claims prevent socket and recovery from repeating bot fan-out.
             if try await deliveryJournal.claimBotEvent(eventId: inbound.eventId) {
-                try await botEventIntake(inbound.channelId, inbound.text, inbound.userId, inbound.eventId)
+                do { try await botEventIntake(inbound.channelId, inbound.text, inbound.userId, inbound.eventId) }
+                catch is CancellationError { throw CancellationError() }
+                catch { await recordError(context: "bot_event_intake", error: error, inbound: inbound) }
             }
             if record.phase == .claimed, record.resolvedRetryInbound == nil,
                inbound.text.trimmingCharacters(in: .whitespacesAndNewlines) == "/retry" {
@@ -319,8 +321,8 @@ extension SlackSocketModeLoop {
             guard let prepared = record.prepared else { throw SlackInboundJournalError.malformed }
             guard record.lastRejection?.preparedFingerprint != prepared.fingerprint else { return false }
             guard !Task.isCancelled else { return false }
-            // Missing artifacts must preserve the prepared reply, never rerun its chat/tool effects.
-            guard prepared.uploads.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
+            let pendingUploads = prepared.uploads.dropFirst(record.confirmedUploadCount ?? 0)
+            guard pendingUploads.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
                 _ = try await deliveryJournal.retryPrepared(eventId: inbound.eventId, detail: "prepared Slack image is no longer available")
                 await recordError(
                     context: "prepared_reply_artifact_missing",
@@ -330,7 +332,7 @@ extension SlackSocketModeLoop {
                 return false
             }
             guard !config.botToken.isEmpty else { throw SlackSocketModeError.api("Slack reply token is unavailable") }
-            let uploads = try prepared.uploads.map { upload in
+            let uploads = try pendingUploads.map { upload in
                 let data = try Data(contentsOf: URL(fileURLWithPath: upload.path))
                 guard !data.isEmpty else {
                     throw SlackSocketModeError.api("Prepared Slack image is empty")
@@ -386,7 +388,7 @@ extension SlackSocketModeLoop {
                 record = try await deliveryJournal.confirmReplyPart(eventId: inbound.eventId, isText: true)
             }
             // Uploads have no message-metadata hook; a visible text marker cannot prove a failed upload safe to replay.
-            for (upload, data) in uploads.dropFirst(record.confirmedUploadCount ?? 0) {
+            for (upload, data) in uploads {
                 _ = try await deliveryJournal.beginDispatch(eventId: inbound.eventId)
                 guard try CodexCompletionReadout.permitsDelivery(sessionId: record.assistantSessionId,
                     runId: record.assistantRunId, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),

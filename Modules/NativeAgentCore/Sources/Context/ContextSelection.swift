@@ -142,6 +142,8 @@ public struct ContextSelector: Sendable {
         let relevanceFloor = memoryStandout
         let restFloor = memoryStandout + 1
         func touched(_ atom: ContextStoredAtom) -> Bool {
+            if let mark = configuration.memorySemanticFloor(forModel: need.queryEmbeddingModelID),
+               let cosine = memoryTouch.cosines[atom.draft.id], cosine <= mark { return false }
             // A relative floor is in standard deviations; a small population instead uses the ordinary model-scaled semantic contribution.
             let floor = smallMemoryPopulation ? configuration.minimumRelevance : relevanceFloor
             if let relevance = relevanceByAtom[atom.draft.id], relevance >= floor { return true }

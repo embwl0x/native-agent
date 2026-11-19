@@ -307,12 +307,19 @@ private struct TodaySource: Sendable, Equatable {
             let rows = try await SwiftNativeApprovalInbox(root: engine.dataRoot).list(filter: .all)
             let approvals = WorkOverviewRead.waitingApprovals(rows)
             source.approvalCount = approvals.count
-            // Each decision carries its Inbox row's own answers (same ids, door calls and confirmation); an unreadable Inbox leaves its open link.
-            let answers = (try? await engine.inboxAnswers()) ?? [:]
+            // Each decision carries its Inbox row's own answers; unread answers keep their cause beside the decision.
+            var answers: [String: [PartFace.Action]] = [:], answersIssue: String?
+            do { answers = try await engine.inboxAnswers() }
+            catch {
+                let issue = "Answers could not be read: " + error.localizedDescription
+                answersIssue = issue
+                source.unavailable.append(issue)
+            }
             source.levers = approvals.map { approval in
                 let matter = approval.matter
                 return PartFace.Row(id: "approval:" + approval.id, title: matter.title,
-                    detail: TodayWords.line(matter.summary), tone: .attention, open: "approval:" + approval.id, actions: answers[approval.id])
+                    detail: answersIssue.map { TodayWords.line(matter.summary) + " · " + $0 } ?? TodayWords.line(matter.summary),
+                    tone: .attention, open: "approval:" + approval.id, actions: answers[approval.id])
             }
             source.owed = !approvals.isEmpty
         } catch {
@@ -338,12 +345,19 @@ private struct TodaySource: Sendable, Equatable {
             }
             source.input["sourceStates"] = .object(["notes": .string(items.isEmpty ? "empty" : "available")])
             let asks = items.filter { $0.requiresOwnerInput && !$0.hasLinkedApproval }.sorted { $0.created_at > $1.created_at }
-            // Each request carries its Inbox row's own answers (same ids, door calls and confirmation); an unreadable Inbox leaves its open link.
-            let answers = (try? await engine.inboxAnswers()) ?? [:]
+            // Each request carries its Inbox row's own answers; unread answers keep their cause beside the request.
+            var answers: [String: [PartFace.Action]] = [:], answersIssue: String?
+            do { answers = try await engine.inboxAnswers() }
+            catch {
+                let issue = "Answers could not be read: " + error.localizedDescription
+                answersIssue = issue
+                source.unavailable.append(issue)
+            }
             let waiting = asks.map { item -> JSONValue in
                 source.keys["card:" + item.id] = .object(["open": .string("card:" + item.id)])
                 if let actions = answers[item.id] { source.keyed.append(PartFace.Row(id: "card:" + item.id, title: item.title, actions: actions)) }
-                return .object(["id": .string("card:" + item.id), "title": .string(item.title), "detail": .string(TodayWords.line(item.summary))])
+                let detail = answersIssue.map { TodayWords.line(item.summary) + " · " + $0 } ?? TodayWords.line(item.summary)
+                return .object(["id": .string("card:" + item.id), "title": .string(item.title), "detail": .string(detail)])
             }
             let notes = items.filter { $0.isActivityPending && !$0.isSystemLane }.compactMap { item -> JSONValue? in
                 if let at = TodayWords.parseTimestamp(item.created_at) {
@@ -420,24 +434,14 @@ private struct TodaySource: Sendable, Equatable {
     static func moments(_ engine: NativeAgentEngine) async -> Self {
         var source = Self()
         let now = Date(), calendar = Calendar.autoupdatingCurrent
-        func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
-        var moments: [JSONValue] = [], unreadable = false
         do {
-            let kept = try await engine.memory.listMemory(kind: MemoryMoments.kind)
-            for record in kept {
-                if let at = TodayWords.parseTimestamp(record.createdAt), today(at) {
-                    let quote = TodayWords.plain(record.extras?.objectValue?["quote"]?.stringValue ?? "")
-                    let body = quote.isEmpty ? TodayWords.plain(record.text) : quote
-                    if !body.isEmpty {
-                        let key = "moment:" + record.id
-                        moments.append(.object(["key": .string(key), "at": .double(at.timeIntervalSince1970),
-                            "quote": .string(TodayWords.bounded(body, limit: 200))]))
-                    }
-                } else if TodayWords.parseTimestamp(record.createdAt) == nil {
-                    unreadable = true
-                }
+            let kept = try await engine.memory.todayMoments(now, calendar: calendar)
+            let moments: [JSONValue] = kept.rows.map { record in
+                .object(["key": .string("moment:" + record.id), "at": .double(record.at),
+                         "quote": .string(TodayWords.bounded(record.text, limit: 200))])
             }
-            source.input["moments"] = .object(["state": .string(unreadable ? "partial" : "available"), "rows": .array(moments)])
+            source.input["moments"] = .object(["state": .string(kept.unreadable ? "partial" : "available"), "rows": .array(moments),
+                "total": .int(Int64(kept.total)), "firstAt": kept.firstAt.map(JSONValue.double) ?? .null])
         } catch {
             source.input["moments"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
@@ -709,6 +713,7 @@ public actor TodayReadout {
     private var inboxTask: Task<Void, Never>?
     private var cognitionTask: Task<Void, Never>?
     private var personaTask: Task<Void, Never>?
+    private var momentsTask: Task<Void, Never>?
     private var intentionsDeadline: Task<Void, Never>?
 
     public init() {}
@@ -720,6 +725,7 @@ public actor TodayReadout {
         inboxTask?.cancel()
         cognitionTask?.cancel()
         personaTask?.cancel()
+        momentsTask?.cancel()
         intentionsDeadline?.cancel()
     }
 
@@ -756,6 +762,9 @@ public actor TodayReadout {
                 guard await iterator.next() != nil else { return }
             }
         }
+        momentsTask = Task { [weak self, memory = engine.memory] in
+            await memory.observePage(.moments) { [weak self] in await self?.changed(.feed(.moments)) }
+        }
         let notificationChanges: [Notification.Name: TodayChange] = [
             .NSSystemTimeZoneDidChange: .all, .NSCalendarDayChanged: .all, .NSSystemClockDidChange: .all,
             .turnTraceTerminalPersisted: .feed(.thinking),
@@ -790,7 +799,6 @@ public actor TodayReadout {
         let fields: [(TodayChange, [String])] = [
             (.feed(.approvals), ["workflows/approvals/requests.json"]),
             (.feed(.trials), ["abilities/state.json"]),
-            (.feed(.moments), ["memory/memory.sqlite", "memory/memory.sqlite-wal"]),
             (.feed(.schedule), ["trust/policy.json", "mind/rhythm.json", "cognition/user_turn.json",
                                 "experiences/experiences.sqlite", "experiences/experiences.sqlite-wal"]),
             (.feed(.dream), ["trust/policy.json", "dream_diary/"]),

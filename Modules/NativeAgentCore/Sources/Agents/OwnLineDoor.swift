@@ -59,10 +59,10 @@ public struct OwnLineDoor: OwnLineRunner {
         var origin = ChatMessageOrigin(surface: Self.surface, agent: "self", authored: .agent)
         origin.peerSources = job.peers
         origin.elevatedPeerSources = job.elevated
-        let request = TurnRequest(message: message, sessionID: session, fileAccess: job.fileAccess ?? "auto", surface: Self.surface,
+        let request = TurnRequest(message: message, sessionID: session, fileAccess: job.fileAccess?.mode ?? "auto", surface: Self.surface,
             envelope: TurnEnvelope(surface: Self.surface, agent: "self", declaredRemote: false),
             verifiedSessionID: session, origin: origin, threadKind: .builder)
-        let ingress = request.turn().with(\.lineInstructions, job.instructions)
+        let ingress = request.turn().with(\.fileAccessCeiling, job.fileAccess ?? .init()).with(\.lineInstructions, job.instructions)
         return try await TurnAdmission.shared.runAlone(dataRoot: dataRoot, sessionID: session, turn: ingress) { admitted in
             try await request.chat(on: clients.lineChatClient(), holding: admitted)
         }

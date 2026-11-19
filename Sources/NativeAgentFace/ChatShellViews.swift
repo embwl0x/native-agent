@@ -146,7 +146,6 @@ struct ShellConversationRow: View {
         .accessibilityElement(children: .contain)
     }
 }
-
 /// Each mounted row observes only its conversation; the containing list owns identities.
 struct ShellSessionFaceRow: View, Equatable {
     @Environment(AppModel.self) private var appModel
@@ -367,18 +366,6 @@ extension ChatActivityRow where Leading == EmptyView {
     }
 }
 
-/// Fold the helper reply without exposing its routing envelope.
-struct ShellEnvelopeRow: View {
-    var title: String
-    var content: String
-    @State private var expanded = false
-
-    var body: some View {
-        ChatActivityRow(title: title, isExpanded: $expanded) {
-            Text(content)
-        }
-    }
-}
 
 // MARK: - The empty room
 
@@ -417,56 +404,5 @@ struct ShellEmptyRoom: View {
         }
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .contain)
-    }
-}
-
-// MARK: - Trouble
-
-/// Failure and eligibility arrive together from the body's message presentation.
-struct ShellTroubleCard: View {
-    var action: MessageActionFace
-    var failure: WireFailure
-    var showsStuckLink: Bool
-    var onRetry: () -> Void
-    var onContinue: () -> Void
-    var onOpenSettings: () -> Void
-    @State private var confirming: WireFailure?
-    @State private var showsDetails = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label(failure.message, systemImage: "exclamationmark.circle")
-                .font(ShellType.bodySemibold)
-                .foregroundStyle(NativeAgentShell.trouble)
-                .accessibilityIdentifier("chat.shell.trouble-line")
-            HStack(spacing: 14) {
-                if action.canRetry {
-                    Button("Try again…") { confirming = failure }
-                        .buttonStyle(.bordered).controlSize(.small)
-                        .accessibilityIdentifier("chat.shell.trouble-retry")
-                }
-                if action.canContinue {
-                    Button("Continue from here", action: onContinue).buttonStyle(.bordered).controlSize(.small)
-                }
-                if failure.cause != nil {
-                    Button(showsDetails ? "Hide details" : "Details") { showsDetails.toggle() }
-                        .buttonStyle(.plain).font(ShellType.label)
-                        .accessibilityIdentifier("chat.shell.trouble-details")
-                }
-                if showsStuckLink {
-                    Button(ChatShellCopy.errorStuckLink, action: onOpenSettings).buttonStyle(.plain).font(ShellType.label)
-                        .accessibilityIdentifier("chat.shell.stuck-settings-link")
-                }
-            }
-            if showsDetails, let cause = failure.cause {
-                Text(cause).font(ShellType.code).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .modifier(FailedTurnRetryConfirmation(failure: $confirming, onRetry: onRetry, onContinue: onContinue))
-        .padding(.horizontal, 16).padding(.vertical, 14)
-        .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-        .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("chat.shell.trouble-card")
     }
 }

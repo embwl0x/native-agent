@@ -315,10 +315,18 @@ public final class MacScreenViewStore {
     }
     private var latest: MacScreenViewSnapshot?
     private let publication = LatestRead()
+    private var readsInFlight = 0
+    private var motionPulses: [MacPointerPosition] = []
     public nonisolated init() {}
     public func read(
         _ load: @Sendable () async -> (MacControlResult, MacScreenViewSnapshot?)
     ) async -> (value: MacControlResult, published: Bool) {
+        let pulseStart = motionPulses.count
+        readsInFlight += 1
+        defer {
+            readsInFlight -= 1
+            if readsInFlight == 0 { motionPulses.removeAll() }
+        }
         var published = false
         do {
             let read = try await publication.read({
@@ -326,7 +334,11 @@ public final class MacScreenViewStore {
                 guard result.0.ok, result.1 != nil else { throw MacSnapshotUnavailable(result: result.0) }
                 return result
             }) { result in
-                if let snapshot = result.1 { latest = snapshot; published = true }
+                guard let snapshot = result.1, !motionPulses.dropFirst(pulseStart).contains(where: {
+                    $0.isInside(snapshot.bounds) || !(snapshot.bounds.w > 0 && snapshot.bounds.h > 0)
+                }) else { return }
+                latest = snapshot
+                published = true
             }
             return (read.0, published)
         } catch {
@@ -351,7 +363,17 @@ public final class MacScreenViewStore {
         guard let hit = latest.mark(mark) else { return .failure(.unknownMark) }
         return .success(hit)
     }
-    /// Input or completed motor work can invalidate the single live scene; retaining old handles would misdirect later acts.
+    func invalidate(for activity: MacAttentionActivity) {
+        guard activity.kind == .pointerMoved || activity.kind == .scrolled,
+              let x = activity.pointerX, let y = activity.pointerY,
+              let point = MacPointerPosition(x: x, y: y) else {
+            invalidate()
+            return
+        }
+        if let latest, point.isInside(latest.bounds) || !(latest.bounds.w > 0 && latest.bounds.h > 0) { self.latest = nil }
+        if readsInFlight > 0 { motionPulses.append(point) }
+    }
+
     public func invalidate() {
         publication.write { latest = nil }
     }

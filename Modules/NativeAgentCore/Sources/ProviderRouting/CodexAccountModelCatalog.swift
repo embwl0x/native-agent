@@ -16,7 +16,6 @@ public enum CodexAccountModelCatalog {
         guard isAccountBackedProvider(providerID) else {
             return []
         }
-        // The account's models see images; whether this route's transport carries them is the adapter's declaration (the Codex CLI does not).
         let vision = ProviderToolCapability.carriesImages(
             providerID: providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         return load(
@@ -30,12 +29,17 @@ public enum CodexAccountModelCatalog {
                 name: $0.displayName,
                 context_length: $0.contextWindow,
                 supports_streaming: true,
-                supports_vision: vision,
+                supports_vision: vision && $0.inputModalities?.contains("image") != false,
                 supports_tools: true,
                 supports_json_mode: true,
                 default_reasoning_effort: $0.defaultReasoningEffort,
                 supported_reasoning_efforts: $0.supportedReasoningEfforts,
-                supports_fast: $0.supportsFast
+                supports_fast: $0.supportsFast,
+                controls_note: $0.minimalClientVersion.flatMap { minimum in
+                    let checked = ChatGPTTransport.codexClientVersion
+                    guard minimum.compare(checked, options: .numeric) == .orderedDescending else { return nil }
+                    return "Newer than this app's ChatGPT wire was checked against (\(checked)); its first turn is the check."
+                }
             )
         }
     }
@@ -46,18 +50,25 @@ public enum CodexAccountModelCatalog {
         public let description: String?
         public let defaultReasoningEffort: String
         public let supportedReasoningEfforts: [String]
+        public let ultraEffort: String
         public let supportsFast: Bool
         public let priority: Int
         public let contextWindow: Int
+        let minimalClientVersion: String?
+        let inputModalities: [String]?
     }
 
-    private struct Cache: Decodable {
+    struct Cache: Decodable {
         var models: [Record]
         var accountID: String?
+        var clientVersion: String?
+        var fullListRefusal: String?
 
         enum CodingKeys: String, CodingKey {
             case models
             case accountID = "nativeagent_account_id"
+            case clientVersion = "client_version"
+            case fullListRefusal = "nativeagent_full_list_refused"
         }
 
         init(from decoder: Decoder) throws {
@@ -65,6 +76,9 @@ public enum CodexAccountModelCatalog {
             // An unreadable model array is an unreadable list, never an empty one.
             models = try fields.decode([Record].self, forKey: .models)
             for record in models {
+                guard !record.slug.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw DecodingError.dataCorruptedError(forKey: .models, in: fields, debugDescription: "Account model has an empty slug")
+                }
                 let efforts = record.supportedReasoningLevels.map(\.effort)
                 guard !efforts.isEmpty, efforts.allSatisfy({ !$0.isEmpty }),
                       efforts.contains(record.defaultReasoningLevel) else {
@@ -73,6 +87,8 @@ public enum CodexAccountModelCatalog {
                 }
             }
             accountID = try fields.decodeIfPresent(String.self, forKey: .accountID)
+            clientVersion = try fields.decodeIfPresent(String.self, forKey: .clientVersion)
+            fullListRefusal = try fields.decodeIfPresent(String.self, forKey: .fullListRefusal)
         }
     }
 
@@ -80,7 +96,7 @@ public enum CodexAccountModelCatalog {
     nonisolated(unsafe) private static var decodedByPath: [String: (stamp: [FileAttributeKey: Any], cache: Cache?)] = [:]
 
     /// Account matching and both route projections share this decode. File replacement invalidates it; auth identity is checked on every selection.
-    private static func readCache(at url: URL, dataRoot: URL, preview: Bool = false) -> Cache? {
+    static func readCache(at url: URL, dataRoot: URL, preview: Bool = false) -> Cache? {
         let url = url.resolvingSymlinksInPath()
         cacheLock.lock()
         let previewCache = preview ? decodedByPath : nil
@@ -130,7 +146,7 @@ public enum CodexAccountModelCatalog {
         return cache
     }
 
-    private struct Record: Decodable {
+    struct Record: Decodable {
         struct Effort: Decodable { var effort: String }
         struct ServiceTier: Decodable { var id: String }
 
@@ -145,6 +161,9 @@ public enum CodexAccountModelCatalog {
         var visibility: String?
         var priority: Int?
         var contextWindow: Int?
+        var multiAgentReasoningEffort: String?
+        var minimalClientVersion: String?
+        var inputModalities: [String]?
 
         enum CodingKeys: String, CodingKey {
             case slug
@@ -158,6 +177,9 @@ public enum CodexAccountModelCatalog {
             case visibility
             case priority
             case contextWindow = "context_window"
+            case multiAgentReasoningEffort = "multi_agent_reasoning_effort"
+            case minimalClientVersion = "minimal_client_version"
+            case inputModalities = "input_modalities"
         }
     }
 
@@ -194,10 +216,14 @@ public enum CodexAccountModelCatalog {
                     description: record.description,
                     defaultReasoningEffort: record.defaultReasoningLevel,
                     supportedReasoningEfforts: efforts,
+                    ultraEffort: record.multiAgentReasoningEffort.flatMap { $0 != "ultra" && efforts.contains($0) ? $0 : nil }
+                        ?? (efforts.contains("max") ? "max" : efforts.last { $0 != "ultra" } ?? "medium"),
                     supportsFast: hasFastTier,
                     priority: record.priority ?? 1_000,
                     // A read catalog owns its windows; an absent value is unknown (0).
-                    contextWindow: record.contextWindow ?? 0
+                    contextWindow: record.contextWindow ?? 0,
+                    minimalClientVersion: record.minimalClientVersion,
+                    inputModalities: record.inputModalities
                 )
             }
         }
@@ -255,6 +281,12 @@ public enum CodexAccountModelCatalog {
             return "The model catalog does not belong to this ChatGPT account. Refresh its models in Providers."
         }
         return nil
+    }
+
+    static func fullListRefusal(dataRoot: URL, environment: [String: String], preview: Bool) -> String? {
+        guard let cache = chatGPTOAuthCache(dataRoot: dataRoot, environment: environment, preview: preview)?.cache,
+              let refusal = cache.fullListRefusal else { return nil }
+        return "The full ChatGPT model list could not be asked (\(refusal)). This list is for checked version \(cache.clientVersion ?? "unstated")."
     }
 
     private static func cacheSource(dataRoot: URL, environment: [String: String]) -> URL {

@@ -2,36 +2,20 @@ import Foundation
 import NativeAgentShared
 import SwiftUI
 
-// Blueprint: | `SystemToastBar.swift` | platform notice rendering and room-scoped positioning; values, queue and timers belong to NativeAgentShared |
+// Blueprint: | `SystemToastBar.swift` | Platform notice rendering; values, queue and timers belong to NativeAgentShared |
 
-/// Bind placement to the visible room so hidden chat notices cannot appear on another page.
-struct NoticeLaneRoom {
-    let anchor: Anchor<CGRect>
-    let notices: SystemToastCenter
-}
-
-struct NoticeLaneRoomKey: PreferenceKey {
-    static let defaultValue: NoticeLaneRoom? = nil
-
-    static func reduce(value: inout NoticeLaneRoom?, nextValue: () -> NoticeLaneRoom?) {
-        value = nextValue() ?? value
-    }
-}
 
 /// Share one notice column while each owner retains its severity-based durations.
 struct NoticeLane: View {
     let centers: [SystemToastCenter]
 
     var body: some View {
-        GlassEffectContainer(spacing: NativeAgentSpacing.sm) {
-            VStack(spacing: NativeAgentSpacing.sm) {
-                ForEach(centers, id: \.id) { center in
-                    NoticeLaneColumn(center: center)
-                }
+        VStack(spacing: NativeAgentSpacing.sm) {
+            ForEach(centers, id: \.id) { center in
+                NoticeLaneColumn(center: center)
             }
-            // Cap capsule width to keep long notices within the lane.
-            .frame(maxWidth: 520)
         }
+        .frame(maxWidth: 520)
         .padding(.horizontal, NativeAgentSpacing.lg)
         .frame(maxWidth: .infinity, alignment: .center)
     }

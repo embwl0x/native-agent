@@ -19,6 +19,7 @@ extension CloudKitDeviceTransport {
         recordType: String,
         since: Date?,
         inboundDirection: String,
+        assetSecret: Data?,
         recovery: DeviceSyncRecovery
     ) async throws -> DeviceCKPullResult {
         return try await withDeviceCKOperation("CloudKitDeviceTransport.pull", onFailure: accountFailureReporter) {
@@ -26,6 +27,7 @@ extension CloudKitDeviceTransport {
                 recordType: recordType,
                 since: since,
                 inboundDirection: inboundDirection,
+                assetSecret: assetSecret,
                 recovery: recovery
             )
         }
@@ -35,6 +37,7 @@ extension CloudKitDeviceTransport {
         recordType: String,
         since: Date?,
         inboundDirection: String,
+        assetSecret: Data?,
         recovery: DeviceSyncRecovery
     ) async throws -> DeviceCKPullResult {
         let query = CKQuery(
@@ -44,7 +47,6 @@ extension CloudKitDeviceTransport {
         query.sortDescriptors = [
             NSSortDescriptor(key: "modificationDate", ascending: false)
         ]
-        let assetSecret = await loadAssetSecretProvider()?()
 
         var combined = DeviceCKPullResult()
         var nextCursor: CKQueryOperation.Cursor?

@@ -158,7 +158,7 @@ public struct QuietToolPage: Sendable, Equatable {
 
 
     public static let inbox = QuietToolPage(
-        id: "inbox", title: "Inbox", summary: "Today's Inbox: the notes Today and the Desk count, by id and state.")
+        id: "inbox", title: "Inbox", summary: "Approval cards and notes by id and state. Read details and answers with page:inbox, item:<note or approval id>.")
     public static let unindexed = [
         QuietToolPage(id: "context", title: "Context", summary: ""),
         QuietToolPage(id: "agent_view", title: "Agent view", summary: ""),
@@ -178,7 +178,7 @@ public enum AppDoorNames {
     public static let places = ["desk": "ongoing", "mac": "computer", "memories": "memory", "bots": "helpers", "notifications": "notify"]
 
     public static let aliases: [String: String] = [
-        "approvals": "today", "approval": "today", "pending approvals": "today",
+        "approvals": "inbox", "approval": "inbox", "pending approvals": "inbox",
         "inbox policy": "notifications", "inbox_policy": "notifications", "proactive": "notifications",
         "memory": "memories", "moments": "memories", "provider": "providers", "models": "providers",
         "trust center": "trust", "trust_center": "trust", "permissions": "trust",
@@ -259,7 +259,7 @@ public enum AppDoorNames {
                      Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow next_call. chat.message \
                      expands clipped bodies. Screen controls are separate actions.
                      """],
-        "inbox": ["all": "compact notes newest first, archived and dismissed too, up to 200; read a note id for details and actions"],
+        "inbox": ["all": "compact notes and approval cards newest first, archived and dismissed too, up to 200; read a note or approval id for details and actions"],
         "desk": ["<exact title or handle>": "the matching Desk record; duplicate titles require the exact desk number"],
         "pairing": ["phone-senses": """
             Phone senses guide: last reported per-sense on/off, iOS permission, missing setup and exact phone Settings steps; observations with \
@@ -323,7 +323,7 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
     public static let vocabulary: [(surface: String, about: String, blocks: [(name: String, shows: String)])] = [
         ("home", "Home (app {} and the Agent view), top to bottom; people and helpers are also the Simple sidebar's Agents and Helpers, in this order", [
             ("notable", "NOTABLE TODAY"), ("changed", "CHANGED since the agent last looked"), ("waits", "what waits on the person"),
-            ("queue", "MY QUEUE"), ("working", "WORKING: the agent's jobs and lines at work"), ("open", "OPEN: this chat's windows"),
+            ("queue", "MY QUEUE"), ("working", "WORKING: the agent's jobs and lines at work"),
             ("people", "PEOPLE: the agents in conversation with this agent"), ("helpers", "HELPERS"), ("senses", "MY SENSES"),
             ("elsewhere", "ELSEWHERE"), ("places", "PLACES, in the places order"), ("mac", "MAC"),
         ]),

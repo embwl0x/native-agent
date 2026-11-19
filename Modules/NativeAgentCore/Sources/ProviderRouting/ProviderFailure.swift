@@ -232,7 +232,6 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         }
         if error is any ProviderFailureWrapping { return error }
         // Output truncation carries partial prose; routing/configuration failures retain their repair identity rather than becoming a transport failure.
-        if ProviderRecoveryPolicy.isEmptyReply(error) { return error }
         if let error = error as? LLMError {
             switch error {
             case .outputLengthLimit, .modelUnavailable, .notConfigured: return error

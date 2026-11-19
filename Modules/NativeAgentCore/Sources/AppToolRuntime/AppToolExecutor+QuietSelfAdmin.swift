@@ -182,9 +182,10 @@ extension AppToolExecutor {
         catch { return ChatToolOutcome.failure(error: error, tool: "chat_session", effects: ToolFailureError.Effects.none) }
         let answer = await host.runChatSession(verb: verb, input: input, reachesUser: reachesUser, turn: turn)
         guard case .object(var body) = answer else {
-            return Self.doorRefusal("handler_result_missing", "The conversation handler returned no structured result; its effects are unknown.",
-                remedy: "inspect", "Read the conversation's current state before another change.",
-                next: ["page": .string("chat"), "item": input["session_id"] ?? .string("")], extra: ["effects": .string("unknown"), "verb": .string(verb)])
+            return Self.failure("handler_result_missing", "The conversation handler returned no structured result; its effects are unknown.",
+                extra: ["effects": .string("unknown"), "verb": .string(verb), "remedy": .object(["kind": .string("inspect"),
+                    "instruction": .string("Read the conversation's current state before another change."),
+                    "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("chat"), "item": input["session_id"] ?? .string("")])])])])
         }
         body["verb"] = .string(verb)
         body["trust_mode"] = .string(posture.name)
@@ -226,7 +227,7 @@ extension AppToolExecutor {
     /// of choices is said once per read: a later row offering the same list (several groups on one account, and that account's default)
     /// carries `choices_same_as`, the id of the row that gave it.
     @MainActor
-    func pageSettingRows(page: QuietToolPage, host: any QuietToolHost, only item: String? = nil) async throws -> [JSONValue] {
+    func pageSettingRows(page: QuietToolPage, host: any QuietToolHost, turn: Turn, only item: String? = nil) async throws -> [JSONValue] {
         var rows: [JSONValue] = []
         var given: [(choices: JSONValue, id: String)] = []
         let wanted = item?.lowercased()
@@ -236,11 +237,12 @@ extension AppToolExecutor {
         let compact = wanted == nil && settings.count > Self.compactSettingsAfter
         for setting in settings where wanted == nil || setting.id.lowercased() == wanted {
             do {
-                if case .object(let listed) = try await setting.catalogRow(host: { self.quietHost() }) {
+                if case .object(let listed) = try await setting.catalogRow(host: { self.quietHost() },
+                    dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot(), turn: turn) {
                     let kept = compact ? ["id", "choices", "owner_only"] + (setting.mindOwned ? ["note"] : [])
                         : ["id", "label", "type", "choices", "note", "writable", "owner_only"]
                     var row = listed.filter { kept.contains($0.key) }
-                    if compact, listed["writable"] == .bool(false) { row["writable"] = .bool(false) }
+                    if compact, setting.ownerOnly || listed["writable"] == .bool(false) { row["writable"] = listed["writable"] }
                     let choices = row["choices"]
                     if let choices, let first = given.first(where: { $0.choices == choices }) {
                         row["choices"] = nil
@@ -284,7 +286,7 @@ extension AppToolExecutor {
         let content = await appModel.pageRead(page, turn: turn)
         let posture = await Self.freshQuietPosture()
         let settingRows: [JSONValue]
-        do { settingRows = try await pageSettingRows(page: page, host: appModel) }
+        do { settingRows = try await pageSettingRows(page: page, host: appModel, turn: turn) }
         catch { return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none) }
 
         var fields: [String: JSONValue] = [
@@ -362,9 +364,6 @@ extension AppToolExecutor {
         do { currentValue = try await setting.read(appModel) }
         catch { return refuse(Self.settingReadFailure(error, setting: setting)) }
 
-        // Who decides: the person's own decided call of exactly these arguments (their tap, the phone's signed change, a card they approved,
-        // their own ask in a turn they started) passes every person-only check below; nothing else does. Posture is what the agent may do, never
-        // what the person may.
         let decided = QuietSettings.personDecided(input.filter { !$0.key.hasPrefix("__") }, turn: turn)
 
         var request: String?
@@ -390,8 +389,6 @@ extension AppToolExecutor {
                 request = quoted
                 restoresPrevious = restores
             } else {
-                // A change that is the person's to decide (an owner-only row, a raise) asks them on a card at every posture, as without this
-                // check; only a change of the agent's own that no one asked for is refused here.
                 let theirs: Bool
                 if setting.ownerOnly { theirs = true }
                 else if case .users? = await setting.check?(appModel, value, turn) { theirs = true }
@@ -444,16 +441,11 @@ extension AppToolExecutor {
                 extra: ["setting": .string(setting.id), "type": .string(setting.kind.rawValue)]
             ))
         }
-        // The person's controls are the person's at every posture, Full Mac included, as a raise is: the agent's change asks them on a card
-        // for this exact call (`needs_person`), and their word, tap or Approve makes it. Safe and an unwritable row refused above, first.
-        if setting.ownerOnly, !decided {
-            return refuse(.object([
-                "status": .string("needs_person"), "reason": .string("owners_call"), "effects": .string("none"),
-                "detail": .string("Changing \(setting.label) to \(requestedValue.scalarText ?? "that") is the person's to decide at every "
-                    + "posture: this exact change asks them on a card, and their Approve makes it."),
-                "setting": .string(setting.id), "page": .string(setting.page), "label": .string(setting.label),
-                "requested_value": requestedValue, "current_value": currentValue,
-            ]))
+        if setting.ownerOnly, !decided,
+           let refused = await QuietSettings.usersCall("Changing \(setting.label) to \(requestedValue.scalarText ?? "that")", setting.page,
+               setting: setting.id, value: requestedValue, dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(), turn: turn) {
+            return refuse(await Self.settingWriteFailure(refused, setting, requestedValue, host: appModel,
+                detail: ["effects": .string("none"), "current_value": currentValue]))
         }
         if setting.id.hasPrefix("providers."), setting.id != "providers.routing_repair" {
             do {
@@ -548,19 +540,18 @@ extension AppToolExecutor {
             if setting.kind == .boolean { reply["accepted_values"] = .array([.bool(false), .bool(true)]) }
             let posture = setting.mindOwned ? nil
                 : await Self.freshQuietPosture(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            if case .object(let catalog) = try await setting.catalogRow(host: { self.quietHost() }) {
+            if case .object(let catalog) = try await setting.catalogRow(host: { self.quietHost() },
+                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(), turn: turn) {
                 for key in ["choices", "note", "writable", "owner_only", "refusal"] {
                     reply[key] = catalog[key]
                 }
             }
-            if setting.mindOwned {
-                reply["writable"] = .bool(setting.writable)
-            } else if let posture {
+            if !setting.mindOwned, let posture {
                 if !posture.changesAllowed {
                     reply["writable"] = .bool(false)
                     reply["refusal"] = .string("\(posture.name) permits reads only. The person changes this in Trust.")
                 }
-            } else {
+            } else if !setting.mindOwned {
                 reply["writable"] = .bool(false)
                 reply["refusal"] = .string("The saved Trust policy is unreadable; no setting change is authorized.")
             }

@@ -9,9 +9,100 @@ import CognitiveSubstrate
 import ChatTurnContracts
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `MemoryStorage+Projections.swift` | `MemoryStorage`, `userPromptCore`: ordered derived hooks and user prompt core |
+// Blueprint: | `MemoryStorage+Projections.swift` | `MemoryStorage`, `userPromptCore`: committed page regions, bounded Today moments, ordered derived hooks and user prompt core |
 
 extension MemoryStorage {
+    public enum PageProjection: Sendable, Hashable {
+        case memories, graph, settings, moments
+
+        var regions: [any DatabaseRegionConvertible] {
+            switch self {
+            case .memories:
+                [SQLRequest<Row>(sql: """
+                    SELECT id, content, persona_id, source, confidence, created_at, updated_at,
+                           status, lifecycle, valid_from, valid_to, observed_at, evidence_json, metadata_json
+                    FROM memories
+                    """), SQLRequest<Row>(sql: "SELECT * FROM proposals"),
+                 SQLRequest<Row>(sql: "SELECT * FROM correction_occurrences"),
+                 SQLRequest<Row>(sql: "SELECT * FROM correction_proposal_occurrences"),
+                 SQLRequest<Row>(sql: "SELECT * FROM correction_ledger_state")]
+            case .graph:
+                [SQLRequest<Row>(sql: "SELECT * FROM kg_entities"), SQLRequest<Row>(sql: "SELECT * FROM kg_relationships")]
+            case .settings:
+                [SQLRequest<Row>(sql: "SELECT * FROM proposals")]
+            case .moments:
+                [SQLRequest<Row>(sql: "SELECT id, content, created_at, metadata_json, lifecycle FROM memories")]
+            }
+        }
+    }
+
+    /// Observe commits touching the page's columns. Arm before the initial read; cancellation releases the subscription.
+    public func observePage(_ projection: PageProjection, changed: @escaping @Sendable () async -> Void,
+                            failed: @escaping @Sendable (String) async -> Void) async {
+        let changes = AsyncThrowingStream<Void, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let observation = DatabaseRegionObservation(tracking: projection.regions).start(in: dbPool,
+            onError: { changes.continuation.finish(throwing: $0) },
+            onChange: { _ in changes.continuation.yield(()) })
+        defer { observation.cancel(); changes.continuation.finish() }
+        changes.continuation.yield(())
+        do {
+            for try await _ in changes.stream {
+                guard !Task.isCancelled else { return }
+                await changed()
+            }
+        } catch {
+            if !Task.isCancelled { await failed(error.localizedDescription) }
+        }
+    }
+
+    /// Count this day's visible moments in SQLite; return only the six quotes Today shows, without decoding memory/embedding records.
+    public func moments(on day: Date, calendar: Calendar, text: @escaping @Sendable (String, String?) -> String) async throws
+        -> (rows: [(id: String, at: Double, text: String)], total: Int, firstAt: Double?, unreadable: Bool) {
+        guard let interval = calendar.dateInterval(of: .day, for: day) else {
+            throw MemoryStorageError.databaseUnavailable("Today's calendar interval is unavailable.")
+        }
+        return try await dbPool.read { db in
+            // The caller supplies its exact display-text rule; count and selection cannot disagree about an empty quote.
+            let words = DatabaseFunction("today_moment_text", argumentCount: 2, pure: true) { args in
+                guard let content = String.fromDatabaseValue(args[0]) else {
+                    throw MemoryStorageError.databaseUnavailable("A moment has no content.")
+                }
+                return text(content, String.fromDatabaseValue(args[1]))
+            }
+            let stamp = DatabaseFunction("today_moment_time", argumentCount: 1, pure: true) { args in
+                String.fromDatabaseValue(args[0]).flatMap {
+                    NativeTimestampFormat.parseISO8601FractionalFirst($0.trimmingCharacters(in: .whitespacesAndNewlines))
+                }?.timeIntervalSince1970
+            }
+            let live = DatabaseFunction("today_moment_live", argumentCount: 1, pure: true) { args in
+                MemoryLifecycle.isRecallEligible(String.fromDatabaseValue(args[0]))
+            }
+            db.add(function: words); db.add(function: stamp); db.add(function: live)
+            defer { db.remove(function: words); db.remove(function: stamp); db.remove(function: live) }
+            let eligible = """
+                FROM memories WHERE json_extract(metadata_json, '$.kind') = ?
+                  AND today_moment_live(lifecycle)
+                """
+            let selected = eligible + "\n" + """
+                  AND today_moment_time(created_at) IS NOT NULL
+                  AND julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?)
+                  AND today_moment_text(content, json_extract(metadata_json, '$.quote')) != ''
+                """
+            let args: StatementArguments = [MemoryMoments.kind,
+                NativeTimestampFormat.fractionalZulu(interval.start), NativeTimestampFormat.fractionalZulu(interval.end)]
+            let counts = try Row.fetchOne(db, sql: "SELECT COUNT(*) AS total, MIN(today_moment_time(created_at)) AS first_at " + selected, arguments: args)
+            guard let counts else { throw MemoryStorageError.databaseUnavailable("Today's moment count is unavailable.") }
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT id, today_moment_time(created_at) AS at, today_moment_text(content, json_extract(metadata_json, '$.quote')) AS text
+                """ + "\n" + selected + " ORDER BY julianday(created_at) DESC, id DESC LIMIT 6", arguments: args)
+            let unreadable = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 " + eligible + " AND today_moment_time(created_at) IS NULL)",
+                                              arguments: [MemoryMoments.kind])
+            guard let unreadable else { throw MemoryStorageError.databaseUnavailable("Today's moment timestamp status is unavailable.") }
+            let moments: [(id: String, at: Double, text: String)] = rows.map { (id: $0["id"], at: $0["at"], text: $0["text"]) }
+            return (moments, counts["total"], counts["first_at"], unreadable)
+        }
+    }
+
     /// Project canonical mutations through one USER.md owner.
     public func attachUserMDGenerator(_ generator: UserMDGenerator) async {
         guard !projectionsClosed else { await generator.shutdown(); return }
@@ -212,7 +303,7 @@ extension MemoryStorage {
         memoryPath: URL
     ) {
         guard !evicted.isEmpty else { return }
-        nativeLog("MemoryV2 bound: pruned %d overflow row(s) while opening %@",
+        nativeLog("MemoryV2 bound: archived %d active overflow row(s) while opening %@",
               evicted.count, memoryPath.lastPathComponent)
         Task {
             for memory in evicted {
@@ -227,25 +318,22 @@ extension MemoryStorage {
         }
     }
 
-    /// Carry disclosure-filtered person facts with pins first in pinned order, then the remaining facts newest first.
-    public func userPromptCore(surface: String) async throws -> [String] {
+    /// Carry pinned person facts and whether any eligible person facts exist, from one disclosure-filtered read.
+    public func userPromptCore(surface: String) async throws -> (facts: [String], established: Bool) {
         let now = Date()
         let dataRoot = path.deletingLastPathComponent().deletingLastPathComponent()
         return try await dbPool.read { db in
             let rows = try Row.fetchAll(db, sql: """
-                SELECT * FROM memories WHERE status = 'active' AND persona_id = ?
+                SELECT \(Self.memoryProjectionColumns) FROM memories WHERE status = 'active' AND persona_id = ?
                     AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                ORDER BY CASE WHEN json_extract(metadata_json, '$.pinned') = 1 THEN 0 ELSE 1 END,
-                    CASE WHEN json_extract(metadata_json, '$.pinned') = 1
-                        THEN COALESCE(json_extract(metadata_json, '$.pinned_order'), 0) END,
-                    CASE WHEN json_extract(metadata_json, '$.pinned') = 1 THEN created_at END,
-                    CASE WHEN json_extract(metadata_json, '$.pinned') = 1 THEN id END,
-                    created_at DESC
-            """, arguments: [MemoryV2Defaults.personaID]).map(Self.decodeMemory).filter {
+                ORDER BY COALESCE(json_extract(metadata_json, '$.pinned_order'), 0), created_at, id
+            """, arguments: [MemoryV2Defaults.personaID]).map(Self.decodeMemoryProjection).filter {
                 MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0), at: now)?
                     .permits(surface: surface, personaID: nil) == true
             }
-            return Array(UserMDGenerator.userFacts(memories: rows, now: now, dataRoot: dataRoot))
+            let pinned = rows.filter { Self.metadataFlag($0.metadata, "pinned") }
+            return (Array(UserMDGenerator.userFacts(memories: pinned, now: now, dataRoot: dataRoot)),
+                    UserMDGenerator.userFacts(memories: rows, now: now, dataRoot: dataRoot).contains { _ in true })
         }
     }
 }

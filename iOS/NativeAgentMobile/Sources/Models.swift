@@ -65,24 +65,11 @@ extension TrustPolicy {
         updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
         macControlPolicy = try c.decodeIfPresent(MacControlPolicyWireSnapshot.self, forKey: .macControlPolicy)
     }
-
-    var effectiveRequireBackups: Bool? {
-        requireBackups ?? filePolicy?.requireBackupBeforeWrite
-    }
-
-    var effectiveOutsideDefault: String? {
-        outsideDefault ?? filePolicy?.outsideWorkspaceDefault
-    }
 }
-
-
 
 typealias ProviderAuthStatus = NativeAgentShared.ProviderAuthStatus
 
 typealias ProviderModelInfo = NativeAgentShared.ProviderModelInfo
-
-
-typealias ProviderTestResult = NativeAgentShared.ProviderTestResult
 
 /// One built-in guidance entry in the skills snapshot.
 struct SkillManifestEntry: Decodable, Identifiable, Hashable, Sendable {

@@ -87,7 +87,6 @@ struct StandingBotsDisk: Sendable {
         guard !bot.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !bot.brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               bot.briefVersion > 0, bot.budget.tokens > 0, (bot.dailyTokenCeiling ?? 1) > 0,
-              bot.budget.seconds.isFinite, bot.budget.seconds > 0,
               bot.createdAt.timeIntervalSince1970.isFinite, bot.updatedAt.timeIntervalSince1970.isFinite else {
             throw StandingBotsError.invalidValue("definition")
         }

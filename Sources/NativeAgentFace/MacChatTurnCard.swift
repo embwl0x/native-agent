@@ -30,6 +30,7 @@ struct MacChatTurnCard: View {
     var done: [TurnFace.Step] = []
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.chatPageIsVisible) private var chatPageIsVisible
 
     private var tint: Color {
         switch model.tone {
@@ -261,7 +262,7 @@ struct MacChatTurnCard: View {
     @ViewBuilder
     private var leading: some View {
         if model.showsLiveIndicator {
-            PulsingDot(color: tint, size: 7, animates: !reduceMotion)
+            PulsingDot(color: tint, size: 7, animates: !reduceMotion && chatPageIsVisible)
         } else {
             Image(systemName: model.symbolName)
                 .font(NativeAgentFont.tag)
@@ -368,13 +369,14 @@ struct MacChatTurnLongStepLine: View {
 struct MacChatTurnThinkingTitle: View {
     let since: Date
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.chatPageIsVisible) private var chatPageIsVisible
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.xs) {
             Text("Thinking\u{2026}")
                 .foregroundStyle(NativeAgentShell.secondary)
                 .overlay {
-                    if !reduceMotion {
+                    if !reduceMotion, chatPageIsVisible {
                         // Draw from the clock to avoid repeatForever layout recursion.
                         TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
                             GeometryReader { geometry in

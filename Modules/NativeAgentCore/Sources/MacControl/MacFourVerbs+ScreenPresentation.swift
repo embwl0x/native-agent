@@ -385,7 +385,9 @@ extension MacFourVerbs {
             for key in ["reason", "detail", "effects", "note", "guidance", "message", "remedy", "blocked_by", "block_reason", "matched_name",
                 "bundle_identifier", "process_identifier",
                         "requested_events_emitted", "recovery_events_emitted", "effects_may_have_occurred",
-                        "ax_outcome", "ax_emission_attempted", "ax_cause", "ax_native_code", "ax_outcomes", "ax_readback"] { detail[key] = output[key] }
+                        "ax_outcome", "ax_emission_attempted", "ax_cause", "ax_native_code", "ax_outcomes", "ax_readback", "menu_cleanup"] {
+                detail[key] = output[key]
+            }
         }
         if let error = result.error { detail["error"] = .string(error) }
         if result.error?.hasPrefix("human_takeover:") == true, case .object(let receipt) = result.output {

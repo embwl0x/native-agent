@@ -100,10 +100,9 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     public let userMessage: String
     public let assistantMessage: String
     public let existing: [MemoryManagerExistingMemory]
+    public let standing: Int
     /// Pending rows shown in the prompt and used to resolve update targets before meaning is written. Never reconstructed on replay.
     public let pendingTargets: [MemoryManagerExistingMemory]
-    /// The nearest claims the agent was told to forget or the person rejected.
-    public let forgotten: [String]
     /// Use the person's configured name so retained facts identify their subject.
     public let personName: String?
     public let standingAgent: Bool
@@ -128,8 +127,8 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         userMessage: String,
         assistantMessage: String,
         existing: [MemoryManagerExistingMemory] = [],
+        standing: Int = 0,
         pendingTargets: [MemoryManagerExistingMemory] = [],
-        forgotten: [String] = [],
         personName: String? = nil,
         standingAgent: Bool = false,
         appAuthored: Bool = false,
@@ -145,8 +144,8 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         self.userMessage = userMessage
         self.assistantMessage = assistantMessage
         self.existing = existing
+        self.standing = standing
         self.pendingTargets = pendingTargets
-        self.forgotten = forgotten
         self.personName = personName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? personName : nil
         self.standingAgent = standingAgent
         self.appAuthored = appAuthored
@@ -282,6 +281,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
     public let affect: CognitiveSubstrate.AffectAppraisal
     public let caring: CaringAppraisalVerdict
     public let cares: [CognitiveCareJudgment]
+    public let careFaults: [String]?
     public let promises: [MemoryManagerPromise]
     public let settled: [MemoryManagerSettlement]
     /// The incoming words were the app's, so only the agent's side of the exchange counts.
@@ -291,13 +291,14 @@ public struct AfterTurnInterpretation: Codable, Sendable {
 
     public init(memories: [MemoryManagerDecision],
                 affect: CognitiveSubstrate.AffectAppraisal, caring: CaringAppraisalVerdict,
-                cares: [CognitiveCareJudgment] = [], promises: [MemoryManagerPromise] = [],
+                cares: [CognitiveCareJudgment] = [], careFaults: [String]? = nil, promises: [MemoryManagerPromise] = [],
                 settled: [MemoryManagerSettlement] = [], appAuthored: Bool = false,
                 model: String?, surface: String) {
         self.memories = memories
         self.affect = affect
         self.caring = caring
         self.cares = cares
+        self.careFaults = careFaults
         self.promises = promises
         self.settled = settled
         self.appAuthored = appAuthored
@@ -306,7 +307,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case memories, affect, caring, cares, promises, settled, appAuthored, model, surface
+        case memories, affect, caring, cares, careFaults, promises, settled, appAuthored, model, surface
     }
 
     public init(from decoder: Decoder) throws {
@@ -315,6 +316,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
         affect = try values.decode(CognitiveSubstrate.AffectAppraisal.self, forKey: .affect)
         caring = try values.decode(CaringAppraisalVerdict.self, forKey: .caring)
         cares = try values.decode([CognitiveCareJudgment].self, forKey: .cares)
+        careFaults = try values.decodeIfPresent([String].self, forKey: .careFaults)
         promises = try values.decode([MemoryManagerPromise].self, forKey: .promises)
         settled = try values.decode([MemoryManagerSettlement].self, forKey: .settled)
         appAuthored = try values.decode(Bool.self, forKey: .appAuthored)
@@ -402,8 +404,6 @@ public enum MemoryManagerLane {
     /// Bound memories to sentences rather than paragraphs.
     public static let statementCap = 200
     public static let statementFloor = 12
-    /// Use the same embedding to select forgotten claims and known memories for judgment.
-    public static let forgottenTopK = 8
     /// Carry the superseded target so acceptance can archive the exact old row.
     public static let supersedesKey = "supersedes_memory_id"
     /// Retain the target's staging-time fingerprint so acceptance cannot demote wording the user never reviewed.
@@ -583,7 +583,7 @@ public enum MemoryManagerLane {
                                                    pending: kept == nil) }, grounding: decision.grounding)
         }
         return AfterTurnInterpretation(memories: decisions, affect: interpretation.affect,
-            caring: interpretation.caring, cares: interpretation.cares, promises: interpretation.promises,
+            caring: interpretation.caring, cares: interpretation.cares, careFaults: interpretation.careFaults, promises: interpretation.promises,
             settled: interpretation.settled,
             appAuthored: interpretation.appAuthored,
             model: interpretation.model, surface: interpretation.surface)

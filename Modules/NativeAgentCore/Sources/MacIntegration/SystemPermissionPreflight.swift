@@ -177,6 +177,7 @@ public enum SystemPermissionPreflight {
         guard let executable = grantProbeExecutable else { return .unknown }
         let process = Process(), output = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
+        process.environment = ManagedProcess.agentEnvironment()
         process.arguments = [grantProbeArgument]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output

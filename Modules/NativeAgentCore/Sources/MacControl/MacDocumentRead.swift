@@ -145,13 +145,15 @@ public enum MacDocumentRead {
         var didRedact = false
         collection: for node in collected where textRoles.contains(node.attributes.role) {
             let a = node.attributes
-            let value = nonEmpty(a.value)
-            guard let raw = value ?? nonEmpty(a.title) else { continue }
+            let editorValue = a.role == "AXTextArea" && a.value?.isEmpty == false
+            guard let raw = editorValue ? a.value : nonEmpty(a.value) ?? nonEmpty(a.title) else { continue }
             if raw.count > maxCharsPerNode { truncated = true }
             let enclosing = MacScreenViewTextRedaction.enclosingKinds(
                 forNodeAt: a.frame, path: node.path, among: secretContext.enclosingCaptions
             )
-            for line in split(raw) {
+            for original in raw.prefix(maxCharsPerNode).split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+                let line = original.trimmingCharacters(in: .whitespaces)
+                guard editorValue || !line.isEmpty else { continue }
                 let redacted: JSONValue
                 if a.value != nil, MacScreenViewBuilder.isSecretField(role: a.role, subrole: a.subrole, label: a.title) {
                     redacted = MacScreenViewTextRedaction.redactedText(line, reason: "secure_field")
@@ -163,7 +165,7 @@ public enum MacDocumentRead {
                 }
                 let text: String
                 if case .string(let safe) = redacted {
-                    text = safe
+                    text = editorValue ? String(original) : safe
                 } else {
                     didRedact = true
                     let reason: String
@@ -173,11 +175,11 @@ public enum MacDocumentRead {
                     text = "[redacted: \(reason)]"
                 }
                 let remaining = limit - characters - (lines.isEmpty ? 0 : 1)
-                guard remaining > 0 else { truncated = true; break collection }
+                guard remaining > 0 || (remaining == 0 && text.isEmpty) else { truncated = true; break collection }
                 let kept = String(text.prefix(remaining))
                 characters += kept.count + (lines.isEmpty ? 0 : 1)
                 lines.append(kept)
-                wholeText = wholeText && a.role == "AXTextArea" && value != nil
+                wholeText = wholeText && editorValue
                 if kept.count < text.count { truncated = true; break collection }
             }
         }
@@ -192,14 +194,6 @@ public enum MacDocumentRead {
         guard let raw else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    /// Split AX values into lines because cross-frame identity and merging operate on lines, even when one value holds an entire document.
-    static func split(_ raw: String) -> [String] {
-        String(raw.prefix(maxCharsPerNode))
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
     }
 
     // MARK: - Cross-frame identity: the merge
@@ -221,7 +215,7 @@ public enum MacDocumentRead {
         private mutating func append(_ fresh: [String]) {
             for line in fresh {
                 let remaining = remainingCharacters - (lines.isEmpty ? 0 : 1)
-                guard remaining > 0 else { truncated = true; break }
+                guard remaining > 0 || (remaining == 0 && line.isEmpty) else { truncated = true; break }
                 let kept = String(line.prefix(remaining))
                 characters += kept.count + (lines.isEmpty ? 0 : 1)
                 lines.append(kept)
@@ -272,7 +266,7 @@ public enum MacDocumentRead {
             let maxK = min(tail.count, frame.count)
             guard maxK > 0 else { return nil }
             for k in stride(from: maxK, through: 1, by: -1)
-            where Array(tail.suffix(k)) == Array(frame.prefix(k)) {
+                where tail.suffix(k).elementsEqual(frame.prefix(k)) && frame.prefix(k).contains(where: { nonEmpty($0) != nil }) {
                 let fresh = Array(frame.dropFirst(k))
                 guard !fresh.isEmpty else { return true }
                 append(fresh)
@@ -294,6 +288,8 @@ public enum MacDocumentRead {
                   frame[frame.count - 1 - tail] == previous[previous.count - 1 - tail] {
                 tail += 1
             }
+            if frame.prefix(head).allSatisfy({ nonEmpty($0) == nil }) { head = 0 }
+            if frame.suffix(tail).allSatisfy({ nonEmpty($0) == nil }) { tail = 0 }
             guard head > 0 || tail > 0 else { return frame }
             return Array(frame.dropFirst(head).dropLast(tail))
         }

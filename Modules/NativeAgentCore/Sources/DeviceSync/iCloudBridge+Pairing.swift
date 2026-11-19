@@ -128,7 +128,6 @@ extension iCloudBridge {
         if wasElsewhere {
             doctorTransportHealth = .unmeasured
         }
-        Task.detached(priority: .utility) { await PairingSecret.publishMaterialToKVS() }
         Task {
             _ = await self.publishProviderCatalogStatus()
             await self.sync.engine.republishPhonePages()
@@ -295,16 +294,14 @@ extension iCloudBridge {
             return .init(.broken, "CloudKit cannot wake this Mac for phone messages.", owner: .builder,
                          lever: "Repair APNs registration and CloudKit subscriptions. Open Connection to refresh explicitly meanwhile.")
         }
-        let carrier = deviceTransport != nil ? "CloudKit" : "iCloud Drive"
+        let carrier = "CloudKit"
         switch doctorTransportHealth {
         case .available, .pairedElsewhere:
             guard doctorSendFailures.isEmpty else {
                 return .init(.waiting, "\(carrier) is up; some deliveries to the iPhone are waiting to resend.", owner: .network,
                              lever: "Keep this Mac online with NativeAgent open; it resends on its own.")
             }
-            // A build without the key-value store has one way to wake the phone; the phone also reads iCloud whenever its app opens.
-            return .init(.holds, "\(carrier) carries their messages." + (deviceTransport != nil && !DeviceCloudKitPreflight.hasKeyValueStoreEntitlement()
-                ? " This build wakes the iPhone by CloudKit push only; the iPhone also reads iCloud whenever its app opens." : ""))
+            return .init(.holds, "CloudKit carries their messages and wakes the iPhone by push; the iPhone also reads iCloud whenever its app opens.")
         case .unmeasured:
             return .init(.waiting, "\(carrier) is starting; not measured yet.")
         case .signedOut:
@@ -347,7 +344,7 @@ extension iCloudBridge {
             return .init(.waiting, "No message from your iPhone yet.", owner: .personOnPhone,
                          lever: "Send a message from NativeAgent on your iPhone.")
         }
-        return .init(.holds, "Last message from your iPhone: \(contact.formatted(date: .abbreviated, time: .shortened)).")
+        return .init(.holds, "Last message from your iPhone: \(contact.formatted(date: .abbreviated, time: .omitted)).")
     }
 
 }

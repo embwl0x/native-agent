@@ -77,8 +77,7 @@ public enum ToolArguments {
         // Contacts owns its raw contract: nulls and numeric entries must not disappear or become strings before the owner can reject them.
         try MacContactsExecutor.validateArguments(tool: canonical, input: input)
         // The call's one reading comes first, so the address binding, gates and receipts all see an action's arguments inside args.
-        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, ToolNameAliases.doorCall(canonical, input),
-            reportShim: recordShims), reportShim: recordShims)
+        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, ToolNameAliases.doorCall(canonical, input)))
         try SwiftToolDispatcher.validateDeskMutationArguments(canonical, input: input)
         let authoring = canonical == "sense_make" || (canonical == "ability_manage" && input["verb"] == .string("save"))
         // No executor runs without the current catalog contract.
@@ -227,6 +226,7 @@ private enum PreparedContextInvocationPart: ToolInvocationPart { static let unse
 private enum InternalReadInvocationPart: ToolInvocationPart { static let unset: Bool = false }
 private enum InsideWorkspaceInvocationPart: ToolInvocationPart { static let unset: Bool = false }
 private enum DryRunInvocationPart: ToolInvocationPart { static let unset: Bool = false }
+private enum ArgumentPreflightInvocationPart: ToolInvocationPart { static let unset: Bool = false }
 private enum LiveTargetInvocationPart: ToolInvocationPart { static let unset: AgentConversationLiveTarget? = nil }
 private enum HelperDoorInvocationPart: ToolInvocationPart { static let unset: HelperContact.Door? = nil }
 private enum ReturnsHistoryInvocationPart: ToolInvocationPart { static let unset: Bool = true }
@@ -285,6 +285,10 @@ extension ChatToolInvocation {
     package var dryRun: Bool {
         get { self[DryRunInvocationPart.self] }
         set { self[DryRunInvocationPart.self] = newValue }
+    }
+    package var argumentPreflightOnly: Bool {
+        get { self[ArgumentPreflightInvocationPart.self] }
+        set { self[ArgumentPreflightInvocationPart.self] = newValue }
     }
     package var liveTarget: AgentConversationLiveTarget? {
         get { self[LiveTargetInvocationPart.self] }

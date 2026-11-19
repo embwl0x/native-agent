@@ -53,17 +53,6 @@ public enum IntentionClock {
 
     static func filed(_ step: DeskStep) -> Date? { step.filedAt.flatMap(DeskClock.parseISO) }
 
-    /// Calendar anchors retain the complete civil time, not just the identity's minute. A supported firstRunAt of 16:00:30 must never become 16:00:00.
-    public static func importedStart(at date: Date, rhythm: JSONValue) -> String {
-        if SchedulerJobNormalizer.rhythmInterval(rhythm) != nil {
-            return NativeTimestampFormat.microsecondUTCOffset(date, rounding: .up)
-        }
-        let civil = date.addingTimeInterval(TimeInterval(TimeZone.autoupdatingCurrent.secondsFromGMT(for: date)))
-        let start = NativeTimestampFormat.microsecondUTCOffset(civil, rounding: .up)
-            .replacingOccurrences(of: "T", with: " ").replacingOccurrences(of: "+00:00", with: "")
-        return start
-    }
-
     /// Resolve civil time in the current zone, preserving the subminute part. The scheduler still owns minute-based occurrence identity through moves.
     private static func firstOccurrence(_ step: DeskStep, rhythm: JSONValue) -> Date? {
         guard let start = step.clockStart else { return nil }

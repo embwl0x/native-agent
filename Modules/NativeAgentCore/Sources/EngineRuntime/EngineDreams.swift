@@ -117,6 +117,7 @@ extension NativeAgentEngine {
             "ok": report.errors.isEmpty, "backend": "swift", "force": force,
             "trigger": report.trigger.rawValue, "sessionsProcessed": report.sessionsProcessed,
             "entriesWritten": report.entriesWritten, "disabled": report.disabled, "errors": report.errors,
+            "moreMessagesRemain": report.moreMessagesRemain,
         ]
         response["entryDate"] = DreamREMSchedule.todayKey(now: beganAt)
         if let skipReason = report.skipReason { response["skipReason"] = skipReason }

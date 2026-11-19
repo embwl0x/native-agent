@@ -1,4 +1,5 @@
 import Foundation
+import ChatTurnContracts
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
@@ -159,6 +160,11 @@ public actor BotRunner {
         var turn = parent?.derived() ?? Turn(session: bot.sessionID)
         turn.session = bot.sessionID
         turn.botEventProvenance = claimed.provenance
+        if !claimed.steeringSources.isEmpty {
+            let steering = turn.peerSteering ?? PeerDataTaint()
+            for source in claimed.steeringSources { steering.mark(peer: source) }
+            turn.peerSteering = steering
+        }
         return try await perform(bot, message: message, requestID: claimed.runID,
             turn: turn, scope: scope.entering(id), judgesCondition: !ask.isEmpty)
     }
@@ -275,7 +281,6 @@ public actor BotRunner {
             uncertainties: outcome.detail.map { [$0] } ?? [],
             runHealth: health,
             spend: ShelfSpend(tokens: nil, seconds: max(0, seconds)))
-        entry.reply = outcome.reply
         entry.artifacts = outcome.artifacts
         entry.status = outcome.status
         entry.statusDetail = outcome.detail

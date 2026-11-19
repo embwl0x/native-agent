@@ -4,11 +4,6 @@ import PersistenceCore
 // Blueprint: | `AppActions+ProvidersConnectorsCapabilitiesVerbs.swift` | The verbs the rows of Providers, Connectors (Telegram, iPhone, agents) and Capabilities call that no other verb runs; each is a `connections` host verb running the code its row ran |
 
 extension AppActions {
-    /// What a row of the stem's Providers, Connectors and Capabilities pages does where no other verb does it, declared once: the person's
-    /// tap and the agent's call are the same `connections` host call. A lever names why it is the person's, and `asks: false` where no card
-    /// and no word of theirs can stand in for the person: a secret read off their screen, a pairing code they match, a place they choose in a
-    /// system panel, a macOS grant they answer in the foreground, or words sent as theirs. Raising the card or window where they sign in or
-    /// enter a key is no such act: the agent does it when they ask, and asks first when it is its own idea.
     static var providersConnectorsCapabilitiesVerbs: [AppAction] {
         get throws {
             // An irreversible change writes app data through its tool, as every irreversible row verb declares.
@@ -104,7 +99,6 @@ extension AppActions {
                 AppAction("native.run", "capabilities", "Run a Mac action", ["id"], subject: ["id"],
                           owner: .person("it runs the Mac action as the person's own act",
                               name: "Running a Mac action as yours"), tool: "connections", input: verb("native_run")),
-                AppAction("improvement.run", "capabilities", "Run the improvement checks", tool: "connections", input: verb("improvement_run")),
                 AppAction("browser.preview", "capabilities", "Browser dry run", tool: "connections", input: verb("browser_preview")),
                 AppAction("browser.cancel", "capabilities", "Cancel a browser run", ["id"], subject: ["id"],
                           tool: "connections", input: verb("browser_cancel")),
@@ -118,13 +112,14 @@ extension AppActions {
                           ["sense_id", "version:int"], subject: ["sense_id"],
                           owner: .person("sharing a sense exports it to a place the person chooses on the Mac", asks: false, name: "Sharing a sense as a file"),
                           tool: "connections", input: verb("sense_share")),
-                AppAction("ability.keep", "tools", "Approve an ability's exact waiting version and turn it on", ["id", "version?"], subject: ["id"],
-                          owner: .person("approving a grown ability is the person's", instead: "ability.enable keeps it as yours",
+                AppAction("ability.keep", "tools", "Keep an ability's exact waiting version and turn it on", ["id", "version?"], subject: ["id"],
+                          owner: .person("keeping an ability admits its waiting version", instead: "ability.enable keeps it as yours",
                               name: "Approving an ability I grew"),
                           tool: "connections", input: verb("ability_keep")),
-                AppAction("ability.off", "tools", "Turn an ability off as the person's own off, which stays off until the person turns it on",
-                          ["id"], subject: ["id"], owner: .person("the person's off stays off", instead: "ability.disable turns it off as yours",
-                              name: "Turning an ability off as yours"),
+                AppAction("ability.off", "tools", "Turn an ability off",
+                          ["id"], subject: ["id"], owner: .person("switching an ability off changes its availability",
+                              instead: "ability.disable turns it off as yours",
+                              name: "Turning an ability off"),
                           tool: "connections", input: verb("ability_off")),
                 AppAction("skill.build", "skills", "Build a skill in chat: the request started in the Mac's message box",
                           owner: .person("it starts the person's own request in the Mac's message box", asks: false, name: "Starting a skill build in chat"),

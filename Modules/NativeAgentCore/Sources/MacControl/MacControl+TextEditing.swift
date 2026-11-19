@@ -155,9 +155,9 @@ extension SwiftNativeMacControl {
             return result(typed.refusal?.error)
         }
 
-        /// Background typing selects one writer from the requested contract: replace single-line values, insert at multiline selection, or explicit keys.
+        /// AX typing replaces single-line values and inserts at multiline selection; background keys retain their explicit contract.
         /// Unsupported operations stop with their own readback. Pid-addressed keys require the act window and field to retain their app's focus.
-        func typeInBackground(_ text: String) async -> MacActPerformed {
+        func typeWithAXOrBackgroundKeys(_ text: String) async -> MacActPerformed {
             let expected = accessibilityActSource(context: context).textInput(target, context: context)?.inserting(text)
             func needsFront() -> MacActPerformed {
                 MacActPerformed(
@@ -171,7 +171,7 @@ extension SwiftNativeMacControl {
                 )
             }
             if !keystrokes {
-                let replacesValue = ["AXTextField", "AXComboBox", "AXSearchField"].contains(target.role)
+                let replacesValue = MacActClosedLoop.replacesTextValue(role: target.role)
                 if !replacesValue {
                     let outcome = ledgeredSetSelectedText(target, text: text)
                     return MacActPerformed(
@@ -181,9 +181,9 @@ extension SwiftNativeMacControl {
                         expectedText: expected
                     )
                 }
-                    let result = await ledgeredActuatorAct(action: nil, value: text, target: target)
+                let result = await ledgeredActuatorAct(action: nil, value: text, target: target)
                 return summarize(result, target: target, actedHandle: handle,
-                    extra: ["background_route": .string("ax_value_replace")], text: text)
+                    extra: background ? ["background_route": .string("ax_value_replace")] : [:], text: text)
             }
             if let refusal = MacActClosedLoop.secureInputRefusal(active: eventSink.secureKeyboardEntryActive) {
                 return MacActPerformed(
@@ -339,12 +339,7 @@ extension SwiftNativeMacControl {
         }
         let beforeValueWrite = accessibilityActSource(context: context).reread(target, context: context)?.value
         var valueWrite: MacActPerformed?
-        if background { valueWrite = await typeInBackground(text) }
-        // AXSetValue cannot be intercepted by another focused field; explicit keystroke requests still select the keyboard contract.
-        else if !keystrokes {
-            let result = await ledgeredActuatorAct(action: nil, value: text, target: target)
-            valueWrite = summarize(result, target: target, actedHandle: handle, text: text)
-        }
+        if background || !keystrokes { valueWrite = await typeWithAXOrBackgroundKeys(text) }
         if var valueWrite {
             valueWrite.textBeforeWrite = beforeValueWrite
             return valueWrite
@@ -433,7 +428,7 @@ extension SwiftNativeMacControl {
             }
             let input = accessibilityActSource(context: context).textInput(focused, context: context)
             if let refusal = refuseInput("type") { return refusal }
-            let replacesField = ["AXTextField", "AXComboBox", "AXSearchField"].contains(target.role)
+            let replacesField = MacActClosedLoop.replacesTextValue(role: target.role)
             if replacesField {
                 guard let input else { return typingFailure("text_selection_not_ready") }
                 if input.selection != NSRange(location: 0, length: input.value.utf16.count) {

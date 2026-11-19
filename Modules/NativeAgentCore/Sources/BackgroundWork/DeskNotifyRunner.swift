@@ -26,7 +26,6 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
     let dataRoot: URL
 
     public var loopId: String { "desk_notify" }
-    public var tickTimeoutOverride: TimeInterval? { 30 }
 
     public func physiologyEvents() -> AsyncStream<Void> {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
@@ -52,6 +51,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
         let held: Bool
         do { held = try await AttentionRouter.hasHeld(dataRoot: dataRoot) }
+        catch is CancellationError { return nil }
         catch {
             await recordDeadlineFailure(error, source: "held notification record")
             return nil
@@ -69,6 +69,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             try read.validate(proposal)
             return [proposal.deadline.map { Date(timeIntervalSince1970: $0) }, held ? quietEnd : nil].compactMap { $0 }.min()
         } catch {
+            if error is CancellationError || (error as? PartCallError)?.code == "cancelled" { return nil }
             nativeLog("desk_notify: deadline proposal failed: \(error)")
             await settle {
                 await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId,
@@ -89,12 +90,17 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
 
     public func tickOutcome() async -> LoopTickOutcome {
         let outcome = await notify()
-        if Task.isCancelled {
+        if Task.isCancelled || outcome == .skipped(reason: "cancelled", healthNeutral: true) {
             OrganJudge.beat(loopId, .stopped, note: "cancelled", cadence: wake.period)
         } else {
             OrganJudge.beat(loopId, tick: outcome, cadence: wake.period)
         }
         return outcome
+    }
+
+    private func cancelledOutcome(failures: [String]) -> LoopTickOutcome {
+        failures.isEmpty ? .skipped(reason: "cancelled", healthNeutral: true)
+            : .failed(error: "Desk notification partial failure: " + failures.prefix(5).joined(separator: "; "))
     }
 
     private func notify() async -> LoopTickOutcome {
@@ -103,6 +109,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         var failures: [String] = []
         if !Task.isCancelled {
             do { released = try await AttentionRouter.release(dataRoot: dataRoot, router: attention) }
+            catch is CancellationError { return cancelledOutcome(failures: failures) }
             catch { failures.append("Held notification release: \(error.localizedDescription)") }
         }
         let prepared: Result<(DeskNotificationRead, DeskNotificationProposal), Error>
@@ -121,6 +128,9 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         switch prepared {
         case .success(let value): (read, proposal) = value
         case .failure(let error):
+            if error is CancellationError || (error as? PartCallError)?.code == "cancelled" {
+                return cancelledOutcome(failures: failures)
+            }
             // The Desk moved under this pass; the change that moved it wakes the next one, so this is no failure.
             if error is DeskNotificationRead.ChangedRead, released == 0, failures.isEmpty { return .skipped(reason: "the Desk changed during this pass") }
             return .failed(error: "Desk notification proposal/commit: \(error)"
@@ -131,7 +141,10 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let decisions = proposal.notifications
         var notified = 0
         var deferred = Set<String>()
-        let nagCount = await publishNags(proposal, read: read, failures: &failures, deferred: &deferred)
+        let nagCount: Int
+        do { nagCount = try await publishNags(proposal, read: read, failures: &failures, deferred: &deferred) }
+        catch { return cancelledOutcome(failures: failures) }
+        if Task.isCancelled { return cancelledOutcome(failures: failures) }
         if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
             return .notNeeded("no Desk notification due")
         }
@@ -154,7 +167,8 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
                     from: "desk", title: decision.title, summary: decision.body,
                     open: "page:desk/" + decision.handle, evidence: [.init(source: "desk", id: decision.handle)]),
                     reach: .person(from: nil), turn: nil
-                ) } catch { failures.append("\(decision.handle) notification route: \(error.localizedDescription)") }
+                ) } catch is CancellationError { return cancelledOutcome(failures: failures) }
+                catch { failures.append("\(decision.handle) notification route: \(error.localizedDescription)") }
             }
             if let outcome {
                 for (destination, verdict) in outcome.destinationOutcomes {
@@ -190,6 +204,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             return .failed(error: "Desk notification partial failure: "
                 + failures.prefix(5).joined(separator: "; ") + held)
         }
+        if Task.isCancelled { return cancelledOutcome(failures: failures) }
         // Count channel acceptance, not proposed decisions.
         return .completed(result: "notified \(notified) of \(decisions.count) Desk decision(s)"
             + (nagCount > 0 ? " + \(nagCount) recorded nag(s)" : "") + held)
@@ -197,11 +212,11 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
 
     /// A digest never travels alone, except for the mute-expiry drift report.
     private func publishNags(_ proposal: DeskNotificationProposal, read: DeskNotificationRead,
-                             failures: inout [String], deferred: inout Set<String>) async -> Int {
-        guard !Task.isCancelled else { return 0 }
+                             failures: inout [String], deferred: inout Set<String>) async throws -> Int {
+        try Task.checkCancellation()
         if proposal.openWindow {
             if !proposal.digest.isEmpty {
-                if await deliverNag(title: proposal.digestTitle, body: proposal.digestBody,
+                if try await deliverNag(title: proposal.digestTitle, body: proposal.digestBody,
                     label: "unmute digest:\(read.config.windowId)", failures: &failures, deferred: &deferred) {
                     let error: String? = await settle {
                         do {
@@ -217,8 +232,8 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         }
         var delivered = 0
         for nag in proposal.nags {
-            guard !Task.isCancelled else { break }
-            if await deliverNag(title: nag.title, body: nag.body, label: "\(nag.handle):\(read.config.windowId)",
+            try Task.checkCancellation()
+            if try await deliverNag(title: nag.title, body: nag.body, label: "\(nag.handle):\(read.config.windowId)",
                 deskHandle: nag.handle, failures: &failures, deferred: &deferred) {
                 delivered += 1
                 let error: String? = await settle {
@@ -239,14 +254,15 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         deskHandle: String? = nil,
         failures: inout [String],
         deferred: inout Set<String>
-    ) async -> Bool {
-        guard !Task.isCancelled else { return false }
+    ) async throws -> Bool {
+        try Task.checkCancellation()
         // Item handles route banner clicks to their item; the unmute digest has no single target.
         let outcome: AttentionOutcome?
         do { outcome = try await attention.tell(Matter(id: "desk_nag:\(label)", form: .words, from: "desk",
             title: title, summary: body, open: deskHandle.map { "page:desk/" + $0 } ?? "page:desk",
             evidence: deskHandle.map { [.init(source: "desk", id: $0)] } ?? []), reach: .person(from: nil), turn: nil
-        ) } catch {
+        ) } catch is CancellationError { throw CancellationError() }
+        catch {
             outcome = nil
             failures.append("\(label) nag route: \(error.localizedDescription)")
         }

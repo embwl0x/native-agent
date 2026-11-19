@@ -81,58 +81,6 @@ struct PaletteItem: Identifiable, Hashable, Sendable {
     }
 }
 
-extension PaletteItem {
-    init(desk row: DeskPaletteRow) {
-        self.init(
-            id: "desk.\(row.handle)",
-            title: row.title,
-            subtitle: "\(row.alias) · \(row.status) · \(row.project)",
-            systemImage: "tray.full",
-            kind: .deskItem(row.handle)
-        )
-    }
-}
-
-struct DeskPaletteScope {
-    let rows: [DeskPaletteRow]
-    let selectedHandle: String?
-    let onSelect: (String) -> Void
-    let onCommand: (DeskPaletteQuery.Verb, String) -> Void
-}
-
-enum DeskPalettePresentation {
-    static func target(
-        rows: [DeskPaletteRow],
-        matches: [DeskPaletteRow],
-        selectedHandle: String?,
-        parsed: DeskPaletteQuery,
-        highlighted: Int
-    ) -> DeskPaletteRow? {
-        if parsed.verb != nil, parsed.query.isEmpty {
-            return rows.first { $0.handle == selectedHandle }
-        }
-        guard !matches.isEmpty else { return nil }
-        return matches[min(max(highlighted, 0), matches.count - 1)]
-    }
-
-    /// Name Enter's mutation before a stray keystroke can close an item.
-    static func bannerText(
-        for verb: DeskPaletteQuery.Verb,
-        target: DeskPaletteRow?,
-        query: String
-    ) -> String {
-        guard let target else {
-            return query.isEmpty
-                ? "\(verb.actionLabel) — nothing selected yet; type part of an item's title."
-                : "\(verb.actionLabel) — no item matches \u{201C}\(query)\u{201D}."
-        }
-        switch verb {
-        case .close: return "Enter closes \u{201C}\(target.title)\u{201D}."
-        case .deferItem: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the park menu."
-        case .note: return "Enter selects \u{201C}\(target.title)\u{201D} and opens the note field."
-        }
-    }
-}
 
 enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
     case newChat = "new_chat"
@@ -229,14 +177,6 @@ enum CommandPalettePresentation {
         }
     }
 
-    @MainActor
-    static func settingItems(appModel: AppModel) throws -> [PaletteItem] {
-        try QuietSettings.all(host: AppQuietSettingsHost(appModel)).map { row in
-            PaletteItem(id: "setting.\(row.id)", title: row.label,
-                        subtitle: QuietPages.page(named: row.page)?.title ?? row.page,
-                        systemImage: "slider.horizontal.3", kind: .setting(row.page, tab: row.tab))
-        }
-    }
 }
 
 enum CommandPaletteSavedThings {

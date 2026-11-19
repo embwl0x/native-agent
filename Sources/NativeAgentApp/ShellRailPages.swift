@@ -7,7 +7,6 @@ import TrustCenter
 
 
 enum ShellRailTab {
-    static func storageKey(_ item: SidebarItem) -> String { "shell.tab.\(item.rawValue)" }
 
     /// Share layout order between page routes and command search.
     @MainActor static func all(_ layout: SurfaceLayoutAvailability) -> [(page: SidebarItem, tabs: [ShellTab<String>])] {

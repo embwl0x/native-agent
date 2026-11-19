@@ -8,7 +8,6 @@ import ChatToolParsing
 import NativeAgentCore
 import SlackBot
 import TelegramBot
-import TriggerScheduler
 import BackgroundLoops
 import AppToolRuntime
 import TrustCenter
@@ -150,7 +149,7 @@ extension NativeAgentEngine {
                     // Stable bytes: an unchanged card never reads as a changed transcript, so the phone never rebuilds a chat for nothing.
                     encoder.outputFormatting = [.sortedKeys]
                     row.interactionJSON = try Self.phoneDisplayJSON(card, encoder: encoder)
-                    // Phone builds 61/63 require all three fields to draw their conversation card. These are the same prepared owner's facts.
+                    // The phone's transcript schema carries the card, descriptor and source session from the same prepared owner.
                     row.interactionDescriptorJSON = try Self.phoneDisplayJSON(projected.descriptor, encoder: encoder)
                     row.interactionSessionID = projected.sessionID
                     // The card's own face, whole; the phone puts its own Inbox row's answers on it.
@@ -272,6 +271,7 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>,
         jobEvidence: Result<[DeskExecutionEvidence], Error>
     ) {
+        // A standard pass may follow a source change the board has not read yet; it reads behind any read in flight.
         let board = await engine.desk.refreshPage().board!
         let lifecycles = await engine.turns.lifecycleBySession
         let approvals = board.approvals.map { records in
@@ -311,7 +311,10 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     }
     @MainActor public func faceAction(page: String, row: String, action: String, value: String?, device: String) async throws -> String? {
         let pages = page == "memories" ? engine.phoneMemoryPages : engine.pages
-        return try await pages.act(page: page, row: row, action: action, value: value, door: "phone", device: device)
+        let result = try await pages.act(page: page, row: row, action: action, value: value, door: "phone", device: device)
+        // The phone's following Inbox readback must include this completed action, even before its source event is delivered.
+        if page == "inbox" { _ = await settle { await self.engine.desk.refreshPage() } }
+        return result
     }
     @MainActor public func faceOutcome(page: String, row: String, action: String, value: String?, values: [String: PartFace.Value]?,
                                        formRevision: String?, device: String,
@@ -333,8 +336,11 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     }
     public func decidePhoneApproval(id: String, decision: String, device: String) async throws -> ApprovalRecord {
         let provenance = ApprovalResolutionProvenance.signedIOS(clientID: device, decidedBy: "ios_signed_operator")
-        return try await engine.ports.backgroundWork.approvals.resolveApproval(id: id, decision: decision, provenance: provenance,
+        let resolved = try await engine.ports.backgroundWork.approvals.resolveApproval(id: id, decision: decision, provenance: provenance,
             turn: provenance.resolvingTurn)
+        // Queue after any pre-decision read and await publication before returning to the phone's readback.
+        _ = await settle { await self.engine.desk.refreshPage() }
+        return resolved
     }
 
     @MainActor public func answerPhoneInteraction(_ fields: [String: String], device: String) async throws -> [String: String] {
@@ -400,13 +406,14 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         try await engine.mobileChatMessages(sessionId: sessionId)
     }
     public func getOtherRoomExchanges() async throws -> [OtherRoomExchange] {
-        try await AgentContactThreads.read(root: engine.dataRoot, contacts: engine.contacts, includeHelpers: false).otherRooms.map { event in
+        try await AgentContactThreads.read(root: engine.dataRoot, contacts: engine.contacts,
+            includeHelpers: false, refreshDoors: false).otherRooms.map { event in
             OtherRoomExchange(id: event.id, sessionID: event.sessionID, contactID: event.contactID,
                 contact: TurnSecretRedactor.redactText(event.contact), agent: TurnSecretRedactor.redactText(event.agent), at: event.at,
                 message: TurnSecretRedactor.redactText(event.message), reply: TurnSecretRedactor.redactText(event.reply))
         }
     }
-    public func getHealth() async throws -> RuntimeHealth { engine.doctor.readHealth() }
+    public func getHealth() async throws -> RuntimeHealth { try await engine.doctor.readHealth() }
     public func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows {
         (try await engine.memory.proposals(status: "pending")).map(MemoryProposalRecord.init)
     }
@@ -520,7 +527,8 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
             }
         }
 
-        passthrough["status"] = (responseValue("status") as? String) ?? passthrough["status"] ?? "ok"
+        // A status the owner did not give stays absent; the phone judges the outcome by result_class.
+        passthrough["status"] = (responseValue("status") as? String) ?? passthrough["status"]
         passthrough["result_class"] = reply.outcome.rawValue
 
         let resultText: String
@@ -570,11 +578,6 @@ extension EngineDeviceSyncHost {
 }
 
 extension EngineDeviceSyncHost {
-    @MainActor
-    public func providerSignInStates() -> [String: [String: String]] { ProviderSignInHandoff.shared.states }
-}
-
-extension EngineDeviceSyncHost {
     public func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows {
         try await engine.connectors.disconnectMobileConnector(id: id)
     }
@@ -595,10 +598,6 @@ extension AttentionDeliveryPorts {
         }
     )
     }
-}
-
-extension DeviceSync: TriggerSnapshotDeliveryPort {
-    public func writeSnapshots() async { await engine.writeSnapshots() }
 }
 
 @MainActor
@@ -661,17 +660,7 @@ public struct EngineICloudIncomingTurnPort: ICloudIncomingTurnPort {
         let turns = engine.turns
         let sync = engine.deviceSync!
         let runID = sync.engine.activeChatRunID(for: sessionID)
-        var activity = turns.lifecycle(for: sessionID)?.presentation.currentAction
-        if let runID,
-           let data = NSUbiquitousKeyValueStore.default.data(forKey: NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest) {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            if let progress = try? decoder.decode(BridgeMessage.self, from: data),
-               progress.sessionID == sessionID, progress.correlationID == runID,
-               progress.metadata?["kind"] == "tool_use", let name = progress.metadata?["toolName"] {
-                activity = ToolActivityPresentation.progress(name)
-            }
-        }
+        let activity = turns.lifecycle(for: sessionID)?.presentation.currentAction
         turns.runtime.phoneControlHandoffSentAt[sessionID] = max(
             turns.runtime.phoneControlHandoffSentAt[sessionID] ?? messageDate, messageDate
         )

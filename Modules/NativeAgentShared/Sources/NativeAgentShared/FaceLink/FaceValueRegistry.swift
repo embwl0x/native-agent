@@ -59,6 +59,7 @@ public struct FaceValueRegistry: Sendable {
             .init(InboxCountsFace.self, name: "inbox-counts-face.v1"),
             .init(CountsFace.self, name: "counts-face.v1"),
             .init(PartFaceSnapshot.self, name: "part-face-snapshot.v1"),
+            .init(PageTitleFace.self, name: "page-title-face.v1"),
             .init(PartFaceCatalog.self, name: "part-face-catalog.v1"),
             .init(ProviderSettingsSnapshot.self, name: "provider-settings-snapshot.v1"),
             .init(ProviderHelperPresentation.self, name: "provider-helper-presentation.v1"),

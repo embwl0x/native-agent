@@ -126,6 +126,15 @@ public enum MacControlSensitivePathFence {
         PersistenceCore.defaultDataRoot().path
     }
 
+    public static func credentialRoots(dataRoot: URL) -> [URL] {
+        SenseSandboxProfile.credentialRoots + [SwiftNativeManifestSigner(dataRoot: dataRoot).keyPath]
+            + ["providers", "codex_home", "codex_child_home"].map { dataRoot.appendingPathComponent($0, isDirectory: true) }
+    }
+
+    public static func isCredentialPath(_ path: URL, dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> Bool {
+        try SenseSandboxProfile.containsResolved(path, roots: credentialRoots(dataRoot: dataRoot))
+    }
+
     public static func reason(forPath rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "empty path" }

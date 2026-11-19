@@ -98,25 +98,12 @@ struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
 }
 
 extension iCloudSyncEngine {
-    /// Retain newer canonical rows and removals until the Mac snapshot revision acknowledges their readbacks.
     func orderedSnapshot<Row: Decodable & Identifiable & Sendable>(
         _ read: MacSnapshotRead<[Row]>, file: String, current: [Row]
     ) -> [Row] where Row.ID == String {
         if read.revision < (snapshotReadRevisions[file] ?? 0) { return current }
         snapshotReadRevisions[file] = read.revision
-        let newer = (recordReadbackRevisions[file] ?? [:]).filter { $0.value > read.revision }
-        recordReadbackRevisions[file] = newer
-        let currentByID = Dictionary(current.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        let incomingIDs = Set(read.value.map(\.id))
-        return read.value.compactMap { newer[$0.id] == nil ? $0 : currentByID[$0.id] }
-            + current.filter { newer[$0.id] != nil && !incomingIDs.contains($0.id) }
-    }
-
-    func installReadback(revision: Double, file: String, id: String) -> Bool {
-        let applied = max(snapshotReadRevisions[file] ?? 0, recordReadbackRevisions[file]?[id] ?? 0)
-        if revision < applied { return false }
-        recordReadbackRevisions[file, default: [:]][id] = revision
-        return true
+        return read.value
     }
 
     func applyConnectorSnapshot(_ rows: [MobileConnectorSnapshot]) {
@@ -537,35 +524,6 @@ extension iCloudSyncEngine {
     }
 
     @discardableResult
-    func refreshHealthSnapshot() async -> (outcome: AdvancedSnapshotRefreshOutcome, feedbackMessage: String?) {
-        guard let snapshotDir else {
-            health = nil
-            organismLivingStatus = nil
-            return (.unavailable, "Health snapshot is still downloading from iCloud. Try again in a moment.")
-        }
-        let lifecycle = lifecycleGeneration
-        async let healthRead: SnapshotReading<RuntimeHealth> = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
-        async let organismRead = readOrganismSnapshot(in: snapshotDir)
-        let (latest, organism) = await (healthRead, organismRead)
-        guard lifecycle == lifecycleGeneration, !Task.isCancelled else {
-            return (.superseded, "Health refresh was superseded by a sync reconfiguration. Try again.")
-        }
-        let latestValue = acceptSnapshot(latest, named: "health.json")
-        let organismValue = organism.value
-        // Absence stays explicit; coordinated-read failure preserves the prior publication.
-        if let state = latest.health, !state.failed { health = latestValue }
-        if latestValue != nil && organismValue != nil {
-            noteRefreshSucceeded()
-            return (.refreshed, syncError)
-        }
-        let outcome: AdvancedSnapshotRefreshOutcome = latestValue != nil || organismValue != nil ? .partial : .unavailable
-        syncError = snapshotHealth.damageSentence() ?? (outcome == .partial
-            ? "Some Health snapshots are still downloading from iCloud."
-            : "Health snapshot is still downloading from iCloud. Try again in a moment.")
-        return (outcome, syncError)
-    }
-
-    @discardableResult
     func refreshRunsSnapshot() async -> (outcome: AdvancedSnapshotRefreshOutcome, feedbackMessage: String?) {
         guard let snapshotDir else { return (.unavailable, "Runs snapshot is still downloading from iCloud. Try again in a moment.") }
         let lifecycle = lifecycleGeneration
@@ -706,7 +664,6 @@ extension iCloudSyncEngine {
         if let v = acceptSnapshot(bundle.connectors, named: "connectors.json") { applyConnectorSnapshot(v) }
         applyProviderState(providers: acceptSnapshot(bundle.providers, named: "providers.json"), surfaceModels: acceptSnapshot(bundle.surfaceModels,
             named: "model_preferences.json"))
-        if let v = acceptSnapshot(bundle.providerSignIns, named: "provider_sign_ins.json"), providerSignIns != v { providerSignIns = v }
     }
 
     private struct LightweightSnapshotBundle: Sendable {
@@ -719,7 +676,6 @@ extension iCloudSyncEngine {
         var pinnedChatSessions: SnapshotReading<ChatSessionNavigation>
         var connectors: SnapshotReading<[MobileConnectorSnapshot]>
         var providers: SnapshotReading<[ProviderInfo]>
-        var providerSignIns: SnapshotReading<[String: [String: String]]>
         var surfaceModels: SnapshotReading<MacSnapshotRead<[String: NAProviderSurfaceSelection]>>
         var approvals: SnapshotReading<MacSnapshotRead<[ApprovalRequest]>>
 
@@ -754,7 +710,6 @@ extension iCloudSyncEngine {
         async let pinnedChatSessions: SnapshotReading<ChatSessionNavigation> = Self.loadSnapshotObjectOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
         async let connectors: SnapshotReading<[MobileConnectorSnapshot]> = Self.loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: SnapshotReading<[ProviderInfo]> = Self.loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
-        async let providerSignIns: SnapshotReading<[String: [String: String]]> = Self.loadSnapshotObjectOnly(named: "provider_sign_ins.json", in: snapshotDir)
         async let surfaceModels: SnapshotReading<MacSnapshotRead<[String: NAProviderSurfaceSelection]>> = Self.loadSnapshotObjectOnly(
             named: "model_preferences.json", in: snapshotDir)
         async let approvals: SnapshotReading<MacSnapshotRead<[ApprovalRequest]>> = Self.loadSnapshotObjectOnly(named: "approvals.json", in: snapshotDir)
@@ -768,7 +723,6 @@ extension iCloudSyncEngine {
             pinnedChatSessions: pinnedChatSessions,
             connectors: connectors,
             providers: providers,
-            providerSignIns: providerSignIns,
             surfaceModels: surfaceModels,
             approvals: approvals
         )
@@ -776,8 +730,8 @@ extension iCloudSyncEngine {
 
     private func readActivitySnapshots(
         snapshotDir: URL, lifecycle: UInt64, recovery: DeviceSyncRecovery
-    ) async -> (loadedAny: Bool, loadedAll: Bool, publishedAll: Bool) {
-        guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return (false, false, false) }
+    ) async -> (loadedAll: Bool, publishedAll: Bool) {
+        guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return (false, false) }
         let inboxAccepted = await refreshInboxSnapshot(recovery: recovery)
         var published = false
         let proposals = await memoryRead.read({ () async -> SnapshotReading<MacSnapshotRead<[MemoryProposalRecord]>> in
@@ -791,7 +745,7 @@ extension iCloudSyncEngine {
             published = true
         })
         let loaded = [inboxAccepted, proposals.value != nil]
-        return (loaded.contains(true), loaded.allSatisfy { $0 }, published && inboxAccepted)
+        return (loaded.allSatisfy { $0 }, published && inboxAccepted)
     }
 
 }

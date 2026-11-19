@@ -42,10 +42,6 @@ public enum ProviderToolCapability {
         transport(providerID: providerID)?.carriesImages ?? false
     }
 
-    public static func caption(providerID: String) -> String? {
-        supportsTools(providerID: providerID) ? nil : "text only, no tools"
-    }
-
     public static let unavailableNote = """
         This account cannot use tools in NativeAgent; choose ChatGPT (OAuth) or another account for tasks that read \
         pages or files.

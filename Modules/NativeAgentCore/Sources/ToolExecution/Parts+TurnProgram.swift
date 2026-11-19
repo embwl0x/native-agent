@@ -72,6 +72,9 @@ extension Parts {
         if asks != nil { return ask("this revision of your turn program, on trial with your why,") }
         var revised = current
         revised.body = source
+        revised.metadata["record"] = .object(current.record)
+        revised.metadata.removeValue(forKey: "candidate")
+        revised.metadata.removeValue(forKey: "proof")
         // Validate the complete proposed file before either retained slot or its trial can change.
         _ = try AbilityStore.encode(revised)
         var receipt: [String: JSONValue] = [
@@ -154,6 +157,9 @@ extension Parts {
             }
             var forward = current
             forward.body = kept.body
+            forward.metadata["record"] = .object(current.record)
+            forward.metadata.removeValue(forKey: "candidate")
+            forward.metadata.removeValue(forKey: "proof")
             var attempted = false
             do { try abilities.write(forward, turn: turn, writing: { attempted = true }) }
             catch {

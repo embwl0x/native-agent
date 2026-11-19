@@ -70,6 +70,10 @@ public actor ContextSQLiteStore {
                 db,
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
             )
+            // The first generation can hold only persona mirrors, with no projected atoms yet.
+            if parentID != nil, draft.changedSources.isEmpty, draft.removedSourceIDs.isEmpty {
+                throw ContextFlowStoreError.emptyGeneration
+            }
             let (generationID, overflow) = (parentID ?? 0).addingReportingOverflow(1)
             guard !overflow, generationID > 0 else {
                 throw ContextFlowStoreError.malformedStoredValue("generation id exhausted or invalid")
@@ -312,10 +316,6 @@ public actor ContextSQLiteStore {
     // MARK: - Validation
 
     private static func validate(_ draft: ContextGenerationDraft) throws {
-        guard !draft.changedSources.isEmpty || !draft.removedSourceIDs.isEmpty else {
-            throw ContextFlowStoreError.emptyGeneration
-        }
-
         var sourceIDs = Set<ContextSourceID>()
         var atomIDs = Set<ContextAtomID>()
         for source in draft.changedSources {

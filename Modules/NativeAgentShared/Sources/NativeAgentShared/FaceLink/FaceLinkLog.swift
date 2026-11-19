@@ -110,6 +110,7 @@ public actor FaceLinkLog {
         case .conversation(let session), .turn(let session), .transcript(let session), .session(let session):
             return name(key) + " session=" + session
         case .page(let page): return "page=" + page
+        case .pageTitle(let page): return "pageTitle=" + page
         default: return name(key)
         }
     }
@@ -140,7 +141,7 @@ public actor FaceLinkLog {
             case .composer(let session): key = "composer session=" + session
             default: key = name(demand)
             }
-            return "observe id=\(id) key=\(key)"
+            return "observe id=\(id) slot=\(key)"
         case .unobserve(let id): return "unobserve id=\(id)"
         default: return name(act)
         }

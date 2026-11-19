@@ -14,7 +14,7 @@ enum CognitiveArtifactCodec {
         guard case .object(let object) = payload else { throw FieldFailure(path: family) }
         let required: [String]
         switch family {
-        case "capsule_presentation": required = ["updatedAt", "soundRutTurnsSinceSurfaced", "remindedOfTurnsSinceSurfaced", "ambivalenceCount"]
+        case "capsule_presentation": required = ["updatedAt", "soundRutTurnsSinceSurfaced", "remindedOfTurnsSinceSurfaced"]
         case "emotional_consolidation": required = ["ranAt", "reinforced", "calmed"]
         case "affect": required = ["updatedAt", "arousal", "uncertainty", "taskPressure", "socialWarmth"]
         case "disposition": required = ["updatedAt", "valence"]
@@ -66,10 +66,10 @@ enum CognitiveArtifactCodec {
         }
         switch family {
         case "capsule_presentation":
-            for key in ["updatedAt", "lastAmbivalenceAt", "remindedOfLastSurfacedAt", "soundRutLastSurfacedAt", "owedSinceGap", "lastSessionBridgeAt"] {
+            for key in ["updatedAt", "remindedOfLastSurfacedAt", "soundRutLastSurfacedAt", "owedSinceGap", "lastSessionBridgeAt"] {
                 try field(key) { $0.numberValue(coercingStrings: false, finiteOnly: true) != nil }
             }
-            for key in ["soundRutTurnsSinceSurfaced", "remindedOfTurnsSinceSurfaced", "ambivalenceCount"] {
+            for key in ["soundRutTurnsSinceSurfaced", "remindedOfTurnsSinceSurfaced"] {
                 try field(key) { if case .int(let count) = $0 { return count >= 0 && Int(exactly: count) != nil }; return false }
             }
             try field("soundRutSignature") { $0.stringValue.map { $0.contains(":") } == true }
