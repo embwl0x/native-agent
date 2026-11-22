@@ -4,6 +4,10 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.22 — new installs pick a model (2026-11-22)
+
+- Fix: on a new install, choosing a Chat model saved nothing; a blank Think level is now no level chosen
+
 ## 0.6.21 — your version, a faster phone (2026-11-22)
 
 - Revise: on the Mac, Revise… on the agent's message sends the person's version as theirs and keeps both; the agent reads both next turn, offers the other

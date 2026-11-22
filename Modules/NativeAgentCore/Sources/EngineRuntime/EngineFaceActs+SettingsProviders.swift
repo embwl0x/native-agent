@@ -41,7 +41,8 @@ extension EngineFaceActs {
         }
         let saved = try await engine.providers.routing.saveGroupSelection(group: ProviderSurfaceGroups.chat,
             providerID: request.edit == .selection ? choice.provider : nil, model: request.edit == .selection ? choice.model : nil,
-            reasoningEffort: request.edit == .fast ? nil : choice.reasoningEffort,
+            // A blank level is no level chosen (a fresh install has none): never checked or saved as a level.
+            reasoningEffort: request.edit == .fast || choice.reasoningEffort.isEmpty ? nil : choice.reasoningEffort,
             serviceTier: request.edit == .reasoning ? nil : (choice.fast ? "priority" : "default"), expectedRevision: request.expectedRevision,
             expectedChatChoice: request.expectedBaseline)
         await engine.providers.publishCommittedRouting(saved.snapshot)
