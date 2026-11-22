@@ -24,7 +24,7 @@ extension SwiftNativeChatOrchestrationClient {
         let admission = TurnRouteAdmission(routingSurface: "chat", modelId: choice.model,
             reasoningEffort: choice.reasoningEffort, providerId: choice.provider, serviceTier: choice.fast ? "priority" : nil)
         return try await holding(turn.with(\.providerChoice, choice)) { turn in
-        try await withModelContext(admission, surface: "bot", turn: turn) { turn in
+        try await withModelContext(admission, turn: turn) { turn in
         try await holding(turn.with(\.tokenBudget, TurnTokenBudget(tokens: bot.budget.tokens))) { turn in
         let run = runID ?? turn.run
         let started = DispatchTime.now().uptimeNanoseconds
@@ -51,12 +51,59 @@ extension SwiftNativeChatOrchestrationClient {
                 runId: run, attachments: attachments, source: "bot", mechanicalRow: .botReceipt,
                 messageId: turn.rows.pinnedUserMessageID ?? UUID().uuidString, turn: turn)
         }
+        let (context, windowTokens, replacingUserID) = try await standingBotContext(bot, choice: choice, turn: turn,
+            run: run, replacing: replacing, input: input, schemas: schemas, codec: codec)
+        let request = try ConversationPrefixSeeding.request(context, codec: codec)
+        let seed = request.seed
+        let layout = (system: request.system ?? "", segments: request.segments)
+        let requestPlan = try request.plan(runID: run, userMessageID: replacingUserID).encoded
+        let prefix = ConversationPrefixTelemetrySink()
+        let work = work.with(\.prefixTelemetry, prefix)
+        prefix.set(ConversationPrefixSeeding.telemetry(seed,
+            toolSchemaFingerprint: SwiftNativeTurnEngine.toolSchemaFingerprint(schemas)))
+        await seed.sentContext.persist(sessionID: bot.sessionID, runID: run,
+            userMessageID: replacingUserID, dataRoot: dataRoot)
+        let flag = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: bot.sessionID, runId: run,
+            turnId: turnID)
+        defer { ChatCancelFlag.finish(flag) }
+        var modelCall = LLMCall(turn: turn, surface: "bot", purpose: "other", session: bot.sessionID)
+        modelCall.systemSegments = layout.segments
+        modelCall.currentUserIndex = seed.currentUserIndex
+        modelCall.requestPlan = requestPlan
+        modelCall.conversationRequest = true
+        modelCall.withinTurnReuse = true
+        modelCall.prefixMeasurement = prefix
+        let call = modelCall
+        let execute = await standingBotExecution(bot, choice: choice, progress: progress, run: run,
+            deliverySurface: deliverySurface, execution: execution, schemas: schemas, codec: codec,
+            providerNames: providerNames, windowTokens: windowTokens, context: context, seed: seed, layout: layout,
+            dispatcher: dispatcher, envelope: envelope, taint: taint)
+        let reply = try await withSessionContextMeasurement(sessionId: bot.sessionID, surface: "bot",
+            turn: turn, work: work) { work in
+            try await TurnDispatchClosure.withTurn(dataRoot: dataRoot, turn: turn) {
+                try await SwiftNativeTurnEngine.untilStopped(flag) {
+                    await execute(turn.with(\.offeredTools, ["app"])
+                        .with(\.capabilityNote, { execution.keepCapabilityNote($0) }), call, work)
+                }
+            }
+        }
+        return try await persistStandingBotReply(reply, bot: bot, choice: choice, progress: progress, turn: turn,
+            flag: flag, execution: execution, choices: choices, envelope: envelope, taint: taint, run: run,
+            turnID: turnID, answerID: answerID, deliverySurface: deliverySurface, started: started)
+        } } }
+    }
+
+    /// The helper's replayed conversation and contact thread, fitted to its model's window.
+    private func standingBotContext(
+        _ bot: BotDefinition, choice: ProviderTurnChoice, turn: Turn, run: String, replacing: Bool,
+        input: TurnAttachmentInput, schemas: [LLMToolSchema], codec: ToolCallCodec
+    ) async throws -> (context: TurnContext, windowTokens: Int, replacingUserID: String?) {
         // A regenerate replaces the tail turn: its question is already on disk
         // and its old answer is not history for the new one.
         let historyRead = history.promptMessagesWithStats(
             transcript: try await history.transcriptBytes(forSessionId: bot.sessionID).bytes,
             excludingRunId: nil
-        ).prompt
+        )
         var rows = try historyRead.checkedMessages()
         var replacingUserID = turn.rows.replacementUserMessageID
         if replacing, let asked = rows.lastIndex(where: { $0.role == "user" }) {
@@ -113,28 +160,18 @@ extension SwiftNativeChatOrchestrationClient {
             replacementUserMessageID: replacing ? replacingUserID : nil)
         context.historyReplaySpec?.historySnapshot = historySnapshot
         context = try await fitSessionRequest(context, codec: codec, sessionId: bot.sessionID,
-            surface: "bot", runId: run, progress: progress, turn: turn)
-        let request = try ConversationPrefixSeeding.request(context, codec: codec, turn: turn)
-        let seed = request.seed
-        let layout = (system: request.system ?? "", segments: request.segments)
-        let requestPlan = try request.plan(runID: run, userMessageID: replacingUserID).encoded
-        let prefix = ConversationPrefixTelemetrySink()
-        let work = work.with(\.prefixTelemetry, prefix)
-        prefix.set(ConversationPrefixSeeding.telemetry(seed,
-            toolSchemaFingerprint: SwiftNativeTurnEngine.toolSchemaFingerprint(schemas)))
-        await seed.sentContext.persist(sessionID: bot.sessionID, runID: run,
-            userMessageID: replacingUserID, dataRoot: dataRoot)
-        let flag = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: bot.sessionID, runId: run,
-            turnId: turnID)
-        defer { ChatCancelFlag.finish(flag) }
-        var modelCall = LLMCall(turn: turn, surface: "bot", purpose: "other", session: bot.sessionID)
-        modelCall.systemSegments = layout.segments
-        modelCall.currentUserIndex = seed.currentUserIndex
-        modelCall.requestPlan = requestPlan
-        modelCall.conversationRequest = true
-        modelCall.withinTurnReuse = true
-        modelCall.prefixMeasurement = prefix
-        let call = modelCall
+            surface: "bot", turn: turn)
+        return (context, windowTokens, replacingUserID)
+    }
+
+    /// The helper's model rounds: request fitting, streamed decoding, tool dispatch with saved receipts, waiting states.
+    private func standingBotExecution(
+        _ bot: BotDefinition, choice: ProviderTurnChoice, progress: TurnEventSink?, run: String, deliverySurface: String,
+        execution: ChatTurnExecution, schemas: [LLMToolSchema], codec: ToolCallCodec, providerNames: ProviderToolNameMap,
+        windowTokens: Int, context: TurnContext, seed: ConversationPrefixSeeding.Seed,
+        layout: (system: String, segments: SystemPromptSegments?), dispatcher: any ToolDispatchClient,
+        envelope: TurnEnvelope?, taint: PeerDataTaint?
+    ) -> @Sendable (Turn, LLMCall, ChatTurnWork) async -> BotTurnReply {
         let roundPrefix = OSAllocatedUnfairLock(initialState: (context, seed))
         let execute: @Sendable (Turn, LLMCall, ChatTurnWork) async -> BotTurnReply = { [self] turn, call, work in
             await BotTurnRunner.run(bot: bot, messages: seed.messages, system: layout.system,
@@ -146,13 +183,13 @@ extension SwiftNativeChatOrchestrationClient {
                     let additional = try ConversationPrefixSeeding.additionalMessages(in: messages, after: previousSeed)
                     let encoded = try codec.providerMessages(additional, records: records, schemas: schemas, turn: turn)
                     let nextContext = try await self.fitSessionRequest(previousContext, codec: codec,
-                        additionalMessages: encoded, sessionId: bot.sessionID, surface: "bot", runId: run, progress: progress, turn: turn)
-                    let nextRequest = try ConversationPrefixSeeding.request(nextContext, codec: codec, turn: turn).appending(additional)
+                        additionalMessages: encoded, sessionId: bot.sessionID, surface: "bot", turn: turn)
+                    let nextRequest = try ConversationPrefixSeeding.request(nextContext, codec: codec).appending(additional)
                     roundPrefix.withLock { $0 = (nextContext, nextRequest.seed) }
                     let measure: @Sendable ([LLMMessage]) async throws -> SessionContextMeasurement = { candidate in
                         let wire = try codec.providerMessages(candidate, records: records, schemas: schemas, turn: turn)
                         let request = try SessionContextRequest(messages: wire, system: layout.system,
-                            tools: codec.requestTools(providerNames.schemas) ?? [], historyCharacters: 0, rowCharacters: [:])
+                            tools: codec.requestTools(providerNames.schemas) ?? [], historyCharacters: 0)
                         return try await SessionContextMeasurement.measure(request, sessionId: bot.sessionID,
                             model: choice.model, providerID: choice.provider, dataRoot: self.dataRoot,
                             windowTokens: windowTokens, call: call)
@@ -161,7 +198,7 @@ extension SwiftNativeChatOrchestrationClient {
                         surface: "bot", sessionID: bot.sessionID, turn: turn, measure: measure)
                     let wire = try codec.providerMessages(fitted, records: records, schemas: schemas, turn: turn)
                     let request = try SessionContextRequest(messages: wire, system: layout.system,
-                        tools: codec.requestTools(providerNames.schemas) ?? [], historyCharacters: 0, rowCharacters: [:])
+                        tools: codec.requestTools(providerNames.schemas) ?? [], historyCharacters: 0)
                     try await SessionContextMeasurement.requireFits(request, sessionId: bot.sessionID,
                         model: choice.model, providerID: choice.provider, dataRoot: self.dataRoot,
                         windowTokens: windowTokens, call: call)
@@ -268,16 +305,16 @@ extension SwiftNativeChatOrchestrationClient {
                     return nil
                 })
         }
-        var reply = try await withSessionContextMeasurement(sessionId: bot.sessionID, model: choice.model,
-            providerID: choice.provider, surface: "bot", runId: run, progress: progress,
-            nextTurnOutputBudgetTokens: bot.budget.tokens, turn: turn, work: work) { work in
-            try await TurnDispatchClosure.withTurn(dataRoot: dataRoot, turn: turn) {
-                try await SwiftNativeTurnEngine.untilStopped(flag) {
-                    await execute(turn.with(\.offeredTools, ["app"])
-                        .with(\.capabilityNote, { execution.keepCapabilityNote($0) }), call, work)
-                }
-            }
-        }
+        return execute
+    }
+
+    /// Saves the helper's reply as its turn ends: a stopped or failed reply as its partial, any other as its answer.
+    private func persistStandingBotReply(
+        _ executed: BotTurnReply, bot: BotDefinition, choice: ProviderTurnChoice, progress: TurnEventSink?, turn: Turn,
+        flag: URL, execution: ChatTurnExecution, choices: ReplyChoices, envelope: TurnEnvelope?, taint: PeerDataTaint?,
+        run: String, turnID: String, answerID: String, deliverySurface: String, started: UInt64
+    ) async throws -> BotTurnReply {
+        var reply = executed
         let stopReadFailure = ChatCancelFlag.readFailure(flag)
         if let reason = stopReadFailure {
             reply.status = .stopped
@@ -325,6 +362,5 @@ extension SwiftNativeChatOrchestrationClient {
         }
         try persisted.get()
         return reply
-        } } }
     }
 }

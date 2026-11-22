@@ -27,10 +27,11 @@ public actor SwiftNativeTrustCenter {
 
     /// Called only by the person's recovery control, never a tool. Preserve damaged authority before explicitly reauthorizing the Safe posture.
     public func reauthorizeSafePolicy() async throws -> TrustPolicy {
-        let path = trustPolicyPath, defaults = defaultTrustPolicy()
+        let path = Self.policyURL(dataRoot: dataRoot), defaults = defaultTrustPolicy()
         let saved = try await SwiftNativePersistenceCore.withFileLock(path) {
             do {
-                _ = try Self.loadRawPolicyChecked(at: path, defaults: defaults)
+                // Eligible exactly when the Trust screen's own typed read fails, not only the raw one.
+                _ = try TrustPolicy(policyObject: try Self.loadRawPolicyChecked(at: path, defaults: defaults))
                 throw TrustCenterError.invalidRequest
             } catch TrustCenterError.invalidRequest { throw TrustCenterError.invalidRequest }
             catch {
@@ -55,7 +56,7 @@ public actor SwiftNativeTrustCenter {
         _ patch: [String: JSONValue],
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
     ) async throws -> [String: JSONValue] {
-        let path = trustPolicyPath
+        let path = Self.policyURL(dataRoot: dataRoot)
         let defaults = defaultTrustPolicy()
         let merged = try await SwiftNativePersistenceCore.withFileLock(path) {
             let current = try Self.loadRawPolicyChecked(at: path, defaults: defaults)
@@ -77,12 +78,6 @@ public actor SwiftNativeTrustCenter {
             return merged
         }
         return normalizedTrustPolicy(saved: merged, defaults: defaults)
-    }
-
-    private var trustPolicyPath: URL {
-        dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
     }
 
     private nonisolated static func deepMerge(

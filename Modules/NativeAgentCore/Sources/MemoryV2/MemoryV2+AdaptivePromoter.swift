@@ -1,4 +1,5 @@
 import Transcripts
+import Desk
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -24,6 +25,7 @@ public actor AdaptiveMemoryPromoter {
     var memoryManager: (any MemoryManaging)?
     /// The person's configured name, read fresh so a rename shows up.
     var personName: (@Sendable () throws -> String?)? = nil
+    var reconcilePromiseCard: (@Sendable (MyQueue.Entry, SwiftNativeDeskStore) async throws -> Void)?
     /// Report fold success only when every piece of the recorded moment lands.
     var finishInterpretation: (@Sendable (AfterTurnContext, AfterTurnInterpretation?, String?) async -> Bool)?
     /// The door the agent's lived moments come in by (`LivedMomentDoor`), installed by the cognition runtime. Without a recorded row nothing is applied.
@@ -62,12 +64,14 @@ public actor AdaptiveMemoryPromoter {
         memory: SwiftNativeMemoryV2?,
         memoryManager: (any MemoryManaging)? = nil,
         adaptivePromotionEnabled: (@Sendable () throws -> Bool)? = nil,
-        personName: (@Sendable () throws -> String?)? = nil
+        personName: (@Sendable () throws -> String?)? = nil,
+        reconcilePromiseCard: (@Sendable (MyQueue.Entry, SwiftNativeDeskStore) async throws -> Void)? = nil
     ) {
         guard !stopped else { return }
         self.memory = memory
         if let memoryManager { self.memoryManager = memoryManager }
         if let personName { self.personName = personName }
+        if let reconcilePromiseCard { self.reconcilePromiseCard = reconcilePromiseCard }
         if let adaptivePromotionEnabled {
             self.adaptivePromotionEnabled = adaptivePromotionEnabled
         }

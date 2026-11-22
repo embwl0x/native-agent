@@ -145,8 +145,8 @@ public actor ExperienceStore {
 
     /// A repeated birth cannot create another experience.
     @discardableResult
-    public func begin(_ new: Experience) throws -> Bool {
-        let inserted = try write { db -> Experience? in
+    public func begin(_ new: Experience, durable: Bool = false) throws -> Bool {
+        let inserted = try write(durable: durable) { db -> Experience? in
             if let born = try String.fetchOne(db, sql: "SELECT born FROM experience WHERE id = ?", arguments: [new.id]) {
                 var existing = try Self.decoder.decode(Experience.self, from: Data(born.utf8))
                 var proposed = new
@@ -178,8 +178,8 @@ public actor ExperienceStore {
     }
 
     /// Validate every post-birth change through the same law.
-    public func append(_ changes: [Change], to id: String) throws {
-        let moved = try write { try Self.append(changes, to: id, in: $0) }
+    public func append(_ changes: [Change], to id: String, durable: Bool = false) throws {
+        let moved = try write(durable: durable) { try Self.append(changes, to: id, in: $0) }
         guard let moved else { return }
         changed()
         wrote(moved)
@@ -326,7 +326,8 @@ public actor ExperienceStore {
         var arguments = StatementArguments(kinds.map(\.rawValue))
         arguments += [NativeTimestampFormat.fractionalZulu(after), max(0, limit)]
         return try database().read {
-            try Self.foldReadable($0, matching: "experience.id IN (SELECT id FROM experience WHERE kind IN (\(marks)) AND at > ? ORDER BY at LIMIT ?)",
+            // A capped read keeps the newest births in the window (still returned oldest first): the latest thought is never the one dropped.
+            try Self.foldReadable($0, matching: "experience.id IN (SELECT id FROM experience WHERE kind IN (\(marks)) AND at > ? ORDER BY at DESC LIMIT ?)",
                                   arguments: arguments, order: "experience.at, experience.rowid")
         }
     }
@@ -423,6 +424,33 @@ public actor ExperienceStore {
 
     public func open() throws -> [Experience] {
         try database().read { try Self.fold($0, matching: "experience.open", order: "experience.at, experience.rowid") }
+    }
+
+    /// Open records addressed to one reader, selected before folding: a damaged record addressed elsewhere never closes this reader's view.
+    public func open(addressedTo who: String) throws -> [Experience] {
+        try database().read {
+            try Self.fold($0, matching: """
+                experience.open AND experience.id IN (SELECT experience.id FROM experience, json_each(experience.born, '$.addressedTo') AS addressee
+                                                      WHERE addressee.value = ?)
+                """, arguments: [who], order: "experience.at, experience.rowid")
+        }
+    }
+
+    /// Open records of one kind, selected before folding, for the same reason.
+    public func open(kind: Experience.Kind) throws -> [Experience] {
+        try database().read {
+            try Self.fold($0, matching: "experience.open AND experience.kind = ?", arguments: [kind.rawValue], order: "experience.at, experience.rowid")
+        }
+    }
+
+    /// An exact repair retry needs the debt for its operation, independent of other open records.
+    func openRepair(operation: String) throws -> [Experience] {
+        try database().read {
+            try Self.fold($0, matching: """
+                experience.open AND CASE WHEN json_valid(experience.born)
+                    THEN json_extract(experience.born, '$.outcome.domain') END = ?
+                """, arguments: [operation])
+        }
     }
 
     /// Drain queued writes before reading newly issued IDs so the owner observes its own recorded work.

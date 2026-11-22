@@ -51,11 +51,6 @@ public final class InboxFacade {
             await self.refresh()
         }
     }
-
-    /// The read action already committed; publish its owner's current reading, including any answer that landed meanwhile.
-    public nonisolated func markRead(_ id: String) {
-        Task { await refresh() }
-    }
 }
 
 /// The inbox owns its admitted rows; every caller returns its own read and every face receives this owner's finished value.
@@ -128,11 +123,5 @@ private actor InboxReadings {
             }, interaction_session_id: row.interaction_session_id, interaction_id: row.interaction_id)
         result.relatedDelegationID = row.relatedDelegationID
         return result
-    }
-}
-
-extension InboxRelatedGroup {
-    public func matches(_ item: InboxItemRecord) -> Bool {
-        matches(itemID: item.id, title: item.title)
     }
 }

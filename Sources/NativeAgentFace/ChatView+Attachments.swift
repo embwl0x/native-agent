@@ -30,7 +30,7 @@ extension ChatView {
             let startGeneration = voiceGeneration
             Task {
                 if !voiceSessionId.isEmpty { _ = await finishDictation() }
-                _ = await ChatAttachmentTypeResolver.beginDictation(
+                let began = await ChatAttachmentTypeResolver.beginDictation(
                     voiceInput, client: appModel.client, draft: draft,
                     isCurrent: { appModel.activeChatSessionId == startSessionId && voiceGeneration == startGeneration },
                     prepareDraft: { base, revision in
@@ -40,6 +40,8 @@ extension ChatView {
                     },
                     showToast: showToast
                 )
+                // A recording that never opened is not one Send must finish; the draft and the shown error stay.
+                if !began, voiceSessionId == startSessionId, voiceGeneration == startGeneration { voiceSessionId = "" }
             }
         }
     }

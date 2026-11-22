@@ -23,7 +23,7 @@ public final class XAIOAuthTransport: LLMTransport {
     private let session: URLSession
     private let endpoint: URL?
     private let tokenPathOverride: URL?
-    private let telemetry: LLMCallTraceRecorder
+    public let telemetry: LLMCallTraceRecorder
 
     private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
 
@@ -44,28 +44,6 @@ public final class XAIOAuthTransport: LLMTransport {
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("xai_oauth_direct.json")
     }
-
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        let messages = [LLMMessage.user(prompt)]
-        return try await completeMessages(messages: messages, system: system, model: model, tools: tools, call: call)
-    }
-
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
-    }
-
-
 
     public func streamMessages(
         messages: [LLMMessage],
@@ -117,7 +95,7 @@ public final class XAIOAuthTransport: LLMTransport {
                             (bytes, response) = try await ProviderWire.open(session, req, call: call)
                         }
                     } catch {
-                        throw mapTransportError(error, fallback: self.transientNetworkError(error, operation: "streamMessages"))
+                        throw mapTransportError(error, fallback: transientNetworkError(error, provider: self.providerId, host: nil, operation: "streamMessages"))
                     }
                     defer { bytes.cancel() }
                     guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
@@ -250,7 +228,7 @@ public final class XAIOAuthTransport: LLMTransport {
             (data, response) = try await OAuthGrantOperations.post(state.tokenEndpoint, body, session: session)
         } catch {
             if error is CancellationError { throw CancellationError() }
-            throw mapTransportError(error, fallback: transientNetworkError(error, operation: "refresh"))
+            throw mapTransportError(error, fallback: transientNetworkError(error, provider: providerId, host: nil, operation: "refresh"))
         }
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         let status = http.statusCode
@@ -275,9 +253,7 @@ public final class XAIOAuthTransport: LLMTransport {
         }
         // Refresh 429 preserves Retry-After.
         if status == 429 {
-            throw LLMError.rateLimited(
-                message: "xai_oauth_direct refresh HTTP 429 (temporary)",
-                retryAfterSeconds: parseRetryAfterSeconds(from: response))
+            throw LLMError.rateLimited(retryAfterSeconds: parseRetryAfterSeconds(from: response))
         }
         if (500..<600).contains(status) {
             throw LLMError.transient(
@@ -319,7 +295,7 @@ public final class XAIOAuthTransport: LLMTransport {
             object.removeValue(forKey: "expires_at")
             object.removeValue(forKey: "expires_in")
             for (key, value) in updates { object[key] = value }
-            try Self.writeJSONObject(object, to: tokenPath)
+            try XAIOAuthCredentialStore.write(object, to: tokenPath)
             return try Self.loadTokenState(path: tokenPath)
         }
     }
@@ -330,14 +306,6 @@ public final class XAIOAuthTransport: LLMTransport {
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw LLMError.modelUnavailable(provider: "xai_oauth_direct", model: model) }
         return trimmed
-    }
-
-    private func transientNetworkError(_ error: Error, operation: String) -> LLMError {
-        .transient(
-            message: """
-                \(providerId) \(operation) failed: \
-                \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))
-                """)
     }
 
     private static func effectiveExpiry(_ access: String, saved: Date?) -> Date? {
@@ -373,10 +341,6 @@ public final class XAIOAuthTransport: LLMTransport {
         guard url.scheme == "https" else { return false }
         guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
         return host == "x.ai" || host.hasSuffix(".x.ai")
-    }
-
-    private static func writeJSONObject(_ obj: [String: Any], to url: URL) throws {
-        try XAIOAuthCredentialStore.write(obj, to: url)
     }
 }
 

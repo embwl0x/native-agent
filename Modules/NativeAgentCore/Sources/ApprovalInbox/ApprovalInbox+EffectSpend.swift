@@ -141,8 +141,6 @@ extension SwiftNativeApprovalInbox {
     }
 
     private nonisolated static func effectSpentAt(_ value: JSONValue) -> String {
-        guard case .object(let object) = value,
-              case .string(let value)? = object["spentAt"] else { return "" }
-        return value
+        JSONValue.stringOrEmpty(value.objectValue?["spentAt"])
     }
 }

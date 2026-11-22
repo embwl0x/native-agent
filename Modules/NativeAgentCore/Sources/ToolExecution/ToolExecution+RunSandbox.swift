@@ -279,7 +279,7 @@ actor ToolPrimitiveBroker {
             let result = try await network(operation, args: given, onActivity: execution.onActivity)
             guard operation == "network.connect", case .string(let id)? = Parts.fields(result)["id"] else { return result }
             // A secret goes out only on a connection that established TLS, as the transport reports it (or to this Mac by host); udp carries none.
-            if let host = Parts.string(args, "host"), args["transport"] != .string("udp"),
+            if let host = args["host"]?.stringValue, args["transport"] != .string("udp"),
                connections[id]?.metadata(definition: NWProtocolTLS.definition) != nil || NetworkAddress.loopback(host) { hosts[id] = host.lowercased() }
             pump(id)
             return result
@@ -367,20 +367,20 @@ actor ToolPrimitiveBroker {
             }
             let given = try await inserting(args, ["args", "env"], to: .program(path: path, identity: identity))
             guard case .array(let rows) = given["args"] ?? .array([]), case .object(let env) = given["env"] ?? .object([:]),
-                  Parts.strings(.array(rows)).count == rows.count, JSONValue.object(env).stringFields.count == env.count else {
+                  JSONValue.stringArray(.array(rows)).count == rows.count, JSONValue.object(env).stringFields.count == env.count else {
                 throw Self.inputFailure("invalid_program_arguments", field: "args/env", accepted: "args: [string], env: {name: string}")
             }
             var launching: [String: JSONValue] = ["executable": .string(path), "args": .array(rows)]
             launching["cwd"] = args["cwd"]
             let launch = Parts.fields(try await host.performReach("program.launch", arguments: .object(launching), execution: execution))
-            guard let executable = Parts.string(launch, "executable"), let cwd = Parts.string(launch, "cwd") else {
+            guard let executable = launch["executable"]?.stringValue, let cwd = launch["cwd"]?.stringValue else {
                 throw SenseFailure(code: "program_launch_plan_missing", message: """
                     program.launch returned no executable or cwd for \(path). Inspect the shell admission failure; repair that launch plan before \
                     starting the program.
                     """)
             }
             var environment = AgentHostCommandLines.scrubbedEnvironment().merging(JSONValue.object(env).stringFields) { $1 }
-            if let prefix = Parts.string(launch, "path_prefix") { environment["PATH"] = prefix + ":" + (environment["PATH"] ?? "/usr/bin:/bin") }
+            if let prefix = launch["path_prefix"]?.stringValue { environment["PATH"] = prefix + ":" + (environment["PATH"] ?? "/usr/bin:/bin") }
             // Cancellation or closure during waits must prevent spawn.
             try Task.checkCancellation()
             guard !closed else { throw CancellationError() }
@@ -393,7 +393,7 @@ actor ToolPrimitiveBroker {
             }
             let process = ManagedProcess(), input = Pipe(), output = Pipe(), errors = Pipe()
             process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = Parts.strings(launch["arguments"])
+            process.arguments = JSONValue.stringArray(launch["arguments"])
             process.environment = environment
             process.currentDirectoryURL = URL(fileURLWithPath: cwd)
             process.standardInput = input; process.standardOutput = output; process.standardError = errors
@@ -562,7 +562,7 @@ actor ToolPrimitiveBroker {
         let suffix = if case .string(let signal)? = signal { [signal] } else { [String]() }
         let auditPurpose = (["ability", abilityID, purpose] + suffix).joined(separator: ":")
         let toolNames = try Parts.declaredStrings(args["tools"], name: "model.call tools")
-        let surface = Parts.string(args, "surface")
+        let surface = args["surface"]?.stringValue
         if args["surface"] != nil, surface?.isEmpty != false {
             throw Self.inputFailure("invalid_model_surface", field: "surface", accepted: "a nonempty existing model-routing surface")
         }
@@ -1146,7 +1146,7 @@ actor ToolPrimitiveBroker {
 
     /// Only the holding ability may end its named program.
     func end(_ arguments: JSONValue) {
-        if let id = Parts.string(Parts.fields(arguments), "id"), programs[id] != nil { endProgram(id) }
+        if let id = Parts.fields(arguments)["id"]?.stringValue, programs[id] != nil { endProgram(id) }
     }
 
     /// Closing held reach must preserve admitted fetch ownership through its original transport settlement.

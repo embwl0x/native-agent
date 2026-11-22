@@ -21,7 +21,7 @@ extension AppActions {
     static func senses(records: [SenseRecord]? = nil, catalog: [AppAction]? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot(),
         turn: Turn?) throws -> [AppAction] {
         let records = try records ?? FileSenseRegistry(dataRoot: dataRoot).presentationRecords()
-        let catalog = try catalog ?? available(dataRoot: dataRoot)
+        let catalog = try catalog ?? seedActions
         let scope = turn?.verifiedSessionID ?? ""
         var seen: Set<String> = []
         let views = SenseDoorViews.shared.latest.filter { view in
@@ -68,11 +68,6 @@ extension AppActions {
 }
 
 extension AppToolExecutor {
-    private static func inputInt(_ raw: JSONValue?) -> Int64? {
-        if case .int(let value)? = raw, value >= 0 { return value }
-        return nil
-    }
-
     /// Sense reads re-enter the original action so its Trust gate and raw reader remain authoritative.
     @MainActor
     func doorSenseRead(corner: SenseCorner, item: String, input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue? {
@@ -100,7 +95,7 @@ extension AppToolExecutor {
         if case .site = corner, independentSiteRead {
             siteURL = servedView?.materialRef
         } else if case .site(let host) = corner, item.hasPrefix("site:\(host)/"), item.contains("?read=more") {
-            let continuation = try SenseNativePages.chromeContinuationArguments(item, scope: scope, tab: Self.inputInt(args["tab_id"]))
+            let continuation = try SenseNativePages.chromeContinuationArguments(item, scope: scope, tab: args["tab_id"]?.nonnegativeInt64)
             args.merge(continuation) { _, saved in saved }
             guard let more = continuation["more"]?.scalarText, case .object(let cursor) = try JSONValue.parse(Data(more.utf8)),
                   let url = cursor["url"]?.scalarText, URL(string: url)?.host?.lowercased() == host else {
@@ -121,7 +116,7 @@ extension AppToolExecutor {
                     tabs.compactMap { value in
                         guard case .object(let tab) = value, let url = tab["url"]?.scalarText,
                               SenseNativePages.chromeAddress(host: host, url: url) == item,
-                              Self.inputInt(args["tab_id"]).map({ tab["tab_id"] == .int($0) }) ?? true else { return nil }
+                              args["tab_id"]?.nonnegativeInt64.map({ tab["tab_id"] == .int($0) }) ?? true else { return nil }
                         return tab
                     }
                 } else { [] }
@@ -149,10 +144,10 @@ extension AppToolExecutor {
             if !item.isEmpty, view == nil { args["part"] = .string(item) }
         case .fileKind:
             action = "files.read"
-            let named = item.isEmpty || item.hasPrefix("{") ? Self.doorText(args["path"]) : item
+            let named = item.isEmpty || item.hasPrefix("{") ? JSONValue.trimmedScalarTextOrEmpty(args["path"]) : item
             args["path"] = .string(view?.materialRef ?? named)
         case .site(let host):
-            let url = siteURL ?? view?.materialRef ?? (item.isEmpty ? Self.doorText(args["url"]) : item)
+            let url = siteURL ?? view?.materialRef ?? (item.isEmpty ? JSONValue.trimmedScalarTextOrEmpty(args["url"]) : item)
             guard item.isEmpty || URL(string: url)?.host?.lowercased() == host else {
                 return Self.failure("invalid_address", "Read this corner with a URL on its host.", extra: siteFailureEvidence)
             }
@@ -162,7 +157,7 @@ extension AppToolExecutor {
                 args = view.readInput.filter { names.contains($0.key) }.merging(args) { _, new in new }
             } else {
                 action = "chrome.snapshot"
-                if Self.inputInt(args["tab_id"]) == nil {
+                if args["tab_id"]?.nonnegativeInt64 == nil {
                     let address = try await chrome().existingPageAddress(host: host, context: execution.macOperation(dataRoot: securityCenter.dataRoot))
                     args = address.merging(args) { _, supplied in supplied }
                 }
@@ -231,8 +226,8 @@ extension AppToolExecutor {
 
     @MainActor
     func runSenseAct(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
-        let id = Self.doorText(input["sense_id"]), verb = Self.doorText(input["verb"])
-        let address = Self.doorText(input["address"])
+        let id = JSONValue.trimmedScalarTextOrEmpty(input["sense_id"]), verb = JSONValue.trimmedScalarTextOrEmpty(input["verb"])
+        let address = JSONValue.trimmedScalarTextOrEmpty(input["address"])
         let scope = turn.verifiedSessionID ?? ""
         let view = SenseDoorViews.shared.latest.reversed().first(where: {
             $0.scope == scope && $0.record.id == id && $0.page.things.contains { $0.address == address && $0.verbs.contains(verb) }
@@ -439,9 +434,9 @@ private struct SiteSenseActionBoundary: Sendable {
         guard case .pageSnapshot(.object(let before)) = original,
               case .pageSnapshot(.object(let after)) = fresh,
               case .int(let tab)? = before["tabId"], tab >= 0, after["tabId"] == .int(tab),
-              Self.string(before["snapshotId"]) != nil,
-              let currentSnapshot = Self.string(after["snapshotId"]),
-              let url = Self.string(before["url"]), url == Self.string(after["url"]),
+              before["snapshotId"]?.nonemptyString != nil,
+              let currentSnapshot = after["snapshotId"]?.nonemptyString,
+              let url = before["url"]?.nonemptyString, url == after["url"]?.nonemptyString,
               URL(string: url)?.host?.lowercased() == host.lowercased(),
               case .int(let sequence)? = before["userSequence"], sequence >= 0,
               after["userSequence"] == .int(sequence),
@@ -450,21 +445,21 @@ private struct SiteSenseActionBoundary: Sendable {
             throw SenseFailure(code: "stale_source", message: "The served site tab or page changed; read the site again before acting.")
         }
         let matched = oldNodes.compactMap { value -> [String: JSONValue]? in
-            guard case .object(let fields) = value, let fragment = Self.string(fields["addressFragment"]),
+            guard case .object(let fields) = value, let fragment = fields["addressFragment"]?.nonemptyString,
                   address == SenseNativePages.chromeAddress(host: host, url: url, fragment: fragment) else { return nil }
             return fields
         }
         guard matched.count == 1, let old = matched.first,
-              let identity = Self.string(old["elementIdentity"]) else {
+              let identity = old["elementIdentity"]?.nonemptyString else {
             throw SenseFailure(code: "node_identity_unavailable", message: """
                 The served thing has no Chrome element identity; reload the updated Chrome extension and read the site again.
                 """)
         }
         let candidates = newNodes.compactMap { value -> [String: JSONValue]? in
-            guard case .object(let fields) = value, Self.string(fields["elementIdentity"]) == identity else { return nil }
+            guard case .object(let fields) = value, fields["elementIdentity"]?.nonemptyString == identity else { return nil }
             return fields
         }
-        guard candidates.count == 1, let current = candidates.first, let nodeID = Self.string(current["nodeId"]),
+        guard candidates.count == 1, let current = candidates.first, let nodeID = current["nodeId"]?.nonemptyString,
               ["elementPath", "kind", "role", "name", "text", "value", "url", "frameId", "select"].allSatisfy({ old[$0] == current[$0] }) else {
             throw SenseFailure(code: "node_identity_changed", message: "The served control changed or disappeared; read the site again before acting.")
         }
@@ -472,7 +467,7 @@ private struct SiteSenseActionBoundary: Sendable {
         switch verb {
         case "click": action = "click"; tool = "browser.chrome_click"
         case "open link":
-            guard old["role"] == .string("link"), Self.string(old["url"]) != nil else {
+            guard old["role"] == .string("link"), old["url"]?.nonemptyString != nil else {
                 throw SenseFailure(code: "act_denied", message: "Only a source-grounded link can offer open link.")
             }
             action = "click"; tool = "browser.chrome_click"
@@ -528,10 +523,5 @@ private struct SiteSenseActionBoundary: Sendable {
             throw SenseFailure(code: "act_denied", message: "A site sense cannot override the captured Chrome tab, snapshot, node or action proof.")
         }
         return args
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        if case .string(let text)? = value, !text.isEmpty { return text }
-        return nil
     }
 }

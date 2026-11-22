@@ -3,7 +3,6 @@ import AgentWorkspace
 import ChatToolParsing
 import ChatTurnContracts
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -466,7 +465,11 @@ extension ChatToolInvocation {
     }
 }
 
-public protocol ChatToolExecuting: ToolExecutor {
+/// External owners contribute to the same catalog so listing and execution cannot diverge.
+public protocol ChatToolExecuting: Sendable {
+    var descriptors: [ToolDescriptor] { get }
+    /// A body has one executor per overridden Core tool, using Core's schema and the body's own gates.
+    var replacesCoreTools: Set<String> { get }
     func execute(tool: String, input: [String: JSONValue], surface: String,
                  turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue
     /// What a turn's collection offers the model now. A registered descriptor never changes; a schema the model reads may.
@@ -475,9 +478,6 @@ public protocol ChatToolExecuting: ToolExecutor {
 
 extension ChatToolExecuting {
     public var modelSchemas: [LLMToolSchema] { descriptors.map(\.schema) }
-    public func execute(tool: String, input: [String: JSONValue], surface: String, turn: Turn) async throws -> JSONValue {
-        try await execute(tool: tool, input: input, surface: surface, turn: turn, invocation: .init())
-    }
 }
 public extension ToolDispatchClient {
     func withToolArguments(

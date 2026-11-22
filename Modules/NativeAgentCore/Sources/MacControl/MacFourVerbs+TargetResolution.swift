@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `MacFourVerbs+TargetResolution.swift` | `MacFourVerbs`: Exact names, ordinals and visible main-content scroll targets |
 
 extension MacFourVerbs {
@@ -212,7 +213,7 @@ extension MacFourVerbs {
     }
 
     static func exactName(_ text: String) -> String {
-        text.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        TextNormalization.lowercasedWithCollapsedWhitespace(text)
     }
 
     /// Disclose numeric control/row collisions so the caller can address the other target.
@@ -356,7 +357,14 @@ extension MacFourVerbs {
         where phrase.contains(normalize(kind)) {
             let matches = targets.filter { $0.kind == kind }
             if matches.count == 1, let match = matches.first { return .hit(match) }
-            if matches.count > 1 { return .ambiguous(matches) }
+            if matches.count > 1 {
+                // The words beside the kind are its name: "Comments scroll area" settles which area when one carries that name.
+                let name = phrase.replacingOccurrences(of: normalize(kind), with: " ")
+                    .split(separator: " ").joined(separator: " ")
+                let named = name.isEmpty ? [] : matches.filter { normalize($0.label ?? "").contains(name) }
+                if named.count == 1, let match = named.first { return .hit(match) }
+                return .ambiguous(named.count > 1 ? named : matches)
+            }
         }
         return resolve(target, among: targets, actionable: false)
     }

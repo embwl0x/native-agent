@@ -8,25 +8,16 @@ enum NativeAgentMobileTheme {
     static var plateGlass: Glass { .clear.tint(.black.opacity(0.28)) }
 
     enum Colors {
-        static let canvas = adaptive(dark: 0x211F1D, light: 0xF6F4F1)
-        static let contentSurface = adaptive(dark: 0x292725, light: 0xFFFFFF)
+        static let canvas = Color.adaptive(dark: 0x211F1D, light: 0xF6F4F1)
+        static let contentSurface = Color.adaptive(dark: 0x292725, light: 0xFFFFFF)
         static let secondary = Color.secondary
-        /// Opaque secondary ink for reading plates; system secondary blends too faintly into glass.
-        static let readingSecondary = adaptive(dark: 0xB8B7B5, light: 0x555451)
-        static let trouble = adaptive(dark: 0xFF9F0A, light: 0x864800)
-        static let accentText = adaptive(dark: 0x65CCD2, light: 0x006B73)
-        static let navigationGlass = adaptive(dark: 0x292725, light: 0xFFFFFF)
+        static let trouble = Color.adaptive(dark: 0xFF9F0A, light: 0x864800)
+        static let accentText = Color.adaptive(dark: 0x65CCD2, light: 0x006B73)
+        static let navigationGlass = Color.adaptive(dark: 0x292725, light: 0xFFFFFF)
         static let accent = accentText
         static let softFill = ink(dark: 0.08, light: 0.11)
         static let quietFill = ink(dark: 0.05, light: 0.075)
         static let hairline = ink(dark: 0.10, light: 0.14)
-
-        private static func adaptive(dark: UInt, light: UInt) -> Color {
-            Color(uiColor: UIColor { traits in
-                let hex = traits.userInterfaceStyle == .dark ? dark : light
-                return UIColor(Color(hex: hex))
-            })
-        }
 
         private static func ink(dark: Double, light: Double) -> Color {
             Color(uiColor: UIColor { traits in

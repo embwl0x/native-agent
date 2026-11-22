@@ -171,8 +171,6 @@ actor TelegramTurnCardLedger {
 }
 
 struct TelegramTurnCardRepairResult: Sendable, Equatable {
-    let repaired: Int
-    let cleanedTerminal: Int
     let failures: [String]
 }
 
@@ -227,11 +225,7 @@ actor TelegramTurnCardRestartRepairer {
         do {
             records = try await ledger.records()
         } catch {
-            return TelegramTurnCardRepairResult(
-                repaired: 0,
-                cleanedTerminal: 0,
-                failures: [safe(error)]
-            )
+            return TelegramTurnCardRepairResult(failures: [safe(error)])
         }
 
         func edit(_ record: TelegramPersistedTurnCard, _ text: String) async throws {
@@ -248,8 +242,6 @@ actor TelegramTurnCardRestartRepairer {
                     .localizedCaseInsensitiveContains("message to edit not found") == true {}
         }
 
-        var repaired = 0
-        var cleanedTerminal = 0
         var failures: [String] = []
         attemptedCards.formIntersection(Set(records.map(\.turnId)))
         for record in records {
@@ -268,7 +260,6 @@ actor TelegramTurnCardRestartRepairer {
                         try await edit(record, terminalText)
                     }
                     try await ledger.remove(turnId: record.turnId)
-                    cleanedTerminal += 1
                 } catch {
                     failures.append(safe(error))
                 }
@@ -277,17 +268,12 @@ actor TelegramTurnCardRestartRepairer {
             do {
                 try await edit(record, Self.interruptedText)
                 try await ledger.remove(turnId: record.turnId)
-                repaired += 1
             } catch {
                 // Retain ambiguous repair identities for restart; the API's not-modified response makes repeated edits safe.
                 failures.append(safe(error))
             }
         }
-        return TelegramTurnCardRepairResult(
-            repaired: repaired,
-            cleanedTerminal: cleanedTerminal,
-            failures: failures
-        )
+        return TelegramTurnCardRepairResult(failures: failures)
     }
 
     private func safe(_ error: Error) -> String {

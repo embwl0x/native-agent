@@ -27,7 +27,7 @@ public enum BuiltInSenses {
     }
 
     /// Install after the registry; missing or malformed kit resources must fail launch rather than masquerade as an empty kit.
-    public static func registerAll(dataRoot: URL, resources: URL? = nil) async throws {
+    public static func registerAll(resources: URL? = nil) async throws {
         guard let registry = SensesHub.shared.registry else {
             throw SenseFailure(code: "source_unavailable", message: "The senses registry is not installed.")
         }

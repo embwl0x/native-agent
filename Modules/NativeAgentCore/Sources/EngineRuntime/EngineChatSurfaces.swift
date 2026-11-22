@@ -186,11 +186,10 @@ extension NativeAgentEngine {
             offsetURL: dataRoot
                 .appendingPathComponent("telegram", isDirectory: true)
                 .appendingPathComponent("last_offset.json"),
-            syncCommandMenu: TelegramPollLoop.defaultSyncCommandMenu,
             approvalHandler: approvalFiler,
             attachmentChatHandler: handler,
             // Turn ownership handles memory promotion; Telegram completion must not wait for optional background work.
-            voiceTranscriber: makeTelegramVoiceTranscriber(cfg: cfg, dataRoot: dataRoot),
+            voiceTranscriber: makeTelegramVoiceTranscriber(cfg: cfg),
             onCapabilityDenied: { capability in
                 await fileSystemPermissionNotice(capability: capability, dataRoot: dataRoot)
             },
@@ -219,10 +218,7 @@ extension NativeAgentEngine {
     }
 
     /// Choose the transcription backend once at assembly, preserving shared error and permission-card handling for every voice note.
-    public static func makeTelegramVoiceTranscriber(
-        cfg: TelegramBot.TelegramConfig,
-        dataRoot: URL
-    ) -> SwiftAppleSpeechTranscriber? {
+    public static func makeTelegramVoiceTranscriber(cfg: TelegramBot.TelegramConfig) -> SwiftAppleSpeechTranscriber? {
         guard cfg.voiceTranscriptionEnabled else { return nil }
         return SwiftAppleSpeechTranscriber(contextualStrings: { [NativeAgentEngine.live.ports.backgroundWork.voiceName] })
     }

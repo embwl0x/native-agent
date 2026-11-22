@@ -13,8 +13,7 @@ enum SessionRequestFit {
 
 extension SwiftNativeChatOrchestrationClient {
     func fitSessionRequest(_ context: TurnContext, codec: ToolCallCodec, additionalMessages: [LLMMessage] = [],
-        sessionId: String, surface: String, runId: String, progress: TurnEventSink?,
-        turn: Turn
+        sessionId: String, surface: String, turn: Turn
     ) async throws -> TurnContext {
         guard context.historyReplaySpec != nil,
               let window = ContextBudgetPolicy.windowTokens(forModel: context.modelId,
@@ -23,7 +22,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
         let call = LLMCall(turn: turn, surface: surface, purpose: "context_window", session: sessionId)
         func measure(_ context: TurnContext) async throws -> SessionContextMeasurement {
-            let request = try ConversationPrefixSeeding.request(context, codec: codec, turn: turn).appending(additionalMessages)
+            let request = try ConversationPrefixSeeding.request(context, codec: codec).appending(additionalMessages)
             return try await SessionContextMeasurement.measure(try request.measurement, sessionId: sessionId,
                 model: context.modelId, providerID: context.providerId, dataRoot: dataRoot, windowTokens: window, call: call)
         }

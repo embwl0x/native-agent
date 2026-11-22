@@ -1,6 +1,5 @@
 import Foundation
 import NativeAgentShared
-#if canImport(ApplicationServices) && os(macOS)
 import ApplicationServices
 // Blueprint: | `MacAXAttributeRead.swift` | Checked AX reads isolate node gaps, retain sibling evidence and share ordering |
 
@@ -251,7 +250,7 @@ package enum MacAXAttributeRead {
     }
 
     package static func copyElementArray(
-        _ element: AXUIElement, _ attribute: String, limit: Int? = nil, preservingIndices: Bool = false,
+        _ element: AXUIElement, _ attribute: String, limit: Int? = nil,
         context: MacOperationContext
     ) -> [AXUIElement] {
         do { return try checkedElementArray(element, attribute, limit: limit, context: context) }
@@ -545,4 +544,3 @@ package enum MacAXAttributeRead {
         return CGRect(x: frame.x, y: frame.y, width: frame.w, height: frame.h)
     }
 }
-#endif

@@ -19,10 +19,6 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
     private var observingMusic = false
     private var observers: [NSObjectProtocol] = []
 
-    var waitingSources: [PhoneSenseEvent.Source] {
-        (networkQuery == nil ? [] : [.network]) + (photoQuery == nil ? [] : [.photos])
-    }
-
     init(owner: PhoneSenses) {
         self.owner = owner
         super.init()
@@ -39,7 +35,6 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
     func stop() {
         network?.cancel(); network = nil; networkQuery = nil
         photoQuery = nil
-        owner?.objectWillChange.send()
         if observingPhotos { PHPhotoLibrary.shared().unregisterChangeObserver(self); observingPhotos = false }
         if observingMusic { MPMusicPlayerController.systemMusicPlayer.endGeneratingPlaybackNotifications(); observingMusic = false }
     }
@@ -129,13 +124,13 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
             if !observingPhotos { PHPhotoLibrary.shared().register(self); observingPhotos = true }
             queryPhotos(pairing: pairing, limited: photoStatus == .limited)
         } else {
-            if photoQuery != nil { photoQuery = nil; owner?.objectWillChange.send() }
+            if photoQuery != nil { photoQuery = nil }
             if observingPhotos { PHPhotoLibrary.shared().unregisterChangeObserver(self); observingPhotos = false }
             if enabled.contains(.photos) { owner?.observed(.photos, value: "unknown", pairing: pairing, at: at) }
         }
         if enabled.contains(.network) { queryNetwork(pairing: pairing) }
         else if networkQuery != nil {
-            network?.cancel(); network = nil; networkQuery = nil; owner?.objectWillChange.send()
+            network?.cancel(); network = nil; networkQuery = nil
         }
     }
 
@@ -148,7 +143,6 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
         guard networkQuery == nil else { return }
         let query = UUID(), monitor = NWPathMonitor()
         networkQuery = query; network = monitor
-        owner?.objectWillChange.send()
         monitor.pathUpdateHandler = { [weak self] path in
             let value = path.status != .satisfied ? "unavailable"
                 : path.usesInterfaceType(.wifi) ? "wifi" : path.usesInterfaceType(.cellular) ? "cellular"
@@ -162,7 +156,6 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
     private func finishNetwork(_ query: UUID, value: String, pairing: String?, at: Date) {
         guard networkQuery == query else { return }
         network?.cancel(); network = nil; networkQuery = nil
-        owner?.objectWillChange.send()
         owner?.observed(.network, value: value, pairing: pairing, at: at)
     }
 
@@ -176,7 +169,6 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
         let day = formatter.string(from: at)
         let zone = calendar.timeZone.identifier
         photoQuery = query
-        owner?.objectWillChange.send()
         Task { [weak self] in
             let count = await Task.detached(priority: .utility) {
                 let options = PHFetchOptions()
@@ -187,7 +179,6 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
             }.value
             guard let self, self.photoQuery == query else { return }
             self.photoQuery = nil
-            self.owner?.objectWillChange.send()
             let current = PHPhotoLibrary.authorizationStatus(for: .readWrite)
             guard current == .authorized || current == .limited, (current == .limited) == limited else { self.owner?.wake(); return }
             self.owner?.observed(.photos, value: String(count),

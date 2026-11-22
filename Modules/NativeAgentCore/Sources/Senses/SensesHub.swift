@@ -84,7 +84,7 @@ public final class SensesHub: @unchecked Sendable {
         }.value
     }
     @MainActor
-    public func receiveViewEvent(_ event: JSONValue, presentation: SenseInteractiveView) async -> String? {
+    package func receiveViewEvent(_ event: JSONValue, presentation: SenseInteractiveView, revision: String) async -> String? {
         guard let registry, let source, let receiver = runner else {
             return "This sense cannot receive view events yet."
         }
@@ -94,7 +94,7 @@ public final class SensesHub: @unchecked Sendable {
             }), !Task.isCancelled else {
                 return "This sense is off or its view has changed."
             }
-            if case .failed(let failure) = await receiver.run(record, request: .event(event), source: source,
+            if case .failed(let failure) = await receiver.run(record, request: .event(event, revision: revision), source: source,
                 operation: .init(turn: nil)) {
                 throw failure
             }

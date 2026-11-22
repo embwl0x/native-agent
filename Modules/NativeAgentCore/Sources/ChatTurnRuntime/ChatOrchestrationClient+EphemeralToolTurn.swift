@@ -101,7 +101,7 @@ extension SwiftNativeChatOrchestrationClient {
         // applies only when this thought did not select a surface of its own.
         let route = try await engine.router.checkedRoutingSnapshot().routeAdmission(for: surface,
             choice: requestedSurface == nil ? turn.providerChoice : nil)
-        return try await withModelContext(route, surface: surface, turn: turn, run)
+        return try await withModelContext(route, turn: turn, run)
     }
 
     /// Request-scoped tool schemas and the caller's restricted dispatcher let this turn run without owning a chat transcript.
@@ -113,7 +113,6 @@ extension SwiftNativeChatOrchestrationClient {
         attachments: [MultimodalAttachment] = [],
         persona: String? = nil,
         providerID: String? = nil,
-        serviceTierOverride: String? = nil,
         verifiedSessionId: String? = nil,
         requireCompleted: Bool = false,
         surface: String,
@@ -163,21 +162,21 @@ extension SwiftNativeChatOrchestrationClient {
         // Admit any explicitly supplied route before sizing context; preserve every supplied field and resolve the rest from its surface.
         // An unadmitted thought obtains its route here; preparation never chooses a model.
         var route: TurnRouteAdmission?
-        if !modelOverride.isEmpty || !effortOverride.isEmpty || !providerOverride.isEmpty || serviceTierOverride != nil {
+        if !modelOverride.isEmpty || !effortOverride.isEmpty || !providerOverride.isEmpty {
             let surfaceRoute = try await engine.router.checkedRouteAdmission(for: surface, suppliedModel: modelOverride)
             route = TurnRouteAdmission(
                 routingSurface: surfaceRoute.routingSurface,
                 modelId: modelOverride.isEmpty ? surfaceRoute.modelId : modelOverride,
                 reasoningEffort: effortOverride.isEmpty ? surfaceRoute.reasoningEffort : effortOverride,
                 providerId: providerOverride.isEmpty ? surfaceRoute.providerId : providerOverride,
-                serviceTier: serviceTierOverride ?? surfaceRoute.serviceTier
+                serviceTier: surfaceRoute.serviceTier
             )
         } else if thoughtTurn.admission == nil {
             route = try await engine.router.checkedRoutingSnapshot().routeAdmission(
                 for: surface, choice: thoughtTurn.providerChoice)
         }
         let (turn, projectedContext, pendingProjectionCommit) = if let route {
-            try await withModelContext(route, surface: surface, turn: thoughtTurn) { turn in try await prepare(turn) }
+            try await withModelContext(route, turn: thoughtTurn) { turn in try await prepare(turn) }
         } else {
             try await prepare(thoughtTurn)
         }

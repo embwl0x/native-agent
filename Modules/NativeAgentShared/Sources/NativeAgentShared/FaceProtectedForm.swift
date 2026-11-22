@@ -131,7 +131,7 @@ public enum FaceSecretReceiver: Equatable, Sendable {
                 entry.revisions[field.id] = nil
             }
         }
-        let door = ClosureFaceDoor(open: { _ in }, waitingOn: "the credential owner") { submission in
+        let door = ClosureFaceDoor(open: { _ in }, waitingOn: "the key to be saved") { submission in
             let outcome = await perform(.init(submission: submission, secrets: secrets))
             var clean = Self.scrub(outcome, secrets: secrets)
             if clean.unresolved, entry.mounted, entry.lifetime == lifetime {
@@ -247,7 +247,7 @@ public struct FaceProtectedForm: View {
     private var hasSecret: Bool { entry.values.values.contains { !$0.isEmpty } }
     private var pending: Bool { session.operations.values.contains { $0.outcome == nil || $0.checking } }
     private var readingDoor: ClosureFaceDoor {
-        ClosureFaceDoor(open: opening, waitingOn: "the credential owner") { submission in
+        ClosureFaceDoor(open: opening, waitingOn: "the key to be saved") { submission in
             guard submission.checking, let read = entry.reads[submission.id] else {
                 return .init(words: "The protected entry has closed. Reopen setup to read its saved status.", effects: .unknown)
             }

@@ -86,6 +86,15 @@ public struct TelegramSessionStore: Sendable {
         self.dataRoot = dataRoot
     }
 
+    /// Read the binding without starting a conversation or advancing the shared anchor.
+    func boundSessionId(destination: TelegramDestination) async throws -> String? {
+        let owner = try isOwnerDestination(destination)
+        if owner, let anchor = ConversationAnchor.currentSessionId(dataRoot: dataRoot) { return anchor }
+        let mapped = try await mappedSessionId(chatKey: Self.chatKey(destination))
+        if owner, let mapped, !ConversationAnchor.mayAnchor(mapped, dataRoot: dataRoot) { return nil }
+        return mapped
+    }
+
     public func activeSessionId(destination: TelegramDestination) async throws -> String {
         let activityAt = Date()
         let chatKey = Self.chatKey(destination)
@@ -109,9 +118,9 @@ public struct TelegramSessionStore: Sendable {
                     sessionId = UUID().uuidString
                     resolution = .minted
                 }
-                if entry["createdAt"] == nil { entry["createdAt"] = .string(Self.nowString()) }
+                if entry["createdAt"] == nil { entry["createdAt"] = .string(NativeTimestampFormat.fractionalZulu(Date())) }
                 entry["activeSessionId"] = .string(sessionId)
-                entry["updatedAt"] = .string(Self.nowString())
+                entry["updatedAt"] = .string(NativeTimestampFormat.fractionalZulu(Date()))
                 return (sessionId, resolution)
             }
             try await ensureSessionRow(id: resolved.id, destination: destination, title: Self.sessionTitle(destination))
@@ -135,7 +144,7 @@ public struct TelegramSessionStore: Sendable {
                 let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { return (trimmed, true) }
             }
-            let now = Self.nowString()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             if entry["createdAt"] == nil { entry["createdAt"] = .string(now) }
             entry["activeSessionId"] = .string(initialSessionID)
             entry["updatedAt"] = .string(now)
@@ -160,9 +169,9 @@ public struct TelegramSessionStore: Sendable {
         let sessionId = UUID().uuidString
         try await ensureSessionRow(id: sessionId, destination: destination, title: Self.sessionTitle(destination)) {
             try await patchChatMap(chatKey: Self.chatKey(destination)) { entry in
-                if entry["createdAt"] == nil { entry["createdAt"] = .string(Self.nowString()) }
+                if entry["createdAt"] == nil { entry["createdAt"] = .string(NativeTimestampFormat.fractionalZulu(Date())) }
                 entry["activeSessionId"] = .string(sessionId)
-                entry["updatedAt"] = .string(Self.nowString())
+                entry["updatedAt"] = .string(NativeTimestampFormat.fractionalZulu(Date()))
             }
         }
         // A new session becomes the shared anchor while the previous conversation remains reachable.
@@ -288,9 +297,9 @@ public struct TelegramSessionStore: Sendable {
                 throw TelegramSessionStoreError.sessionNotResumable(sessionId)
             }
             try await patchChatMap(chatKey: Self.chatKey(destination)) { entry in
-                if entry["createdAt"] == nil { entry["createdAt"] = .string(Self.nowString()) }
+                if entry["createdAt"] == nil { entry["createdAt"] = .string(NativeTimestampFormat.fractionalZulu(Date())) }
                 entry["activeSessionId"] = .string(sessionId)
-                entry["updatedAt"] = .string(Self.nowString())
+                entry["updatedAt"] = .string(NativeTimestampFormat.fractionalZulu(Date()))
             }
         }
         // Resume must move the shared anchor so Mac and phone follow the same selected conversation.
@@ -461,9 +470,7 @@ public struct TelegramSessionStore: Sendable {
     }
 
     private var sessionsPath: URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
+        DataRootPaths.chatSessionIndex(in: dataRoot)
     }
 
     private func messagesPath(sessionId: String) -> URL {
@@ -535,9 +542,5 @@ public struct TelegramSessionStore: Sendable {
             updatedAt: updatedAt,
             messageCount: messageCount
         )
-    }
-
-    private static func nowString(_ date: Date = Date()) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
     }
 }

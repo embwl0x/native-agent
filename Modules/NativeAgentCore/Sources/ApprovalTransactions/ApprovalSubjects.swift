@@ -100,7 +100,8 @@ extension ApprovalExecution {
             let work: String
             do { work = try StudioCanonProposal.draft(of: rec).workTitle }
             catch {
-                return .init(action: .object(["op": .string("studio_canon_payload_unavailable"), "rowWritten": .bool(false)]),
+                return .init(action: .object(["op": .string("studio_canon_payload_unavailable"), "status": .string("failed"),
+                    "rowWritten": .bool(false)]),
                     detail: error.localizedDescription)
             }
             if decision != ApprovalDecision.approved.rawValue {
@@ -109,11 +110,13 @@ extension ApprovalExecution {
             }
             let landed = try await SwiftNativeStudioStore(dataRoot: root).readCanon().contains { $0.proposalID == rec.id }
             if landed {
-                return .init(action: .object(["op": .string("studio_canon_already_applied"), "work": .string(work), "rowWritten": .bool(false)]),
+                return .init(action: .object(["op": .string("studio_canon_already_applied"), "status": .string("completed"),
+                    "work": .string(work), "rowWritten": .bool(false)]),
                     detail: "Canon row for \(work) is already on the ledger")
             }
             let agentSeat = StudioCanonSeat.isAgent(rec.decidedBy)
             return .init(action: .object(["op": .string(agentSeat ? "studio_canon_needs_agent_turn" : "studio_canon_refused"),
+                "status": .string(agentSeat ? "pending" : "refused"),
                 "decidedBy": .string(rec.decidedBy ?? ""), "work": .string(work), "rowWritten": .bool(false)]),
                 detail: agentSeat ? "The approved canon row has not landed; run app studio.canon_resolve in the agent's live turn. "
                     + "It is idempotent by proposal id."

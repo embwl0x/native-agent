@@ -3,9 +3,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
 // Blueprint: | `MacNotification.swift` | Notification posting through the app's injected banner exit with truthful unverified acceptance |
 
 extension SwiftNativeMacControl {

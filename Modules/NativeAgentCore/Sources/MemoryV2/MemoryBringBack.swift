@@ -65,17 +65,10 @@ public enum MemoryBringBack {
         public let words: String
     }
 
-    /// The verifier's door: prepare and run against `dataRoot`'s store, with no app.
-    @concurrent public static func bringBack(from: URL, into dataRoot: URL) async throws -> (prepared: Prepared, outcome: Outcome) {
-        let owner = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-        let prepared = try await prepare(from: from, into: dataRoot, owner: owner)
-        return (prepared, await run(prepared, into: dataRoot, owner: owner))
-    }
-
     // MARK: - Prepare: every lookup, nothing written
 
     /// Reads the archive and the current store's brought-back ids. An archive that cannot be read throws `archive_unreadable`.
-    @concurrent public static func prepare(from: URL, into dataRoot: URL, owner: SwiftNativeMemoryV2) async throws -> Prepared {
+    @concurrent public static func prepare(from: URL, into dataRoot: URL) async throws -> Prepared {
         let copy = FileManager.default.temporaryDirectory.appendingPathComponent("bring-back-" + UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: copy) }
         let rows: [Old]
@@ -282,7 +275,7 @@ public enum MemoryBringBack {
         return (ids, held)
     }
 
-    /// "<name> of <Mon d>": the archive's agent and the day of its last memory. A root's name holds no comma, so "of" joins them.
+    /// "<name> of <Mon d>": the archive's agent and the day of its last memory. A validated name may contain commas.
     static func label(name: String?, last: Date?) -> String {
         let name = name.flatMap(MemoryRoot.validName) ?? defaultName
         guard let last else { return name }
@@ -329,7 +322,7 @@ public enum MemoryBringBack {
             return (named(first.how, first.by, past(first.date)), Array(Set(roots.flatMap(\.through))).sorted())
         }
         func text(_ key: String) -> String? {
-            fields[key]?.stringValue.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+            fields[key]?.trimmedString
         }
         let through = principals(fields, person: person)
         guard let raw = text("provenance") else { return (MemoryRoot.Telling(how: .kept, since: written), through) }

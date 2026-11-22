@@ -10,23 +10,18 @@ import SwiftUI
 final class InboxStore: ObservableObject {
     var items: [InboxItemRecord] { iCloudSyncEngine.shared.inboxItems }
     @Published var isLoading = false
-    @Published var bannerError: String? = nil
 
     // MARK: - Fetch
 
     func refresh(pairingStore: PairingStore) async {
         isLoading = true
         defer { isLoading = false }
-        guard pairingStore.usesICloudTransport else {
-            bannerError = "Pair to view"
-            return
-        }
+        guard pairingStore.usesICloudTransport else { return }
         await iCloudSyncEngine.shared.refreshInboxSnapshot()
         applySyncedInboxFromSnapshot()
     }
 
     func applySyncedInboxFromSnapshot() {
         NSLog("[InboxStore] refresh via iCloud fetched=%d", iCloudSyncEngine.shared.inboxItems.count)
-        bannerError = iCloudSyncEngine.shared.syncError
     }
 }

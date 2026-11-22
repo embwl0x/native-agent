@@ -53,14 +53,10 @@ extension QuietInboxHost {
         return nil
     }
 
-    private static func inboxText(_ input: [String: JSONValue], _ key: String) -> String {
-        input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
-
     private func inboxGate(verb: String, input: [String: JSONValue], turn: Turn) async -> Result<QuietInboxTarget, QuietInboxRefusal> {
         func refuse(_ json: JSONValue) -> Result<QuietInboxTarget, QuietInboxRefusal> { .failure(QuietInboxRefusal(json: ChatToolOutcome.refusedBeforeRunning(
             json))) }
-        func text(_ key: String) -> String { Self.inboxText(input, key) }
+        func text(_ key: String) -> String { JSONValue.trimmedScalarTextOrEmpty(input[key]) }
         let items: [InboxItemRecord]
         do { items = try await self.readInbox() } catch {
             return refuse(AppToolExecutor.failure("inbox_unreadable",
@@ -71,10 +67,7 @@ extension QuietInboxHost {
         target.person = AppToolExecutor.personDecided(tool: "inbox", input: input, turn: turn)
 
         var ids = [text("id")].filter { !$0.isEmpty }
-        if case .array(let many)? = input["ids"] {
-            ids += many.compactMap { $0.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-        }
+        ids += JSONValue.trimmedScalarTextArray(input["ids"])
         guard !ids.isEmpty else {
             return refuse(AppToolExecutor.failure("missing_id", "Pass id (or ids). app {page:\"inbox\"} lists them."))
         }
@@ -204,7 +197,7 @@ extension QuietInboxHost {
         case .success(let ready): target = ready
         }
         if verb == "list" {
-            return inboxList(target.items, filter: Self.inboxText(input, "filter"), limit: input["limit"])
+            return inboxList(target.items, filter: JSONValue.trimmedScalarTextOrEmpty(input["filter"]), limit: input["limit"])
         }
         let (ids, byID) = (target.ids, target.byID)
         let selected = ids.compactMap { id in byID[id].map { (id: id, item: $0) } }
@@ -233,7 +226,7 @@ extension QuietInboxHost {
             }
             return .object(["status": .string("ok"), "notes": .array(notes)])
         case "archive", "dismiss", "mark_read":
-            let reason = String(Self.inboxText(input, "reason").prefix(280))
+            let reason = String(JSONValue.trimmedScalarTextOrEmpty(input["reason"]).prefix(280))
             let action = verb == "mark_read" ? "read" : verb
             var done: [JSONValue] = []
             var skipped: [JSONValue] = []
@@ -390,8 +383,10 @@ extension QuietInboxHost {
             "actions": .array(inboxPresentation(item).actions.map { .string("\($0.id): \($0.label)") }),
         ]
         if full {
-            row["summary"] = .string(item.summary)
-            row["detail"] = .string(String((item.detail ?? "").prefix(4_000)))
+            // The summary is the start of the detail (a clip of it); a read says the words once.
+            let detail = String((item.detail ?? "").prefix(4_000))
+            if detail.isEmpty || !detail.hasPrefix(item.summary) { row["summary"] = .string(item.summary) }
+            if !detail.isEmpty { row["detail"] = .string(detail) }
             if let readAt = item.read_at { row["read_at"] = .string(readAt) }
             if let approval = item.related_approval_id, !approval.isEmpty { row["approval_id"] = .string(approval) }
         } else {

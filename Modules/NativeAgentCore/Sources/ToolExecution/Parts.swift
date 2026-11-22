@@ -48,17 +48,14 @@ extension Parts {
     var store: OwnedProgramStore { OwnedProgramStore(root: root.appendingPathComponent("abilities")) }
     var abilities: AbilityStore { AbilityStore(dataRoot: root) }
 
-    public static func fields(_ value: JSONValue) -> [String: JSONValue] { if case .object(let fields) = value { fields } else { [:] } }
-    static func strings(_ value: JSONValue?) -> [String] {
-        if case .array(let values)? = value { values.compactMap { if case .string(let text) = $0 { text } else { nil } } } else { [] }
-    }
-    public static func string(_ fields: [String: JSONValue], _ key: String) -> String? { if case .string(let text)? = fields[key] { text } else { nil } }
+    public static func fields(_ value: JSONValue) -> [String: JSONValue] { JSONValue.objectOrEmpty(value) }
+    public static func string(_ fields: [String: JSONValue], _ key: String) -> String? { fields[key]?.stringValue }
     public static func declaredStrings(_ value: JSONValue?, name: String) throws -> [String] {
         guard let value else { return [] }
         guard case .array(let values) = value, values.allSatisfy({ if case .string = $0 { true } else { false } }) else {
             throw PartError.invalid("\(name) must be an array of strings.")
         }
-        return strings(value)
+        return JSONValue.stringArray(value)
     }
-    static func now() -> String { SwiftNativeToolRegistry.isoTimestamp(Date()) }
+    static func now() -> String { NativeTimestampFormat.fractionalUTCOffset(Date()) }
 }

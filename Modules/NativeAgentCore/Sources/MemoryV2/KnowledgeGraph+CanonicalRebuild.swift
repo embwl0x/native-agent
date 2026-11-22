@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import GRDB
 import PersistenceCore
 // Blueprint: | `KnowledgeGraph+CanonicalRebuild.swift` | `SwiftNativeKnowledgeGraphIndexer`, `rebuildMemoryDerivedGraphFromCanonicalStore`, `reconcileMemoryIndexFingerprints` |
@@ -75,7 +76,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             try db.execute(sql: "DELETE FROM kg_memory_index")
             let indexRowsRemoved = db.changesCount
 
-            let now = Self.nowISO8601()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             let consolidation = if facts.isEmpty {
                 try Self.removeUnreferencedPrimaryUserRole(db)
             } else {

@@ -75,24 +75,4 @@ public enum BoundedWait {
         )
         return maxDeadlineSeconds
     }
-
-    /// Invalid or oversized environment overrides use the configured default and report the rejection; accepting hours would turn a bounded file-lock wait into
-    /// a system-wide stall.
-    public static func seconds(fromEnv key: String, fallback: TimeInterval) -> TimeInterval {
-        guard let raw = ProcessInfo.processInfo.environment[key],
-              let parsed = TimeInterval(raw.trimmingCharacters(in: .whitespaces)),
-              parsed > 0, parsed.isFinite
-        else { return fallback }
-        guard parsed <= maxDeadlineSeconds else {
-            logger.error(
-                """
-                \(key, privacy: .public)=\(parsed, privacy: .public)s exceeds the \
-                \(maxDeadlineSeconds, privacy: .public)s maximum; rejected, using \
-                \(fallback, privacy: .public)s
-                """
-            )
-            return fallback
-        }
-        return parsed
-    }
 }

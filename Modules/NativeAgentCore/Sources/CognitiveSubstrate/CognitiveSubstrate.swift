@@ -90,6 +90,8 @@ public actor CognitiveSubstrate {
     var dreamResidue: CognitiveDreamResidue?
     /// One residue per night, keyed by committed dream id or local calendar day.
     var dreamResidueClaims: Set<String> = []
+    /// Older checkpoints claimed residue before saving its felt event. Only a still-owed night replays it.
+    var unconfirmedDreamClaims: Set<String> = []
     /// Unsettled attention rows share the field's checkpoint: a saved application always retains its replay identity.
     var attentionLanding: AttentionLanding?
     /// Bound recall nudges to one per node per hour.
@@ -100,14 +102,16 @@ public actor CognitiveSubstrate {
     var dirtySince: Date?
     var dirtyRevision: UInt64 = 0
     /// Single-flight at the owner also covers manual and termination paths while SQLite suspends; a second pass cannot stage over the first.
-    var maintenanceRunInFlight = false
+    var maintenanceRunInFlight: Bool { maintenanceTransitionDone != nil }
 
     /// Microcycle commits and maintenance transitions exclude each other across awaits. Microcycles wait for maintenance; maintenance skips an active
     /// microcycle commit. Resident ingest waits only for maintenance, never for this commit hold.
     var maintenanceCommitInFlight = false
     var microcycleWaiters: [ScopedWaiter] = []
 
-    private var maintenanceTransitionDone = ScopedWaiter()
+    private var maintenanceTransitionDone: ScopedWaiter?
+    /// Replay serializes its own evidence and publishes before a reset or restore can replace it.
+    var replayTransitionDone: ScopedWaiter?
     private var lifecycleHoldDone = ScopedWaiter()
 
     /// Restore and Clear are mutually exclusive under one hold: each waits while the other (or another of itself) is in flight.
@@ -125,23 +129,21 @@ public actor CognitiveSubstrate {
     }
 
     /// Mutations wait for the whole durable transition, even when cancelled. Read-only snapshots remain available while the store is suspended.
-    func waitForMaintenanceTransition() async {
-        while maintenanceRunInFlight {
-            let done = maintenanceTransitionDone
+    func waitForMaintenanceTransition(includingReplay: Bool = false) async {
+        while let done = maintenanceTransitionDone ?? (includingReplay ? replayTransitionDone : nil) {
             await Task { await done.park() }.value
         }
     }
 
     /// Pair transition ownership with deferred release in `runMaintenanceChecked`.
     func beginMaintenanceTransition() {
-        maintenanceRunInFlight = true
+        maintenanceTransitionDone = ScopedWaiter()
     }
 
     /// Resume each parked waiter once; later transitions get fresh waiters.
     func endMaintenanceTransition() {
-        maintenanceRunInFlight = false
-        maintenanceTransitionDone.resume()
-        maintenanceTransitionDone = ScopedWaiter()
+        maintenanceTransitionDone?.resume()
+        maintenanceTransitionDone = nil
     }
 
     var lastUserPresenceAt: Date?
@@ -284,7 +286,7 @@ public actor CognitiveSubstrate {
     }
 
     public func configure(_ configuration: CognitiveConfiguration) async {
-        await waitForMaintenanceTransition()
+        await waitForMaintenanceTransition(includingReplay: true)
         self.configuration = configuration
         if !configuration.persistenceEnabled {
             persistenceHealth = .disabled
@@ -325,7 +327,7 @@ public actor CognitiveSubstrate {
     }
 
     public func clearTransientState() async {
-        await waitForMaintenanceTransition()
+        await waitForMaintenanceTransition(includingReplay: true)
         clearResidentState()
     }
 
@@ -361,6 +363,7 @@ public actor CognitiveSubstrate {
         associationSuppressions.removeAll(keepingCapacity: false)
         dreamResidue = nil
         dreamResidueClaims = []
+        unconfirmedDreamClaims = []
         lastRefeltAt.removeAll(keepingCapacity: false)
         lastRefeltRecordAt.removeAll(keepingCapacity: false)
         ablations.removeAll(keepingCapacity: false)
@@ -380,13 +383,13 @@ public actor CognitiveSubstrate {
     }
 
     /// Clear holds every writer across awaits, atomically moves the store epoch, then empties RAM and saves post-clear state. Failed store clear preserves
-    /// resident state; MemoryV2 is outside its scope.
-    public func forgetMind() async throws {
+    /// resident state. After commit, return any self-file deletion failure separately.
+    public func forgetMind() async throws -> String? {
         guard let store else { throw CognitivePersistenceError.storeUnavailable }
         // One hold for Clear and restore: wait out a restore in flight.
         await waitForLifecycleHold()
-        // Hold maintenance and microcycle ownership through Clear so no suspended commit can land after forgetting.
-        await waitForMaintenanceTransition()
+        // Drain replay, then hold maintenance and microcycle ownership through Clear so no suspended commit can land after forgetting.
+        await waitForMaintenanceTransition(includingReplay: true)
         beginMaintenanceTransition()
         if maintenanceCommitInFlight {
             let done = ScopedWaiter()
@@ -398,8 +401,7 @@ public actor CognitiveSubstrate {
         forgettingInFlight = true
         forgettingDiscarded.removeAll()
         var supersededStages = unsavedStages.subtracting(["mind.self", "mind.self.read"])
-        let epoch: UInt64
-        let clearedAt: Date
+        let cleared: Result<(epoch: UInt64, at: Date), Error>
         do {
             // Repair claims survive relaunch; RAM is not their owner. Read before deleting anything, so an unavailable ledger cannot leave a successful Clear
             // with debts it never learned about.
@@ -411,16 +413,32 @@ public actor CognitiveSubstrate {
                 let stage = String(operation.dropFirst("cognition.persist:".count))
                 if stage != "mind.self", stage != "mind.self.read", stage != "clear" { supersededStages.insert(stage) }
             }
-            clearedAt = dependencies.now()
-            epoch = try await store.clear(at: clearedAt)
+            let at = dependencies.now()
+            cleared = .success((try await store.clear(at: at), at))
         } catch {
+            cleared = .failure(error)
+        }
+        let settled = await settle { [supersededStages] in
+            await self.finishForgetting(cleared, supersededStages: supersededStages)
+        }
+        return try settled.get()
+    }
+
+    private func finishForgetting(
+        _ cleared: Result<(epoch: UInt64, at: Date), Error>, supersededStages: Set<String>
+    ) async -> Result<String?, Error> {
+        let committed: (epoch: UInt64, at: Date)
+        switch cleared {
+        case .success(let result): committed = result
+        case .failure(let error):
             // A failed Clear owes one repair for discarded writes; mark affect/nodes dirty and let each other owner save its current state at its next write.
             oweFailedClear(forgettingDiscarded, error: error)
             forgettingDiscarded.removeAll()
             markDirty(at: dependencies.now())
             endForgetting()
-            throw error
+            return .failure(error)
         }
+        let (epoch, clearedAt) = committed
         clearResidentState()
         mindEpoch = epoch
         mindClearedAt = clearedAt
@@ -440,15 +458,23 @@ public actor CognitiveSubstrate {
                 failureStage: unsavedStages.isEmpty ? nil : "unsaved",
                 failureDetail: unsavedStages.isEmpty ? nil : "unsaved: " + unsavedStages.sorted().joined(separator: ", "))
         }
-        await notingPersistence("mind.self") {
-            let path = CognitiveSelfKnowledge.path(conversationDataRoot)
-            if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
-            // Checked deletion retires the old file's read debt as well; a read of an older valid file cannot retire a failed nightly save.
-            await notingPersistence("mind.self.read") { }
+        let selfFileDeletionError: String?
+        do {
+            try await checkingPersistence("mind.self") {
+                let path = CognitiveSelfKnowledge.path(conversationDataRoot)
+                do { try FileManager.default.removeItem(at: path) }
+                catch let error as CocoaError where error.isFileAbsent {}
+                // Confirmed deletion or absence also settles the old file's read debt.
+                await notingPersistence("mind.self.read") { }
+            }
+            selfFileDeletionError = nil
+        } catch {
+            selfFileDeletionError = error.localizedDescription
         }
         endForgetting()
         forgettingDiscarded.removeAll()
         await saveResidentAfterForgetting()
+        return .success(selfFileDeletionError)
     }
 
     /// Release Clear's holds: the lifecycle hold, the maintenance transition and the microcycle commit ownership (handed to a waiting microcycle).

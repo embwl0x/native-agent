@@ -230,9 +230,15 @@ identity resolution and the dream consumption mark; those duties do not write
 or replay summaries.
 
 Launch recovery and stale-row repair share one locked, validated transcript
-observation. Its sidebar preview and row stamp come from the latest conversational
-row, including an empty caption; absence clears both. A repaired preview advances
-the transcript generation before acknowledging the recovered transcript version.
+observation. Its sidebar preview and row stamp come from the transcript decoder's
+reading of the latest conversational row, including an empty caption. Recovery
+names a chat with a blank opening caption “Recovered Chat.” A missing
+conversational row or failed provenance clears the preview and its stamp. If an
+empty read conflicts with the index, reconciliation preserves the indexed count
+and dates and leaves the transcript version and generation alone. A preview
+change from a confirmed transcript advances its generation. Legacy reconciled
+previews share the launch limits of 50 stale transcripts and the reconciliation
+byte budget.
 
 Tool history renders receipt-aware evidence at its actual rendered length;
 the context budget has no separate per-tool-row cap. Replay and the bounded
@@ -313,5 +319,5 @@ The turn part, persona, memory content and built paragraph text are unchanged.
 Source owners: `ChatSessionWork/SentTurnContext.swift`,
 `SessionHistoryMessageProjection.swift`, `SessionHistoryTail.swift`,
 `SessionHistoryPromptRenderer.swift`, `ChatTurnRuntime/ConversationPrefixSeeding.swift`,
-`ChatOrchestration+SessionHistory.swift`, `ChatOrchestration+StreamingToolLoop.swift`
-and `StandingBotModel.swift`.
+`ChatOrchestration+SessionHistory.swift`, `TurnStem.swift`, `TurnStem+Opening.swift`,
+`TurnStem+ModelRound.swift` and `StandingBotModel.swift`.

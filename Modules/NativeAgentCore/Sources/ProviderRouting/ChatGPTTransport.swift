@@ -37,7 +37,7 @@ public final class ChatGPTTransport: LLMTransport {
     internal let authPathOverride: URL?
     internal let dataRootOverride: URL?
     internal let openAIPublicClientID: String
-    private let telemetry: LLMCallTraceRecorder
+    public let telemetry: LLMCallTraceRecorder
     /// Refresh serialization is shared across instances by resolved credential path.
     private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
 
@@ -121,17 +121,7 @@ public final class ChatGPTTransport: LLMTransport {
             authPath: resolveAuthPath()
         )
     }
-    /// Structured calls must stay paired with results or the model can repeat them indefinitely. Whole replies share SSE decoding, liveness and one
-    /// receipt.
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
-    }
+
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -151,7 +141,7 @@ public final class ChatGPTTransport: LLMTransport {
                 let substitutedFrom: String?
                 do {
                     coercedModel = try coerceToGPTModel(model)
-                    substitutedFrom = Self.substitutionTrace(
+                    substitutedFrom = substitutionTrace(
                         requested: model,
                         coerced: coercedModel
                     )
@@ -196,7 +186,7 @@ public final class ChatGPTTransport: LLMTransport {
                     do {
                         (bytes, response) = try await ProviderWire.open(session, req, call: call)
                     } catch {
-                        throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
+                        throw mapTransportError(error, fallback: transientNetworkError(error, provider: providerId, host: endpoint.host ?? "chatgpt.com", operation: "streamMessages"))
                     }
                     defer { bytes.cancel() }
                     guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
@@ -214,7 +204,7 @@ public final class ChatGPTTransport: LLMTransport {
                         providerId: self.providerId, telemetry: self.telemetry,
                         requestStartNs: requestStartNs, substitutedFrom: substitutedFrom,
                         providerLabel: "openai oauth", errorPrefix: "chatgpt-backend",
-                        networkError: { self.transientNetworkError($0, endpoint: endpoint, operation: "streamMessages") },
+                        networkError: { transientNetworkError($0, provider: self.providerId, host: endpoint.host ?? "chatgpt.com", operation: "streamMessages") },
                         continuation: continuation, call: call
                     )
                     continuation.finish()
@@ -228,24 +218,7 @@ public final class ChatGPTTransport: LLMTransport {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        try await completeMessages(
-            messages: [LLMMessage(role: .user, content: [.text(prompt)])],
-            system: system, model: model, tools: tools, call: call
-        )
-    }
-    internal func transientNetworkError(_ error: Error, endpoint: URL, operation: String) -> LLMError {
-        .transient(
-            message: """
-                \(providerId) \(operation) failed for \(endpoint.host ?? "chatgpt.com"): \
-                \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))
-                """)
-    }
+
     private static func boundedBodyString(
         from bytes: ProviderHTTPBytes,
         maxBytes: Int = 4_096
@@ -314,12 +287,5 @@ public final class ChatGPTTransport: LLMTransport {
             return normalized
         }
         throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: r)
-    }
-    /// Record ID normalization so substitution stays visible in telemetry.
-    static func substitutionTrace(requested: String?, coerced: String) -> String? {
-        guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
-            return nil
-        }
-        return r == coerced ? nil : r
     }
 }

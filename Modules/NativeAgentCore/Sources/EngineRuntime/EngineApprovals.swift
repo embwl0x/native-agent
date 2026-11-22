@@ -110,35 +110,6 @@ public actor ApprovalsFacade {
         await counts.updateApprovals(value)
     }
 
-    public enum Resolution: Equatable, Sendable {
-        case applied(ApprovalRecord)
-        case noOpInFlight(id: String)
-        case noOpAlreadyResolved(id: String, status: String)
-        case unavailable(String)
-    }
-
-    public func resolveOnce(
-        id: String, using operation: @MainActor @Sendable (String) async throws -> ApprovalRecord
-    ) async throws -> Resolution {
-        let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedID.isEmpty else {
-            return .unavailable("The approval request has no identifier.")
-        }
-        guard !isResolving(id: trimmedID) else {
-            return .noOpInFlight(id: trimmedID)
-        }
-
-        do {
-            return .applied(try await operation(trimmedID))
-        } catch let ApprovalInboxError.alreadyResolved(id: resolvedID, status: status) {
-            return .noOpAlreadyResolved(id: resolvedID, status: status)
-        }
-    }
-
-    public func isResolving(id: String) -> Bool {
-        resolutionTasks[id.trimmingCharacters(in: .whitespacesAndNewlines)] != nil
-    }
-
     public func resolveApproval(
         id: String, decision: String, coordinator: ApprovalExecution, turn: Turn
     ) async throws -> ApprovalRecord {

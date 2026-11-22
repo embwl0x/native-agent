@@ -1,4 +1,5 @@
 import Foundation
+import enum NativeAgentShared.NativeTimestampFormat
 import GRDB
 import NativeAgentCore
 import PersistenceCore
@@ -129,11 +130,7 @@ extension SwiftNativeMemoryV2 {
             kind: MemoryRecallScoring.kind(of: metadata)
         )
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
-        if let reason = MemoryCandidateQuality.rejectionReason(
-            text: content,
-            source: source,
-            kind: MemoryRecallScoring.kind(of: metadata)
-        ) {
+        if let reason = MemoryCandidateQuality.rejectionReason(text: content) {
             throw MemoryV2Error.rejectedCandidate(reason)
         }
         try await ensureCanonicalAttachment()
@@ -141,7 +138,7 @@ extension SwiftNativeMemoryV2 {
         if try await storage.isTombstoned(content: content) {
             throw MemoryV2Error.forgottenContent("Content matches a forgotten or rejected memory.")
         }
-        let now = Self.iso8601Now()
+        let now = NativeTimestampFormat.plainZulu(Date())
         var liftedConfidence: Double?
         var liftedValidFrom: String?
         var liftedValidTo: String?
@@ -198,7 +195,7 @@ extension SwiftNativeMemoryV2 {
                 throw MemoryV2Error.staleSupersession("Memory to supersede is missing or no longer active: \(id)")
             }
             return SupersedingAcceptance(
-                targetId: id, expectedContentHash: MemoryStorage.contentHash(row.content),
+                targetId: id, expectedContentHash: MemoryStorage.contentFingerprint(row.content),
                 reason: "explicit supersession", restatesOwnPast: context.restatesOwnPast)
         }
         // Share fingerprinted replacement intent with supersession, including cold admission; reasserting the exact target is duplicate evidence, never
@@ -208,7 +205,7 @@ extension SwiftNativeMemoryV2 {
                $0.id == corrects && $0.status == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle)
            }), MemoryStorage.comparisonKey(target.content, mode: .canonical) != MemoryStorage.comparisonKey(content, mode: .canonical) {
             superseding.append(SupersedingAcceptance(
-                targetId: corrects, expectedContentHash: MemoryStorage.contentHash(target.content),
+                targetId: corrects, expectedContentHash: MemoryStorage.contentFingerprint(target.content),
                 reason: correctionReason ?? "explicit correction", restatesOwnPast: context.restatesOwnPast))
         }
         if superseding.isEmpty {
@@ -249,14 +246,6 @@ extension SwiftNativeMemoryV2 {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         return try await storage.isTombstoned(content: content)
-    }
-
-    // MARK: - utilities
-
-    static func iso8601Now() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.string(from: Date())
     }
 
 }

@@ -660,9 +660,8 @@ struct ChromeConversationTab: Sendable {
         let prior = previous?.tabID == id ? previous : nil
         guard case .int(let sequence)? = result["userSequence"] ?? prior?.userSequence, sequence >= 0 else { return nil }
         tabID = id; userSequence = .int(sequence)
-        func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value { text } else { nil } }
-        title = string(result["title"]) ?? prior?.title
-        url = string(result["url"]) ?? prior?.url
+        title = result["title"]?.stringValue ?? prior?.title
+        url = result["url"]?.stringValue ?? prior?.url
         audible = result["audible"] ?? prior?.audible ?? .null
         mutedInfo = result["mutedInfo"] ?? prior?.mutedInfo ?? .null
         if case .object(let view)? = result["readingView"] { readingView = view }

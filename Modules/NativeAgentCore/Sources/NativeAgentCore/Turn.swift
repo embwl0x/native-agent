@@ -79,7 +79,6 @@ private enum ClientPart: TurnPart { static let unset: (any LLMClient)? = nil }
 private enum TokenBudgetPart: TurnPart { static let unset: TurnTokenBudget? = nil }
 private enum OfferedToolsPart: TurnPart { static let unset: Set<String>? = nil }
 private enum CapabilityNotePart: TurnPart { static let unset: (@Sendable (String) -> Void)? = nil }
-private enum PartialReplyPart: TurnPart { static let unset: (@Sendable (String) async -> Void)? = nil }
 private enum AdmissionPart: TurnPart { static let unset: ModelAdmission? = nil }
 private enum VerifiedSessionPart: TurnPart { static let unset: String? = nil }
 private enum ToolActPart: TurnPart { static let unset: String? = nil }
@@ -120,11 +119,6 @@ extension Turn {
     public var capabilityNote: (@Sendable (String) -> Void)? {
         get { self[CapabilityNotePart.self] }
         set { self[CapabilityNotePart.self] = newValue }
-    }
-    /// The whole reply so far on an abnormal end, delivered before the error rethrows.
-    public var partialReply: (@Sendable (String) async -> Void)? {
-        get { self[PartialReplyPart.self] }
-        set { self[PartialReplyPart.self] = newValue }
     }
     /// The model route admitted at the turn's boundary.
     public var admission: ModelAdmission? {

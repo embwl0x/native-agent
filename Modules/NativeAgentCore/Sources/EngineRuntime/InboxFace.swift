@@ -21,7 +21,7 @@ extension NativeAgentEngine {
             }
         }
         return { [weak self] in
-            guard let self else { throw PartCallError(code: "inbox_closed", message: "The Inbox owner has closed.") }
+            guard let self else { throw PartCallError(code: "inbox_closed", message: "The Inbox is not available.") }
             return try await inboxFace()
         }
     }
@@ -74,7 +74,7 @@ extension NativeAgentEngine {
         }
         // The history: every matter put away, newest first, folded under its counts.
         let counts = "\(recent.count) archived in the last day; \(earlier.count) put away in all."
-            + (undated == 0 ? "" : " \(undated) archived matters have no settlement time; the day's count excludes those matters.")
+            + (undated == 0 ? "" : " \(undated) have no date, so the last day's count leaves them out.")
         sections.append(.init(id: "earlier", title: "Earlier", style: .list, footer: counts,
                               rows: inboxDecisionGroups(zip(earlier, history).map { (matter: $0, row: $1) }, section: "earlier"),
                               folded: true))
@@ -140,7 +140,7 @@ extension NativeAgentEngine {
             return matters.map { matter in
                 guard let ref = matter.evidence.first(where: { $0.source == Matter.approvals }) else { return inboxHistoryRow(matter) }
                 guard let face = faces[ref.id] else {
-                    return inboxHistoryRow(matter, unavailable: "The approval owner has no saved settled result for \(ref.id).")
+                    return inboxHistoryRow(matter, unavailable: "The result of this approval was not saved.")
                 }
                 return inboxHistoryRow(matter, savedFace: face)
             }
@@ -156,7 +156,7 @@ extension NativeAgentEngine {
     /// A decided card leads with its owner's saved outcome, then the original request. Only continuation retry survives; consent never reopens.
     private func inboxHistoryRow(_ matter: Experience, savedFace: Experience.Face? = nil, unavailable: String? = nil) -> PartFace.Row {
         guard let face = savedFace ?? matter.face, let row = face.row else {
-            return .init(id: matter.id, title: "This matter has no face row", detail: "The experience owner must supply the missing row.",
+            return .init(id: matter.id, title: "This item can't be shown.", detail: nil,
                          at: matter.at, tone: .attention)
         }
         var title = row.title
@@ -191,7 +191,7 @@ extension NativeAgentEngine {
     private func inboxFaceRow(_ matter: Experience, tone: PartFace.Tone? = nil) -> PartFace.Row {
         let reading = ForPerson.reading(matter)
         guard let face = matter.face, let row = face.row else {
-            return .init(id: matter.id, title: "This matter has no face row", detail: "The experience owner must supply the missing row.",
+            return .init(id: matter.id, title: "This item can't be shown.", detail: nil,
                          at: matter.at, tone: .attention)
         }
         let approval = matter.evidence.contains { $0.source == Matter.approvals }
@@ -203,7 +203,7 @@ extension NativeAgentEngine {
             let role: PartFace.Action.Role? = ["archive", "dismiss", "reject"].contains(answer.id) ? .destructive : composed?.role
             // The inbox's own verbs are housekeeping on every row, drawn behind the row's menu; so is what its owner marked aside.
             let aside = InboxActionVocabulary.inboxVerbs.contains { $0.id == answer.id } || composed?.aside == true
-            return .init(id: answer.id, label: approval && answer.id == "reject" ? "Deny" : answer.label, role: role, doors: composed?.doors,
+            return .init(id: answer.id, label: approval && answer.id == "reject" ? "Decline" : answer.label, role: role, doors: composed?.doors,
                          call: call, aside: aside ? true : nil)
         }
         var detail = [row.detail, face.words].compactMap { $0 }.filter { !$0.isEmpty }

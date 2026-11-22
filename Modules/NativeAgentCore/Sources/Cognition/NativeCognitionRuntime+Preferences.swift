@@ -193,7 +193,7 @@ extension NativeCognitionRuntime {
             await refreshOrganismBodySchema(reason: "onboarding transition")
             await persistOrganismContinuity(reason: "onboarding transition")
         } else {
-            cachedBodyRead = nil
+            bodyReadOrder.write { cachedBodyRead = nil }
         }
         await rescheduleResidualRepairDeadline()
         await rescheduleCognitionMaintenanceDeadline()
@@ -272,14 +272,12 @@ extension NativeCognitionRuntime {
     nonisolated static func organismConfigurationForLaunch(
         dataRoot: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        storedEnabled: Bool? = nil,
         defaults: UserDefaults = .standard
     ) -> OrganismConfiguration {
         if NativeAgentPublicSafety.shouldForceNeutralOrganism(dataRoot: dataRoot, environment: environment) {
             return .disabled
         }
-        let explicitOrganism = storedEnabled
-            ?? (defaults.object(forKey: organismKernelEnabledKey) as? Bool)
+        let explicitOrganism = defaults.object(forKey: organismKernelEnabledKey) as? Bool
         let enabled = (explicitOrganism ?? false)
             || environment["NATIVE_AGENT_ORGANISM_KERNEL_ENABLED"] == "1"
         return OrganismConfiguration(enabled: enabled)

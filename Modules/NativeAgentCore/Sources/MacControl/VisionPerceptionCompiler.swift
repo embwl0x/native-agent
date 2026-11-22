@@ -37,7 +37,6 @@ public struct VisionPerceptionCompiler: Sendable {
 
     public init() {}
 
-    #if canImport(Vision)
     public func compile(
         image: CGImage,
         excludedRegions: [VisionRect] = []
@@ -55,7 +54,46 @@ public struct VisionPerceptionCompiler: Sendable {
         try Task.checkCancellation()
 
         var notes: [String] = []
+        let (textResult, texts, visibleTextBoxes, redactedTexts) = try recognizeVisibleText(
+            image: image, imageSize: imageSize, excludedRegions: excludedRegions, isVisible: isVisible, notes: &notes
+        )
+        let (candidates, colorResult) = try fuseVisibleCandidates(
+            image: image, imageSize: imageSize, grid: grid, visibleTextBoxes: visibleTextBoxes, isVisible: isVisible, notes: &notes
+        )
+        let drafts = draftRows(candidates: candidates, texts: texts, imageSize: imageSize, grid: grid)
+        let rows = compileRows(drafts, imageSize: imageSize, backgroundLuminance: colorResult.backgroundLuminance)
 
+        // Rank standalone unclaimed text by prominence as the pixel counterpart to AX readouts.
+        let readoutsAll = self.readouts(
+            texts: texts,
+            claimed: drafts.flatMap { $0.containedText.map(\.box.rect) },
+            imageSize: imageSize
+        )
+        let readouts = Array(readoutsAll.prefix(maxReadouts))
+
+        try Task.checkCancellation()
+        return VisionPercept(
+            rows: rows,
+            readouts: readouts,
+            frameSize: imageSize,
+            textTiled: textResult.tiled,
+            textTilingReason: textResult.tilingReason,
+            recognizedStrings: visibleTextBoxes.count,
+            recognizedText: zip(redactedTexts, visibleTextBoxes).map {
+                VisionRecognizedText(text: $0.0, confidence: VisionConfidence.clamp($0.1.confidence), rect: $0.1.rect)
+            },
+            notes: notes
+        )
+    }
+
+    /// Recognize and redact text before selecting the visible evidence.
+    private func recognizeVisibleText(
+        image: CGImage,
+        imageSize: VisionSize,
+        excludedRegions: [VisionRect],
+        isVisible: (VisionRect) -> Bool,
+        notes: inout [String]
+    ) throws -> (VisionTextLayerResult, [(VisionTextBox, VisionRedactedText)], [VisionTextBox], [VisionRedactedText]) {
         // Redact before any OCR string can enter a label, readout, fingerprint or glance.
         let textResult = try VisionTextLayer.recognize(
             image: image, using: VisionKitTextRecognizer(),
@@ -78,7 +116,18 @@ public struct VisionPerceptionCompiler: Sendable {
         if redactedTexts.contains(where: \.secret) {
             notes.append("\(redactedTexts.filter(\.secret).count) recognized string(s) redacted")
         }
+        return (textResult, texts, visibleTextBoxes, redactedTexts)
+    }
 
+    /// Fuse color, text bands and saliency into visible candidates within the affordance cap.
+    private func fuseVisibleCandidates(
+        image: CGImage,
+        imageSize: VisionSize,
+        grid: VisionPixelGrid,
+        visibleTextBoxes: [VisionTextBox],
+        isVisible: (VisionRect) -> Bool,
+        notes: inout [String]
+    ) throws -> ([VisionCandidate], VisionColorRegionResult) {
         let colorResult = VisionColorRegionLayer.candidates(grid: grid)
         if colorResult.capped {
             notes.append("colour-region layer hit its \(VisionColorRegionLayer.maxCandidates)-candidate cap")
@@ -119,8 +168,17 @@ public struct VisionPerceptionCompiler: Sendable {
             )
             candidates = Array(candidates.prefix(maxAffordances))
         }
+        return (candidates, colorResult)
+    }
 
-        let drafts: [VisionRowDraft] = candidates.map { candidate in
+    /// Draft each candidate with the text and luminance that inform its role and label.
+    private func draftRows(
+        candidates: [VisionCandidate],
+        texts: [(VisionTextBox, VisionRedactedText)],
+        imageSize: VisionSize,
+        grid: VisionPixelGrid
+    ) -> [VisionRowDraft] {
+        return candidates.map { candidate in
             let contained = texts.filter {
                 $0.0.rect.coverage(by: candidate.rect) >= containmentFraction
             }.map { (box: $0.0, redacted: $0.1) }
@@ -157,7 +215,14 @@ public struct VisionPerceptionCompiler: Sendable {
                 captionContrast: captionContrast
             )
         }
+    }
 
+    /// Compile affordance rows with separate state and target confidence.
+    private func compileRows(
+        _ drafts: [VisionRowDraft],
+        imageSize: VisionSize,
+        backgroundLuminance: Double
+    ) -> [VisionAffordanceRow] {
         let rowFills = drafts.filter { $0.guess.role == VisionRoleGuess.row }
             .compactMap(\.fill).sorted()
         let rowFillBaseline: Double? = rowFills.count >= 2 ? rowFills[rowFills.count / 2] : nil
@@ -183,7 +248,7 @@ public struct VisionPerceptionCompiler: Sendable {
                 role: draft.guess.role,
                 fillLuminance: draft.fill,
                 captionContrast: draft.captionContrast,
-                backgroundLuminance: colorResult.backgroundLuminance,
+                backgroundLuminance: backgroundLuminance,
                 rowFillBaseline: rowFillBaseline
             )
             let textConfidence = draft.containedText.map(\.box.confidence).max() ?? 0
@@ -210,36 +275,14 @@ public struct VisionPerceptionCompiler: Sendable {
                 ambiguous: ambiguous,
                 destructiveRisk: VisionRoleGuess.isDestructive(label: draft.label?.display ?? ""),
                 salience: draft.candidate.salience,
-                visualContrast: draft.fill.map { abs($0 - colorResult.backgroundLuminance) },
+                visualContrast: draft.fill.map { abs($0 - backgroundLuminance) },
                 visualColor: draft.candidate.fillColor?.name,
                 visualShape: draft.candidate.visualShape
             ))
         }
-
-        // Rank standalone unclaimed text by prominence as the pixel counterpart to AX readouts.
-        let readoutsAll = self.readouts(
-            texts: texts,
-            claimed: drafts.flatMap { $0.containedText.map(\.box.rect) },
-            imageSize: imageSize
-        )
-        let readouts = Array(readoutsAll.prefix(maxReadouts))
-
-        try Task.checkCancellation()
-        return VisionPercept(
-            rows: rows,
-            readouts: readouts,
-            frameSize: imageSize,
-            textTiled: textResult.tiled,
-            textTilingReason: textResult.tilingReason,
-            recognizedStrings: visibleTextBoxes.count,
-            recognizedText: zip(redactedTexts, visibleTextBoxes).map {
-                VisionRecognizedText(text: $0.0, confidence: VisionConfidence.clamp($0.1.confidence), rect: $0.1.rect)
-            },
-            notes: notes
-        )
+        return rows
     }
 
-    #endif
 
     // MARK: - Fusion helpers
 

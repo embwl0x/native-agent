@@ -1,7 +1,7 @@
 import Foundation
 import enum NativeAgentShared.NativeTimestampFormat
 import CognitiveSubstrate
-import CryptoKit
+import enum NativeAgentShared.SHA256Hex
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -14,7 +14,7 @@ import TrustCenter
 import Dispatcher
 import MacControl
 import SwarmRuns
-// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`, `cappedRecallK`, `recallHitsJSON`, `telling`; bounded recall |
+// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`, `cappedRecallK`, `recallHitsJSON`, `telling`; bounded recall; `impl_commit_memory` stages over one `MemoryCommitRequest` |
 
 // MARK: - Memory tools
 
@@ -47,7 +47,7 @@ extension SwiftToolDispatcher {
     }
 
     /// Spend content budget in rank order; once a row does not fit, all later rows remain preview-only.
-    static func recallHitsJSON(_ hits: [MemoryRecallHit], dataRoot: URL) -> [JSONValue] {
+    static func recallHitsJSON(_ hits: [MemoryRecallHit]) -> [JSONValue] {
         let trust = MemoryDataProvenance.reading(hits.map(\.extras))
         var remainingBudget = recallContentBudgetChars
         var budgetSpent = false
@@ -115,12 +115,7 @@ extension SwiftToolDispatcher {
     }
 
     private static func memoryHitId(_ hit: MemoryRecallHit) -> String? {
-        guard case .object(let extras)? = hit.extras,
-              case .string(let id)? = extras["id"] else {
-            return nil
-        }
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        hit.extras?.objectValue?["id"]?.trimmedString
     }
 
     private static func memoryHitFullContentCharacterCount(_ hit: MemoryRecallHit, content: String) -> Int64 {
@@ -144,9 +139,8 @@ extension SwiftToolDispatcher {
         return temporal
     }
 
-    /// One telling as the agent states it: how (one of the stated ways), by (a name of at most 40 letters, digits, spaces and . - ') and since (an
-    /// ISO-8601 date-time, or a date meaning the start of that local day; not after now). Nothing stated is nil; a time with no how is kept from then, since nothing says how. Names enter
-    /// model-facing lines, so a name that could forge a delimiter is refused, never trimmed into another.
+    /// One telling as the agent states it: a stated way, a name matching MemoryRoot.nameForm, and an ISO-8601 date-time or local day
+    /// up to now. Nothing stated is nil. A time with no how is kept from then. MemoryRoot validates names for safe use in model-facing lines.
     static func telling(how rawHow: JSONValue?, by rawBy: JSONValue?, since rawSince: JSONValue?,
                         names: (how: String, by: String, since: String)) throws -> MemoryRoot.Telling? {
         func text(_ value: JSONValue?, _ name: String) throws -> String? {
@@ -178,8 +172,8 @@ extension SwiftToolDispatcher {
             how = parsed
         }
         if let by, MemoryRoot.validName(by) == nil {
-            throw ToolFailureError("\(names.by) must be a name of at most \(MemoryRoot.nameLimit) letters, digits, spaces and . - '.",
-                argumentPath: names.by, accepted: "a short name, e.g. my backup", effects: .none, code: "memory_provenance_by_invalid",
+            throw ToolFailureError("\(names.by) must be \(MemoryRoot.nameForm).",
+                argumentPath: names.by, accepted: MemoryRoot.nameForm, effects: .none, code: "memory_provenance_by_invalid",
                 status: .refused, instruction: "Correct \(names.by).", recovery: .correctArguments)
         }
         var date: Date?
@@ -259,7 +253,7 @@ extension SwiftToolDispatcher {
             }
             throw error
         }
-        let arr = Self.recallHitsJSON(hits, dataRoot: dataRoot)
+        let arr = Self.recallHitsJSON(hits)
         var result: [String: JSONValue] = [
             "status": .string("ok"),
             "memory_available": .bool(true),
@@ -320,7 +314,7 @@ extension SwiftToolDispatcher {
                     """)])
         }
         let text = MemoryTextClip.memoryDisplayText(record.text, kind: record.memoryKind)
-        let contentHash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let contentHash = SHA256Hex.of(Data(text.utf8))
         // Eligibility was checked before exposing any version information. The hash describes exactly the normalized display text whose Character offsets are
         // paged, not storage bookkeeping timestamps.
         if let expectedHash, expectedHash != contentHash {
@@ -438,13 +432,97 @@ extension SwiftToolDispatcher {
 
     /// MemoryV2 owns the durable write, duplicate policy and metadata kind stamping.
     func impl_commit_memory(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
+        let commit = try memoryCommitRequest(input)
+        let supersedes = commit.supersedes, kind = commit.kind, text = commit.text, validatedTopics = commit.validatedTopics
+        let telling = commit.telling, since = commit.since
+        let meta = memoryCommitMetadata(turn: turn, input: input, commit: commit)
+
+        let record: MemoryRecord
+        let corrects = input["corrects"]?.nonblankString
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+        let correctionReason = input["correction_reason"]?.nonblankString
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+        do {
+            record = try await memoryV2.store(
+                content: text,
+                source: "chat.commit_memory",
+                metadata: .object(meta),
+                supersedes: supersedes,
+                corrects: corrects,
+                correctionReason: correctionReason,
+                // Nothing stated is kept: nothing says how the agent knows it.
+                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads,
+                               telling: telling ?? MemoryRoot.Telling(how: .kept))
+            )
+        } catch {
+            // Keep the owner's refusal, cancellation or failure and its recovery.
+            return Self.memoryFailure(error)
+        }
+
+        invocation.reportCommittedID?("commit_memory", record.id)
+        // Trace failure cannot negate the already committed write.
+        await emitMemoryCommitTrace(
+            turn: turn,
+            id: record.id,
+            kind: record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind,
+            source: "chat.commit_memory",
+            textLength: text.count
+        )
+        // A replacement awaiting admission demotes what it replaces only when its vector lands.
+        let admitted = Self.memoryMetadataValue(record.extras, key: MemoryStorage.pendingAdmissionKey) != .bool(true)
+        for id in supersedes where admitted {
+            await invocation.preparedContext?.recordAppliedMemoryCorrection(recordID: id, replacementID: record.id)
+        }
+
+        // Replacement admission owns the lineage write; report its canonical outcome or the intent still owed by a cold save.
+        let correctionField = await memoryCorrectionOutcome(invocation: invocation, record: record, corrects: corrects, supersedes: supersedes)
+
+        let trust = MemoryDataProvenance.reading([record.extras])
+        let firstKnown = MemoryDataProvenance.firstKnown(record.extras, trust: trust)
+        var payload: [String: JSONValue] = [
+            "status": .string("ok"),
+            "effects": .string("occurred"),
+            "id": .string(record.id),
+            "layer": .string(record.layer ?? "semantic"),
+            // Report the stored kind independently of its storage layer.
+            "kind": .string(record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind),
+            // What was kept, as the store holds it: when it was first known, how it is known, and any steer its words carry.
+            "since": firstKnown.map(JSONValue.string) ?? .null,
+            "provenance": .string(MemoryDataProvenance.lead(record.extras, trust: trust)),
+            "roots": MemoryDataProvenance.rootsJSON(record.extras, trust: trust),
+        ]
+        payload.merge(MemoryDataProvenance.fields(in: record.extras, trust: trust)) { current, _ in current }
+        let first = firstKnown.flatMap(MemoryRecallScoring.parseTimestamp)
+        if let since, first.map({ abs($0.timeIntervalSince(since)) >= 1 }) != false {
+            payload["since_note"] = .string("""
+                These words were already kept, so they keep that memory's first time (\(firstKnown ?? "unreadable")); a time moves back only \
+                for words no untrusted agent steered.
+                """)
+        }
+        if case .object = correctionField { payload["correction"] = correctionField }
+        if !supersedes.isEmpty {
+            payload[admitted ? "superseded" : "supersedes_once_admitted"] = .array(supersedes.map(JSONValue.string))
+        } else if let validatedTopics {
+            let agreements = await memoryExistingAgreements(turn: turn, record: record, validatedTopics: validatedTopics)
+            payload.merge(agreements) { _, new in new }
+        }
+        // A save without a target shows nearby memories as evidence for a separate judgment about replacement.
+        if supersedes.isEmpty, corrects == nil, kind == "correction" || kind == "instruction" {
+            let matches = await memoryPossibleMatches(turn: turn, record: record, text: text)
+            payload.merge(matches) { _, new in new }
+        }
+        return .object(payload)
+    }
+
+    /// The commit's arguments, every fault collected so one refusal names every required correction.
+    private func memoryCommitRequest(_ input: [String: JSONValue]) throws -> MemoryCommitRequest {
         // Collect faults so one refusal names every required correction.
         var problems: [String] = []
         var supersedes: [String] = []
         if let supplied = input["supersedes"], supplied != .null {
             if case .array(let ids) = supplied,
                ids.allSatisfy({ if case .string(let id) = $0 { return !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }; return false }) {
-                supersedes = Array(Set(Self.stringArray(supplied).map {
+                supersedes = Array(Set(JSONValue.trimmedStringArray(supplied).map {
                     $0.trimmingCharacters(in: .whitespacesAndNewlines)
                 })).sorted()
             } else {
@@ -493,17 +571,24 @@ extension SwiftToolDispatcher {
         do {
             telling = try Self.telling(how: input["provenance"], by: input["provenance_by"], since: input["since"],
                                        names: ("provenance", "provenance_by", "since"))
-        } catch { problems.append(error.localizedDescription) }
+        } catch let failure as ToolFailureError where !problems.isEmpty {
+            problems.append(failure.message)
+        }
         let since = telling?.since
 
         guard problems.isEmpty else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: commit_memory rejected "
-                    + "\(problems.count) argument problem(s): "
-                    + problems.joined(separator: "; ")
-            )
+            throw ToolFailureError("memory.commit rejected \(problems.count) argument problem(s): " + problems.joined(separator: "; "),
+                argumentPath: "args", effects: .none, status: .refused, recovery: .correctArguments)
         }
-        let tags = Self.stringArray(input["tags"])
+        return MemoryCommitRequest(supersedes: supersedes, kind: kind, text: text, validatedTopics: validatedTopics, confidence: confidence,
+            importance: importance, telling: telling, since: since)
+    }
+
+    /// The saved memory's metadata: confidence, importance, kind and tags, the saving turn's provenance, its scope, and a correction's lesson.
+    private func memoryCommitMetadata(turn: Turn, input: [String: JSONValue], commit: MemoryCommitRequest) -> [String: JSONValue] {
+        let confidence = commit.confidence, importance = commit.importance, kind = commit.kind, since = commit.since
+        let validatedTopics = commit.validatedTopics, text = commit.text
+        let tags = JSONValue.trimmedStringArray(input["tags"])
 
         // Stamp metadata.kind using the vocabulary MemoryKindStamp and MemoryRecallScoring.kind(of:) read.
         var meta: [String: JSONValue] = [
@@ -526,44 +611,13 @@ extension SwiftToolDispatcher {
         if kind == "correction" {
             meta["lesson"] = .string(MemoryRecoveryReadout.lesson(metadata: .object(meta), text: text))
         }
+        return meta
+    }
 
-        let record: MemoryRecord
-        let corrects = optionalString(input, "corrects")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
-        let correctionReason = optionalString(input, "correction_reason")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
-        do {
-            record = try await memoryV2.store(
-                content: text,
-                source: "chat.commit_memory",
-                metadata: .object(meta),
-                supersedes: supersedes,
-                corrects: corrects,
-                correctionReason: correctionReason,
-                // Nothing stated is kept: nothing says how the agent knows it.
-                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads,
-                               telling: telling ?? MemoryRoot.Telling(how: .kept))
-            )
-        } catch {
-            // Keep the owner's refusal, cancellation or failure and its recovery.
-            return Self.memoryFailure(error)
-        }
-
-        // Trace failure cannot negate the already committed write.
-        await emitMemoryCommitTrace(
-            turn: turn,
-            id: record.id,
-            kind: record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind,
-            source: "chat.commit_memory",
-            textLength: text.count
-        )
-        // A replacement awaiting admission demotes what it replaces only when its vector lands.
-        let admitted = Self.memoryMetadataValue(record.extras, key: MemoryStorage.pendingAdmissionKey) != .bool(true)
-        for id in supersedes where admitted {
-            await invocation.preparedContext?.recordAppliedMemoryCorrection(recordID: id, replacementID: record.id)
-        }
-
-        // Replacement admission owns the lineage write; report its canonical outcome or the intent still owed by a cold save.
+    /// What a named correction came to: the same record, applied, owed until the replacement is admitted, or unreadable; null when the call
+    /// corrects nothing beyond what it supersedes.
+    private func memoryCorrectionOutcome(invocation: ChatToolInvocation, record: MemoryRecord, corrects: String?, supersedes: [String]) async
+        -> JSONValue {
         var correctionField: JSONValue = .null
         if let corrects, !supersedes.contains(corrects) {
             if corrects == record.id {
@@ -608,135 +662,116 @@ extension SwiftToolDispatcher {
                 }
             }
         }
+        return correctionField
+    }
 
-        let trust = MemoryDataProvenance.reading([record.extras])
-        let firstKnown = MemoryDataProvenance.firstKnown(record.extras, trust: trust)
-        var payload: [String: JSONValue] = [
-            "status": .string("ok"),
-            "id": .string(record.id),
-            "layer": .string(record.layer ?? "semantic"),
-            // Report the stored kind independently of its storage layer.
-            "kind": .string(record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind),
-            // What was kept, as the store holds it: when it was first known, how it is known, and any steer its words carry.
-            "since": firstKnown.map(JSONValue.string) ?? .null,
-            "provenance": .string(MemoryDataProvenance.lead(record.extras, trust: trust)),
-            "roots": MemoryDataProvenance.rootsJSON(record.extras, trust: trust),
-        ]
-        payload.merge(MemoryDataProvenance.fields(in: record.extras, trust: trust)) { current, _ in current }
-        let first = firstKnown.flatMap(MemoryRecallScoring.parseTimestamp)
-        if let since, first.map({ abs($0.timeIntervalSince(since)) >= 1 }) != false {
-            payload["since_note"] = .string("""
-                These words were already kept, so they keep that memory's first time (\(firstKnown ?? "unreadable")); a time moves back only \
-                for words no untrusted agent steered.
-                """)
-        }
-        if case .object = correctionField { payload["correction"] = correctionField }
-        if !supersedes.isEmpty {
-            payload[admitted ? "superseded" : "supersedes_once_admitted"] = .array(supersedes.map(JSONValue.string))
-        } else if let validatedTopics {
-            // Scope narrows automatic context; matching agreement subjects never imply replacement lineage.
-            let topics = Set(validatedTopics.compactMap { value -> String? in
-                guard case .string(let topic) = value else { return nil }
-                return topic.lowercased()
+    /// The fields a scoped save adds: the active records that declare the same subject, bounded, which it does not replace.
+    private func memoryExistingAgreements(turn: Turn, record: MemoryRecord, validatedTopics: [JSONValue]) async -> [String: JSONValue] {
+        var payload: [String: JSONValue] = [:]
+        // Scope narrows automatic context; matching agreement subjects never imply replacement lineage.
+        let topics = Set(validatedTopics.compactMap { value -> String? in
+            guard case .string(let topic) = value else { return nil }
+            return topic.lowercased()
+        })
+        do {
+            try Task.checkCancellation()
+            let records = try await memoryV2.listMemory(kind: nil)
+            try Task.checkCancellation()
+            let existing = records.filter { row in
+                guard row.id != record.id, (row.status ?? "active") == "active",
+                      MemoryLifecycle.isRecallEligible(row.lifecycle),
+                      let disclosure = MemoryRecordDisclosurePolicy.classify(row),
+                      disclosure.permits(surface: turn.runtime?.surface ?? "chat", personaID: record.personaId)
+                else { return false }
+                let rowTopics = Set(JSONValue.trimmedStringArray(Self.memoryMetadataValue(row.extras, key: "context_topics")).map { $0.lowercased() })
+                return !rowTopics.isEmpty && rowTopics == topics
+            }.sorted {
+                let left = MemoryRecallScoring.parseTimestamp($0.updatedAt ?? $0.createdAt) ?? .distantPast
+                let right = MemoryRecallScoring.parseTimestamp($1.updatedAt ?? $1.createdAt) ?? .distantPast
+                return left == right ? $0.id < $1.id : left > right
+            }
+            var remaining = Self.recallContentBudgetChars
+            let agreementTrust = MemoryDataProvenance.reading(Array(existing.prefix(8)).map(\.extras))
+            payload["existing_agreements"] = .array(existing.prefix(8).map { row in
+                var fields: [String: JSONValue] = ["id": .string(row.id), "recorded_at": .string(row.createdAt)]
+                fields["provenance"] = .string(MemoryDataProvenance.lead(row.extras, trust: agreementTrust))
+                if let origin = MemoryMoments.recallOrigin(source: row.sourceRunId, metadata: row.extras, dataRoot: dataRoot) { fields["origin"] = origin }
+                if row.text.count <= remaining {
+                    fields["text"] = .string(row.text)
+                    fields.merge(MemoryDataProvenance.fields(in: row.extras, trust: agreementTrust)) { _, value in value }
+                    remaining -= row.text.count
+                } else {
+                    fields["content_omitted"] = .bool(true)
+                    fields["full_content_chars"] = .int(Int64(row.text.count))
+                }
+                fields["read_more"] = .object(["action": .string("memory.recall"), "memory_id": .string(row.id)])
+                return .object(fields)
             })
-            do {
-                let existing = try await memoryV2.listMemory(kind: nil).filter { row in
-                    guard row.id != record.id, (row.status ?? "active") == "active",
-                          MemoryLifecycle.isRecallEligible(row.lifecycle),
-                          let disclosure = MemoryRecordDisclosurePolicy.classify(row),
-                          disclosure.permits(surface: turn.runtime?.surface ?? "chat", personaID: record.personaId)
-                    else { return false }
-                    let rowTopics = Set(Self.stringArray(Self.memoryMetadataValue(row.extras, key: "context_topics")).map { $0.lowercased() })
-                    return !rowTopics.isEmpty && rowTopics == topics
-                }.sorted {
-                    let left = MemoryRecallScoring.parseTimestamp($0.updatedAt ?? $0.createdAt) ?? .distantPast
-                    let right = MemoryRecallScoring.parseTimestamp($1.updatedAt ?? $1.createdAt) ?? .distantPast
-                    return left == right ? $0.id < $1.id : left > right
-                }
-                var remaining = Self.recallContentBudgetChars
-                let agreementTrust = MemoryDataProvenance.reading(Array(existing.prefix(8)).map(\.extras))
-                payload["existing_agreements"] = .array(existing.prefix(8).map { row in
-                    var fields: [String: JSONValue] = ["id": .string(row.id), "recorded_at": .string(row.createdAt)]
-                    fields["provenance"] = .string(MemoryDataProvenance.lead(row.extras, trust: agreementTrust))
-                    if let origin = MemoryMoments.recallOrigin(source: row.sourceRunId, metadata: row.extras, dataRoot: dataRoot) { fields["origin"] = origin }
-                    if row.text.count <= remaining {
-                        fields["text"] = .string(row.text)
-                        fields.merge(MemoryDataProvenance.fields(in: row.extras, trust: agreementTrust)) { _, value in value }
-                        remaining -= row.text.count
-                    } else {
-                        fields["content_omitted"] = .bool(true)
-                        fields["full_content_chars"] = .int(Int64(row.text.count))
-                    }
+            payload["existing_agreements_count"] = .int(Int64(existing.count))
+            if existing.count > 8 {
+                payload["existing_agreements_more"] = .object([
+                    "action": .string("memory.recall"), "query": .string(topics.sorted().joined(separator: " ")),
+                ])
+            }
+            if !existing.isEmpty {
+                payload["agreement_note"] = .string("""
+                    These active records declare the same subject/scope; they are not automatically replacements. If the new decision \
+                    explicitly changes one, use its id with supersedes or corrects. The old rule then stays in history and leaves automatic \
+                    context. Similarity and age grant no authority.
+                    """)
+            }
+        } catch {
+            payload["existing_agreements_error"] = Self.memoryPostSaveLookupError("existing-agreement lookup", error)
+        }
+        return payload
+    }
+
+    /// Nearby active memories can help identify a replacement target.
+    private func memoryPossibleMatches(turn: Turn, record: MemoryRecord, text: String) async
+        -> [String: JSONValue] {
+        var payload: [String: JSONValue] = [:]
+        do {
+            try Task.checkCancellation()
+            let recalled = try await memoryV2.recall(MemoryV2RecallRequest(text: text, topK: 6, surface: turn.runtime?.surface ?? "chat"),
+                                                     recordingUsage: false, turn: turn)
+            try Task.checkCancellation()
+            let near = recalled.scored.map(\.record).filter {
+                $0.id != record.id && ($0.status ?? "active") == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle)
+                    && !MemoryStorage.metadataFlag($0.extras, MemoryStorage.pendingAdmissionKey)
+            }
+            var remaining = Self.recallContentBudgetChars
+            // Each one reads as recall reads it: who it came from and whether an untrusted source steered it.
+            let nearTrust = MemoryDataProvenance.reading(near.map(\.extras))
+            payload["possible_matches"] = .array(near.map { row in
+                var fields: [String: JSONValue] = ["id": .string(row.id), "recorded_at": .string(row.createdAt),
+                                                   "kind": row.memoryKind.map(JSONValue.string) ?? .null]
+                fields.merge(MemoryDataProvenance.fields(in: row.extras, trust: nearTrust)) { _, value in value }
+                fields["provenance"] = .string(MemoryDataProvenance.lead(row.extras, trust: nearTrust))
+                if row.text.count <= remaining {
+                    fields["text"] = .string(row.text)
+                    remaining -= row.text.count
+                } else {
+                    fields["content_omitted"] = .bool(true)
                     fields["read_more"] = .object(["action": .string("memory.recall"), "memory_id": .string(row.id)])
-                    return .object(fields)
-                })
-                payload["existing_agreements_count"] = .int(Int64(existing.count))
-                if existing.count > 8 {
-                    payload["existing_agreements_more"] = .object([
-                        "action": .string("memory.recall"), "query": .string(topics.sorted().joined(separator: " ")),
-                    ])
                 }
-                if !existing.isEmpty {
-                    payload["agreement_note"] = .string("""
-                        These active records declare the same subject/scope; they are not automatically replacements. If the new decision \
-                        explicitly changes one, use its id with supersedes or corrects. The old rule then stays in history and leaves automatic \
-                        context. Similarity and age grant no authority.
-                        """)
-                }
-            } catch {
-                if error is CancellationError { throw error }
-                payload["existing_agreements_error"] = .string("Saved, but the existing-agreement lookup failed: \(error)")
+                return .object(fields)
+            })
+            if !near.isEmpty {
+                payload["detail"] = .string("""
+                    These are possible matches from recall. If you judge that the new wording explicitly replaces an older memory, repeat \
+                    this save with the same text and scope and put that memory's ID in corrects. This save retired nothing.
+                    """)
             }
+        } catch {
+            payload["possible_matches_error"] = Self.memoryPostSaveLookupError("possible-match lookup", error)
         }
-        // A standing correction that names nothing it corrects leaves every earlier word on its subject surfacing beside it. Which one it
-        // corrects is a judgment of meaning (cosine cannot tell a paraphrase from a contradiction), so the save shows the nearest standing
-        // memories and the agent names the one; saving the same text again with corrects folds into this record and retires that one.
-        if supersedes.isEmpty, corrects == nil, kind == "correction" || kind == "instruction" {
-            do {
-                let near = try await memoryV2.recall(MemoryV2RecallRequest(text: text, topK: 6, surface: turn.runtime?.surface ?? "chat"),
-                                                     recordingUsage: false).scored.map(\.record).filter {
-                    $0.id != record.id && ($0.status ?? "active") == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle)
-                        && !MemoryStorage.metadataFlag($0.extras, MemoryStorage.pendingAdmissionKey)
-                }
-                var remaining = Self.recallContentBudgetChars
-                // Each one reads as recall reads it: who it came from and whether an untrusted source steered it.
-                let nearTrust = MemoryDataProvenance.reading(near.map(\.extras))
-                // The retiring call is this save again, word for word and with the same scope (tags, topics, telling), so it folds into this
-                // record instead of making a broader copy.
-                var retire = input.filter { key, value in
-                    value != .null && ["kind", "tags", "context_topics", "provenance", "provenance_by", "since", "confidence", "importance"]
-                        .contains(key)
-                }
-                retire["text"] = .string(text)
-                payload["still_surfacing"] = .array(near.map { row in
-                    var fields: [String: JSONValue] = ["id": .string(row.id), "recorded_at": .string(row.createdAt),
-                                                       "kind": row.memoryKind.map(JSONValue.string) ?? .null]
-                    fields.merge(MemoryDataProvenance.fields(in: row.extras, trust: nearTrust)) { _, value in value }
-                    fields["provenance"] = .string(MemoryDataProvenance.lead(row.extras, trust: nearTrust))
-                    if row.text.count <= remaining {
-                        fields["text"] = .string(row.text)
-                        remaining -= row.text.count
-                    } else {
-                        fields["content_omitted"] = .bool(true)
-                        fields["read_more"] = .object(["action": .string("memory.recall"), "memory_id": .string(row.id)])
-                    }
-                    var call = retire
-                    call["corrects"] = .string(row.id)
-                    fields["retire_with"] = .object(["tool": .string("app"), "input": .object(["action": .string("memory.commit"), "args": .object(call)])])
-                    return .object(fields)
-                })
-                if !near.isEmpty {
-                    payload["detail"] = .string("""
-                        These older memories still say otherwise and still surface in recall and in every turn's context; retire each one this \
-                        correction replaces with its retire_with call (it is kept in history). Nothing was retired by this save.
-                        """)
-                }
-            } catch {
-                if error is CancellationError { throw error }
-                payload["still_surfacing_error"] = .string("Saved, but reading the memories it may correct failed: \(error)")
-            }
-        }
-        return .object(payload)
+        return payload
+    }
+
+    private static func memoryPostSaveLookupError(_ lookup: String, _ error: Error) -> JSONValue {
+        .string(error is CancellationError
+            ? "Saved. The \(lookup) was interrupted."
+            : "Saved. The \(lookup) failed (\(error)).")
     }
 
     private static func memoryMetadataValue(_ extras: JSONValue?, key: String) -> JSONValue? {
@@ -763,5 +798,23 @@ extension SwiftToolDispatcher {
             payload: payload, createdAt: ISO8601DateFormatter().string(from: Date()), turnId: turn.id, turn: turn)
         if TurnTraceContext.turnId != nil { TurnTraceBus.fire(event, on: TurnTraceContext.bus ?? .shared) }
         else { await TurnTracePersistLane(dataRootOverride: dataRoot).append(event) }
+    }
+}
+
+/// One memory commit's validated arguments, read by each stage of the save.
+private final class MemoryCommitRequest {
+    let supersedes: [String]
+    let kind: String?
+    let text: String
+    let validatedTopics: [JSONValue]?
+    let confidence: Double
+    let importance: Double
+    let telling: MemoryRoot.Telling?
+    let since: Date?
+
+    init(supersedes: [String], kind: String?, text: String, validatedTopics: [JSONValue]?, confidence: Double, importance: Double,
+        telling: MemoryRoot.Telling?, since: Date?) {
+        self.supersedes = supersedes; self.kind = kind; self.text = text; self.validatedTopics = validatedTopics
+        self.confidence = confidence; self.importance = importance; self.telling = telling; self.since = since
     }
 }

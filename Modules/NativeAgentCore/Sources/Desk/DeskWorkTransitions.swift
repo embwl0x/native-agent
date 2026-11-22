@@ -73,11 +73,11 @@ extension SwiftNativeDeskStore {
         )
     }
     /// Queue lookup, provenance and budget checks share the write transaction.
-    func addQueueStep(_ incoming: DeskStep, replacing: MyQueue.Entry? = nil, matchingWords: Bool = true) async throws
+    func addQueueStep(_ incoming: DeskStep, replacing: MyQueue.Entry? = nil, matchingWords: Bool = true, resumeRun: String? = nil) async throws
         -> (entry: MyQueue.Entry, change: MyQueue.Change) {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
-            var state = Self.compact(base: feed.base, feed.ops)
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
             // Interrupted imports reuse job identity; pending work cannot archive before migration commits.
             if replacing == nil, let id = incoming.scheduledJobID,
                let item = state.items.first(where: { $0.step?.scheduledJobID == id }), let step = item.step {
@@ -93,14 +93,16 @@ extension SwiftNativeDeskStore {
                 return (MyQueue.Entry(item: item, step: step), .reused)
             }
             let open = MyQueue.entries(state)
-            let words = Self.equivalentDeskText(incoming.words)
+            let words = Self.equivalentDeskText(incoming.words, preservingPunctuation: true)
             let same: MyQueue.Entry?
             if let replacing {
                 guard let current = open.first(where: { $0.item.handle == replacing.item.handle }),
                       current.item.updatedAt == replacing.item.updatedAt else { throw MyQueue.Superseded() }
                 same = current
+            } else if let resumeRun {
+                same = open.first { MyQueue.resumeRun(findingKey: $0.item.findingKey) == resumeRun }
             } else { same = incoming.scheduledJobID == nil && matchingWords
-                ? open.first { Self.equivalentDeskText($0.step.words) == words } : nil }
+                ? open.first { Self.equivalentDeskText($0.step.words, preservingPunctuation: true) == words } : nil }
             var step = incoming
             step.lifeID = try DataRootLife.current(in: dataRoot)
             if let same {
@@ -112,10 +114,16 @@ extension SwiftNativeDeskStore {
                 if incoming.source == nil, replacing == nil, case .userWrites? = MyQueue.When(step.when, card: step.card) {
                     step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
                 }
-                if step == same.step { return (same, .reused) }
                 if step.when != same.step.when || step.card != same.step.card || step.rhythm != same.step.rhythm {
+                    if MyQueue.isCardReleaseStatus(step.status) { step.status = nil }
                     step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+                } else if step.status == nil || MyQueue.isCardReleaseStatus(step.status),
+                          case .afterCard(let card)? = MyQueue.when(same), MyQueue.cardIsReleased(same, card: card) {
+                    step.status = MyQueue.cardReleaseStatus(card)
                 }
+                // The same step is a reuse whoever holds it; only a real change asks its hold.
+                if step == same.step { return (same, .reused) }
+                if replacing == nil, let conflict = try await runHold(same.item.handle) { throw conflict }
             } else {
                 step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             }
@@ -125,7 +133,8 @@ extension SwiftNativeDeskStore {
             if same == nil {
                 let alias = try Self.nextAlias(parentHandle: nil, parentAlias: nil, base: feed.base, ops: feed.ops)
                 bodies.append(.createItem(alias: alias, kind: .plan, project: MyQueue.project, title: title,
-                    parent: nil, summary: nil, assignee: nil, laneOf: nil, origin: .agent, pursuit: nil))
+                    parent: nil, summary: nil, assignee: nil, laneOf: nil, origin: .agent, pursuit: nil,
+                    findingKey: resumeRun.map { "ability.resume:" + $0 }))
                 bodies.append(.setStatus(status: .todo, blockedReason: nil, waitingOn: nil,
                     progress: nil, assignee: nil, laneOf: nil))
             }
@@ -135,14 +144,14 @@ extension SwiftNativeDeskStore {
                 bodies.append(.appendNote(text: note, author: "agent"))
             }
             if let same, same.item.title != title { bodies.append(.updateTitle(title: title, summary: nil)) }
-            try DeskOp.requireComplete(bodies.map { DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: $0) })
-            for body in bodies {
-                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: body)
-                try Self.validateHierarchyTransition(op, in: state)
-                try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-                (state, feed) = try await appendAndRecompactUnlocked(op, feed: feed)
+            let ops = bodies.map { DeskOp(handle: handle, body: $0) }
+            for (index, op) in ops.enumerated() {
+                let before = index == 0 ? state : Self.compact(base: feed.base, feed.ops + ops.prefix(index))
+                try Self.validateHierarchyTransition(op, in: before)
+                try Self.validatePursuitInvariants(op, in: before, viaGenericPath: false)
             }
-            guard let entry = state.items.first(where: { $0.handle == handle }).flatMap(MyQueue.entry) else {
+            let committed = try await commitUnlocked(ops, feed: feed)
+            guard let entry = committed.state.items.first(where: { $0.handle == handle }).flatMap(MyQueue.entry) else {
                 throw DeskError.unknownHandle(handle)
             }
             return (entry, same == nil ? .added : .updated)
@@ -234,15 +243,14 @@ extension SwiftNativeDeskStore {
                 if nextTitle != nil || nextSummary != nil || nextRefs != nil {
                     bodies.append(.updateTitle(title: nextTitle, summary: nextSummary, refs: nextRefs))
                 }
-                var (state, committedFeed) = (priorState, feed)
-                try DeskOp.requireComplete(bodies.map { DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: existing.handle, body: $0) })
-                for body in bodies {
-                    let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs),
-                        handle: existing.handle, body: body)
-                    try Self.validateHierarchyTransition(op, in: state)
-                    (state, committedFeed) = try await appendAndRecompactUnlocked(op, feed: committedFeed)
+                guard !bodies.isEmpty else { return CreateResult(item: existing, reusedEquivalent: true) }
+                let ops = bodies.map { DeskOp(handle: existing.handle, body: $0) }
+                for (index, op) in ops.enumerated() {
+                    let before = index == 0 ? priorState : Self.compact(base: feed.base, feed.ops + ops.prefix(index))
+                    try Self.validateHierarchyTransition(op, in: before)
                 }
-                guard let item = state.items.first(where: { $0.handle == existing.handle }) else {
+                let committed = try await commitUnlocked(ops, feed: feed)
+                guard let item = committed.state.items.first(where: { $0.handle == existing.handle }) else {
                     throw DeskError.unknownHandle(existing.handle)
                 }
                 return CreateResult(item: item, reusedEquivalent: true)
@@ -250,43 +258,46 @@ extension SwiftNativeDeskStore {
             let alias = try Self.nextAlias(parentHandle: parent, parentAlias: parentAlias, base: feed.base, ops: feed.ops)
             let handle = DeskClock.newHandle()
             // Dedicated creation paths own pursuit evidence, queue provenance and system origin.
-            let create = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: .createItem(
+            let create = DeskOp(handle: handle, body: .createItem(
                 alias: alias, kind: kind, project: project, title: title, parent: parent, summary: summary,
                 assignee: assignee, laneOf: laneOf,
                 origin: origin, pursuit: nil, findingKey: findingKey
             ))
             try Self.validateHierarchyTransition(create, in: priorState)
             try Self.validatePursuitInvariants(create, in: priorState, viaGenericPath: true)
-            try DeskOp.requireComplete([create] + ((keyNote.map { [DeskOpBody.appendNote(text: $0)] } ?? []) + refs.map({ .addRef(ref: $0) }))
-                .map { DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: $0) })
-            var (committedState, committedFeed) = try await appendAndRecompactUnlocked(create, feed: feed)
-            // Assign ownership before another caller can close or reassign the new item.
-            if let waitingOn, let created = committedState.items.first(where: { $0.handle == handle }) {
-                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs), handle: handle,
+            var ops = [create]
+            // Assign ownership in the same commit as creation.
+            if let waitingOn,
+               let created = Self.compact(base: feed.base, feed.ops + ops).items.first(where: { $0.handle == handle }) {
+                ops.append(DeskOp(handle: handle,
                     body: .setStatus(status: created.status, blockedReason: nil, waitingOn: waitingOn,
-                        progress: nil, assignee: assignee, laneOf: laneOf))
-                (committedState, committedFeed) = try await appendAndRecompactUnlocked(op, feed: committedFeed)
+                        progress: nil, assignee: assignee, laneOf: laneOf)))
             }
-            for body in (keyNote.map { [DeskOpBody.appendNote(text: $0)] } ?? []) + refs.map({ .addRef(ref: $0) }) {
-                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs), handle: handle, body: body)
-                (committedState, committedFeed) = try await appendAndRecompactUnlocked(op, feed: committedFeed)
-            }
-            guard let created = committedState.items.first(where: { $0.handle == handle }) else {
+            if let keyNote { ops.append(DeskOp(handle: handle, body: .appendNote(text: keyNote))) }
+            ops += refs.map { DeskOp(handle: handle, body: .addRef(ref: $0)) }
+            let committed = try await commitUnlocked(ops, feed: feed)
+            guard let created = committed.state.items.first(where: { $0.handle == handle }) else {
                 throw DeskError.unknownHandle(handle)
             }
             return CreateResult(item: created, reusedEquivalent: false)
         }
     }
-    public static func equivalentDeskText(_ value: String?) -> String {
+    public static func equivalentDeskText(_ value: String?, preservingPunctuation: Bool = false) -> String {
         let folded = (value ?? "")
             .folding(
                 options: [.caseInsensitive, .diacriticInsensitive],
                 locale: Locale(identifier: "en_US_POSIX")
             )
-        let wordsOnly = folded.unicodeScalars.map { scalar in
-            CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : " "
-        }.joined()
-        return wordsOnly
+        let text: String
+        if preservingPunctuation {
+            let end = folded.lastIndex { !$0.isWhitespace && !".!?…".contains($0) }
+            text = end.map { String(folded[...$0]) } ?? ""
+        } else {
+            text = folded.unicodeScalars.map { scalar in
+                CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : " "
+            }.joined()
+        }
+        return text
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
     }
@@ -304,7 +315,6 @@ extension SwiftNativeDeskStore {
             let alias = try Self.nextAlias(parentHandle: nil, parentAlias: nil, base: feed.base, ops: feed.ops)
             let handle = DeskClock.newHandle()
             let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
                 body: .openPursuit(
                     alias: alias, project: project, title: title,
@@ -315,7 +325,7 @@ extension SwiftNativeDeskStore {
             try Self.validateHierarchyTransition(op, in: state)
             // Dedicated creation still enforces required fields, evidence and the open-pursuit cap.
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            let after = try await appendAndRecompactUnlocked(op, feed: feed).state
+            let after = try await commitUnlocked([op], feed: feed).state
             guard let created = after.items.first(where: { $0.handle == handle }) else {
                 throw DeskError.unknownHandle(handle)
             }
@@ -332,14 +342,12 @@ extension SwiftNativeDeskStore {
                 throw DeskError.unknownHandle(handle)
             }
             let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
                 body: item.isPursuit ? .workLog(receipt: receipt) : .appendNote(text: receipt, author: "agent")
             )
             try Self.validateHierarchyTransition(op, in: state)
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return op
+            return try await commitUnlocked([op], feed: feed).ops[0]
         }
     }
     @discardableResult
@@ -382,6 +390,28 @@ extension SwiftNativeDeskStore {
     public func addRef(_ handle: String, ref: DeskRef) async throws -> DeskOp {
         try await appendValidated(DeskOp(handle: handle, body: .addRef(ref: beginStep(ref))))
     }
+    /// Attach a captured promise and its title while the caller holds the ops flock.
+    func attachCapturedStepUnlocked(_ incoming: DeskStep, to handle: String) async throws {
+        let feed = try await readFeedUnlocked()
+        let state = Self.compact(base: feed.base, feed.ops)
+        guard let item = state.items.first(where: { $0.handle == handle }) else {
+            throw DeskError.unknownHandle(handle)
+        }
+        var step = incoming
+        step.filedAt = DeskClock.commitStamp(notBefore: item.updatedAt)
+        let title = step.title
+        var ops: [DeskOp] = []
+        if item.title != title {
+            ops.append(DeskOp(handle: handle, body: .updateTitle(title: title, summary: nil)))
+        }
+        let ref = try beginStep(DeskRef(kind: .step(step)))
+        ops.append(DeskOp(handle: handle, body: .addRef(ref: ref)))
+        for op in ops {
+            try Self.validateHierarchyTransition(op, in: state)
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+        }
+        try await commitUnlocked(ops, feed: feed)
+    }
     private func beginStep(_ incoming: DeskRef) throws -> DeskRef {
         var ref = incoming
         if case .step(var step) = ref.kind, step.lifeID == nil {
@@ -395,13 +425,13 @@ extension SwiftNativeDeskStore {
         try await appendValidated(DeskOp(handle: handle, body: .appendNote(text: text, author: author)))
     }
     /// Settle waits under the flock so earlier closes or new blockers win.
-    /// Write notes once so partial commits heal without duplicate history; invalid hierarchy stays for explicit repair.
+    /// Keep an already recorded note, and leave invalid hierarchy for explicit repair.
     @discardableResult
     public func settleWaits(
         _ settlement: @escaping @Sendable (DeskItem) -> (note: String, status: DeskStatus, blockedReason: String?)?
     ) async throws -> [DeskOp] {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
+            let feed = try await readFeedUnlocked()
             var state = Self.compact(base: feed.base, feed.ops)
             var settled: [DeskOp] = []
             for item in state.items where !item.status.isTerminal {
@@ -410,14 +440,14 @@ extension SwiftNativeDeskStore {
                     status: answer.status, blockedReason: answer.blockedReason, waitingOn: nil,
                     progress: nil, assignee: nil, laneOf: nil))
                 guard (try? Self.validateHierarchyTransition(status, in: state)) != nil else { continue }
-                let note = DeskOp(handle: item.handle, body: .appendNote(text: answer.note))
-                for var op in item.notes.contains(where: { $0.text == answer.note }) ? [status] : [note, status] {
-                    op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-                    (state, feed) = try await appendAndRecompactUnlocked(op, feed: feed)
-                    settled.append(op)
+                if !item.notes.contains(where: { $0.text == answer.note }) {
+                    settled.append(DeskOp(handle: item.handle, body: .appendNote(text: answer.note)))
                 }
+                settled.append(status)
+                state = Self.compact(base: feed.base, feed.ops + settled)
             }
-            return settled
+            guard !settled.isEmpty else { return [] }
+            return try await commitUnlocked(settled, feed: feed).ops
         }
     }
     /// Check and append markers under one flock so concurrent wakes cannot duplicate receipts.
@@ -428,7 +458,8 @@ extension SwiftNativeDeskStore {
         marker: String,
         text: String,
         author: String = "system",
-        after: String? = nil
+        after: String? = nil,
+        carriedOccurrence: String? = nil
     ) async throws -> DeskOp? {
         let normalizedMarker = marker.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -446,6 +477,10 @@ extension SwiftNativeDeskStore {
                 throw DeskError.unknownHandle(handle)
             }
             guard !item.notes.contains(where: { note in
+                if let carriedOccurrence {
+                    guard note.author == author, note.text == normalizedText else { return false }
+                    if let recorded = note.carriedOccurrence { return recorded == carriedOccurrence }
+                }
                 guard note.text.hasPrefix(normalizedMarker) else { return false }
                 // Identical daily content is a new occurrence; only notes after this snapshot can settle it.
                 if let cutoff { return DeskClock.parseISO(note.ts).map { $0 > cutoff } ?? false }
@@ -454,12 +489,10 @@ extension SwiftNativeDeskStore {
                 return nil
             }
             let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
-                body: .appendNote(text: normalizedText, author: author)
+                body: .appendNote(text: normalizedText, author: author, carriedOccurrence: carriedOccurrence)
             )
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return op
+            return try await commitUnlocked([op], feed: feed).ops[0]
         }
     }
     /// Commit veto, terminal state and rationale in one op so relaunch cannot expose a partial decision.
@@ -485,13 +518,11 @@ extension SwiftNativeDeskStore {
                 throw DeskError.vetoRefusedTerminal(handle: handle, status: item.status)
             }
             let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
                 body: .vetoPursuit(note: rationale)
             )
             try Self.validateHierarchyTransition(op, in: state)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return op
+            return try await commitUnlocked([op], feed: feed).ops[0]
         }
     }
     @discardableResult

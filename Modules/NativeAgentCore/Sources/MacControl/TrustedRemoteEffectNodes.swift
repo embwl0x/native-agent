@@ -112,7 +112,7 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             throw TrustedRemoteEffectError.invalidArgument("combined arguments exceed 64 KiB")
         }
         let command = ([executable] + arguments).map(Self.shellQuote).joined(separator: " ")
-        let digest = SHA256.hash(data: Data(command.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256Hex.of(Data(command.utf8))
         let started = Date()
         let result: ProcessRunResult
         let cancelled: Bool

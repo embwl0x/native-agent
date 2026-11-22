@@ -17,15 +17,15 @@ import SwarmRuns
 extension SwiftToolDispatcher {
     func impl_search_kg(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // Bad input is a thrown refusal before any gate, so an empty call is an error whatever the switch says.
-        let openID = optionalString(input, "entity_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let query = optionalString(input, "query")
+        let openID = input["entity_id"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = input["query"]?.nonblankString
         let limit = min(100, max(1, Self.jsonInt(input["limit"]) ?? 10))
         // Share the page’s entity.type and seen-date filters so both doors browse the same graph.
-        let types = Set((optionalString(input, "type") ?? "")
+        let types = Set((input["type"]?.nonblankString ?? "")
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty })
-        let since = optionalString(input, "since")?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let since = input["since"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let sinceDays: Int?
         switch since {
         case nil: sinceDays = nil
@@ -128,16 +128,12 @@ extension SwiftToolDispatcher {
             )
         }
         // Fact nodes reuse memory vectors; lexical and meaning hits fuse by reciprocal rank, 1 / (60 + rank).
-        func entityID(_ ent: JSONValue) -> String? {
-            guard case .object(let o) = ent, case .string(let id)? = o["id"] else { return nil }
-            return id
-        }
         var order: [String] = []
         var entities: [String: JSONValue] = [:]
         var fused: [String: Double] = [:]
         var via: [String: [String]] = [:]
         for (rank, ent) in results.filter(passesFilters).prefix(limit * 3).enumerated() {
-            guard let id = entityID(ent) else { continue }
+            guard let id = ent.objectValue?["id"]?.stringValue else { continue }
             if entities[id] == nil { order.append(id); entities[id] = ent }
             fused[id, default: 0] += 1.0 / (60.0 + Double(rank))
             via[id, default: []].append("text")
@@ -151,9 +147,6 @@ extension SwiftToolDispatcher {
                 persona: nil,
                 surface: surface
             ))
-            // An epoch-mismatched query vector yields lexical hits, which cannot count as meaning matches.
-            let lexical = response.hits.contains { $0.source == "swift-native-keyword-fallback" }
-            if lexical { meaningSearch = "keyword-fallback" }
             var missing = Set<String>()
             let missingIDs = response.scored.map { SwiftNativeKnowledgeGraphIndexer.memoryFactEntityID(for: $0.record.id) }
                 .filter { entities[$0] == nil && missing.insert($0).inserted }
@@ -165,7 +158,7 @@ extension SwiftToolDispatcher {
                     order.append(nodeID); entities[nodeID] = ent
                 }
                 fused[nodeID, default: 0] += 1.0 / (60.0 + Double(rank))
-                via[nodeID, default: []].append(lexical ? "keyword" : "meaning")
+                via[nodeID, default: []].append("meaning")
             }
         } catch {
             // Preserve text hits, but neither a failed recall nor failed graph hydration proves complete semantic coverage.

@@ -2,13 +2,9 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 // Blueprint: | `MacAccessibilityReader.swift` | `SystemMacAXElementSource`: Bounded read-only walker; exact window/menu roots |
-#endif
 // The walker is read-only: structured AX data needs no input synthesis. Renderer preparation may enable an advertised mode without emitting UI input.
 public enum MacAccessibilityReader {
     package struct NativeReadFailure: Error, LocalizedError {
@@ -24,15 +20,10 @@ public enum MacAccessibilityReader {
     }
     private static let nativeReads = NativeReads()
     package static func withReadBudget<Value>(context: MacOperationContext, _ body: (MacOperationContext) throws -> Value) throws -> Value {
-        #if canImport(ApplicationServices) && os(macOS)
         return try MacAXAttributeRead.checked(context: context) { context in
             try context.holding(
                 \.readDeadline, context.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds), { context in try body(context) })
         }
-        #else
-        return try context.holding(
-            \.readDeadline, context.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds), { context in try body(context) })
-        #endif
     }
     /// Passive native clients share the hands' deadline and cancellation. Only Sendable results leave it; native AX handles stay in the read.
     package static func read<Value: Sendable>(context: MacOperationContext,
@@ -41,39 +32,6 @@ public enum MacAccessibilityReader {
         let value = try await nativeReads.read(context: context, body)
         try Task.checkCancellation()
         return value
-    }
-    #if canImport(ApplicationServices) && os(macOS)
-    /// Read only static text values so credential fields never enter this text channel.
-    package static func nativeText(in root: AXUIElement, context: MacOperationContext) throws -> String {
-        try withReadBudget(context: context) { context in
-            let (source, snapshot) = try nativeSnapshot(in: root, searching: "the desktop reply text", context: context)
-            let children = Dictionary(grouping: snapshot.nodes.filter { !$0.path.isEmpty }, by: { Array($0.path.dropLast()) })
-            var rendered: [[Int]: String] = [:]
-            for node in snapshot.nodes.reversed() {
-                var text = "", previousInline = false
-                if node.attributes.role == kAXStaticTextRole, let ref = node.element, let element = source.element(ref) {
-                    text = try MacAXAttributeRead.checkedText(element, kAXValueAttribute, context: context)
-                } else {
-                    for child in children[node.path] ?? [] {
-                        guard let part = rendered[child.path], !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
-                        let inline = child.attributes.subrole == "AXCodeStyleGroup" || child.attributes.role == "AXLink"
-                        if text.isEmpty || inline || previousInline || text.last?.isWhitespace == true
-                            || part.first.map({ $0.isWhitespace || $0.isPunctuation }) == true { text += part }
-                        else { text += "\n" + part }
-                        previousInline = inline
-                    }
-                }
-                rendered[node.path] = text
-            }
-            try Task.checkCancellation()
-            guard context.readDeadline.map({ Date() < $0 }) == true else {
-                throw NativeReadFailure(detail: """
-                    Accessibility search for the desktop reply text exhausted the shared reader time budget while rendering \(snapshot.nodes.count) elements. \
-                    Narrow the search to the intended message before continuing.
-                    """)
-            }
-            return rendered[[]] ?? ""
-        }
     }
     /// A native window/subtree read through the ordinary hands walker. Read topology only: credential values are never collected into a snapshot. A caller may
     /// exclude a known unrelated region (such as a chat log).
@@ -149,13 +107,8 @@ public enum MacAccessibilityReader {
                 + " Check the app's Accessibility tree before continuing.")
         }
     }
-    #endif
     public static func captureContinuation(pid: Int32?, taskReference: String, context: MacOperationContext) async -> MacWorkContinuation {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         return await SystemMacAXElementSource().captureContinuation(pid: pid, taskReference: taskReference, context: context)
-        #else
-        return .unsupported("accessibility_unsupported", taskReference: taskReference)
-        #endif
     }
     public static let notTrustedNote =
         "NativeAgent does not have Accessibility permission yet. Grant it in "
@@ -325,11 +278,7 @@ public enum MacAccessibilityReader {
         shouldStop: () -> Bool = { false },
         context: MacOperationContext, where matches: (MacAXElementRef, MacAXAttributes) -> Bool) -> FindFirstResult {
         func node<Value>(_ body: (MacOperationContext) throws -> Value) throws -> Value {
-            #if canImport(ApplicationServices) && os(macOS)
             return try MacAXAttributeRead.node(context: context, body)
-            #else
-            return try body(context)
-            #endif
         }
         var queue: [(ref: MacAXElementRef, path: [Int], depth: Int)] = [(root, [], 1)]
         var visited = 0
@@ -392,75 +341,7 @@ public enum MacAccessibilityReader {
         if hitDepthCap { return .depthCap }
         return .notFound
     }
-    /// All predicates must match; ranking orders survivors. Title matches dominate value matches because named controls are the primary target; actionable
-    /// controls beat decoration.
-    public static func find(
-        nodes: [MacAXNode],
-        query: MacAXQuery,
-        limits: MacAXLimits = MacAXLimits()
-    ) -> [MacAXMatch] {
-        guard !query.isEmpty else { return [] }
-        var matches: [MacAXMatch] = []
-        for node in nodes {
-            var score = 0.0
-            if let role = query.role {
-                guard roleMatches(node.attributes.role, query: role) else { continue }
-                score += 2.0
-            }
-            if let title = query.title {
-                guard let candidate = node.attributes.title,
-                      let component = textScore(candidate, query: title, weight: 3.0)
-                else { continue }
-                score += component
-            }
-            if let value = query.value {
-                guard let candidate = node.attributes.value,
-                      let component = textScore(candidate, query: value, weight: 1.5)
-                else { continue }
-                score += component
-            }
-            if node.attributes.actions.contains("AXPress") { score += 0.25 }
-            matches.append(MacAXMatch(node: node, score: score))
-        }
-        // Order by score, title specificity, then document path; sort stability must not decide visible rankings.
-        matches.sort { lhs, rhs in
-            if lhs.score != rhs.score { return lhs.score > rhs.score }
-            let lhsLength = lhs.node.attributes.title?.count ?? Int.max
-            let rhsLength = rhs.node.attributes.title?.count ?? Int.max
-            if lhsLength != rhsLength { return lhsLength < rhsLength }
-            return MacPerceptionCompiler.pathIsBefore(lhs.node.path, rhs.node.path)
-        }
-        return Array(matches.prefix(limits.maxMatches))
-    }
-    /// `"button"`, `"Button"` and `"AXButton"` all address AXButton. Roles are an AX vocabulary, not free text, so the AX prefix is optional.
-    static func roleMatches(_ role: String, query: String) -> Bool {
-        let lhs = role.lowercased()
-        let rhs = query.lowercased()
-        if lhs == rhs { return true }
-        return lhs == "ax" + rhs
-    }
-    static func textScore(_ candidate: String, query: String, weight: Double) -> Double? {
-        let lhs = candidate.lowercased()
-        let rhs = query.lowercased()
-        if lhs == rhs { return weight }
-        if lhs.hasPrefix(rhs) { return weight * (2.0 / 3.0) }
-        if lhs.contains(rhs) { return weight * (1.0 / 3.0) }
-        return nil
-    }
-}
-/// Unsupported platforms report accessibility unavailable rather than pretend to read.
-public struct UnavailableMacAXElementSource: MacAXElementSource {
-    public init() {}
-    public func isTrusted() -> Bool { false }
-    public func frontmostApp() -> MacAXAppInfo? { nil }
-    public func frontmostWindowRoot(context: MacOperationContext) -> MacAXElementRef? { nil }
-    public func attributes(of ref: MacAXElementRef, context: MacOperationContext) -> MacAXAttributes? { nil }
-    public func children(of ref: MacAXElementRef, context: MacOperationContext) -> [MacAXElementRef] { [] }
 }
 public func defaultMacAXElementSource() -> any MacAXElementSource {
-    #if canImport(ApplicationServices) && os(macOS)
     return SystemMacAXElementSource()
-    #else
-    return UnavailableMacAXElementSource()
-    #endif
 }

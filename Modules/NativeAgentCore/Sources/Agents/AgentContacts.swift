@@ -104,7 +104,7 @@ public final class AgentContacts: Sendable {
             case let .state(_, _, sendID, status):
                 if try await !clients.bridgeChatClient().recordAgentConversationSendState(sessionID: entry.session,
                     sendID: sendID, status: status) {
-                    nativeLog("AgentContacts: send %@ has no row in its conversation; its state %@ has no line to show on", sendID, status)
+                    throw AgentConversationStore.Failure(message: "Send \(sendID) has no transcript row in \(entry.session) for its \(status) state.")
                 }
             case let .reply(owner, _, name, text, replyID, at, from, steeredBy):
                 // Persist words without running a turn; preserve the actual speaker’s stamp rather than the thread owner’s.

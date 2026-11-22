@@ -18,8 +18,8 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
         let name: String
         let path: URL
 
-        func signIn(_ root: URL) -> String {
-            if let control = NativeOAuthFlow.signInControl(providerID: owner, dataRoot: root) { return "Open " + control + "." }
+        func signIn() -> String {
+            if let control = NativeOAuthFlow.signInControl(providerID: owner) { return "Open " + control + "." }
             return "Open Connectors → \(name) → Connect (or Reconnect)."
         }
     }
@@ -61,7 +61,7 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                 checked += 1
                 guard state.configured else {
                     findings.append("\(credential.name) has no usable saved credential")
-                    asks.append(credential.signIn(root))
+                    asks.append(credential.signIn())
                     continue
                 }
                 if state.expiresAt == nil && !state.requiresRefresh {
@@ -71,14 +71,14 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                 if !state.requiresRefresh, let expiry = state.expiresAt, expiry > now {
                     if !state.canRefresh && expiry.timeIntervalSince(now) <= 7 * 24 * 60 * 60 {
                         findings.append("\(credential.name) access expires within 7 days and no refresh credential is available")
-                        asks.append(credential.signIn(root))
+                        asks.append(credential.signIn())
                     }
                     continue
                 }
                 let reason = state.requiresRefresh ? "authorization needs renewal" : "access expired"
                 guard state.canRefresh else {
                     findings.append("\(credential.name) \(reason) and no refresh credential is available")
-                    asks.append(credential.signIn(root))
+                    asks.append(credential.signIn())
                     continue
                 }
                 // Refreshable tokens renew on use; reporting them as signed out would provoke an unnecessary sign-in.
@@ -95,13 +95,13 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                         if state.expiresAt == nil { noExpiry.append(credential.name) }
                     } else {
                         findings.append("\(credential.name) still has no current access credential after refresh")
-                        if !state.configured || !state.canRefresh { asks.append(credential.signIn(root)) }
+                        if !state.configured || !state.canRefresh { asks.append(credential.signIn()) }
                         else { refreshable = true }
                     }
                 } catch {
                     if ProviderOAuthCredentialMaintenance.requiresSignIn(error) {
                         findings.append("\(credential.name) rejected the saved refresh authorization")
-                        asks.append(credential.signIn(root))
+                        asks.append(credential.signIn())
                     } else {
                         // Provider bodies and credential material never enter Doctor reports.
                         findings.append("\(credential.name) refresh could not complete")
@@ -111,7 +111,7 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
             } catch {
                 unreadable = true
                 findings.append("\(credential.name) credential state could not be read from \(credential.path.path)")
-                asks.append(credential.signIn(root))
+                asks.append(credential.signIn())
             }
         }
         var parts = ["\(checked) credential(s) inspected through their owners"]

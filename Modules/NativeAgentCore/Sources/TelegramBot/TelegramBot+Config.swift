@@ -90,9 +90,9 @@ public struct TelegramConfig: Sendable, Equatable {
         do {
             return try CredentialFileLock.withLock(path) {
                 guard let fields = try validateSavedConfiguration(dataRoot: dataRoot) else { return (.success(nil), nil) }
-                let metadata = try parseFlat(fields, at: path, includeDisconnected: true, resolveCredential: false)
+                let metadata = try parseFlat(fields, includeDisconnected: true, resolveCredential: false)
                 do {
-                    let resolved = try parseFlat(fields, at: path, includeDisconnected: true, resolveCredential: true)
+                    let resolved = try parseFlat(fields, includeDisconnected: true, resolveCredential: true)
                     return (.success(resolved), nil)
                 } catch { return (.success(metadata), error) }
             }
@@ -108,7 +108,7 @@ public struct TelegramConfig: Sendable, Equatable {
         let path = dataRoot.appendingPathComponent("telegram/config.json")
         return try CredentialFileLock.withLock(path) {
             guard let fields = try validateSavedConfiguration(dataRoot: dataRoot) else { return nil }
-            return try parseFlat(fields, at: path, includeDisconnected: includeDisconnected, resolveCredential: resolveCredential)
+            return try parseFlat(fields, includeDisconnected: includeDisconnected, resolveCredential: resolveCredential)
         }
     }
 
@@ -193,7 +193,7 @@ public struct TelegramConfig: Sendable, Equatable {
         }
     }
 
-    private static func parseFlat(_ obj: [String: JSONValue], at url: URL, includeDisconnected: Bool, resolveCredential: Bool) throws -> TelegramConfig? {
+    private static func parseFlat(_ obj: [String: JSONValue], includeDisconnected: Bool, resolveCredential: Bool) throws -> TelegramConfig? {
         let token: String
         if resolveCredential, let reference = obj[tokenReferenceField]?.stringValue {
             guard let bytes = try DeviceSecretKeychain.read(service: tokenService, account: reference),

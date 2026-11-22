@@ -59,12 +59,7 @@ public enum LocalPIMConnectorActions {
         case .string(let s):
             let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { return nil }
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime]
-            if let d = formatter.date(from: trimmed) { return d }
-            let fractional = ISO8601DateFormatter()
-            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let d = fractional.date(from: trimmed) { return d }
+            if let date = NativeTimestampFormat.parseISO8601(trimmed) { return date }
             if let epoch = TimeInterval(trimmed) {
                 return Date(timeIntervalSince1970: epoch)
             }

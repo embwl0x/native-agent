@@ -39,7 +39,7 @@ public struct BrowserActionRoutes: Sendable {
             let parsed = try ValidBrowserURL(url)
             return BrowserRun(id: UUID().uuidString.lowercased(), url: parsed.url.absoluteString,
                 domain: parsed.domain, status: "dry_run", dryRun: true, visible: true,
-                opened: false, createdAt: SwiftNativeBrowserClient.nowISO(Date()))
+                opened: false, createdAt: NativeTimestampFormat.sixDigitUTCOffset(Date()))
         }
         let runID = UUID().uuidString.lowercased()
         let run = try await executeVisibleBrowserRun(

@@ -38,8 +38,9 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
     }
 
     public static let key = "roots"
-    /// Names enter model-facing lines and delimited metadata, so delimiters, brackets and controls are excluded.
-    public static let nameLimit = 40
+    /// Names enter model-facing lines. Commas stay inside quoted names; quotes, brackets, semicolons and controls are excluded.
+    public static let nameLimit = 80
+    package static let nameForm = "a name of at most \(nameLimit) characters using letters, digits, spaces, periods, hyphens, apostrophes and commas"
 
     public let how: How
     public let by: String?
@@ -65,7 +66,7 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, name.count <= nameLimit else { return nil }
         let allowed = name.unicodeScalars.allSatisfy { scalar in
-            CharacterSet.alphanumerics.contains(scalar) || scalar == " " || scalar == "." || scalar == "-" || scalar == "'"
+            CharacterSet.alphanumerics.contains(scalar) || " .-',".unicodeScalars.contains(scalar)
         }
         return allowed ? name : nil
     }
@@ -88,7 +89,7 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
             throw Unreadable("how is not one of \(How.allCases.map(\.rawValue).joined(separator: ", "))")
         }
         let by = try fields.decodeIfPresent(String.self, forKey: .by)
-        if let by, Self.validName(by) != by { throw Unreadable("by is not a name of at most \(Self.nameLimit) letters, digits, spaces and . - '") }
+        if let by, Self.validName(by) != by { throw Unreadable("by must be \(Self.nameForm)") }
         let at = try fields.decode(String.self, forKey: .at)
         guard NativeTimestampFormat.parseISO8601FractionalFirst(at) != nil else { throw Unreadable("at is not an ISO-8601 time") }
         let written = try fields.decode(String.self, forKey: .written)
@@ -125,7 +126,7 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
         switch fields["by"] {
         case nil: by = nil
         case .string(let name)? where validName(name) == name: by = name
-        default: throw Unreadable("by is not a name of at most \(nameLimit) letters, digits, spaces and . - '")
+        default: throw Unreadable("by must be \(nameForm)")
         }
         guard case .string(let at)? = fields["at"], NativeTimestampFormat.parseISO8601FractionalFirst(at) != nil else {
             throw Unreadable("at is not an ISO-8601 time")
@@ -205,14 +206,19 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
 
     // MARK: Words, in the agent's voice
 
+    /// The quotes keep a name's commas distinct from the comma before a remembered root's date phrase.
+    private var byInLine: String? {
+        by.map { $0.unicodeScalars.contains(",") ? "\"\($0)\"" : $0 }
+    }
+
     public func line(calendar: Calendar) -> String {
         let date = day(in: calendar)
         switch how {
-        case .told: return by.map { "\($0) told me on \(date)" } ?? "I was told this on \(date)"
+        case .told: return byInLine.map { "\($0) told me on \(date)" } ?? "I was told this on \(date)"
         case .noticed: return "I noticed this on \(date)"
         case .inferred: return "I worked this out on \(date)"
         case .verified: return "I checked this on \(date)"
-        case .remembered: return by.map { "From \($0), I've known this since \(date)" } ?? "I've known this since \(date)"
+        case .remembered: return byInLine.map { "From \($0), I've known this since \(date)" } ?? "I've known this since \(date)"
         case .kept: return "I've kept this since \(date); where it came from isn't recorded"
         }
     }
@@ -221,11 +227,11 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
     public func lead(calendar: Calendar) -> String {
         let date = day(in: calendar)
         switch how {
-        case .told: return by.map { "\($0) told me \(date)" } ?? "I was told it \(date)"
+        case .told: return byInLine.map { "\($0) told me \(date)" } ?? "I was told it \(date)"
         case .noticed: return "I noticed it \(date)"
         case .inferred: return "I worked it out \(date)"
         case .verified: return "I checked it \(date)"
-        case .remembered: return by.map { "from \($0), known since \(date)" } ?? "known since \(date)"
+        case .remembered: return byInLine.map { "from \($0), known since \(date)" } ?? "known since \(date)"
         case .kept: return "kept since \(date), source unrecorded"
         }
     }

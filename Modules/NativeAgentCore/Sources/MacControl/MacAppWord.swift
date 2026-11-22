@@ -3,10 +3,8 @@ import Synchronization
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-#if canImport(AppKit) && canImport(ApplicationServices) && os(macOS)
 import AppKit
 import ApplicationServices
-#endif
 
 // Blueprint: | `MacAppWord.swift` | Event-paced effect settlement, off-lane app admission and payload-free mac.settled receipts |
 
@@ -98,7 +96,6 @@ private final class MacAppReplyState: Sendable {
     let signals = MacWaitSignals(collector: collector)
     let launching = DispatchSemaphore(value: 0)
     defer { signals.stop(); state.value.withLock { $0.stopped = true }; launching.signal() }
-    #if canImport(AppKit) && canImport(ApplicationServices) && os(macOS)
     let center = NSWorkspace.shared.notificationCenter
     let termination = center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil) { note in
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
@@ -143,9 +140,6 @@ private final class MacAppReplyState: Sendable {
             observation.invalidate()
         }
     }
-    #else
-    state.value.withLock { $0.reply = .unreachable; $0.cause = "Accessibility admission requires macOS." }
-    #endif
     var seconds = max(0, patience)
     if let wall = context.wallDate { seconds = min(seconds, max(0, wall.timeIntervalSinceNow)) }
     let end = await macSettleLoop("app_reply", signals: signals, patience: seconds, until: [], record: false) { state.value.withLock { $0.reply != nil } }
@@ -165,7 +159,6 @@ private final class MacAppReplyState: Sendable {
     guard reply == .answered, !Task.isCancelled, !context.expired else {
         return Task.isCancelled ? .stopped : reply == .answered ? .busy : reply
     }
-    #if canImport(AppKit) && canImport(ApplicationServices) && os(macOS)
     do { try await SystemMacAXElementSource.prepareRenderer(pid: pid, context: context.with(\.readDeadline, nil)) }
     catch {
         if Task.isCancelled { return .stopped }
@@ -175,7 +168,6 @@ private final class MacAppReplyState: Sendable {
         macSettled(MacSettledRow(what: "renderer_admission", endedBy: reply.rawValue))
         return reply
     }
-    #endif
     return Task.isCancelled ? .stopped : context.expired ? .busy : .answered
 }
 

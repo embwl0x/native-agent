@@ -11,25 +11,6 @@ import TurnTrace
 // Blueprint: | `NativeCognitionRuntime+ProviderEvidence.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
-    public nonisolated static func providerPathEvidence(
-        providerID: String, dataRoot: URL, since: Date, now: Date = Date()
-    ) async throws -> (model: String, observedAt: Date)? {
-        let receipt = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
-            .traceEvidence(now: now, since: since, kinds: ["llm.call"])
-        guard receipt.turns.unreadable == 0 else {
-            throw PersistenceCoreError.ioFailure("Provider evidence is incomplete; inspect the retained trace sources before checking the provider.")
-        }
-        var newest: (model: String, observedAt: Date)?
-        for row in receipt.rows {
-            guard let decoded = Self.decodeProviderLifecycleEvidence(row),
-                  decoded.provider == providerID, decoded.evidence.outcome == .succeeded,
-                  decoded.evidence.observedAt >= since, decoded.evidence.observedAt <= now,
-                  decoded.evidence.observedAt > (newest?.observedAt ?? .distantPast) else { continue }
-            newest = (decoded.model, decoded.evidence.observedAt)
-        }
-        return newest
-    }
-
     func recordProviderLifecycleEvidence(_ event: LLMCallLifecycleEvent) {
         let outcome: ProviderPathEvidenceOutcome
         switch event.phase {
@@ -44,7 +25,7 @@ extension NativeCognitionRuntime {
             outcome: outcome
         )
         enforceProviderLifecycleEvidenceCapacity()
-        cachedBodyRead = nil
+        bodyReadOrder.write { cachedBodyRead = nil }
         publishRuntimeChange(reason: "provider_lifecycle:\(event.phase.rawValue)")
     }
 
@@ -82,20 +63,19 @@ extension NativeCognitionRuntime {
         var restored: [String: ProviderPathEvidence] = [:]
         for row in rows.reversed() {
             guard restored.count < Self.maximumProviderLifecycleEvidence else { break }
-            guard let decoded = Self.decodeProviderLifecycleEvidence(row) else { continue }
-            let evidence = decoded.evidence
+            guard let evidence = Self.decodeProviderLifecycleEvidence(row) else { continue }
             restored[evidence.evidenceID] = evidence
         }
         for (key, value) in restored where providerLifecycleEvidenceByCallID[key] == nil {
             providerLifecycleEvidenceByCallID[key] = value
         }
         enforceProviderLifecycleEvidenceCapacity()
-        if !restored.isEmpty { cachedBodyRead = nil }
+        if !restored.isEmpty { bodyReadOrder.write { cachedBodyRead = nil } }
     }
 
     private nonisolated static func decodeProviderLifecycleEvidence(
         _ row: JSONValue
-    ) -> (provider: String, model: String, evidence: ProviderPathEvidence)? {
+    ) -> ProviderPathEvidence? {
         guard case .object(let object) = row,
               case .string("llm.call")? = object["kind"],
               case .string(let rawDate)? = object["createdAt"],
@@ -121,8 +101,7 @@ extension NativeCognitionRuntime {
             if case .string(let id)? = object["id"], !id.isEmpty { return id }
             return "\(provider):\(model):\(rawDate)"
         }()
-        return (provider, model, ProviderPathEvidence(
-            evidenceID: "trace-call:\(rowID)", observedAt: date, outcome: outcome))
+        return ProviderPathEvidence(evidenceID: "trace-call:\(rowID)", observedAt: date, outcome: outcome)
     }
 
     private func enforceProviderLifecycleEvidenceCapacity() {

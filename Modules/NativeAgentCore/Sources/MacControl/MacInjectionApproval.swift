@@ -2,21 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(ApplicationServices)
+import NativeAgentShared
 import ApplicationServices
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(Carbon) && os(macOS)
 import Carbon
-#endif
 
 // Blueprint: | `MacInjectionApproval.swift` | `MacInjectionCapability`: Expiring single-use input authority, approval digests and redacted secret replay |
 
@@ -122,11 +112,7 @@ public struct MacInjectionCapability: Sendable, Equatable {
             "body": .object(canonicalBody),
         ])
         guard let data = try? envelope.serializedData(pretty: false) else { return nil }
-        #if canImport(CryptoKit)
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        #else
-        return nil
-        #endif
+        return SHA256Hex.of(data)
     }
 }
 

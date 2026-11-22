@@ -95,8 +95,7 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient {
         return .object(fields)
     }
 
-    /// The configured contact's display name for an attested peer id. Read from the same store `isElevated` consults — the person's own peer records, never
-    /// anything the peer supplied.
+    /// Read the display name for an attested peer ID from the person's configured peer records.
     private static func contactName(forPeerID id: String, peerStore: AgentPeerStore?) -> String? {
         guard let peerStore, !id.isEmpty, let peers = try? peerStore.list() else { return nil }
         guard let name = peers.first(where: { $0.id == id })?.name else { return nil }

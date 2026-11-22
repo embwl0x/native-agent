@@ -185,22 +185,6 @@ public enum SnapshotTailOpLog {
         ))
     }
 
-    /// Refuse and report compaction while any row is unusable, preserving its original bytes and order.
-    public static func mayCompact(_ integrity: OpLogIntegrity, feed: String, path: URL) -> Bool {
-        guard !integrity.isClean else { return true }
-        if claimLogSlot("refuse|\(feed)|\(path.path)|\(integrity.summary)") {
-            FileHandle.standardError.write(Data(
-                """
-                \(feed): REFUSING to compact \(path.path) — \(integrity.unusableRowCount) row(s) \
-                this build cannot decode (\(integrity.summary)). Compacting would delete them \
-                permanently. The feed will keep growing until a build that understands them runs.
-
-                """.utf8
-            ))
-        }
-        return false
-    }
-
     /// Drop the prefix through the last compacted id to prevent double application across a base/tail crash gap.
     public static func dropCompactedPrefix<Op>(
         _ ops: [Op],

@@ -25,5 +25,17 @@ extension ChatStore {
             if publishedIDs.contains(row.id) { repliesByRun[run] = row }
         }
         resolvePendingReplyFromMac(repliesByRun)
+        // A sent message the Mac received but moved past without a reply of its own (a quit or a crash ended its turn) will never get one:
+        // once an answer follows it in the Mac's transcript, close its wait. The sent words stay in the chat.
+        let movedPast = pendingICloudPlaceholders.filter { pendingId, _ in
+            guard let received = rows.firstIndex(where: { $0.role == .user && $0.runId == pendingId }) else { return false }
+            return !rows.contains { $0.isTerminalReply && $0.runId == pendingId }
+                && rows[(received + 1)...].contains { $0.isTerminalReply }
+        }
+        for (pendingId, placeholderId) in movedPast {
+            settlePendingReply(pendingId, placeholderId: placeholderId)
+            messages.removeAll { $0.id == placeholderId }
+            onTalkReply?(pendingId, "", true, "That turn ended before a reply. Send it again if you still need it.")
+        }
     }
 }

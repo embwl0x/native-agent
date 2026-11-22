@@ -66,16 +66,15 @@ extension TelegramPollLoop {
 
     /// Media captions live in extras rather than TelegramMessage.text; read them so image prompts are not lost.
     static func caption(from message: TelegramMessage) -> String? {
-        guard case .object(let extras)? = message.extras else { return nil }
-        guard case .string(let cap)? = extras["caption"] else { return nil }
-        let trimmed = cap.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        message.extras?.objectValue?["caption"]?.trimmedString
     }
 
     /// Only classify unsupported payloads; supported chat/voice owners and the original caption remain authoritative for their existing paths.
     static func unsupportedAttachmentKind(from message: TelegramMessage) -> String? {
         guard case .object(let extras)? = message.extras else { return nil }
+        // A round video note is a video too: it gets the same reply, never silence.
         if case .object(_)? = extras["video"] { return "video" }
+        if case .object(_)? = extras["video_note"] { return "video" }
         if case .object(_)? = extras["document"], chatAttachment(from: message) == nil {
             return "document"
         }
@@ -134,7 +133,7 @@ extension TelegramPollLoop {
                 "chatId": .string(String(chatId)),
                 "updateId": .int(Int64(updateId)),
                 "surface": .string("telegram"),
-            ]), createdAt: _tgNowString(), turn: turn)
+            ]), createdAt: NativeTimestampFormat.fractionalZulu(Date()), turn: turn)
         await TurnTracePersistLane(dataRootOverride: dataRoot).append(event)
     }
 

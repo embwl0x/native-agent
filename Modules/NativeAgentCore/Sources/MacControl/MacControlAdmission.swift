@@ -3,9 +3,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
 // Blueprint: | `MacControlAdmission.swift` | Canonical desktop policy and input admission; passive observation carries no motor authority |
 
 extension SwiftNativeMacControl {
@@ -30,7 +28,6 @@ extension SwiftNativeMacControl {
             return .refuse(Self.refusalResult(
                 action: action,
                 reason: "mac_control_policy_unavailable: \(error.localizedDescription)",
-                now: now,
                 remedy: Repair.why(owner: "trust/policy.json", tap: "Trust",
                     instruction: "Preserve the saved policy bytes and repair the authority before continuing.")
             ))
@@ -47,20 +44,19 @@ extension SwiftNativeMacControl {
 
         let decision = MacControlGate.gate(policy, category: category, trigger: trigger)
         if !decision.allowed {
-            let result = Self.refusalResult(action: action, reason: decision.reason, now: now, remedy: decision.remedy)
+            let result = Self.refusalResult(action: action, reason: decision.reason, remedy: decision.remedy)
             await emitBlockedAudit(action: action, category: category, reason: decision.reason, trigger: trigger, policy: policy, body: body, turn: turn)
             return .refuse(result)
         }
-        // Accessibility category permission alone is insufficient: reads, input, clipboard, document access and nudge also require an active Full Mac window,
+        // Accessibility category permission alone is insufficient: reads, input, clipboard and document access also require an active Full Mac window,
         // including calls entering through remote surfaces.
         if macControlAccessibilityReadActions.contains(action)
-            || macControlAccessibilityNudgeActions.contains(action)
             || macControlClipboardActions.contains(action)
             || macControlDocumentReadActions.contains(action)
             || macControlAccessibilityInjectionActions.contains(action),
            !(policy.trustPolicy.map { PermissionLaw.posture($0) == .fullMac } ?? false) {
             let reason = "full_mac_inactive: \(action) requires Full Mac access enabled in Trust"
-            let result = Self.refusalResult(action: action, reason: reason, now: now)
+            let result = Self.refusalResult(action: action, reason: reason)
             await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body, turn: turn)
             return .refuse(result)
         }
@@ -71,7 +67,7 @@ extension SwiftNativeMacControl {
         // everything.
         if let answer = await provider.authorize(tool: action, input: body, turn: turn), answer.level != "auto" {
             let reason = (answer.level == "confirm" ? "needs_approval: " : "blocked: ") + answer.reason
-            let result = Self.refusalResult(action: action, reason: reason, now: now, remedy: answer.remedy)
+            let result = Self.refusalResult(action: action, reason: reason, remedy: answer.remedy)
             await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body, turn: turn)
             return .refuse(result)
         }
@@ -83,7 +79,7 @@ extension SwiftNativeMacControl {
             let anySensitive = paths.contains { MacControlSensitivePathFence.reason(forPath: $0) != nil }
             if !anySensitive, !paths.isEmpty,
                let reason = MacControlGate.fileReason(policy, forPaths: paths) {
-                let result = Self.refusalResult(action: action, reason: reason, now: now)
+                let result = Self.refusalResult(action: action, reason: reason)
                 await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body, turn: turn)
                 return .refuse(result)
             }
@@ -95,7 +91,6 @@ extension SwiftNativeMacControl {
     private static func refusalResult(
         action: String,
         reason: String,
-        now: @Sendable () -> Date,
         remedy: JSONValue? = nil
     ) -> MacControlResult {
         MacControlResult(
@@ -115,31 +110,13 @@ extension SwiftNativeMacControl {
         )
     }
 
-    static func unsupportedResult(action: String) -> MacControlResult {
-        let error = "unsupported_mac_control_action: \(action) is not implemented in Swift"
-        return MacControlResult(
-            ok: false,
-            action: action,
-            output: .object([
-                "ok": .bool(false),
-                "status": .string("unsupported"),
-                "error": .string(error),
-                "dispatched_via": .string("swift"),
-            ]),
-            error: error,
-            durationMs: 0,
-            httpStatus: 501
-        )
-    }
-
     // MARK: accessibility perception (read-only)
 
     /// Resolve the caller-supplied bounds, clamped to the hard ceilings by `MacAXLimits.init`. A caller CANNOT raise the caps, only lower them.
     static func axLimits(from body: [String: JSONValue]) -> MacAXLimits {
         return MacAXLimits(
             maxNodes: body["max_nodes"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacAXLimits.hardMaxNodes,
-            maxDepth: body["max_depth"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacAXLimits.hardMaxDepth,
-            maxMatches: body["limit"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacAXLimits.hardMaxMatches
+            maxDepth: body["max_depth"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacAXLimits.hardMaxDepth
         )
     }
 
@@ -207,13 +184,13 @@ extension SwiftNativeMacControl {
         body: [String: JSONValue],
         turn: Turn
     ) async -> MacControlResult {
-        let result = Self.refusalResult(action: action, reason: reason, now: now)
+        let result = Self.refusalResult(action: action, reason: reason)
         if let provider = policyProvider {
             let policy: MacControlPolicy
             do { policy = try await provider.currentPolicy(turn: turn) }
             catch {
                 return Self.refusalResult(action: action,
-                    reason: "mac_control_policy_unavailable: \(error.localizedDescription)", now: now,
+                    reason: "mac_control_policy_unavailable: \(error.localizedDescription)",
                     remedy: Repair.why(owner: "trust/policy.json", tap: "Trust",
                         instruction: "Preserve the saved policy bytes and repair the authority before continuing."))
             }

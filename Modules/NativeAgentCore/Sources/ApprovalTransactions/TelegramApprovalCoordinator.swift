@@ -248,23 +248,16 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     /// The Inbox face, where every card's buttons come from and every answer goes.
     nonisolated let inbox: TelegramInboxDoor
 
-    public typealias CardSender = @Sendable (
-        _ token: String, _ destination: TelegramDestination, _ text: String, _ replyMarkup: JSONValue
-    ) async throws -> Int
-    private let cardSender: CardSender
-
     public init(
         dataRoot: URL,
         token: String,
         promptSender: @escaping PromptSender,
-        inbox: TelegramInboxDoor,
-        cardSender: @escaping CardSender = TelegramPollLoop.defaultSendConsentWithReplyMarkupReturningId
+        inbox: TelegramInboxDoor
     ) {
         self.dataRoot = dataRoot
         self.token = token
         self.promptSender = promptSender
         self.inbox = inbox
-        self.cardSender = cardSender
     }
 
     /// The Telegram door among the person's doors: an action whose `doors` leave it out is neither drawn on Telegram nor accepted from it.
@@ -368,7 +361,8 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
                     "The request has an invalid Telegram topic; no prompt was sent into General.")
             }
             try await deliverOnce(key: "interaction:\(id):\(chatId)", send: {
-                let messageID = try await self.cardSender(self.token, TelegramDestination(chatId: chatId, threadId: topic), text, markup)
+                let messageID = try await TelegramPollLoop.defaultSendConsentWithReplyMarkupReturningId(
+                    self.token, TelegramDestination(chatId: chatId, threadId: topic), text, markup)
                 return ["telegram_chat_id": .string(String(chatId)), "telegram_message_id": .string(String(messageID))]
             }, saveReceipt: { fields in
                 try await self.saveInteractionReceipt(fields, id: id, dataRoot: dataRoot)
@@ -452,9 +446,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         id: String,
         toolName: String,
         surface: String,
-        payload: JSONValue,
-        reason: String,
-        turn: Turn
+        reason: String
     ) async -> JSONValue {
         ToolNotRunStatus.approvalFiled.reporting(.object([
             "status": .string("waiting_approval"),
@@ -625,11 +617,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     }
 
     private static func nonEmptyStringValue(_ raw: String?) -> JSONValue {
-        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty else {
-            return .null
-        }
-        return .string(trimmed)
+        raw.trimmedNonEmpty.map(JSONValue.string) ?? .null
     }
 
 }

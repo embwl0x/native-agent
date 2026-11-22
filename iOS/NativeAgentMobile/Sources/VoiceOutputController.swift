@@ -53,7 +53,7 @@ final class VoiceOutputController: NSObject, ObservableObject {
 
     @objc nonisolated private func audioSessionInterrupted(_ notification: Notification) {
         Task { @MainActor [weak self] in
-            self?.handleAudioSessionInterruption()
+            self?.stop()
         }
     }
 
@@ -104,12 +104,6 @@ final class VoiceOutputController: NSObject, ObservableObject {
     }
 
     func stop() {
-        preparationTask?.cancel()
-        _synthesizer?.stopSpeaking(at: .immediate)
-        finishPlayback()
-    }
-
-    func handleAudioSessionInterruption() {
         preparationTask?.cancel()
         _synthesizer?.stopSpeaking(at: .immediate)
         finishPlayback()

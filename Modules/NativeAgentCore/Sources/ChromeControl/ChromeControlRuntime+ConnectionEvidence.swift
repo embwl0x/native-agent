@@ -246,7 +246,7 @@ extension ChromeControlRuntime {
     }
 
     static func dateJSON(_ date: Date?) -> JSONValue {
-        date.map { .string(ISO8601DateFormatter().string(from: $0)) } ?? .null
+        date.map { .string(NativeTimestampFormat.plainZulu($0)) } ?? .null
     }
 
     private func disconnection(chromeRunning: Bool, refusal: ChromeRelayRefusal?) -> (side: String, reason: String) {

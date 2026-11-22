@@ -346,6 +346,8 @@ connectors and agent communication under the saved policy.
   Clipboard reads with `org.nspasteboard.ConcealedType` or `org.nspasteboard.TransientType`
   return no text or text length and a note that the clipboard holds concealed content,
   including metadata-only reads. Ordinary text keeps its line redaction and size limit.
+  Text and type metadata share one checked pasteboard generation. A change during the read
+  returns `clipboard_unavailable` without a snapshot.
   Interactive AX reads and mutations share capability-based renderer preparation,
   checked capability readback and event-backed content readiness; passive reads
   never write mode flags. See [renderer perception](USER_GUIDE.md#turn-on-mac-computer-control-and-the-activity-watcher)
@@ -355,9 +357,10 @@ connectors and agent communication under the saved policy.
   Act-time name reads have the same scope. A failed own-name read, including
   `AXTitle`, marks the label unreadable without trying another label attribute,
   caption or hint; unsupported/no-value attributes remain absent.
-  Missing `AXEnabled` stays unknown in perception. A disabled control says so,
-  so an AX action refuses `false` and a failed read, with its cause; a control
-  that publishes no `AXEnabled` (TextEdit's text area) is not disabled.
+  Missing `AXEnabled` stays unknown in perception. An action that requires
+  enabled-state evidence refuses `false` and reports the cause of a failed
+  read. A control that publishes no `AXEnabled` (TextEdit's text area) is not
+  disabled. AX scroll target resolution skips the enabled-state read.
   A separate caption read's failure
   yields one caption gap and `label_source:"unreadable"` on the control;
   sibling attributes are never reported as its own, and another name is not
@@ -445,7 +448,11 @@ connectors and agent communication under the saved policy.
   AX role/label/frame identity; identical AX identities are not distinguishable.
   Named character chords resolve through the active keyboard layout (including
   its Command mapping); `key:` and `code:` retain explicit physical addressing.
+  `mac.act` accepts physical tokens such as `key:36` alongside named keys and chords.
+  A batch that types before a Return step recognizes the physical Return code
+  through the same key parser and uses typing events for the submit field.
   Chords post keyboard input directly, independent of duplicate menu titles.
+  The global key path counts an event only after posting it to Core Graphics. Observed effects are checked separately.
   Point `type` clicks the image point, then admits text only to the editor
   that takes focus. Focused typing requires positive AX editability (text role,
   `AXEditable`, caret range or writable selected text), separately from readable
@@ -457,6 +464,11 @@ connectors and agent communication under the saved policy.
   otherwise unchanged control identity. Missing or unconfirmed identities and
   declared-effect mismatches stop the batch; positional handles retain
   cohort/geometry checks and the shared TTL.
+  Scrolls by handle or by name accept `direction` and `scroll_amount` on a
+  single act or in a step. A handle step also accepts `to` as the direction.
+  Direction defaults to down and a handle defaults to three wheel lines.
+  Omission and 0 match the same stopped-batch step.
+  See [the scroll contract](ONE_DOOR.md#one-door-every-action).
   A targetless scroll selects the largest visible scrollable content region,
   or the observed window content area when AX supplies none. Application names
   prefer exact bundle filenames over display names; duplicate winning filenames
@@ -471,7 +483,10 @@ connectors and agent communication under the saved policy.
   late or incomplete evidence withholds the image with
   `image_unavailable_reason:"redaction_coverage_unavailable"` and a named
   `image_withheld_reason`, retaining the text observation for automatic and
-  explicit pixel requests. A subrole gap alone requires a finite element frame
+  explicit pixel requests. Under Full Mac nothing is masked (User 11-20), so the
+  secret inspections and the disclosure budget cannot withhold their pixels: an
+  incomplete inspection costs only the marks it would have placed; process,
+  geometry and capture provenance still bind the image to the window. A subrole gap alone requires a finite element frame
   and masks it completely; caption and geometry failures still withhold pixels.
   Text roles with an unreadable subrole contribute no value to text looks,
   including values read as another control's caption or a native selector label.
@@ -485,7 +500,8 @@ connectors and agent communication under the saved policy.
   only when that point is within its bounds or the view has no bounds. Other pulses, including motion or
   scroll without a usable point, invalidate all views and in-flight captures.
   Superseded views discard pixels and marks, and superseded looks return no
-  action handles. LatestRead owns publication order and the shared frame
+  action handles. An attention capture that needs to discard its marks can clear
+  only its own published view. LatestRead owns publication order and the shared frame
   lifetime is 180 seconds. Selected marks/text report omissions and
   AX truncation; they never claim an exhaustive window. Control names come from
   their own attributes or owned descendants, never unrelated nearby text.
@@ -555,6 +571,9 @@ connectors and agent communication under the saved policy.
   held keys and buttons are released; watch input cannot overlap an ordinary act.
   Physical input shares one hand executor for posting, waits and held-input release;
   raw typing and targeted typing retain their own admission and effect checks.
+  An interrupted hand counts successful recovery posts for its operation, including
+  releases already posted by Stop or physical takeover. Failed releases stay pending
+  for cleanup.
   Every four-verb physical hand carries the observed foreground PID, including
   keys in an app with no window. A cross-app drag retains the source PID, or the
   destination PID after an authorized raise. An unknown foreground identity sends
@@ -624,19 +643,23 @@ connectors and agent communication under the saved policy.
   when a changed target interrupts accumulation, including an empty frame left
   by a container replaced during its walk. For those reads, the end is accepted
   only while the original target is still current, with a nonempty, uncut frame
-  at the restoration owner's observed scrollbar maximum. Repeated or overlapping
-  text affects accumulation only; it never proves the end. Moving through repeated
-  text continues reading. Missing position evidence reports
-  `scroll_position_unavailable`; a position that fails to advance without proven
-  completion reports `scroll_progress_unconfirmed`. Both return partial text with
-  `reached_end: false` and `truncated: true`, retaining the existing frame and
-  deadline bounds. A missing/invalid maximum never proves completion.
+  at the restoration owner's observed scrollbar maximum. New frames are read
+  after confirmed scrollbar progress. A merge requires matching AX elements
+  and line offsets that moved up with the document, including a readable line
+  that occurs once in each moving run. Fixed footers stay after the merged
+  document rows. An unverified seam keeps the observed rows and reports
+  `gaps: true` and `truncated: true`, even at the scrollbar maximum.
+  Missing position evidence reports `scroll_position_unavailable`. A position
+  that fails to advance reports `scroll_progress_unconfirmed`. Both return
+  previously accumulated text with `reached_end: false` and `truncated: true`.
+  Frame and deadline bounds still apply. A missing or invalid maximum never
+  proves completion.
   Once that end is read without gaps or clipping, a target check during view
   restoration cannot make that text incomplete;
-  `scroll_restored` reports restoration separately. Restoration runs through
-  `settle` under the original driver generation even after Stop; physical takeover,
-  explicit handback and changed-target refusals still apply. A read accumulating by
-  scrolling from below the beginning still reports `started_below_beginning`
+  `scroll_restored` reports restoration separately. Restoration checks authority and
+  target identity using the original driver's settlement binding, including after Stop.
+  Physical takeover, explicit handback and changed-target refusals still apply.
+  A read that scrolls from below the beginning reports `started_below_beginning`
   and `truncated: true`.
 - **Mac services:** Mail, Calendar, Reminders, Notes, Contacts, Messages and
   Music have app pages and actions. Service-specific permissions apply.
@@ -793,8 +816,8 @@ connectors and agent communication under the saved policy.
   own app actions. Chrome requires the extension's connection and authority.
   The built-in browser's [operation contract](INTERNAL_WORKINGS.md#built-in-browser-operation-ownership)
   owns pure previews, settlement, bounded WebKit waits and checked IPC readiness.
-- **Web search:** `web.search` searches SearXNG and returns its results or an explicit failure with setup or repair guidance. A malformed result is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
-- **Web search:** `web.search` searches SearXNG and returns its results or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
+- **Web search:** `web.search` searches SearXNG and returns its results (with the engines' direct `answers` and up to three `infoboxes` knowledge panels, each a title, summary and page, when SearXNG has them) or an explicit failure with setup or repair guidance. A malformed result is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
+- **Web search:** `web.search` searches SearXNG and returns its results (with the engines' direct `answers` and up to three `infoboxes` knowledge panels, each a title, summary and page, when SearXNG has them) or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
 - **Web reads:** `web.read` (`read_page`) extracts the retained HTTP HTML as
   paragraphs, list items and table rows, with each content link inline as
   `title → url` (a URL label appears once). HN stories keep their points and
@@ -1002,7 +1025,7 @@ matching inherited values are accepted as no-ops with a note. The
 [helper settings contract](USER_GUIDE.md#helpers-standing-bots) describes this rule.
 
 The routing group table is in `ProviderRouting`; its UI projection is
-[ProviderActivityChoices.swift](../Sources/NativeAgentApp/ProviderActivityChoices.swift).
+`ProviderSurfaceGroups` in [ProviderCatalogWireModels.swift](../Modules/NativeAgentShared/Sources/NativeAgentShared/ProviderCatalogWireModels.swift).
 
 ## Trust, security, and receipts
 

@@ -53,7 +53,7 @@ struct MobileTranscriptRow: TranscriptRow, Hashable {
 
     /// The key the phone keeps a Mac row's message by.
     static func key(_ recordID: String) -> String {
-        (UUID(uuidString: recordID) ?? ChatMessage.derivedMessageID(recordID)).uuidString
+        (UUID(uuidString: recordID) ?? TranscriptMessageID.derived(recordID)).uuidString
     }
 
     /// Merge local messages into the Mac's conversation order without losing non-message rows.
@@ -181,7 +181,7 @@ enum MobileTranscriptPreparation {
                                                       label: input.isLoadingHistory ? "Loading earlier messages…" : "Load earlier messages",
                                                       link: input.isLoadingHistory ? nil : .olderHistory)] : []
         let owed = owedMatters.map { matter in
-            TranscriptBlock(id: "approval-" + matter, messageID: "approval-" + matter, role: "system",
+            TranscriptBlock(id: TranscriptBlockID.approval(matter), messageID: TranscriptBlockID.approval(matter), role: "system",
                             kind: .attachment(.approval(rowID: matter)), source: "", lead: .message, foldGroup: nil)
         }
         let data = TranscriptAttachmentData(messages: messages,
@@ -198,7 +198,7 @@ enum MobileTranscriptPreparation {
                     quiet: true, failed: true)
             },
             wanted: { _ in }, render: { block, width, _ in
-                try TranscriptRenderer(width: CGFloat(width), category: category).prepared(block)
+                try TranscriptRenderer(width: CGFloat(width), look: .phone(category: category)).prepared(block)
             },
             door: TranscriptDoor(leading: older, after: after, trailing: owed,
                                  live: input.liveMessageID.map { .init(rowID: $0.uuidString, waiting: input.waitingLine) }),

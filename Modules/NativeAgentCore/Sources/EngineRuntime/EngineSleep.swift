@@ -50,22 +50,36 @@ public enum EngineSleep {
     /// The reading of one window over the traces already read for it.
     static func findings(dataRoot: URL, since: Date, through: Date, window: SurpriseReading) async -> Findings {
         var found = Findings(revision: Self.revision)
-        func noteGaps(_ reading: SurpriseReading, _ span: String) {
-            for gap in reading.gaps {
-                var fields: [String: JSONValue] = ["source": .string(gap.source), "reading": .string(span)]
-                if let unreadable = gap.unreadable { fields["unreadable"] = .int(Int64(unreadable)) }
-                found.gaps.append(.object(fields))
-            }
-        }
-        noteGaps(window, "window")
+        noteGaps(window, "window", found: &found)
         let store = AbilityStore(dataRoot: dataRoot)
-        let catalog: (files: [AbilityStore.File], retained: [AbilityStore.Slot: [String: AbilityStore.File]], states: [String: JSONValue])
+        let catalog: SleepCatalog
         do { catalog = try store.catalog() } catch {
             found.gaps.append(Self.gap("abilities", reason: error.localizedDescription))
             return found
         }
         let current = catalog.retained[.current] ?? [:]
 
+        found = await readSleepTrials(found, dataRoot: dataRoot, through: through, store: store, catalog: catalog, current: current)
+        guard found.revision else { return found }
+        let (withGaps, debts, considered, traced) = await sleepCandidateIDs(found, dataRoot: dataRoot, since: since, through: through,
+            window: window, store: store, catalog: catalog, current: current)
+        return await rankSleepCandidates(withGaps, dataRoot: dataRoot, since: since, through: through, window: window,
+            store: store, catalog: catalog, current: current, debts: debts, considered: considered, traced: traced)
+    }
+
+    private typealias SleepCatalog = (files: [AbilityStore.File], retained: [AbilityStore.Slot: [String: AbilityStore.File]], states: [String: JSONValue])
+
+    private static func noteGaps(_ reading: SurpriseReading, _ span: String, found: inout Findings) {
+        for gap in reading.gaps {
+            var fields: [String: JSONValue] = ["source": .string(gap.source), "reading": .string(span)]
+            if let unreadable = gap.unreadable { fields["unreadable"] = .int(Int64(unreadable)) }
+            found.gaps.append(.object(fields))
+        }
+    }
+
+    private static func readSleepTrials(_ initial: Findings, dataRoot: URL, through: Date,
+                                        store: AbilityStore, catalog: SleepCatalog, current: [String: AbilityStore.File]) async -> Findings {
+        var found = initial
         for (id, value) in catalog.states.sorted(by: { $0.key < $1.key }) {
             guard let row = value.objectValue, let trial = row["trial"]?.objectValue else { continue }
             guard let version = trial["version"]?.stringValue, let keptKey = trial["kept"]?.stringValue else {
@@ -88,7 +102,7 @@ public enum EngineSleep {
                     let born = versions[keptKey]?.objectValue?["first_seen"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601)
                     let from = born.map { max($0, opened.addingTimeInterval(-Self.keptSpan)) }
                     let sinceOpened = await SurpriseReading.read(dataRoot: dataRoot, since: opened, through: through)
-                    noteGaps(sinceOpened, "trial")
+                    noteGaps(sinceOpened, "trial", found: &found)
                     // The kept self's turns are read from the traces once, while they still hold them, and kept on the trial by the night.
                     // A kept self first seen once its trial opened has no turns before it: no baseline, and the trial stays open.
                     let frozen = trial["kept_turns"]?.objectValue
@@ -109,7 +123,7 @@ public enum EngineSleep {
                     }
                     if frozen == nil, let from, from < opened {
                         let read = await SurpriseReading.read(dataRoot: dataRoot, since: from, through: opened)
-                        noteGaps(read, "kept_record")
+                        noteGaps(read, "kept_record", found: &found)
                         before = read
                     }
                     guard !Self.unread(sinceOpened), !(before.map(Self.unread) ?? false) else {
@@ -164,8 +178,17 @@ public enum EngineSleep {
             }
             found.trials.append(.object(entry))
         }
-        guard found.revision else { return found }
+        return found
+    }
 
+    private static func runs(_ id: String, catalog: SleepCatalog) -> [String: JSONValue] {
+        catalog.states[id]?.objectValue?["runs"]?.objectValue?["versions"]?.objectValue ?? [:]
+    }
+
+    private static func sleepCandidateIDs(_ initial: Findings, dataRoot: URL, since: Date, through: Date, window: SurpriseReading,
+                                           store: AbilityStore, catalog: SleepCatalog, current: [String: AbilityStore.File]) async
+        -> (Findings, debts: Set<String>, considered: Set<String>, traced: Bool) {
+        var found = initial
         var debts = Set<String>()
         do {
             for debt in try await ExperienceStore.at(dataRoot).open() where RepairOwed.isOwed(debt) {
@@ -175,14 +198,11 @@ public enum EngineSleep {
             }
         } catch { found.gaps.append(Self.gap("repair_owed", reason: error.localizedDescription)) }
 
-        func runs(_ id: String) -> [String: JSONValue] {
-            catalog.states[id]?.objectValue?["runs"]?.objectValue?["versions"]?.objectValue ?? [:]
-        }
         // An ability is read from its record alone: the window is its current version's hours, in the record's own outcome classes.
         var considered = debts
         for (id, file) in current where file.kind != .turn {
             do {
-                if try Self.hours(runs(id)[store.versionKey(file)], from: since, to: through).misses > 0 { considered.insert(id) }
+                if try Self.hours(runs(id, catalog: catalog)[store.versionKey(file)], from: since, to: through).misses > 0 { considered.insert(id) }
             } catch { found.gaps.append(Self.accountingGap(id, error)) }
         }
         // The turn program's own kinds are read from the traces, per settled turn.
@@ -190,74 +210,81 @@ public enum EngineSleep {
         if let turn = current.values.first(where: { $0.kind == .turn }), window.misses(.turnProgram(store.identity(turn))) > 0 {
             considered.insert(turn.id)
         }
+        return (found, debts, considered, traced)
+    }
+
+    private static func rankSleepCandidates(_ initial: Findings, dataRoot: URL, since: Date, through: Date, window: SurpriseReading,
+                                              store: AbilityStore, catalog: SleepCatalog, current: [String: AbilityStore.File],
+                                              debts: Set<String>, considered: Set<String>, traced: Bool) async -> Findings {
+        var found = initial
         var candidates: [(owed: Bool, rounds: Double?, id: String, value: JSONValue, line: String)] = []
         var span: SurpriseReading?
         for id in considered.sorted() {
             do {
-            if catalog.states[id]?.objectValue?["trial"]?.objectValue != nil { found.skipped["open_trial", default: 0] += 1; continue }
-            guard let file = current[id] else { found.skipped["gone", default: 0] += 1; continue }
-            let key = store.versionKey(file), evidence = runs(id)[key]
-            let record = try Self.partTally(evidence)
-            let owner: SurpriseReading.Owner = file.kind == .turn ? .turnProgram(store.identity(file)) : .ability(id)
-            let uses: Int, misses: Int, expected: Int
-            // The record outside the window: what the window is compared against, in the same unit.
-            let rest: (uses: Int, misses: Int)
-            if file.kind == .turn {
-                guard traced else { found.skipped["unread", default: 0] += 1; continue }
-                guard let born = evidence?.objectValue?["first_seen"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601) else {
-                    found.gaps.append(Self.gap("turn_provenance", reason: "The turn version has no first_seen provenance.", part: id))
-                    continue
+                if catalog.states[id]?.objectValue?["trial"]?.objectValue != nil { found.skipped["open_trial", default: 0] += 1; continue }
+                guard let file = current[id] else { found.skipped["gone", default: 0] += 1; continue }
+                let key = store.versionKey(file), evidence = runs(id, catalog: catalog)[key]
+                let record = try Self.partTally(evidence)
+                let owner: SurpriseReading.Owner = file.kind == .turn ? .turnProgram(store.identity(file)) : .ability(id)
+                let uses: Int, misses: Int, expected: Int
+                // The record outside the window: what the window is compared against, in the same unit.
+                let rest: (uses: Int, misses: Int)
+                if file.kind == .turn {
+                    guard traced else { found.skipped["unread", default: 0] += 1; continue }
+                    guard let born = evidence?.objectValue?["first_seen"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601) else {
+                        found.gaps.append(Self.gap("turn_provenance", reason: "The turn version has no first_seen provenance.", part: id))
+                        continue
+                    }
+                    // The turn program's surprise is per turn: its version's turns before the window.
+                    let life = await SurpriseReading.read(dataRoot: dataRoot, since: born, through: since)
+                    noteGaps(life, "turn_program_record", found: &found)
+                    guard !Self.unread(life) else { found.skipped["unread", default: 0] += 1; continue }
+                    if span == nil {
+                        let read = await SurpriseReading.read(dataRoot: dataRoot, since: through.addingTimeInterval(-Self.decisionSpan), through: through)
+                        noteGaps(read, "decision_span", found: &found)
+                        span = read
+                    }
+                    guard let decision = span, !Self.unread(decision) else { found.skipped["unread", default: 0] += 1; continue }
+                    (uses, misses, expected) = (window.uses[owner] ?? 0, window.misses(owner), decision.uses[owner] ?? 0)
+                    rest = (life.uses[owner] ?? 0, life.misses(owner))
+                } else {
+                    (uses, misses) = try Self.hours(evidence, from: since, to: through)
+                    rest = (record.uses - uses, record.targetMisses - misses)
+                    // The part's own use rate: its current and previous versions' runs in the span.
+                    let from = through.addingTimeInterval(-Self.decisionSpan)
+                    let previous = try catalog.retained[.previous]?[id].map { try Self.hours(runs(id, catalog: catalog)[store.versionKey($0)], from: from, to: through).uses }
+                    expected = try Self.countSum(Self.hours(evidence, from: from, to: through).uses, previous ?? 0)
                 }
-                // The turn program's surprise is per turn: its version's turns before the window.
-                let life = await SurpriseReading.read(dataRoot: dataRoot, since: born, through: since)
-                noteGaps(life, "turn_program_record")
-                guard !Self.unread(life) else { found.skipped["unread", default: 0] += 1; continue }
-                if span == nil {
-                    let read = await SurpriseReading.read(dataRoot: dataRoot, since: through.addingTimeInterval(-Self.decisionSpan), through: through)
-                    noteGaps(read, "decision_span")
-                    span = read
+                let longRun: Double? = rest.uses > 0 ? Double(rest.misses) / Double(rest.uses) : nil
+                let owed = debts.contains(id)
+                if !owed {
+                    guard let longRun else { found.skipped["no_baseline", default: 0] += 1; continue }
+                    guard PartTrial.rose(uses: uses, misses: misses, longRun: longRun) else { continue }
                 }
-                guard let decision = span, !Self.unread(decision) else { found.skipped["unread", default: 0] += 1; continue }
-                (uses, misses, expected) = (window.uses[owner] ?? 0, window.misses(owner), decision.uses[owner] ?? 0)
-                rest = (life.uses[owner] ?? 0, life.misses(owner))
-            } else {
-                (uses, misses) = try Self.hours(evidence, from: since, to: through)
-                rest = (record.uses - uses, record.targetMisses - misses)
-                // The part's own use rate: its current and previous versions' runs in the span.
-                let from = through.addingTimeInterval(-Self.decisionSpan)
-                let previous = try catalog.retained[.previous]?[id].map { try Self.hours(runs(id)[store.versionKey($0)], from: from, to: through).uses }
-                expected = try Self.countSum(Self.hours(evidence, from: from, to: through).uses, previous ?? 0)
-            }
-            let longRun: Double? = rest.uses > 0 ? Double(rest.misses) / Double(rest.uses) : nil
-            let owed = debts.contains(id)
-            if !owed {
-                guard let longRun else { found.skipped["no_baseline", default: 0] += 1; continue }
-                guard PartTrial.rose(uses: uses, misses: misses, longRun: longRun) else { continue }
-            }
-            // Decidable only: the trial must be able to decide within the span at the part's own rates.
-            let total = file.kind == .turn
-                ? (uses: try Self.countSum(rest.uses, uses), misses: try Self.countSum(rest.misses, misses))
-                : (uses: record.uses, misses: record.targetMisses)
-            guard total.uses > 0, let needed = PartTrial.needed(m0: Double(total.misses) / Double(total.uses)), expected >= needed else {
-                found.skipped["undecidable", default: 0] += 1; continue
-            }
-            let rounds = record.meanRounds.map { Double(misses) * $0 }
-            var fields: [String: JSONValue] = [
-                "part": .string(id), "kind": .string(file.kind.rawValue), "version": .string(key),
-                "reason": .string(owed ? "repair_owed" : "surprise"),
-                "uses": .int(Int64(uses)), "misses": .int(Int64(misses)),
-                "lower": .double(Expectation.lowerBound(hits: misses, tries: uses)),
-                "rounds_spent": rounds.map(JSONValue.double) ?? .null, "expected_uses": .int(Int64(expected)), "needed_uses": .int(Int64(needed)),
-            ]
-            // Corrections are a surprise kind of their own, read from the traces; an unread window reports none rather than zero.
-            if traced { fields["corrected"] = .int(Int64(window.count(owner, kind: "corrected"))) }
-            fields["long_run"] = longRun.map(JSONValue.double)
-            let reason = owed ? "is owed a repair" : "surprised more than its record"
-            let rate = longRun.map { "a long-run \(Self.percent($0)) miss rate" } ?? "no long-run record"
-            let spent = rounds.map { String(format: "%.1f", $0) + " rounds" } ?? "unmeasured rounds"
-            let line = "\(id) \(reason): \(misses) of \(uses) uses missed in this window against \(rate); the misses spent \(spent); "
-                + "\(expected) uses expected within 14 days, \(needed) needed to decide a trial."
-            candidates.append((owed, rounds, id, .object(fields), line))
+                // Decidable only: the trial must be able to decide within the span at the part's own rates.
+                let total = file.kind == .turn
+                    ? (uses: try Self.countSum(rest.uses, uses), misses: try Self.countSum(rest.misses, misses))
+                    : (uses: record.uses, misses: record.targetMisses)
+                guard total.uses > 0, let needed = PartTrial.needed(m0: Double(total.misses) / Double(total.uses)), expected >= needed else {
+                    found.skipped["undecidable", default: 0] += 1; continue
+                }
+                let rounds = record.meanRounds.map { Double(misses) * $0 }
+                var fields: [String: JSONValue] = [
+                    "part": .string(id), "kind": .string(file.kind.rawValue), "version": .string(key),
+                    "reason": .string(owed ? "repair_owed" : "surprise"),
+                    "uses": .int(Int64(uses)), "misses": .int(Int64(misses)),
+                    "lower": .double(Expectation.lowerBound(hits: misses, tries: uses)),
+                    "rounds_spent": rounds.map(JSONValue.double) ?? .null, "expected_uses": .int(Int64(expected)), "needed_uses": .int(Int64(needed)),
+                ]
+                // Corrections are a surprise kind of their own, read from the traces; an unread window reports none rather than zero.
+                if traced { fields["corrected"] = .int(Int64(window.count(owner, kind: "corrected"))) }
+                fields["long_run"] = longRun.map(JSONValue.double)
+                let reason = owed ? "is owed a repair" : "surprised more than its record"
+                let rate = longRun.map { "a long-run \(Self.percent($0)) miss rate" } ?? "no long-run record"
+                let spent = rounds.map { String(format: "%.1f", $0) + " rounds" } ?? "unmeasured rounds"
+                let line = "\(id) \(reason): \(misses) of \(uses) uses missed in this window against \(rate); the misses spent \(spent); "
+                    + "\(expected) uses expected within 14 days, \(needed) needed to decide a trial."
+                candidates.append((owed, rounds, id, .object(fields), line))
             } catch { found.gaps.append(Self.accountingGap(id, error)) }
         }
         candidates.sort { left, right in

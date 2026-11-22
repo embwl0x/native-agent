@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import AppKit
 import Cognition
 import Combine
@@ -19,6 +18,9 @@ actor ICloudIncomingVerifier {
     }
     func admitsControl(_ message: BridgeMessage) -> Bool {
         guard let key = try? PairingSecret.loadOrGenerateSecret() else { return false }
+        if message.metadata?["kind"] == PhoneRequestResult.messageKind {
+            return ICloudIncomingMessageDisposition.classify(message, secret: key, now: Date()) == .deliver
+        }
         if message.metadata?["kind"] != "icloud_action",
            UserMessageIntentSignals.isControlHandoff(message.text),
            let session = message.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),

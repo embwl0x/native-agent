@@ -92,7 +92,7 @@ public struct NativeReflectionRouteStatus: Sendable, Equatable {
 public enum CognitiveTransientStateClearOutcome: Sendable, Equatable {
     case cleared
     case persistenceFailed(String)
-    case bodyPersistenceFailed
+    case partiallyCleared(String)
 }
 
 public enum OrganismDebugBodyScenario: String, CaseIterable, Sendable {

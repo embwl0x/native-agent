@@ -9,7 +9,6 @@ import PersistenceCore
 import CognitiveSubstrate
 import TurnTrace
 import Desk
-import CryptoKit
 
 // Blueprint: | `MemoryV2+MemoryManager.swift` | Grounded decisions, promise candidates and evidence-backed intention outcomes |
 
@@ -398,7 +397,7 @@ public enum MemoryManagerLane {
     /// One identity for an owed moment's dependency (its judging route, its embedder): the same values give the same key.
     public static func fingerprint(_ values: [String]) -> String {
         let text = values.map { "\($0.utf8.count):" + $0 }.joined()
-        return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        return SHA256Hex.of(Data(text.utf8))
     }
     public static let pendingCap = 24
     /// Bound memories to sentences rather than paragraphs.
@@ -613,7 +612,7 @@ public enum MemoryManagerLane {
         }
         let now = Date()
         if let due = decision.due, due > now {
-            meta[MemoryDueDateStamp.dueAtKey] = .string(MemoryDueDateStamp.iso8601(due))
+            meta[MemoryDueDateStamp.dueAtKey] = .string(NativeTimestampFormat.plainZulu(due))
             meta[MemoryDueDateStamp.dueSourceKey] = .string("memory_manager")
         }
         if decision.kind == "correction", let subject = decision.correctionSubject {

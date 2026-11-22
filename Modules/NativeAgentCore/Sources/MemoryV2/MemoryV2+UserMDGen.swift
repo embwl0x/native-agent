@@ -159,7 +159,7 @@ public actor UserMDGenerator {
                         persona: projectionPersona, status: "active", limit: nil
                     )
                     let now = nowProvider()
-                    let body = Self.renderBody(memories: memories, now: now, dataRoot: dataRoot)
+                    let body = Self.renderBody(memories: memories, now: now)
                     let existing = try Self.loadPreambleForRegeneration(at: target)
                     let payload = Self.assemble(preamble: existing.preamble, body: body)
                     try Self.atomicReplaceIfChanged(payload, existingBytes: existing.bytes, at: target)
@@ -185,11 +185,11 @@ public actor UserMDGenerator {
     // MARK: - Rendering
 
     /// Bound pinned facts at promptByteCap; unpinned facts and overflow remain recallable.
-    static func renderBody(memories: [StoredMemory], now: Date, dataRoot: URL) -> String {
+    static func renderBody(memories: [StoredMemory], now: Date) -> String {
         var budget = UserMDAutogenMarkers.promptByteCap - "# USER\n".utf8.count
         var lines: [String] = []
         let pinned = memories.filter { MemoryStorage.metadataFlag($0.metadata, "pinned") }
-        for fact in userFacts(memories: pinned, now: now, dataRoot: dataRoot) {
+        for fact in userFacts(memories: pinned, now: now) {
             let line = "- \(fact)\n"
             guard line.utf8.count <= budget else { continue }
             lines.append(line)
@@ -198,7 +198,7 @@ public actor UserMDGenerator {
         return "# User Facts (auto-generated from memory SQLite)\n\n" + lines.joined() + "\n"
     }
 
-    static func userFacts(memories: [StoredMemory], now: Date = Date(), dataRoot: URL) -> some Sequence<String> {
+    static func userFacts(memories: [StoredMemory], now: Date = Date()) -> some Sequence<String> {
         let trust = MemoryDataProvenance.reading(memories.map(\.metadata))
         return memories.lazy.compactMap { m -> String? in
             // Admit only known person kinds; excluded kinds remain recallable outside USER.md.
@@ -210,11 +210,7 @@ public actor UserMDGenerator {
             guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: m.validTo, at: now) else { return nil }
             // A cold write is not a fact until its vector lands and passes admission.
             guard !MemoryStorage.metadataFlag(m.metadata, MemoryStorage.pendingAdmissionKey) else { return nil }
-            guard MemoryCandidateQuality.isDurableCandidate(
-                text: m.content,
-                source: m.source,
-                kind: MemoryRecallScoring.kind(of: m.metadata)
-            ) else { return nil }
+            guard MemoryCandidateQuality.isDurableCandidate(text: m.content) else { return nil }
             let content = MemoryTextClip.memoryDisplayText(
                 m.content.replacingOccurrences(of: "\n", with: " "),
                 kind: MemoryRecallScoring.kind(of: m.metadata)

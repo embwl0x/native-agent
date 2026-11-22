@@ -128,7 +128,7 @@ public actor TranscriptPress<Row: TranscriptRow> {
             var causes: [String] = []
             if let failure { causes.append(failure) }
             if unconfirmedReply {
-                causes.append("Finished reply has no conversation row. Read the conversation again; its reply is unconfirmed.")
+                causes.append("The reply finished but didn't load here. Reopen the conversation to see it.")
             }
             // A paragraph whose reveal could not be mapped shows whole; that is a diagnostic (TranscriptRevealMapping logs it), not an issue.
             return causes.isEmpty ? nil : causes.joined(separator: "\n")
@@ -178,10 +178,20 @@ public actor TranscriptPress<Row: TranscriptRow> {
         var markdown = TranscriptLiveMarkdown()
         var paragraphs: [String: [Format: TranscriptRenderedParagraph]] = [:]
         var printed: [Format: [String: Saved]] = [:]
+        /// Layouts are kept for the two widths used last (a main window and a detached panel); older widths are let go.
+        private var recentFormats: [Format] = []
 
         func keep(_ value: Printed, input: TranscriptPressInput<Row>, words: [String: String], complete: Bool) {
-            printed[Format(input), default: [:]][input.presentation] =
+            let format = Format(input)
+            printed[format, default: [:]][input.presentation] =
                 Saved(selection: Selection(input), words: words, value: value, complete: complete)
+            recentFormats.removeAll { $0 == format }
+            recentFormats.append(format)
+            while recentFormats.count > 2 {
+                let old = recentFormats.removeFirst()
+                printed.removeValue(forKey: old)
+                for key in paragraphs.keys { paragraphs[key]?.removeValue(forKey: old) }
+            }
         }
 
         func ready(_ input: TranscriptPressInput<Row>) -> Saved? {

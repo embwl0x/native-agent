@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import MacControl
+import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` from copied fields |
 
 extension CognitiveSubstrate {
@@ -209,7 +210,7 @@ extension CognitiveSubstrate {
     }
 
     private func isAssistantAuthoredFocus(_ node: CognitiveNode) -> Bool {
-        if metadataString(node.metadata["role"])?.lowercased() == "assistant" {
+        if node.metadata["role"]?.trimmedString?.lowercased() == "assistant" {
             return true
         }
         let subjectType = node.subjectReference.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

@@ -53,19 +53,11 @@ extension AppModel {
 
 
     @MainActor
-    /// Let a Telegram caller defer poll restart because shutdown waits for its own turn too.
-    func clearTelegramToken(restartPollLoop: Bool = true) async -> AppMutationResult {
+    /// The Telegram caller restarts the poll loop itself, deferred, because shutdown waits for its own turn too.
+    func clearTelegramToken() async -> AppMutationResult {
         statusText = "Clearing Telegram bot token..."
-        let restart: (@Sendable () async -> Bool)? = restartPollLoop
-            ? { @Sendable [backgroundLoopsManager] in
-                await NativeAgentEngine.restartBackgroundLoop(
-                    id: "telegram_poll",
-                    manager: backgroundLoopsManager
-                ).didRestart
-            }
-            : nil
         do {
-            try await engine.telegram.disconnectTelegram(restartPollLoop: restart)
+            try await engine.telegram.disconnectTelegram()
             await refreshAll()
             statusText = "Telegram bot token cleared"
             return .success("Telegram bot token cleared")

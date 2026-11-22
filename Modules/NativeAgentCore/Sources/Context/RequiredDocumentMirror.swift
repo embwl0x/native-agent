@@ -249,10 +249,6 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
         self.kernels = kernelsBySurface
     }
 
-    public func document(id: RequiredDocumentID) -> RequiredDocument? {
-        documents.first { $0.id == id }
-    }
-
     public func kernel(for surfaceVariant: ContextSurfaceVariant) -> StablePromptKernel? {
         kernels[surfaceVariant]
     }

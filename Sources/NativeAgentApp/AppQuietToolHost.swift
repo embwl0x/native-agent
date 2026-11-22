@@ -279,7 +279,7 @@ extension AppQuietToolHost: QuietInboxHost {
         }
         try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
             dataRootOverride: dataRootOverride, turn: turn,
-            effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
+            effects: AppInboxCardActionEffects())
     }
     func withdrawApproval(id: String, decidedBy: String) async throws {
         guard let turn = inboxTurn else {

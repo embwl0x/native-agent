@@ -27,7 +27,7 @@ extension MacSyncEngine {
     nonisolated static func activity(_ experience: Experience) -> MobileWorkActivity? {
         // Only the person's conversations reach their phone; worker answers belong to the requesting caller.
         guard experience.kind == .heard, let answer = experience.owes["answer"], answer.to.hasPrefix("conversation:"),
-              let started = DeskActivityState.movementDate(experience.at) else { return nil }
+              let started = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(experience.at) else { return nil }
         let state: MobileWorkActivity.State
         let status: String
         if answer.phase == .accepted { state = .completed; status = "Reply ready" }
@@ -46,7 +46,7 @@ extension MacSyncEngine {
             sessionID: destination.hasPrefix("conversation:") ? String(destination.dropFirst(13)) : nil,
             startedAt: started, content: .init(
                 title: "Working on your message", state: state,
-                status: status, updatedAt: DeskActivityState.movementDate(experience.updatedAt) ?? started, sequence: experience.sequence))
+                status: status, updatedAt: NativeTimestampFormat.parseOptionalISO8601FractionalFirst(experience.updatedAt) ?? started, sequence: experience.sequence))
     }
 
     nonisolated static func workActivity(_ id: String, dataRoot: URL) async throws -> MobileWorkActivity {

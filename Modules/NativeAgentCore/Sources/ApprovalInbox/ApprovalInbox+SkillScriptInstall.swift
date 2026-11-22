@@ -29,7 +29,7 @@ extension SwiftNativeApprovalInbox {
             "action": .string(Self.skillScriptInstallAction),
             "risk": .string("medium"),
             "reason": .string(why + " Approve installs this exact candidate, including code, fixtures and dependencies (digest \(short)); if it changed since, "
-                + "approving installs nothing. Deny leaves it drafted."),
+                + "approving installs nothing. Decline leaves it drafted."),
             "payloadPreview": .string(script),
             "payload": .object(["skill": .string(skillID), "name": .string(skill), "digest": .string(digest)]),
         ]), turn: turn, handsBack: handsBack) { payload in

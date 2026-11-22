@@ -1,4 +1,5 @@
 import CloudKit
+import Foundation
 import NativeAgentShared
 import UserNotifications
 
@@ -9,6 +10,7 @@ enum MobileNotificationRouting {
     static let approve = "nativeagent.mobile.approve"
     static let deny = "nativeagent.mobile.deny"
     static let reply = "nativeagent.mobile.reply"
+    static let replyEnvelopeKey = "notificationReplyEnvelope"
 
     static func register() {
         UNUserNotificationCenter.current().setNotificationCategories(nativeAgentNotificationCategories(
@@ -17,12 +19,12 @@ enum MobileNotificationRouting {
         ))
     }
 
-    static func categorized(_ content: UNNotificationContent) throws -> UNNotificationContent {
+    static func categorized(_ content: UNNotificationContent, replyEnvelope: String? = nil) throws -> UNNotificationContent {
         guard let copy = content.mutableCopy() as? UNMutableNotificationContent else {
             throw NSError(domain: "NativeAgentNotification", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "Notification content could not be copied for routing."])
         }
-        // `originSessionId` names the knock's conversation; a knock without its own screen opens that conversation with Reply.
+        // A knock without its own screen opens the conversation named by `originSessionId`.
         let screen = nonEmpty(copy.userInfo["screen"] as? String)
         if nonEmpty(copy.userInfo["sessionId"] as? String) == nil,
            nonEmpty(copy.userInfo["approvalId"] as? String) == nil,
@@ -31,10 +33,11 @@ enum MobileNotificationRouting {
             copy.userInfo["sessionId"] = origin
             copy.userInfo["screen"] = "chat"
         }
+        copy.userInfo[replyEnvelopeKey] = replyEnvelope
         if nonEmpty(copy.userInfo["approvalId"] as? String) != nil {
             copy.categoryIdentifier = approvalCategory
         } else if nonEmpty(copy.userInfo["sessionId"] as? String) != nil {
-            copy.categoryIdentifier = messageCategory
+            copy.categoryIdentifier = replyEnvelope != nil ? messageCategory : ""
         }
         return copy
     }
@@ -51,9 +54,9 @@ enum MobileNotificationRouting {
         }
         let record = try await CKContainer(identifier: containerID).privateCloudDatabase.record(for: recordID)
         guard record.recordType == NADeviceSyncRecordType.notification,
-              let payload = record["payloadJSON"] as? String, let data = payload.data(using: .utf8),
-              let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let metadata = envelope["metadata"] as? [String: String], metadata["kind"] == "notification" else {
+              let payload = record["payloadJSON"] as? String,
+              let envelope = try? decodeReplyEnvelope(payload), envelope.id == recordID.recordName,
+              envelope.sender == "mac", let metadata = envelope.metadata, metadata["kind"] == "notification" else {
             throw NSError(domain: "NativeAgentNotification", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "The notified record has no notification routing envelope."])
         }
@@ -66,7 +69,27 @@ enum MobileNotificationRouting {
         }
         // CloudKit's alert names only title and body; the envelope carries the subtitle the call gave.
         if let subtitle = nonEmpty(metadata["subtitle"]) { copy.subtitle = subtitle }
+        // The extension has no pairing key. Carry the envelope for the app to authenticate before Reply.
+        if replySession(metadata) != nil, let title = nonEmpty(metadata["title"]) {
+            copy.title = title
+            copy.body = envelope.text
+            return try categorized(copy, replyEnvelope: payload)
+        }
         return try categorized(copy)
+    }
+
+    static func decodeReplyEnvelope(_ payload: String) throws -> BridgeMessage {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(BridgeMessage.self, from: Data(payload.utf8))
+    }
+
+    static func replySession(_ metadata: [String: String]) -> String? {
+        guard metadata["kind"] == "notification", nonEmpty(metadata[BridgeMessage.notificationPairingKey]) != nil,
+              nonEmpty(metadata["userInfo.approvalId"]) == nil else { return nil }
+        if let session = nonEmpty(metadata["userInfo.sessionId"]) { return session }
+        let screen = nonEmpty(metadata["userInfo.screen"])
+        return screen == nil || screen == "activity" ? nonEmpty(metadata["userInfo.originSessionId"]) : nil
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

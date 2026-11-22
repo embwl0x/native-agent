@@ -105,53 +105,16 @@ final class BodySettingsActHandler: FaceActHandler {
             try await handleFaceNotification(response, model: model, target: BodyFacePresentation.current(model: model))
             return .acknowledged
         case .restoreConversation:
-            let model = try requireModel()
-            await model.loadChatState()
-            guard !model.chatStateLoadFailed, !model.activeChatSessionId.isEmpty else {
-                throw PartCallError(code: "conversation_restore_failed", message: model.statusText)
-            }
-            return try await engine.faceActs.handle(.selectConversation(session: model.activeChatSessionId, userInitiated: false))
+            return try await restoreFaceConversation()
         case .observe(let id, .composer(let session)):
-            guard !session.isEmpty else {
-                throw PartCallError(code: "conversation_required", message: "Choose a conversation before observing its composer.")
-            }
-            guard composerObservations[id] == nil else {
-                throw PartCallError(code: "observation_exists", message: "This composer observation is already open.")
-            }
-            let providers = engine.providers
-            composerObservations[id] = Task { await providers.observeSession(session) }
-            return .observation(id: id)
+            return try observeFaceComposer(id: id, session: session)
         case .onboarding(.greet):
             let model = try requireModel()
             model.markFirstRunWelcomePending()
             let outcome = await model.maybeSendFirstRunGreeting()
             return .result(.object(["routeFailure": outcome.routeFailureMessage.map(PartFace.Value.string) ?? .null]))
         case .observe(let id, let demand):
-            guard case .key(let key) = demand else {
-                throw PartCallError(code: "observation_owner_unmounted", message: "This presentation has not been mounted in the body.")
-            }
-            switch key {
-            case .settings:
-                _ = try await BodySettingsPreferences.refreshPreferences(engine: engine)
-                try await engine.settingsFeed.deliverFaces()
-            case .page(let page), .pageTitle(let page):
-                await engine.pages.observe(page: page, reader: id,
-                    renderer: try BodyFacePresentation.current(model: requireModel()).connection, titleOnly: key == .pageTitle(page))
-                await engine.pages.refresh(page: page)
-                return .observation(id: id)
-            case .sessions, .sessionPalette, .sessionSearch:
-                _ = try await engine.transcripts.readSessionIndex()
-            case .sessionNavigation:
-                await engine.transcripts.refreshNavigationIdentity()
-                await engine.transcripts.deliverSessionFaces()
-            case .turns, .turn, .counts:
-                try await engine.settingsFeed.deliverFaces()
-            case .document:
-                break
-            default:
-                throw PartCallError(code: "observation_owner_unmounted", message: "This presentation has not been mounted in the body.")
-            }
-            return .observation(id: id)
+            return try await observeFaceDemand(id: id, demand: demand)
         case .unobserve(let id):
             await engine.pages.release(reader: id)
             let composer = composerObservations.removeValue(forKey: id)
@@ -165,23 +128,7 @@ final class BodySettingsActHandler: FaceActHandler {
             let values = try await BodySettingsPreferences.refreshPreferences(engine: engine, keys: keys)
             return .result(.object(values))
         case .setPreference(let key, let value):
-            if key == "chatPersona" {
-                guard case .string(let name) = value, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw PartCallError(code: "persona_name_required", message: "Choose a named persona before changing this selection.")
-                }
-                let selected = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                if PersonaSelection.current() != selected {
-                    PersonaSelection.select(selected)
-                    await engine.contextFlow.personaPickerDidChange()
-                }
-            } else if value == .null { try await engine.settingsFeed.useDeclaredPreference(key) }
-            else { try await engine.settingsFeed.setPreference(value, key: key) }
-            let values = try await BodySettingsPreferences.refreshPreferences(engine: engine, keys: [key])
-            guard let saved = values[key] else {
-                throw WireFailure(code: "preference_readback_unavailable", message: "The preference was written, but its value could not be read.",
-                    cause: nil, effects: .known)
-            }
-            return committed(saved, identities: [key])
+            return try await setFacePreference(key, value: value)
         case .openBrowser:
             BrowserWindowController.shared.showWindow()
             return .acknowledged
@@ -192,23 +139,7 @@ final class BodySettingsActHandler: FaceActHandler {
             let target = try BodyFacePresentation.current(model: requireModel())
             return try UpdateController.shared.interaction(operation: operation, action: action, renderer: target.connection)
         case .beginOAuth(let provider):
-            let result = await NativeOAuthFlow.startOAuthFlow(platform: BodyOAuthPlatform.self, providerId: provider, dataRoot: engine.dataRoot)
-            guard result.ok else {
-                throw PartCallError(code: "oauth_failed", message: result.error ?? "Sign-in did not complete.")
-            }
-            engine.providers.fetchModelListInBackground(after: provider)
-            var issue: WireFailure?
-            _ = await engine.providers.adoptProviderForBlankSurfaces(provider, dataRoot: engine.dataRoot) { error, _ in
-                issue = WireFailure(code: "oauth_routing_publication_failed", message: "Sign-in was saved, but Chat could not select the account.",
-                    cause: error.localizedDescription, effects: .known)
-            }
-            let saved: PartFace.Value = .object(["credentialSaved": .bool(true)])
-            do { _ = try await refreshProviders() }
-            catch {
-                issue = WireFailure(code: "oauth_publication_failed", message: "Sign-in was saved, but Providers could not be refreshed.",
-                    cause: error.localizedDescription, effects: .known)
-            }
-            return .committed(.init(identities: [provider], value: saved, revision: nil, effects: .known, publicationFailure: issue))
+            return try await beginFaceOAuth(provider)
         case .answerCard(let answer): return try await cardActions().answer(answer)
         case .verifyCardOnReturn(let card, let session, let revision):
             return try await cardActions().verify(.init(card: card, session: session, revision: revision))
@@ -218,21 +149,9 @@ final class BodySettingsActHandler: FaceActHandler {
             if let card { return try await cardActions().verify(card) }
             return committed(.object(["problems": .array(problems.map(PartFace.Value.string))]))
         case .openMacOSSettings(let capability):
-            guard let gate = SystemPermissionPreflight.cardSettingsCapability(capability) else {
-                throw PartCallError(code: "unknown_permission", message: "That macOS permission is not recognized.")
-            }
-            if let failure = await SystemPermissionPreflight.openSettings(gate) {
-                throw PartCallError(code: "permission_settings_failed", message: failure)
-            }
-            return .acknowledged
+            return try await openFaceMacOSSettings(capability)
         case .runMacControl(let request):
-            guard let action = MacControlWorkbenchAction(rawValue: request.action) else {
-                throw PartCallError(code: "unknown_mac_action", message: "Choose a supported Mac control action.")
-            }
-            let turn = Self.personTurn("mac_control." + request.action)
-            let result = try await engine.trust.runMacControl(action: action, body: request.arguments.mapValues { JSONValue($0) },
-                notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn)
-            return committed(PartFace.Value(result.toJSON(readContent: nil)))
+            return try await runFaceMacControl(request)
         case .notify(let title, let message):
             let turn = Self.personTurn("mac_control.notify")
             let result = try await engine.trust.runMacControl(action: .notify, body: ["title": .string(title), "message": .string(message)],
@@ -245,68 +164,204 @@ final class BodySettingsActHandler: FaceActHandler {
             return committed(.object(["status": .string(record.status), "decision": record.decision.map(PartFace.Value.string) ?? .null]),
                 identities: [record.id])
         case .importGrokCredentials(let request):
-            guard let secret = String(data: request.secret, encoding: .utf8) else {
-                throw PartCallError(code: "invalid_secret_encoding", message: "The submitted credentials are not UTF-8.")
-            }
-            let root = engine.dataRoot
-            let saved = try await Self.saveGrok(contact: request.contact, secret: secret, root: root)
-            guard saved else {
-                throw PartCallError(code: "grok_credentials_invalid", message: """
-                    Paste the webhook address and key: {"url":"…","key":"…"}, or the address and the key one after the other separated by a space or \
-                    a new line. Nothing was saved.
-                    """)
-            }
-            var issue: WireFailure?
-            do { _ = try await engine.connectors.refresh().get() }
-            catch { issue = WireFailure(code: "grok_publication_failed", message: "The credentials were saved, but Connectors could not be refreshed.",
-                cause: error.localizedDescription, effects: .known) }
-            return committed(.bool(true), identities: [request.contact, request.operation.uuidString], publicationFailure: issue)
+            return try await importFaceGrokCredentials(request)
         case .setUpChrome:
             let url = try await ChromeExtensionFolder.setUp(turn: Self.personTurn("chrome.setup"), context: .init(dataRoot: engine.dataRoot))
             return committed(.string(url.path), identities: ["chrome"])
         case .reindexSpotlight:
-            let result = await MemorySpotlightReindexOperation.run(dataRoot: engine.dataRoot)
-            await engine.memory.refreshDiagnostics()
-            guard case .indexed = result else {
-                throw PartCallError(code: "spotlight_reindex_failed", message: result.agentMessage)
-            }
-            return committed(.string(result.userMessage), identities: ["spotlight"])
+            return try await reindexFaceSpotlight()
         case .inboxAction(let id, let action, _):
-            let turn = Self.personTurn("inbox." + action)
-            let target = try BodyFacePresentation.current(model: requireModel())
-            let effects = BodyInboxCardActionEffects(call: { try await target.call($0) }, renderer: target.connection)
-            try await ApprovalTransactions.InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot,
-                turn: turn, effects: effects)
-            var issue: WireFailure?
-            do { _ = try await engine.inbox.list() }
-            catch { issue = WireFailure(code: "inbox_publication_failed", message: "The Inbox action completed, but its list could not be refreshed.",
-                cause: error.localizedDescription, effects: .known) }
-            return committed(.object(["action": .string(action)]), identities: [id], publicationFailure: issue)
+            return try await runFaceInboxAction(id: id, action: action)
         case .openCard(let id):
-            // The card's own conversation, opened as a notification opens one: where its request was raised, or the thread its matter came
-            // from. A card: link names a request by its id or its matter's, and a note by its matter's.
-            let owner = ForPerson.at(engine.dataRoot)
-            var found = try await owner.matter(id)
-            if found == nil, !id.hasPrefix("interaction:") { found = try await owner.matter("interaction:" + id) }
-            guard let matter = found else {
-                throw PartCallError(code: "card_unavailable", message: "This card is no longer kept, so it has no conversation to open.")
-            }
-            let raised = matter.evidence.first { $0.source.hasPrefix(Matter.conversations) }
-                .map { String($0.source.dropFirst(Matter.conversations.count)) }
-            var thread: String?
-            if case .conversation(let session)? = ForPerson.thread(matter) { thread = session }
-            guard let session = raised ?? thread else {
-                throw PartCallError(code: "card_conversation_unavailable",
-                    message: "This item was not raised in a conversation; it reads in the Inbox.")
-            }
-            try await BodyFacePresentation.current(model: requireModel()).present(.openConversation(session: session, message: nil))
-            return .acknowledged
+            return try await openFaceCard(id)
         case .restartBody:
             try Self.restart()
             return .acknowledged
         default:
             throw PartCallError(code: "act_owner_unmounted", message: "This operation belongs to an area that has not been integrated.")
         }
+    }
+
+    /// Restore the body's saved conversation and acknowledge its selection.
+    private func restoreFaceConversation() async throws -> FaceActReply {
+        let model = try requireModel()
+        await model.loadChatState()
+        guard !model.chatStateLoadFailed, !model.activeChatSessionId.isEmpty else {
+            throw PartCallError(code: "conversation_restore_failed", message: model.statusText)
+        }
+        return try await engine.faceActs.handle(.selectConversation(session: model.activeChatSessionId, userInitiated: false))
+    }
+
+    /// Admit the mounted composer observation and start its provider read.
+    private func observeFaceComposer(id: UUID, session: String) throws -> FaceActReply {
+        guard !session.isEmpty else {
+            throw PartCallError(code: "conversation_required", message: "Choose a conversation before observing its composer.")
+        }
+        guard composerObservations[id] == nil else {
+            throw PartCallError(code: "observation_exists", message: "This composer observation is already open.")
+        }
+        let providers = engine.providers
+        composerObservations[id] = Task { await providers.observeSession(session) }
+        return .observation(id: id)
+    }
+
+    /// Mount a keyed presentation demand at its body owner.
+    private func observeFaceDemand(id: UUID, demand: FaceDemand) async throws -> FaceActReply {
+        guard case .key(let key) = demand else {
+            throw PartCallError(code: "observation_owner_unmounted", message: "This presentation has not been mounted in the body.")
+        }
+        switch key {
+        case .settings:
+            _ = try await BodySettingsPreferences.refreshPreferences(engine: engine)
+            try await engine.settingsFeed.deliverFaces()
+        case .page(let page), .pageTitle(let page):
+            await engine.pages.observe(page: page, reader: id,
+                renderer: try BodyFacePresentation.current(model: requireModel()).connection, titleOnly: key == .pageTitle(page))
+            await engine.pages.refresh(page: page)
+            return .observation(id: id)
+        case .sessions, .sessionPalette, .sessionSearch:
+            _ = try await engine.transcripts.readSessionIndex()
+        case .sessionNavigation:
+            await engine.transcripts.refreshNavigationIdentity()
+            await engine.transcripts.deliverSessionFaces()
+        case .turns, .turn, .counts:
+            try await engine.settingsFeed.deliverFaces()
+        case .document:
+            break
+        default:
+            throw PartCallError(code: "observation_owner_unmounted", message: "This presentation has not been mounted in the body.")
+        }
+        return .observation(id: id)
+    }
+
+    /// Write the preference and read back the value for the commit receipt.
+    private func setFacePreference(_ key: String, value: PartFace.Value) async throws -> FaceActReply {
+        if key == "chatPersona" {
+            guard case .string(let name) = value, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw PartCallError(code: "persona_name_required", message: "Choose a named persona before changing this selection.")
+            }
+            let selected = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if PersonaSelection.current() != selected {
+                PersonaSelection.select(selected)
+                await engine.contextFlow.personaPickerDidChange()
+            }
+        } else if value == .null { try await engine.settingsFeed.useDeclaredPreference(key) }
+        else { try await engine.settingsFeed.setPreference(value, key: key) }
+        let values = try await BodySettingsPreferences.refreshPreferences(engine: engine, keys: [key])
+        guard let saved = values[key] else {
+            throw WireFailure(code: "preference_readback_unavailable", message: "The preference was written, but its value could not be read.",
+                cause: nil, effects: .known)
+        }
+        return committed(saved, identities: [key])
+    }
+
+    /// Save the OAuth sign-in, then report any routing or publication failure.
+    private func beginFaceOAuth(_ provider: String) async throws -> FaceActReply {
+        let result = await NativeOAuthFlow.startOAuthFlow(platform: BodyOAuthPlatform.self, providerId: provider, dataRoot: engine.dataRoot)
+        guard result.ok else {
+            throw PartCallError(code: "oauth_failed", message: result.error ?? "Sign-in did not complete.")
+        }
+        engine.providers.fetchModelListInBackground(after: provider)
+        var issue: WireFailure?
+        _ = await engine.providers.adoptProviderForBlankSurfaces(provider, dataRoot: engine.dataRoot) { error, _ in
+            issue = WireFailure(code: "oauth_routing_publication_failed", message: "Sign-in was saved, but Chat could not select the account.",
+                cause: error.localizedDescription, effects: .known)
+        }
+        let saved: PartFace.Value = .object(["credentialSaved": .bool(true)])
+        do { _ = try await refreshProviders() }
+        catch {
+            issue = WireFailure(code: "oauth_publication_failed", message: "Sign-in was saved, but Providers could not be refreshed.",
+                cause: error.localizedDescription, effects: .known)
+        }
+        return .committed(.init(identities: [provider], value: saved, revision: nil, effects: .known, publicationFailure: issue))
+    }
+
+    /// Open the macOS settings for a recognized permission capability.
+    private func openFaceMacOSSettings(_ capability: String) async throws -> FaceActReply {
+        guard let gate = SystemPermissionPreflight.cardSettingsCapability(capability) else {
+            throw PartCallError(code: "unknown_permission", message: "That macOS permission is not recognized.")
+        }
+        if let failure = await SystemPermissionPreflight.openSettings(gate) {
+            throw PartCallError(code: "permission_settings_failed", message: failure)
+        }
+        return .acknowledged
+    }
+
+    /// Run the supported Mac control action under the person's turn.
+    private func runFaceMacControl(_ request: MacControlRequest) async throws -> FaceActReply {
+        guard let action = MacControlWorkbenchAction(rawValue: request.action) else {
+            throw PartCallError(code: "unknown_mac_action", message: "Choose a supported Mac control action.")
+        }
+        let turn = Self.personTurn("mac_control." + request.action)
+        let result = try await engine.trust.runMacControl(action: action, body: request.arguments.mapValues { JSONValue($0) },
+            notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn)
+        return committed(PartFace.Value(result.toJSON(readContent: nil)))
+    }
+
+    /// Save Grok credentials before refreshing the connector presentation.
+    private func importFaceGrokCredentials(_ request: GrokCredentialWrite) async throws -> FaceActReply {
+        guard let secret = String(data: request.secret, encoding: .utf8) else {
+            throw PartCallError(code: "invalid_secret_encoding", message: "The submitted credentials are not UTF-8.")
+        }
+        let root = engine.dataRoot
+        let saved = try await Self.saveGrok(contact: request.contact, secret: secret, root: root)
+        guard saved else {
+            throw PartCallError(code: "grok_credentials_invalid", message: """
+                Paste the webhook address and key: {"url":"…","key":"…"}, or the address and the key one after the other separated by a space or \
+                a new line. Nothing was saved.
+                """)
+        }
+        var issue: WireFailure?
+        do { _ = try await engine.connectors.refresh().get() }
+        catch { issue = WireFailure(code: "grok_publication_failed", message: "The credentials were saved, but Connectors could not be refreshed.",
+            cause: error.localizedDescription, effects: .known) }
+        return committed(.bool(true), identities: [request.contact, request.operation.uuidString], publicationFailure: issue)
+    }
+
+    /// Reindex Spotlight and refresh the body's memory diagnostics.
+    private func reindexFaceSpotlight() async throws -> FaceActReply {
+        let result = await MemorySpotlightReindexOperation.run(dataRoot: engine.dataRoot)
+        await engine.memory.refreshDiagnostics()
+        guard case .indexed = result else {
+            throw PartCallError(code: "spotlight_reindex_failed", message: result.agentMessage)
+        }
+        return committed(.string(result.userMessage), identities: ["spotlight"])
+    }
+
+    /// Apply the requested Inbox action and refresh the list after it commits.
+    private func runFaceInboxAction(id: String, action: String) async throws -> FaceActReply {
+        let turn = Self.personTurn("inbox." + action)
+        let target = try BodyFacePresentation.current(model: requireModel())
+        let effects = BodyInboxCardActionEffects(call: { try await target.call($0) }, renderer: target.connection)
+        try await ApprovalTransactions.InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot,
+            turn: turn, effects: effects)
+        var issue: WireFailure?
+        do { _ = try await engine.inbox.list() }
+        catch { issue = WireFailure(code: "inbox_publication_failed", message: "The Inbox action completed, but its list could not be refreshed.",
+            cause: error.localizedDescription, effects: .known) }
+        return committed(.object(["action": .string(action)]), identities: [id], publicationFailure: issue)
+    }
+
+    /// Open the conversation that owns the card link.
+    private func openFaceCard(_ id: String) async throws -> FaceActReply {
+        // The card's own conversation, opened as a notification opens one: where its request was raised, or the thread its matter came
+        // from. A card: link names a request by its id or its matter's, and a note by its matter's.
+        let owner = ForPerson.at(engine.dataRoot)
+        var found = try await owner.matter(id)
+        if found == nil, !id.hasPrefix("interaction:") { found = try await owner.matter("interaction:" + id) }
+        guard let matter = found else {
+            throw PartCallError(code: "card_unavailable", message: "This card is no longer kept, so it has no conversation to open.")
+        }
+        let raised = matter.evidence.first { $0.source.hasPrefix(Matter.conversations) }
+            .map { String($0.source.dropFirst(Matter.conversations.count)) }
+        var thread: String?
+        if case .conversation(let session)? = ForPerson.thread(matter) { thread = session }
+        guard let session = raised ?? thread else {
+            throw PartCallError(code: "card_conversation_unavailable",
+                message: "This item was not raised in a conversation; it reads in the Inbox.")
+        }
+        try await BodyFacePresentation.current(model: requireModel()).present(.openConversation(session: session, message: nil))
+        return .acknowledged
     }
 
     private func refresh(_ scope: FaceRefreshScope) async throws {

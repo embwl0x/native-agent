@@ -5,14 +5,14 @@ import NativeAgentShared
 extension iCloudSyncEngine {
     private nonisolated static func writeWorkOverviewCache(_ data: Data, to url: URL) throws {
         let incoming = try JSONDecoder().decode(WorkOverview.self, from: data)
-        guard let incomingDate = DeskActivityState.movementDate(incoming.capturedAt) else {
+        guard let incomingDate = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(incoming.capturedAt) else {
             throw DeviceSyncError.underlying(message: "invalid work overview state-change time")
         }
         if FileManager.default.fileExists(atPath: url.path) {
             let currentData = try VolumeIO.contents(of: url)
             do {
                 let current = try JSONDecoder().decode(WorkOverview.self, from: currentData)
-                guard let currentDate = DeskActivityState.movementDate(current.capturedAt) else {
+                guard let currentDate = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(current.capturedAt) else {
                     throw DeviceSyncError.underlying(message: "invalid cached overview state-change time")
                 }
                 if incomingDate <= currentDate {

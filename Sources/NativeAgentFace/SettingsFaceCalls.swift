@@ -37,7 +37,7 @@ enum SettingsFaceCalls {
                 guard let url = panel.url else {
                     throw PartCallError(code: "destination_unavailable", message: "The save picker returned no destination.")
                 }
-                return .destination(try await resourceGrant(id: operation, url: url, writable: true))
+                return .destination(try await FaceNativePanel.resourceGrant(id: operation, url: url, writable: true))
             case .runOAuthSession(let request):
                 return try await NativeOAuthPlatform.run(request)
             case .showPermissionGuidance(let capability, let raw):
@@ -71,28 +71,10 @@ enum SettingsFaceCalls {
             UpdateController.disconnect()
         })
     }
-
-    @concurrent
-    nonisolated static func resourceGrant(id: UUID, url: URL, writable: Bool) async throws -> ResourceGrant {
-        .init(id: id, name: url.lastPathComponent,
-              bookmark: try url.bookmarkData(),
-              writable: writable)
-    }
 }
 
 @MainActor
-enum FaceNativePanel {
-    static func choose(_ panel: NSSavePanel) async throws -> NSApplication.ModalResponse {
-        // A question never holds Quit: the person can always quit the app while it is open.
-        panel.preventsApplicationTerminationWhenModal = false
-        return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            let result = await panel.begin()
-            try Task.checkCancellation()
-            return result
-        } onCancel: { Task { @MainActor in panel.cancel(nil) } }
-    }
-
+extension FaceNativePanel {
     static func confirm(_ alert: NSAlert) async throws -> NSApplication.ModalResponse {
         alert.window.preventsApplicationTerminationWhenModal = false
         let host: NSWindow?

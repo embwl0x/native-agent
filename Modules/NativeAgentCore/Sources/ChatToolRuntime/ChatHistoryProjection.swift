@@ -57,27 +57,26 @@ extension SwiftToolDispatcher {
             return (ChatHistorySearchRow(valid: false, identity: trimmed, content: "", searchable: "", folded: "",
                 displayPrefix: "", shape: 1), nil)
         }
-        func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value { return text }; return nil }
         let role = (decoded.role ?? "unknown").lowercased()
         let words = role == "tool" ? nil : decoded.content
         let bridgeRouted = ChatTranscriptBoilerplate.isBridgeRouted(rowMetadata: obj["metadata"])
         let timestamp = decoded.timestamp
         let instant = timestamp.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
-        let metadata = persistedHistoryMetadata(row: obj)
-        let name = string(metadata["toolName"])
+        let metadata = JSONValue.objectOrEmpty(obj["metadata"])
+        let name = metadata["toolName"]?.stringValue
         func project(_ text: String) -> ChatHistorySearchRow {
             let content = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : text
             // Only persisted bridge provenance strips routing boilerplate; quoted words stay searchable.
             let searchable = bridgeRouted ? DelegatedReplyEnvelope(content).searchText : content
             return ChatHistorySearchRow(
                 valid: true,
-                identity: string(obj["id"]) ?? trimmed, role: decoded.role, runId: string(obj["runId"]),
-                messageId: string(obj["id"]), timestamp: timestamp, rawContent: words,
+                identity: obj["id"]?.stringValue ?? trimmed, role: decoded.role, runId: obj["runId"]?.stringValue,
+                messageId: obj["id"]?.stringValue, timestamp: timestamp, rawContent: words,
                 content: content, searchable: searchable, folded: searchable.lowercased(),
                 instant: role == "tool" ? nil : instant,
                 author: persistedHistoryAuthor(role: role, row: obj, metadata: metadata), route: persistedHistoryRoute(row: obj, metadata: metadata),
                 peer: role != "tool" ? persistedHistoryPeer(role: role, row: obj, metadata: metadata) : nil,
-                tool: name.flatMap { $0.isEmpty ? nil : ToolNameAliases.shown($0, inputJSON: string(metadata["inputJSON"])).name },
+                tool: name.flatMap { $0.isEmpty ? nil : ToolNameAliases.shown($0, inputJSON: metadata["inputJSON"]?.stringValue).name },
                 displayPrefix: chatHistoryDisplayEvidence("", role: role, row: obj, decodedMetadata: metadata),
                 shape: decoded.role != nil && decoded.content != nil ? 2 : 1,
                 mechanical: CognitiveMechanicalRowKind.marksMechanicalRow(metadata))
@@ -88,13 +87,6 @@ extension SwiftToolDispatcher {
         receipt.instant = instant
         receipt.peer = persistedHistoryPeer(role: role, row: obj, metadata: metadata)
         return (project(""), receipt)
-    }
-
-    static func persistedHistoryMetadata(row: [String: JSONValue]) -> [String: JSONValue] {
-        switch row["metadata"] {
-        case .object(let object)?: return object
-        default: return [:]
-        }
     }
 
     /// A narrow projection owned by explicit history tools. Do not teach the ordinary history reader to inject tool metadata into every new turn.
@@ -173,14 +165,14 @@ extension SwiftToolDispatcher {
     /// Receipt sources retain their own evidence; speech uses the shared row stamp.
     package static func persistedHistoryPeer(role: String, row: [String: JSONValue], metadata: [String: JSONValue]? = nil) -> String? {
         let principals = role.lowercased() == "tool"
-            ? toolReceiptSources(row: row, metadata: metadata ?? persistedHistoryMetadata(row: row))
+            ? toolReceiptSources(metadata: metadata ?? JSONValue.objectOrEmpty(row["metadata"]))
             : ContactThread.Line(row, role: role.lowercased(), metadata: metadata).speakers
         var seen: Set<String> = []
         let unique = principals.filter { seen.insert($0).inserted }
         return unique.isEmpty ? nil : unique.joined(separator: "\n")
     }
 
-    private static func toolReceiptSources(row: [String: JSONValue], metadata: [String: JSONValue]) -> [String] {
+    private static func toolReceiptSources(metadata: [String: JSONValue]) -> [String] {
         let tool = (metadata["toolName"])?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? ""
         let storedInput = metadata["inputJSON"]
         let input: [String: JSONValue]
@@ -236,7 +228,7 @@ extension SwiftToolDispatcher {
 
     package static func persistedHistoryAuthor(role: String, row: [String: JSONValue], metadata: [String: JSONValue]? = nil) -> String? {
         guard role == "user" else { return nil }
-        let metadata = metadata ?? persistedHistoryMetadata(row: row)
+        let metadata = metadata ?? JSONValue.objectOrEmpty(row["metadata"])
         let origin = (metadata["origin"]?.objectValue ?? [:])
         let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
         let route = (persistedHistoryRoute(row: row, metadata: metadata) ?? "").lowercased()

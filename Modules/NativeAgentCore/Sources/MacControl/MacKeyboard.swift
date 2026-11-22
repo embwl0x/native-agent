@@ -2,21 +2,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(Carbon) && os(macOS)
 import Carbon
-#endif
 
 // Blueprint: | `MacKeyboard.swift` | `MacKeyModifiers`, `MacKeyChord`, `MacKeySyntax`, `MacKeyEvent`, `MacSecureEventInput`: Layout and secure-input rules |
 
@@ -136,7 +125,6 @@ public enum MacKeySyntax {
 
     /// Resolve a glyph in one stroke; dead-key sequences are not key chords.
     private static func characterKey(_ glyph: String, command: Bool) -> (UInt16, MacKeyModifiers)? {
-        #if canImport(Carbon) && os(macOS)
         // The input-source manager requires the main queue; copy layout bytes there before translating off-queue.
         let read = { () -> (Data, UInt8)? in
             guard let retained = TISCopyCurrentKeyboardLayoutInputSource() else { return nil }
@@ -164,9 +152,6 @@ public enum MacKeySyntax {
             }
             return nil
         }
-        #else
-        return nil
-        #endif
     }
 
     static func modifier(_ token: String) -> MacKeyModifiers? {
@@ -300,10 +285,6 @@ public struct MacKeyEvent: Sendable, Equatable {
 /// Carbon’s secure-input probe is global and cannot identify the process that enabled it.
 public enum MacSecureEventInput {
     public static func isEnabled() -> Bool {
-        #if canImport(Carbon) && os(macOS)
         return IsSecureEventInputEnabled()
-        #else
-        return false
-        #endif
     }
 }

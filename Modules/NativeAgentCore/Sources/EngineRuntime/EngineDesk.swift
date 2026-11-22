@@ -59,7 +59,6 @@ public final class DeskFacade {
         didSet { if faceItem != oldValue { faceDidChange?() } }
     }
     @ObservationIgnored var faceDidChange: (@MainActor () -> Void)?
-    @ObservationIgnored public var faceRequest: (@MainActor (DeskFaceRequest) throws -> String)?
     private var availableOverview: WorkOverview? {
         guard let overview = page.overview, overview.unavailable.isEmpty else { return nil }
         return overview
@@ -434,12 +433,7 @@ public extension DeskQuickAction {
         switch self {
         case .close, .closeIfCurrent: return "Closing"
         case .setStatus: return "Updating status"
-        case let .defer_(_, until): return until == nil ? "Clearing the park" : "Deferring"
         case .note: return "Adding note"
-        case let .nagGlobal(on): return on ? "Turning nagging on" : "Turning nagging off"
-        case .nagProject, .nagItem: return "Updating nag scope"
-        case .nagMute: return "Muting nags"
-        case .nagUnmute: return "Turning nagging back on"
         }
     }
 }

@@ -331,14 +331,6 @@ public actor PartFaces {
         publication.yield(.snapshot(id, snapshot))
     }
 
-    /// The stem's own page publishes the face it read at record position `epoch` through the same gate as a part's projection: an older read
-    /// never replaces a newer one, and a failed read keeps its error beside the last face rather than inventing one.
-    @discardableResult
-    public func publish(page id: String, epoch: UInt64, owed: Bool = false,
-                        read: @escaping @Sendable () async throws -> PartFace) async -> PartFaceSnapshot {
-        await readNative(page: id, at: epoch, owed: owed) { (try await read(), epoch) }
-    }
-
     /// A lever page (the stem's) registers once how it reads itself; every door then refreshes it through `refresh(page:)`.
     public func register(page id: String, read: @escaping Read) {
         natives[id] = read
@@ -627,7 +619,9 @@ public actor PartFaces {
         return try PartFace.Keys(packet: source.input).rows[item]?.read != nil
     }
 
-    /// The row or section a page shows under these words: its id, else its title as the page draws it, with where the row opens.
+    /// The row or section a page shows under these words: an id (a row's, then a section's) before any title, then a title as the page
+    /// draws it (a row's, then a section's), with where the row opens. A title never outranks an id: a section's own pointer
+    /// (`item: "security"`) must not land on a row that is merely titled Security.
     public func shownItem(page id: String, named words: String) -> (id: String, open: String?)? {
         let snapshot = currentSnapshot(id)
         let sections = (snapshot?.drawnFace?.sections ?? []) + (snapshot?.levers ?? [])
@@ -636,8 +630,10 @@ public actor PartFaces {
             shown.map { $0.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased() }
                 == words.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
         }
-        if let row = rows.first(where: { same($0.id) }) ?? rows.first(where: { same($0.title) }) { return (row.id, row.open) }
-        guard let section = sections.first(where: { same($0.id) }) ?? sections.first(where: { same($0.title) }) else { return nil }
+        if let row = rows.first(where: { same($0.id) }) { return (row.id, row.open) }
+        if let section = sections.first(where: { same($0.id) }) { return (section.id, nil) }
+        if let row = rows.first(where: { same($0.title) }) { return (row.id, row.open) }
+        guard let section = sections.first(where: { same($0.title) }) else { return nil }
         return (section.id, nil)
     }
 

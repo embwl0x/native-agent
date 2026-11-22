@@ -206,10 +206,7 @@ extension MacFourVerbs {
 
     // MARK: - Words
 
-    enum ScrollDirection: String {
-        case up, down, left, right
-        var isHorizontal: Bool { self == .left || self == .right }
-    }
+    typealias ScrollDirection = MacActScrollDirection
 
     static func parseVerb(_ raw: String) -> (String, ScrollDirection) {
         let words = normalize(raw).split(separator: " ").map(String.init)

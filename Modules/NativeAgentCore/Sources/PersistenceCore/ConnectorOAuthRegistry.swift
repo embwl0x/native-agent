@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `ConnectorOAuthRegistry.swift` | `writeRegistry`, `connectionDecision`; Only owner acts record consent. |
 
 public enum ConnectorOAuthRegistry {
@@ -20,12 +21,12 @@ public enum ConnectorOAuthRegistry {
             guard case .object(var row) = value else {
                 throw PersistenceCoreError.ioFailure("Connector registry contains a non-object entry")
             }
-            guard let rawID = connectorString(row["id"]), !normalizedConnectorID(rawID).isEmpty,
+            guard let rawID = row["id"]?.stringValue, !normalizedConnectorID(rawID).isEmpty,
                   ids.insert(normalizedConnectorID(rawID)).inserted else {
                 throw PersistenceCoreError.ioFailure("Connector registry has a missing, conflicting or duplicate id")
             }
             if row[decisionField] == nil { row[decisionField] = ConnectionDecision.undecided.value }
-            guard let decision = connectorString(row[decisionField]), ConnectionDecision(rawValue: decision) != nil else {
+            guard let decision = row[decisionField]?.stringValue, ConnectionDecision(rawValue: decision) != nil else {
                 throw PersistenceCoreError.ioFailure("Connector registry connectionDecision must be undecided, connected or disconnected")
             }
             for field in ["enabled", "registered", "connected", "client_id_present"] {
@@ -72,17 +73,11 @@ public enum ConnectorOAuthRegistry {
     }
 
     public static func connectorRow(_ row: [String: JSONValue], matches providerID: String) -> Bool {
-        guard let id = connectorString(row["id"]) else { return false }
+        guard let id = row["id"]?.stringValue else { return false }
         return normalizedConnectorID(id) == providerID
     }
 
     public static func normalizedConnectorID(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    public static func connectorString(_ value: JSONValue?) -> String? {
-        guard let value else { return nil }
-        if case .string(let string) = value { return string }
-        return nil
+        TextNormalization.trimmedLowercased(raw)
     }
 }

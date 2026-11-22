@@ -2,7 +2,6 @@ import NativeAgentCore
 import CognitiveSubstrate
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import MemoryV2
 import ProviderRouting
 import TurnTrace
@@ -153,6 +152,76 @@ public struct MindMemoryJudgment: MemoryManaging {
             let limit = MemoryRecallScoring.relevanceCandidateLimit(topK: requested, count: candidates.count)
             return Array(candidates.prefix(limit))
         } ?? candidates
+        let route: RecallRoute
+        switch await recallJudgmentRoute() {
+        case .failure(let failure): return .failure(failure)
+        case .success(let selected): route = selected
+        }
+        let surface = route.surface
+        let payloadByteCap = route.payloadByteCap
+        let routeFinished = ProcessInfo.processInfo.systemUptime
+        guard payloadByteCap > 0 else { return .failure(Self.recallJudgmentFailure(.contextTooLong, route: route)) }
+        guard let encodedQuery = try? JSONSerialization.data(withJSONObject: query, options: [.fragmentsAllowed]) else {
+            return .failure(Self.recallJudgmentFailure(.invalidJSON, route: route))
+        }
+        let queryJSON = String(decoding: encodedQuery, as: UTF8.self)
+        let envelopeBytes = "{\"memories\":[],\"query\":\(queryJSON)}".utf8.count
+        let progress = RecallJudgmentProgress()
+        let scope = generation.map { RecallCacheScope(generation: $0, route: route) }
+        let result = await collectRecallJudgments(query: query, queryJSON: queryJSON, candidates: candidates, topK: topK,
+            envelopeBytes: envelopeBytes, route: route, scope: scope, turn: turn, progress: progress)
+        reportRecallJudgment(progress.metrics, started: started, routeFinished: routeFinished, surface: surface, payloadByteCap: payloadByteCap)
+        switch result {
+        case .failure(let failure): return .failure(failure)
+        case .success(let completed):
+            guard !Task.isCancelled else { return .failure(Self.recallJudgmentFailure(.cancelled, route: route)) }
+            if let scope { await relevanceCache.store(scope: scope, judgments: completed) }
+            return .success(Set(completed.filter(\.value).compactMap { progress.recordIDs[$0.key] }))
+        }
+    }
+
+    private struct RecallJudgmentMetrics {
+        var preparedPages = 0
+        var cachedPages = 0
+        var pagingMilliseconds = 0.0
+        var cacheMilliseconds = 0.0
+        var batchingMilliseconds = 0.0
+        var providerBatches = 0
+        var providerStarted: Double?
+        var providerFinished: Double?
+        var providerTotalMilliseconds = 0.0
+        var judgedPages = 0
+    }
+
+    private final class RecallJudgmentProgress {
+        var metrics = RecallJudgmentMetrics()
+        var recordIDs: [String: String] = [:]
+        // Only a completely judged ranking prefix can settle the result. A
+        // lower-ranked hit cannot hide unresolved evidence in a higher row.
+        var rankingCursor = 0, admittedPrefixCount = 0
+        var next = 0
+        var pageStart: String.UnicodeScalarView.Index?
+        var pendingPage: RecallPage?
+        var inFlight: Set<String> = []
+        var admitted: Set<String> = []
+        var resolved: Set<String> = []
+        var exhausted: Set<String> = []
+        var uncheckedCounts: [String: Int] = [:]
+        var completed: [String: Bool] = [:]
+
+        func enough(topK: Int?, candidates: [MemoryManagerExistingMemory]) -> Bool {
+            guard let topK, topK > 0 else { return false }
+            while rankingCursor < candidates.count, admittedPrefixCount < topK {
+                let id = candidates[rankingCursor].id
+                guard admitted.contains(id) || resolved.contains(id) else { return false }
+                if admitted.contains(id) { admittedPrefixCount += 1 }
+                rankingCursor += 1
+            }
+            return admittedPrefixCount >= topK
+        }
+    }
+
+    private func recallJudgmentRoute() async -> Result<RecallRoute, AfterTurnMemoryFailure> {
         let router = SwiftNativeProviderRouting()
         let snapshot: ProviderRoutingSnapshot
         do { snapshot = try await router.checkedRoutingSnapshot() }
@@ -183,156 +252,46 @@ public struct MindMemoryJudgment: MemoryManaging {
         let payloadByteCap = contextLength / 2 - Self.relevanceEnvelopeByteReserve
         let route = RecallRoute(snapshot: snapshot, surface: surface,
             admission: admission, payloadByteCap: payloadByteCap)
-        let routeFinished = ProcessInfo.processInfo.systemUptime
-        func failure(_ reason: AfterTurnMemoryFailure.Reason) -> AfterTurnMemoryFailure {
-            .init(reason: reason, recovery: reason == .invalidJSON ? Self.recallEncodingRecovery : Self.judgmentRecovery(reason, surface: surface),
-                  model: route.model, surface: surface)
-        }
-        guard payloadByteCap > 0 else { return .failure(failure(.contextTooLong)) }
-        guard let encodedQuery = try? JSONSerialization.data(withJSONObject: query, options: [.fragmentsAllowed]) else {
-            return .failure(failure(.invalidJSON))
-        }
-        let queryJSON = String(decoding: encodedQuery, as: UTF8.self)
-        let envelopeBytes = "{\"memories\":[],\"query\":\(queryJSON)}".utf8.count
-        var recordIDs: [String: String] = [:]
-        let scope = generation.map { RecallCacheScope(generation: $0, route: route) }
-        var preparedPages = 0
-        var cachedPages = 0
-        var pagingMilliseconds = 0.0
-        var cacheMilliseconds = 0.0
-        var batchingMilliseconds = 0.0
-        var providerBatches = 0
-        var providerStarted: Double?
-        var providerFinished: Double?
-        var providerTotalMilliseconds = 0.0
-        var judgedPages = 0
-        // Only a completely judged ranking prefix can settle the result. A
-        // lower-ranked hit cannot hide unresolved evidence in a higher row.
-        var rankingCursor = 0, admittedPrefixCount = 0
-        func enough(_ resolved: Set<String>, _ admitted: Set<String>) -> Bool {
-            guard let topK, topK > 0 else { return false }
-            while rankingCursor < candidates.count, admittedPrefixCount < topK {
-                let id = candidates[rankingCursor].id
-                guard admitted.contains(id) || resolved.contains(id) else { return false }
-                if admitted.contains(id) { admittedPrefixCount += 1 }
-                rankingCursor += 1
-            }
-            return admittedPrefixCount >= topK
-        }
+        return .success(route)
+    }
+
+    private static func recallJudgmentFailure(_ reason: AfterTurnMemoryFailure.Reason, route: RecallRoute) -> AfterTurnMemoryFailure {
+        let surface = route.surface
+        return .init(reason: reason, recovery: reason == .invalidJSON ? Self.recallEncodingRecovery : Self.judgmentRecovery(reason, surface: surface),
+              model: route.model, surface: surface)
+    }
+
+    private func collectRecallJudgments(query: String, queryJSON: String, candidates: [MemoryManagerExistingMemory], topK: Int?,
+                                        envelopeBytes: Int, route: RecallRoute, scope: RecallCacheScope?, turn: Turn?,
+                                        progress: RecallJudgmentProgress) async -> Result<[String: Bool], AfterTurnMemoryFailure> {
         // Parallelize independent records; wait for a record's judgment before
         // dispatching more of its pages, and stop once it is admitted.
-        let result: Result<[String: Bool], AfterTurnMemoryFailure> = await withTaskGroup(
+        return await withTaskGroup(
             of: ([RecallPage], Result<Set<String>, AfterTurnMemoryFailure>, Double).self
         ) { group in
-            var next = 0
-            var pageStart: String.UnicodeScalarView.Index?
-            var pendingPage: RecallPage?
             var running = 0
-            var inFlight: Set<String> = []
-            var admitted: Set<String> = []
-            var resolved: Set<String> = []
-            var exhausted: Set<String> = []
-            var uncheckedCounts: [String: Int] = [:]
-            var completed: [String: Bool] = [:]
             // Bound speculative work even for a very large context window.
             let pageLimit = max(1, min(topK ?? candidates.count, candidates.count)) * 8
             while true {
-                guard !Task.isCancelled else { group.cancelAll(); return .failure(failure(.cancelled)) }
-                while running < 2, !enough(resolved, admitted) {
-                    var batch: [RecallPage] = []
-                    var batchBytes = envelopeBytes
-                    while batch.count < pageLimit, !enough(resolved, admitted) {
-                        if let page = pendingPage {
-                            if admitted.contains(page.id) {
-                                uncheckedCounts[page.id, default: 0] -= 1
-                                pendingPage = nil
-                                continue
-                            }
-                            guard !inFlight.contains(page.id) else { break }
-                            let packingStarted = ProcessInfo.processInfo.systemUptime
-                            let rowBytes = page.encodedRow.utf8.count + String(batch.count).utf8.count - 1 + (batch.isEmpty ? 0 : 1)
-                            batchingMilliseconds += (ProcessInfo.processInfo.systemUptime - packingStarted) * 1_000
-                            if batchBytes + rowBytes > payloadByteCap { break }
-                            batchBytes += rowBytes
-                            batch.append(page)
-                            pendingPage = nil
-                            continue
-                        }
-                        guard next < candidates.count else { break }
-                        let candidate = candidates[next]
-                        if admitted.contains(candidate.id) || resolved.contains(candidate.id) {
-                            next += 1
-                            pageStart = nil
-                            continue
-                        }
-                        guard !inFlight.contains(candidate.id) else { break }
-                        let pagingStarted = ProcessInfo.processInfo.systemUptime
-                        let scalars = candidate.content.unicodeScalars
-                        let start = pageStart ?? scalars.startIndex
-                        var length = scalars.distance(from: start,
-                            to: scalars.index(start, offsetBy: memoryRecallContentCap, limitedBy: scalars.endIndex) ?? scalars.endIndex)
-                        var end = scalars.index(start, offsetBy: length)
-                        var content = String(scalars[start..<end])
-                        var encodedRow = Data()
-                        // A single page must fit too, including escaped JSON and
-                        // the query. Shrink pages without dropping any evidence.
-                        while true {
-                            guard let data = try? JSONSerialization.data(withJSONObject:
-                                ["id": "0", "memory_id": candidate.id, "content": content], options: [.sortedKeys]) else {
-                                group.cancelAll(); return .failure(failure(.invalidJSON))
-                            }
-                            encodedRow = data
-                            if envelopeBytes + data.count <= payloadByteCap { break }
-                            guard length > 1 else {
-                                group.cancelAll(); return .failure(failure(.contextTooLong))
-                            }
-                            length /= 2
-                            end = scalars.index(start, offsetBy: length)
-                            content = String(scalars[start..<end])
-                        }
-                        let identity = ["query": query, "id": candidate.id, "content": content, "kind": candidate.kind ?? ""]
-                        guard let data = try? JSONSerialization.data(withJSONObject: identity, options: [.sortedKeys]) else {
-                            group.cancelAll(); return .failure(failure(.invalidJSON))
-                        }
-                        let key = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-                        let page = RecallPage(key: key, id: candidate.id, encodedRow: String(decoding: encodedRow, as: UTF8.self))
-                        recordIDs[key] = candidate.id
-                        preparedPages += 1
-                        if end == scalars.endIndex {
-                            exhausted.insert(candidate.id)
-                            next += 1
-                            pageStart = nil
-                        } else {
-                            pageStart = scalars.index(end, offsetBy: -min(200, length / 2))
-                        }
-                        pagingMilliseconds += (ProcessInfo.processInfo.systemUptime - pagingStarted) * 1_000
-                        let cacheStarted = ProcessInfo.processInfo.systemUptime
-                        let cached = if let scope { await relevanceCache.read(scope: scope, keys: [key])[key] } else { nil as Bool? }
-                        cacheMilliseconds += (ProcessInfo.processInfo.systemUptime - cacheStarted) * 1_000
-                        if let cached {
-                            cachedPages += 1
-                            completed[key] = cached
-                            if cached { admitted.insert(candidate.id) }
-                            if exhausted.contains(candidate.id), uncheckedCounts[candidate.id, default: 0] == 0 {
-                                resolved.insert(candidate.id)
-                            }
-                        } else {
-                            uncheckedCounts[candidate.id, default: 0] += 1
-                            pendingPage = page
-                        }
-                        guard !Task.isCancelled else { break }
+                guard !Task.isCancelled else { group.cancelAll(); return .failure(Self.recallJudgmentFailure(.cancelled, route: route)) }
+                while running < 2, !progress.enough(topK: topK, candidates: candidates) {
+                    var batch: [RecallPage]
+                    switch await prepareRecallBatch(query: query, candidates: candidates, topK: topK, envelopeBytes: envelopeBytes,
+                        pageLimit: pageLimit, route: route, scope: scope, progress: progress) {
+                    case .failed(let reason): group.cancelAll(); return .failure(Self.recallJudgmentFailure(reason, route: route))
+                    case .ready(let prepared): batch = prepared
                     }
-                    if enough(resolved, admitted) { break }
-                    for page in batch where admitted.contains(page.id) {
-                        uncheckedCounts[page.id, default: 0] -= 1
+                    if progress.enough(topK: topK, candidates: candidates) { break }
+                    for page in batch where progress.admitted.contains(page.id) {
+                        progress.uncheckedCounts[page.id, default: 0] -= 1
                     }
-                    batch.removeAll { admitted.contains($0.id) }
+                    batch.removeAll { progress.admitted.contains($0.id) }
                     if batch.isEmpty { break }
                     let ids = Set(batch.map(\.id))
-                    inFlight.formUnion(ids)
+                    progress.inFlight.formUnion(ids)
                     running += 1
-                    providerBatches += 1
-                    if providerStarted == nil { providerStarted = ProcessInfo.processInfo.systemUptime }
+                    progress.metrics.providerBatches += 1
+                    if progress.metrics.providerStarted == nil { progress.metrics.providerStarted = ProcessInfo.processInfo.systemUptime }
                     let rows = batch.enumerated().map { index, page in
                         page.encodedRow.replacingOccurrences(of: #""id":"0""#, with: "\"id\":\"\(index)\"")
                     }.joined(separator: ",")
@@ -345,40 +304,139 @@ public struct MindMemoryJudgment: MemoryManaging {
                     }
                 }
                 guard let (batch, result, duration) = await group.next() else { break }
-                providerFinished = ProcessInfo.processInfo.systemUptime
-                providerTotalMilliseconds += duration
-                judgedPages += batch.count
+                progress.metrics.providerFinished = ProcessInfo.processInfo.systemUptime
+                progress.metrics.providerTotalMilliseconds += duration
+                progress.metrics.judgedPages += batch.count
                 nativeLog("Memory recall batch: duration_ms=\(Int(duration)) pages=\(batch.count)")
                 running -= 1
-                inFlight.subtract(batch.map(\.id))
+                progress.inFlight.subtract(batch.map(\.id))
                 switch result {
                 case .success(let keys):
                     for page in batch {
-                        completed[page.key] = keys.contains(page.key)
-                        if keys.contains(page.key) { admitted.insert(page.id) }
-                        uncheckedCounts[page.id, default: 0] -= 1
-                        if exhausted.contains(page.id), uncheckedCounts[page.id, default: 0] == 0 {
-                            resolved.insert(page.id)
+                        progress.completed[page.key] = keys.contains(page.key)
+                        if keys.contains(page.key) { progress.admitted.insert(page.id) }
+                        progress.uncheckedCounts[page.id, default: 0] -= 1
+                        if progress.exhausted.contains(page.id), progress.uncheckedCounts[page.id, default: 0] == 0 {
+                            progress.resolved.insert(page.id)
                         }
                     }
                 case .failure(let failure): group.cancelAll(); return .failure(failure)
                 }
             }
-            return .success(completed)
+            return .success(progress.completed)
         }
+    }
+
+    private enum RecallBatchPreparation {
+        case ready([RecallPage])
+        case failed(AfterTurnMemoryFailure.Reason)
+    }
+
+    private func prepareRecallBatch(query: String, candidates: [MemoryManagerExistingMemory], topK: Int?, envelopeBytes: Int,
+                                    pageLimit: Int, route: RecallRoute, scope: RecallCacheScope?, progress: RecallJudgmentProgress) async
+        -> RecallBatchPreparation {
+        let payloadByteCap = route.payloadByteCap
+        var batch: [RecallPage] = []
+        var batchBytes = envelopeBytes
+        while batch.count < pageLimit, !progress.enough(topK: topK, candidates: candidates) {
+            if let page = progress.pendingPage {
+                if progress.admitted.contains(page.id) {
+                    progress.uncheckedCounts[page.id, default: 0] -= 1
+                    progress.pendingPage = nil
+                    continue
+                }
+                guard !progress.inFlight.contains(page.id) else { break }
+                let packingStarted = ProcessInfo.processInfo.systemUptime
+                let rowBytes = page.encodedRow.utf8.count + String(batch.count).utf8.count - 1 + (batch.isEmpty ? 0 : 1)
+                progress.metrics.batchingMilliseconds += (ProcessInfo.processInfo.systemUptime - packingStarted) * 1_000
+                if batchBytes + rowBytes > payloadByteCap { break }
+                batchBytes += rowBytes
+                batch.append(page)
+                progress.pendingPage = nil
+                continue
+            }
+            guard progress.next < candidates.count else { break }
+            let candidate = candidates[progress.next]
+            if progress.admitted.contains(candidate.id) || progress.resolved.contains(candidate.id) {
+                progress.next += 1
+                progress.pageStart = nil
+                continue
+            }
+            guard !progress.inFlight.contains(candidate.id) else { break }
+            let pagingStarted = ProcessInfo.processInfo.systemUptime
+            let scalars = candidate.content.unicodeScalars
+            let start = progress.pageStart ?? scalars.startIndex
+            var length = scalars.distance(from: start,
+                to: scalars.index(start, offsetBy: memoryRecallContentCap, limitedBy: scalars.endIndex) ?? scalars.endIndex)
+            var end = scalars.index(start, offsetBy: length)
+            var content = String(scalars[start..<end])
+            var encodedRow = Data()
+            // A single page must fit too, including escaped JSON and
+            // the query. Shrink pages without dropping any evidence.
+            while true {
+                guard let data = try? JSONSerialization.data(withJSONObject:
+                    ["id": "0", "memory_id": candidate.id, "content": content], options: [.sortedKeys]) else {
+                    return .failed(.invalidJSON)
+                }
+                encodedRow = data
+                if envelopeBytes + data.count <= payloadByteCap { break }
+                guard length > 1 else {
+                    return .failed(.contextTooLong)
+                }
+                length /= 2
+                end = scalars.index(start, offsetBy: length)
+                content = String(scalars[start..<end])
+            }
+            let identity = ["query": query, "id": candidate.id, "content": content, "kind": candidate.kind ?? ""]
+            guard let data = try? JSONSerialization.data(withJSONObject: identity, options: [.sortedKeys]) else {
+                return .failed(.invalidJSON)
+            }
+            let key = SHA256Hex.of(data)
+            let page = RecallPage(key: key, id: candidate.id, encodedRow: String(decoding: encodedRow, as: UTF8.self))
+            progress.recordIDs[key] = candidate.id
+            progress.metrics.preparedPages += 1
+            if end == scalars.endIndex {
+                progress.exhausted.insert(candidate.id)
+                progress.next += 1
+                progress.pageStart = nil
+            } else {
+                progress.pageStart = scalars.index(end, offsetBy: -min(200, length / 2))
+            }
+            progress.metrics.pagingMilliseconds += (ProcessInfo.processInfo.systemUptime - pagingStarted) * 1_000
+            let cacheStarted = ProcessInfo.processInfo.systemUptime
+            let cached = if let scope { await relevanceCache.read(scope: scope, keys: [key])[key] } else { nil as Bool? }
+            progress.metrics.cacheMilliseconds += (ProcessInfo.processInfo.systemUptime - cacheStarted) * 1_000
+            if let cached {
+                progress.metrics.cachedPages += 1
+                progress.completed[key] = cached
+                if cached { progress.admitted.insert(candidate.id) }
+                if progress.exhausted.contains(candidate.id), progress.uncheckedCounts[candidate.id, default: 0] == 0 {
+                    progress.resolved.insert(candidate.id)
+                }
+            } else {
+                progress.uncheckedCounts[candidate.id, default: 0] += 1
+                progress.pendingPage = page
+            }
+            guard !Task.isCancelled else { break }
+        }
+        return .ready(batch)
+    }
+
+    private func reportRecallJudgment(_ metrics: RecallJudgmentMetrics, started: Double, routeFinished: Double,
+                                      surface: String, payloadByteCap: Int) {
         let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1_000
         let timings: [String: JSONValue] = [
-            "duration_ms": .double(elapsed), "pages": .int(Int64(preparedPages)),
-            "cached_pages": .int(Int64(cachedPages)), "provider_batches": .int(Int64(providerBatches)),
+            "duration_ms": .double(elapsed), "pages": .int(Int64(metrics.preparedPages)),
+            "cached_pages": .int(Int64(metrics.cachedPages)), "provider_batches": .int(Int64(metrics.providerBatches)),
             "route_ms": .double((routeFinished - started) * 1_000),
-            "paging_ms": .double(pagingMilliseconds),
-            "cache_ms": .double(cacheMilliseconds),
-            "batching_ms": .double(batchingMilliseconds),
-            "provider_wall_ms": .double(providerStarted.flatMap { start in
-                providerFinished.map { ($0 - start) * 1_000 }
+            "paging_ms": .double(metrics.pagingMilliseconds),
+            "cache_ms": .double(metrics.cacheMilliseconds),
+            "batching_ms": .double(metrics.batchingMilliseconds),
+            "provider_wall_ms": .double(metrics.providerStarted.flatMap { start in
+                metrics.providerFinished.map { ($0 - start) * 1_000 }
             } ?? 0),
             "payload_byte_cap": .int(Int64(payloadByteCap)),
-            "provider_total_ms": .double(providerTotalMilliseconds), "judged_pages": .int(Int64(judgedPages)),
+            "provider_total_ms": .double(metrics.providerTotalMilliseconds), "judged_pages": .int(Int64(metrics.judgedPages)),
         ]
         TurnTraceBus.fireFromContext(kind: "memory.recall.relevance", surface: surface, payload: .object(timings), turn: nil)
         let detail = timings.sorted { $0.key < $1.key }.map { key, value in
@@ -389,13 +447,6 @@ public struct MindMemoryJudgment: MemoryManaging {
             }
         }.joined(separator: " ")
         nativeLog("Memory recall relevance: \(detail)")
-        switch result {
-        case .failure(let failure): return .failure(failure)
-        case .success(let completed):
-            guard !Task.isCancelled else { return .failure(failure(.cancelled)) }
-            if let scope { await relevanceCache.store(scope: scope, judgments: completed) }
-            return .success(Set(completed.filter(\.value).compactMap { recordIDs[$0.key] }))
-        }
     }
 
     // Preserve the 819-byte instruction and 128-byte framing allowances independently of prompt wording.

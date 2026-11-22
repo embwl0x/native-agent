@@ -1,7 +1,6 @@
 import Foundation
 import UIKit
 import NativeAgentShared
-import CryptoKit
 import SwiftUI
 // Blueprint: | `iCloudBridge+CloudKit.swift` | Pairing-bound reads while the phone is open, presence beat and lifecycle-fenced recovery |
 
@@ -226,7 +225,7 @@ extension iCloudBridge {
                       UIApplication.shared.applicationState == .active || TalkModeController.shared.isActive {
                     let accountGeneration = self.accountFailureGeneration
                     let pairing = self.pairingStore?.iCloudPairingSecret
-                    let result = await transport.drainIncoming(queueIfBusy: false)
+                    let result = await transport.drainBell(queueIfBusy: false)
                     guard !Task.isCancelled, self.setupGeneration == generation else { return }
                     _ = await self.saveSeenMacRecords()
                     guard pairing == self.pairingStore?.iCloudPairingSecret else { continue }

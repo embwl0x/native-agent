@@ -93,6 +93,37 @@ extension SwiftToolDispatcher {
     }
 
     func impl_recent_trace_summary(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
+        let call = TraceSummaryCall(turn: turn, invocation: invocation, input: input)
+        if let answer = try await traceSummaryFilters(call) { return answer }
+        let snapshot: TurnTraceRecentReader.Snapshot
+        do {
+            snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(now: call.anchorDate ?? call.now,
+                history: call.receiptID != nil || call.completedTurns != nil || call.turnID?.isEmpty == false,
+                since: call.since ?? (call.receiptID != nil ? Date.distantPast : nil),
+                holding: call.receiptID != nil ? ["tool.dispatch"] : [],
+                kinds: call.receiptID != nil ? ["tool.dispatch"] : nil,
+                kindContains: call.receiptID == nil && call.completedTurns == nil && call.normalizedSessionFilter == nil
+                    && call.turnID?.isEmpty != false
+                    ? call.kindFilter : nil,
+                receipt: call.receiptID)
+        } catch {
+            return .object([
+                "status": .string("failed"),
+                "error": .string(String(describing: error)),
+                "count": .int(0),
+                "traces": .array([]),
+                "source": .string("detail"),
+            ])
+        }
+        try traceSummaryRank(call, snapshot: snapshot)
+        try traceSummaryPage(call)
+        return try traceSummaryResponse(call, snapshot: snapshot)
+    }
+
+    /// The read's filters, each refused when malformed; model calls and usage are answered here, and a kind that names an action answers
+    /// with the call that selects it.
+    private func traceSummaryFilters(_ call: TraceSummaryCall) async throws -> JSONValue? {
+        let turn = call.turn, input = call.input
         try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["recent_trace_summary"]).turnSchemas()
             .compactMap { $0 }.first)
         if input["view"]?.stringValue == "model_calls" {
@@ -177,27 +208,17 @@ extension SwiftToolDispatcher {
             }
             anchorDate = min(date, now)
         }
-        // Shared across all returned events, in serialized UTF-8 bytes.
-        var remainingPayloadBytes = 8 * 1024
+        call.now = now; call.limit = limit; call.offset = offset; call.effectsOnly = effectsOnly; call.receiptID = receiptID
+        call.receiptView = receiptView; call.since = since; call.completedTurns = completedTurns; call.kindFilter = kindFilter
+        call.nameFilter = nameFilter; call.statusFilter = statusFilter; call.normalizedSessionFilter = normalizedSessionFilter
+        call.turnID = turnID; call.fields = fields; call.anchorDate = anchorDate
+        return nil
+    }
 
-        let snapshot: TurnTraceRecentReader.Snapshot
-        do {
-            snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(now: anchorDate ?? now,
-                history: receiptID != nil || completedTurns != nil || turnID?.isEmpty == false,
-                since: since ?? (receiptID != nil ? Date.distantPast : nil),
-                holding: receiptID != nil ? ["tool.dispatch"] : [],
-                kindContains: receiptID == nil && completedTurns == nil && normalizedSessionFilter == nil && turnID?.isEmpty != false
-                    ? kindFilter : nil)
-        } catch {
-            return .object([
-                "status": .string("failed"),
-                "error": .string(String(describing: error)),
-                "count": .int(0),
-                "traces": .array([]),
-                "source": .string("detail"),
-            ])
-        }
-
+    /// The retained events in time order up to the anchor, the completed turns asked for, and receipts ranked non-read first.
+    private func traceSummaryRank(_ call: TraceSummaryCall, snapshot: TurnTraceRecentReader.Snapshot) throws {
+        let turn = call.turn, normalizedSessionFilter = call.normalizedSessionFilter, anchorDate = call.anchorDate
+        let completedTurns = call.completedTurns, turnID = call.turnID, receiptView = call.receiptView
         let sessionTurnIDs: Set<String>
         if let normalizedSessionFilter {
             sessionTurnIDs = Set(snapshot.events.compactMap { event in
@@ -242,6 +263,17 @@ extension SwiftToolDispatcher {
         let classified = try events.map { (event: $0, nonRead: try receiptView && nonReadReceipt($0)) }
         let ranked = receiptView ? classified.filter(\.nonRead) + classified.filter { !$0.nonRead } : classified
         events = ranked.map(\.event)
+        call.sessionTurnIDs = sessionTurnIDs; call.events = events; call.completedIDs = completedIDs; call.anchor = anchor; call.ranked = ranked
+    }
+
+    /// One page of matching events as bounded summaries; selected payload fields share one byte budget across the page.
+    private func traceSummaryPage(_ call: TraceSummaryCall) throws {
+        let ranked = call.ranked, since = call.since, completedTurns = call.completedTurns, completedIDs = call.completedIDs
+        let turnID = call.turnID, normalizedSessionFilter = call.normalizedSessionFilter, sessionTurnIDs = call.sessionTurnIDs
+        let receiptID = call.receiptID, kindFilter = call.kindFilter, statusFilter = call.statusFilter, nameFilter = call.nameFilter
+        let receiptView = call.receiptView, effectsOnly = call.effectsOnly, offset = call.offset, fields = call.fields, limit = call.limit
+        // Shared across all returned events, in serialized UTF-8 bytes.
+        var remainingPayloadBytes = 8 * 1024
         var summaries: [JSONValue] = []
         var matched = 0, summaryBytes = 0, hasMore = false
         for (event, nonRead) in ranked {
@@ -349,7 +381,16 @@ extension SwiftToolDispatcher {
             summaryBytes += byteCount
             summaries.append(.object(summary))
         }
+        call.summaries = summaries; call.hasMore = hasMore
+    }
 
+    /// The page with its read references, the app's lives, coverage and the next call, bounded to the response budget.
+    private func traceSummaryResponse(_ call: TraceSummaryCall, snapshot: TurnTraceRecentReader.Snapshot) throws -> JSONValue {
+        let input = call.input, turn = call.turn, invocation = call.invocation, offset = call.offset, events = call.events
+        let normalizedSessionFilter = call.normalizedSessionFilter, sessionTurnIDs = call.sessionTurnIDs, turnID = call.turnID
+        let anchor = call.anchor, completedIDs = call.completedIDs, completedTurns = call.completedTurns, receiptView = call.receiptView
+        let receiptID = call.receiptID, effectsOnly = call.effectsOnly, hasMore = call.hasMore
+        var summaries = call.summaries
         var next = input.filter { !$0.key.hasPrefix("__") }
         next["offset"] = .int(Int64(offset + summaries.count))
         next["before"] = anchor
@@ -450,4 +491,39 @@ extension SwiftToolDispatcher {
         return try JSONValue.parse(bounded.data)
     }
 
+}
+
+/// One trace read: its filters as parsed, the events it ranked and the page it filled.
+private final class TraceSummaryCall {
+    let turn: Turn
+    let invocation: ChatToolInvocation
+    let input: [String: JSONValue]
+    var now = Date.distantPast
+    var limit = 0
+    var offset = 0
+    var effectsOnly = false
+    var receiptID: String?
+    var receiptView = false
+    var since: Date?
+    var completedTurns: Int?
+    var kindFilter: String?
+    var nameFilter: String?
+    var statusFilter: String?
+    var normalizedSessionFilter: String?
+    var turnID: String?
+    var fields: [String] = []
+    var anchorDate: Date?
+    var sessionTurnIDs: Set<String> = []
+    var events: [TurnTraceEvent] = []
+    var completedIDs: [String] = []
+    var anchor: JSONValue = .null
+    var ranked: [(event: TurnTraceEvent, nonRead: Bool)] = []
+    var summaries: [JSONValue] = []
+    var hasMore = false
+
+    init(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) {
+        self.turn = turn
+        self.invocation = invocation
+        self.input = input
+    }
 }

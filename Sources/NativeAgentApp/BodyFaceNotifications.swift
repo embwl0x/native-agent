@@ -45,6 +45,11 @@ func handleFaceNotification(_ response: NotificationResponse, model: AppModel, t
                 expectedSelection: nil, options: .init(hideUserBubble: false, choice: nil, continuationReference: nil))))
             switch reply {
             case .accepted: return nil
+            // Admission committed: the turn started. Only publishing the conversation anchor failed, which is not a refusal, so the person
+            // is never told to send the same words again.
+            case .committed(let result):
+                if let failure = result.publicationFailure { NSLog("notification reply: sent; publication pending: %@", failure.message) }
+                return nil
             case .refused(let issue), .failed(let issue): return issue.message
             default: return "The notification reply was not accepted."
             }

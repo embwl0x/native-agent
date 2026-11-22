@@ -112,6 +112,8 @@ function face(input) {
         }).filter(span => span.rows.length);
     }
     const total = input.statusFailures.length === 0 && input.total !== null ? input.total : null;
+    // A new install holds nothing: the page line says so once, and no count or empty note repeats it.
+    const nothing = input.kept.state === "available" && input.kept.memories.length === 0 && total === 0;
 
     const sections = [];
     if (input.kept.state === "unavailable") sections.push(issue("kept", "Saved memories unavailable", input.kept.reason));
@@ -119,7 +121,7 @@ function face(input) {
         // How many I remember is the store's own count, unknown when its status could not be read; pinned and this week count the memories read here.
         const memories = input.kept.memories, pinned = memories.filter(memory => memory.pinned).length;
         const week = memories.filter(memory => memory.when === "today" || memory.when === "week").length;
-        sections.push({id: "readout", style: "list", rows: [{id: "readout", symbol: "brain.head.profile",
+        if (!nothing) sections.push({id: "readout", style: "list", rows: [{id: "readout", symbol: "brain.head.profile",
             title: total === null ? "I can't read how many things I remember" : "I remember " + total + (total === 1 ? " thing" : " things"),
             detail: pinned + " pinned · " + week + " this week"}]});
     }
@@ -149,7 +151,7 @@ function face(input) {
         for (let at = 0; at < pinned.length; at += 256) sections.push({id: at ? "pinned:" + at : "pinned",
             title: at ? "Pinned, continued" : "Pinned", style: "list", rows: pinned.slice(at, at + 256).map(memoryRow)});
         if (recent.length) sections.push({id: "recent", title: "What I've kept", style: "list", rows: spans(recent)});
-        else if (!all.length) sections.push({id: "empty", style: "note", rows: [{id: "empty", title: "It fills up as we talk."}]});
+        else if (!all.length && !nothing) sections.push({id: "empty", style: "note", rows: [{id: "empty", title: "It fills up as we talk."}]});
     }
     if (input.rejected.state === "unavailable") {
         sections.push({id: "rejected-error", style: "list", rows: [{id: "rejected-error", title: "Rejected history unavailable",
@@ -184,7 +186,8 @@ function face(input) {
         {id: "refresh", title: "Read my memories again", actions: [{id: "refresh", label: "Check again"}]}
     ]});
     let pageLine = "Saved memories could not be read.";
-    if (input.kept.state === "available") {
+    if (nothing) pageLine = "Nothing remembered yet; it fills up as we talk.";
+    else if (input.kept.state === "available") {
         pageLine = input.kept.memories.length + " memories loaded" + (total === null ? " · total unavailable" : " of " + total + " saved") + ".";
     }
     return {title: "Memories", line: pageLine, sections};

@@ -245,9 +245,7 @@ struct MacSyncErrorBanner: View {
 
 enum MacSyncErrorBannerPresentation {
     static func normalizedMessage(_ syncError: String?) -> String? {
-        guard let syncError else { return nil }
-        let message = syncError.trimmingCharacters(in: .whitespacesAndNewlines)
-        return message.isEmpty ? nil : message
+        syncError.trimmedNonEmpty
     }
 
     static func headline(_ message: String) -> (headline: String, detail: String?) {

@@ -151,19 +151,15 @@ public struct AppConnectorStatusPlatform: Sendable {
 
     private let subject: @Sendable () -> String
     let chooseSharedFolder: (@MainActor @Sendable (UUID?) async throws -> (name: String, path: String, writable: Bool)?)?
-    /// Opens the stem's secure paste for a Grok Bot contact's routine credentials (the contact's id).
-    let showGrokSecureSetup: (@MainActor @Sendable (String) async throws -> Void)?
-    /// Closes that secure paste window, if one is open, once the agent's paste has finished the contact's setup.
+    /// Closes the stem's secure paste window for a Grok Bot contact (the contact's id), if one is open, once the agent's paste has finished the contact's setup.
     let closeGrokSecureSetup: (@MainActor @Sendable (String) async throws -> Void)?
     let showProviderSetup: (@MainActor @Sendable (ProviderInfo, URL) async throws -> Void)?
     public init(subject: @escaping @Sendable () -> String,
                 chooseSharedFolder: (@MainActor @Sendable (UUID?) async throws -> (name: String, path: String, writable: Bool)?)? = nil,
-                showGrokSecureSetup: (@MainActor @Sendable (String) async throws -> Void)? = nil,
                 closeGrokSecureSetup: (@MainActor @Sendable (String) async throws -> Void)? = nil,
                 showProviderSetup: (@MainActor @Sendable (ProviderInfo, URL) async throws -> Void)? = nil) {
         self.subject = subject
         self.chooseSharedFolder = chooseSharedFolder
-        self.showGrokSecureSetup = showGrokSecureSetup
         self.closeGrokSecureSetup = closeGrokSecureSetup
         self.showProviderSetup = showProviderSetup
     }

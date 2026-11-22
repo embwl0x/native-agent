@@ -1,4 +1,5 @@
 import Cognition
+import Experiences
 import NativeAgentCore
 import Foundation
 import MacControl
@@ -19,9 +20,10 @@ public final class MacPhoneRequestChannel {
     /// A cancelled observation cannot prove CloudKit did not deliver.
     private var sendTask: Task<Void, Never>?
     private var sendFinished: ScopedWaiter?
-    var hasPendingRequest: Bool { !pending.isEmpty }
 
     init(bridge: iCloudBridge) { self.bridge = bridge }
+
+    func isWaiting(for requestID: String) -> Bool { pending[requestID] != nil }
 
     public func request(_ request: PhoneRequest, deadline: ContinuousClock.Instant?) async throws -> BridgeMessage {
         guard let bridge, bridge.usesCloudKitDeviceTransport else { throw DeviceSyncError.notConfigured }
@@ -77,6 +79,15 @@ public final class MacPhoneRequestChannel {
         let result = try JSONDecoder().decode(PhoneRequestResult.self, from: Data(message.text.utf8))
         guard result.requestID == message.correlationID else {
             throw DeviceSyncError.underlying(message: "The phone request result does not match its signed correlation ID.")
+        }
+        // The person answers at their own pace: an answer after the wait ended still reaches the agent.
+        if pending[result.requestID] == nil {
+            let values = result.values.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
+            Attention.post(Happening(.world, subject: "phone:request:" + result.requestID, door: "phone",
+                words: "The phone answered request \(result.requestID) after the wait ended: \(result.status.rawValue)"
+                    + (values.isEmpty ? "" : " (\(values))") + (result.message.map { ". \($0)" } ?? "") + ".",
+                once: "phone:request:" + result.requestID),
+                dataRoot: PersistenceCore.defaultDataRoot())
         }
         finish(result.requestID, result: .success(message))
     }

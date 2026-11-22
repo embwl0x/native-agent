@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -500,7 +501,7 @@ extension CognitiveSubstrate {
             object["remindedOfSurfaced"] = .object(capsulePresentationState.remindedOfSurfaced.mapValues { .double($0.timeIntervalSince1970) })
         }
         if let signature = capsulePresentationState.soundRutSignature {
-            object["soundRutSignature"] = .string(bounded(signature, maxCharacters: 240))
+            object["soundRutSignature"] = .string(TextClipping.prefixOrWhole(signature, maxCharacters: 240))
         }
         if let surfacedAt = capsulePresentationState.soundRutLastSurfacedAt {
             object["soundRutLastSurfacedAt"] = .double(surfacedAt.timeIntervalSince1970)
@@ -675,7 +676,7 @@ extension CognitiveSubstrate {
         let suffix = "..."
         let prefixLimit = max(0, maxCharacters - suffix.count)
         guard prefixLimit > 0 else {
-            return bounded(normalized, maxCharacters: maxCharacters)
+            return TextClipping.prefixOrWhole(normalized, maxCharacters: maxCharacters)
         }
         let prefix = String(normalized.prefix(prefixLimit))
         if let breakIndex = prefix.lastIndex(where: { $0 == " " || $0 == "," || $0 == ";" || $0 == ":" }) {

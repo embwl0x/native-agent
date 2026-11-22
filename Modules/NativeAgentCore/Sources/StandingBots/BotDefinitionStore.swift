@@ -128,20 +128,3 @@ public struct BotDefinitionStore: Sendable {
                                                        old.timeIntervalSinceReferenceDate.nextUp))
     }
 }
-
-extension BotDefinitionStore {
-    /// Accept domain values so form parsing cannot bypass the owner's validation.
-    public static func editedDefinition(_ definition: BotDefinition?, name: String, personality: String?, brief: String,
-        provider: String, model: String, think: String, modelPinned: Bool, fast: Bool,
-        budget: BotBudget, dailyTokenCeiling: Int?, cadence: BotCadence,
-        eventTrigger: BotEventTrigger?, notificationCondition: String?) -> BotDefinition {
-        var bot = definition ?? BotDefinition(name: name, brief: brief, cadence: cadence, budget: budget)
-        bot.name = name; bot.brief = brief; bot.personality = personality
-        bot.provider = provider; bot.model = model; bot.reasoningEffort = think
-        bot.modelPinned = modelPinned; bot.fast = fast
-        if !modelPinned { bot.followProviders() }
-        bot.eventTrigger = eventTrigger; bot.cadence = cadence; bot.budget = budget
-        bot.dailyTokenCeiling = dailyTokenCeiling; bot.notificationCondition = notificationCondition
-        return bot
-    }
-}

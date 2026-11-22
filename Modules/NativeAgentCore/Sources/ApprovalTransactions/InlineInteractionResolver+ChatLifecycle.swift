@@ -89,15 +89,6 @@ extension InlineInteractionResolver {
         return nil
     }
 
-    public static func beginControl(
-        _ id: String, sessionID: String, dataRoot: URL
-    ) async throws -> (interaction: InlineInteraction, descriptor: InlineInteractionDescriptor)? {
-        let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
-        let control = await descriptor(for: current, dataRoot: dataRoot)
-        let running = try await begin(id: id, sessionID: sessionID, expectedRevision: current.revision, dataRoot: dataRoot)
-        return (running, control)
-    }
-
     public static func runControl(
         _ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor,
         sessionID: String, value: String?, choice: String?, values: [String: String],
@@ -228,30 +219,6 @@ extension InlineInteractionResolver {
             }
         } catch {
             recordControlFailure(id, dataRoot: dataRoot, error: error)
-        }
-    }
-
-    public static func verifyOnReturn(_ pending: [String: (sessionID: String, revision: Int)], dataRoot: URL, refresh: @MainActor () async -> Void) async {
-        for (id, claim) in pending {
-            let sessionID = claim.sessionID
-            do {
-            guard let current = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
-                  current.state.isOpen, current.revision == claim.revision else { continue }
-            if current.kind == .connector {
-                await settleOrReopen(id, sessionID: sessionID, expectedRevision: claim.revision, dataRoot: dataRoot)
-                await refresh()
-                continue
-            }
-            let selection: String?
-            do { selection = try await selectionForReturn(current, dataRoot: dataRoot) }
-            catch {
-                _ = try await complete(id: id, sessionID: sessionID, expectedRevision: current.revision,
-                    setupError: error.localizedDescription, turn: nil, dataRoot: dataRoot)
-                continue
-            }
-            _ = try await complete(id: id, sessionID: sessionID, selection: selection,
-                scope: current.kind == .modelChoice ? .persistent : nil, expectedRevision: current.revision, turn: nil, dataRoot: dataRoot)
-            } catch { recordControlFailure(id, dataRoot: dataRoot, error: error) }
         }
     }
 
@@ -388,18 +355,6 @@ extension InlineInteractionResolver {
         }
         return try await complete(id: card.id, sessionID: sessionID, selection: picked, scope: scope,
             expectedRevision: expectedRevision, attribution: attribution, setupError: setupError, door: door, turn: nil, dataRoot: dataRoot)
-    }
-
-    public static func settleVerifiedControls(
-        _ waiting: [String: (sessionID: String, revision: Int)], dataRoot: URL, didSettle: @MainActor (String) -> Void
-    ) async -> Bool {
-        var allSettled = true
-        for (id, claim) in waiting {
-            if await completeIfVerified(id: id, sessionID: claim.sessionID, expectedRevision: claim.revision, dataRoot: dataRoot) {
-                didSettle(id)
-            } else { allSettled = false }
-        }
-        return allSettled
     }
 
     /// Complete against the session captured at the tap; a control can outlive a conversation switch, and a refusal must not disappear into UI refresh.

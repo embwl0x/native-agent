@@ -1,5 +1,5 @@
 import Foundation
-import CryptoKit
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -84,10 +84,6 @@ extension SwiftToolDispatcher {
         availableToolNames.intersection(alwaysOnCoreNames)
     }
 
-    package static func normalModelToolNames(activeTools: Set<String>) -> Set<String> {
-        alwaysOnCoreNames
-    }
-
     /// Keep the always-on floor sorted and preserve incoming order for appended tools so advertised prefixes remain stable.
     package struct ToolContractOrdering: Sendable, Equatable {
         package let floor: [String]
@@ -105,9 +101,7 @@ extension SwiftToolDispatcher {
             let text = floor.joined(separator: "\n")
                 + "\n\u{1F}\n"
                 + appended.joined(separator: "\n")
-            return SHA256.hash(data: Data(text.utf8))
-                .map { String(format: "%02x", $0) }
-                .joined()
+            return SHA256Hex.of(Data(text.utf8))
         }
     }
 

@@ -3,161 +3,44 @@ import Observation
 import SwiftUI
 import UIKit
 
-// Blueprint: | `MobileTranscriptAttachments.swift` | Phone document attachments: one hosted view per block id, fed from the model, sized to fit |
+// Blueprint: | `MobileTranscriptAttachments.swift` | The phone's hosted attachment views on the Shared hosts: message and Inbox data, box, host, model and what each attachment draws |
 
-/// One retained host per block; the controller supplies its data and attachment frame.
-@MainActor final class TranscriptAttachments {
-    /// Set by the controller. Called when a hosted view's height changes; the controller re-lays that block's paragraph.
-    var heightChanged: (_ blockID: String) -> Void = { _ in }
-
-    private var entries: [String: Entry] = [:]
+/// The phone's hosted views: each block's box reads the conversation's messages and Inbox rows by its reference, and acts through the
+/// thread's actions.
+@MainActor final class TranscriptAttachments: TranscriptAttachmentHosts<TranscriptAttachmentBox, TranscriptAttachmentRoot> {
     private var data: TranscriptAttachmentData?
     private var environment: EnvironmentValues?
     private var actions = MobileTranscriptActions()
-    private var columnWidth: CGFloat = 0
-    /// Blocks whose size must be read again; read together on the next main-actor turn, outside any layout pass.
-    private var pending: Set<String> = []
-    private var measureScheduled = false
-
-    init() {}
 
     /// The same block id returns the same attachment while the block lives.
-    func attachment(blockID: String, ref: TranscriptAttachmentRef) -> NSTextAttachment {
-        if let entry = entries[blockID] {
-            // A growing reply can change what its block shows (a table gains rows) under the same id.
-            if entry.ref != ref {
-                entry.ref = ref
-                entry.box.model = data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .unavailable("Waiting on transcript data")
-                remeasure(blockID)
-            }
-            return entry.attachment
+    func attachment(blockID: String, ref: TranscriptAttachmentRef, role: String) -> NSTextAttachment {
+        retained(blockID: blockID, ref: ref, role: role, rebind: { box in
+            box.model = data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .unavailable("Waiting on transcript data")
+        }) { resized in
+            let box = TranscriptAttachmentBox(model: data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .unavailable("Waiting on transcript data"),
+                                              environment: environment, actions: actions)
+            box.resized = resized
+            let host = UIHostingController(rootView: TranscriptAttachmentRoot(box: box))
+            // The controller places the view by frame; the host neither drives Auto Layout nor insets for the screen's bars.
+            host.sizingOptions = []
+            host.safeAreaRegions = []
+            host.view.backgroundColor = .clear
+            return (box, host)
         }
-        let box = TranscriptAttachmentBox(model: data.map { TranscriptAttachmentModel(ref, in: $0) } ?? .unavailable("Waiting on transcript data"),
-                                          environment: environment, actions: actions)
-        box.resized = { [weak self] in self?.remeasure(blockID) }
-        let host = UIHostingController(rootView: TranscriptAttachmentRoot(box: box))
-        // The controller places the view by frame; the host neither drives Auto Layout nor insets for the screen's bars.
-        host.sizingOptions = []
-        host.safeAreaRegions = []
-        host.view.backgroundColor = .clear
-        let entry = Entry(ref: ref, box: box, host: host, attachment: TranscriptAttachment(blockID: blockID))
-        entries[blockID] = entry
-        // Sized before TextKit first lays the paragraph out, so the first layout is the right one.
-        measure(entry)
-        return entry.attachment
     }
 
     /// Fresh data, SwiftUI environment, actions and column width before every document edit; live hosted views refresh from it.
     func update(_ data: TranscriptAttachmentData, environment: EnvironmentValues, actions: MobileTranscriptActions, columnWidth: CGFloat) {
-        let resized = columnWidth != self.columnWidth
         self.data = data
         self.environment = environment
         self.actions = actions
-        self.columnWidth = columnWidth
-        for (blockID, entry) in entries {
+        refresh(columnWidth: columnWidth) { entry, _ in
             entry.box.environment = environment
             entry.box.actions = actions
             let model = TranscriptAttachmentModel(entry.ref, in: data)
-            if model != entry.box.model {
-                entry.box.model = model
-                remeasure(blockID)
-            } else if resized {
-                remeasure(blockID)
-            }
-        }
-    }
-
-    /// Blocks gone from the document.
-    func forget(_ blockIDs: Set<String>) {
-        for blockID in blockIDs {
-            guard let entry = entries.removeValue(forKey: blockID) else { continue }
-            entry.host.willMove(toParent: nil)
-            entry.host.view.removeFromSuperview()
-            entry.host.removeFromParent()
-        }
-        pending.subtract(blockIDs)
-    }
-
-    /// Whether a touched view is inside a hosted view: its own controls take the touch, not the document's taps.
-    func hosts(_ view: UIView?) -> Bool {
-        guard let view else { return false }
-        return entries.values.contains { view.isDescendant(of: $0.host.view) }
-    }
-
-    /// Retain hosts at their attachment frames; child-controller ownership supplies sheet presentation.
-    func place(_ frames: [String: CGRect], in textView: UIView) {
-        for (blockID, entry) in entries {
-            guard let view = entry.host.view else { continue }
-            guard let frame = frames[blockID] else {
-                if view.superview != nil, !view.isHidden { view.isHidden = true }
-                continue
-            }
-            if view.superview !== textView {
-                if let parent = Self.viewController(of: textView), entry.host.parent !== parent {
-                    entry.host.willMove(toParent: nil)
-                    entry.host.removeFromParent()
-                    parent.addChild(entry.host)
-                    textView.addSubview(view)
-                    entry.host.didMove(toParent: parent)
-                } else {
-                    textView.addSubview(view)
-                }
-            }
-            if view.frame != frame { view.frame = frame }
-            if view.isHidden { view.isHidden = false }
-        }
-    }
-
-    private static func viewController(of view: UIView) -> UIViewController? {
-        var responder: UIResponder? = view.next
-        while let current = responder {
-            if let controller = current as? UIViewController { return controller }
-            responder = current.next
-        }
-        return nil
-    }
-
-    private func remeasure(_ blockID: String) {
-        pending.insert(blockID)
-        guard !measureScheduled else { return }
-        measureScheduled = true
-        Task { @MainActor [weak self] in self?.measurePending() }
-    }
-
-    private func measurePending() {
-        measureScheduled = false
-        let blockIDs = pending
-        pending = []
-        for blockID in blockIDs {
-            guard let entry = entries[blockID], measure(entry) else { continue }
-            heightChanged(blockID)
-        }
-    }
-
-    /// The hosted view's fitting size at the column width: its own width up to the column (so paragraph alignment can seat it)
-    /// and its whole height. Returns whether the size changed. Before the controller gives a column width there is nothing to fit.
-    @discardableResult
-    private func measure(_ entry: Entry) -> Bool {
-        guard columnWidth > 0 else { return false }
-        let fit = entry.host.sizeThatFits(in: CGSize(width: columnWidth, height: .greatestFiniteMagnitude))
-        let size = CGSize(width: min(fit.width.rounded(.up), columnWidth), height: fit.height.rounded(.up))
-        guard size != entry.attachment.bounds.size else { return false }
-        entry.attachment.bounds = CGRect(origin: .zero, size: size)
-        return true
-    }
-
-    private final class Entry {
-        var ref: TranscriptAttachmentRef
-        let box: TranscriptAttachmentBox
-        let host: UIHostingController<TranscriptAttachmentRoot>
-        let attachment: TranscriptAttachment
-
-        init(ref: TranscriptAttachmentRef, box: TranscriptAttachmentBox, host: UIHostingController<TranscriptAttachmentRoot>,
-             attachment: TranscriptAttachment) {
-            self.ref = ref
-            self.box = box
-            self.host = host
-            self.attachment = attachment
+            guard model != entry.box.model else { return false }
+            entry.box.model = model
+            return true
         }
     }
 }
@@ -261,30 +144,6 @@ enum TranscriptAttachmentModel: Equatable {
     }
 }
 
-/// A block's room in the text: TextKit lays out its measured bounds and draws nothing there; the controller places the block's hosted
-/// view over that frame. TextKit's own attachment views are not used: it creates their providers only for paragraphs a scroll lays out.
-final class TranscriptAttachment: NSTextAttachment {
-    let blockID: String
-
-    init(blockID: String) {
-        self.blockID = blockID
-        super.init(data: nil, ofType: nil)
-        allowsTextAttachmentView = false
-    }
-
-    required init?(coder: NSCoder) { nil }
-
-    /// The hosted view is the only drawing; under it TextKit draws an empty image.
-    override func image(for bounds: CGRect, attributes: [NSAttributedString.Key: Any], location: any NSTextLocation,
-                        textContainer: NSTextContainer?) -> UIImage? { UIImage() }
-
-    /// The hosted view's measured size (kept in `bounds` by the owner), never wider than the line; zero until measured.
-    override func attachmentBounds(for attributes: [NSAttributedString.Key: Any], location: any NSTextLocation,
-                                   textContainer: NSTextContainer?, proposedLineFragment: CGRect, position: CGPoint) -> CGRect {
-        CGRect(x: 0, y: 0, width: min(bounds.width, proposedLineFragment.width), height: bounds.height)
-    }
-}
-
 // MARK: - What each attachment draws
 
 /// The hosted root. It carries the conversation's whole environment, so the stores, pairing and appearance reach every attachment
@@ -294,24 +153,16 @@ struct TranscriptAttachmentRoot: View {
 
     var body: some View {
         if let environment = box.environment {
-            TranscriptAttachmentBody(box: box)
+            TranscriptAttachmentFrame(resized: { box.resized() }) { TranscriptAttachmentBody(box: box) }
                 .environment(\.self, environment)
         }
     }
 }
 
-/// Grows to its whole height at the width it is given, and reports every size change so the document re-lays its paragraph
-/// (a card answered, details opened, an image loaded).
 private struct TranscriptAttachmentBody: View {
     let box: TranscriptAttachmentBox
 
-    var body: some View {
-        content
-            .fixedSize(horizontal: false, vertical: true)
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in box.resized() }
-    }
-
-    @ViewBuilder private var content: some View {
+    @ViewBuilder var body: some View {
         switch box.model {
         case .matter(let row):
             MobileFaceRow(page: "inbox", row: row)

@@ -37,15 +37,16 @@ extension ClaudeBridgeRuntime {
         messageRuntime().handleMessage(response: { [weak self] status, object, settle in
             guard let self else { settle(false); conn.cancel(); return }
             let taskID = object["task_id"] as? String
-            let carriesReply = AgentContactRoutes.carriesReply(object)
+            let transmission = AgentContactRoutes.ReplyTransmission(object)
+            let wasTerminal = object["execution_terminal"] as? Bool == true
             self.writeJSON(conn, status: status, obj: object, onSent: { [weak self] in
                 settle(true)
                 // Failed work can still return produced words/files. The successful write acknowledges those bytes, not execution success.
-                guard carriesReply, let taskID, let self else { return }
+                guard let transmission, let taskID, let self else { return }
                 Task {
                     do {
                         let task = try await self.tasks.get(taskID, owner: principal.id)
-                        await self.tasks.recordReplyFetch(task)
+                        await transmission.record(task, tasks: self.tasks, wasTerminal: wasTerminal)
                     } catch { nativeLog("Bridge transmitted reply acknowledgment unavailable for %@: %@", taskID, error.localizedDescription) }
                 }
             }, onFailed: { settle(false) })
@@ -104,7 +105,7 @@ extension ClaudeBridgeRuntime {
         let requestTurn = principal.turnRequest(context: context, plain: "", messageID: request)
         let turn = requestTurn.turn()
         let taskID = context.flatMap { context in request.map { "na3.\(context).\($0)" } }
-        let requestDigest = AgentPeerReplayClaimStore.digest(body)
+        let requestDigest = SHA256Hex.of(body)
         let started = Date()
         let workLatch = WorkLatch()
         let workTask = startRequest(conn: conn, latch: workLatch, priority: .userInitiated, accepted: true) { [weak self] id in
@@ -131,12 +132,13 @@ extension ClaudeBridgeRuntime {
                     } catch {
                         // Only dispatch exit settles retained tool work.
                         if let taskID {
-                            let status = Task.isCancelled || error is CancellationError
-                                ? "outcome_unknown" : "failed"
+                            let execution: ChatToolOutcome.ExactResultClass = Task.isCancelled || error is CancellationError
+                                ? .unknown : .failed
                             let dispatchCause = String(describing: error)
                             do {
                                 try await tasks.finishTool(taskID, owner: principal.id,
-                                    result: .object(["status": .string(status), "detail": .string(dispatchCause)]))
+                                    result: .object(["status": .string(execution.receipt.status), "detail": .string(dispatchCause)]),
+                                    execution: execution)
                             } catch {
                                 RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message, steeredBy: turn.steeringStamp(),
                                     operation: "bridge.tool.settle:" + taskID, owner: taskID,
@@ -148,7 +150,7 @@ extension ClaudeBridgeRuntime {
                         throw error
                     }
                     if let taskID {
-                        do { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
+                        do { try await tasks.finishTool(taskID, owner: principal.id, result: result, execution: .succeeded) }
                         catch {
                             RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message, steeredBy: turn.steeringStamp(),
                                 operation: "bridge.tool.settle:" + taskID, owner: taskID,
@@ -172,7 +174,8 @@ extension ClaudeBridgeRuntime {
                 if admitted, let taskID, self.closeUnstartedTool(id) {
                     do {
                         try await tasks.finishTool(taskID, owner: principal.id,
-                            result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]))
+                            result: .object(["status": .string("failed"), "detail": .string(String(describing: error))]),
+                            execution: .failed)
                     } catch {
                         RepairOwed.owe(self.host.dataRoot, id: taskID, kind: .message, steeredBy: turn.steeringStamp(),
                             operation: "bridge.tool.settle:" + taskID, owner: taskID,

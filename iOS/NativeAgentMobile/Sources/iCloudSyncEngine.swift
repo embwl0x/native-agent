@@ -1,5 +1,4 @@
 
-import CryptoKit
 import AppIntents
 import Foundation
 import SwiftUI
@@ -39,8 +38,7 @@ enum AgentNameCache {
     private static let pairingKey = SharedChatInbox.identityPairingKey
 
     static func fingerprint(_ secret: Data?) -> String? {
-        guard let secret, !secret.isEmpty else { return nil }
-        return SHA256.hash(data: secret).prefix(8).map { String(format: "%02x", $0) }.joined()
+        BridgeMessage.pairingFingerprint(secret)
     }
 
     static func remember(_ name: String, pairing secret: Data?, defaults: UserDefaults? = SharedChatInbox.identityDefaults) {
@@ -140,7 +138,6 @@ final class iCloudSyncEngine {
         health = nil
         organismLivingStatus = nil
         runs = []
-        runsSnapshotLoaded = false
         connectors = []
         telegram = nil
         providers = []
@@ -157,7 +154,6 @@ final class iCloudSyncEngine {
         syncError = nil
         inboxSnapshotLoaded = false
         approvalsSnapshotLoaded = false
-        memoryProposalsSnapshotLoaded = false
         NativeAgentMobileShortcuts.updateAppShortcutParameters()
     }
     var sessions: [ChatSession] = []
@@ -166,11 +162,15 @@ final class iCloudSyncEngine {
     var sessionNavigation: ChatSessionNavigation?
     var pinnedChatSessions: [ChatSession] { sessionNavigation?.rows.filter(\.isPinned).map(\.session) ?? [] }
     var chatAnchor: ConversationAnchorPin? { sessionNavigation?.anchor }
+    var availableChatAnchorID: String? {
+        guard let id = chatAnchor?.cleanSessionId,
+              sessions.contains(where: { $0.id == id && $0.archived != true }) else { return nil }
+        return id
+    }
     var chatTranscripts: [String: PublishedTranscript] = [:]
     var health: RuntimeHealth?
     var organismLivingStatus: OrganismLivingStatusFile?
     var runs: [RunRecord] = []
-    var runsSnapshotLoaded = false
     var connectors: [MobileConnectorSnapshot] = []
     var telegram: MobileTelegramSnapshot?
     var providers: [ProviderInfo] = []
@@ -248,7 +248,6 @@ final class iCloudSyncEngine {
     var inboxSnapshotLoaded = false
     /// Track queue arrival independently: provider updates advance lastSyncAt without proving empty queues were ever read.
     var approvalsSnapshotLoaded = false
-    var memoryProposalsSnapshotLoaded = false
 
     var agentDisplayName: String {
         let secret = pairingStore?.iCloudPairingSecret

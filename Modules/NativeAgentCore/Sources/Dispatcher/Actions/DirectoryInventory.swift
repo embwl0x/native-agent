@@ -5,10 +5,7 @@ import NativeAgentCore
 import MacControl
 import PersistenceCore
 import TrustCenter
-#if canImport(Darwin)
 import Darwin
-import Darwin
-#endif
 // Blueprint: | `DirectoryInventory.swift` | File metadata and bounded directory inventory |
 extension FileSystemActions {
     static func fileInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
@@ -46,78 +43,14 @@ extension FileSystemActions {
     }
     static func listDir(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let started = ContinuousClock.now
-        let rawPath = input["path"]?.stringValue ?? ""
-        if rawPath.isEmpty { return errResult("path is required", code: "bad_input") }
-        let rawMe = input["max_entries"]
-        guard var maxEntries = safeInt(rawMe, default: connectorListDirMaxEntries) else {
-            return errResult("max_entries must be an integer, got \(jsonRepr(rawMe))", code: "bad_input")
+        let request: DirectoryListingRequest
+        switch admitDirectoryListing(input, ctx, started: started) {
+        case .admitted(let admitted): request = admitted
+        case .refused(let refusal): return refusal
         }
-        maxEntries = min(maxEntries, connectorListDirMaxEntries)
-        // Every page must advance, even when a caller supplies zero.
-        maxEntries = max(1, maxEntries)
-        if case .double(let value)? = input["offset"], Int(exactly: value) == nil {
-            return errResult("offset must be a nonnegative whole entry count", code: "bad_input")
-        }
-        for field in ["name_contains", "snapshot", "sort"] {
-            switch input[field] {
-            case nil, .null?, .string?: break
-            default: return errResult("\(field) must be a string", code: "bad_input")
-            }
-        }
-        guard let offset = safeInt(input["offset"], default: 0), offset >= 0 else {
-            return errResult("offset must be a nonnegative integer", code: "bad_input")
-        }
-        let nameContains = input["name_contains"]?.stringValue ?? ""
-        let sort = (input["sort"]?.stringValue ?? "").isEmpty ? "name" : (input["sort"]?.stringValue ?? "")
-        guard ["name", "newest", "added", "size"].contains(sort) else { return errResult("sort must be name, newest, added or size", code: "bad_input") }
-        guard let budget = safeInt(input["time_budget_seconds"], default: 5), (1...20).contains(budget) else {
-            return errResult("time_budget_seconds must be an integer from 1 to 20", code: "bad_input")
-        }
-        let deadline = started.advanced(by: .seconds(budget))
-        if sort == "size" && offset > 0 { return errResult(
-            "Narrow path for another size scan; size rankings cannot be paged across changing scans", code: "bad_input") }
-        let caseSensitive: Bool
-        switch input["case_sensitive"] {
-        case .bool(let value)?: caseSensitive = value
-        case nil, .null?: caseSensitive = false
-        default: return errResult("case_sensitive must be a boolean", code: "bad_input")
-        }
-        let expectedSnapshot = input["snapshot"]?.stringValue ?? ""
-        if offset > 0 && expectedSnapshot.isEmpty {
-            return errResult("Use the previous page's next arguments, including snapshot, to continue safely.", code: "bad_input")
-        }
-        let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot, workspaceRoot: ctx.workspaceRoot)
-        let allowed = allowedRoots(ctx)
-        if !allowed.isEmpty && !isWithinRoots(resolved, allowed) {
-            return errResult(
-                "Path '\(resolved.path)' is outside sandbox roots: \(rootsRepr(allowed))",
-                code: "path_not_allowed"
-            )
-        }
-        if isSensitiveDataPath(resolved, ctx) {
-            return errResult(
-                "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
-                + "pairing secrets, provider credentials, trust policy). "
-                + "Use the app's own actions for this data instead.",
-                code: "path_not_allowed"
-            )
-        }
-        do {
-            guard let isDirectory = try readPathIsDirectory(resolved) else {
-                return errResult("Directory not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing")
-            }
-            if !isDirectory { return errResult("Not a directory: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "file") }
-        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code, path: resolved) }
-        catch { return errResult(error.localizedDescription, code: "read_failed", path: resolved) }
-        // Parent dirent types avoid entering dormant child mounts. Unknown and symlink types display as files; listing must not follow them.
-        struct Entry {
-            let name: String; let isFile: Bool; var modified: Date? = nil; var added: Date? = nil
-            var bytes: Int64 = 0; var complete = false
-            var length: Int64? = nil
-        }
+        let resolved = request.resolved
         var entries: [Entry] = []
         var namesComplete = true
-        #if canImport(Darwin)
         // Reopen each authorized component with O_DIRECTORY|O_NOFOLLOW and list its descriptor to refuse swapped-in symlinks.
         let directoryFD: Int32
         do { directoryFD = try VerifiedPath.open(resolved, flags: O_RDONLY | O_DIRECTORY) }
@@ -130,6 +63,112 @@ extension FileSystemActions {
         }
         defer { closedir(directory) }
         var beforeStat = stat()
+        if let refusal = readDirectoryEntries(directory, request: request, ctx: ctx, beforeStat: &beforeStat,
+            entries: &entries, namesComplete: &namesComplete) {
+            return refusal
+        }
+        return directoryListingReceipt(entries: &entries, namesComplete: namesComplete, directory: directory, beforeStat: beforeStat, request: request)
+    }
+
+    private struct DirectoryListingRequest {
+        let resolved: URL
+        let maxEntries: Int
+        let offset: Int
+        let nameContains: String
+        let sort: String
+        let budget: Int
+        let deadline: ContinuousClock.Instant
+        let caseSensitive: Bool
+        let expectedSnapshot: String
+    }
+
+    private enum DirectoryListingAdmission {
+        case admitted(DirectoryListingRequest)
+        case refused(JSONValue)
+    }
+
+    /// Validate the page arguments and admit the requested directory.
+    private static func admitDirectoryListing(_ input: [String: JSONValue], _ ctx: ConnectorActionContext,
+        started: ContinuousClock.Instant) -> DirectoryListingAdmission {
+        let rawPath = input["path"]?.stringValue ?? ""
+        if rawPath.isEmpty { return .refused(errResult("path is required", code: "bad_input")) }
+        let rawMe = input["max_entries"]
+        guard var maxEntries = safeInt(rawMe, default: connectorListDirMaxEntries) else {
+            return .refused(errResult("max_entries must be an integer, got \(jsonRepr(rawMe))", code: "bad_input"))
+        }
+        maxEntries = min(maxEntries, connectorListDirMaxEntries)
+        // Every page must advance, even when a caller supplies zero.
+        maxEntries = max(1, maxEntries)
+        if case .double(let value)? = input["offset"], Int(exactly: value) == nil {
+            return .refused(errResult("offset must be a nonnegative whole entry count", code: "bad_input"))
+        }
+        for field in ["name_contains", "snapshot", "sort"] {
+            switch input[field] {
+            case nil, .null?, .string?: break
+            default: return .refused(errResult("\(field) must be a string", code: "bad_input"))
+            }
+        }
+        guard let offset = safeInt(input["offset"], default: 0), offset >= 0 else {
+            return .refused(errResult("offset must be a nonnegative integer", code: "bad_input"))
+        }
+        let nameContains = input["name_contains"]?.stringValue ?? ""
+        let sort = (input["sort"]?.stringValue ?? "").isEmpty ? "name" : (input["sort"]?.stringValue ?? "")
+        guard ["name", "newest", "added", "size"].contains(sort) else { return .refused(errResult("sort must be name, newest, added or size", code: "bad_input")) }
+        guard let budget = safeInt(input["time_budget_seconds"], default: 5), (1...20).contains(budget) else {
+            return .refused(errResult("time_budget_seconds must be an integer from 1 to 20", code: "bad_input"))
+        }
+        let deadline = started.advanced(by: .seconds(budget))
+        if sort == "size" && offset > 0 { return .refused(errResult(
+            "Narrow path for another size scan; size rankings cannot be paged across changing scans", code: "bad_input")) }
+        let caseSensitive: Bool
+        switch input["case_sensitive"] {
+        case .bool(let value)?: caseSensitive = value
+        case nil, .null?: caseSensitive = false
+        default: return .refused(errResult("case_sensitive must be a boolean", code: "bad_input"))
+        }
+        let expectedSnapshot = input["snapshot"]?.stringValue ?? ""
+        if offset > 0 && expectedSnapshot.isEmpty {
+            return .refused(errResult("Use the previous page's next arguments, including snapshot, to continue safely.", code: "bad_input"))
+        }
+        let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot, workspaceRoot: ctx.workspaceRoot)
+        let allowed = allowedRoots(ctx)
+        if !allowed.isEmpty && !isWithinRoots(resolved, allowed) {
+            return .refused(errResult(
+                "Path '\(resolved.path)' is outside sandbox roots: \(rootsRepr(allowed))",
+                code: "path_not_allowed"
+            ))
+        }
+        if isSensitiveDataPath(resolved, ctx) {
+            return .refused(errResult(
+                "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
+                + "pairing secrets, provider credentials, trust policy). "
+                + "Use the app's own actions for this data instead.",
+                code: "path_not_allowed"
+            ))
+        }
+        do {
+            guard let isDirectory = try readPathIsDirectory(resolved) else {
+                return .refused(errResult("Directory not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing"))
+            }
+            if !isDirectory { return .refused(errResult("Not a directory: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "file")) }
+        } catch let failure as FileReadFailure { return .refused(errResult(failure.message, code: failure.code, path: resolved)) }
+        catch { return .refused(errResult(error.localizedDescription, code: "read_failed", path: resolved)) }
+        return .admitted(DirectoryListingRequest(resolved: resolved, maxEntries: maxEntries, offset: offset,
+            nameContains: nameContains, sort: sort, budget: budget, deadline: deadline, caseSensitive: caseSensitive,
+            expectedSnapshot: expectedSnapshot))
+    }
+
+    // Parent dirent types avoid entering dormant child mounts. Unknown and symlink types display as files; listing must not follow them.
+    private struct Entry {
+        let name: String; let isFile: Bool; var modified: Date? = nil; var added: Date? = nil
+        var bytes: Int64 = 0; var complete = false
+        var length: Int64? = nil
+    }
+
+    /// Read immediate entries and measure allocated sizes when requested.
+    private static func readDirectoryEntries(_ directory: UnsafeMutablePointer<DIR>, request: DirectoryListingRequest, ctx: ConnectorActionContext,
+        beforeStat: inout stat, entries: inout [Entry], namesComplete: inout Bool) -> JSONValue? {
+        let sort = request.sort, deadline = request.deadline, resolved = request.resolved
         guard fstat(dirfd(directory), &beforeStat) == 0 else {
             return errResult(String(cString: strerror(errno)))
         }
@@ -195,15 +234,14 @@ extension FileSystemActions {
                 entries[index].complete = size.complete
             }
         }
-        #else
-        if sort == "size" || sort == "added" { return errResult("Allocated disk usage and added-date ordering require macOS", code: "unavailable") }
-        do {
-            entries = try FileManager.default.contentsOfDirectory(atPath: resolved.path)
-                .map { Entry(name: $0, isFile: true) }
-        } catch {
-            return errResult(error.localizedDescription)
-        }
-        #endif
+        return nil
+    }
+
+    /// Order the observed entries, bind continuation and return the selected page.
+    private static func directoryListingReceipt(entries: inout [Entry], namesComplete: Bool, directory: UnsafeMutablePointer<DIR>,
+        beforeStat: stat, request: DirectoryListingRequest) -> JSONValue {
+        let resolved = request.resolved, sort = request.sort, nameContains = request.nameContains, caseSensitive = request.caseSensitive
+        let expectedSnapshot = request.expectedSnapshot, offset = request.offset, maxEntries = request.maxEntries, budget = request.budget
         entries.sort { lhs, rhs in
             if sort == "size", lhs.bytes != rhs.bytes { return lhs.bytes > rhs.bytes }
             if sort == "newest" || sort == "added" {

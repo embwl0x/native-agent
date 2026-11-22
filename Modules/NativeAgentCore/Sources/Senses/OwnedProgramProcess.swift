@@ -294,6 +294,3 @@ final class OwnedProgramProcess: @unchecked Sendable {
         writeQueue.sync { closeWriter() }
     }
 }
-func text(_ value: JSONValue?) -> String {
-    value?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-}

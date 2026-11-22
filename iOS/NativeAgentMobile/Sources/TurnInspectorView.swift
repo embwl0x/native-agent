@@ -1,6 +1,5 @@
 import SwiftUI
 import Foundation
-import CryptoKit
 import NativeAgentShared
 // Blueprint: | `TurnInspectorView.swift` | Device-local summary faces, bounded continuations and demanded count evidence |
 
@@ -33,7 +32,7 @@ enum TurnInspectorPresentation {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(file)
-        let revision = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let revision = SHA256Hex.of(data)
         if let expected = request.revision, expected != revision {
             throw PartCallError(code: "collection_changed", message: "The received summaries changed; read from the current turn.")
         }

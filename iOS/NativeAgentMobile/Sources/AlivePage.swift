@@ -196,7 +196,7 @@ extension View {
     }
 
     /// Cover both room colour and haze beneath the pushed Back button so content cannot show through it.
-    @ViewBuilder func aliveTopFade(_ on: Bool = true, holdsBar: Bool = false) -> some View {
+    @ViewBuilder func aliveTopFade(holdsBar: Bool = false) -> some View {
         if holdsBar {
             overlay {
                 GeometryReader { g in
@@ -216,7 +216,7 @@ extension View {
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
             }
-        } else if on {
+        } else {
             overlay(alignment: .top) {
                 GeometryReader { g in
                     let y = g.frame(in: .global).minY
@@ -229,8 +229,6 @@ extension View {
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
             }
-        } else {
-            self
         }
     }
 

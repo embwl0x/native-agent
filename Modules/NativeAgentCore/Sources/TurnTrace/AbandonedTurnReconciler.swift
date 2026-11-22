@@ -113,12 +113,6 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
         return record
     }
 
-    public static func forSession(dataRoot: URL, sessionId: String) throws -> [Self] {
-        try turnIds(dataRoot: dataRoot, sessionId: sessionId).compactMap {
-            try read(dataRoot: dataRoot, sessionId: sessionId, turnId: $0)
-        }
-    }
-
     /// The turns a session holds checkpoints for, each readable on its own.
     public static func turnIds(dataRoot: URL, sessionId: String) throws -> [String] {
         let directory = try path(dataRoot: dataRoot, sessionId: sessionId, turnId: "checkpoint").deletingLastPathComponent()

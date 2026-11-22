@@ -162,7 +162,8 @@ public struct ContextFeedbackReducer: Sendable {
             }
         }
 
-        let finalBucket = timeBucket ?? ordered.last?.timeBucket
+        // Decay ends at the later of now and the latest applied event: a clock moved back never ends before an event already applied.
+        let finalBucket = [timeBucket, ordered.last?.timeBucket].compactMap { $0 }.max()
         if let finalBucket {
             for atomID in working.keys.sorted() {
                 guard var state = working[atomID] else { continue }

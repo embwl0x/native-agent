@@ -3,7 +3,6 @@ import ChatTurnContracts
 import AgentWorkspace
 import ChatToolParsing
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine

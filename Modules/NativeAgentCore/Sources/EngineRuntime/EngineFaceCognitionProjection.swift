@@ -59,13 +59,13 @@ public enum EngineFaceCognitionProjection {
         ])
         let timeline = PartFace.Section(id: "timeline", title: "Timeline", style: .timeline, rows: detail.developmentalTimeline.map { event in
             PartFace.Row(id: event.id.uuidString, title: safe(event.title), detail: safe(event.summary),
-                value: event.kind.rawValue, at: ISO8601DateFormatter().string(from: event.occurredAt))
+                value: Self.kindWords(event.kind), at: ISO8601DateFormatter().string(from: event.occurredAt))
         }, folded: true)
         let reflections = PartFace.Section(id: "reflections", title: "Reflections", style: .timeline, rows: detail.reflections.map { reflection in
             PartFace.Row(id: reflection.id.uuidString, title: safe(reflection.resultSummary),
                 detail: safe(reflection.request.reason),
                 value: reflection.careIntegrationPending == true || reflection.dispositionSaveFailed || reflection.journalPending == true
-                    ? "Settlement owed" : (reflection.cancelled ? "Cancelled" : "Recorded"),
+                    ? "Unfinished" : (reflection.cancelled ? "Cancelled" : "Recorded"),
                 at: ISO8601DateFormatter().string(from: reflection.createdAt))
         }, folded: true)
         var sections = [PartFace(sections: [overview, workspace, associations, capacities, feeling, timeline, reflections])]
@@ -184,6 +184,14 @@ public enum EngineFaceCognitionProjection {
     }
 
     private static func safe(_ text: String) -> String { NativeAppSecretRedactor.redactText(text) }
+    private static func kindWords(_ kind: CognitiveDevelopmentalTimelineKind) -> String {
+        switch kind {
+        case .dreamEpisode: "Dream"
+        case .schemaProposal: "Proposal"
+        case .proposalResolution: "Decision"
+        case .replayRun: "Replay"
+        }
+    }
 
     private static func row(_ id: String, _ title: String, _ detail: String?, state: String? = nil, date: Date? = nil) -> PartFace.Row {
         EngineFaceMindProjection.row(id, title, detail, state: state, date: date)

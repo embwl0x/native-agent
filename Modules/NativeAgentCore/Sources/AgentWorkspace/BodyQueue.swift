@@ -3,7 +3,7 @@ import Desk
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `BodyQueue.swift` | `BodyQueue`, `BodyFinding`, `file`, `resolve`, `fold`: stable finding identities |
+// Blueprint: | `BodyQueue.swift` | `BodyQueue`, `BodyFinding`, `file`, `resolve`: stable finding identities |
 
 /// Each finding keeps its Desk identity and the person who can tend it.
 public struct BodyFinding: Sendable, Equatable {
@@ -58,13 +58,6 @@ public enum BodyQueue {
     /// Close matching finding-key prefixes in one pass, retaining each prefix's note.
     public static func resolve(keyPrefixes notes: [String: String], dataRoot: URL) async throws {
         try await settle(dataRoot: dataRoot) { key in notes.first { key.hasPrefix($0.key) }?.value }
-    }
-
-    /// Settle per-record findings only after their rollup is filed.
-    public static func fold(keyPrefixes: [String], into title: String, dataRoot: URL) async throws {
-        try await settle(dataRoot: dataRoot) { key in
-            keyPrefixes.contains(where: { key.hasPrefix($0) }) ? "folded into " + title : nil
-        }
     }
 
     @discardableResult

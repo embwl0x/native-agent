@@ -31,7 +31,6 @@ public protocol CognitionHost: Sendable {
     func perceiveDay(dataRoot: URL) async
     func phoneNotificationTargetCount(dataRoot: URL) async throws -> Int
     func readoutFace(id: String, input: JSONValue, version: String, dataRoot: URL) async -> PartCallResult<PartFace>
-    func inQuietHours(at date: Date, dataRoot: URL) -> Bool
     /// Return the route for confirmed delivery; nil leaves delivery unconfirmed here.
     func deliverShoulderTap(
         eventId: String, title: String, body: String, reason: String,

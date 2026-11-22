@@ -258,8 +258,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
                     MemoryRecordDisclosurePolicy.localPrivateSurfaces.contains(
                         MemoryRecordDisclosurePolicy.canonicalSurface($0))
                 },
-                sinceGap: { from, to, surface in
-                    await NativeCognitionRuntime.sinceGapItems(from: from, to: to, surface: surface, dataRoot: root)
+                sinceGap: { from, to, _ in
+                    await NativeCognitionRuntime.sinceGapItems(from: from, to: to, dataRoot: root)
                 },
                 decisions: {
                     do {
@@ -328,7 +328,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
             sourceWakes.horizonDirty = true
         }
         if somaticAccepted {
-            cachedBodyRead = nil
+            bodyReadOrder.write { cachedBodyRead = nil }
             // Drain felt resolutions from both kernel-feed paths into the substrate.
             await drainFeltResolutionsIntoSubstrate()
         }
@@ -362,7 +362,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     }
 
     /// Apply debug overrides after the two-second composite-gauge cache.
+    /// The composite body sample is published through one owner's read order: a read that started before an invalidation never replaces it.
     var cachedBodyRead: (read: OrganismBodyRead, at: Date)?
+    let bodyReadOrder = LatestRead()
     /// Reload canonical successful receipts at bootstrap and replace live call IDs in transient evidence.
     /// Provider lifecycle beliefs never select routing authority.
     var providerLifecycleEvidenceByCallID: [String: ProviderPathEvidence] = [:]
@@ -391,9 +393,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
             publishRuntimeChange(reason: "transient_clear:failed")
             return .persistenceFailed(detail)
         }
+        let selfFileDeletionError: String?
         do {
             // Exclude store, forgetting epoch and resident state changes as one logical operation.
-            try await substrate.forgetMind()
+            selfFileDeletionError = try await substrate.forgetMind()
             bootstrapFailure = nil
         } catch {
             // A failed Clear remains dirty so normal microcycle persistence can settle affect and nodes.
@@ -417,12 +420,21 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
         // Clear may replace damaged body continuity; a failed write restores its persistence freeze.
         let wasRestoreFrozen = organismRestoreFailedHard
         organismRestoreFailedHard = false
-        guard await persistOrganismContinuity(reason: "clear transient") else {
-            // Repeat Clear to finish partial forgetting because forgetting is not journalled.
+        let bodySaved = await persistOrganismContinuity(reason: "clear transient")
+        if !bodySaved {
             organismRestoreFailedHard = wasRestoreFrozen
-            await substrate.recordReceipt(kind: "user.clear_transient_state_partial")
+        }
+        if selfFileDeletionError != nil || !bodySaved {
+            var detail = "The thought store was cleared."
+            if let selfFileDeletionError {
+                detail += " mind/self.json could not be deleted (\(selfFileDeletionError))."
+            }
+            detail += bodySaved
+                ? " Body state was cleared and saved."
+                : " Body state was cleared in memory. Its previous state may return after a restart because the clear could not be saved."
+            await substrate.recordReceipt(kind: "user.clear_transient_state_partial", payload: .object(["detail": .string(detail)]))
             publishRuntimeChange(reason: "transient_clear:partial")
-            return .bodyPersistenceFailed
+            return .partiallyCleared(detail)
         }
         await substrate.recordReceipt(kind: "user.clear_transient_state")
         publishRuntimeChange(reason: "transient_clear:completed")

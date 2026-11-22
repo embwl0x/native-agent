@@ -1,16 +1,19 @@
+#if os(macOS)
 import AppKit
 import QuartzCore
-// Blueprint: | `DisplayFrame.swift` | `DisplayFrame`: the Mac window's display rhythm; the face feed applies what arrived once per frame |
+// Blueprint: | `DisplayFrame.swift` | `DisplayFrame`: the Mac window's display rhythm (macOS only); the face feed applies what arrived once per frame |
 
 /// The next frame of the screen the window is on. The link runs only while something waits for a frame, and pauses after it.
+/// `followsScreenChanges` rebuilds the link when the screen parameters change.
 @MainActor
-final class DisplayFrame: NSObject {
+public final class DisplayFrame: NSObject {
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var link: CADisplayLink?
     private var screenChanges: Task<Void, Never>?
 
-    override init() {
+    public init(followsScreenChanges: Bool) {
         super.init()
+        guard followsScreenChanges else { return }
         let changes = NotificationCenter.default.notifications(named: NSApplication.didChangeScreenParametersNotification).map { _ in () }
         screenChanges = Task { [weak self] in
             for await _ in changes {
@@ -26,7 +29,7 @@ final class DisplayFrame: NSObject {
 
     deinit { screenChanges?.cancel() }
 
-    func next() async {
+    public func next() async {
         await withCheckedContinuation { waiter in
             waiters.append(waiter)
             guard let screen = NSScreen.main else {
@@ -52,3 +55,4 @@ final class DisplayFrame: NSObject {
         for waiter in ready { waiter.resume() }
     }
 }
+#endif

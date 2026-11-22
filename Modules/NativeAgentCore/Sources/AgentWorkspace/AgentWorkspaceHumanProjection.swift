@@ -1,11 +1,12 @@
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `AgentWorkspaceHumanProjection.swift` | `HumanConversationRead` enum; `read`, `project` |
 
 enum HumanConversationRead {
     /// A selected conversation reads through its explicit owner; the list is the index's own rows.
     static func read(workspace: WorkspaceOperation, _ input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue {
-        guard let id = input["conversation_session_id"] else { return try HumanConversationIndex.list(workspace: workspace, input, dataRoot: dataRoot) }
+        guard let id = input["conversation_session_id"] else { return try HumanConversationIndex.list(input, dataRoot: dataRoot) }
         guard case .string(let session) = id else {
             return .object(["status": .string("unavailable"), "detail": .string("This conversation is unavailable. Open the conversation list again.")])
         }
@@ -26,7 +27,7 @@ enum HumanConversationRead {
             }
             let named = rows.map { AgentScreen.humanTitle($0["title"]?.stringValue ?? "Conversation with you", agentName: nil) }
             let titles = AgentScreen.disambiguate(named.map(\.title), who: named.map(\.who),
-                at: rows.map { $0["updated_at"]?.stringValue.flatMap(AgentScreen.date) })
+                at: rows.map { $0["updated_at"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) })
             let items = zip(rows, titles).compactMap { item, title -> AgentWorkspaceItem? in
                 guard case .string(let id)? = item["conversation_session_id"] else { return nil }
                 let location = AgentWorkspaceLocation.record(tool: "chat_conversations",

@@ -5,7 +5,7 @@ import PersistenceCore
 import NativeAgentCore
 import Synchronization
 // Blueprint: | `DeskStore.swift` | `SwiftNativeDeskStore`, `currentRevision`, `continuation`, `setContinuation`, `updateTitle` |
-// Flocked base-plus-tail replay prevents compaction from racing committed appends.
+// Flocked base-plus-tail replay prevents compaction from racing journal commits.
 // Snapshot before truncation and prefix-drop on replay prevent loss and duplicate application.
 // Preserve alias high-water, reopening targets and the commit-stamp floor because live rows cannot recover them.
 /// Local export and phone sync exclude archive and holds; off-disk backup retains the Desk tree.
@@ -54,7 +54,7 @@ public struct SwiftNativeDeskStore: Sendable {
                                 requiresActive: Bool = false) async throws {
         guard DeskContinuation.fromJSON(record.toJSON()) != nil else { throw DeskContinuationError.unsafe }
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
+            let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
             guard let item = state.items.first(where: { $0.handle == handle }),
                   item.continuation?.revision == expectedRevision else { throw DeskContinuationError.conflict }
@@ -67,23 +67,22 @@ public struct SwiftNativeDeskStore: Sendable {
                     throw DeskContinuationError.parked
                 }
             }
+            var ops: [DeskOp] = []
             if record.state == .blocked, !item.status.isTerminal,
                item.status != .blocked || !item.requiresOwnerInput {
-                let ask = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle,
+                let ask = DeskOp(handle: handle,
                     body: .setStatus(status: .blocked,
                         blockedReason: """
-                            Continuation stopped (\(record.reason ?? "blocked")). Check the unfinished step through its own domain, then set \
-                            this task back to todo to continue, or cancel it.
+                            Work on this stopped partway. Check what it left unfinished, then set this task back to todo to continue, \
+                            or cancel it.
                             """,
                         waitingOn: "owner", progress: nil, assignee: nil, laneOf: nil))
                 try Self.validateHierarchyTransition(ask, in: state)
                 try Self.validatePursuitInvariants(ask, in: state, viaGenericPath: true)
-                let committed = try await appendAndRecompactUnlocked(ask, feed: feed)
-                feed = committed.feed
+                ops.append(ask)
             }
-            let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
-                            handle: handle, body: .setContinuation(record: record))
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            ops.append(DeskOp(handle: handle, body: .setContinuation(record: record)))
+            try await commitUnlocked(ops, feed: feed)
         }
     }
     /// Scan every create and base high-water so aliases stay unique after closure, archival or truncation.

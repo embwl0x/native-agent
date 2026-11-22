@@ -15,7 +15,7 @@ extension ProductionExport {
         dataRoot root: URL, runProcess: ArtifactProcessRunner,
         hardening: () async throws -> Hardening
     ) async throws -> ProductionExport {
-        let now = TrustBackupPersistence.nativeArtifactTimestamp()
+        let now = NativeTimestampFormat.plainZulu(Date())
         let id = UUID().uuidString.lowercased()
         let exportRoot = root
             .appendingPathComponent("production", isDirectory: true)
@@ -79,7 +79,7 @@ extension ProductionExport {
         dataRoot root: URL, runProcess: ArtifactProcessRunner,
         diagnostics: () async throws -> Diagnostics, health: () throws -> Health
     ) async throws -> ProductionExport {
-        let now = TrustBackupPersistence.nativeArtifactTimestamp()
+        let now = NativeTimestampFormat.plainZulu(Date())
         let id = UUID().uuidString.lowercased()
         let supportRoot = root
             .appendingPathComponent("production", isDirectory: true)

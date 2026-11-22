@@ -1,5 +1,4 @@
 import SwiftUI
-import CryptoKit
 import UIKit
 import PhotosUI
 import NativeAgentShared
@@ -171,14 +170,6 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         self.matter = matter
     }
 
-    nonisolated static func derivedMessageID(_ id: String) -> UUID {
-        var bytes = Array(SHA256.hash(data: Data(("nativeagent.message:" + id).utf8)).prefix(16))
-        bytes[6] = (bytes[6] & 0x0F) | 0x50
-        bytes[8] = (bytes[8] & 0x3F) | 0x80
-        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
-    }
-
     nonisolated static func projectChatRecords(_ records: [ChatMessageRecord]) throws -> [ChatMessage] {
         // Project metadata.attachments into chat summaries so snapshot refresh preserves attachments.
         try records.compactMap { rec in
@@ -187,8 +178,6 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
             let card = rec.interactionJSON != nil
             guard roleStr == "user" || roleStr == "assistant" || card else { return nil }
             let role: ChatMessage.Role = roleStr == "user" ? .user : .assistant
-            // Derive non-UUID card/approval row IDs exactly as the Mac does so each row retains one stable identity.
-            let uuid = UUID(uuidString: rec.id) ?? Self.derivedMessageID(rec.id)
             let attachments: [ChatAttachmentSummary] = (rec.metadata?.attachments ?? []).map { a in
                 ChatAttachmentSummary(
                     id: a.id,
@@ -200,7 +189,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
                     utterance: a.utterance
                 )
             }
-            var message = ChatMessage(id: uuid, role: role, text: card ? "" : rec.content, attachments: attachments, runId: rec.runId,
+            var message = ChatMessage(id: rec.mobileMessageID, role: role, text: card ? "" : rec.content, attachments: attachments, runId: rec.runId,
                 matter: try rec.cardMatter())
             message.toolEvents = rec.toolEvents ?? []
             if roleStr == "assistant" {
@@ -215,6 +204,9 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
 }
 
 extension ChatMessageRecord {
+    /// Non-UUID card and approval IDs project to the same stable identity as on the Mac.
+    nonisolated var mobileMessageID: UUID { UUID(uuidString: id) ?? TranscriptMessageID.derived(id) }
+
     /// An interaction card names its Inbox matter; malformed card identities fail the read.
     nonisolated func cardMatter() throws -> String? {
         try interactionJSON.map { "interaction:" + (try JSONDecoder().decode(CardIdentity.self, from: Data($0.utf8))).id }
@@ -283,7 +275,7 @@ enum ChatSessionTabs {
         var tabs: [ChatSessionTab] = [
             ChatSessionTab(
                 id: "ios-main",
-                title: cleanTitle(mainTitle, fallback: "iPhone"),
+                title: mainTitle.trimmedNonEmpty ?? "iPhone",
                 systemImage: "iphone",
                 sessionID: mainSessionID,
                 kind: .main
@@ -306,10 +298,5 @@ enum ChatSessionTabs {
                 sessionID: session.id, kind: .anchor(session.id)))
         }
         return tabs
-    }
-
-    private static func cleanTitle(_ title: String, fallback: String) -> String {
-        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return clean.isEmpty ? fallback : clean
     }
 }

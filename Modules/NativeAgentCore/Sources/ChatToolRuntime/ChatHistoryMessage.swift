@@ -141,7 +141,7 @@ extension SwiftToolDispatcher {
         let isToolReceipt = found.message.role.lowercased() == "tool"
         let readText: String
         if isToolReceipt, case .object(let row)? = found.message.extras {
-            readText = Self.persistedToolReceiptText(row: row, metadata: Self.persistedHistoryMetadata(row: row))
+            readText = Self.persistedToolReceiptText(row: row, metadata: JSONValue.objectOrEmpty(row["metadata"]))
         } else {
             readText = found.message.content
         }

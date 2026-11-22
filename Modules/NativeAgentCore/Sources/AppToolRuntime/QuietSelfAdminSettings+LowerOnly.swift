@@ -91,6 +91,17 @@ extension QuietLowerOnlySettingsHost {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         var rows: [QuietSetting] = []
 
+        rows += trustLowerOnlyRows(root: root)
+        rows += peerLowerOnlyRows(forPage: page, connectedPeers: connectedPeers, root: root)
+        rows += macIntegrationLowerOnlyRows(root: root)
+        rows += telegramLowerOnlyRows(root: root)
+        rows += slackLowerOnlyRows(root: root)
+        return rows
+    }
+
+    /// Trust's own switches: Chrome control, Pause everything, activity capture and what it records, and the Mac access preset.
+    private func trustLowerOnlyRows(root: URL) -> [QuietSetting] {
+        var rows: [QuietSetting] = []
         rows.append(QuietSettings.lowerOnly(
             id: "trust.chrome_control", page: "trust", label: "Chrome control in narrower modes",
             whereUserDoesIt: "Trust → Mac → Chrome control",
@@ -192,6 +203,12 @@ extension QuietLowerOnlySettingsHost {
                 self.applySavedTrustPolicy(saved, status: "Mac access saved")
             }
         ).onTab("mac"))
+        return rows
+    }
+
+    /// Each connected agent's elevation (Trust) and Desk reading (Connectors) levers.
+    private func peerLowerOnlyRows(forPage page: String?, connectedPeers: [AgentPeerContact], root: URL) -> [QuietSetting] {
+        var rows: [QuietSetting] = []
         if page == nil || page == "trust" {
             let peers = AgentPeerStore(dataRoot: root)
             for peer in connectedPeers {
@@ -236,7 +253,12 @@ extension QuietLowerOnlySettingsHost {
                 }
             ))
         }
+        return rows
+    }
 
+    /// Each Mac integration's access, as one choice and as one switch per axis; giving access back is the person's below Full Mac.
+    private func macIntegrationLowerOnlyRows(root: URL) -> [QuietSetting] {
+        var rows: [QuietSetting] = []
         let store = MacIntegrationPermissionStore(dataRoot: root)
         let setIntegration: @MainActor @Sendable (String, String, String, JSONValue, Bool?, Bool?, QuietSettingWrite) async throws -> Void = {
             integration, name, setting, value, read, write, context in
@@ -341,7 +363,12 @@ extension QuietLowerOnlySettingsHost {
                 ))
             }
         }
+        return rows
+    }
 
+    /// Telegram's on switch, mention rule and allowlists, saved through one change that says who it locks out.
+    private func telegramLowerOnlyRows(root: URL) -> [QuietSetting] {
+        var rows: [QuietSetting] = []
         let telegram: @Sendable () throws -> TelegramBot.TelegramConfig = {
             guard let saved = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: root, resolveCredential: false) else {
                 throw QuietSettingError.unavailable("""
@@ -410,7 +437,12 @@ extension QuietLowerOnlySettingsHost {
             read: { _ in try telegram().allowedUserIds.sorted().map(String.init) },
             write: { _, ids, context in try await saveTelegram(context) { _, _, _, users in users = ids } }
         ))
+        return rows
+    }
 
+    /// Slack's mention rule and allowlists, read through one checked policy per row batch.
+    private func slackLowerOnlyRows(root: URL) -> [QuietSetting] {
+        var rows: [QuietSetting] = []
         // Checked policy owns both reads and writes; unavailable policy cannot appear as an empty allowlist.
         let slack = QuietSlackPolicyRead { try await self.slackIngressPolicy(dataRoot: root) }
         let saveSlack: @MainActor @Sendable (Set<String>, Set<String>, Bool, QuietSettingWrite) async throws -> Void = { channels, users, mention, context in

@@ -30,7 +30,7 @@ extension CognitiveSubstrate {
     ) async -> CognitiveReflectionPlan {
         await waitForMaintenanceTransition()
         let epoch = mindEpoch
-        let admission = await reflectionAdmission()
+        let admission = await reflectionAdmission(reason: reason)
         guard admission.admitted else { return .refused(admission) }
         let now = dependencies.now()
         let read = await frozenRead(at: now)
@@ -96,7 +96,7 @@ extension CognitiveSubstrate {
                 shownCares.map { "[\($0.key)] \($0.text)" }.joined(separator: "\n")
             ]))
             prompt = try completionPolicy("reflection", arguments: [
-                bounded(reason, maxCharacters: 200), careKey,
+                TextClipping.prefixOrWhole(reason, maxCharacters: 200), careKey,
                 sourceExcerpts.joined(separator: "\n\n"), capsule.combined, caresSection
             ])
         } catch {
@@ -106,7 +106,7 @@ extension CognitiveSubstrate {
             return .refused(refused)
         }
         // Recheck admission after frozenRead suspends: actor reentrancy permits another claim or a changed budget.
-        let recheck = await reflectionAdmission()
+        let recheck = await reflectionAdmission(reason: reason)
         guard recheck.admitted else { return .refused(recheck) }
         guard epoch == mindEpoch else {
             var refused = recheck
@@ -118,7 +118,7 @@ extension CognitiveSubstrate {
         reflectionReservation = reservation
         return .admitted(CognitiveReflectionRequest(
             reservationId: reservation.id,
-            reason: bounded(reason, maxCharacters: 200),
+            reason: TextClipping.prefixOrWhole(reason, maxCharacters: 200),
             prompt: prompt,
             surface: configuration.reflectionSurface,
             requestedAt: now,
@@ -157,12 +157,12 @@ extension CognitiveSubstrate {
         defer {
             if ownsReflectionReservation(request) { reflectionReservation = nil }
         }
-        let boundedResult = bounded(resultSummary, maxCharacters: 600)
+        let boundedResult = TextClipping.prefixOrWhole(resultSummary, maxCharacters: 600)
         var receipt = CognitiveReflectionReceipt(
             id: dependencies.makeUUID(),
             request: request,
             resultSummary: boundedResult,
-            provider: bounded(provider, maxCharacters: 80),
+            provider: TextClipping.prefixOrWhole(provider, maxCharacters: 80),
             createdAt: dependencies.now(),
             cancelled: cancelled,
             estimatedPromptTokens: estimatedTokens(request.prompt),
@@ -308,21 +308,29 @@ extension CognitiveSubstrate {
     /// A rolling window lets quiet hours leave room for harder hours without freeing slots at midnight.
     static let reflectionCostWindow: TimeInterval = 24 * 60 * 60
 
-    /// Read spent calls from their receipt owner; do not mirror the ledger.
+    /// Read spent calls from their receipt owner; do not mirror the ledger. The night's sleep is not spent from the waking budget.
     func reflectionCallsInCostWindow(at now: Date) -> Int {
-        let cutoff = now.addingTimeInterval(-Self.reflectionCostWindow)
-        return reflectionReceipts.values.filter { $0.createdAt > cutoff }.count
+        Self.wakingReflectionsSpent(Array(reflectionReceipts.values), at: now)
     }
 
+    /// The waking budget's spend, one law for admission and every readout of it.
+    public static func wakingReflectionsSpent(_ receipts: [CognitiveReflectionReceipt], at now: Date) -> Int {
+        let cutoff = now.addingTimeInterval(-reflectionCostWindow)
+        return receipts.filter { $0.createdAt > cutoff && !isDream($0.request.reason) }.count
+    }
+
+    /// A dream's judgment is the night sorting its day: it is owed every night, so the waking ceiling neither counts nor refuses it.
+    static func isDream(_ reason: String?) -> Bool { reason?.hasPrefix("dream:") == true }
+
     /// Evidence-driven reflection shares the receipt budget and reservation.
-    public func reflectionAdmission() async -> CognitiveReflectionAdmission {
+    public func reflectionAdmission(reason: String? = nil) async -> CognitiveReflectionAdmission {
         let now = dependencies.now()
         let ceiling = configuration.dailyReflectionCallBudget
         let spent = reflectionCallsInCostWindow(at: now)
         var refusal: String?
         if !configuration.enabled || !configuration.reflectiveCallsEnabled || ceiling <= 0 {
             refusal = Self.reflectionRefusalDisabled
-        } else if spent >= ceiling {
+        } else if spent >= ceiling, !Self.isDream(reason) {
             refusal = Self.reflectionRefusalCeilingReached
         } else if let reservation = reflectionReservation,
                   now.timeIntervalSince(reservation.since) < Self.reflectionInFlightMaximumAge {

@@ -331,7 +331,8 @@ struct WorkPaneScreen: View {
                         FaceDocumentContent(text: readText, format: "code")
                             .accessibilityLabel("What I read: \(readText)")
                     }
-                    FaceView(face: WorkPaneFace.screen(preview), open: { _ in }, act: { _, _, _ in })
+                    FaceView(face: WorkPaneFace.screen(preview), door: ReadOnlyFaceDoor(),
+                             session: FacePageSession(), retaining: false)
                 }
                 .padding(.horizontal, NativeAgentShellLayout.roomGutter)
                 .padding(.bottom, NativeAgentShellLayout.roomGutter)

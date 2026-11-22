@@ -211,7 +211,9 @@ extension AppActions {
                       """,
                   tool: "make_studio", input: verb("add"), versionExempt: true),
         AppAction("table.put", "desk", """
-            With type, add (occupied id: exists); missing id mints e plus twelve lowercase hex digits. Without type, edit by id (absent: not_found)
+            Put something on the table: with type, add (occupied id: exists); missing id mints e plus twelve lowercase hex digits. Without type, \
+            edit by id (absent: not_found). A new shape or container needs x,y,w,h; text x,y; arrow from,to; stroke x,y and points (the points run from x,y). \
+            Colors: green|yellow|purple|blue|peach|white|ink
             """,
                   ["id?", "type?:shape|text|container|arrow|stroke", "x?:number", "y?:number", "w?:number", "h?:number", "text?", "color?",
                    "kind?", "size?", "from?", "to?", "fromSide?", "toSide?", "label?", "points?:[number]", "width?:number", "item?", "piece?"],
@@ -947,9 +949,10 @@ extension AppActions {
         .fold("mac_notify", "notifications"),
         .fold("mobile_notify", "notifications"),
         .fold("phone_request", "pairing"),
-        // Location is read-only; the wait covers an open phone's push, tap, fix and 8-second Mac drain, not a closed phone.
+        // Location is read-only; the wait covers an open phone's push, tap, fix and 8-second Mac drain, not a closed phone. A real answer took
+        // about 65 s, so 90 s of wait (its call ends at 120 s with settlement) leaves room for the answer to arrive.
         .fold("phone_request", "pairing", id: "phone.location", "Ask the paired iPhone for its current location", [],
-              input: ["kind": .string("location.current"), "wait_seconds": .int(20)], read: true),
+              input: ["kind": .string("location.current"), "wait_seconds": .int(90)], read: true),
         .fold("image_generate", "chat"),
 
         .fold("read_file", "files", """
@@ -966,7 +969,7 @@ extension AppActions {
         .fold("write_file", "files"),
         .fold("move_file", "files"),
         .fold("copy_file", "files"),
-        .fold("trash_file", "files"),
+        .fold("trash_file", "files", resultSchema: trashResultSchema),
         .fold("apply_patch", "files", "Apply a unified diff with paths relative to cwd",
               warn: #"Example app {action:"files.patch",args:{cwd:"/absolute/path/to/repo",patch:"--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"}}; supply actual content/ranges; the marker is only for missing final newlines"#),
         .fold("git_status", "shell", """
@@ -1072,7 +1075,7 @@ extension AppActions {
         .fold("artifact_find", "chat", read: true),
         .fold("work_context", "desk", read: true),
         // What a page's rows call, declared once beside every other verb: the person's tap and the agent's call are the same call.
-        ] + agentPageVerbs + trustSettingsInboxVerbs + providersConnectorsCapabilitiesVerbs + cardVerbs
+        ] + agentPageVerbs + trustSettingsInboxVerbs + providersConnectorsCapabilitiesVerbs
         requireDeclaredArgumentShapes(actions)
         return actions
     }
@@ -1094,6 +1097,6 @@ extension AppActions {
                              "ability.read", "trace.recent", "desk.read", "memory.recall", "memory.commit",
                              "bot.reply", "agent.contacts", "agent.message", "agent.read", "agent.connect",
                              "agent.jobs", "mail.recent",
-                             "calendar.upcoming", "files.read", "files.list", "files.write", "chat.search",
+                             "calendar.upcoming", "files.read", "files.list", "files.write", "files.trash", "chat.search",
                              "result.page", "mac.look", "mac.system_info", "mac.volume", "mac.act", "mac.go", "sense.make"]
 }

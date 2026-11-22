@@ -151,7 +151,12 @@ extension iCloudBridge {
             let digest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
             guard UserDefaults.standard.string(forKey: Self.otherKeyDeletionDoneKey) != digest else { return }
             do {
-                let deleted = try await transport.deleteRecordsSignedWithOtherKeys(current: secret)
+                let storage = sync.storage
+                let deleted = try await transport.deleteRecordsSignedWithOtherKeys(current: secret, stillCurrent: {
+                    (try? await storage.perform { try PairingSecret.requireExistingSecret() }) == secret
+                })
+                // A pass a rotation stopped leaves its digest unrecorded, so the new key's own pass runs.
+                guard (try? await storage.perform { try PairingSecret.requireExistingSecret() }) == secret else { return }
                 UserDefaults.standard.set(digest, forKey: Self.otherKeyDeletionDoneKey)
                 nativeLog("[PairingBootstrap] Deleted %d iCloud transport record(s) signed with other pairing keys", deleted)
                 if deleted > 0 { syncStatus = "Deleted \(deleted) iCloud message record(s) left from earlier pairing keys." }
@@ -204,6 +209,13 @@ extension iCloudBridge {
 
     /// A phone message this Mac cannot verify still gets an answer the phone can act on: the unsigned pairing wake-up, after which the phone
     /// re-reads the pairing key from iCloud and sends again. It carries no command and nothing the phone could mistake for one.
+    /// The phone's word signed with a key this Mac does not hold, message or action alike: the connection is broken until the phone pairs again.
+    /// A message older than accepted contact is not the phone's latest word.
+    func notePhoneRejected(at timestamp: Date) {
+        let rejectedAt = min(timestamp, Date())
+        if rejectedAt > (lastPhoneRejectedAt ?? .distantPast) { lastPhoneRejectedAt = rejectedAt }
+    }
+
     func answerUnverifiablePhoneMessage(_ rejectedID: String) async {
         guard let deviceTransport, !phonePairedElsewhere, let sourceKey = try? NativeAgentICloudBridgeConstants.mobileSourceKey else { return }
         let hint = BridgeMessage.make(sender: "mac", text: "signature_invalid_resync", correlationID: rejectedID, metadata: [

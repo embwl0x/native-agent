@@ -474,8 +474,8 @@ extension iCloudSyncEngine {
 
     /// Missing/unreadable overview is not empty; it cannot replace a newer delivered copy.
     func applyWorkOverview(_ overview: WorkOverview?) {
-        guard let overview, let incoming = DeskActivityState.movementDate(overview.capturedAt) else { return }
-        if let current = workOverview.flatMap({ DeskActivityState.movementDate($0.capturedAt) }), incoming <= current {
+        guard let overview, let incoming = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(overview.capturedAt) else { return }
+        if let current = workOverview.flatMap({ NativeTimestampFormat.parseOptionalISO8601FractionalFirst($0.capturedAt) }), incoming <= current {
             if incoming < current {
                 NSLog("[iCloudSync] work overview refused older capturedAt=%@", overview.capturedAt)
             }
@@ -533,7 +533,6 @@ extension iCloudSyncEngine {
         }
         if let latest = acceptSnapshot(read, named: "runs.json") {
             runs = latest
-            runsSnapshotLoaded = true
             noteRefreshSucceeded()
             return (.refreshed, snapshotHealth.damageSentence(for: ["runs.json"]))
         }
@@ -739,7 +738,6 @@ extension iCloudSyncEngine {
         }, publish: { rows in
             guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return }
             if let v = acceptSnapshot(rows, named: "memory_proposals.json") {
-                memoryProposalsSnapshotLoaded = true
                 memoryProposals = orderedSnapshot(v, file: "memory_proposals.json", current: memoryProposals).filter(\.isPending)
             }
             published = true

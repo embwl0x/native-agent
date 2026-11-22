@@ -235,6 +235,13 @@ public enum SlackCredentials {
                 }
                 let registry = JSONValue.array(try ConnectorOAuthRegistry.checkedConnectorRows(from: savedRegistry).map(JSONValue.object))
                 _ = try TransportAllowlist.slackPolicy(fields: connector)
+                // A grant confirmed absent means this save never got past its Keychain step, so it published nothing: it is withdrawn
+                // rather than left to block a reconnect and every other connector change.
+                guard try DeviceSecretKeychain.read(service: service, account: grantAccount(reference, dataRoot: dataRoot)) != nil else {
+                    try FileManager.default.removeItem(at: path)
+                    try SwiftNativePersistenceCore.syncDirectory(path.deletingLastPathComponent())
+                    return
+                }
                 _ = try grant(reference, dataRoot: dataRoot)
                 // Canonical auth publishes metadata and grant together; the registry is last. A crash keeps the exact intent for retry.
                 let bytes = try JSONValue.object(connector).serializedData(pretty: true)

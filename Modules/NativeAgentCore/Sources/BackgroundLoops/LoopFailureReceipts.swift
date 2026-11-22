@@ -137,14 +137,6 @@ extension SwiftNativeLoopScheduler {
         return e.range(of: #"(server status|http) 5\d\d"#, options: .regularExpression) != nil
     }
 
-    /// Even an empty localized description must retain a named failure cause.
-    package static func describeLoopError(_ error: any Error) -> String {
-        let described = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !described.isEmpty { return described }
-        let ns = error as NSError
-        return "\(type(of: error)) (\(ns.domain) code \(ns.code))"
-    }
-
     /// Write each occurrence once; readers fold an incident without rewriting its earlier evidence.
     internal func appendFailureReceipt(loopId: String, error: String) async {
         guard !Self.isOfflineError(error) else { return }
@@ -194,9 +186,8 @@ extension SwiftNativeLoopScheduler {
         if !Self.isRetriedNetworkError(error) { await failureOutcome?(loopId, error) }
     }
 
-    /// A timeout records failure without advancing the durable due clock.
     func recordFailure(
-        loopId: String, error: String, advanceDurableRun: Bool = true
+        loopId: String, error: String
     ) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
         let now = clock()
@@ -206,9 +197,7 @@ extension SwiftNativeLoopScheduler {
         st.lastResult = "failed"
         st.nextTickAt = (loops[loopId]?.loop.wake.period).map { now.addingTimeInterval($0) }
         states[loopId] = st
-        if advanceDurableRun {
-            await recordDurableRun(loopId: loopId, at: now)
-        }
+        await recordDurableRun(loopId: loopId, at: now)
         await appendFailureReceipt(loopId: loopId, error: error)
         await recordFailureOutcome(loopId: loopId, error: error)
     }

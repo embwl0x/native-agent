@@ -205,7 +205,9 @@ extension NativeCognitionRuntime {
                 catch { state = nil; readFailure = "the Desk could not be read: " + error.localizedDescription }
                 let context: MyQueue.Context?, conditionsFailure: String?
                 do {
-                    context = try state.map { _ in try AgentScreen.queueContext(dataRoot: root, now: clock(), ownTurn: true) }
+                    if let state {
+                        context = try await AgentScreen.queueContext(items: state.items, dataRoot: root, now: clock(), ownTurn: true)
+                    } else { context = nil }
                     conditionsFailure = nil
                 } catch {
                     context = nil
@@ -348,9 +350,9 @@ extension NativeCognitionRuntime {
         }
         guard !pursuitRefreshInFlight, !pursuitRefreshQueued,
               pursuitReadRevision == revision, SwiftNativeDeskStore.currentRevision == revision else { return }
-        // Past the free time with a turn still open, the window's closing reads the Desk again.
-        let current = now()
-        await keepTimes(items, at: current, freeAt: due.waitingForFree && freeAt > current ? freeAt : nil)
+        // Select deadlines from the readiness boundary. OneClock fires a deadline that crossed during this pass
+        // on declaration, requesting a fresh Desk read. After freeAt, a live turn's closing is the next free edge.
+        await keepTimes(items, at: at, freeAt: due.waitingForFree && freeAt > at ? freeAt : nil)
     }
 
     private struct MomentAdmission {
@@ -382,7 +384,7 @@ extension NativeCognitionRuntime {
     /// they are and the moment still comes to her; everything else opens a thought.
     private func take(_ admission: MomentAdmission, at: Date) async {
         let moment = admission.moment
-        let once = MyQueueReady.once(moment.item.handle, moment.occurrence)
+        let once = MyQueueReady.once(moment.item, moment.occurrence)
         guard let entry = MyQueue.entry(moment.item) else { await post(moment.item, once: once, at: at, admission: admission); return }
         if entry.step.action != nil {
             await runHabit(entry, once: once, at: at, admission: admission)
@@ -437,8 +439,10 @@ extension NativeCognitionRuntime {
 
     private func runHabit(_ entry: MyQueue.Entry, once: String, at: Date, admission: MomentAdmission) async {
         let root = dataRoot, handle = entry.item.handle
+        let store = SwiftNativeDeskStore(dataRoot: root)
         do {
             let receipt: JSONValue
+            let ranNow: Bool
             if let run = try await MyQueueCarried.run(once: once, dataRoot: root) {
                 guard run.done != true else { return }
                 // A run kept before its effects is never repeated: it continues from what it returned, or goes to the agent if it never returned.
@@ -446,12 +450,13 @@ extension NativeCognitionRuntime {
                     throw PersistenceCoreError.ioFailure("The saved habit run has no receipt: " + once)
                 }
                 receipt = saved
+                ranNow = false
             } else {
                 guard await admits(admission) else { return }
                 let reserved = JSONValue.object(["status": .string("outcome_unknown"),
                     "detail": .string("This habit's attempt was interrupted. Reconcile its effects before repeating it."),
                     "call": entry.step.action ?? .null])
-                try await MyQueueCarried.keep(handle: handle, once: once, receipt: reserved, dataRoot: root)
+                try await MyQueueCarried.keep(entry.item, once: once, receipt: reserved, store: store)
                 guard await admits(admission) else {
                     // No call began. Withdraw only this exact reservation, so a fresh pass may admit unchanged work.
                     let withdrawn: Result<Void, Error> = await settle {
@@ -461,12 +466,8 @@ extension NativeCognitionRuntime {
                     try withdrawn.get()
                     return
                 }
-                let ran = await host.runCarriedAction(entry.step, handle: handle, dataRoot: root)
-                let unsaved: (any Error)? = await settle {
-                    do { try await MyQueueCarried.keep(handle: handle, once: once, receipt: ran, dataRoot: root); return nil } catch { return error }
-                }
-                if let unsaved { throw unsaved }
-                receipt = ran
+                receipt = await host.runCarriedAction(entry.step, handle: handle, dataRoot: root)
+                ranNow = true
             }
             let reply = ToolResult(receipt)
             let outcome = reply.payload.objectValue?["result"] ?? reply.payload
@@ -492,22 +493,44 @@ extension NativeCognitionRuntime {
             let looked = !ran.isEmpty && ran.allSatisfy {
                 $0["read_only"] == .bool(true) && $0["action"]?.stringValue?.hasPrefix("authored.") != true
             }
-            guard finished, !judgedEnd, !looked else {
+            // Fixed words from other origins need judgment even when the action finished.
+            let hasWords = entry.step.say.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false
+            let words = MyQueue.spoken(entry)
+            let completed = finished && !judgedEnd && !looked && (!hasWords || words != nil)
+            let note: String? = if completed { try Self.habitNote(returnedReply.payload, at: at) } else { nil }
+            let noteAwaitingSpeech = words == nil ? nil : note
+            let pending: MyQueueCarried.Settlement?
+            if ranNow || noteAwaitingSpeech != nil {
+                let saved: Result<MyQueueCarried.Settlement?, Error> = await settle {
+                    do {
+                        return .success(try await MyQueueCarried.keep(entry.item, once: once, receipt: receipt,
+                            noteAwaitingSpeech: noteAwaitingSpeech, store: store))
+                    } catch { return .failure(error) }
+                }
+                pending = try saved.get()
+            } else {
+                pending = nil
+            }
+            guard completed else {
                 await post(entry.item, once: once, at: at, receipt: reply.payload, admission: admission)
                 return
             }
-            // A step changed since the habit ran is a new moment; this run stays kept.
-            guard !isFlushedForTermination, !Task.isCancelled,
-                  let current = try await MyQueue.entry(handle, store: SwiftNativeDeskStore(dataRoot: root)), current.step == entry.step else { return }
-            if let words = entry.step.say, !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // Only the agent's own steps and promises to the person may say fixed words directly; anything else is the agent's to judge.
-                guard entry.step.origin == "self" || entry.owedToPerson else {
-                    await post(entry.item, once: once, at: at, receipt: reply.payload, admission: admission)
-                    return
+            if let words {
+                // Speaking is new work; only the still-current step can admit it.
+                if !isFlushedForTermination, !Task.isCancelled,
+                   let current = try await MyQueue.entry(handle, store: store), current.step == entry.step {
+                    await deliverSay(current, words: words, once: once, at: at,
+                        habitNote: pending?.notes.first ?? note, admission: admission)
                 }
-                await deliverSay(current, words: words, once: once, at: at, habitResult: returnedReply.payload, admission: admission)
+                if let pending {
+                    let unsaved: (any Error)? = await settle {
+                        do { try await MyQueueCarried.finish(pending, store: store); return nil }
+                        catch { return error }
+                    }
+                    if let unsaved { throw unsaved }
+                }
             } else {
-                await settle { await self.settleCarriedDelivery(current, once: once, words: nil, habitResult: returnedReply.payload, at: at) }
+                await settle { await self.settleCarriedDelivery(entry, once: once, words: nil, habitNote: note, at: at) }
             }
         } catch {
             owe("habit", handle, "Its habit needs reconciliation: " + error.localizedDescription)
@@ -529,7 +552,7 @@ extension NativeCognitionRuntime {
 
     /// Fixed words land in the current conversation between turns. Speech is keyed by the moment, so an uncertain delivery is reconciled at its original
     /// destination before any repeat; words that could not be said stay due and are tried again at the next read, never turned into a thought.
-    private func deliverSay(_ entry: MyQueue.Entry, words: String, once: String, at: Date, habitResult: JSONValue? = nil,
+    private func deliverSay(_ entry: MyQueue.Entry, words: String, once: String, at: Date, habitNote: String? = nil,
                             admission: MomentAdmission) async {
         let root = dataRoot, handle = entry.item.handle
         let key = SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: "intention.say:" + handle, content: once)
@@ -538,7 +561,7 @@ extension NativeCognitionRuntime {
             return
         }
         do {
-            if habitResult == nil, try await MyQueueCarried.run(once: once, dataRoot: root)?.done == true {
+            if habitNote == nil, try await MyQueueCarried.run(once: once, dataRoot: root)?.done == true {
                 await post(entry.item, once: once, at: at, admission: admission)
                 return
             }
@@ -564,7 +587,7 @@ extension NativeCognitionRuntime {
                 // A duplicate proves the append committed; finish any interrupted Desk settlement.
                 break
             }
-            await settle { await self.settleCarriedDelivery(entry, once: once, words: words, habitResult: habitResult, at: at) }
+            await settle { await self.settleCarriedDelivery(entry, once: once, words: words, habitNote: habitNote, at: at) }
         } catch {
             nativeLog("intention say: %@ stays due: %@", handle, error.localizedDescription)
         }
@@ -581,23 +604,25 @@ extension NativeCognitionRuntime {
         ]))
     }
 
-    private func settleCarriedDelivery(_ entry: MyQueue.Entry, once: String, words: String?, habitResult: JSONValue? = nil, at: Date) async {
+    private static func habitNote(_ result: JSONValue, at: Date) throws -> String {
+        let clock = DateFormatter(); clock.locale = Locale(identifier: "en_US_POSIX"); clock.dateFormat = "h:mm a"
+        let fields = result.objectValue
+        let summary = try fields?["summary"]?.stringValue ?? fields?["detail"]?.stringValue
+            ?? fields?["confirmation"]?.stringValue ?? result.serialize(pretty: false)
+        return "Ran \(clock.string(from: at)): " + String(summary.split(whereSeparator: \.isNewline).joined(separator: " ").prefix(500))
+    }
+
+    private func settleCarriedDelivery(_ entry: MyQueue.Entry, once: String, words: String?, habitNote: String?, at: Date) async {
         do {
-            var notes: [String] = []
-            if let result = habitResult {
-                let clock = DateFormatter(); clock.locale = Locale(identifier: "en_US_POSIX"); clock.dateFormat = "h:mm a"
-                let fields = result.objectValue
-                let summary = try fields?["summary"]?.stringValue ?? fields?["detail"]?.stringValue
-                    ?? fields?["confirmation"]?.stringValue ?? result.serialize(pretty: false)
-                notes.append("Ran \(clock.string(from: at)): " + String(summary.split(whereSeparator: \.isNewline).joined(separator: " ").prefix(500)))
-            }
+            var notes = [habitNote].compactMap { $0 }
             if let words {
                 notes.append("Said \(MyQueue.shown(at)): \"\(words)\"")
             }
             // Spend the moment and record its Desk debt in one write; recovery closes only the unchanged once-step.
+            let store = SwiftNativeDeskStore(dataRoot: dataRoot)
             let debt = try await MyQueueCarried.delivered(entry.item, once: once, notes: notes,
-                reason: habitResult == nil ? "said" : "habit finished", dataRoot: dataRoot)
-            try await finishCarriedSettlement(debt)
+                reason: habitNote == nil ? "said" : "habit finished", store: store)
+            try await MyQueueCarried.finish(debt, store: store)
         } catch {
             owe("settlement", entry.item.handle, "Its delivery finished but its Desk settlement remains owed: " + error.localizedDescription)
         }
@@ -607,37 +632,13 @@ extension NativeCognitionRuntime {
     func finishOwedCarriedSettlements() async {
         await settle {
             do {
-                for debt in try await MyQueueCarried.owedSettlements(dataRoot: self.dataRoot) {
-                    do { try await self.finishCarriedSettlement(debt) }
+                let store = SwiftNativeDeskStore(dataRoot: self.dataRoot)
+                for debt in try await MyQueueCarried.owedSettlements(dataRoot: store.dataRoot) {
+                    do { try await MyQueueCarried.finish(debt, store: store) }
                     catch { nativeLog("intention settlement: %@ remains owed: %@", debt.id, error.localizedDescription) }
                 }
             } catch { nativeLog("intention settlements unreadable: %@", error.localizedDescription) }
         }
-    }
-
-    private func finishCarriedSettlement(_ debt: MyQueueCarried.Settlement) async throws {
-        guard let item = DeskItem.fromJSON(debt.item), let entry = MyQueue.entry(item) else {
-            throw PersistenceCoreError.ioFailure("The intention's settlement snapshot is unreadable.")
-        }
-        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        // Never close a refiled or replacement intention through this handle.
-        if let current = try await MyQueue.entry(item.handle, store: store), current.step == entry.step {
-            for note in debt.notes {
-                _ = try await store.appendNoteIfAbsent(item.handle, marker: note, text: note, author: "agent", after: item.updatedAt)
-            }
-            if debt.reason != "said", case .once = MyQueue.until(entry) {
-                // Close only the still-matching intention; one retry covers a concurrent write between read and close.
-                for attempt in 0..<2 {
-                    guard let current = try await MyQueue.entry(entry.item.handle, store: store),
-                          current.step == entry.step else { break }
-                    do {
-                        try await MyQueue.finish(current, dropped: false, why: debt.reason, store: store)
-                        break
-                    } catch is MyQueue.Superseded where attempt == 0 { continue }
-                }
-            }
-        }
-        try await MyQueueCarried.settled(debt, dataRoot: dataRoot)
     }
 
     /// Each open step's next time, the agent's next free time when work waits for it, and the next offer of a moment still owed to her (1, 1, 2, 4,

@@ -258,7 +258,6 @@ extension AppModel: MacChatSessionSelectionPort {
             // Seed before publishing because the next suspension lets the composer start a turn that owns these rows.
             engine.transcripts.setMessages([], for: session.id)
             activeChatSessionId = session.id
-            MacChatSelectionIntent.lastSeenAnchorSessionId = engine.transcripts.conversationAnchor?.sessionId
             await refreshChatSessionIndex()
             migrateEmptySessionChatState(to: activeChatSessionId)
             statusText = "New chat session ready"

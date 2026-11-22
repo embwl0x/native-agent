@@ -99,6 +99,21 @@ public enum RepairOwed {
         }
     }
 
+    /// Confirm durable settlement of this owner's repair before the source records completion.
+    static func settleChecked(_ dataRoot: URL, operation: String, owner: String, evidence: Experience.Ref) async throws {
+        try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, any Error>) in
+            ExperienceStore.record(dataRoot, "repair:" + operation) { store in
+                do {
+                    for owed in try await store.openRepair(operation: operation)
+                        where isOwed(owed) && RepairDebt(owed).matches(operation: operation, owner: owner) {
+                        try await store.append([.obligation(key: "repair", phase: .accepted, evidence: evidence)], to: owed.id, durable: true)
+                    }
+                    completion.resume()
+                } catch { completion.resume(throwing: error) }
+            }
+        }
+    }
+
     /// An owner's success that proves the owner itself works settles every repair that owner owes, whatever operation named it.
     /// It runs in `operation`'s repair queue, so it follows every obligation of that operation already recorded.
     public static func settle(_ dataRoot: URL, owner: String, after operation: String, evidence: Experience.Ref) -> Task<Void, Never> {

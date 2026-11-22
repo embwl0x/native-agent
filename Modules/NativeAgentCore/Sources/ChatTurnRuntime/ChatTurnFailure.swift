@@ -129,19 +129,6 @@ public enum ChatTurnFailure: Equatable {
         }
     }
 
-    public var confirmationMessage: String {
-        switch self {
-        case .classificationFailed(let cause):
-            return "I can't classify what ran: \(cause). Starting over could repeat a step. Check its outcome before continuing."
-        case .acted(let names) where !names.isEmpty:
-            return "It already did: \(names.joined(separator: ", ")). Starting over could do that again. "
-                + "Continue from here starts a new turn that is told what already ran."
-        default:
-            return "Part of this may already have happened. Starting over could repeat it. "
-                + "Continue from here starts a new turn from the conversation so far; nothing guarantees it won't repeat a step."
-        }
-    }
-
     public static let continuePrompt =
         "Continue from where you stopped. Don't repeat any step that already ran."
 
@@ -167,11 +154,6 @@ public enum ChatTurnFailure: Equatable {
               let range = Range(match.range(at: 1), in: json) else { return nil }
         let id = json[range].trimmingCharacters(in: .whitespacesAndNewlines)
         return id.isEmpty ? nil : id
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value else { return nil }
-        return text
     }
 
     public static func isFailed<Message: ChatTurnFailureMessage>(_ message: Message) -> Bool {
@@ -212,8 +194,8 @@ public enum ChatTurnFailure: Equatable {
         case .failed:
             if MacControlReceiptOutcome.projecting(envelope: value) == .refused { return false }
             if case .object(let fields) = value,
-               string(fields["status"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "failed",
-               let error = string(fields["error"]), error.hasPrefix("tool denied: "),
+               fields["status"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "failed",
+               let error = fields["error"]?.stringValue, error.hasPrefix("tool denied: "),
                fields["reason"] == .string(error) { return false }
             return true
         default: return true

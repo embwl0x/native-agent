@@ -2,10 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(AppKit)
 import AppKit
 import ApplicationServices
-#endif
 // Blueprint: | `MacAppActGate.swift` | Saved Write switches govern all acts; retain target/authority failures without cold-index waits |
 
 public struct MacAppActRefusal: Error, LocalizedError, Sendable {
@@ -52,7 +50,9 @@ public enum MacAppActGate {
         let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(origin: origin, turn: turn)
         guard authority.state != .unavailable else { throw SwiftNativeTrustCenter.policyUnavailable(authority.reason) }
         return try await context.holding(\.dataRoot, dataRoot) { context in
-            try await turn.holding(\.fullMacAdmitted, authority.admitted, { turn in try await operation(turn, context) })
+            try await context.holding(\.seesAsPerson, authority.admitted) { context in
+                try await turn.holding(\.fullMacAdmitted, authority.admitted, { turn in try await operation(turn, context) })
+            }
         }
     }
 
@@ -152,7 +152,6 @@ public enum MacAppActGate {
             if holdingAllowsLooking(input) { return nil }
             // A named act uses that app (raising it first for front:true). A native hand retains the executor's required foreground pid. Neither sends the
             // chord to an unrelated app currently in front.
-            #if canImport(AppKit)
             if operation == "act", let name = input["app"]?.stringValue,
                !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return namedAppRefusal(name, dataRoot: dataRoot, context: context)
@@ -161,9 +160,6 @@ public enum MacAppActGate {
                 return refusal(pid: pid, dataRoot: dataRoot, context: context)
             }
             return refusal(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, dataRoot: dataRoot, context: context)
-            #else
-            return noAppKit()
-            #endif
         }
         // Frame/mark ownership is resolved by its owner at execution, not guessed from whichever app happens to be in front during preflight.
         if let id = input["frame_id"]?.stringValue, input["handle"] != nil {
@@ -185,7 +181,6 @@ public enum MacAppActGate {
             }
             return refusal(pid: pid, dataRoot: dataRoot, context: context)
         }
-        #if canImport(AppKit)
         func coordinates(_ value: JSONValue?) -> (Double, Double)? {
             guard let fields = value?.objectValue,
                   let x = fields["x"]?.numberValue(coercingStrings: false, finiteOnly: true),
@@ -221,9 +216,6 @@ public enum MacAppActGate {
             return context.holding(\.dataRoot, dataRoot) { context in pointRefusal(x: x, y: y, context: context) }
         }
         return refusal(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, dataRoot: dataRoot, context: context)
-        #else
-        return noAppKit()
-        #endif
     }
 
     /// Looking never asks for Write. Missing/corrupt authority throws through the same disk reader used by the switch; it is never read as permission.
@@ -231,13 +223,11 @@ public enum MacAppActGate {
         context: MacOperationContext) -> MacAppActRefusal? {
         guard !looking else { return nil }
         guard !bundleID.isEmpty else { return unavailable("the bundle_id is empty", next: "Give the bundle_id of the app it drives") }
-        #if canImport(AppKit)
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first(where: {
             PersonOnlyWindows.isOwnProcess($0.processIdentifier)
         }) {
             return refusal(pid: app.processIdentifier, throughAppleEvents: throughAppleEvents, dataRoot: dataRoot, context: context)
         }
-        #endif
         // System Events can relay GUI mutations to another process. Its own bundle is not evidence of the affected app; native hands resolve it.
         if throughAppleEvents, bundleID == "com.apple.systemevents" {
             return unavailable("System Events relays input to another app, so its bundle id does not say which",
@@ -273,7 +263,6 @@ public enum MacAppActGate {
                     + "on the person's own authenticated message. Otherwise ask them to tap it.", integration: nil)
         }
         guard !looking else { return nil }
-        #if canImport(AppKit)
         guard let pid, pid > 0 else {
             return unavailable("no app process owns this target", next: "Look again and act on an app the look shows")
         }
@@ -284,19 +273,12 @@ public enum MacAppActGate {
             return unavailable("process \(pid) has no bundle identifier", next: "Use native hands on an observed app or a named player's action")
         }
         return refusal(bundleID: bundle, throughAppleEvents: throughAppleEvents, dataRoot: dataRoot, context: context)
-        #else
-        return noAppKit()
-        #endif
     }
 
     /// Every refusal of this kind names the fact that failed and the next step, so the caller fixes that fact instead of guessing.
     static func unavailable(_ fact: String, next: String) -> MacAppActRefusal {
         MacAppActRefusal(code: "app_action_target_unavailable",
             message: "I can't establish which app this input would reach: \(fact). \(next); this input was not admitted.", integration: nil)
-    }
-
-    static func noAppKit() -> MacAppActRefusal {
-        unavailable("this build has no AppKit to resolve apps", next: "Use a named player's action")
     }
 
     /// Retain a refusal as the act's outcome, never as a permission cache.
@@ -306,7 +288,6 @@ public enum MacAppActGate {
         return false
     }
 
-    #if canImport(AppKit)
     private static func namedAppRefusal(_ name: String, dataRoot: URL, context: MacOperationContext) -> MacAppActRefusal? {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let matches = NSWorkspace.shared.runningApplications.filter {
@@ -317,7 +298,7 @@ public enum MacAppActGate {
         if matches.count == 1 { return refusal(pid: matches[0].processIdentifier, dataRoot: dataRoot, context: context) }
         // A named stopped app can still have a known owner; no launch is needed.
         do {
-            if let url = try MacApplications.installedApplicationURL(named: name, context: context),
+            if let url = try MacApplications.installedApplicationURL(named: name),
                let bundle = Bundle(url: url)?.bundleIdentifier {
                 return refusal(bundleID: bundle, dataRoot: dataRoot, context: context)
             }
@@ -339,7 +320,12 @@ public enum MacAppActGate {
     }
 
     static func frontRefusal(context: MacOperationContext) -> MacAppActRefusal? {
-        return refusal(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, looking: context.looking, context: context)
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if let expected = context.requiredFrontPid, pid != expected {
+            return MacAppActRefusal(code: "front_changed",
+                message: "The intended app is no longer in front. This key was not posted.", integration: nil)
+        }
+        return refusal(pid: pid, looking: context.looking, context: context)
     }
     static func pointRefusal(x: Double, y: Double, context: MacOperationContext) -> MacAppActRefusal? {
         // The AX hit supplies a process, not a named control. Canvases need no label.
@@ -356,5 +342,4 @@ public enum MacAppActGate {
         }
         return refusal(pid: pid, looking: context.looking, context: context)
     }
-    #endif
 }

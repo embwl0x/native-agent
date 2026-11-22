@@ -170,12 +170,12 @@ public final class AppToolExecutor: ChatToolExecuting {
                 try doorReadOnly(call.filter { !["expect", "as", "cleanup"].contains($0.key) }, turn: turn) } else { false } }
         }
         var input = ToolNameAliases.doorCall("app", input)
-        if doorText(input["action"]).isEmpty {
-            let place = AppDoorNames.place(page: doorText(input["page"]), item: doorText(input["item"]))
+        if JSONValue.trimmedScalarTextOrEmpty(input["action"]).isEmpty {
+            let place = AppDoorNames.place(page: JSONValue.trimmedScalarTextOrEmpty(input["page"]), item: JSONValue.trimmedScalarTextOrEmpty(input["item"]))
             input["page"] = .string(place.page)
             input["item"] = .string(place.item)
         }
-        let action = doorText(input["action"])
+        let action = JSONValue.trimmedScalarTextOrEmpty(input["action"])
         if !action.isEmpty {
             let args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
             return try AppActions.action(action, turn: turn)?.readOnly(args: args) == true
@@ -199,12 +199,6 @@ public final class AppToolExecutor: ChatToolExecuting {
     }.sorted { $0.name < $1.name }
 
     public var replacesCoreTools: Set<String> { Set(Self.notificationToolNames) }
-
-    public func execute(
-        tool: String, input: [String: JSONValue], surface: String, turn: Turn
-    ) async throws -> JSONValue {
-        try await execute(tool: tool, input: input, surface: surface, turn: turn, execution: actionExecution)
-    }
 
     public func execute(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
         invocation: ChatToolInvocation) async throws -> JSONValue {
@@ -336,55 +330,7 @@ public final class AppToolExecutor: ChatToolExecuting {
         // A folded tool runs as itself: the chain is re-entered under its own name, so its gates, Trust key and cards judge it, and what comes back is its own
         // result. A card it files replays that call, not this one.
         if action.isFold || action.id == "agent.verify" {
-            guard let perform = execution.perform else {
-                return Self.doorRefusal("door_unavailable",
-                    "This call did not come from inside a chat turn, so it has no gate to pass. Nothing ran.",
-                    remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
-            }
-            // Preview contact sends under agent_message's own gates.
-            if action.id == "agent.verify" {
-                return try await AgentContactHealth.repair(turn: turn, mac: execution.macOperation(dataRoot: securityCenter.dataRoot),
-                    conversation: execution.invocation.conversation, input["agent"]?.scalarText ?? "",
-                    dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-                    workspace: input["workspace"]?.scalarText, perform: { name, arguments, callTurn, conversation, mac in
-                        var execution = execution
-                        execution.invocation = execution.invocation.serving(conversation: conversation).serving(mac: mac)
-                        return try await perform(name, arguments, callTurn, execution)
-                    })
-            }
-            var call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
-                                                      sessionId: input["__session_id"]?.scalarText)
-            // A verb a part answers meets the workspace's names as its native executor did: names it takes are bound before it runs, and the rows it
-            // reads are named after.
-            let verb = action.partAction ? action.input["verb"]?.stringValue : nil
-            let workspace = ChatWorkspaceBinding.operation(turn: turn, invocation: execution.invocation)
-            if let verb, AgentWorkspace.takesNames.contains(verb) {
-                call = AgentWorkspace.bindMail(workspace: workspace, call, dataRoot: securityCenter.dataRoot)
-            }
-            do {
-                let result = try await perform(action.tool, call, turn, execution)
-                // Home does not tell the agent of a Desk change its own mind just made: a turn a model is running, not the person's tap and
-                // not another agent's call that reached this tool without her.
-                if action.id.hasPrefix("desk."), turn.personAct == nil, turn.admission != nil, case .object(let done) = result,
-                   done["status"] == .string("ok"),
-                   let handle = done["handle"]?.stringValue {
-                    await AgentScreen.sawOwnDeskChange(handle, dataRoot: securityCenter.dataRoot)
-                }
-                if action.partAction, execution.valueCall?.id != action.tool,
-                   case .object(let fields) = result, let returned = fields["returned"] {
-                    var answer: [String: JSONValue] = if case .object(let answer) = returned { answer } else { ["result": returned] }
-                    if fields["status"] == .string("ok") || fields["status"] == .string("refused") && answer["status"] == .string("failed") {
-                        // The part supplies its payload; only the runner can attest its effects and how many times it carried itself.
-                        for key in ["effects", "calls", "changed", "runs", "handed_back", "ability_run"] { answer[key] = fields[key] }
-                        guard let verb, AgentWorkspace.namesRows.contains(verb) else { return .object(answer) }
-                        AgentReadBadges.shared.note(.object(answer), dataRoot: securityCenter.dataRoot)
-                        return AgentWorkspace.attachReadReferences(workspace: workspace, tool: verb, input: call, result: .object(answer),
-                                                                   dataRoot: securityCenter.dataRoot)
-                    }
-                }
-                return result
-            }
-            catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
+            return try await runFoldedChain(action, input: input, turn: turn, execution: execution)
         }
         // A setting and a card hold the posture gate themselves, and say it in their own words (a setting's requested and current values; a card's origin and
         // Full Mac checks).
@@ -393,95 +339,88 @@ public final class AppToolExecutor: ChatToolExecuting {
         if action.isCard { return await runCardAction(input: input, surface: surface, turn: turn) }
         try Task.checkCancellation()
         let verb = action.input["verb"]?.scalarText ?? ""
+        if let native = try await runFoldedNative(action, verb: verb, input: input, surface: surface, turn: turn, execution: execution) {
+            return native
+        }
+        guard let host = quietHost() else { return Self.unattachedFailure() }
+        return await runFoldedHost(action, verb: verb, host: host, input: input, surface: surface, turn: turn, execution: execution)
+    }
+
+    /// A folded tool re-enters the chain under its own name; agent.verify repairs a contact under agent_message's own gates.
+    @MainActor
+    private func runFoldedChain(_ action: AppAction, input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+        guard let perform = execution.perform else {
+            return Self.doorRefusal("door_unavailable",
+                "This call did not come from inside a chat turn, so it has no gate to pass. Nothing ran.",
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
+        }
+        // Preview contact sends under agent_message's own gates.
+        if action.id == "agent.verify" {
+            return try await AgentContactHealth.repair(turn: turn, mac: execution.macOperation(dataRoot: securityCenter.dataRoot),
+                conversation: execution.invocation.conversation, input["agent"]?.scalarText ?? "",
+                dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                workspace: input["workspace"]?.scalarText, perform: { name, arguments, callTurn, conversation, mac in
+                    var execution = execution
+                    execution.invocation = execution.invocation.serving(conversation: conversation).serving(mac: mac)
+                    return try await perform(name, arguments, callTurn, execution)
+                })
+        }
+        var call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
+                                                  sessionId: input["__session_id"]?.scalarText)
+        // A verb a part answers meets the workspace's names as its native executor did: names it takes are bound before it runs, and the rows it
+        // reads are named after.
+        let verb = action.partAction ? action.input["verb"]?.stringValue : nil
+        let workspace = ChatWorkspaceBinding.operation(turn: turn, invocation: execution.invocation)
+        if let verb, AgentWorkspace.takesNames.contains(verb) {
+            call = AgentWorkspace.bindMail(workspace: workspace, call, dataRoot: securityCenter.dataRoot)
+        }
+        do {
+            let result = try await perform(action.tool, call, turn, execution)
+            // Home does not tell the agent of a Desk change its own mind just made: a turn a model is running, not the person's tap and
+            // not another agent's call that reached this tool without her.
+            if action.id.hasPrefix("desk."), turn.personAct == nil, turn.admission != nil, case .object(let done) = result,
+               done["status"] == .string("ok"),
+               let handle = done["handle"]?.stringValue {
+                await AgentScreen.sawOwnDeskChange(handle, dataRoot: securityCenter.dataRoot)
+            }
+            if action.partAction, execution.valueCall?.id != action.tool,
+               case .object(let fields) = result, let returned = fields["returned"] {
+                var answer: [String: JSONValue] = if case .object(let answer) = returned { answer } else { ["result": returned] }
+                if fields["status"] == .string("ok") || fields["status"] == .string("refused") && answer["status"] == .string("failed") {
+                    // The part supplies its payload; only the runner can attest its effects and how many times it carried itself.
+                    for key in ["effects", "calls", "changed", "runs", "handed_back", "ability_run"] { answer[key] = fields[key] }
+                    guard let verb, AgentWorkspace.namesRows.contains(verb) else { return .object(answer) }
+                    AgentReadBadges.shared.note(.object(answer), dataRoot: securityCenter.dataRoot)
+                    return AgentWorkspace.attachReadReferences(workspace: workspace, input: call, result: .object(answer),
+                                                               dataRoot: securityCenter.dataRoot)
+                }
+            }
+            return result
+        }
+        catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
+    }
+
+    /// The actions the app answers in process, by tool; nil leaves the action to the host.
+    @MainActor
+    private func runFoldedNative(_ action: AppAction, verb: String, input: [String: JSONValue], surface: String, turn: Turn,
+                                 execution: AppActionExecution) async throws -> JSONValue? {
         switch action.tool {
         case "app_find":
-            let what = Self.doorText(input["what"])
-            let query = what.isEmpty ? Self.doorText(input["query"]) : what
+            let what = JSONValue.trimmedScalarTextOrEmpty(input["what"])
+            let query = what.isEmpty ? JSONValue.trimmedScalarTextOrEmpty(input["query"]) : what
             guard !query.isEmpty else {
                 return Self.doorRefusal("invalid_args", "Discovery needs words in args.what or args.query. Nothing was searched.",
-                    remedy: "correct_arguments", "Use app {find:\"what you want to do\"}.", next: ["find": .string("what you want to do")])
+                    remedy: "correct_arguments", "Use app {find:\"what you want to do\"} with your own words.")
             }
-            return try await doorFind(query, turn: turn, execution: execution)
+            return try await doorFind(query, turn: turn)
         case "chat_post":
-            let root = securityCenter.dataRoot
-            guard !turn.id.isEmpty else {
-                throw ChatOrchestrationError.underlying("chat.post requires a current turn. Nothing was posted.")
-            }
-            let destination = try await Self.personConversation(dataRoot: root)
-            let message = input["message"]?.scalarText ?? ""
-            // Post into the user's thread with that thread's route so delivery reaches the user's Mac, phone and Telegram.
-            let route = try await HumanConversationReader.read(sessionID: destination, dataRoot: root).route
-            // Resolve notification provenance before producing the post. An unavailable route is not evidence that this conversation has no Telegram door.
-            let telegram = try await HumanConversationReader.read(sessionID: destination, dataRoot: root, surface: "telegram").route
-            let result = try await proactiveSpeechClient(root).speakProactively(
-                content: message, caller: .reachOut,
-                idempotencyKey: SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: "chat.post:" + turn.id, content: message),
-                sessionId: destination,
-                turn: turn.with(\.envelope, route))
-            switch result {
-            case .posted(let session, let run):
-                // Knock at the person's doors, including the target thread's Telegram door when present.
-                let knock: AttentionOutcome
-                do {
-                    knock = try await attention().tell(Matter(id: "chat.post:" + run, form: .words, from: "chat.post",
-                        title: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root), summary: message,
-                        open: "chat:" + session),
-                        reach: .person(from: AttentionOrigin(replyRoute: (telegram ?? route)?.replyRoute, sessionId: session)), turn: turn)
-                } catch {
-                    return .object(["status": .string("ok"), "effects": .string("occurred"), "session_id": .string(session),
-                        "run_id": .string(run), "knock": .string("failed"), "knock_error": .string(error.localizedDescription)])
-                }
-                return .object(["status": .string("ok"), "effects": .string("occurred"), "session_id": .string(session), "run_id": .string(run),
-                                "knock": .string(knock.deliveryProjection.rawValue),
-                                "destinations": .object(knock.destinationFields)])
-            case .duplicate(let session):
-                return .object(["status": .string("ok"), "effects": .string("none"), "session_id": .string(session), "duplicate": .bool(true)])
-            }
+            return try await runChatPost(input: input, turn: turn)
         case "mac_apps":
-            let name = input["name"]?.scalarText ?? ""
-            let inventory = try await MacAppIndex.shared.inventory(context: execution.macOperation(dataRoot: securityCenter.dataRoot))
-            let every = inventory.apps.filter { name.isEmpty || $0.name.localizedCaseInsensitiveContains(name) }
-            let all = input["all"] == .bool(true)
-            let apps = all ? every : MacAppIndex.installed(every)
-            let twice = MacAppIndex.collisions(apps)
-            // Disambiguate duplicate shown names by file name, then folder, so launch targets remain explicit.
-            var fileNames: [String: Int] = [:]
-            for app in apps where twice.contains(app.name.lowercased()) {
-                fileNames[app.url.deletingPathExtension().lastPathComponent.lowercased(), default: 0] += 1
-            }
-            // Duplicate bundle ids make id-based launch ambiguous; expose that ambiguity on the row.
-            var ids: [String: Int] = [:]
-            for app in apps { ids[app.bundleID ?? "", default: 0] += 1 }
-            let rows: [JSONValue] = apps.map { app in
-                guard case .object(var fields) = app.json else { return app.json }
-                if ids[app.bundleID ?? "", default: 0] > 1 { fields["bundle_id_shared"] = .bool(true) }
-                guard twice.contains(app.name.lowercased()) else { return .object(fields) }
-                let file = app.url.deletingPathExtension().lastPathComponent
-                let folder = UserDisplayFormatters.tildifyPath(app.url.deletingLastPathComponent().standardizedFileURL.path)
-                fields["shown_name"] = fields["name"]
-                fields["name"] = .string(fileNames[file.lowercased(), default: 0] > 1 ? "\(file) (\(folder))" : file)
-                fields["name_collision"] = .bool(true)
-                return .object(fields)
-            }
-            let unclassified = every.filter { !$0.classificationFailures.isEmpty }
-            let complete = unclassified.isEmpty && inventory.directoryGaps.isEmpty
-            return .object(["status": .string(complete ? "ok" : "partial"), "apps": .array(rows), "count": .int(Int64(apps.count)),
-                            "classification_complete": .bool(complete),
-                            "classification_unavailable": .array(unclassified.map(\.json)),
-                            "directory_gaps": .array(inventory.directoryGaps.map(JSONValue.string)),
-                            "other_copies_and_ios": .int(Int64(every.filter { $0.kind == "copy" || $0.platform == "ios" }.count)),
-                            "source": .string("the Mac's app index (Spotlight): the installed copy of each Mac app, as the Apps screen shows them"
-                                + (all ? """
-                                    , plus every other copy (builds, backups) and iOS build the Mac indexes, tagged by kind and platform
-                                    """ : "; all:true lists other copies and iOS builds too")
-                                + """
-                                    ; unavailable classification is reported separately and excluded from the installed projection; an app on a volume \
-                                    Spotlight does not index is not listed
-                                    """)])
+            return try await runMacApps(input: input, execution: execution)
         case "undo":
             return try await doorUndo(input: input, turn: turn, execution: execution)
         case "read_file" where action.id == "reply.attach":
-            return await runReplyAttach(input: input, turn: turn, execution: execution)
+            return await runReplyAttach(input: input, turn: turn)
         case "claude_worklog":
             return await AgentConversationView.claudeWorklog(input: input)
         case "chat_working_memory":
@@ -539,16 +478,16 @@ public final class AppToolExecutor: ChatToolExecuting {
         case "sense_make":
             return await runSenseMake(input: input, turn: turn, execution: execution)
         case "sense_lifecycle":
-            return try await runSenseLifecycle(input: input, turn: turn, execution: execution)
+            return try await runSenseLifecycle(input: input, turn: turn)
         case "app_page_screenshot":
             let reply = ToolResult(await presentation.pageScreenshot(input: input, imageSink: execution.localImageSink))
             guard case .object(var fields) = reply.payload, reply.remedy == nil else { return reply.payload }
-            let page = Self.doorText(input["page"])
-            switch Self.doorText(fields["reason"]) {
+            let page = JSONValue.trimmedScalarTextOrEmpty(input["page"])
+            switch JSONValue.trimmedScalarTextOrEmpty(fields["reason"]) {
             case "unknown_tab":
                 fields["remedy"] = Repair.remedy(owner: "page \(page) tabs",
                     nextCall: .object(["tool": .string("app"), "input": .object(["page": .string(page)])]), tap: nil,
-                    instruction: "Read this page and choose a key from tabs for args.tab; omit tab only to draw the default tab.")
+                    instruction: "Leave tab out to draw the whole page; name a tab only when the refusal lists this page's tabs.")
             case "render_failed":
                 fields["remedy"] = Repair.remedy(owner: "page \(page) renderer",
                     nextCall: .object(["tool": .string("app"), "input": .object(["page": .string(page)])]), tap: nil,
@@ -583,44 +522,7 @@ public final class AppToolExecutor: ChatToolExecuting {
         case "turn_reconcile":
             return await runTurnReconcile(input: input)
         case "home_arrive":
-            let line = (input["line"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let part = turn.partID else {
-                return Self.doorRefusal("not_a_part", "home.arrive is a part's way to you; this call came from no part's run. Nothing was filed.",
-                    remedy: "none", "Say it in this turn instead.")
-            }
-            guard !line.isEmpty else {
-                return Self.doorRefusal("invalid_args", "Pass line: what it should tell you. Nothing was filed.",
-                    remedy: "correct_arguments", "Call home.arrive with line.")
-            }
-            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let format = DateFormatter()
-            format.dateFormat = "yyyy-MM-dd"
-            let day = format.string(from: Date())
-            let eventKey = input["event_key"]?.scalarText
-            if input["event_key"] != nil, eventKey?.isEmpty != false || (eventKey?.utf8.count ?? 0) > 1024 {
-                return Self.failure("invalid_args", "event_key must be a nonempty string of at most 1024 bytes.")
-            }
-            let identity = Data((eventKey ?? line).utf8)
-            let digest = SHA256.hash(data: identity).prefix(8).map { String(format: "%02x", $0) }.joined()
-            // A part's line is a world happening, judged by the agent's weigh and never by this door. Peers that steered the run travel with it, so
-            // the thought that reads it carries their authority, never more.
-            let happening = Happening(.world, subject: "part:" + part, door: "part:" + part, words: part + ": " + line,
-                once: "part:" + part + ":" + (eventKey == nil ? day : "event") + ":" + digest,
-                peers: turn.peerSteering?.checkpointSources, elevated: turn.peerSteering?.elevatedSources)
-            do {
-                guard try await ExperienceStore.at(root).experience(happening.id) == nil else {
-                    return .object(["status": .string("ok"), "effects": .string("none"), "detail": .string("This arrival is already known.")])
-                }
-            } catch {
-                return Self.failure("record_unreadable", """
-                    The record could not say whether this arrival is already known (\(error.localizedDescription)), so nothing was filed. Call it again \
-                    once the record reads.
-                    """)
-            }
-            Attention.post(happening, dataRoot: root)
-            return .object(["status": .string("ok"), "effects": .string("occurred"), "detail": .string("""
-                In your mind: your weigh judges what it is worth, and worth that gathers on what it means opens a thought.
-                """)])
+            return await runHomeArrive(input: input, turn: turn)
         case "list_memories", "rewrite_memory":
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             return try await Self.curateMemory(tool: action.tool, root: root, input: input, surface: surface,
@@ -628,7 +530,140 @@ public final class AppToolExecutor: ChatToolExecuting {
         default:
             break
         }
-        guard let host = quietHost() else { return Self.unattachedFailure() }
+        return nil
+    }
+
+    /// chat.post: the agent's words into the person's own conversation, with a knock at their doors.
+    @MainActor
+    private func runChatPost(input: [String: JSONValue], turn: Turn) async throws -> JSONValue {
+        let root = securityCenter.dataRoot
+        guard !turn.id.isEmpty else {
+            throw ChatOrchestrationError.underlying("chat.post requires a current turn. Nothing was posted.")
+        }
+        let destination = try await Self.personConversation(dataRoot: root)
+        let message = input["message"]?.scalarText ?? ""
+        // Post into the user's thread with that thread's route so delivery reaches the user's Mac, phone and Telegram.
+        let route = try await HumanConversationReader.read(sessionID: destination, dataRoot: root).route
+        // Resolve notification provenance before producing the post. An unavailable route is not evidence that this conversation has no Telegram door.
+        let telegram = try await HumanConversationReader.read(sessionID: destination, dataRoot: root, surface: "telegram").route
+        let result = try await proactiveSpeechClient(root).speakProactively(
+            content: message, caller: .reachOut,
+            idempotencyKey: SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: "chat.post:" + turn.id, content: message),
+            sessionId: destination,
+            turn: turn.with(\.envelope, route))
+        switch result {
+        case .posted(let session, let run):
+            // Knock at the person's doors, including the target thread's Telegram door when present.
+            let knock: AttentionOutcome
+            do {
+                knock = try await attention().tell(Matter(id: "chat.post:" + run, form: .words, from: "chat.post",
+                    title: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root), summary: message,
+                    open: "chat:" + session),
+                    reach: .person(from: AttentionOrigin(replyRoute: (telegram ?? route)?.replyRoute, sessionId: session)), turn: turn)
+            } catch {
+                return .object(["status": .string("ok"), "effects": .string("occurred"), "session_id": .string(session),
+                    "run_id": .string(run), "knock": .string("failed"), "knock_error": .string(error.localizedDescription)])
+            }
+            return .object(["status": .string("ok"), "effects": .string("occurred"), "session_id": .string(session), "run_id": .string(run),
+                            "knock": .string(knock.deliveryProjection.rawValue),
+                            "destinations": .object(knock.destinationFields)])
+        case .duplicate(let session):
+            return .object(["status": .string("ok"), "effects": .string("none"), "session_id": .string(session), "duplicate": .bool(true)])
+        }
+    }
+
+    /// mac.apps: the Mac's app index, with duplicate names and shared bundle ids made explicit.
+    @MainActor
+    private func runMacApps(input: [String: JSONValue], execution: AppActionExecution) async throws -> JSONValue {
+        let name = input["name"]?.scalarText ?? ""
+        let inventory = try await MacAppIndex.shared.inventory(context: execution.macOperation(dataRoot: securityCenter.dataRoot))
+        let every = inventory.apps.filter { name.isEmpty || $0.name.localizedCaseInsensitiveContains(name) }
+        let all = input["all"] == .bool(true)
+        let apps = all ? every : MacAppIndex.installed(every)
+        let twice = MacAppIndex.collisions(apps)
+        // Disambiguate duplicate shown names by file name, then folder, so launch targets remain explicit.
+        var fileNames: [String: Int] = [:]
+        for app in apps where twice.contains(app.name.lowercased()) {
+            fileNames[app.url.deletingPathExtension().lastPathComponent.lowercased(), default: 0] += 1
+        }
+        // Duplicate bundle ids make id-based launch ambiguous; expose that ambiguity on the row.
+        var ids: [String: Int] = [:]
+        for app in apps { ids[app.bundleID ?? "", default: 0] += 1 }
+        let rows: [JSONValue] = apps.map { app in
+            guard case .object(var fields) = app.json else { return app.json }
+            if ids[app.bundleID ?? "", default: 0] > 1 { fields["bundle_id_shared"] = .bool(true) }
+            guard twice.contains(app.name.lowercased()) else { return .object(fields) }
+            let file = app.url.deletingPathExtension().lastPathComponent
+            let folder = UserDisplayFormatters.tildifyPath(app.url.deletingLastPathComponent().standardizedFileURL.path)
+            fields["shown_name"] = fields["name"]
+            fields["name"] = .string(fileNames[file.lowercased(), default: 0] > 1 ? "\(file) (\(folder))" : file)
+            fields["name_collision"] = .bool(true)
+            return .object(fields)
+        }
+        let unclassified = every.filter { !$0.classificationFailures.isEmpty }
+        let complete = unclassified.isEmpty && inventory.directoryGaps.isEmpty
+        return .object(["status": .string(complete ? "ok" : "partial"), "apps": .array(rows), "count": .int(Int64(apps.count)),
+                        "classification_complete": .bool(complete),
+                        "classification_unavailable": .array(unclassified.map(\.json)),
+                        "directory_gaps": .array(inventory.directoryGaps.map(JSONValue.string)),
+                        "other_copies_and_ios": .int(Int64(every.filter { $0.kind == "copy" || $0.platform == "ios" }.count)),
+                        "source": .string("the Mac's app index (Spotlight): the installed copy of each Mac app, as the Apps screen shows them"
+                            + (all ? """
+                                , plus every other copy (builds, backups) and iOS build the Mac indexes, tagged by kind and platform
+                                """ : "; all:true lists other copies and iOS builds too")
+                            + """
+                                ; unavailable classification is reported separately and excluded from the installed projection; an app on a volume \
+                                Spotlight does not index is not listed
+                                """)])
+    }
+
+    /// home.arrive: a part's line to the agent, posted once as a world happening.
+    @MainActor
+    private func runHomeArrive(input: [String: JSONValue], turn: Turn) async -> JSONValue {
+        let line = (input["line"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let part = turn.partID else {
+            return Self.doorRefusal("not_a_part", "home.arrive is a part's way to you; this call came from no part's run. Nothing was filed.",
+                remedy: "none", "Say it in this turn instead.")
+        }
+        guard !line.isEmpty else {
+            return Self.doorRefusal("invalid_args", "Pass line: what it should tell you. Nothing was filed.",
+                remedy: "correct_arguments", "Call home.arrive with line.")
+        }
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let format = DateFormatter()
+        format.dateFormat = "yyyy-MM-dd"
+        let day = format.string(from: Date())
+        let eventKey = input["event_key"]?.scalarText
+        if input["event_key"] != nil, eventKey?.isEmpty != false || (eventKey?.utf8.count ?? 0) > 1024 {
+            return Self.failure("invalid_args", "event_key must be a nonempty string of at most 1024 bytes.")
+        }
+        let identity = Data((eventKey ?? line).utf8)
+        let digest = SHA256.hash(data: identity).prefix(8).map { String(format: "%02x", $0) }.joined()
+        // A part's line is a world happening, judged by the agent's weigh and never by this door. Peers that steered the run travel with it, so
+        // the thought that reads it carries their authority, never more.
+        let happening = Happening(.world, subject: "part:" + part, door: "part:" + part, words: part + ": " + line,
+            once: "part:" + part + ":" + (eventKey == nil ? day : "event") + ":" + digest,
+            peers: turn.peerSteering?.checkpointSources, elevated: turn.peerSteering?.elevatedSources)
+        do {
+            guard try await ExperienceStore.at(root).experience(happening.id) == nil else {
+                return .object(["status": .string("ok"), "effects": .string("none"), "detail": .string("This arrival is already known.")])
+            }
+        } catch {
+            return Self.failure("record_unreadable", """
+                The record could not say whether this arrival is already known (\(error.localizedDescription)), so nothing was filed. Call it again \
+                once the record reads.
+                """)
+        }
+        Attention.post(happening, dataRoot: root)
+        return .object(["status": .string("ok"), "effects": .string("occurred"), "detail": .string("""
+            In your mind: your weigh judges what it is worth, and worth that gathers on what it means opens a thought.
+            """)])
+    }
+
+    /// The host's own actions: inbox, providers and connections, upkeep, mind and parts, chat sessions and the composer.
+    @MainActor
+    private func runFoldedHost(_ action: AppAction, verb: String, host: any QuietToolHost, input: [String: JSONValue], surface: String,
+                               turn: Turn, execution: AppActionExecution) async -> JSONValue {
         switch action.tool {
         case "inbox":
             return await host.inbox(verb: verb, input: input, turn: turn)
@@ -785,7 +820,7 @@ public final class AppToolExecutor: ChatToolExecuting {
         // Origin, steer and Trust decide who may restore an off switch; preview uses the real call's checks and reports its proposed state.
         if let lifecycle = action.lifecycle, lifecycle != .drop, lifecycle != .change {
             if action.tool == "sense_lifecycle" {
-                do { return try await runSenseLifecycle(input: input.merging(["preview": .bool(true)]) { $1 }, turn: turn, execution: execution) }
+                do { return try await runSenseLifecycle(input: input.merging(["preview": .bool(true)]) { $1 }, turn: turn) }
                 catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
             }
             guard let host = quietHost() else { return Self.unattachedFailure() }

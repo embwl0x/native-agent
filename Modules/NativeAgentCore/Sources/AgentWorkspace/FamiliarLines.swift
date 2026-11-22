@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import Synchronization
 import PersistenceCore
@@ -46,10 +47,9 @@ public enum FamiliarLines {
     }
 
     static func key(_ line: String) -> UInt64 {
-        line.lowercased()
+        let normalized = line.lowercased()
             .replacingOccurrences(of: "[0-9]+", with: "#", options: .regularExpression)
-            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
-            .utf8.reduce(0xcbf2_9ce4_8422_2325) { ($0 ^ UInt64($1)) &* 0x100_0000_01b3 }
+        return StableHash.fnv1a64(TextNormalization.collapseWhitespace(normalized))
     }
 
     /// Retain encounter order.

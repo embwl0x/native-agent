@@ -4,6 +4,20 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.21 — your version, a faster phone (2026-11-22)
+
+- Revise: on the Mac, Revise… on the agent's message sends the person's version as theirs and keeps both; the agent reads both next turn, offers the other
+  version where unsure, and the next choice settles it; a fact correction is not taste
+- Abilities and repairs: hand work an ability already does points to it or to its failed step; a felt fault's first real pass tells the agent it works
+  again; Home and Doctor show why a repair is owed
+- iPhone: Send beside Stop while the agent replies; each side announces what it sent; a fast Mac clock skips no phone message; chats reach the phone again;
+  a Location sense, off until turned on; notification replies go to their own Mac
+- Plain words: approval cards say who, what and why, with Decline everywhere; Running, never Unknown; errors, pairing and health in sentences; one pairing code
+- Search and Mac: every usable result across engines, with answers and info boxes; scroll and drag no longer hang and prove what moved; Full Mac looks are
+  unmasked, saved text stays redacted; the shell finds programs on the login PATH
+- Steadiness: the dream is no longer refused by the waking reflection limit; Spotlight memories no longer expire; a receipt read no longer hangs a turn;
+  archiving stops a running reply; relaunch sends in order; a fixed-time habit never runs twice; titles and notifications are redacted before they are cut
+
 ## 0.6.20 — one table, its own plans (2026-11-19)
 
 - Desk: one standing table with notes, shapes, arrows, pen strokes and live cards; a card reads its item live and crossing it closes the item; the table pops

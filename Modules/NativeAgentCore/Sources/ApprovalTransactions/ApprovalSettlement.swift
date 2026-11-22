@@ -91,9 +91,8 @@ extension ApprovalExecution {
             await ensureChatToolApprovalOutcomeReceipt(approvalID: rec.id, dataRoot: dataRoot, continuation: continuation)
             return
         }
-        let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
         let carried: (sources: [String], elevated: [String])
-        do { carried = try PeerDataTaint.steer(in: payload["peer"], scope: rec.decision == "approved" ? rec.scope : nil) }
+        do { carried = try AgentScreen.queueApprovalSteering(rec) }
         catch {
             RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
                 operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
@@ -291,7 +290,7 @@ extension ApprovalExecution {
         let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
         let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
         let carried: (sources: [String], elevated: [String])
-        do { carried = try PeerDataTaint.steer(in: payload["peer"], scope: rec.decision == "approved" ? rec.scope : nil) }
+        do { carried = try AgentScreen.queueApprovalSteering(rec) }
         catch {
             RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
                 operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
@@ -303,10 +302,6 @@ extension ApprovalExecution {
             guard case .object(let state)? = rec.chatContinuation else { return false }
             return state["started"] != nil && state["done"] != .bool(true)
         }()
-        // A card that continues its conversation hands its after_card steps to that turn; one that does not releases them to run on their own.
-        let resume = await AgentScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
-                                            handOff: continueConversation && !abandonedClaim, dataRoot: dataRoot)
-        let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
         // Absent retained file access uses the host's chat policy.
         let fileAccess: String? = if case .string(let mode)? = payload["fileAccess"] { mode } else { nil }
         do {
@@ -317,12 +312,19 @@ extension ApprovalExecution {
                 returnedID: executedAction.objectValue?["returned_id"]?.stringValue,
                 effects: executedAction.objectValue?["effects"]?.stringValue,
                 recoveredAt: continueConversation ? nil : (rec.resolvedAt ?? rec.createdAt))
+            // Filing reads this transition under the same Desk lock as the continuation's scan.
+            let resume = try await SwiftNativePersistenceCore.withFileLock(SwiftNativeDeskStore(dataRoot: dataRoot).opsPath) {
+                () -> (text: String, sources: [String], elevated: [String])? in
+                if continueConversation, !abandonedClaim,
+                   !(try await inbox.annotateChatContinuation(rec.id, done: false)) { return nil }
+                return await AgentScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
+                                               handOff: continueConversation && !abandonedClaim, dataRoot: dataRoot)
+            }
             // The receipt is durable before any claim becomes evictable. A prior process may have delivered already, so never resend it.
             if abandonedClaim {
                 _ = try await inbox.annotateChatContinuation(rec.id, done: true, settlement: "interrupted")
-            } else if continueConversation,
-               try await inbox.annotateChatContinuation(
-                rec.id, done: false) {
+            } else if continueConversation, let resume {
+                let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
                 var settlement = "completed"
                 do {
                     let turn = TurnRequest(message: "", sessionID: safeSessionID, surface: replay.surface,

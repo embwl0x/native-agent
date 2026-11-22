@@ -8,8 +8,6 @@ public enum JSONLLineCaps {
     public static let activityMinimumRowsPerKind = 8
     /// Marks activity for amortized line checks; this soft trigger is not a byte ceiling.
     public static let activityTrimTriggerBytes = 4 * 1024 * 1024
-    /// Model-call first outputs kept per key by provider vitals.
-    public static let traceEvents = 5000
     /// The largest model-call trace row a writer builds (the record's detail bound matches it).
     public static let traceMaximumBytes = 8 * 1024 * 1024
 

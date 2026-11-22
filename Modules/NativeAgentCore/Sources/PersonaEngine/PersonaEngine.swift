@@ -77,16 +77,13 @@ public struct PersonaToolWriteResult: Sendable, Equatable {
 /// Actor isolation serializes engine state.
 public actor SwiftNativePersonaEngine {
     private let root: URL
-    private let fileManager: FileManager
     private let dataRoot: URL
 
     public init(
         root: URL = PersistenceCore.defaultPersonaRoot(),
-        fileManager: FileManager = .default,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         self.root = root
-        self.fileManager = fileManager
         self.dataRoot = dataRoot
     }
 

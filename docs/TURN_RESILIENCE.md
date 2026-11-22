@@ -186,7 +186,8 @@ ends its own work; the call does not.
 
 Four boundaries give each call its watch, and every call a turn makes crosses
 one: `runSingleDispatch` for each call of a turn on the shared tool loop; a
-helper's turn's own dispatch (`runStandingBot`), which does not use that loop;
+helper's turn's own dispatch (`runStandingBot`'s `standingBotExecution`), which does
+not use that loop;
 the app door's re-entry (`CanonicalToolNameDispatcher`'s
 `AppDoorReentry.perform`) for every nested call, which is how batch steps,
 script and part actions, reads and finds, folded calls, part thoughts' calls
@@ -378,6 +379,8 @@ silence deadline: an open, silent stream remains waiting with Stop available.
 Malformed nonempty JSON data fails Responses, Chat Completions and Anthropic
 SSE decoding even before first output. Empty SSE data and protocol control
 frames remain explicit; the shared framer consumes comments as keep-alives.
+Chat Completions sends a call's tool results before any accompanying user
+image message, including screenshots returned to a standing helper.
 A malformed frame is not a network outage and does not admit a redial.
 After transport control debris is removed, literal markup is answer text;
 emptiness depends on whitespace, not on removing HTML or XML tags.
@@ -419,7 +422,8 @@ failures. Existing retained files keep their names and contents.
 
 ### 5. In-loop provider recovery
 
-`ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` owns the loop,
+`ChatTurnRuntime/TurnStem+Effects.swift` owns the loop and
+`TurnStem+ModelRound.swift` its model round,
 including native-tool and text-marker protocols. One `TurnObservation` owns
 the model's next-round feedback for a limit, stream cut, correctness boundary,
 malformed call, undeclared empty reply, refusal or full context.
@@ -436,11 +440,10 @@ turn part ends with that failure's words; that failure event requests no
 further model call.
 
 Streaming adapters report max-token limits as `toolBoundary(.outputLimit)`.
-Whole-reply collection returns a complete reply or rethrows the original error
-unchanged. Partial text travels beside the error through the caller's
-`LLMCallContext.partialReply` sink and the shared trace recorder, never through
-an Error wrapper. Cancellation stays `CancellationError`; provider diagnostics
-keep their type and remedy. Incomplete text is never admitted as successful input.
+On failure, whole-reply collection joins provider work, records the partial
+text and failure through `LLMCallTraceRecorder.recordPartialReply`, then throws.
+Cancellation stays `CancellationError`; provider diagnostics keep their type and
+remedy. Incomplete text is never admitted as successful input.
 The `llm.reply.partial` receipt retains credential-redacted output under the
 trace owner's payload bounds and the selected data root, including after Stop;
 explicit preview generation emits no receipt.
@@ -466,16 +469,40 @@ Slack journal retention reads completion-lifecycle references only when terminal
 records exceed its retention cap; admission and settlement below that cap need only the journal.
 An orphaned Slack generation without a saved answer settles as interrupted and
 releases pending capacity. Its notice offers `/retry`, which pins the original
-input and conversation to the command's own run; `/retry resend` only sends saved output.
+input and conversation to the command's own run and claims that interruption
+in the same journal write. Any later interruption belongs to the retry's row.
+A retained live or settled retry supersedes interrupted retries that older builds
+pinned to the same source.
+`/retry resend` only sends saved output.
 The interrupted run keeps its identity, and a late saved answer can still be delivered.
+Direct and startup recovery check the saved destination against the current Slack
+workspace and allowlists, including replies created outside Slack ingress.
+Each reply part records dispatch after local preflight. A cancellation observed
+before the request leaves keeps that part prepared.
+Image dispatch records the channel share after upload. Allocation and byte
+transfer failures keep the image prepared, and the share checks current authorization.
 Every advertised Slack file reaches attachment preparation, including files with
-missing MIME/download metadata; any preparation failure is shown before chat admission.
+missing MIME or download metadata. Readable text and attachments reach the turn
+with the preparation notice. A notice alone is sent when no readable input remains.
+Telegram keeps a group message with a valid mention entity pending when it cannot
+look up the bot's username. The same pending path retains an addressed command.
+The tick retries pending claims before polling for new updates, even if a claim
+still needs the bot's identity.
 Telegram speech-permission denial retains both ordinary intake and `/retry` as
 `awaiting_speech_permission` and asks the Mac for authorization. A retry's resolved
-input and session are durable before preparation, so approval recovery uses that same request.
+input and session are durable before preparation, so approval recovery uses that
+same request. A fresh generation retry requires its input's conversation to
+match the current binding. An older queued retry can establish that identity
+from an original inbox claim matching the retained sender, destination and
+message ID. If that evidence is unavailable, it reports that the binding
+cannot be verified.
 Telegram's stopped turn retains and joins its settlement task without a timeout.
 Stop-button polling requests that task without awaiting its result; slash commands
 await confirmation in their command task after releasing polling admission.
+Control handoff stops and joins every admitted turn for the destination,
+including arrivals waiting on turn admission. A generation retry registers with
+the turn coordinator before releasing polling. Handoff reads cancellation
+evidence from each turn after it settles.
 Telegram restart repair edits an interrupted progress card in place, clears its
 buttons and removes its ledger row. A saved-answer `/retry` delivers to the same
 chat and topic and leaves the interruption notice in chat.
@@ -485,6 +512,8 @@ and notification-disabled replies share that chat's send order and pacing across
 Streaming surfaces keep editing the same reply after cuts.
 Telegram and Slack previews coalesce while the admitted send is in flight;
 producer progress and send completion drive publication, without a spacing clock.
+Telegram persists each surplus group preview deletion before continuing.
+Telegram's confirmation that a message is already absent also settles deletion.
 Reply producers own secret masking. Slack retains and sends their canonical reply
 and fingerprint without another output check at the wire.
 Slack's saved connected flag also requires its running socket owner; age alone
@@ -626,7 +655,10 @@ returned (`EngineTurnContinuation.swift`). Ordinary turns acquire no Desk item.
 There is no process-resume count limit or new timer.
 
 Resuming a current checkpoint requires the tool receipt's recorded `ranCall`
-identity. Saved names, arguments and image metadata do not invent that binding.
+identity. A started call whose receipt reached the transcript though its result never
+reached the turn log counts as done on resume, not as an unknown step: receipts past
+the logged results are matched in order by call and input, and one that cannot be
+matched stays uncertain. Saved names, arguments and image metadata do not invent that binding.
 Tool receipt/input encoders and working-note renderers report invalid values;
 they do not replace an unencodable result with null, an empty string or zero
 bytes. The offered provider catalog admits every model call before execution;

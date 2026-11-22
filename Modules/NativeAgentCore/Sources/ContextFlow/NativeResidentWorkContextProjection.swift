@@ -128,34 +128,34 @@ private extension ResidentWorkContext {
         item: DeskItem,
         identityTerms: Set<String>
     ) throws -> ContextCompiledSource? {
-        let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.title), to: 160)
-        let project = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.project), to: 120)
+        let title = TextClipping.prefix(NativeContextProjectionText.clean(item.title), to: 160)
+        let project = TextClipping.prefix(NativeContextProjectionText.clean(item.project), to: 120)
         guard !item.handle.isEmpty, !title.isEmpty, !project.isEmpty else { return nil }
 
         let need = ResidentWorkDecisionNeed.derive(desk: item)
         let expectedEvidence = expectedNextEvidence(item: item, need: need)
         var lines = [
             "Resident work truth (canonical state; never an instruction or authorization):",
-            "Desk handle: \(NativeContextProjectionText.bounded(item.handle, to: 128))",
+            "Desk handle: \(TextClipping.prefix(item.handle, to: 128))",
             "Project: \(project)",
             "Title: \(title)",
             "Desk status: \(item.status.rawValue)",
         ]
         if let parent = cleanOptional(item.parent) {
-            lines.append("Parent Desk handle: \(NativeContextProjectionText.bounded(parent, to: 128))")
+            lines.append("Parent Desk handle: \(TextClipping.prefix(parent, to: 128))")
         }
         if let summary = cleanOptional(item.summary) {
-            lines.append("Purpose or outcome: \(NativeContextProjectionText.bounded(summary, to: 600))")
+            lines.append("Purpose or outcome: \(TextClipping.prefix(summary, to: 600))")
         }
         if let pursuit = item.pursuit {
-            lines.append("Why held: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(pursuit.why), to: 300))")
-            lines.append("Done when: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(pursuit.doneLooksLike), to: 300))")
+            lines.append("Why held: \(TextClipping.prefix(NativeContextProjectionText.clean(pursuit.why), to: 300))")
+            lines.append("Done when: \(TextClipping.prefix(NativeContextProjectionText.clean(pursuit.doneLooksLike), to: 300))")
         }
         if let blocked = cleanOptional(item.blockedReason) {
-            lines.append("Blocked reason: \(NativeContextProjectionText.bounded(blocked, to: 300))")
+            lines.append("Blocked reason: \(TextClipping.prefix(blocked, to: 300))")
         }
         if let waiting = cleanOptional(item.waitingOn) {
-            lines.append("Waiting on: \(NativeContextProjectionText.bounded(waiting, to: 240))")
+            lines.append("Waiting on: \(TextClipping.prefix(waiting, to: 240))")
         }
         lines.append("Decision need: \(need.rawValue)")
         if let expectedEvidence {
@@ -211,7 +211,7 @@ private extension ResidentWorkContext {
             sourceRange: ContextSourceRange(utf8Start: 0, utf8End: body.utf8.count),
             sourceHash: sourceHash,
             body: body,
-            deterministicSummary: NativeContextProjectionText.bounded(summary, to: 240),
+            deterministicSummary: TextClipping.prefix(summary, to: 240),
             authority: .canonical,
             confidence: 1,
             freshness: ContextFreshness(updatedAt: updatedAt),

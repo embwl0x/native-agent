@@ -81,10 +81,10 @@ public actor AgentContactHealth {
         verification.dryRun = true
         let found = try await perform("agent_message", ["agent": .string(agent), "text": .string(AgentHostDirectory.probeToken), "dry_run": .bool(true)],
             turn, verification, mac)
-        if passed(found), case .object(let fields) = found, let peer = text(fields["agent"]) {
+        if passed(found), case .object(let fields) = found, let peer = fields["agent"]?.stringValue {
             // A pass closes only faults it exercised; actual delivery closes the rest.
-            let checked: [String] = if case .array(let keys)? = fields["checked"] { keys.compactMap { text($0) } } else { [] }
-            let closes: [String] = switch text(fields["transport"]) {
+            let checked: [String] = if case .array(let keys)? = fields["checked"] { keys.compactMap { $0.stringValue } } else { [] }
+            let closes: [String] = switch fields["transport"]?.stringValue {
             case "acp": ["protocol_mismatch|"]
             case "a2a": ["protocol_mismatch|", "recipe_mismatch|"]
             default: checked.map { "recipe_mismatch|" + $0 }
@@ -101,7 +101,7 @@ public actor AgentContactHealth {
             await resolve(row.agent, [""], note: "A message reached it.", dataRoot: dataRoot)
             return receipt
         }
-        guard let reason = text(failed["reason"]),
+        guard let reason = failed["reason"]?.stringValue,
               ["protocol_mismatch", "recipe_mismatch", "connection_startup_timeout", "not_confirmed"].contains(reason) else { return receipt }
         failed["automatic_resend"] = .bool(false)
         failed["remedy"] = Repair.reconcile(
@@ -117,13 +117,13 @@ public actor AgentContactHealth {
 
     private static func file(_ failed: [String: JSONValue], reason: String, row: AgentConversationRecord, dataRoot: URL,
                              then: String) async -> String? {
-        let at = text(failed["selector"]) ?? text(failed["method"]) ?? text(failed["phase"]) ?? ""
+        let at = failed["selector"]?.stringValue ?? failed["method"]?.stringValue ?? failed["phase"]?.stringValue ?? ""
         var labels: [String] = []
-        if reason == "not_confirmed", case .array(let seen)? = failed["labels"] { labels = seen.compactMap { text($0) } }
+        if reason == "not_confirmed", case .array(let seen)? = failed["labels"] { labels = seen.compactMap { $0.stringValue } }
         return try? await BodyQueue.file(BodyFinding(
             key: "bridge|\(row.agent.dropFirst("peer:".count))|\(reason)|\(at)",
             title: "\(row.name): \(reason.replacingOccurrences(of: "_", with: " ")) at \(at)",
-            summary: (text(failed["detail"]) ?? "") + (labels.isEmpty ? "" : "\nWindow labels nearest \(at): "
+            summary: (failed["detail"]?.stringValue ?? "") + (labels.isEmpty ? "" : "\nWindow labels nearest \(at): "
                 + labels.map { "\u{201C}\($0)\u{201D}" }.joined(separator: ", ")) + "\n" + then,
             owner: .agent, refs: [DeskRef(kind: .agent(name: row.name, handoffId: row.operationID, sessionId: row.scopeSessionID))],
             source: .bridge), dataRoot: dataRoot).handle
@@ -138,10 +138,6 @@ public actor AgentContactHealth {
     private static func passed(_ found: JSONValue) -> Bool {
         guard case .object(let fields) = found else { return false }
         return [.string("passed"), .string("repaired")].contains(fields["status"] ?? .null)
-    }
-
-    private static func text(_ value: JSONValue?) -> String? {
-        if case .string(let text)? = value { text } else { nil }
     }
 
     package static func shortVersion(_ version: String) -> String {
@@ -208,10 +204,10 @@ public actor AgentContactHealth {
 
     private nonisolated static func notReached(_ row: AgentConversationRecord, peer: AgentPeerContact?, good: Date?) -> AgentLocalHealth {
         let receipt = row.sendEvidence
-        let reason = text(receipt["detail"]) ?? text(receipt["error"]) ?? text(receipt["execution_error"])
-            ?? text(receipt["reason"]) ?? "The send did not run."
+        let reason = receipt["detail"]?.stringValue ?? receipt["error"]?.stringValue ?? receipt["execution_error"]?.stringValue
+            ?? receipt["reason"]?.stringValue ?? "The send did not run."
         var detail = "Not reached yet: \(reason) (\(NativeTimestampFormat.plainZulu(row.updatedAt)))."
-        let code = text(receipt["reason"])
+        let code = receipt["reason"]?.stringValue
         if peer?.transport == .desktopChat {
             let trusted = SystemMacAXElementSource().isTrusted()
             let installed = peer?.appBundleIDs.contains { AgentHostRow.applicationURL($0) != nil } == true
@@ -334,7 +330,7 @@ public actor AgentContactHealth {
                 observed.failureOperation = operation
                 // Transport evidence distinguishes an undeliverable send from a broken reply path.
                 let dotWords: String? = if let peer, ChatGPTDotIPCTransport.owns(peer), !ChatGPTDotIPCTransport.available,
-                    case .object(let state) = ChatGPTDotIPCTransport.readiness, let why = Self.text(state["detail"]), !why.isEmpty {
+                    case .object(let state) = ChatGPTDotIPCTransport.readiness, let why = state["detail"]?.stringValue, !why.isEmpty {
                     """
                         Sends to \(peer.name) cannot be delivered: \(why) \(peer.name) can still reach the agent by running the local message \
                         command on this Mac (nativeagent-link message, with its contact file); a reply typed in its own chat no longer arrives. Last good send \
@@ -362,7 +358,7 @@ public actor AgentContactHealth {
                     observed.repairAttemptedAt = Date()
                     // Use the repair evidence from the send without running it again.
                     if case .object(let repair)? = failure?.sendEvidence["repair"],
-                       let found = Self.text(repair["detail"]) {
+                       let found = repair["detail"]?.stringValue {
                         observed.repairDetail = found
                     } else {
                         observed.repairDetail = "Checking the reply path; no message will be resent."
@@ -425,7 +421,7 @@ public actor AgentContactHealth {
                 detail = "Its routine's webhook is saved; an actual reply is still unproven. Approve its reply command in Grok Bot if asked."
             } else if let peer, peer.transport == .a2a {
                 let found = try await Self.cardCheck(peer)
-                detail = (Self.text(found["detail"]) ?? "") + (Self.passed(.object(found))
+                detail = (found["detail"]?.stringValue ?? "") + (Self.passed(.object(found))
                     ? " An actual reply is still unproven; run agent.verify for \(name)."
                     : " Fix its recipe with agent.recipe_write, or ask \(name)'s owner to restore its card, then run agent.verify.")
             } else if let peer, peer.transport == .nativeAgent {

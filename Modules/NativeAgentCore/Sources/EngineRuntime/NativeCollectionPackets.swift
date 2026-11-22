@@ -1,5 +1,4 @@
 import AuthoredCapabilities
-import CryptoKit
 import DreamREMCycle
 import Foundation
 import MemoryV2
@@ -145,11 +144,11 @@ extension NativeAgentEngine {
             let text = NativeAppSecretRedactor.redactText(content)
             return PartFace(title: item, sections: [.init(id: "entry", rows: [], block: .init(key: "entry:" + item,
                 text: text.utf8.count <= PartFace.Block.inlineByteLimit ? text : nil, copy: true,
-                read: .init("dream.entry", ["date": .string(item)]), revision: try collectionRevision(text)))])
+                read: .init("dream.entry", ["date": .string(item)]), revision: try StableHash.sortedJSONSHA256(text)))])
         }
         let gate = try await cognitionView.dreamGateChecked()
         let diary = try await cognitionView.readDreamDiary(limit: Int.max, enabled: gate.dreamEnabled)
-        let revision = try collectionRevision(diary.entries.map { [$0.date, $0.modifiedAt] })
+        let revision = try StableHash.sortedJSONSHA256(diary.entries.map { [$0.date, $0.modifiedAt] })
         let cursor = try collectionCursor(request, revision: revision, ids: diary.entries.map(\.date))
         let entries = Array(diary.entries.dropFirst(cursor).prefix(256))
         let next = cursor + entries.count
@@ -213,7 +212,7 @@ extension NativeAgentEngine {
         await EngineFaceProjection.postGraph(engine: self)
         if item == "entities" {
             // The list's identity is its own first packet, never an encoding of the whole graph.
-            let revision = try collectionRevision(GraphCollectionFace.list(entities: entities, total: entities.count,
+            let revision = try StableHash.sortedJSONSHA256(GraphCollectionFace.list(entities: entities, total: entities.count,
                 revision: "", itemPrefix: "entity:"))
             let cursor = try collectionCursor(request, revision: revision, ids: entities.map(\.id))
             var face = try GraphCollectionFace.list(entities: entities, total: entities.count, cursor: cursor, revision: revision,
@@ -243,7 +242,7 @@ extension NativeAgentEngine {
         let edges = snapshot.canvasEdges.filter { $0.from == entityID || $0.to == entityID }.map {
             FaceGraphEdge(from: $0.from, to: $0.to, kind: NativeAppSecretRedactor.redactText($0.kind), weight: $0.weight)
         }
-        let revision = try collectionRevision(GraphCollectionFace.detail(entity: entity, entities: entities, edges: edges,
+        let revision = try StableHash.sortedJSONSHA256(GraphCollectionFace.detail(entity: entity, entities: entities, edges: edges,
             state: .ready, itemPrefix: "entity:"))
         let cursor = try collectionCursor(request, revision: revision, ids: edges.indices.map { "edge:\($0)" })
         var face = try GraphCollectionFace.detail(entity: entity, entities: entities, edges: edges, state: .ready,
@@ -252,7 +251,7 @@ extension NativeAgentEngine {
             var section = section
             if section.id == "summary" {
                 section.block?.read = .init("graph.summary", ["entity": .string(entityID)])
-                if let summary = entity.detail { section.block?.revision = try collectionRevision(summary) }
+                if let summary = entity.detail { section.block?.revision = try StableHash.sortedJSONSHA256(summary) }
             }
             section.more?.read = .init("graph.relationships", ["entity": .string(entityID)])
             return section
@@ -276,12 +275,6 @@ extension NativeAgentEngine {
             }
         }
         return face
-    }
-
-    nonisolated private func collectionRevision<Value: Encodable>(_ value: Value) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return SHA256.hash(data: try encoder.encode(value)).map { String(format: "%02x", $0) }.joined()
     }
 
     nonisolated private func collectionCursor(_ request: FaceReadRequest, revision: String, ids: [String]) throws -> Int {

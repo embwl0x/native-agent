@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -129,11 +128,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         return try await provider.embedWithEpoch(texts)
     }
 
-    func coversCompleteTextsIfResident(_ texts: [String]) -> Bool? {
-        guard let provider = lock.withLock({ state.coreMLProvider }) else { return nil }
-        return provider.coversCompleteTexts(texts)
-    }
-
     public func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         try await embedWithEpoch(texts, asQueries: false)
     }
@@ -236,9 +230,9 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 coreMLResourcesAvailable: resourcesAvailable,
                 coreMLLoaded: loaded,
                 modelLoadable: configurationError == nil && resourcesAvailable && state.lastLoadError == nil,
-                lastUsedAt: Self.isoString(state.lastUsedAt),
-                lastLoadedAt: Self.isoString(state.lastLoadedAt),
-                lastUnloadedAt: Self.isoString(state.lastUnloadedAt),
+                lastUsedAt: state.lastUsedAt.map(NativeTimestampFormat.plainZulu),
+                lastLoadedAt: state.lastLoadedAt.map(NativeTimestampFormat.plainZulu),
+                lastUnloadedAt: state.lastUnloadedAt.map(NativeTimestampFormat.plainZulu),
                 unloadReason: state.unloadReason,
                 lastLoadError: configurationError ?? state.lastLoadError ?? installedModelProblem,
                 loadCount: state.loadCount,
@@ -355,11 +349,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             .appendingPathComponent("config", isDirectory: true)
             .appendingPathComponent("embeddings.json")
     }
-
-    private static func isoString(_ date: Date?) -> String? {
-        guard let date else { return nil }
-        return ISO8601DateFormatter().string(from: date)
-    }
 }
 
 extension SwiftNativeMemoryV2 {
@@ -427,7 +416,7 @@ extension SwiftNativeMemoryV2 {
     private static func actionTextHash(_ text: String) -> String {
         actionHashLock.withLock {
             if let known = actionHashes[text] { return known }
-            let hash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+            let hash = SHA256Hex.of(Data(text.utf8))
             if actionHashes.count >= 4096 { actionHashes.removeAll(keepingCapacity: true) }
             actionHashes[text] = hash
             return hash

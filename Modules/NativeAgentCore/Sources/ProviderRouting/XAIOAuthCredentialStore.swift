@@ -13,12 +13,12 @@ enum XAIOAuthCredentialStore {
     static func read(at path: URL) throws -> [String: Any] {
         try CredentialFileLock.withLock(path) {
             guard let data = try ProviderStateValidation.dataIfPresent(at: path) else { return [:] }
-            return try resolve(ProviderStateValidation.credential(data: data), at: path)
+            return try resolve(ProviderStateValidation.credential(data: data))
         }
     }
 
     /// The caller validates and locks this metadata generation before resolving it.
-    static func resolve(_ object: [String: Any], at path: URL) throws -> [String: Any] {
+    static func resolve(_ object: [String: Any]) throws -> [String: Any] {
         guard object["tokens"] == nil, !secretFields.contains(where: { object[$0] != nil }) else {
             throw ProviderRoutingError.configurationFailed(
                 "Saved xAI credentials contain plaintext tokens. Save the account through Providers to repair its Keychain storage.")

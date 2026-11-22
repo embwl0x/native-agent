@@ -115,22 +115,15 @@ presentation clock after a successful live turn, even with an empty capsule;
 previews and unconfirmed deliveries do not consume cadence. Candidates that are not shown
 remain owed rather than counting as presented.
 
-**Felt state.** `CognitiveSubstrate+CapsuleFeltSignals.swift` maps projected
-chemistry into the felt fingerprint. `OrganismChemistry.bodyLine` can supply a
-bounded `- Body:` candidate. Positive feeling, bracing and tiredness coexist
-in that line; operational advice does not replace feeling. Located hand pain
-travels separately in the existing private posture context, naming the act
-and its recorded cause as receipt data. Generic dispatches are grouped by
+**Hand pain.** Located hand pain travels in the private posture context, naming
+the act and its recorded cause as receipt data. Generic dispatches are grouped by
 exact tool name; motor outcomes by action identity, with their domain as the
 act. A later known success replaces that act's pain reading without claiming
 an earlier failed effect completed. Starts, cancellation and unknown outcomes
 prove no recovery. Missing cause text is stated as unrecorded. Only the two
 newest supported pain readings travel, bounded and redacted before clipping;
 the field retains receipt ownership, and the body saves no pain copy.
-Ordinary turns select one non-rut felt cue or none,
-with an optional separate Sound rut line; private reflection is cadence-exempt.
-Unchanged body lines are suppressed between presentation windows. Losing the
-cue slot or fitting budget does not count a body line as presented.
+
 **Felt state.** `CognitiveSubstrate+CapsuleFeltSignals.swift` reads projected
 chemistry directly into the first feeling paragraph, alongside mood, charged
 cares and recorded dream tone. Warmth and bracing can both be present; quiet
@@ -330,9 +323,9 @@ Stated plans have the identity their source gives them: Desk titles supply
 bounded canonical labels and name identity; memory atoms have no name and carry
 empty labels, keyed by their due instants at whole-second resolution (the legacy
 encoder's nearest-second rounding). Desk plans deduplicate by name and atoms by
-instant. Named plans display their labels; only unnamed atoms derive time words
-against every display read's clock, including toward and resolution between
-source scans. Stored `due_label` never supplies current atom words.
+instant. Named plans display their labels. Unnamed atoms derive time words from
+their due instant and the display read's clock, including toward and resolution
+between source scans.
 On load, pending time-word-named rows become unnamed atoms; other names remain
 Desk plans. Due-keyed rows recover a non-time name retained in `sourceOrgan`.
 Rekeying preserves held state without settlement or minting; duplicate

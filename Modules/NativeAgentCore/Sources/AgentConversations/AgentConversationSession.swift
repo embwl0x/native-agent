@@ -36,7 +36,7 @@ package enum AgentConversationSession {
     static func approvalRow(_ id: String, store: AgentConversationStore) throws -> AgentConversationRecord? {
         try store.records().first {
             guard $0.phase == "attention", case .object(let receipt)? = $0.receipt else { return false }
-            return receipt["approvalId"] == .string(id) && AgentConversationRecord.approvalWaits(string(receipt["status"]) ?? "")
+            return receipt["approvalId"] == .string(id) && AgentConversationRecord.approvalWaits(receipt["status"]?.nonblankString ?? "")
         }
     }
 
@@ -46,14 +46,14 @@ package enum AgentConversationSession {
                                    MacOperationContext) async throws -> JSONValue) async throws -> JSONValue {
         let store = AgentConversationStore(dataRoot: dataRoot)
         guard let held = try approvalRow(id, store: store) else {
-            throw AgentConversationStore.Failure(message: "This conversation has moved on; the older result was not applied.")
+            throw AgentConversationStore.Failure.movedOn
         }
         let peer = try AgentPeerStore(dataRoot: dataRoot).list().first { "peer:" + $0.id == held.agent }
         guard AgentConversationStore.sameRoute(held.peerRouteFingerprint, peer) else {
             let detail = "The contact's connection changed. Start a separate conversation explicitly; this conversation has been preserved."
             try store.update(id: held.id, operationID: held.operationID) {
                 guard $0.phase == "attention", $0.receipt == held.receipt else {
-                    throw AgentConversationStore.Failure(message: "This conversation has moved on; the older result was not applied.")
+                    throw AgentConversationStore.Failure.movedOn
                 }
                 $0.receipt = .object(["status": .string("failed"), "sent": .bool(false),
                     "approvalId": .string(id), "detail": .string(detail)])
@@ -65,7 +65,7 @@ package enum AgentConversationSession {
         let row: AgentConversationRecord
         do { row = try store.update(id: held.id, operationID: held.operationID) {
             guard $0.phase == "attention", $0.receipt == held.receipt else {
-                throw AgentConversationStore.Failure(message: "This conversation has moved on; the older result was not applied.")
+                throw AgentConversationStore.Failure.movedOn
             }
             $0.phase = "sending"
             if let index = $0.exchanges?.firstIndex(where: { $0.id == held.operationID }) {
@@ -119,18 +119,18 @@ package enum AgentConversationSession {
             dataRoot: dataRoot, reservation: reservation, waitSeconds: wait, perform: perform)
         if tool == "agent_read", !readRefused(result), case .object(var fields) = result,
            fields["status"] != .string("unavailable"), fields["state"] != .string("unknown_contact"),
-           !["failed", "error", "refused", "not_found"].contains(string(fields["status"]) ?? "") || fields["thread_id"] != nil {
+           !["failed", "error", "refused", "not_found"].contains(fields["status"]?.nonblankString ?? "") || fields["thread_id"] != nil {
             if case .object(let history)? = fields["session_history"], history["status"] == .string("unavailable") {
                 fields["status"] = .string("unavailable")
                 return .object(fields)
             }
             fields["execution"] = .string("executed")
             fields["effect"] = .string("none")
-            try await graphEntity(of: string(fields["agent_id"]) ?? string(input["agent"]), dataRoot: dataRoot, into: &fields)
+            try await graphEntity(of: fields["agent_id"]?.nonblankString ?? input["agent"]?.nonblankString, dataRoot: dataRoot, into: &fields)
             return .object(fields)
         }
         guard tool == "agent_message" else { return result }
-        let agent = string(input["agent"]) ?? ""
+        let agent = input["agent"]?.nonblankString ?? ""
         let peer = try AgentPeerStore(dataRoot: dataRoot).list().first {
             "peer:" + $0.id == agent || ($0.handles ?? []).contains(agent)
         }
@@ -161,29 +161,9 @@ package enum AgentConversationSession {
         tool: String, input: [String: JSONValue], surface: String,
                          scope: String, dataRoot: URL, reservation: String?, waitSeconds: Int,
                          perform: @escaping Dispatch) async throws -> JSONValue {
-        var args = input.filter { $0.value != .null }
-        var label = string(args.removeValue(forKey: "conversation"))
-        let clearQueue = args.removeValue(forKey: "clear_queue") == .bool(true)
-        let historyBefore = string(args.removeValue(forKey: "history_before"))
-        let historyExchange = string(args.removeValue(forKey: "history_exchange"))
-        if historyBefore != nil || historyExchange != nil {
-            guard tool == "agent_read", args["details"] != .bool(true), !agentIsBot(args),
-                  historyBefore == nil || historyExchange == nil,
-                  [historyBefore, historyExchange].compactMap({ $0 }).allSatisfy(ContactThread.isMessageID) else {
-                throw AgentConversationStore.Failure(message: "Choose one offered session-history page or message. This only reads the conversation.")
-            }
-        }
-        let freshValue = args.removeValue(forKey: "new_conversation")
-        if let freshValue, case .bool = freshValue {} else if freshValue != nil {
-            throw AgentConversationStore.Failure(message: "new_conversation must be true or false.")
-        }
-        let fresh = freshValue == .bool(true)
-        // Answer demand is local record state, never peer input.
-        let expectsValue = args.removeValue(forKey: "expects_reply")
-        if let expectsValue, case .bool = expectsValue {} else if expectsValue != nil {
-            throw AgentConversationStore.Failure(message: "expects_reply must be true or false.")
-        }
-        guard let agent = string(args["agent"]) else { return try await perform(tool, args, turn, conversation, mac) }
+        let options = try conversationArguments(tool: tool, input: input)
+        let (args, label, fresh) = (options.args, options.label, options.fresh)
+        guard let agent = args["agent"]?.nonblankString else { return try await perform(tool, args, turn, conversation, mac) }
         if tool == "agent_message", HelperContact.matches(conversation: conversation, args) {
             if fresh || label != nil {
                 throw AgentConversationStore.Failure(message: """
@@ -210,6 +190,58 @@ package enum AgentConversationSession {
             return unknownContact(agent, contacts: peers.map { ("peer:" + $0.id, $0.name) }
                 + bots.map { ("bot:" + $0.id.uuidString.lowercased(), $0.name) })
         }
+        return try await dispatchKnownConversation(turn: turn, mac: mac, conversation: conversation, workspace: workspace, tool: tool,
+            options: options, agent: agent, peer: peer, botName: botName, dot: dot, surface: surface, scope: scope, dataRoot: dataRoot,
+            reservation: reservation, waitSeconds: waitSeconds, perform: perform)
+    }
+
+    private struct ConversationArguments {
+        let args: [String: JSONValue]
+        let label: String?
+        let clearQueue: Bool
+        let historyBefore: String?
+        let historyExchange: String?
+        let fresh: Bool
+        let expectsValue: JSONValue?
+    }
+
+    /// Read and validate conversation controls before resolving the contact.
+    private static func conversationArguments(tool: String, input: [String: JSONValue]) throws -> ConversationArguments {
+        var args = input.filter { $0.value != .null }
+        let label = args.removeValue(forKey: "conversation")?.nonblankString
+        let clearQueue = args.removeValue(forKey: "clear_queue") == .bool(true)
+        let historyBefore = args.removeValue(forKey: "history_before")?.nonblankString
+        let historyExchange = args.removeValue(forKey: "history_exchange")?.nonblankString
+        if historyBefore != nil || historyExchange != nil {
+            guard tool == "agent_read", args["details"] != .bool(true), !agentIsBot(args),
+                  historyBefore == nil || historyExchange == nil,
+                  [historyBefore, historyExchange].compactMap({ $0 }).allSatisfy(ContactThread.isMessageID) else {
+                throw AgentConversationStore.Failure(message: "Choose one offered session-history page or message. This only reads the conversation.")
+            }
+        }
+        let freshValue = args.removeValue(forKey: "new_conversation")
+        if let freshValue, case .bool = freshValue {} else if freshValue != nil {
+            throw AgentConversationStore.Failure(message: "new_conversation must be true or false.")
+        }
+        let fresh = freshValue == .bool(true)
+        // Answer demand is local record state, never peer input.
+        let expectsValue = args.removeValue(forKey: "expects_reply")
+        if let expectsValue, case .bool = expectsValue {} else if expectsValue != nil {
+            throw AgentConversationStore.Failure(message: "expects_reply must be true or false.")
+        }
+        return ConversationArguments(args: args, label: label, clearQueue: clearQueue, historyBefore: historyBefore,
+                                     historyExchange: historyExchange, fresh: fresh, expectsValue: expectsValue)
+    }
+
+    /// Resolve the exact or saved conversation before reading, stopping, or sending.
+    private static func dispatchKnownConversation(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext,
+        workspace: WorkspaceOperation, tool: String, options: ConversationArguments, agent: String, peer: AgentPeerContact?, botName: String?,
+        dot: Bool, surface: String, scope: String, dataRoot: URL, reservation: String?, waitSeconds: Int,
+        perform: @escaping Dispatch) async throws -> JSONValue {
+        var args = options.args
+        var label = options.label
+        let (clearQueue, historyBefore, historyExchange, fresh, expectsValue) =
+            (options.clearQueue, options.historyBefore, options.historyExchange, options.fresh, options.expectsValue)
         let store = AgentConversationStore(dataRoot: dataRoot)
         let records = Result { try store.records() }
         if tool == "agent_cancel", let label, UUID(uuidString: label) != nil {
@@ -229,12 +261,12 @@ package enum AgentConversationSession {
             args = args.filter { !listing.contains($0.key) }
         }
         // limit/offset page nothing on a contact's route without an exact message or task; they mean "show me the recent talk".
-        if !dot, agent.hasPrefix("peer:"), string(args["message_id"]) == nil, string(args["task_id"]) == nil {
+        if !dot, agent.hasPrefix("peer:"), args["message_id"]?.nonblankString == nil, args["task_id"]?.nonblankString == nil {
             args.removeValue(forKey: "limit"); args.removeValue(forKey: "offset")
         }
         // Resolve thread IDs to the same visible conversation, queue and history as names.
-        if !dot, tool == "agent_message" || tool == "agent_read", label == nil, !fresh, let conversation = string(args["conversation_id"]),
-           string(args["message_id"]) == nil, string(args["task_id"]) == nil {
+        if !dot, tool == "agent_message" || tool == "agent_read", label == nil, !fresh, let conversation = args["conversation_id"]?.nonblankString,
+           args["message_id"]?.nonblankString == nil, args["task_id"]?.nonblankString == nil {
             let rows = (try? records.get()) ?? []
             label = rows.filter { $0.agent == agent && $0.conversationID == conversation }
                 .sorted { $0.updatedAt > $1.updatedAt }.first { row in
@@ -247,7 +279,7 @@ package enum AgentConversationSession {
         if !dot, reservation == nil, args.contains(where: { advanced.contains($0.key) && $0.value != .string("")
             && !(tool == "agent_read" && label != nil && ["limit", "offset"].contains($0.key)) }) {
             if tool == "agent_read", label != nil, let row = try pinned.record ?? store.find(scopeSessionID: scope, agent: agent, label: label, in: records.get()),
-               [nil, row.conversationID].contains(string(args["conversation_id"])) {
+               [nil, row.conversationID].contains(args["conversation_id"]?.nonblankString) {
                 args["conversation_id"] = row.conversationID.map(JSONValue.string); label = nil
             }
             guard label == nil, !fresh, historyBefore == nil, historyExchange == nil else { throw AgentConversationStore.Failure(
@@ -261,7 +293,7 @@ package enum AgentConversationSession {
             }
             let exact = try await perform(tool, args, turn, conversation, mac)
             if tool == "agent_read" {
-                consumeRead(exact, turn: turn, peer: peer, message: string(args["message_id"]), scope: scope, conversation: conversation, dataRoot: dataRoot)
+                consumeRead(exact, turn: turn, peer: peer, message: args["message_id"]?.nonblankString, scope: scope, conversation: conversation, dataRoot: dataRoot)
             }
             return exact
         }
@@ -289,7 +321,7 @@ package enum AgentConversationSession {
                 independent discussion for this bot.
                 """)
         }
-        var previous = try pinned.record ?? store.find(scopeSessionID: scope, agent: agent, label: label, in: records.get())
+        let previous = try pinned.record ?? store.find(scopeSessionID: scope, agent: agent, label: label, in: records.get())
         if let row = previous, !AgentConversationStore.sameRoute(row.peerRouteFingerprint, peer) {
             guard tool == "agent_message", fresh else {
                 return attention(name, label: row.label,
@@ -327,11 +359,25 @@ package enum AgentConversationSession {
             let refreshed = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform)
             let readView = AgentConversationView.view(refreshed, details: args["details"] == .bool(true), read: true, dataRoot: dataRoot,
                         historyBefore: historyBefore, historyExchange: historyExchange, includeHistory: conversation.returnsHistory)
-            consumeRead(readView, turn: turn, peer: peer, message: string(refreshed.readInput?["message_id"]), scope: scope, conversation: conversation,
+            consumeRead(readView, turn: turn, peer: peer, message: refreshed.readInput?["message_id"]?.nonblankString, scope: scope, conversation: conversation,
                             dataRoot: dataRoot)
             return readView
         }
         guard tool == "agent_message" else { return try await perform(tool, args, turn, conversation, mac) }
+        return try await sendInConversation(turn: turn, mac: mac, conversation: conversation, workspace: workspace, tool: tool, args: args,
+            agent: agent, name: name, peer: peer, dot: dot, label: label, fresh: fresh, expectsValue: expectsValue, fingerprint: fingerprint,
+            previous: previous, store: store, scope: scope, surface: surface, dataRoot: dataRoot, reservation: reservation,
+            waitSeconds: waitSeconds, perform: perform)
+    }
+
+    /// Admit the send behind existing work or begin its own exchange.
+    private static func sendInConversation(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext,
+        workspace: WorkspaceOperation, tool: String, args: [String: JSONValue], agent: String, name: String, peer: AgentPeerContact?,
+        dot: Bool, label: String?, fresh: Bool, expectsValue: JSONValue?, fingerprint: String?,
+        previous: AgentConversationRecord?, store: AgentConversationStore, scope: String, surface: String, dataRoot: URL,
+        reservation: String?, waitSeconds: Int, perform: @escaping Dispatch) async throws -> JSONValue {
+        var args = args
+        var previous = previous
         // A reservation already read settlement under the store lock; a background callback alone publishes its own terminal receipt.
         if let row = previous, row.phase == "waiting", !fresh, reservation == nil, !backgroundSend(row),
            !row.automaticRead, row.readInput != nil {
@@ -382,7 +428,7 @@ package enum AgentConversationSession {
         let messageID = try protocolMessageID(args, peer: peer)
         let row = try store.begin(scopeSessionID: scope, agent: agent, name: name, label: label, record: fresh ? nil : previous?.id,
                                   fresh: fresh, sourceSurface: surface, fingerprint: fingerprint, replyRoute: replyRoute,
-                                  message: string(args["text"]),
+                                  message: args["text"]?.nonblankString,
                                   personInitiated: turn.personInitiatedSend?.matches(args) == true,
                                   supersedeWaiting: supersedeWaiting,
                                   expectsReply: expectsValue != .bool(false),
@@ -397,7 +443,7 @@ package enum AgentConversationSession {
         return noting(try await send(turn: turn, mac: mac, conversation: conversation, workspace: workspace, row, store: store, peer: peer,
             reservation: reservation, dataRoot: dataRoot,
                                     waitSeconds: waitSeconds, dispatch: perform) { [args] turn, conversation, mac in
-            if let peer, let text = string(args["text"]) {
+            if let peer, let text = args["text"]?.nonblankString {
                 try await ContactThread.attempt(.send(owner: peer.id, conversation: row.conversationID, text: text, sendID: row.operationID,
                     byPerson: row.personInitiated == true, turn: turn), dataRoot: dataRoot)
             }
@@ -432,7 +478,7 @@ package enum AgentConversationSession {
         let row = try store.begin(scopeSessionID: scope, agent: agent, name: peer?.name ?? agent,
             label: nil, record: nil, fresh: true, sourceSurface: surface,
             fingerprint: peer.map(AgentConversationStore.routeFingerprint), replyRoute: replyRoute,
-            message: string(args["text"]), personInitiated: turn.personInitiatedSend?.matches(args) == true,
+            message: args["text"]?.nonblankString, personInitiated: turn.personInitiatedSend?.matches(args) == true,
             expectsReply: args["expects_reply"] != .bool(false), messageID: messageID, steeredBy: turn.steeringStamp())
         // An approval replay may run outside this send's live task context.
         var args = args
@@ -440,9 +486,9 @@ package enum AgentConversationSession {
         return try await send(turn: turn, mac: mac, conversation: conversation, workspace: workspace, row, store: store, peer: peer, reservation: nil,
             dataRoot: dataRoot,
                               waitSeconds: waitSeconds, dispatch: perform) { [args] turn, conversation, mac in
-            if let peer, let text = string(args["text"]) {
+            if let peer, let text = args["text"]?.nonblankString {
                 // An exact send's line belongs to the conversation it names: a held one's own session, the contact's session for any other.
-                try await ContactThread.attempt(.send(owner: peer.id, conversation: string(args["conversation_id"]), text: text,
+                try await ContactThread.attempt(.send(owner: peer.id, conversation: args["conversation_id"]?.nonblankString, text: text,
                     sendID: row.operationID, byPerson: row.personInitiated == true, turn: turn), dataRoot: dataRoot)
             }
             return try await perform("agent_message", args, turn, conversation, mac)
@@ -553,12 +599,12 @@ package enum AgentConversationSession {
         let queuedOrHeld = fields["queued"] == .bool(true) || fields["state"] == .string("queued") || fields["status"] == .string("held")
         if fields["status"] == .string("failed") || fields["delivery"] == .string("failed") || fields["sent"] == .bool(false) && !queuedOrHeld {
             fields["delivery"] = .string("failed")
-        } else if fields["reply"] != nil, !["waiting", "sending", "working"].contains(string(fields["state"]) ?? "") {
+        } else if fields["reply"] != nil, !["waiting", "sending", "working"].contains(fields["state"]?.nonblankString ?? "") {
             fields["delivery"] = .string("answered")
         } else if queuedOrHeld || fields["state"] == .string("waiting") || fields["state"] == .string("working")
-                    || ["held", "queued", "accepted", "running", "waiting", "enqueued"].contains(string(fields["status"]) ?? "") {
+                    || ["held", "queued", "accepted", "running", "waiting", "enqueued"].contains(fields["status"]?.nonblankString ?? "") {
             fields["delivery"] = .string(fields["status"] == .string("held") ? "held" : "queued")
-        } else if ["delivered", "sent"].contains(string(fields["status"]) ?? "") {
+        } else if ["delivered", "sent"].contains(fields["status"]?.nonblankString ?? "") {
             fields["delivery"] = .string("delivered")
         }
         fields["wait_ignored"] = live ? nil : .string("lane_is_async")
@@ -568,7 +614,7 @@ package enum AgentConversationSession {
     /// The row's current send is held for a contact that collects its messages and awaits its answer: it has a record (`HeldSends`).
     package static func heldSend(_ row: AgentConversationRecord) -> Bool {
         guard row.agent.hasPrefix("peer:"), row.phase == "ready", row.awaitsReply, case .object(let receipt)? = row.receipt else { return false }
-        return ["held", "delivering", "delivered"].contains(string(receipt["status"]) ?? "")
+        return ["held", "delivering", "delivered"].contains(receipt["status"]?.nonblankString ?? "")
     }
 
     /// A held send stays owed while its record says so: delivery does not end the wait, and neither does a record that cannot be read. Only
@@ -672,7 +718,7 @@ package enum AgentConversationSession {
                 // Typed refusals carry their own remedy and card; any other fault reaches the agent in the receipt's words.
                 if !(error is ToolFailureError || error is AutonomyGateError || error is CancellationError) {
                     let said = Self.sendFailure(error, row: row)
-                    return .failure(ToolFailureError(string(said["detail"]) ?? error.localizedDescription,
+                    return .failure(ToolFailureError(said["detail"]?.nonblankString ?? error.localizedDescription,
                         effects: said["sent"] == .bool(false) ? .none : .unknown, code: "agent_send_failed", status: .failed))
                 }
                 return .failure(error)
@@ -718,7 +764,7 @@ package enum AgentConversationSession {
             next = " Nothing was sent to \(row.name): this needs the person's approval, and a turn another agent started cannot ask for one. "
                 + "Send it from your own chat or your own thought, where the person can approve it."
         }
-        fields["detail"] = .string((string(fields["detail"]) ?? "The send failed.") + next)
+        fields["detail"] = .string((fields["detail"]?.nonblankString ?? "The send failed.") + next)
         fields["sent"] = nothingLeft ? .bool(false) : .null
         if nothingLeft { fields["execution"] = .string("not_run") }
         fields["delivery"] = .string("failed")
@@ -781,7 +827,7 @@ package enum AgentConversationSession {
         if let reply = try AgentConversationStore(dataRoot: dataRoot).records().first(where: { $0.id == row.id })?
             .exchanges?.first(where: { $0.id == row.operationID })?.reply { return answered(peer, reply) }
         // The gate’s card or refusal is the send’s actual outcome.
-        let status = string(run.objectValue?["status"]) ?? ""
+        let status = run.objectValue?["status"]?.nonblankString ?? ""
         if readRefused(reply.payload) || AgentConversationRecord.approvalWaits(status) { return reply.payload }
         if [.failed, .refused, .cancelled, .timeout].contains(reply.outcome) {
             return .object(["status": .string("failed"), "agent": .string("peer:" + peer.id), "ability_run": reply.payload,

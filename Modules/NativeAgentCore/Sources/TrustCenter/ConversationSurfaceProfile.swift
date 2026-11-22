@@ -8,7 +8,7 @@ public struct ConversationSurfaceProfile: Sendable, Equatable, Hashable {
 
     public init(_ rawValue: String) {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // Every bridge lane (BridgeLane.bridgeSurfaceName: "<sender>-bridge", peer:<id>-bridge included) is a peer on the agent bridge, never the
+        // Every bridge lane ("<sender>-bridge", peer:<id>-bridge included) is a peer on the agent bridge, never the
         // local operator, whatever its sender.
         self.id = normalized == "bridge" || normalized.hasSuffix("-bridge") ? Self.agentBridgeID : normalized
     }

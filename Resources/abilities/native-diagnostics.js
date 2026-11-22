@@ -132,7 +132,7 @@ function headline(s) {
 }
 
 function summaryDetail(s) {
-    if (s.total === 0) return "Press Repair to check everything and fix what is broken.";
+    if (s.total === 0) return "Press Run checks to see how everything is doing.";
     const parts = [s.healthy + " working"];
     if (s.warning > 0) parts.push(s.warning + " need attention");
     if (s.failing > 0) parts.push(s.failing + " not working");

@@ -64,7 +64,7 @@ enum SensesAssembly {
                     }
                     let memory = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
                     SensesHub.shared.installMemoryProvenanceSink(memory)
-                    try await BuiltInSenses.registerAll(dataRoot: dataRoot)
+                    try await BuiltInSenses.registerAll()
                     try Task.checkCancellation()
                     await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
                         id: "launch.senses", title: "Senses installation", status: "ok",

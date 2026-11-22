@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import GRDB
 import NativeAgentCore
 import PersistenceCore
@@ -45,7 +46,7 @@ extension MemoryStorage {
                 case .unembeddable(let reason):
                     try db.execute(sql: "DELETE FROM action_embeddings WHERE epoch = ? AND text_hash = ?", arguments: [epoch.rawValue, hash])
                     try db.execute(sql: "INSERT OR REPLACE INTO action_embedding_failures (epoch, text_hash, reason, recorded_at) VALUES (?, ?, ?, ?)",
-                                   arguments: [epoch.rawValue, hash, reason, Self.nowISO8601()])
+                                   arguments: [epoch.rawValue, hash, reason, NativeTimestampFormat.fractionalZulu(Date())])
                 }
             }
             if let hashes {
@@ -82,7 +83,7 @@ extension MemoryStorage {
         staged: [MemoryEmbeddingStagedRow],
         activationProbe: [Float]?
     ) async throws -> MemoryEmbeddingEpochActivationReport {
-        let activatedAt = Self.nowISO8601()
+        let activatedAt = NativeTimestampFormat.fractionalZulu(Date())
         let outcome = try await dbPool.write { db -> Result<MemoryEmbeddingEpochActivationReport, MemoryStorageError> in
             let prior = try Self.embeddingEpochState(in: db)
             let live = try Self.embeddingCorpus(in: db)
@@ -252,7 +253,7 @@ extension MemoryStorage {
         try db.execute(sql: """
             INSERT OR REPLACE INTO memory_embedding_failures (kind, row_id, content, epoch, reason, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            """, arguments: [row.kind.rawValue, row.id, Data(row.content.utf8), epoch.rawValue, reason, nowISO8601()])
+            """, arguments: [row.kind.rawValue, row.id, Data(row.content.utf8), epoch.rawValue, reason, NativeTimestampFormat.fractionalZulu(Date())])
     }
 
     static func clearEmbeddingFailure(in db: Database, kind: MemoryEmbeddingCorpusKind, id: String) throws {

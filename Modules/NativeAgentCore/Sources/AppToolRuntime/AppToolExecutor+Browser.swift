@@ -103,7 +103,7 @@ extension AppToolExecutor {
         if let refusal = resolveChromeTarget(actionId, &input, turn: turn, execution: execution) { return refusal }
         if !dryRun, let fields {
             return try await runChromeFieldsCall(actionId: actionId, input: input, fields: fields, direct: direct, surface: surface, turn: turn,
-                execution: execution, run: run)
+                run: run)
         }
         // Judge a keypress by the page it changed; scroll readback shows only newly visible rows.
         let lastRead = ChromePageMirror.page(tab: Self.chromeTabID(input["tab_id"]), dataRoot: securityCenter.dataRoot, session: turn.verifiedSessionID)

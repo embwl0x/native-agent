@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+import TurnTrace
 // Blueprint: | `MacSyncActionRouter+ChatHistory.swift` | `MacSyncActionRouter`, `chatHistoryPage`; Generation-bound history. |
 
 extension MacSyncActionRouter {
@@ -37,7 +38,7 @@ extension MacSyncActionRouter {
         }
         let limit = min(max(Int(payload["limit"] ?? "") ?? 80, 1), 80)
         func response(_ rows: [ChatMessageRecord], start: Int) throws -> [String: String] {
-            let data = try MobileSnapshotBuilder.encoder().encode(rows)
+            let data = try TurnSummaryComputer.makeEncoder().encode(rows)
             var result = ["status": "ok", "ok": "true", "messages": String(decoding: data, as: UTF8.self),
                           "hasOlder": String(messages[..<start].contains(where: \.isPersonVisible))]
             result["transcriptGeneration"] = generation.map(String.init)

@@ -89,8 +89,6 @@ public final class iCloudBridge: ObservableObject {
     var deviceDrainTask: Task<Bool, Never>?
     var deviceDrainGeneration: Int?
     var deviceDrainQueued = false
-    var cloudKitPushProofAt: Date?
-    let cloudKitPushProofRead = LatestRead()
     var cloudKitPushEvidenceTask: Task<Void, Never>?
     var cloudKitPushUnavailable = false
     var deviceMetadataDrainTask: Task<Void, Never>?
@@ -255,7 +253,6 @@ public final class iCloudBridge: ObservableObject {
         deviceNetworkChanges?.cancel()
         deviceNetworkChanges = nil
         deviceMetadataDrainTask?.cancel()
-        cloudKitPushProofAt = nil
         cloudKitPushUnavailable = false
         messageHandler = nil
         deviceTransport = nil

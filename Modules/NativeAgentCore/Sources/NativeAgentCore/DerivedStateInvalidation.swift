@@ -29,18 +29,13 @@ public struct DerivedSourceChange: Codable, Equatable, Hashable, Sendable {
         semantic: Bool = true,
         occurredAt: Date = Date()
     ) {
-        self.namespace = Self.normalized(namespace, fallback: "unknown")
-        self.stableID = Self.normalized(stableID, fallback: "unknown")
+        self.namespace = namespace.trimmedNonEmpty ?? "unknown"
+        self.stableID = stableID.trimmedNonEmpty ?? "unknown"
         self.operation = operation
         self.canonicalLocator = canonicalLocator
-        self.reason = Self.normalized(reason, fallback: "source_change")
+        self.reason = reason.trimmedNonEmpty ?? "source_change"
         self.semantic = semantic
         self.occurredAt = occurredAt
-    }
-
-    private static func normalized(_ value: String, fallback: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? fallback : trimmed
     }
 }
 

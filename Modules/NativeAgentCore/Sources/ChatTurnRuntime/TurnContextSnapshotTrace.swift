@@ -57,6 +57,32 @@ extension SwiftNativeTurnEngine {
         let cognitive = context.cognitiveRuntimeContext.flatMap { fragment in
             Self.deliveredInput(context).contains(fragment) ? fragment : nil
         }
+        var payload = measureContextSnapshot(
+            request: request, context: context, messages: messages, wireSchemas: wireSchemas,
+            systemPrompt: systemPrompt, stable: stable, countedDynamic: countedDynamic, cognitive: cognitive,
+            surface: surface, sessionId: sessionId, turn: turn, emitReady: emitReady
+        )
+        addContextDeliveryDetails(
+            to: &payload, context: context, messages: messages, systemPrompt: systemPrompt,
+            countedVolatile: countedVolatile, volatileBlock: volatileBlock, ridesVolatileBlock: ridesVolatileBlock,
+            prefix: prefix, runId: runId, sessionId: sessionId
+        )
+        addContextPreviews(
+            to: &payload, context: context, request: request,
+            systemPrompt: systemPrompt, stable: stable, dynamic: dynamic, cognitive: cognitive
+        )
+        publishContextSnapshot(
+            payload, publication: publication, surface: surface, sessionId: sessionId, turn: turn,
+            dynamic: dynamic, volatileBlock: volatileBlock, ridesVolatileBlock: ridesVolatileBlock
+        )
+        return sessionId
+    }
+
+    private nonisolated static func measureContextSnapshot(
+        request: ConversationPrefixSeeding.Request, context: TurnContext, messages: [LLMMessage],
+        wireSchemas: [LLMToolSchema], systemPrompt: String, stable: String, countedDynamic: String, cognitive: String?,
+        surface: String, sessionId: String?, turn: Turn, emitReady: Bool
+    ) -> [String: JSONValue] {
         let sourceSizes = context.personaDocs.keys.sorted().map { id in
             let content = context.personaDocs[id] ?? ""
             return JSONValue.object([
@@ -111,7 +137,7 @@ extension SwiftNativeTurnEngine {
 
         if emitReady { fireContextReady(surface: surface, context: context, sessionId: sessionId, turn: turn) }
 
-        var payload: [String: JSONValue] = [
+        let payload: [String: JSONValue] = [
             "schema": .string("context.snapshot.v1"),
             "model": .string(context.modelId),
             "reasoningEffort": .string(context.reasoningEffort),
@@ -162,6 +188,14 @@ extension SwiftNativeTurnEngine {
                 "cognitiveChars": .int(Int64(contextSnapshotCognitiveLimit)),
             ]),
         ]
+        return payload
+    }
+
+    private nonisolated static func addContextDeliveryDetails(
+        to payload: inout [String: JSONValue], context: TurnContext, messages: [LLMMessage],
+        systemPrompt: String, countedVolatile: String, volatileBlock: String, ridesVolatileBlock: Bool,
+        prefix: ConversationPrefixTelemetrySnapshot?, runId: String?, sessionId: String?
+    ) {
         if let preparationMs = context.preparationMs {
             payload["preparationMs"] = .int(preparationMs)
         }
@@ -226,7 +260,12 @@ extension SwiftNativeTurnEngine {
         if let sessionId, !sessionId.isEmpty {
             payload["sessionId"] = .string(sessionId)
         }
+    }
 
+    private nonisolated static func addContextPreviews(
+        to payload: inout [String: JSONValue], context: TurnContext, request: ConversationPrefixSeeding.Request,
+        systemPrompt: String, stable: String, dynamic: String, cognitive: String?
+    ) {
         if request.segments != nil {
             let stablePreview = snapshotPreview(stable, maxCharacters: contextSnapshotStableLimit)
             let dynamicPreview = snapshotPreview(dynamic, maxCharacters: contextSnapshotDynamicLimit)
@@ -291,7 +330,12 @@ extension SwiftNativeTurnEngine {
                 return .object(row)
             })
         }
+    }
 
+    private nonisolated static func publishContextSnapshot(
+        _ payload: [String: JSONValue], publication: ContextFedRecord.Publication?, surface: String,
+        sessionId: String?, turn: Turn, dynamic: String, volatileBlock: String, ridesVolatileBlock: Bool
+    ) {
         TurnTraceBus.fireFromContext(
             kind: "context.snapshot",
             sessionId: sessionId,
@@ -313,7 +357,6 @@ extension SwiftNativeTurnEngine {
             TurnTraceBus.fireFromContext(kind: "context.fed.failed", sessionId: sessionId, surface: surface,
                 payload: .object(["reason": .string("No owning data root was supplied for this session's context record.")]), turn: turn)
         }
-        return sessionId
     }
 
     private nonisolated static func promptFingerprint(
@@ -351,8 +394,7 @@ extension SwiftNativeTurnEngine {
     nonisolated static func updateFingerprint(
         _ hasher: inout SHA256,
         label: String,
-        block: LLMContentBlock,
-        imageLabel: String? = nil
+        block: LLMContentBlock
     ) {
         switch block {
         case .text(let text):
@@ -366,7 +408,7 @@ extension SwiftNativeTurnEngine {
             updateFingerprint(&hasher, label: label + ".toolResult.content", data: Data(content.utf8))
             updateFingerprint(&hasher, label: label + ".toolResult.error", data: Data(String(isError).utf8))
         case .image(let mediaType, let base64, let name, let byteSize):
-            let prefix = imageLabel ?? label + ".image"
+            let prefix = label + ".image"
             updateFingerprint(&hasher, label: prefix + ".mediaType", data: Data(mediaType.utf8))
             updateFingerprint(&hasher, label: prefix + ".base64", data: Data(base64.utf8))
             updateFingerprint(&hasher, label: prefix + ".name", data: Data((name ?? "").utf8))

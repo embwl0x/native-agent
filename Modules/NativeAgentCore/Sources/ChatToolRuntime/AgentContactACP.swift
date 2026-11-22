@@ -13,7 +13,6 @@ import PersonaEngine
 import StandingBots
 import ProviderRouting
 import Darwin
-import CryptoKit
 import MemoryV2
 import Dispatcher
 import MacControl
@@ -81,11 +80,48 @@ extension SwiftToolDispatcher {
         guard usesCanonicalBody, try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed else {
             return builderFullMacRequired(invocation: invocation, tool: "agent_message")
         }
-        func missing(_ reason: String, _ detail: String, instruction: String, call: String? = nil, tap: String? = nil) -> JSONValue {
-            .object(["status": .string("unavailable"), "reason": .string(reason), "effects": .string("none"),
+        switch try await prepareACPRun(turn: turn, invocation: invocation, contact: contact, store: store, surface: surface) {
+        case .refused(let receipt): return receipt
+        case .ready(let prepared):
+            return try await runPreparedACP(turn: turn, invocation: invocation, contact: contact, message: message,
+                                            conversationID: conversationID, store: store, prepared: prepared)
+        }
+    }
+
+    private struct PreparedACP: Sendable {
+        let recipe: AgentRecipeStore.Recipe
+        let line: AgentHostACP
+        let secret: String
+        let handshakeCheck: String
+        let origin: SecurityOriginContext
+        let launchPermission: DrivenAgentLaunchPermission
+        let approved: AgentACPExecutable
+        let dryRun: Bool
+        let shown: String
+        let directory: URL
+        let server: JSONValue
+        let inbox: SwiftNativeApprovalInbox
+        let program: String
+        let arguments: [String]
+        let approvalContext: AgentACPApproval.Context
+        let decidedSessionID: String?
+        let childEnvironment: [String: String]
+        let configuration: String
+    }
+
+    private enum ACPRunPreparation {
+        case refused(JSONValue)
+        case ready(PreparedACP)
+    }
+
+    /// Validate the approved program and assemble the exact ACP launch configuration.
+    private func prepareACPRun(turn: Turn, invocation: ChatToolInvocation, contact: AgentPeerContact,
+                               store: AgentPeerStore, surface: String) async throws -> ACPRunPreparation {
+        func missing(_ reason: String, _ detail: String, instruction: String, call: String? = nil, tap: String? = nil) -> ACPRunPreparation {
+            .refused(.object(["status": .string("unavailable"), "reason": .string(reason), "effects": .string("none"),
                 "sent": .bool(false), "completed": .bool(false), "detail": .string(detail),
                 "remedy": Repair.remedy(owner: contact.name, nextCall: call.flatMap { try? JSONValue.parse(Data($0.utf8)) },
-                    tap: tap, instruction: instruction)])
+                    tap: tap, instruction: instruction)]))
         }
         let recipeCall = ToolFailureError.call("app", ["action": .string("agent.recipe"),
             "args": .object(contact.recipeID.map { ["host": .string($0)] } ?? [:])])
@@ -124,25 +160,25 @@ extension SwiftToolDispatcher {
         guard let approved = current.approvedACPExecutable, approved.isCurrent else {
             await AgentACPConnections.shared.revoke(peer: contact.id)
             // Reconnecting raises the renewal card without holding this turn.
-            return .object(["status": .string("reconnect_required"), "sent": .bool(false), "completed": .bool(false),
+            return .refused(.object(["status": .string("reconnect_required"), "sent": .bool(false), "completed": .bool(false),
                 "detail": .string("""
                     The approved program is missing, changed, or was never bound to this contact. Reconnect this agent to approve it. Nothing ran; \
                     the message was not resent.
-                    """)])
+                    """)]))
         }
         if let blocker = line.startupBlocker(installedVersion: approved.version) {
             await AgentACPConnections.shared.revoke(peer: contact.id)
             store.recordUnavailable(peerID: contact.id)
-            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                "reason": .string("incompatible_sandboxed_acp"), "detail": .string(blocker)])
+            return .refused(.object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                "reason": .string("incompatible_sandboxed_acp"), "detail": .string(blocker)]))
         }
         let executable = approved.path
         // A recipe dry run starts a fresh handshake without sending a prompt.
         let dryRun = invocation.dryRun
         let shown = contact.name + (approved.version.map { " " + AgentContactHealth.shortVersion($0) } ?? "")
         guard let folder = contact.acpWorkingDirectory else {
-            return .object(["status": .string("reconnect_required"), "completed": .bool(false),
-                "detail": .string("Reconnect this agent to approve its starting folder.")])
+            return .refused(.object(["status": .string("reconnect_required"), "completed": .bool(false),
+                "detail": .string("Reconnect this agent to approve its starting folder.")]))
         }
         let directory = URL(fileURLWithPath: folder)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
@@ -160,7 +196,7 @@ extension SwiftToolDispatcher {
         let rule = await Self.agentProgramLaunch(launchPermission, dataRoot: dataRoot)
         guard case .run(let wrap) = rule.launch else {
             await AgentACPConnections.shared.revoke(peer: contact.id)
-            return .object(rule.refused)
+            return .refused(.object(rule.refused))
         }
         let command = wrap(executable, line.arguments)
         let program = command[0], arguments = Array(command.dropFirst())
@@ -174,6 +210,21 @@ extension SwiftToolDispatcher {
             "folder": .string(folder), "server": server,
             "environment": .object(childEnvironment.mapValues(JSONValue.string))
         ]).serialize(pretty: false)
+        return .ready(PreparedACP(recipe: recipe, line: line, secret: secret, handshakeCheck: handshakeCheck, origin: origin,
+                                  launchPermission: launchPermission, approved: approved, dryRun: dryRun, shown: shown, directory: directory,
+                                  server: server, inbox: inbox, program: program, arguments: arguments, approvalContext: approvalContext,
+                                  decidedSessionID: decidedSessionID, childEnvironment: childEnvironment, configuration: configuration))
+    }
+
+    /// Run the turn against its retained ACP client and settle the lease.
+    private func runPreparedACP(turn: Turn, invocation: ChatToolInvocation, contact: AgentPeerContact, message: String?,
+                                conversationID: String?, store: AgentPeerStore, prepared: PreparedACP) async throws -> JSONValue {
+        let (recipe, line, secret, origin) = (prepared.recipe, prepared.line, prepared.secret, prepared.origin)
+        let (launchPermission, approved, dryRun, directory) = (prepared.launchPermission, prepared.approved, prepared.dryRun, prepared.directory)
+        let (server, inbox, program, arguments) = (prepared.server, prepared.inbox, prepared.program, prepared.arguments)
+        let (approvalContext, decidedSessionID) = (prepared.approvalContext, prepared.decidedSessionID)
+        let (childEnvironment, configuration) = (prepared.childEnvironment, prepared.configuration)
+        let row = recipe.host
         var lease: AgentACPConnections.Lease?
         let began = Date()
         do {
@@ -225,28 +276,8 @@ extension SwiftToolDispatcher {
             // sign-in (an agent may ask for it only at its prompt), so a dry run leaves a mark that carries the person's step.
             store.clearUnavailable(peerID: contact.id, before: began, keepingStep: dryRun)
             if dryRun {
-                let found = await acquired.client.learned(line)
-                var host = row
-                host.acp = found
-                // A finding that cannot be written proves nothing, and no retry runs on it.
-                var written: AgentRecipeStore.Recipe?
-                if found != line {
-                    do { written = try AgentRecipeStore.learn(recipe, host: host) }
-                    catch {
-                        return Self.peerRedact(.object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false),
-                            "agent": .string("peer:" + contact.id), "transport": .string("acp"),
-                            "detail": .string("""
-                                Handshake verified for \(shown); recipe save unconfirmed (\(Self.learned(line, found))): \(error).
-                                """)]), token: secret)
-                    }
-                }
-                let now = written ?? recipe
-                var result: [String: JSONValue] = ["status": .string(written == nil ? "passed" : "repaired"), "dry_run": .bool(true), "sent": .bool(false),
-                    "agent": .string("peer:" + contact.id), "transport": .string("acp"), "recipe_version": .int(Int64(now.recipeVersion)),
-                    "detail": .string("\(shown) answered its handshake with no prompt sent.")]
-                if let written { result["healed"] = .string("\(shown): \(Self.learned(line, found)) — recipe updated to v\(written.recipeVersion)") }
-                if let note = reply.modeNote { result["mode_note"] = .string(note) }
-                return .object(result)
+                return await recordACPHandshake(acquired.client, reply: reply, contact: contact, recipe: recipe,
+                                                line: line, shown: prepared.shown, secret: secret)
             }
             store.recordProof(peerID: contact.id, inbound: message != nil && reply.completed && !reply.text.isEmpty, outbound: message != nil)
             // Only a send that never launched proves the route unavailable; an unanswered delivered prompt remains the peer's turn.
@@ -272,102 +303,138 @@ extension SwiftToolDispatcher {
             return .object(["status": .string("reconnect_required"), "sent": .bool(false), "completed": .bool(false),
                 "detail": .string("The program changed before launch. Reconnect this agent to approve it. Nothing ran; the message was not resent.")])
         } catch {
-            // The session it already has, so an uncertain turn can be resumed, not orphaned.
-            let opened = await lease?.client.currentSessionID
-            let delivered = await lease?.client.delivered == true
-            let reported = await lease?.client.learned(line).protocolVersion
-            // A turn that ended in an error still shows what the agent said in it (often its own account of the failure).
-            let said = await lease?.client.said ?? ""
-            let session = conversationID ?? opened
-            if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
-            func withSaid(_ result: [String: JSONValue]) -> JSONValue {
-                var result = result
-                if !said.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    result["reply"] = .string(said)
-                    result["untrusted_remote_data"] = .bool(true)
-                }
-                return Self.peerRedact(.object(result), token: secret)
-            }
-            let failure = error as? AgentACPClient.Failure
-            let declined = (error as? ToolFailureError)?.code == AgentACPClient.Failure.busy.rawValue
-            if failure == .sessionUnavailable || failure == .busy || declined {
-                let detail = error.localizedDescription + (failure == .sessionUnavailable ? "" :
-                    " This call sent nothing. Earlier deliveries still stand.")
-                return Self.peerRedact(.object(["status": .string(failure == .sessionUnavailable ? "session_unavailable" : "busy"),
-                    "agent": .string("peer:" + contact.id), "sent": .bool(false), "completed": .bool(false),
-                    "detail": .string(detail), "untrusted_remote_data": .bool(declined)]), token: secret)
-            }
-            // The agent is not signed in to its own service (classified where its error is read). The conversation stays; signing in continues it.
-            if (error as? AgentACPClient.Failure) == .signInRequired {
-                // The recipe names the person's one step in plain words; the contact row says it until the next answer clears it.
-                let step = line.signIn.map { "Not signed in: \($0)." } ?? "Not signed in to its own service: sign it in once in its own app or terminal."
-                store.recordUnavailable(peerID: contact.id, step: step)
-                var result: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + contact.id),
-                    "transport": .string("acp"), "sent": delivered ? .null : .bool(false), "completed": .bool(false),
-                    "reason": .string("sign_in_required"),
-                    "detail": .string((line.signIn.map { "\(shown) is not signed in to its own service: \($0); then the conversation continues where it was." }
-                        ?? "\(shown): " + AgentACPClient.Failure.signInRequired.localizedDescription)
-                        + (delivered ? " Whether it took the message is unknown; it was not resent." : " Nothing was sent."))]
-                result["person_step"] = .string(step)
-                if let session { result["conversation_id"] = .string(session) }
-                if dryRun { result["dry_run"] = .bool(true) }
-                return withSaid(result)
-            }
-            // Recipe disagreement or a failed dry run cannot claim a send.
-            if let refused = error as? AgentACPClient.Mismatch {
-                store.recordUnavailable(peerID: contact.id)
-                var result: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + contact.id),
-                    "transport": .string("acp"), "sent": .bool(false), "completed": .bool(false), "reason": .string("protocol_mismatch"),
-                    "method": .string(refused.method),
-                    "detail": .string("\(shown): \(refused.method) — \(refused.detail). Nothing was sent." + handshakeCheck)]
-                if let code = refused.code { result["code"] = .int(code) }
-                if let reported { result["protocol_version"] = .int(Int64(reported)) }
-                if let version = approved.version { result["program_version"] = .string(version) }
-                if dryRun { result["dry_run"] = .bool(true) }
-                // The agent's own error text never carries this connection's key.
-                return Self.peerRedact(.object(result), token: secret)
-            }
-            // An interrupted reply does not prove the program unavailable; distinguish local shutdown from peer EOF.
-            let quit = (error as? AgentACPClient.Failure) == .appQuit && !Task.isCancelled
-            let cutOff = (error as? AgentACPClient.Failure) == .interrupted || quit || error is CancellationError || Task.isCancelled
-            // Post-delivery timeout or unreadable output means the reply stalled, not that sending failed.
-            if !cutOff, !delivered { store.recordUnavailable(peerID: contact.id) }
-            if var result = AgentACPClient.startupTimeoutReceipt(error) {
-                result["agent"] = .string("peer:" + contact.id)
-                result["transport"] = .string("acp")
-                let detail: String = if case .string(let text)? = result["detail"] { text } else { error.localizedDescription }
-                result["detail"] = .string(detail + handshakeCheck)
-                if dryRun { result["status"] = .string("failed"); result["dry_run"] = .bool(true) }
-                return .object(result)
-            }
-            if dryRun {
+            return await recordACPFailure(error, lease: lease, contact: contact, conversationID: conversationID, store: store, prepared: prepared)
+        }
+    }
+
+    /// Retain what the dry handshake learned about the recipe.
+    private func recordACPHandshake(_ client: AgentACPClient, reply: AgentACPClient.Reply, contact: AgentPeerContact,
+                                    recipe: AgentRecipeStore.Recipe, line: AgentHostACP, shown: String, secret: String) async -> JSONValue {
+        let row = recipe.host
+        let found = await client.learned(line)
+        var host = row
+        host.acp = found
+        // A finding that cannot be written proves nothing, and no retry runs on it.
+        var written: AgentRecipeStore.Recipe?
+        if found != line {
+            do { written = try AgentRecipeStore.learn(recipe, host: host) }
+            catch {
                 return Self.peerRedact(.object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false),
-                    "agent": .string("peer:" + contact.id),
-                    "transport": .string("acp"), "detail": .string("\(shown) did not finish its handshake: "
-                        + ((error as? AgentACPClient.Failure)?.localizedDescription ?? error.localizedDescription) + handshakeCheck)]), token: secret)
+                    "agent": .string("peer:" + contact.id), "transport": .string("acp"),
+                    "detail": .string("""
+                        Handshake verified for \(shown); recipe save unconfirmed (\(Self.learned(line, found))): \(error).
+                        """)]), token: secret)
             }
-            if let unavailable = error as? AgentACPClient.PermissionUnavailable {
-                var result: [String: JSONValue] = ["status": .string("unavailable"), "reason": .string("permission_decision_unavailable"),
-                    "agent": .string("peer:" + contact.id), "transport": .string("acp"), "sent": .null,
-                    "completed": .bool(false), "terminal": .bool(true), "detail": .string(unavailable.localizedDescription),
-                    "permission_failure": ChatToolOutcome.failure(error: unavailable.cause)]
-                if let session { result["conversation_id"] = .string(session) }
-                return withSaid(result)
+        }
+        let now = written ?? recipe
+        var result: [String: JSONValue] = ["status": .string(written == nil ? "passed" : "repaired"), "dry_run": .bool(true), "sent": .bool(false),
+            "agent": .string("peer:" + contact.id), "transport": .string("acp"), "recipe_version": .int(Int64(now.recipeVersion)),
+            "detail": .string("\(shown) answered its handshake with no prompt sent.")]
+        if let written { result["healed"] = .string("\(shown): \(Self.learned(line, found)) — recipe updated to v\(written.recipeVersion)") }
+        if let note = reply.modeNote { result["mode_note"] = .string(note) }
+        return .object(result)
+    }
+
+    /// Release a failed lease and retain any delivery, session, and reply evidence.
+    private func recordACPFailure(_ error: Error, lease: AgentACPConnections.Lease?, contact: AgentPeerContact,
+                                  conversationID: String?, store: AgentPeerStore, prepared: PreparedACP) async -> JSONValue {
+        let (line, secret, shown, approved, dryRun, handshakeCheck) =
+            (prepared.line, prepared.secret, prepared.shown, prepared.approved, prepared.dryRun, prepared.handshakeCheck)
+        // The session it already has, so an uncertain turn can be resumed, not orphaned.
+        let opened = await lease?.client.currentSessionID
+        let delivered = await lease?.client.delivered == true
+        let reported = await lease?.client.learned(line).protocolVersion
+        // A turn that ended in an error still shows what the agent said in it (often its own account of the failure).
+        let said = await lease?.client.said ?? ""
+        let session = conversationID ?? opened
+        if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
+        func withSaid(_ result: [String: JSONValue]) -> JSONValue {
+            var result = result
+            if !said.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                result["reply"] = .string(said)
+                result["untrusted_remote_data"] = .bool(true)
             }
-            if let failure = ProviderFailure.report(error, work: .outcomeUnknown) {
-                var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("acp")]
-                Self.peerFailure(failure, into: &result)
-                if let session { result["conversation_id"] = .string(session) }
-                return withSaid(result)
-            }
-            var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : quit ? "waiting" : "outcome_unknown"),
-                "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false), "terminal": .bool(!quit),
-                "detail": .string(Task.isCancelled ? "The conversation was stopped." :
-                    (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")]
-            if quit { result["background_send"] = .bool(true) }
+            return Self.peerRedact(.object(result), token: secret)
+        }
+        let failure = error as? AgentACPClient.Failure
+        let declined = (error as? ToolFailureError)?.code == AgentACPClient.Failure.busy.rawValue
+        if failure == .sessionUnavailable || failure == .busy || declined {
+            let detail = error.localizedDescription + (failure == .sessionUnavailable ? "" :
+                " This call sent nothing. Earlier deliveries still stand.")
+            return Self.peerRedact(.object(["status": .string(failure == .sessionUnavailable ? "session_unavailable" : "busy"),
+                "agent": .string("peer:" + contact.id), "sent": .bool(false), "completed": .bool(false),
+                "detail": .string(detail), "untrusted_remote_data": .bool(declined)]), token: secret)
+        }
+        // The agent is not signed in to its own service (classified where its error is read). The conversation stays; signing in continues it.
+        if (error as? AgentACPClient.Failure) == .signInRequired {
+            // The recipe names the person's one step in plain words; the contact row says it until the next answer clears it.
+            let step = line.signIn.map { "Not signed in: \($0)." } ?? "Not signed in to its own service: sign it in once in its own app or terminal."
+            store.recordUnavailable(peerID: contact.id, step: step)
+            var result: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + contact.id),
+                "transport": .string("acp"), "sent": delivered ? .null : .bool(false), "completed": .bool(false),
+                "reason": .string("sign_in_required"),
+                "detail": .string((line.signIn.map { "\(shown) is not signed in to its own service: \($0); then the conversation continues where it was." }
+                    ?? "\(shown): " + AgentACPClient.Failure.signInRequired.localizedDescription)
+                    + (delivered ? " Whether it took the message is unknown; it was not resent." : " Nothing was sent."))]
+            result["person_step"] = .string(step)
+            if let session { result["conversation_id"] = .string(session) }
+            if dryRun { result["dry_run"] = .bool(true) }
+            return withSaid(result)
+        }
+        // Recipe disagreement or a failed dry run cannot claim a send.
+        if let refused = error as? AgentACPClient.Mismatch {
+            store.recordUnavailable(peerID: contact.id)
+            var result: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + contact.id),
+                "transport": .string("acp"), "sent": .bool(false), "completed": .bool(false), "reason": .string("protocol_mismatch"),
+                "method": .string(refused.method),
+                "detail": .string("\(shown): \(refused.method) — \(refused.detail). Nothing was sent." + handshakeCheck)]
+            if let code = refused.code { result["code"] = .int(code) }
+            if let reported { result["protocol_version"] = .int(Int64(reported)) }
+            if let version = approved.version { result["program_version"] = .string(version) }
+            if dryRun { result["dry_run"] = .bool(true) }
+            // The agent's own error text never carries this connection's key.
+            return Self.peerRedact(.object(result), token: secret)
+        }
+        // An interrupted reply does not prove the program unavailable; distinguish local shutdown from peer EOF.
+        let quit = (error as? AgentACPClient.Failure) == .appQuit && !Task.isCancelled
+        let cutOff = (error as? AgentACPClient.Failure) == .interrupted || quit || error is CancellationError || Task.isCancelled
+        // Post-delivery timeout or unreadable output means the reply stalled, not that sending failed.
+        if !cutOff, !delivered { store.recordUnavailable(peerID: contact.id) }
+        if var result = AgentACPClient.startupTimeoutReceipt(error) {
+            result["agent"] = .string("peer:" + contact.id)
+            result["transport"] = .string("acp")
+            let detail: String = if case .string(let text)? = result["detail"] { text } else { error.localizedDescription }
+            result["detail"] = .string(detail + handshakeCheck)
+            if dryRun { result["status"] = .string("failed"); result["dry_run"] = .bool(true) }
+            return .object(result)
+        }
+        if dryRun {
+            return Self.peerRedact(.object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false),
+                "agent": .string("peer:" + contact.id),
+                "transport": .string("acp"), "detail": .string("\(shown) did not finish its handshake: "
+                    + ((error as? AgentACPClient.Failure)?.localizedDescription ?? error.localizedDescription) + handshakeCheck)]), token: secret)
+        }
+        if let unavailable = error as? AgentACPClient.PermissionUnavailable {
+            var result: [String: JSONValue] = ["status": .string("unavailable"), "reason": .string("permission_decision_unavailable"),
+                "agent": .string("peer:" + contact.id), "transport": .string("acp"), "sent": .null,
+                "completed": .bool(false), "terminal": .bool(true), "detail": .string(unavailable.localizedDescription),
+                "permission_failure": ChatToolOutcome.failure(error: unavailable.cause)]
             if let session { result["conversation_id"] = .string(session) }
             return withSaid(result)
         }
+        if let failure = ProviderFailure.report(error, work: .outcomeUnknown) {
+            var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("acp")]
+            Self.peerFailure(failure, into: &result)
+            if let session { result["conversation_id"] = .string(session) }
+            return withSaid(result)
+        }
+        var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : quit ? "waiting" : "outcome_unknown"),
+            "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false), "terminal": .bool(!quit),
+            "detail": .string(Task.isCancelled ? "The conversation was stopped." :
+                (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")]
+        if quit { result["background_send"] = .bool(true) }
+        if let session { result["conversation_id"] = .string(session) }
+        return withSaid(result)
     }
     /// Scrub reply snapshots before exposing ACP progress.
     static func acpLiveUpdate(_ target: AgentConversationLiveTarget?) -> @Sendable (JSONValue) async -> Void {

@@ -1,20 +1,11 @@
 import AppKit
-// Blueprint: | `BodyNativePanels.swift` | Cancellable body-native panels and questions; once its run loop runs the body never runs modal |
+import NativeAgentShared
+// Blueprint: | `BodyNativePanels.swift` | Cancellable body-native confirmation sheets; once its run loop runs the body never runs modal |
 
-/// Once its run loop runs, the body asks through these, never through `runModal`: an app-modal session started from a main-actor job
+/// Once its run loop runs, the body asks through sheets, never through `runModal`: an app-modal session started from a main-actor job
 /// freezes every main-actor owner until it is answered, and macOS refuses Quit while it is open, so an unseen question holds the body.
-/// A question these show never holds Quit either: Quit ends the question with the body.
-@MainActor enum FaceNativePanel {
-    static func choose(_ panel: NSSavePanel) async throws -> NSApplication.ModalResponse {
-        panel.preventsApplicationTerminationWhenModal = false
-        return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            let result = await panel.begin()
-            try Task.checkCancellation()
-            return result
-        } onCancel: { Task { @MainActor in panel.cancel(nil) } }
-    }
-
+/// Quit ends the question with the body.
+@MainActor extension FaceNativePanel {
     static func confirm(_ alert: NSAlert) async throws -> NSApplication.ModalResponse {
         alert.window.preventsApplicationTerminationWhenModal = false
         let host: NSWindow?

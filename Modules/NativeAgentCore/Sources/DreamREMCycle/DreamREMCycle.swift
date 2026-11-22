@@ -153,8 +153,7 @@ public enum DreamREMSchedule {
         now: Date = Date(),
         calendar: Calendar = localCalendar()
     ) -> String {
-        let c = calendar.dateComponents([.year, .month, .day], from: now)
-        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+        NativeTimestampFormat.calendarDay(now, calendar: calendar)
     }
 
 

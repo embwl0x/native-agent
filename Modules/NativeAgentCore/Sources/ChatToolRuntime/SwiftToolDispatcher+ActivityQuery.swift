@@ -78,11 +78,6 @@ extension SwiftToolDispatcher {
             throw activityQueryFailure(.remoteSurfaceRefused(surface: surface))
         }
 
-        func stringArg(_ key: String) -> String? {
-            guard case .string(let value)? = input[key] else { return nil }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
         func intArg(_ key: String) -> Int? {
             switch input[key] {
             case .int(let value): return Int(value)
@@ -93,7 +88,7 @@ extension SwiftToolDispatcher {
         }
 
         let timezone: TimeZone
-        if let requestedTimezone = stringArg("timezone") {
+        if let requestedTimezone = input["timezone"]?.trimmedString {
             guard let resolved = TimeZone(identifier: requestedTimezone) else {
                 throw activityQueryFailure(.badRange(
                         "unknown IANA timezone \"\(requestedTimezone)\""
@@ -106,14 +101,14 @@ extension SwiftToolDispatcher {
         let now = Date()
 
         let range: (from: Double, to: Double)
-        if let fromRaw = stringArg("from") ?? intArg("from").map(String.init) {
+        if let fromRaw = input["from"]?.trimmedString ?? intArg("from").map(String.init) {
             guard let from = ActivityQueries.parseInstant(fromRaw, timezone: timezone) else {
                 throw activityQueryFailure(.badRange(
                         "could not read `from` = \"\(fromRaw)\". Accepted: epoch seconds, "
                         + "an ISO-8601 instant, or YYYY-MM-DD."
                     ), argumentPath: "$.from")
             }
-            let toRaw = stringArg("to") ?? intArg("to").map(String.init)
+            let toRaw = input["to"]?.trimmedString ?? intArg("to").map(String.init)
             let to: Double
             if let toRaw {
                 guard let parsed = ActivityQueries.parseInstant(toRaw, timezone: timezone) else {
@@ -128,7 +123,7 @@ extension SwiftToolDispatcher {
             }
             range = (from, to)
         } else {
-            let name = stringArg("range") ?? "today"
+            let name = input["range"]?.trimmedString ?? "today"
             guard let resolved = ActivityQueries.resolveRange(
                 named: name, timezone: timezone, now: now
             ) else {
@@ -146,7 +141,7 @@ extension SwiftToolDispatcher {
             return try await service.run(ActivityQueries.Request(
                 from: range.from,
                 to: range.to,
-                bundleID: stringArg("bundle_id"),
+                bundleID: input["bundle_id"]?.trimmedString,
                 timezone: timezone,
                 rowCap: intArg("limit") ?? ActivityQueries.maxRows
             ), fullMacAdmitted: fullMacAdmitted)

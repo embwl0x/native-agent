@@ -115,7 +115,7 @@ struct ChatView: View {
               let session = sync.sessions.first(where: { $0.id == mainID }) else {
             return "iPhone"
         }
-        return cleanTabTitle(session.displayTitle, fallback: "iPhone")
+        return session.displayTitle.trimmedNonEmpty ?? "iPhone"
     }
 
     var body: some View {
@@ -227,11 +227,6 @@ struct ChatView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func cleanTabTitle(_ title: String, fallback: String) -> String {
-        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return clean.isEmpty ? fallback : clean
-    }
-
     /// Hold notification navigation until the current session load finishes so the two switches cannot race.
     func consumeNotifiedChatSessionIfNeeded() {
         guard !store.isSwitchingSession, let sessionID = notifiedSessionID else { return }
@@ -264,8 +259,9 @@ struct ChatView: View {
                   $0.sessionID == store.selectedSessionID
                       && (!isInitialBinding || $0.preparedMessage != nil || $0.placeholderID != nil)
               }),
-              let anchorID = sync.chatAnchor?.cleanSessionId,
-              sync.sessions.contains(where: { $0.id == anchorID && $0.archived != true }) else { return }
+              let anchorID = sync.availableChatAnchorID,
+              store.locallyCreatedSessionID == nil || store.locallyCreatedSessionID != store.selectedSessionID
+                  || store.locallyCreatedSessionID == anchorID else { return }
         guard MobileChatSelectionIntent.explicitlySelectedSessionID == nil,
               store.selectedSessionID != anchorID else { return }
         if isInitialBinding {
@@ -330,7 +326,7 @@ struct ChatView: View {
                 }
             } catch SyncError.responseUnconfirmed {
                 // An expired unpin wait must not resubmit; retained action evidence and published navigation remain authoritative.
-                store.errorBanner = "Closing this tab is unconfirmed. Waiting for your Mac's updated tabs."
+                store.errorBanner = "Still closing that tab. Waiting for your Mac."
             } catch {
                 store.errorBanner = "Couldn't close that tab: \(error.localizedDescription)"
             }
@@ -372,12 +368,15 @@ struct ChatView: View {
             .disabled(store.isSwitchingSession)
 
             if store.messages.contains(where: { $0.role == .assistant }) {
+                let target = store.regenerationTarget
                 Button {
-                    store.regenerateLast(client: bridgeClient, controls: runtimeControls)
+                    if let target {
+                        store.regenerate(target.id, in: target.sessionID, client: bridgeClient, controls: runtimeControls)
+                    }
                 } label: {
                     Label("Answer again", systemImage: "arrow.clockwise")
                 }
-                .disabled(!store.canRegenerateLast)
+                .disabled(target == nil)
                 .accessibilityLabel("Regenerate last response")
                 .accessibilityHint("Asks the agent to answer the latest message again")
             }

@@ -4,43 +4,16 @@ import Senses
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
 import UserNotifications
 import Experiences
-import CryptoKit
 import os
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacAXObservation.swift` | Anchored AX search retains optional-attribute and action-name gaps |
 extension SwiftNativeMacControl {
-    func handleAXStatus(context: MacOperationContext) -> MacControlResult {
-        let started = now()
-        let trusted = accessibilitySource(context: context).isTrusted()
-        var output: [String: JSONValue] = ["trusted": .bool(trusted)]
-        if !trusted {
-            output["note"] = .string(MacAccessibilityReader.notTrustedNote)
-            output["grant_path"] = .string("System Settings → Privacy & Security → Accessibility")
-        }
-        if let app = accessibilitySource(context: context).frontmostApp() {
-            output["frontmost_app"] = app.toJSON()
-        }
-        // Missing permission is a valid status answer; only tree/find reads fail closed.
-        return MacControlResult(
-            ok: true,
-            action: "ax_status",
-            output: .object(output),
-            error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000)
-        )
-    }
     /// One read epoch anchors the walk and focus path to the same root; outside-root focus is unknown.
     /// - Parameter pid: re-read this process for identity checks, regardless of frontmost app.
     func axSnapshot(
@@ -101,25 +74,19 @@ extension SwiftNativeMacControl {
         section: String? = nil,
         context: MacOperationContext
     ) -> MacAnchoredRead {
-        #if canImport(ApplicationServices) && os(macOS)
         do { return try MacAXAttributeRead.checked(context: context) { context in
             anchoredSnapshotRead(limits: limits, pid: pid, window: window, complete: complete, section: section, context: context)
         } } catch { return .rendererUnavailable(error.localizedDescription) }
-        #else
-        return anchoredSnapshotRead(limits: limits, pid: pid, window: window, complete: complete, section: section, context: context)
-        #endif
     }
     private func anchoredSnapshotRead(limits: MacAXLimits, pid: Int32?, window: MacAXWindowIdentity?,
         complete: Bool, section: String?, context: MacOperationContext) -> MacAnchoredRead {
         // The body and its window share the person-only boundary.
         if PersonOnlyWindows.isOwnProcess(pid) { return .selfProcess }
-        #if canImport(ApplicationServices) && os(macOS)
         if accessibilitySource(context: context) is SystemMacAXElementSource,
            let target = pid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier, !PersonOnlyWindows.isOwnProcess(target) {
             do { try SystemMacAXElementSource.ensureRenderer(AXUIElementCreateApplication(target), refresh: true, context: context) }
             catch { return .rendererUnavailable(error.localizedDescription) }
         }
-        #endif
         let root: MacAXElementRef
         var identity: MacAXWindowIdentity?
         if let pid, let window {
@@ -249,8 +216,7 @@ extension SwiftNativeMacControl {
         // Electron can expose sibling web areas; read the complete window so sidebars, overlays and canvases remain reachable by window-relative paths.
         if scope != .chrome, try MacChromiumAccessibility.looksChromium(
             bundleId: windowRead.app?.bundleIdentifier,
-            pid: windowRead.app?.processIdentifier,
-            snapshot: windowRead.snapshot
+            pid: windowRead.app?.processIdentifier
         ) {
             let snapshot = windowRead.snapshot
             let webAreas = snapshot.nodes.filter { $0.attributes.role == "AXWebArea" }
@@ -282,8 +248,7 @@ extension SwiftNativeMacControl {
         }
         let chromiumFamily = try MacChromiumAccessibility.looksChromium(
             bundleId: windowRead.app?.bundleIdentifier,
-            pid: windowRead.app?.processIdentifier,
-            snapshot: windowRead.snapshot
+            pid: windowRead.app?.processIdentifier
         ) || MacChromiumAccessibility.hasWebArea(windowRead.snapshot)
         guard scope != .chrome, chromiumFamily else {
             seam["scope"] = .string(scope == .page && !chromiumFamily ? "chrome" : scope.rawValue)
@@ -400,15 +365,12 @@ extension SwiftNativeMacControl {
         limits: MacAXLimits,
         context: MacOperationContext
     ) -> (read: MacAXRead, seam: [String: JSONValue]) {
-        func normalized(_ raw: String?) -> String {
-            (raw ?? "").lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        }
         // Deep descent is for pages that bury their controls: a web read, or a walk the caps cut. A miss in an ordinary native window stays cheap.
         guard MacChromiumAccessibility.hasWebArea(read.snapshot) || read.snapshot.truncated else {
             return (read, [:])
         }
         // Keep the requested kind as a requirement so a Save link cannot answer Save button.
-        var words = normalized(seek).split(separator: " ").map(String.init)
+        var words = TextNormalization.lowercasedWithCollapsedWhitespace(seek).split(separator: " ").map(String.init)
         if words.first == "the" { words.removeFirst() }
         let kindRoles: [String: Set<String>] = [
             "button": ["AXButton", "AXMenuButton", "AXPopUpButton"],
@@ -429,7 +391,8 @@ extension SwiftNativeMacControl {
         // Only an actionable control of the requested kind counts, both for "the walk already has it" and for the deep hit: a static text or a field value
         // carrying the same words must not hide the button.
         func names(_ attributes: MacAXAttributes) -> Bool {
-            (normalized(attributes.title) == wanted || normalized(attributes.value) == wanted)
+            (TextNormalization.lowercasedWithCollapsedWhitespace(attributes.title ?? "") == wanted
+                || TextNormalization.lowercasedWithCollapsedWhitespace(attributes.value ?? "") == wanted)
                 && MacPerceptionCompiler.isInteractive(attributes)
                 && roles.map { $0.contains(attributes.role) } ?? true
         }
@@ -439,7 +402,7 @@ extension SwiftNativeMacControl {
             snapshot: read.snapshot, secretContext: MacScreenViewTextRedaction.nodeSecretContext(read.snapshot.nodes),
             app: read.app, windowTitle: read.rootTitle, focusPath: read.focusPath
         ).affordances
-        if kept.contains(where: { normalized($0.label) == wanted && (roles?.contains($0.role) ?? true) }) {
+        if kept.contains(where: { TextNormalization.lowercasedWithCollapsedWhitespace($0.label) == wanted && (roles?.contains($0.role) ?? true) }) {
             return (read, [:])
         }
         let rootPath = read.snapshot.nodes.first?.path ?? []

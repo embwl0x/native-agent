@@ -202,7 +202,8 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
             let binding = Installation(applicationURL: apps.first, executables: programs, environment: environment,
                 transports: failure == nil && (route != .mcpSettingsOnly || settingsSupported) ? [route] : [],
                 evidence: evidence, locations: locations, failure: failure)
-            cache[id] = (self, binding, installationInputs(binding))
+            // A binding read while the login PATH could not be read is not kept: the next use reads again once PATH returns.
+            if case .success = AgentHostCommandLines.loginEnvironment { cache[id] = (self, binding, installationInputs(binding)) }
             return binding
         }
     }

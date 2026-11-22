@@ -189,12 +189,6 @@ public final class FileSenseRegistry: Sendable {
         return published
     }
 
-    public func versions(id: String) async throws -> [SenseRecord] {
-        try await withSelection { store, _ in
-            (store, try store.senses[Self.index(id, in: store)].versions.map(\.presentationRecord).sorted { $0.version > $1.version })
-        }
-    }
-
     /// Exclude read bookkeeping and captured views so reads cannot change helper lifetimes.
     public func lifecycleRead(id: String) async throws -> JSONValue {
         try await withSelection { store, _ in

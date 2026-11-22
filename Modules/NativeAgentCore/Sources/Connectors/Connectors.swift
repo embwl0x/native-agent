@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Connectors.swift` | Workspace registry read and workspace path spelling |
+// Blueprint: | `Connectors.swift` | Workspace registry read |
 
 public final class SwiftNativeConnectorsClient: Sendable {
     private let root: URL
@@ -21,14 +21,5 @@ public final class SwiftNativeConnectorsClient: Sendable {
             throw PersistenceCoreError.ioFailure("\(workspacesPath.path) is not a list of workspaces; repair it before using workspaces")
         }
         return arr
-    }
-
-    nonisolated static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalUTCOffset(date)
-    }
-
-    static func workspaceURL(_ value: JSONValue?) -> URL? {
-        let path = value?.stringValue ?? ""
-        return path.isEmpty ? nil : URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(path))
     }
 }

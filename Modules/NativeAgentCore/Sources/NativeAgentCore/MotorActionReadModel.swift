@@ -43,7 +43,6 @@ public enum MotorVerificationState: String, Codable, Sendable, CaseIterable {
 /// authoritative for when its attempt or operation actually begins.
 public struct MotorActionDeadlineReadModel: Codable, Sendable, Equatable {
     public enum Scope: String, Codable, Sendable, CaseIterable {
-        case stepAttempt = "step_attempt"
         case operation
     }
 

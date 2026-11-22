@@ -29,17 +29,13 @@ extension AppToolExecutor {
 
     static func usedOutside(_ journal: [JSONValue]) -> Bool {
         journal.contains { entry in
-            guard case .array(let call)? = partFields(entry)["call"] else { return false }
+            guard case .array(let call)? = JSONValue.objectOrEmpty(entry)["call"] else { return false }
             return call.first == .string("primitive")
         }
     }
 
     /// Only decision and card-preview stops admit resumable strict checkpoints.
     static let partHandBacks: Set<String> = ["decide", "would_card"]
-
-    static func partFields(_ value: JSONValue?) -> [String: JSONValue] {
-        if case .object(let fields)? = value { fields } else { [:] }
-    }
 
     @MainActor
     func doorPart(_ action: AppAction, call: [String: JSONValue], input: [String: JSONValue], surface: String, root: URL,
@@ -68,7 +64,7 @@ extension AppToolExecutor {
     func doorPartPreview(_ action: AppAction, args: [String: JSONValue], input: [String: JSONValue], surface: String, root: URL,
                          turn: Turn, execution: AppActionExecution) async -> JSONValue {
         do {
-            var out = Self.partFields(try await Parts(root: root).run(id: action.tool, input: .object(args),
+            var out = JSONValue.objectOrEmpty(try await Parts(root: root).run(id: action.tool, input: .object(args),
                 requiredFingerprint: execution.valueCall.flatMap { $0.id == action.tool ? $0.version : nil }, preview: true,
                 invocation: execution.partInvocation(turn: turn, surface: surface, preview: true)))
             // A previewed run is never resumed: its private journal is let go.
@@ -125,7 +121,7 @@ extension AppToolExecutor {
                 out.removeValue(forKey: "upgrade")
             } catch { out = partSettlementFailure(out, error: error, operation: "ability.upgrade_queue", id: id, root: root) }
         }
-        let reason = doorText(out["reason"])
+        let reason = JSONValue.trimmedScalarTextOrEmpty(out["reason"])
         // The runner carries the action owner's remedy, including sense-version reads. Only the runner decides what took effect, including the original journal
         // on an aborted resume. A fresh run must not repeat it.
         let outside = calls.map(usedOutside) ?? false
@@ -142,8 +138,9 @@ extension AppToolExecutor {
         guard out["status"] == .string("stopped"), partHandBacks.contains(reason), let calls,
               !outside, let digest = out["version"]?.scalarText else { return .object(out) }
         let runID = "run-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8).lowercased()
-        let back = partFields(out["hand_back"])
-        let question = [back["question"], partFields(out["stopped"])["detail"]].lazy.map(doorText).first { !$0.isEmpty } ?? reason
+        let back = JSONValue.objectOrEmpty(out["hand_back"])
+        let question = [back["question"], JSONValue.objectOrEmpty(out["stopped"])["detail"]].lazy
+            .map(JSONValue.trimmedScalarTextOrEmpty).first { !$0.isEmpty } ?? reason
         // Resumes inherit the sealed steer and wake.
         var sealed: [String: JSONValue] = [
             "run_id": .string(runID), "skill": .string(id), "name": .string(name), "digest": .string(digest),
@@ -156,7 +153,9 @@ extension AppToolExecutor {
         sealed["wake"] = execution.wake
         do { try await PartRunStore.save(sealed, id: runID, root: root) }
         catch {
-            out["saved_run_id"] = .string(runID)
+            if (error as? ToolFailureError)?.code == "run_retention_failed" {
+                out["saved_run_id"] = .string(runID)
+            }
             out["resume_failure"] = ChatToolOutcome.failure(error: error, tool: "ability.run_checkpoint")
             return .object(partSettlementFailure(out, error: error, operation: "ability.run_checkpoint", id: runID, root: root))
         }
@@ -172,13 +171,18 @@ extension AppToolExecutor {
         }
         out["resume"] = .object(["run_id": .string(runID), "question": .string(question), "held": .array(held.map(JSONValue.string))])
         let took = out["changed"] == nil ? "" : "The calls in changed took effect; don't run them again. "
+        let notebook = switch out["notebook_changed"] {
+        case .bool(true): "The ability's notebook changed. Do not repeat its completed writes. "
+        case .null: "A notebook write has an unconfirmed result. Check the ability's notebook before repeating a write. "
+        default: ""
+        }
         out["remedy"] = .object([
             "kind": .string("resume"),
-            "instruction": .string(took + (reason == "decide"
+            "instruction": .string(took + notebook + (reason == "decide"
                 ? "It stopped to ask you hand_back.question: answer with ability.resume {run_id, answer}, and app.decide returns your answer."
                 : "It handed hand_back's step back before it ran: do it yourself as its own app call if you still want it, "
                     + "then ability.resume {run_id, answer} goes on, the step returning your answer.")
-                + " A resume reads again everything it read, and goes on only if it all reads the same."),
+                + " A resume verifies its earlier reads against current state, accounting for its own later writes."),
             "next_call": .object(["tool": .string("app"), "input": .object([
                 "action": .string("ability.resume"), "args": .object(["run_id": .string(runID)]),
             ])]),
@@ -207,11 +211,44 @@ extension AppToolExecutor {
     @MainActor
     func doorPartResume(_ args: [String: JSONValue], preview: Bool = false, surface: String, root: URL,
                         turn: Turn, execution: AppActionExecution) async -> JSONValue {
-        let runID = Self.doorText(args["run_id"])
+        let runID = JSONValue.trimmedScalarTextOrEmpty(args["run_id"])
         if runID.range(of: "^run-[0-9a-f]{8}$", options: .regularExpression) == nil {
             return Self.doorRefusal("invalid_run_id", "run_id must be run- followed by eight lowercase hex digits. Nothing ran.",
                 remedy: "select_run", "Read the saved run ids and pass the exact run_id.", next: ["page": .string("tools")])
         }
+        switch await readResumeRequest(args, runID: runID, preview: preview, root: root) {
+        case .refused(let result): return result
+        case .ready(let run, let claim, let requestedAbility):
+            let resume = PartResumeCheckpoint(runID: runID, root: root, claim: claim)
+            return await resumeClaimedPart(run, requestedAbility: requestedAbility, args: args, preview: preview, surface: surface,
+                                           turn: turn, execution: execution, resume: resume)
+        }
+    }
+
+    private enum PartResumeRequest {
+        case refused(JSONValue)
+        case ready([String: JSONValue], PartRunStore.Claim?, String?)
+    }
+
+    private final class PartResumeCheckpoint {
+        let runID: String
+        let root: URL
+        let claim: PartRunStore.Claim?
+        let store: SwiftNativeDeskStore
+        var passed: [String: DeskHold] = [:]
+        var closeFailure: Error?
+
+        init(runID: String, root: URL, claim: PartRunStore.Claim?) {
+            self.runID = runID
+            self.root = root
+            self.claim = claim
+            store = SwiftNativeDeskStore(dataRoot: root)
+        }
+    }
+
+    /// Bind the optional ability and read or claim the exact checkpoint.
+    @MainActor
+    private func readResumeRequest(_ args: [String: JSONValue], runID: String, preview: Bool, root: URL) async -> PartResumeRequest {
         // An optional ability reference binds the requested run without claiming it on a typo or a different ability. run_id remains the exact checkpoint.
         var requestedAbility: String?
         if let named = args["id"]?.scalarText {
@@ -219,16 +256,16 @@ extension AppToolExecutor {
                 let parts = Parts(root: root)
                 guard let row = try parts.row(named), let id = row["id"]?.scalarText else {
                     let refusal = try parts.unknown(named)
-                    return .object(refusal.fields.merging(["status": .string("refused")]) { $1 })
+                    return .refused(.object(refusal.fields.merging(["status": .string("refused")]) { $1 }))
                 }
                 requestedAbility = id
                 let waiting = try await PartRunStore.read(runID, root: root)
-                if Self.doorText(waiting["skill"]) != id {
-                    return Self.doorRefusal("wrong_ability", "\(runID) is not a stopped run of \(id). Nothing was claimed or run.",
+                if JSONValue.trimmedScalarTextOrEmpty(waiting["skill"]) != id {
+                    return .refused(Self.doorRefusal("wrong_ability", "\(runID) is not a stopped run of \(id). Nothing was claimed or run.",
                         remedy: "select_run", "Read the saved run ids and choose this ability's run_id.",
-                        next: ["page": .string("tools")], extra: ["id": .string(id), "run_id": .string(runID)])
+                        next: ["page": .string("tools")], extra: ["id": .string(id), "run_id": .string(runID)]))
                 }
-            } catch { return ChatToolOutcome.failure(error: error, tool: "ability.resume") }
+            } catch { return .refused(ChatToolOutcome.failure(error: error, tool: "ability.resume")) }
         }
         let run: [String: JSONValue]
         let claim: PartRunStore.Claim?
@@ -238,88 +275,57 @@ extension AppToolExecutor {
                 let taken = try await PartRunStore.take(runID, root: root)
                 claim = taken; run = taken.run
             }
-        } catch { return ChatToolOutcome.failure(error: error, tool: "ability.resume") }
-        let store = SwiftNativeDeskStore(dataRoot: root)
-        var passed: [String: DeskHold] = [:]
-        func checkpoint(_ result: JSONValue, consume: Bool) async -> JSONValue {
-            guard let claim else { return result }
-            return await settle { [passed] in
-                var result = result
-                if !consume || Self.partFields(result)["settlement_failures"] != nil {
-                    do { try await store.returnHolds(passed) }
-                    catch {
-                        result = .object(Self.partSettlementFailure(Self.partFields(result), error: error,
-                            operation: "ability.return_holds", id: runID, root: root))
-                    }
-                }
-                if consume, Self.partFields(result)["settlement_failures"] != nil {
-                    var out = Self.partFields(result)
-                    out["unsettled_checkpoint"] = .string(claim.path)
-                    return .object(out)
-                }
-                do {
-                    if consume { try claim.consume() } else { try claim.release() }
-                    return result
-                } catch {
-                    var failure = Self.partSettlementFailure(Self.partFields(result), error: error,
-                        operation: consume ? "ability.consume_checkpoint" : "ability.release_checkpoint", id: runID, root: root)
-                    if consume {
-                        do { try await store.returnHolds(passed) }
-                        catch {
-                            failure = Self.partSettlementFailure(failure, error: error, operation: "ability.return_holds", id: runID, root: root)
-                        }
-                    }
-                    return .object(failure)
-                }
-            }
-        }
-        if let requestedAbility, Self.doorText(run["skill"]) != requestedAbility {
+        } catch { return .refused(ChatToolOutcome.failure(error: error, tool: "ability.resume")) }
+        return .ready(run, claim, requestedAbility)
+    }
+
+    /// Validate the claimed run, pass its holds and choose fresh execution or replay.
+    @MainActor
+    private func resumeClaimedPart(_ run: [String: JSONValue], requestedAbility: String?, args: [String: JSONValue],
+                                   preview: Bool, surface: String, turn: Turn, execution: AppActionExecution,
+                                   resume: PartResumeCheckpoint) async -> JSONValue {
+        let (runID, root, store) = (resume.runID, resume.root, resume.store)
+        if let requestedAbility, JSONValue.trimmedScalarTextOrEmpty(run["skill"]) != requestedAbility {
             return await checkpoint(Self.failure("wrong_ability", "\(runID) is not a stopped run of \(requestedAbility). Nothing ran.",
                 extra: ["id": .string(requestedAbility), "run_id": .string(runID), "remedy": .object(["kind": .string("select_run"),
                     "instruction": .string("Read the saved run ids and choose this ability's run_id."),
-                    "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("tools")])])])]), consume: false)
+                    "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("tools")])])])]), consume: false, resume: resume)
         }
         let steer: (sources: [String], elevated: [String])
         do { steer = try PeerDataTaint.steer(in: run["steer"]) }
         catch {
-            let failure = Self.partFields(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
+            let failure = JSONValue.objectOrEmpty(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
             if preview { return .object(failure) }
             return await checkpoint(.object(Self.partSettlementFailure(failure, error: error, operation: "ability.resume_provenance", id: runID, root: root)),
-                consume: false)
+                consume: false, resume: resume)
         }
         // Restore only at a live run, including a fresh one after a prior process
         // life. A preview or a refused checkpoint mutates no turn authority.
         let heldTurn = turn
-        func resumedTurn() -> Turn {
-            let taint = heldTurn.peerSteering ?? PeerDataTaint()
-            steer.sources.forEach { taint.mark(peer: $0) }
-            steer.elevated.forEach { taint.elevate(peer: $0) }
-            return heldTurn.with(\.peerSteering, taint)
-        }
         var execution = execution
         execution.wake = run["wake"]
-        let name = Self.doorText(run["name"]), id = Self.doorText(run["skill"])
+        let name = JSONValue.trimmedScalarTextOrEmpty(run["name"]), id = JSONValue.trimmedScalarTextOrEmpty(run["skill"])
         // Both fresh restored runs and replayed runs release the stopped run's reservations while retaining its checkpoint.
         if !preview {
-            do { passed = try await store.passHolds(run: runID) }
+            do { resume.passed = try await store.passHolds(run: runID) }
             catch {
-                return await checkpoint(.object(Self.partSettlementFailure(Self.partFields(ChatToolOutcome.failure(error: error, tool: "ability.resume")),
-                    error: error, operation: "ability.resume_holds", id: runID, root: root)), consume: false)
+                return await checkpoint(.object(Self.partSettlementFailure(JSONValue.objectOrEmpty(ChatToolOutcome.failure(error: error, tool: "ability.resume")),
+                    error: error, operation: "ability.resume_holds", id: runID, root: root)), consume: false, resume: resume)
             }
         }
         if run["status"] == .string("stopped"), run["reason"] == .string(DataRootLife.stoppedReason) {
-            let input = Self.partFields(run["input"])
+            let input = JSONValue.objectOrEmpty(run["input"])
             if preview { return .object(["status": .string("stopped"), "reason": .string(DataRootLife.stoppedReason),
                 "execution": .string("not_run"), "effects": .string("none"), "resume_mode": .string("fresh"),
                 "run_id": .string(runID), "id": .string(id), "ability": .string(id), "input": .object(input)]) }
             do {
-                let turn = resumedTurn()
+                let turn = resumedTurn(heldTurn, steer: steer)
                 let result = try await Parts(root: root).run(id: id, input: .object(input),
                     invocation: execution.partInvocation(turn: turn, surface: surface))
                 let out = await Self.afterPartRun(result, id: id, input: input, surface: surface, root: root,
                                                  turn: turn, execution: execution)
-                return await checkpoint(out, consume: !OwnedProgramRunner.turnedAway(result))
-            } catch { return await checkpoint(ChatToolOutcome.failure(error: error, tool: id), consume: false) }
+                return await checkpoint(out, consume: !Self.resumeDidNotStart(result), resume: resume)
+            } catch { return await checkpoint(ChatToolOutcome.failure(error: error, tool: id), consume: false, resume: resume) }
         }
         if !preview {
             do {
@@ -329,58 +335,45 @@ extension AppToolExecutor {
                         """, effects: .none, code: "run_journal_unavailable")
                 }
                 if let conflict = try await store.runHold(try Self.deskRefs(heldJournal, turn: turn)) {
-                    var refusal = Self.partFields(conflict.refusal("Run \(runID)'s Desk work"))
+                    var refusal = JSONValue.objectOrEmpty(conflict.refusal("Run \(runID)'s Desk work"))
                     refusal["run_id"] = .string(runID)
-                    return await checkpoint(.object(refusal), consume: false)
+                    return await checkpoint(.object(refusal), consume: false, resume: resume)
                 }
             }
             catch {
-                var failure = Self.partFields(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
+                var failure = JSONValue.objectOrEmpty(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
                 failure["run_id"] = .string(runID)
                 return await checkpoint(.object(Self.partSettlementFailure(failure, error: error, operation: "ability.resume_holds", id: runID, root: root)),
-                    consume: false)
+                    consume: false, resume: resume)
             }
         }
-        // Its queued step closes once the run is taken up or closed; a resume turned away busy leaves it open, so the run, its step and its holds wait on
-        // together.
-        var closeFailure: Error?
-        func closeStep() async {
-            guard !preview else { return }
-            do {
-                let state = try await store.liveState()
-                for entry in MyQueue.entries(state) where entry.step.words.hasPrefix(MyQueue.skillRunPrefix(skill: name, run: runID)) {
-                    try await MyQueue.finish(entry, dropped: false, why: "resumed", store: store)
-                }
-            } catch { closeFailure = error }
-        }
-        func settled(_ result: JSONValue) -> JSONValue {
-            guard let closeFailure else { return result }
-            return .object(Self.partSettlementFailure(Self.partFields(result), error: closeFailure,
-                operation: "ability.resume_queue", id: runID, root: root))
-        }
-        func closed(_ reason: String, _ why: String) async -> JSONValue {
-            await checkpoint(settled(Self.failure(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
-                : " Run \(runID) is closed; nothing ran."), extra: ["id": .string(id), "remedy": .object(["kind": .string("none"), "instruction": .string("""
-                    Read the ability and affected state before choosing what remains; do not repeat completed effects.
-                    """), "next_call": .null])])), consume: true)
-        }
+        return await replayPartResume(run, name: name, id: id, args: args, preview: preview, surface: surface,
+                                      heldTurn: heldTurn, steer: steer, execution: execution, resume: resume)
+    }
+
+    /// Check the current ability and preview or replay the stopped call.
+    @MainActor
+    private func replayPartResume(_ run: [String: JSONValue], name: String, id: String, args: [String: JSONValue],
+                                  preview: Bool, surface: String, heldTurn: Turn, steer: (sources: [String], elevated: [String]),
+                                  execution: AppActionExecution, resume: PartResumeCheckpoint) async -> JSONValue {
+        let (runID, root) = (resume.runID, resume.root)
         let row: [String: JSONValue]?
         do { row = try Parts(root: root).row(id) }
         catch {
-            let failure = Self.partFields(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
+            let failure = JSONValue.objectOrEmpty(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
             return await checkpoint(.object(Self.partSettlementFailure(failure, error: error, operation: "ability.resume_metadata", id: runID, root: root)),
-                consume: false)
+                consume: false, resume: resume)
         }
         guard let row, row["status"] == .string("active"), row["codeFingerprint"] == run["digest"],
               run["hostRevision"] == .string(OwnedProgramStore.hostRevision), case .array(let journal)? = run["journal"] else {
-            await closeStep()
-            return await closed("script_changed", "\(name) changed or was switched off since run \(runID) stopped.")
+            await closeStep(preview: preview, name: name, resume: resume)
+            return await closed("script_changed", "\(name) changed or was switched off since run \(runID) stopped.", preview: preview, id: id, resume: resume)
         }
-        let input = Self.partFields(run["input"])
-        if Self.usedOutside(journal) { await closeStep(); return await closed("not_resumable", Self.unresumable) }
+        let input = JSONValue.objectOrEmpty(run["input"])
+        if Self.usedOutside(journal) { await closeStep(preview: preview, name: name, resume: resume); return await closed("not_resumable", Self.unresumable, preview: preview, id: id, resume: resume) }
         if preview {
             // Retain the exact stopped call and step so the reply resumes at its original boundary.
-            let last = Self.partFields(journal.last), row = Self.partFields(last["row"])
+            let last = JSONValue.objectOrEmpty(journal.last), row = JSONValue.objectOrEmpty(last["row"])
             var at = row.filter { ["n", "line", "step", "call"].contains($0.key) }
             if at.isEmpty, case .array(let call)? = last["call"], call.count == 4 { at = ["call": call[0], "id": call[1], "line": call[3]] }
             return .object([
@@ -389,31 +382,118 @@ extension AppToolExecutor {
                 "ability": .string(id), "question": run["question"] ?? .null, "reason": run["reason"] ?? .null,
                 "input": .object(input), "wake": run["wake"] ?? .null, "stopped_at": .object(at),
                 "detail": .string("Resuming would run \(name) from the top on this input: each call it made before it stopped "
-                    + "answers as it did (what it read is read again, and it goes on only if that reads the same), "
+                    + "answers as it did (earlier reads are verified against current state, accounting for its own later writes), "
                     + "the call at stopped_at returns your answer, and its code goes on live from there. Nothing was claimed or run."),
             ])
         }
-        let turn = resumedTurn()
+        let turn = resumedTurn(heldTurn, steer: steer)
         do {
             let result = try await Parts(root: root).run(id: id, input: .object(input),
-                requiredFingerprint: Self.doorText(run["digest"]),
+                requiredFingerprint: JSONValue.trimmedScalarTextOrEmpty(run["digest"]),
                 replay: OwnedProgramRunner.Replay(journal: journal, answer: args["answer"] ?? .null),
                 invocation: execution.partInvocation(turn: turn, surface: surface))
-            // A busy resume leaves the checkpoint untouched until its active call ends.
-            if OwnedProgramRunner.turnedAway(result) {
-                var out = Self.partFields(await Self.afterPartRun(result, id: id, input: input, surface: surface, root: root,
-                                                                turn: turn, execution: execution))
-                out["resume"] = .object(["run_id": .string(runID), "question": run["question"] ?? .null,
-                                         "held": .array(try Self.deskRefs(journal, turn: turn).map(JSONValue.string))])
-                out["resume_note"] = .string("Run \(runID) still waits; nothing of it ran. Resume it again once that call finishes.")
-                return await checkpoint(.object(out), consume: false)
+            if Self.resumeDidNotStart(result) {
+                var out = JSONValue.objectOrEmpty(result)
+                out["id"] = .string(id)
+                out["name"] = .string(name)
+                return await checkpoint(.object(out), consume: false, resume: resume, waitingQuestion: run["question"] ?? .null)
             }
-            await closeStep()
+            await closeStep(preview: preview, name: name, resume: resume)
             return await checkpoint(settled(await Self.afterPartRun(result, id: id, input: input, surface: surface, root: root,
-                                                            turn: turn, execution: execution)), consume: true)
+                                                            turn: turn, execution: execution), resume: resume), consume: true, resume: resume)
         } catch {
-            return await checkpoint(ChatToolOutcome.failure(error: error, tool: "ability.resume"), consume: false)
+            return await checkpoint(ChatToolOutcome.failure(error: error, tool: "ability.resume"), consume: false, resume: resume)
         }
+    }
+
+    private static func resumeDidNotStart(_ result: JSONValue) -> Bool {
+        result.objectValue?["execution"] == .string("not_run") || OwnedProgramRunner.turnedAway(result)
+    }
+
+    /// Return reservations and settle the claim outside cancellation.
+    @MainActor
+    private func checkpoint(_ result: JSONValue, consume: Bool, resume: PartResumeCheckpoint, waitingQuestion: JSONValue? = nil) async -> JSONValue {
+        let (runID, root, store, passed) = (resume.runID, resume.root, resume.store, resume.passed)
+        guard let claim = resume.claim else { return result }
+        return await settle { [passed] in
+            var result = result
+            var restored: [String] = []
+            if !consume || JSONValue.objectOrEmpty(result)["settlement_failures"] != nil {
+                do { restored = try await store.returnHolds(passed) }
+                catch {
+                    result = .object(Self.partSettlementFailure(JSONValue.objectOrEmpty(result), error: error,
+                        operation: "ability.return_holds", id: runID, root: root))
+                }
+            }
+            if consume, JSONValue.objectOrEmpty(result)["settlement_failures"] != nil {
+                var out = JSONValue.objectOrEmpty(result)
+                out["unsettled_checkpoint"] = .string(claim.path)
+                return .object(out)
+            }
+            do {
+                if consume { try claim.consume() } else { try claim.release() }
+                if let waitingQuestion, var out = result.objectValue, out["settlement_failures"] == nil {
+                    out["resume"] = .object(["run_id": .string(runID), "question": waitingQuestion,
+                                             "held": .array(restored.map(JSONValue.string))])
+                    out["resume_note"] = .string("Run \(runID) still waits. Resume it again after resolving the reported refusal.")
+                    return .object(out)
+                }
+                return result
+            } catch {
+                var failure = Self.partSettlementFailure(JSONValue.objectOrEmpty(result), error: error,
+                    operation: consume ? "ability.consume_checkpoint" : "ability.release_checkpoint", id: runID, root: root)
+                if consume {
+                    do { try await store.returnHolds(passed) }
+                    catch {
+                        failure = Self.partSettlementFailure(failure, error: error, operation: "ability.return_holds", id: runID, root: root)
+                    }
+                }
+                return .object(failure)
+            }
+        }
+    }
+
+    /// Restore the saved steering onto the live run.
+    @MainActor
+    private func resumedTurn(_ heldTurn: Turn, steer: (sources: [String], elevated: [String])) -> Turn {
+        let taint = heldTurn.peerSteering ?? PeerDataTaint()
+        steer.sources.forEach { taint.mark(peer: $0) }
+        steer.elevated.forEach { taint.elevate(peer: $0) }
+        return heldTurn.with(\.peerSteering, taint)
+    }
+
+    /// Close the run's queued step when the checkpoint closes or resumes.
+    @MainActor
+    private func closeStep(preview: Bool, name: String, resume: PartResumeCheckpoint) async {
+        let (store, runID) = (resume.store, resume.runID)
+        // Its queued step closes once the run is taken up or closed. A pre-execution refusal leaves it open with the run and its holds.
+        guard !preview else { return }
+        do {
+            let state = try await store.liveState()
+            for entry in MyQueue.entries(state) where MyQueue.resumeRun(findingKey: entry.item.findingKey) == runID
+                || (entry.item.findingKey == nil && entry.step.words.hasPrefix(MyQueue.skillRunPrefix(skill: name, run: runID))) {
+                try await MyQueue.finish(entry, dropped: false, why: "resumed", store: store)
+            }
+        } catch { resume.closeFailure = error }
+    }
+
+    /// Attach any queue settlement failure to the result.
+    @MainActor
+    private func settled(_ result: JSONValue, resume: PartResumeCheckpoint) -> JSONValue {
+        let (runID, root) = (resume.runID, resume.root)
+        guard let closeFailure = resume.closeFailure else { return result }
+        return .object(Self.partSettlementFailure(JSONValue.objectOrEmpty(result), error: closeFailure,
+            operation: "ability.resume_queue", id: runID, root: root))
+    }
+
+    /// Report closure and settle the stopped checkpoint.
+    @MainActor
+    private func closed(_ reason: String, _ why: String, preview: Bool, id: String, resume: PartResumeCheckpoint) async -> JSONValue {
+        let runID = resume.runID
+        return await checkpoint(settled(Self.failure(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
+            : " Run \(runID) is closed; nothing ran."), extra: ["id": .string(id), "remedy": .object(["kind": .string("none"), "instruction": .string("""
+                Read the ability and affected state before choosing what remains; do not repeat completed effects.
+                """), "next_call": .null])]), resume: resume), consume: true, resume: resume)
     }
 
     /// Preview reads SecurityCenter, explicit card requests and peer floors without filing a user card.
@@ -446,24 +526,31 @@ extension AppToolExecutor {
 }
 
 extension AppToolExecutor {
-    /// Journaled writes identify the exact items a stopped run must hold.
+    /// The journaled mutation receipt identifies the item even if its title has changed since the write.
     static func deskRefs(_ journal: [JSONValue], turn: Turn?) throws -> [String] {
         try journal.flatMap { entry -> [String] in
-            guard case .object(let fields) = entry, case .array(let call)? = fields["call"], call.count > 2,
-                  call[0] == .string("action"), case .string(let id) = call[1], case .string(let raw) = call[2] else { return [] }
+            guard case .object(let fields) = entry, case .array(let call)? = fields["call"], call.count > 1,
+                  call[0] == .string("action"), case .string(let id) = call[1] else { return [] }
             guard let action = try AppActions.action(id, turn: turn) else {
                 throw ToolFailureError("""
                     Stopped-run action \(id) is not in the checked catalog. Read its journal before reconciling Desk holds.
                     """, effects: .none, code: "run_action_unavailable")
             }
-            guard action.page == "desk", !action.read else { return [] }
-            guard case .array(let given) = try JSONValue.parse(Data(raw.utf8)) else {
-                throw ToolFailureError("Stopped-run Desk arguments are not an array. Repair its journal before reconciling holds.", effects: .none,
-                    code: "run_arguments_unavailable")
+            let queueItem = action.tool == "my_queue" && action.subject.contains("id")
+            guard action.page == "desk", !action.read, action.subject.contains("handle") || queueItem,
+                  case .object(let row)? = fields["row"], row["read_only"] != .bool(true),
+                  row["effects"] != .string("none"),
+                  row["status"] == .string("ok") || row["effects"] == .string("occurred") else { return [] }
+            guard case .string(let raw)? = fields["out"],
+                  case .object(let reply) = try JSONValue.parse(Data(raw.utf8)) else {
+                throw ToolFailureError("Stopped-run Desk receipt is unreadable. Repair its journal before reconciling holds.", effects: .none,
+                    code: "run_receipt_unavailable")
             }
-            let input = try AppScriptRunner.doorInput(id: id, given: given, turn: turn).get()
-            let args = partFields(input["args"])
-            return [args["handle"], args["id"]].compactMap { $0?.scalarText }
+            let receipt = JSONValue.objectOrEmpty(reply["value"] ?? reply["receipt"].map(ToolResult.stepAnswer))
+            if let handle = receipt["handle"]?.nonblankString { return [handle] }
+            // Older queue receipts already name the exact step by its durable visible number.
+            if queueItem, let name = receipt["id"]?.nonblankString { return [name] }
+            return []
         }
     }
 }

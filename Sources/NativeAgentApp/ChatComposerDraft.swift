@@ -8,9 +8,10 @@ import SwiftUI
 final class ChatComposerDraft {
     private(set) var text = ""
     private(set) var hasVisibleText = false
+    /// Counts manual edits; the quiet composer reads it to tell a typed draft from a carried one.
+    private(set) var manualEditRevision: UInt64 = 0
     let sessionId: String
     var editedAt = Date.distantPast
-    private(set) var manualEditRevision: UInt64 = 0
 
     init(sessionId: String) { self.sessionId = sessionId }
 
@@ -21,22 +22,10 @@ final class ChatComposerDraft {
         editedAt = Date()
     }
 
-    /// Dictation must not claim a manual edit; typing invalidates all later updates from that dictation.
-    func dictate(_ newText: String, revision: UInt64) {
-        guard manualEditRevision == revision else { return }
-        replaceText(newText)
-        editedAt = Date()
-    }
-
     private func replaceText(_ newText: String) {
         guard text != newText else { return }
         text = newText
         let visible = newText.contains { !$0.isWhitespace }
         if hasVisibleText != visible { hasVisibleText = visible }
-    }
-
-    /// Bind directly to the draft child so writes do not invalidate ChatView state.
-    var textBinding: Binding<String> {
-        Binding(get: { self.text }, set: { self.edit($0) })
     }
 }

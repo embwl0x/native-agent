@@ -284,15 +284,6 @@ private extension KeyedDecodingContainer where Key == JSONKey {
     }
 }
 
-func _tgNowString(_ date: Date = Date()) -> String {
-    NativeTimestampFormat.fractionalZulu(date)
-}
-
-func _tgParseDate(_ value: String?) -> Date? {
-    guard let value, !value.isEmpty else { return nil }
-    return NativeTimestampFormat.parseISO8601FractionalFirst(value)
-}
-
 func _tgPreview(_ text: String?, limit: Int = 240) -> String? {
     guard let text else { return nil }
     // Redact receipts.jsonl previews before truncation so partial tokens cannot escape.

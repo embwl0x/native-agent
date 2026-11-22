@@ -382,34 +382,34 @@ extension CapabilitiesFace {
     /// Everything the person reads before approving one ability: its whole description, reach, the exact waiting version and its code.
     private static func abilityDocument(_ tool: ToolRecord) -> String {
         var notes: [String] = [tool.name]
-        func note(_ key: String, _ title: String, _ text: String?) {
+        func note(_ title: String, _ text: String?) {
             guard let text, !text.isEmpty else { return }
             notes.append(title + ":\n" + text)
         }
-        func json(_ key: String, _ title: String, _ value: JSONValue) {
-            do { note(key, title, try value.serialize(pretty: true)) }
-            catch { note(key, title, "Could not be shown: " + error.localizedDescription) }
+        func json(_ title: String, _ value: JSONValue) {
+            do { note(title, try value.serialize(pretty: true)) }
+            catch { note(title, "Could not be shown: " + error.localizedDescription) }
         }
-        note("about", "About", tool.description)
+        note("About", tool.description)
         var facts: [String] = tool.autoCreated == true ? ["Written by me"] : []
         if let validation = tool.validationStatus { facts.append("Validation: \(validation)") } else { facts.append("Untested") }
         if let uses = tool.useCount { facts.append("Used \(uses) times") } else { facts.append("Use count not recorded") }
-        note("facts", "Status", facts.joined(separator: " · "))
-        note("triggers", "Triggers", tool.triggers.joined(separator: ", "))
-        note("permissions", "Permissions", tool.permissions?.joined(separator: ", "))
-        note("errors", "Validation errors", tool.validationErrors?.joined(separator: " "))
-        note("path", "Saved at", (tool.activePath ?? tool.proposalPath).map(UserDisplayFormatters.tildifyPath))
+        note("Status", facts.joined(separator: " · "))
+        note("Triggers", tool.triggers.joined(separator: ", "))
+        note("Permissions", tool.permissions?.joined(separator: ", "))
+        note("Validation errors", tool.validationErrors?.joined(separator: " "))
+        note("Saved at", (tool.activePath ?? tool.proposalPath).map(UserDisplayFormatters.tildifyPath))
         if let review = tool.keepReview, case .string(let version)? = review["version"], case .string(let code)? = review["code"],
            let reach = review["reach"] {
-            note("version", tool.candidateDigest == nil ? "Version to turn on" : "Waiting version", version)
-            if case .string(let description)? = review["description"] { note("change", "This version", description) }
-            json("reach", "Reach", reach)
-            note("code", "Code", code)
+            note(tool.candidateDigest == nil ? "Version to turn on" : "Waiting version", version)
+            if case .string(let description)? = review["description"] { note("This version", description) }
+            json("Reach", reach)
+            note("Code", code)
             let declarations = review.filter { !["code", "description", "reach", "version"].contains($0.key) }
-            if !declarations.isEmpty { json("declarations", "Declarations and fixtures", .object(declarations)) }
+            if !declarations.isEmpty { json("Declarations and fixtures", .object(declarations)) }
         }
         let evidence = tool.fields.filter { ["validation_evidence", "candidate_validation_evidence", "learned"].contains($0.key) }
-        if !evidence.isEmpty { json("evidence", "Evidence and learned use", .object(evidence)) }
+        if !evidence.isEmpty { json("Evidence and learned use", .object(evidence)) }
         return notes.joined(separator: "\n\n")
     }
 
@@ -616,7 +616,7 @@ extension CapabilitiesFace {
             .init(id: "browser-preview", title: "Browser dry run", detail: tools.browserDryRunError ?? browser?.url,
                 value: tools.browserDryRunStartedAt != nil ? "Running" : tools.browserDryRunError != nil ? "Failed"
                     : browser?.status ?? "No preview in this session",
-                at: stamp(tools.browserDryRunStartedAt) ?? (tools.browserDryRunError == nil ? browser?.createdAt : nil),
+                at: tools.browserDryRunStartedAt.map(NativeTimestampFormat.plainZulu) ?? (tools.browserDryRunError == nil ? browser?.createdAt : nil),
                 tone: tools.browserDryRunStartedAt != nil ? .live : tools.browserDryRunError == nil ? tone(browser?.status) : .failed,
                 actions: [.init(id: "browser.open", label: "Run", call: .init("browser.preview"))]),
         ]
@@ -636,7 +636,7 @@ extension CapabilitiesFace {
                 value: work != nil ? "Creating" : failure != nil ? "Failed"
                     : latest.map { $0.sizeBytes.map { "\($0) bytes" } ?? "Size unavailable" }
                         ?? (missingExports ? "Not read" : "No recorded export"),
-                at: stamp(work) ?? (failure == nil ? latest?.createdAt : nil),
+                at: work.map(NativeTimestampFormat.plainZulu) ?? (failure == nil ? latest?.createdAt : nil),
                 tone: work != nil ? .live : failure == nil ? .quiet : .failed,
                 actions: [.init(id: "export.bundle", label: title, call: .init("export.bundle", ["support": .bool(id == "support")]))]))
         }
@@ -655,8 +655,6 @@ extension CapabilitiesFace {
         }
         return .init(id: "checks", title: "Checks", rows: rows)
     }
-
-    nonisolated private static func stamp(_ date: Date?) -> String? { date.map { ISO8601DateFormatter().string(from: $0) } }
 
     /// A Mac action's Run keeps the id of the agent's own verb for that action, where it has one; its call is native.run.
     nonisolated static func runActionID(_ action: NativeActionRecord) -> String { ToolNameAliases.appAction(action.id) ?? "native.run" }

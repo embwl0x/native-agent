@@ -78,9 +78,6 @@ public actor SwiftNativeApprovalInbox {
     public nonisolated func pendingUnlocked() throws -> [ApprovalRecord] {
         try recordsUnlocked().filter { $0.status == "pending" }
     }
-    public nonisolated func resolvedUnlocked() throws -> [ApprovalRecord] {
-        try recordsUnlocked().filter { $0.status == "resolved" }
-    }
     public nonisolated func recordsUnlocked() throws -> [ApprovalRecord] {
         try readContinuations(Self.loadApprovalRowsChecked(at: approvalsPath).compactMap(ApprovalRecord.init(json:)))
     }
@@ -200,7 +197,7 @@ public actor SwiftNativeApprovalInbox {
     ) async throws -> (record: ApprovalRecord, created: Bool) {
       return try await SwiftNativePersistenceCore.withFileLock(approvalsPath) {
         var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-        let stamp = Self.isoTimestamp(now)
+        let stamp = NativeTimestampFormat.fractionalUTCOffset(now)
         for (idx, item) in items.enumerated() {
             guard case .object(var obj) = item else { continue }
             guard case .string("pending") = obj["status"] ?? .null else { continue }
@@ -289,7 +286,7 @@ public actor SwiftNativeApprovalInbox {
         // default to false.
         let isHardLocalOnly = Self.hardLocalOnlyActions.contains(action)
         let isOwnerReview = Self.ownerReviewActions.contains(action)
-        let declaredRemoteResolvable = Self.strictBool(bodyObj["remoteResolvable"])
+        let declaredRemoteResolvable = bodyObj["remoteResolvable"]?.boolValue
         let remoteResolvable: Bool
         if isHardLocalOnly {
             remoteResolvable = false
@@ -305,7 +302,7 @@ public actor SwiftNativeApprovalInbox {
             localOnly = true
         } else if isOwnerReview {
             localOnly = false
-        } else if let declared = Self.strictBool(bodyObj["localOnly"]) {
+        } else if let declared = bodyObj["localOnly"]?.boolValue {
             localOnly = declared
         } else {
             localOnly = !remoteResolvable
@@ -315,7 +312,7 @@ public actor SwiftNativeApprovalInbox {
                 "approval authority fields contradict each other"
             )
         }
-        let stamp = isoTimestamp(now)
+        let stamp = NativeTimestampFormat.fractionalUTCOffset(now)
         var approval = ApprovalRecord(
             id: UUID().uuidString.lowercased(),
             // A part or script that asked is named first, in the one asker form the card keeps.
@@ -367,7 +364,7 @@ public actor SwiftNativeApprovalInbox {
             // All decisions share the resolved status; retain the outcome separately.
             obj["status"] = .string("resolved")
             obj["decision"] = .string(decision.rawValue)
-            obj["resolvedAt"] = .string(Self.isoTimestamp(now))
+            obj["resolvedAt"] = .string(NativeTimestampFormat.fractionalUTCOffset(now))
             obj["decidedBy"] = .string(provenance.decidedBy)
             obj["resolutionProvenance"] = provenance.toJSON()
             obj["chatContinuation"] = .object(["lifeID": .string(lifeID)])
@@ -398,7 +395,7 @@ public actor SwiftNativeApprovalInbox {
             var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
             guard let index = items.firstIndex(where: { $0.objectValue?["id"] == .string(id) }),
                   case .object(var object) = items[index], object["executedAction"] == nil else { return }
-            object["running_since"] = running ? .string(Self.isoTimestamp(now)) : nil
+            object["running_since"] = running ? .string(NativeTimestampFormat.fractionalUTCOffset(now)) : nil
             items[index] = .object(object)
             try await SwiftNativePersistenceCore.writeJSON(.array(items), to: approvalsPath)
         }

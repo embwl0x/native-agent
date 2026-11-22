@@ -1,9 +1,7 @@
 import AgentWorkspace
 import AgentConversations
 import AuthoredCapabilities
-#if canImport(AppKit)
 import AppKit
-#endif
 import Foundation
 import NativeAgentShared
 import TrustCenter
@@ -14,7 +12,6 @@ import PersonaEngine
 import StandingBots
 import ProviderRouting
 import Darwin
-import CryptoKit
 import MemoryV2
 import Dispatcher
 import MacControl
@@ -86,7 +83,7 @@ extension SwiftToolDispatcher {
         guard usesCanonicalBody else {
             throw AgentCommunicationError.invalid("setting another agent up on this Mac is unavailable outside the canonical app")
         }
-        var proposal: AgentHostConnection.Proposal
+        let proposal: AgentHostConnection.Proposal
         do { proposal = try AgentHostConnection.propose(name: name, store: store, dataRoot: dataRoot, workspace: workspace,
             workingDirectory: workingDirectory) }
         catch let refusal as AgentHostConnection.Refusal {
@@ -97,83 +94,105 @@ extension SwiftToolDispatcher {
                             "detail": .string(refusal.localizedDescription)])
         }
         if proposal.row.route == .grokBot {
-            let result = try AgentHostConnection.connect(proposal: proposal, store: store)
-            // Select the recipient's exact sidebar name before sending the routine request.
-            if let conversationLabel {
-                guard result.contact.grokConversation == nil else {
-                    throw AgentCommunicationError.invalid("""
-                        The routine request already went to a Bot, so the Bot cannot be changed here. Disconnect Grok Bot (disconnect true, name \
-                        peer:\(result.contact.id)) and connect again with conversation_label.
-                        """)
-                }
-                do {
-                    try store.updateGrok(result.contact.id) { current in
-                        guard current.grokConversation == nil else { throw GrokLinkCredential.Failure.invalid }
-                        current.conversationLabel = conversationLabel
-                    }
-                } catch {
-                    throw AgentCommunicationError.invalid("""
-                        conversation_label was not saved: it must be the Bot's exact sidebar name on one line, and the routine request must not \
-                        have gone out yet
-                        """)
-                }
-            }
-            return .object(["status": .string("grok_setup"), "peer_id": .string(result.contact.id)])
+            return try connectGrok(proposal: proposal, conversationLabel: conversationLabel, store: store)
         }
-        if var existing = proposal.existing, proposal.row.acp == nil {
-            if proposal.row.format == .shellEnvironment {
-                let result = try AgentHostConnection.ensureEnvironment(proposal: proposal, store: store)
-                return Self.environmentSetupResult(proposal: proposal, contact: result.contact, store: store,
-                    changed: result.repaired, repaired: result.repaired)
-            }
-            let setup = try AgentHostConnection.connect(proposal: proposal, store: store)
-            existing = setup.contact
-            let repaired = setup.outcome.backupPath != nil
-            let permissionsChanged = setup.permissionsChanged
-            // Reconnection approves the currently installed program; an update may leave obsolete version folders on disk.
-            var programApproved = false
-            if proposal.row.commandLine != nil,
-               let path = proposal.executablePath, path == executablePath, existing.verifiedExecutablePath != path {
-                programApproved = try store.approveExecutable(peerID: existing.id, path: path)
-                guard programApproved else {
-                    throw ToolFailureError("The contact changed before its program could be approved. Read agent.contacts before continuing.",
-                        effects: .unknown, owner: store.fileURL.path,
-                        nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]), recovery: .inspect)
-                }
-            }
-            var value: [String: JSONValue] = ["status": .string(repaired ? "configured" : "already_configured"),
-                "contact": Self.checkedPeerProjection(existing.id, store: store),
-                            "changed": .bool(repaired || permissionsChanged || programApproved),
-                            "detail": .string(repaired
-                                ? "Repaired \(proposal.row.displayName)'s connector entry and key on the same contact. Restart: \(proposal.row.restartNote)"
-                                : programApproved
-                ? """
-                    Approved the \(proposal.row.displayName) program at \(executablePath ?? ""); a Full Mac launch runs exactly this file. Nothing \
-                    else was changed.
-                    """
-                                : "\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")]
-            if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == false {
-                value["detail"] = .string(Self.directCommandSetupDetail)
-            }
-            if permissionsChanged { value["detail"] = .string("""
-                Enabled only this connection's two messaging tools in \(proposal.row.displayName). Send a message to verify the return path; \
-                existing Ask/Deny rules and all other permissions are unchanged. Restart: \(proposal.row.restartNote)
-                """) }
-            if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == true {
-                let probe = try await hostCommandRun(turn: turn, invocation: invocation, row: proposal.row, contact: existing,
-                    message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
-                    session: nil, store: store, surface: surface, probe: true)
-                let fields = Self.checkedPeerReadout(existing.id, store: store).fields
-                value.merge(fields) { _, current in current }
-                let connected = fields["state"] == .string(AgentPeerContactState.connected.rawValue)
-                value["status"] = .string(connected ? "connected" : "configured")
-                value["detail"] = connected ? fields["state_detail"] : .string(Self.probeReason(probe, row: proposal.row))
-                if fields["state_failure"] != nil { value["detail"] = fields["state_detail"] }
-                Self.includeConnectionProbe(probe, in: &value)
-            }
-            Self.sayReplaced(setup.outcome, in: &value)
-            return .object(value)
+        if let existing = proposal.existing, proposal.row.acp == nil {
+            return try await reconnectHost(turn: turn, invocation: invocation, proposal: proposal, existing: existing,
+                                           executablePath: executablePath, store: store, surface: surface)
         }
+        return try await connectHost(turn: turn, invocation: invocation, proposal: proposal, executablePath: executablePath,
+                                     store: store, surface: surface)
+    }
+
+    /// Save the Grok contact and bind its optional recipient.
+    private func connectGrok(proposal: AgentHostConnection.Proposal, conversationLabel: String?, store: AgentPeerStore) throws -> JSONValue {
+        let result = try AgentHostConnection.connect(proposal: proposal, store: store)
+        // Select the recipient's exact sidebar name before sending the routine request.
+        if let conversationLabel {
+            guard result.contact.grokConversation == nil else {
+                throw AgentCommunicationError.invalid("""
+                    The routine request already went to a Bot, so the Bot cannot be changed here. Disconnect Grok Bot (disconnect true, name \
+                    peer:\(result.contact.id)) and connect again with conversation_label.
+                    """)
+            }
+            do {
+                try store.updateGrok(result.contact.id) { current in
+                    guard current.grokConversation == nil else { throw GrokLinkCredential.Failure.invalid }
+                    current.conversationLabel = conversationLabel
+                }
+            } catch {
+                throw AgentCommunicationError.invalid("""
+                    conversation_label was not saved: it must be the Bot's exact sidebar name on one line, and the routine request must not \
+                    have gone out yet
+                    """)
+            }
+        }
+        return .object(["status": .string("grok_setup"), "peer_id": .string(result.contact.id)])
+    }
+
+    /// Repair an existing host connection and refresh its proof when required.
+    private func reconnectHost(turn: Turn, invocation: ChatToolInvocation, proposal: AgentHostConnection.Proposal,
+                               existing: AgentPeerContact, executablePath: String?, store: AgentPeerStore, surface: String) async throws -> JSONValue {
+        var existing = existing
+        if proposal.row.format == .shellEnvironment {
+            let result = try AgentHostConnection.ensureEnvironment(proposal: proposal, store: store)
+            return Self.environmentSetupResult(proposal: proposal, contact: result.contact, store: store,
+                changed: result.repaired, repaired: result.repaired)
+        }
+        let setup = try AgentHostConnection.connect(proposal: proposal, store: store)
+        existing = setup.contact
+        let repaired = setup.outcome.backupPath != nil
+        let permissionsChanged = setup.permissionsChanged
+        // Reconnection approves the currently installed program; an update may leave obsolete version folders on disk.
+        var programApproved = false
+        if proposal.row.commandLine != nil,
+           let path = proposal.executablePath, path == executablePath, existing.verifiedExecutablePath != path {
+            programApproved = try store.approveExecutable(peerID: existing.id, path: path)
+            guard programApproved else {
+                throw ToolFailureError("The contact changed before its program could be approved. Read agent.contacts before continuing.",
+                    effects: .unknown, owner: store.fileURL.path,
+                    nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]), recovery: .inspect)
+            }
+        }
+        var value: [String: JSONValue] = ["status": .string(repaired ? "configured" : "already_configured"),
+            "contact": Self.checkedPeerProjection(existing.id, store: store),
+                        "changed": .bool(repaired || permissionsChanged || programApproved),
+                        "detail": .string(repaired
+                            ? "Repaired \(proposal.row.displayName)'s connector entry and key on the same contact. Restart: \(proposal.row.restartNote)"
+                            : programApproved
+            ? """
+                Approved the \(proposal.row.displayName) program at \(executablePath ?? ""); a Full Mac launch runs exactly this file. Nothing \
+                else was changed.
+                """
+                            : "\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")]
+        if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == false {
+            value["detail"] = .string(Self.directCommandSetupDetail)
+        }
+        if permissionsChanged { value["detail"] = .string("""
+            Enabled only this connection's two messaging tools in \(proposal.row.displayName). Send a message to verify the return path; \
+            existing Ask/Deny rules and all other permissions are unchanged. Restart: \(proposal.row.restartNote)
+            """) }
+        if proposal.row.commandLine?.automaticMCPProbe == true,
+           repaired || existing.state != .connected || existing.mcpReturnProof == nil {
+            let probe = try await hostCommandRun(turn: turn, invocation: invocation, row: proposal.row, contact: existing,
+                message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
+                session: nil, store: store, surface: surface, probe: true)
+            let fields = Self.checkedPeerReadout(existing.id, store: store).fields
+            value.merge(fields) { _, current in current }
+            let connected = fields["state"] == .string(AgentPeerContactState.connected.rawValue)
+            value["status"] = .string(connected ? "connected" : "configured")
+            value["detail"] = connected ? fields["state_detail"] : .string(Self.probeReason(probe, row: proposal.row))
+            if fields["state_failure"] != nil { value["detail"] = fields["state_detail"] }
+            Self.includeConnectionProbe(probe, in: &value)
+        }
+        Self.sayReplaced(setup.outcome, in: &value)
+        return .object(value)
+    }
+
+    /// Approve and write a new host connection, then preserve its checked setup evidence.
+    private func connectHost(turn: Turn, invocation: ChatToolInvocation, proposal: AgentHostConnection.Proposal,
+                             executablePath: String?, store: AgentPeerStore, surface: String) async throws -> JSONValue {
+        var proposal = proposal
         if proposal.row.acp != nil {
             // Reuse chat approval or Full Mac authority; ask here only if setup has not already been approved.
             if !turn.personApprovedHost {
@@ -253,7 +272,6 @@ extension SwiftToolDispatcher {
         guard case .object(var value) = result else { return result }
         let settled = ["configured", "connected", "already_configured", "repaired"].contains(value["status"]?.stringValue ?? "")
         guard settled, row.restartRequired else { return result }
-        #if canImport(AppKit)
         let running = row.bundleIDs.flatMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0) }.filter { !$0.isTerminated }
         guard let first = running.first, let bundle = first.bundleURL else {
             value["reopened"] = .string("not_running")
@@ -285,12 +303,8 @@ extension SwiftToolDispatcher {
                 + " Quit \(row.displayName), but opening it again failed: \(error.localizedDescription). Opening it loads the entry.")
         }
         return .object(value)
-        #else
-        return result
-        #endif
     }
 
-    #if canImport(AppKit)
     /// The reopen a Stop owes: once every instance asked to quit is seen gone, the app opens again. Not cancelled by the Stop that owes it.
     private static func reopenAfter(_ asked: [pid_t], bundle: URL) async {
         for pid in asked { if let app = NSRunningApplication(processIdentifier: pid) { await gone(app) } }
@@ -334,7 +348,6 @@ extension SwiftToolDispatcher {
             }
         } onCancel: { watch.finish() }
     }
-    #endif
 
     private static let directCommandSetupDetail = """
         Contact saved with permission for its two MCP messaging tools only. agent.message returns the command's answer; conversation_id continues \

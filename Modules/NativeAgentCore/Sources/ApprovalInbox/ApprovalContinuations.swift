@@ -22,7 +22,7 @@ extension SwiftNativeApprovalInbox {
             }
             guard Self.continuationIsPending(record, now: now),
                   state["done"] == nil, state["started"] == nil else { return false }
-            state["started"] = .string(Self.isoTimestamp(now))
+            state["started"] = .string(NativeTimestampFormat.fractionalUTCOffset(now))
             return true
         }
     }

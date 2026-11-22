@@ -1,5 +1,4 @@
 import SwiftUI
-import CryptoKit
 import UserNotifications
 import UIKit
 import NativeAgentShared
@@ -56,7 +55,7 @@ struct NativeAgentPushTokenSyncCache {
 
     static func pairingIdentity(secret: Data?, secretVersion: Int64) -> PairingIdentity {
         PairingIdentity(
-            secretHash: secret.map { sha256Hex($0) },
+            secretHash: secret.map { SHA256Hex.of($0) },
             secretVersion: secretVersion
         )
     }
@@ -69,16 +68,12 @@ struct NativeAgentPushTokenSyncCache {
         pairing: PairingIdentity
     ) -> Fingerprint {
         Fingerprint(
-            tokenHash: sha256Hex(Data(token.utf8)),
+            tokenHash: SHA256Hex.of(utf8: token),
             environment: environment,
             bundleId: bundleId,
             deviceId: deviceId,
             pairing: pairing
         )
-    }
-
-    private static func sha256Hex(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -349,6 +344,7 @@ enum NativeAgentNotificationEventGate {
         content: UNNotificationContent,
         eventID: String,
         trigger: UNNotificationTrigger?,
+        replyEnvelope: String? = nil,
         center: UNUserNotificationCenter = .current()
     ) async throws -> Bool {
         // Check pending/delivered alerts to avoid duplicates. Keep non-Sendable UserNotifications objects in this task rather than async-let children.
@@ -360,7 +356,7 @@ enum NativeAgentNotificationEventGate {
         }) {
             return false
         }
-        let categorized = try MobileNotificationRouting.categorized(content)
+        let categorized = try MobileNotificationRouting.categorized(content, replyEnvelope: replyEnvelope)
         let alert = try await CommunicationNotification.decorate(categorized)
         try await center.add(UNNotificationRequest(
             identifier: eventID,
@@ -378,7 +374,7 @@ enum NativeAgentNotificationEventGate {
 enum NativeAgentBridgeNotificationScheduler {
     static func schedule(_ msg: BridgeMessage) async -> Bool {
         let metadata = msg.metadata ?? [:]
-        guard let title = nonEmpty(metadata["title"]), let body = nonEmpty(metadata["body"]) else {
+        guard let title = metadata["title"].trimmedNonEmpty, let body = metadata["body"].trimmedNonEmpty else {
             await reportFailure("The Mac's notification has no title or body. Refresh Activity on the Mac to repair its notification publication.")
             return false
         }
@@ -426,7 +422,7 @@ enum NativeAgentBridgeNotificationScheduler {
 
         let content = UNMutableNotificationContent()
         content.title = title
-        if let subtitle = nonEmpty(metadata["subtitle"]) { content.subtitle = subtitle }
+        if let subtitle = metadata["subtitle"].trimmedNonEmpty { content.subtitle = subtitle }
         content.body = body
         content.sound = .default
         content.userInfo = userInfo
@@ -435,10 +431,14 @@ enum NativeAgentBridgeNotificationScheduler {
         }
 
         do {
+            let replyEnvelope = try MobileNotificationRouting.replySession(metadata).map { _ in
+                try NAChatMessageCodec.encode(msg).payloadJSON
+            }
             let added = try await NativeAgentNotificationEventGate.add(
                 content: content,
                 eventID: eventID,
                 trigger: nil,
+                replyEnvelope: replyEnvelope,
                 center: center
             )
             NSLog("[NativeAgentMobile] bridge notification %@ event=%@ msg=%@",
@@ -458,10 +458,5 @@ enum NativeAgentBridgeNotificationScheduler {
 
     private static func reportFailure(_ message: String) async {
         await MainActor.run { iCloudSyncEngine.shared.syncError = message }
-    }
-
-    private static func nonEmpty(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
     }
 }

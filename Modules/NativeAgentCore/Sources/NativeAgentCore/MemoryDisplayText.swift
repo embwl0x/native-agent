@@ -1,6 +1,7 @@
 // Both sides of USER.md precoverage use `projectionJoinKey`, never independent normalization.
 
 import Foundation
+import NativeAgentShared
 
 // Blueprint: | `MemoryDisplayText.swift` | `MemoryDisplayText`: prompt rendering and coverage keys |
 
@@ -55,11 +56,11 @@ public enum MemoryDisplayText {
     }
 
     public static func projectionJoinKey(_ text: String) -> Key {
-        let collapsed = collapseWhitespace(text)
+        let collapsed = TextNormalization.collapseWhitespace(text)
         guard !collapsed.isEmpty else { return Key(core: "", stamp: nil) }
         var core = collapsed
         for _ in 0..<4 {
-            let next = collapseWhitespace(stripLeadingStamp(core))
+            let next = TextNormalization.collapseWhitespace(stripLeadingStamp(core))
             if next == core || next.isEmpty { break }
             core = next
         }
@@ -83,10 +84,6 @@ public enum MemoryDisplayText {
             )
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return stripLeadingISODateStamp(value)
-    }
-
-    private static func collapseWhitespace(_ text: String) -> String {
-        text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
     private static func isDateCriticalKind(_ kind: String?) -> Bool {

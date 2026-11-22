@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import CoreGraphics
 import NativeAgentCore
@@ -112,15 +113,14 @@ public enum LocalToolImage {
     /// Bound the whole conversation while retaining up to eight images for comparisons and all paired receipts. Release to half the cap at once: each release
     /// rewrites the cached prefix from the oldest touched image. Never release pixels the model has not answered; replace released images with an explicit
     /// reread notice.
-    public static func boundConversation(_ messages: inout [LLMMessage],
-                                         maxImages: Int = roundImages, maxBytes: Int = roundBytes) {
+    public static func boundConversation(_ messages: inout [LLMMessage], maxBytes: Int = roundBytes) {
         supersede(&messages)
         func size(_ block: LLMContentBlock) -> Int? {
             guard case .image(_, let base64, _, let byteSize) = block else { return nil }
             return max(byteSize, base64.utf8.count * 3 / 4)
         }
         let all = messages.flatMap(\.content).compactMap(size)
-        guard all.count > maxImages || all.reduce(0, +) > maxBytes else { return }
+        guard all.count > roundImages || all.reduce(0, +) > maxBytes else { return }
         let answered = messages.lastIndex { $0.role == .assistant } ?? -1
         let unseen = messages[(answered + 1)...].flatMap(\.content).compactMap(size)
         var count = unseen.count, bytes = unseen.reduce(0, +)
@@ -130,7 +130,7 @@ public enum LocalToolImage {
             var changed = false
             for blockIndex in content.indices.reversed() {
                 guard case .image(_, _, let name, _) = content[blockIndex], let size = size(content[blockIndex]) else { continue }
-                if count < maxImages / 2, size <= maxBytes / 2 - bytes {
+                if count < roundImages / 2, size <= maxBytes / 2 - bytes {
                     count += 1; bytes += size
                 } else {
                     content[blockIndex] = .text("""
@@ -150,7 +150,7 @@ public enum LocalToolImage {
     public static func screenshotName(of display: String, source: String, at date: Date = Date()) -> String {
         let clock = DateFormatter()
         clock.dateFormat = "HH:mm"
-        let tag = source.utf8.reduce(UInt64(14_695_981_039_346_656_037)) { ($0 ^ UInt64($1)) &* 1_099_511_628_211 }
+        let tag = StableHash.fnv1a64(source)
         return "screenshot of " + display + " at " + clock.string(from: date) + sourceMark + String(tag, radix: 16)
     }
     private static let sourceMark = " · source "

@@ -81,10 +81,10 @@ or requesting a model that can acknowledge it. Reservations extend across cuts
 before first text. Relaunch rebuilds these readings outside history, whose end
 is pinned before the resumed turn's first shown input; a restored joining door
 takes the same delivered answer through admission instead of running again.
-The person's and their own untainted words may join a turn of theirs, except Mac
-intent arrivals, which always wait for their own turn;
-peer-steered arrivals join only a turn that same sender started under the same steering, so
-nothing rides past the floor its own turn would meet. Every arrival's
+The person's and their own untainted words may join a turn of theirs. Mac
+`intent:chat` arrivals always wait for their own turn. A peer-steered arrival
+can join across surfaces if its originating principal matches the open turn's
+and the open turn holds all the arrival's steering sources. Every arrival's
 file-access ceiling must also be held by the reading turn: an arrival with
 `none` needs that path-read restriction, and one with `read_only` needs that
 write restriction (`none` is not a write fence). A turn can hold both.
@@ -92,12 +92,17 @@ Missing or invalid ceilings join no turn; an incompatible arrival waits for
 its own place under its own restrictions. A door accepts an arrival
 only once it is durable in its own intake record (Mac: its saved row and turn
 checkpoint; Telegram: its inbox claim; Slack: its journal record; phone: its
-CloudKit record), and launch recovers it through that door's owner. Telegram's
+CloudKit record and local reservation), and launch recovers it through that
+door's owner. A phone request stays reserved while it waits for turn admission
+and can enter again within its signed request window if dispatch was never
+claimed. Once claimed, the run owner's evidence governs recovery. Telegram's
 `pending` claims and Slack's `claimed` records admit work; `processing` and
 `generating` record the boundary before invoking the turn. Recovery of those
 admitted generations delivers a saved answer. Telegram retains an owed, unknown
 outcome without one. Slack settles an orphaned generation without saved output as
-interrupted; the person's `/retry` pins its retained input to a new command's run.
+interrupted. The person's `/retry` claims that interruption and pins its retained
+input to the command's run in one write. A Telegram generation retry can use
+retained input only while its conversation is the destination's current binding.
 Missing checkpoints or replies never authorize automatic generation. There is no
 queued-turn store and no successor turn. Work that
 never joins another turn (a regenerate, a restored run, a helper's
@@ -130,11 +135,9 @@ and the conversation store holds its exchange for the contact's next door call.
 The `agent-held` reply route keeps this settlement out of person-result notices;
 completion records `completed` / `held_for_contact` after that handoff, while
 the held exchange alone owns actual delivery. Chosen silence holds nothing.
-A contact's replies return at most three times per contact conversation an hour
-(`AgentConversationStore.returnsPerHour`, `AgentConversationReplies.swift`); past that a reply stays kept in its
-conversation. Missing conversations or routes owe repair,
-never a reply through another line. Helper sessions are not targets: their minds
-remain their own. Everything else owed to the agent opens a thought in its
+Eligible contact replies return once per exchange. Missing conversations or
+routes owe repair, never a reply through another line. Helper sessions are not
+targets: their minds remain their own. Everything else owed to the agent opens a thought in its
 mind stream (session `mind`, title "Thoughts", never replayed as history): a turn
 admitted like any other, whose opening message carries what it attends as
 `attended` ([manifest](skill_manifest_spec.md#weigh)); one thought at a time,
@@ -320,10 +323,10 @@ App batches hand back between steps with remaining entries in `unrun` and the
 first unstarted step in `next_step`. An earlier failed receipt, including a
 nested receipt, keeps the batch failed with its remedy and failure detail;
 the arrival only adds which steps did not start, and the provider error bit
-stays set. A running ability keeps its existing
-next-step hand-back. The next model call reads arrivals. Only the turn program's
-`hear` can cut a generating round; a peer's words join only a turn that same sender started
-under the same steering.
+stays set. A carrying ability checks for readable arrivals after a run returns
+`again`, before starting its next run. The next model call reads arrivals.
+Only the turn program's `hear` can cut a generating round, under the admission
+rules in [§1](#1-a-surface-admits-the-turn).
 
 Source: `ChatOrchestrationClient+StructuredChat.swift` and
 `ChatOrchestrationClient+MessagePersistence.swift`; history preparation and
@@ -487,7 +490,8 @@ seed's resource, installed and bundled program digests (source and manifest; an 
 Unchanged seed installation writes nothing. Persona, guidance, memory, diary,
 Desk and settings are outside this seed path.
 
-`ChatOrchestration+StreamingToolLoop.swift` opens `TurnPart` and delivers the
+`ChatOrchestration+StreamingToolLoop.swift` opens `TurnPart`, and
+`TurnStem+Opening.swift` (`openPart`) delivers the
 message event, the facts of the moment, read-only: `text`, the authorizing
 `surface` and the arrival `door`, `attachments`, `who` (`person`, `self` or
 `agent:<id>`), `verified` (the transport-attested user id, or null), `trust`,
@@ -612,8 +616,9 @@ it does not alter the cached prefix. The separate `ThoughtWords` reader and its
 backward transcript walk are removed. Every turn's “Your last thought” comes
 from the latest clean, nonempty settled thought and its clean answer in the same
 record snapshot, including a thought before the recent-life window. Its closing
-600 characters lead the inner stream, then the body line, cognitive capsule and
-private working memory. Sessionless turns read the same thought without acquiring
+600 characters lead the inner stream, then the body line, then (on the user's
+own turn after they revised their words) the eye line ([memory map](MEMORY_SYSTEM_MAP.md#the-users-eye)),
+cognitive capsule and private working memory. Sessionless turns read the same thought without acquiring
 another conversation's private choice or acts. A peer-steered receiving turn
 receives no carried thought words. Missing clean words or an unavailable reading
 does not establish that they had no thought. `prior = []`
@@ -649,7 +654,10 @@ selection has no heading or disclaimer; bounds and real read gaps still speak.
 
 The implementation separates stable system segments from dynamic material.
 Persona documents belong in the stable prefix; the changing clock and turn
-context do not. History entry pins one clock before parallel reads for facts,
+context do not. A saved contact's own words feed the recent relevance window
+while its origin remains attached to the replayed message. Retained timeout
+receipts distinguish a completed tool call from an unconfirmed operation.
+History entry pins one clock before parallel reads for facts,
 quiet hours and workspace timing. The tool loop requires that prepared context;
 the single `app` schema holds its launch hand for the process, with later done
 verbs in the volatile catalog until relaunch folds them into the door. Ability
@@ -671,7 +679,7 @@ saved on its row as evidence, never replayed. The
 held conversation, the time line, the leads and stateless whole-turn checkpoints
 anchored to the transcript's start. There is no generated summary or
 per-turn trimming. The decode memo still keys only exact UTF-8 row bytes, with
-at most 2,048 rows and 8 MiB of input keys; it never owns selected history or
+at most 48 MiB of row-key bytes, least recently read evicted first (a cache bound, not process memory or model context); it never owns selected history or
 supplies missing transcript evidence. Speech stays whole, and leading assistant
 or tool rows receive a historical header.
 `ConversationPrefixSeeding.seed` applies
@@ -773,10 +781,9 @@ The summary's `stageMs` uses the `turn.*` names in `ContextStageTrace`.
 `context.facts.*` timings separate clock/notes, contacts, place, glance,
 elsewhere reads, the remaining join, taint-sensitive elsewhere composition,
 arrivals and runtime rendering. Read-only elsewhere inputs gather beside
-history; only after history establishes peer taint are words selected and
-contacts marked consumed. That read refreshes the existing transcript index
-once for door lines, posts and bridge exchanges. It does not keep another
-cross-turn snapshot. `context.glance.read` separates home and parts;
+history. A turn with a steering stamp omits the person's words. The read is the
+experience store's conversation life plus the transcript evidence of acts that
+occurred; it keeps no cross-turn snapshot. `context.glance.read` separates home and parts;
 `context.parts.summary` separates inventory, ranking, states/kept parts and
 rendering; `context.ranking.summary` names index and embedding
 reads that completed. Missing stages are incomplete evidence, not zero work.
@@ -863,6 +870,12 @@ resident and helper delivery share this rule and final request admission.
 ## 5. The model answers or requests a tool
 
 The loop uses `ToolDispatchClient` directly through the canonical file-access, Trust, provenance and trace chain. Part thoughts use their restricted dispatcher directly. Expansion's call prediction and speculative delivery are removed. `TurnDispatchClosure.withTurn` preserves `tool.dispatch.closed` after deferred private work settles or is abandoned, and closes throwing turns through `settle`.
+
+An attached Desk continuation commits admission before dispatch. A refused
+proposal leaves the prior pending effects intact, including any earlier
+pending call whose identity the proposal would have reused. A parked refusal
+keeps remaining work ready to return when Desk admits it, including after an
+item or ancestor defer expires.
 
 Words for the person stream as the provider writes them, including words
 before a tool call. Mac chat, phone chat, Telegram and Slack keep those words in the
@@ -1052,8 +1065,9 @@ the canonical saved reply before settling it. Final delivery joins any admitted
 preview send so an older edit cannot overwrite the answer. Network delivery and
 a visible render remain separate observations from model output.
 
-On phone turns, `surface.replyDeliveryStarted.characters` counts the complete
-reply handed to terminal transport. Its timestamp precedes that send; it is
+On phone turns, the joined producer supplies the words and terminal state used
+by live delivery and recovery. `surface.replyDeliveryStarted.characters` counts
+the words handed to terminal transport. Its timestamp precedes that send; it is
 not evidence that the phone received it. An admitted optional snapshot settles
 alongside terminal delivery, with both joined before the forwarder exits;
 the final send does not wait for that optional network round trip.
@@ -1181,7 +1195,7 @@ queue records are untouched.
 
 Source: `Resources/abilities/turn.js` (`step`, `stable`, `dynamic`),
 `ChatTurnRuntime/TurnPart.swift` (event delivery and effect queue),
-`ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` (effect execution),
+`ChatTurnRuntime/TurnStem+Effects.swift` and `TurnStem+ModelRound.swift` (effect execution),
 `ChatOrchestration+ToolLoop.swift` (support and settlement),
 `ChatOrchestration+ToolDispatch.swift`,
 `ChatToolRuntime/ProviderToolResultRecovery.swift` and
@@ -1278,18 +1292,6 @@ settlement that removes its waiting placeholder. Missing words without explicit
 completed settlement remain missing evidence; provider failures, waiting turns
 and interrupted output retain their existing outcomes.
 
-Before the first private keep request, the native stem
-meets the hand work that triggered it: ordered tool/action ids of landed writes
-or irreversible non-ability calls, without arguments or incidental reads, or
-the one call repeated 3+ rounds when there is no such hand work. Its
-`practice: ` line goes through `FamiliarLines.firstMet` in `mind/familiar.bin`.
-The first meeting only records it; the second and later meetings admit the
-keep unless an active ability's current learned-use or validation route
-contains those ids in order. Declared reach proves no route.
-`practice.keep` records `practice`, `met: first|again` and `kept` (keep
-admission, not an ability save). Later rounds of an admitted keep finish
-normally. This replaces the unfamiliar whole-turn-signature gate
-([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)).
 Any step may act with their own `{effect: "app", call: {tool: "app", input}}`.
 `TurnPart` names it `own_<event index>_<effect position>_<input digest>`, so a
 replayed step names the same act. The stem runs consecutive own calls as one
@@ -1310,19 +1312,22 @@ one call made 3+ rounds in a row with the same input when there is no such hand
 work. A route needs two steps or that loop. Its `practice: ` line goes through
 `FamiliarLines.firstMet` in `mind/familiar.bin`, once per route per turn (a
 resumed turn counts its restored receipts as already met). The first meeting
-only records it. A later meeting, unless an active ability's current learned-use
-or validation route contains those ids in order, puts
-`practice: {route, hand, loop?: {call, count}}` on that round's last `result`,
-at most once a turn. Declared reach proves no route. The shipped `turn.js` makes
-it the `note` of its next `model.call`: keep the route with `ability.save` as part
-of this work, revise the part they worked around, or let a looped part carry
-itself by returning `{again: input}`. `practice.keep` records `practice`,
-`met: first|again` and `noted` (or `failed` with the read's cause; the turn goes
+only records it. A later meeting puts
+`practice: {route, hand, loop?: {call, count}, ability?}` on that round's last
+`result`, at most once a turn. When an active ability's current learned-use or
+validation route makes exactly those ids in order (other steps only reads),
+`ability` names it (`{id, description, worked: true}` when its newest covering
+run's own outcome completed or it passed validation, else `{id, description, failed}` with the step its run failed at).
+Declared reach proves no route. The shipped `turn.js` makes it the `note` of its
+next `model.call`, leaving the landed work as it stands: use the ability they
+already has next time, repair the one whose run failed under its id, keep the route with `ability.save` as part of this work, or
+let a looped part carry itself by returning `{again: input}`. `practice.keep` records `practice`,
+`met: first|again`, `noted` and the covering `ability` (or `failed` with the read's cause; the turn goes
 on without the note). There is no private model call after the reply and no
 `keep` purpose ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)).
 
 A deed may carry its own ending. When the round ran one call, that call's
-input has `actions` and text `then_say`, and its result's `then_say` stands,
+input requests closing words with `then_say` on a batch or a single checked action, and its result's `then_say` stands,
 the `result` event carries `say`: the filled words
 ([contract](ONE_DOOR.md)). An action's own answer cannot put words there,
 because the call itself must have asked. The shipped `turn.js` then streams

@@ -54,10 +54,6 @@ extension TriggerSchedulerError {
 
 /// The rhythm grammar's scalar readers and the payload admission of scheduled reads.
 public enum SchedulerJobNormalizer {
-    static func string(_ value: JSONValue?) -> String? {
-        if case .string(let text)? = value { return text }; return nil
-    }
-
     /// Current documented units may use numeric strings; booleans and fractions are never integers. Absence is handled only by the field's own default.
     static func integer(_ value: JSONValue?) throws -> Int {
         switch value {
@@ -83,7 +79,7 @@ public enum SchedulerJobNormalizer {
     static func validatePayload(kind: String, payload: [String: JSONValue]) throws {
         switch kind {
         case "connector_action":
-            guard let action = string(payload["actionId"]), !action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard let action = payload["actionId"]?.stringValue, !action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw TriggerSchedulerError.schedulerInvalid("payload.actionId is required", path: "$.payload.actionId")
             }
             if let input = payload["input"], case .object = input {} else if payload["input"] != nil {

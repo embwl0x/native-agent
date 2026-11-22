@@ -33,7 +33,8 @@ extension NativeOAuthFlow {
     private static func clearTokensAfterRetiringSignIn(providerId: String, dataRoot: URL?) -> Bool {
         let normalized = normalizedOAuthProviderId(providerId)
         switch providerId {
-        case "openai_oauth_direct":
+        // Codex verifies against the same app-owned OpenAI credential, so its sign-out clears it the same way (the CLI's own file stays).
+        case "openai_oauth_direct", "codex":
             // Sign-out may delete only this root's app-owned credential.
             let root = dataRoot ?? PersistenceCore.defaultDataRoot()
             var removed = true
@@ -266,7 +267,7 @@ extension NativeOAuthFlow {
 extension NativeOAuthFlow {
 
     /// The Providers face sends sign-in through the account's protected connection card.
-    public static func signInControl(providerID: String, dataRoot: URL) -> String? {
+    public static func signInControl(providerID: String) -> String? {
         guard ["openai_oauth_direct", "codex", "anthropic_oauth_direct", "xai_oauth_direct"].contains(providerID) else { return nil }
         return "Providers → Accounts → " + SwiftNativeProviderRouting.displayName(for: providerID) + " → Sign in"
     }

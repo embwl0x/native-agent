@@ -127,6 +127,11 @@ struct FaceDocumentReadout: View {
     }
 
     private func correct(id: String, text: String) {
+        // Chat takes the correction only into an empty draft: with words already there, the sheet stays open and says why.
+        guard appModel.chatDraft(for: appModel.activeChatSessionId).isEmpty else {
+            failure = "Chat already has a draft. Send or clear it, then press Correct this again."
+            return
+        }
         dismiss()
         let draft = """
             Correct what you remember. The memory (id \(id)) says:

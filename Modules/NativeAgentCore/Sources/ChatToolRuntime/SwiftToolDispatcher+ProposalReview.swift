@@ -11,7 +11,7 @@ extension SwiftToolDispatcher {
     static let maxPendingProposalsListed = 10
 
     private static func awaitsReview(_ proposal: ProposalRecord) -> Bool {
-        SwiftNativeMemoryV2.awaitsReview(content: proposal.content, source: proposal.source, metadata: proposal.metadata)
+        SwiftNativeMemoryV2.awaitsReview(content: proposal.content, metadata: proposal.metadata)
     }
 
     private static func permitsProposalDisclosure(_ proposal: ProposalRecord, surface: String, persona: String?) -> Bool {
@@ -22,7 +22,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_memory_proposals_pending(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        let status = (optionalString(input, "status") ?? "pending").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let status = (input["status"]?.nonblankString ?? "pending").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard status == "pending" || status == "rejected" else {
             return .object(["status": .string("refused"), "reason": .string("status must be \"pending\" or \"rejected\".")])
         }
@@ -72,7 +72,7 @@ extension SwiftToolDispatcher {
 
     func impl_memory_proposal_review(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         // Strict schemas may supply empty optionals; return a refusal with a remedy rather than a misleading policy exception.
-        let id = (optionalString(input, "id") ?? "")
+        let id = (input["id"]?.nonblankString ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else {
             return .object([
@@ -80,7 +80,7 @@ extension SwiftToolDispatcher {
                 "reason": .string("memory_proposal_review needs the proposal 'id' from memory_proposals_pending."),
             ])
         }
-        let decision = (optionalString(input, "decision") ?? "")
+        let decision = (input["decision"]?.nonblankString ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard decision == "accept" || decision == "reject" else {
@@ -89,7 +89,7 @@ extension SwiftToolDispatcher {
                 "reason": .string("memory_proposal_review 'decision' must be exactly \"accept\" or \"reject\"."),
             ])
         }
-        let reason = optionalString(input, "reason")?
+        let reason = input["reason"]?.nonblankString?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Apply the page’s pending rule so completed proposals cannot be reviewed again.

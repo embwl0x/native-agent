@@ -2,7 +2,7 @@ import AppKit
 import NativeAgentShared
 import SwiftUI
 
-// Blueprint: | `TranscriptStyle.swift` | Layout tokens, text scale and fold links |
+// Blueprint: | `TranscriptStyle.swift` | Layout tokens and text scale |
 
 enum TranscriptMetrics {
     static let column = NativeAgentShellLayout.roomColumn
@@ -10,7 +10,6 @@ enum TranscriptMetrics {
     static let bubblePadH: CGFloat = NativeAgentSpacing.lg
     static let bubblePadV: CGFloat = NativeAgentSpacing.md
     static let userCorners = NativeAgentShellLayout.userBubbleCorners
-    static var paragraphGap: CGFloat { StreamingParagraphText.paragraphGap }
     static let codePadH: CGFloat = NativeAgentSpacing.sm
     static let codePadV: CGFloat = NativeAgentSpacing.sm
     /// The strip above the code that holds its language label and copy button.
@@ -22,17 +21,6 @@ enum TranscriptMetrics {
     static let topFade: CGFloat = 24
     /// Text fades out across the clearance between the reading bottom and the composer's top edge, so none shows under the glass.
     static let bottomFade: CGFloat = NativeAgentShellLayout.composerClearanceMargin
-
-    static func topGap(_ lead: TranscriptBlock.Lead) -> CGFloat {
-        switch lead {
-        case .none: 0
-        case .message: NativeAgentShellLayout.transcriptGap
-        case .paragraph: paragraphGap
-        case .listItem: NativeAgentSpacing.xs
-        case .detail: NativeAgentSpacing.xs
-        case .gap: NativeAgentShellLayout.transcriptGap + NativeAgentSpacing.sm
-        }
-    }
 }
 
 enum TranscriptInk {
@@ -62,16 +50,5 @@ enum TranscriptTextScale {
         guard rounded != Double(value) else { return }
         UserDefaults.standard.set(rounded, forKey: defaultsKey)
         NotificationCenter.default.post(name: changed, object: nil)
-    }
-}
-
-/// A fold headline's link: the tool run's group id under a scheme only this view opens.
-enum TranscriptFoldLink {
-    static let scheme = "nativeagent-fold"
-
-    static func group(_ link: Any) -> String? {
-        guard let url = link as? URL ?? (link as? String).flatMap(URL.init(string:)), url.scheme == scheme else { return nil }
-        let group = String(url.path.dropFirst())
-        return group.isEmpty ? nil : group
     }
 }

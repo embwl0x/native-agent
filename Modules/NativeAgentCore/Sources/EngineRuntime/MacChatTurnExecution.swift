@@ -55,7 +55,6 @@ import SwarmRuns
 import Onboarding
 import Privacy
 import Experiences
-import CryptoKit
 import ActivityWatch
 import OSLog
 import SchedulerExecution
@@ -69,7 +68,7 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `MacChatTurnExecution.swift` | `NativeAgentEngine`, `TurnsFacade.runtime`, `ChatTurnToolPlacement`; Ordered stream settlement |
+// Blueprint: | `MacChatTurnExecution.swift` | `NativeAgentEngine`, `TurnsFacade.runtime`, `MacChatTurnPresentationPort`; Ordered stream settlement |
 
 extension NativeAgentEngine {
     @MainActor
@@ -143,7 +142,7 @@ extension NativeAgentEngine {
         // The turn carries the displayed user row id to core persistence.
         let execution = ChatStreamExecution.macChatStream(
             client: client, text: trimmed, attachments: attachments,
-            sessionId: requestSessionId, activityIdentity: activityIdentity, replyRowId: bubbleId,
+            sessionId: requestSessionId, replyRowId: bubbleId,
             hideUserBubble: hideUserBubble,
             onScreenPreview: { [turns] in await turns.receiveScreenPreview($0, identity: activityIdentity) },
             helperSession: { progress, _ in self.standingBotSession(admitted: true, attachments: attachments, progress: progress) },
@@ -377,14 +376,15 @@ public extension NativeAgentEngine {
         sessionId: String,
         prunePresentation: (String) async -> Void
     ) async throws -> Bool {
-        guard try await transcripts.archive(id: sessionId) != nil else { return false }
+        // Stop and settle first, then archive: a reply stopped after the archive would save its words to a fresh conversation of one partial
+        // answer. Stop must include busy reservations still awaiting admission.
         let runningTask = turns.runtime.tasks[sessionId]
-        // Stop must include busy reservations still awaiting admission.
         if runningTask != nil || turns.runtime.streamingSessions.contains(sessionId) || turns.runtime.busySessions.contains(sessionId) {
             port.stopChatStream(sessionId: sessionId)
         }
         // Retain reservations until their producer commits Stop proof.
         await runningTask?.value
+        guard try await transcripts.archive(id: sessionId) != nil else { return false }
         if runningTask == nil, turns.runtime.activeTurnIDsBySession[sessionId] == nil {
             turns.runtime.taskGenerations[sessionId] = nil
         }
@@ -451,6 +451,13 @@ public extension NativeAgentEngine {
             .turn(id: lifecycleIdentity.turnId, parent: parent)
         if let renderer { retryTurn[FacePresentationPart.self] = renderer }
         retryTurn.rows.replacementUserMessageID = retrySnapshot.userRowPersisted ? retrySnapshot.priorUserMessageId : nil
+        // A retry's question is already in the transcript under its original run: the checkpoint carries it as input, so an
+        // interrupted retry resumes instead of finding no question under its own new run.
+        if retrySnapshot.userRowPersisted {
+            retryTurn.rows.hiddenInput = TurnCheckpoint.HiddenInput(
+                origin: retrySnapshot.priorUserOrigin.flatMap { try? JSONValue.fromEncodable($0) }, attachments: [], completion: nil,
+                queryUserMessage: nil, threadKind: nil, ownedSessionID: nil, questionRunID: nil, verifiedSessionID: nil)
+        }
         // Save unsaved questions under their displayed id.
         retryTurn.rows.pinnedUserMessageID = retrySnapshot.userRowPersisted ? nil : retrySnapshot.priorUserMessageId
         await port.runAdmittedMacChatRetry(admission, operation: { [self] retryTurn in

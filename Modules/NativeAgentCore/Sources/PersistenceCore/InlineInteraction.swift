@@ -685,4 +685,21 @@ public enum InlineInteractionWire {
         decoder.dateDecodingStrategy = .iso8601
         return decoder
     }
+
+    package static func checkedCard(in row: JSONValue, lifeID: String?) throws -> InlineInteraction? {
+        guard let metadata = row.objectValue?["metadata"]?.objectValue,
+              metadata["kind"] == .string(transcriptKind) else { return nil }
+        guard let raw = metadata[metadataKey] else {
+            throw PersistenceCoreError.ioFailure("The saved interaction card has no interaction payload. Repair its transcript row.")
+        }
+        var card = try decoder().decode(InlineInteraction.self, from: raw.serializedData(pretty: false))
+        if let lifeID, let continuation = card.continuation,
+           DataRootLife.life(of: continuation.lifeID) != lifeID,
+           [.waiting, .claimed, .replaying, .stopped].contains(continuation.state) {
+            card.continuation?.state = .stopped
+            card.continuation?.reason = DataRootLife.stoppedReason
+            card.state = .stopped(reason: DataRootLife.stoppedReason)
+        }
+        return card
+    }
 }

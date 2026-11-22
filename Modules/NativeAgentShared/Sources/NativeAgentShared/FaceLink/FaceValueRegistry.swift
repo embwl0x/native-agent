@@ -23,13 +23,6 @@ public struct FaceValueRegistry: Sendable {
 
     public init(registrations: [FaceValueRegistration]) { self.registrations = registrations }
 
-    public func registering<Value: FaceValue>(_ type: Value.Type, name: String) throws -> FaceValueRegistry {
-        guard !registrations.contains(where: { $0.name == name || $0.type == ObjectIdentifier(type) }) else {
-            throw FaceWireError.duplicateValue(name)
-        }
-        return FaceValueRegistry(registrations: registrations + [.init(type, name: name)])
-    }
-
     fileprivate func encode(_ value: AnyFaceValue) throws -> (String, Data) {
         let matches = registrations.filter { $0.type == ObjectIdentifier(Swift.type(of: value.base)) }
         guard matches.count == 1, let entry = matches.first else {

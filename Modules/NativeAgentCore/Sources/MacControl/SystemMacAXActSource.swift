@@ -4,20 +4,11 @@ import Synchronization
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
 import Carbon
 import NativeAgentShared
-#endif
 // Blueprint: | `SystemMacAXActSource.swift` | Dedicated AX thread and run loop; CF-equal identity, scoped gaps and target-pid Write/driver gates |
 /// AX IPC and observer delivery share one serial thread, independently of the app's windows.
 /// Synchronous clients enter only from non-main execution; async surface entries must suspend their actor before calling.
@@ -78,7 +69,6 @@ enum MacAXExecutionLane {
         CFRunLoopWakeUp(loop)
     }
 }
-#if canImport(ApplicationServices) && os(macOS)
 package enum MacNativeActionFailure: Error, LocalizedError {
     case driver(String), selfTarget, renderer(String), evidence(String), appPermission(MacAppActRefusal)
     package var errorDescription: String? {
@@ -132,19 +122,14 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         }
     }
     private func resolveMenuOnExecutionLane(path: [Int], pid: Int32, titlePath: [String]?, context: MacOperationContext) -> MacAXPidResolution {
-        #if canImport(AppKit)
         // Person-only UI cannot supply an AX action target.
         guard !PersonOnlyWindows.isOwnProcess(pid) else { return .appGone }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
         let appElement = AXUIElementCreateApplication(pid)
         guard let current = MacAXAttributeRead.copyElement(appElement, kAXMenuBarAttribute, context: context) else { return .appGone }
         return resolveDescendant(path: path, from: current, titlePath: titlePath, context: context)
-        #else
-        return .appGone
-        #endif
     }
     private func resolveOnExecutionLane(path: [Int], pid: Int32, context: MacOperationContext) -> MacAXPidResolution {
-        #if canImport(AppKit)
         // Her body and window share the person-only boundary.
         guard !PersonOnlyWindows.isOwnProcess(pid) else { return .appGone }
         // Probe process existence directly: AX can construct dead-pid references whose failed reads cannot establish window absence.
@@ -153,9 +138,6 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         guard let current = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute, context: context)
         else { return .appGone }
         return resolveDescendant(path: path, from: current, context: context)
-        #else
-        return .appGone
-        #endif
     }
     /// Inventory every window so the caller can identify the observed one rather than whichever is focused.
     public func windows(pid: Int32, context: MacOperationContext) throws -> [MacAXWindowRef] {
@@ -185,7 +167,6 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         }
     }
     private func windowsOnExecutionLane(pid: Int32, context: MacOperationContext) throws -> [MacAXWindowRef] {
-        #if canImport(AppKit)
         // Apply the same self-process fence as path resolution.
         guard !PersonOnlyWindows.isOwnProcess(pid) else { return [] }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
@@ -202,9 +183,6 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                 identity: try MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index, context: context)
             )
         }
-        #else
-        return []
-        #endif
     }
     public func focusedWindow(pid: Int32, context: MacOperationContext) -> MacAXWindowRef? {
         MacAXExecutionLane.sync {
@@ -214,7 +192,6 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     /// Focus and inventory must mint the same composite identity so callers compare complete window evidence rather than titles.
     private func focusedWindowOnExecutionLane(pid: Int32, context: MacOperationContext) throws -> MacAXWindowRef? {
-        #if canImport(AppKit)
         // Apply the same self-process fence as path resolution.
         guard !PersonOnlyWindows.isOwnProcess(pid) else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
@@ -232,12 +209,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             handle: mint(focused),
             identity: try MacAXAttributeRead.copyWindowIdentity(focused, pid: pid, index: index, context: context)
         )
-        #else
-        return nil
-        #endif
     }
-    public func resolve(path: [Int], inWindow window: MacAXWindowRef, context: MacOperationContext) -> MacAXPidResolution {
-        MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, inWindow: window, context: context) }
+    public func resolve(path: [Int], inWindow window: MacAXWindowRef, readEnabled: Bool, context: MacOperationContext) -> MacAXPidResolution {
+        MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, inWindow: window, readEnabled: readEnabled, context: context) }
     }
     public func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef,
         context: MacOperationContext) throws -> MacAXActTarget? {
@@ -310,25 +284,24 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             return try search(root).flatMap { describe($0, context: context) }
         }
     }
-    private func resolveOnExecutionLane(path: [Int], inWindow window: MacAXWindowRef, context: MacOperationContext) -> MacAXPidResolution {
-        #if canImport(AppKit)
+    private func resolveOnExecutionLane(path: [Int], inWindow window: MacAXWindowRef, readEnabled: Bool,
+                                        context: MacOperationContext) -> MacAXPidResolution {
         // A retained handle cannot bypass the person-only boundary.
         guard !PersonOnlyWindows.isOwnProcess(window.identity.pid) else { return .appGone }
         guard NSRunningApplication(processIdentifier: window.identity.pid) != nil else { return .appGone }
         // Retain the identity-matched window root; substituting focused or first windows would redirect the act.
         guard let current = element(window.handle) else { return .windowGone }
-        return resolveDescendant(path: path, from: current, context: context)
-        #else
-        return .appGone
-        #endif
+        return resolveDescendant(path: path, from: current, readEnabled: readEnabled, context: context)
     }
     // The caller validates the root on the AX lane; the shared walk cannot substitute another window or menu.
-    private func resolveDescendant(path: [Int], from root: AXUIElement, titlePath: [String]? = nil, context: MacOperationContext) -> MacAXPidResolution {
+    private func resolveDescendant(path: [Int], from root: AXUIElement, titlePath: [String]? = nil, readEnabled: Bool = true,
+                                   context: MacOperationContext) -> MacAXPidResolution {
         do { return try MacAXAttributeRead.checked(context: context) { context in resolveCheckedDescendant(path: path, from: root, titlePath: titlePath,
-            context: context) } }
+            readEnabled: readEnabled, context: context) } }
         catch { return .unavailable(error.localizedDescription) }
     }
-    private func resolveCheckedDescendant(path: [Int], from root: AXUIElement, titlePath: [String]?, context: MacOperationContext) -> MacAXPidResolution {
+    private func resolveCheckedDescendant(path: [Int], from root: AXUIElement, titlePath: [String]?, readEnabled: Bool,
+                                          context: MacOperationContext) -> MacAXPidResolution {
         var current = root
         var titles: [String] = []
         var validAncestry = true
@@ -344,7 +317,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             }
         }
         if let titlePath, !validAncestry || titles != titlePath { return .menuPathDrifted }
-        guard let described = describe(current, context: context) else { return .pathNotFound }
+        guard let described = describe(current, readEnabled: readEnabled, context: context) else { return .pathNotFound }
         return .resolved(described)
     }
     public func perform(_ target: MacAXActTarget, action: String, turn: Turn, context: MacOperationContext) -> MacAXActOutcome {
@@ -532,7 +505,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func acceptsTextInput(_ target: MacAXActTarget, context: MacOperationContext) -> Bool {
         MacAXExecutionLane.sync {
             guard let element = element(target.handle), let current = describe(element, reusing: target.handle, context: context),
-                  current.enabled, !MacActClosedLoop.isSecureField(role: current.role) else { return false }
+                  current.enabled == true, !MacActClosedLoop.isSecureField(role: current.role) else { return false }
             if MacActClosedLoop.canType(role: current.role)
                 || MacAXAttributeRead.copyBool(element, "AXEditable", context: context) == true { return true }
             // Canvas editors may expose a caret without exposing their text.
@@ -551,7 +524,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func textInput(_ target: MacAXActTarget, context: MacOperationContext) -> MacAXTextInput? {
         MacAXExecutionLane.sync {
             guard let element = element(target.handle), let current = describe(element, reusing: target.handle, context: context),
-                  current.enabled,
+                  current.enabled == true,
                   let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute, context: context),
                   CFGetTypeID(rawValue) == CFStringGetTypeID(),
                   let raw = MacAXAttributeRead.copyRaw(element, kAXSelectedTextRangeAttribute, context: context),
@@ -616,26 +589,29 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     private func rereadOnExecutionLane(_ target: MacAXActTarget, context: MacOperationContext) -> MacAXActTarget? {
         guard let element = element(target.handle) else { return nil }
-        return describe(element, reusing: target.handle, context: context)
+        return describe(element, reusing: target.handle, readEnabled: target.enabled != nil, context: context)
     }
     // MARK: raw AX reads used to describe the target (nil-tolerant)
-    private func describe(_ element: AXUIElement, reusing handle: Int? = nil, context: MacOperationContext) -> MacAXActTarget? {
-        do { return try MacAXAttributeRead.checked(context: context) { context in describeChecked(element, reusing: handle, context: context) } }
+    private func describe(_ element: AXUIElement, reusing handle: Int? = nil, readEnabled: Bool = true,
+                          context: MacOperationContext) -> MacAXActTarget? {
+        do { return try MacAXAttributeRead.checked(context: context) { context in
+            describeChecked(element, reusing: handle, readEnabled: readEnabled, context: context)
+        } }
         catch { MacAXAttributeRead.failed(error, context: context); return nil }
     }
-    private func describeChecked(_ element: AXUIElement, reusing handle: Int?, context: MacOperationContext) -> MacAXActTarget? {
+    private func describeChecked(_ element: AXUIElement, reusing handle: Int?, readEnabled: Bool,
+                                 context: MacOperationContext) -> MacAXActTarget? {
         do { try SystemMacAXElementSource.ensureRenderer(element, refresh: true, context: context) }
         catch { nativeLog("AX target renderer preparation refused: %@", error.localizedDescription); return nil }
-        let role: String, enabled: Bool, actions: [String]
+        let role: String, enabled: Bool?, actions: [String]
         do {
             role = try MacAXAttributeRead.checkedText(element, kAXRoleAttribute, context: context)
-            let observedEnabled = try MacAXAttributeRead.checkedEnabled(element, context: context)
+            enabled = readEnabled ? try MacAXAttributeRead.checkedEnabled(element, context: context) : nil
             guard !role.isEmpty else {
                 MacAXAttributeRead.failed(MacAccessibilityReader.NativeReadFailure(
                     detail: "AX target evidence unavailable: the role is missing. Read this control again before acting."), context: context)
                 return nil
             }
-            enabled = observedEnabled
             actions = try MacAXAttributeRead.copyActions(element, context: context)
         } catch { MacAXAttributeRead.failed(error, context: context); return nil }
         // Unreadable optional names, values or frames belong to this element’s gap, not a refusal of an otherwise validated act.
@@ -655,4 +631,3 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         ) }
     }
 }
-#endif

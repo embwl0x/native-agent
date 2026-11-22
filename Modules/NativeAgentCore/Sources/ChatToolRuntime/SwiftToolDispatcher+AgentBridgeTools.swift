@@ -2,7 +2,6 @@ import AgentWorkspace
 import Foundation
 import NativeAgentShared
 import Darwin
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import Desk

@@ -161,7 +161,8 @@ final class MacBridgeClient: ObservableObject {
     func disconnect() {
         connectionGeneration += 1
         isConnecting = false
-        bridge.tearDown()
+        // A disconnect ends the transport, not the app's listeners: Chat keeps its registrations, so live replies resume on reconnect.
+        bridge.tearDown(preservingConsumers: true)
         refreshConnection()
     }
 

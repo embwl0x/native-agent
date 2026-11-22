@@ -47,8 +47,6 @@ extension InboxItemRecord {
     public var actionIDs: Set<String> {
         Set(InboxActionVocabulary.actions(declared: actions, approvalLinked: hasLinkedApproval).map(\.id))
     }
-
-    public var isForYouLane: Bool { !isSystemLane }
 }
 
 /// Meaning belongs to the wire's declared fields, never inferred presentation prose.

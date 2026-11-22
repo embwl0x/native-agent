@@ -11,7 +11,12 @@ final class PipeFaceClient: FaceClient {
 
     let face = FaceFeed()
     private(set) var state = State.connecting
-    @ObservationIgnored private let displayFrame = DisplayFrame()
+    /// Work that needs the link runs once the body acknowledges attach, never racing it.
+    private var afterConnect: [() -> Void] = []
+    func whenConnected(_ work: @escaping () -> Void) {
+        if case .connected = state { work() } else { afterConnect.append(work) }
+    }
+    @ObservationIgnored private let displayFrame = DisplayFrame(followsScreenChanges: true)
     @ObservationIgnored private var link: FaceLink.Connection?
     @ObservationIgnored private weak var router: FaceCallRouter?
     @ObservationIgnored private var ended = false
@@ -128,7 +133,13 @@ final class PipeFaceClient: FaceClient {
                     else if abandoned.remove(id) != nil { continue }
                     else if let receipt = receipts.removeValue(forKey: id) {
                         switch reply {
-                        case .acknowledged: if case .attach = receipt { state = .connected }
+                        case .acknowledged:
+                            if case .attach = receipt {
+                                state = .connected
+                                let work = afterConnect
+                                afterConnect = []
+                                work.forEach { $0() }
+                            }
                         case .failed(let failure), .refused(let failure):
                             if case .attach = receipt { state = .failed(failure.localizedDescription) }
                             else { onReceiptFailure?(failure) }
@@ -225,7 +236,7 @@ final class PipeFaceClient: FaceClient {
         abandoned.removeAll()
         receipts.removeAll()
         for (id, continuation) in pending {
-            continuation.resume(throwing: WireFailure(code: "face_reply_lost", message: "My connection closed.",
+            continuation.resume(throwing: WireFailure(code: "face_reply_lost", message: "Lost connection while doing that. It may or may not have gone through.",
                 cause: "Request \(id.uuidString): \(error.localizedDescription). Its effects are unknown.", effects: .unknown))
         }
         for task in calls.values { task.cancel() }

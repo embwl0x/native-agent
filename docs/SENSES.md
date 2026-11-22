@@ -77,6 +77,8 @@ read is used; older reads do not make that selection ambiguous. An explicit
 will receive, without another source read. A trial runs once against that
 captured material; `keep:true`, or a later exact `trial_id`/`digest` keep,
 publishes the proven candidate without rerunning it.
+Switching a different sense preserves that trial and its proof. Omission from
+a registry update removes only records previously published in that registry.
 
 A revision needs a fresh trial. A kept receipt carries `status:"kept",place,sense_id,version,page,timing`; reread the place for its page, provenance and verbs.
 A failed or pageless trial is discarded with its failure and serves no page. Without a matching sense, the original payload names its generic reader or raw-view reason.
@@ -157,7 +159,12 @@ App → helper:
   `{"type":"act","verb":"…","address":"…","args":{...}}`, or `{"type":"watch"}`.
   The sealed Work pane may also send `{"type":"event","event":<JSON>}`;
   it calls `event(request)` and never authorizes an act.
-  Events share ordinary entry admission, helper reuse and settlement; an event never starts a watch.
+  Events use the helper selection and source that published the visible
+  presentation, and share ordinary entry admission, helper reuse and settlement.
+  A file click rechecks current file admission and checks the admitted identity
+  against the presentation. Site clicks use the captured reader or the tab
+  bound by the presenting Chrome observation.
+  The runner starts no watch after a view event.
   Supplied material serves `source.read()` or that request's address locally; omitted
   source addresses mean the current request's address. Each run repeats program and sense; the program must stay
   identical, and record id/version/corner/mode/reach cannot change. JS globals persist.
@@ -515,7 +522,7 @@ the [blueprint](ARCHITECTURE_BLUEPRINT.md) maps its source owners.
 A sense is one JS file (ES2020, no modules, no network unless declared reach
 allows it). The runtime exposes a global `sense`:
 
-- `sense.source.read(address?)` → the raw material (`{kind:"accessibility", tree}` | `{kind:"file", path, bytes, data}` where `data` is a Uint8Array | `{kind:"page", snapshot}` | `{kind:"text", text}`)
+- `sense.source.read(address?)` → the raw material (`{kind:"accessibility", tree}` | `{kind:"file", path, bytes, data}` where `data` is a Uint8Array | `{kind:"page", snapshot}` | `{kind:"text", text}`). A file read through the app door supplies its admitted file. Once captured, that file's identity stays fixed. A served cursor without a path can select a position in that same file. A request naming a different file receives `source_denied` from that source.
 - `sense.source.watch()` → subscribe; changes arrive as calls to the sense's `changed(material)` function
 - `sense.publish(page)` → page = `{address, title, text, things:[{name, kind, address, detail?, verbs?}], folded?, more?}`
 - `sense.notify({address, summary})`
@@ -523,7 +530,7 @@ allows it). The runtime exposes a global `sense`:
   Swift policy before composing news; local, no plug traffic or progress credit
 - `sense.present({title, html})` → present an offline interactive Work pane;
   `sense.present(null)` closes it. Its one event channel calls `event({event})`
-  in that same sense/version, with door actions prohibited.
+  through the helper and source bound to that presentation, with door actions prohibited.
 - `sense.act(verb, address, args)` → only while answering an `act` request; returns the door's result
 - `sense.state.get(key)` / `sense.state.set(key, value)` → the small saved notebook
 - `sense.log(...)`

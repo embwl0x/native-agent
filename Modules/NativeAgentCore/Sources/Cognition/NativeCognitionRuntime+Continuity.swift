@@ -71,12 +71,12 @@ extension NativeCognitionRuntime {
         do { cached = try cachedDreamTheme(dataRoot: dataRoot, diary: diary, space: space) } catch {
             requestDreamThemeExtraction(dataRoot: dataRoot, diary: diary, space: space, embed: embed)
             return CognitiveCueRead([], unreadable: ["the dream theme cache (\(error.localizedDescription)); " + dreamThemeExtractionStatus(
-                dataRoot: dataRoot, diary: diary, space: space)])
+                diary: diary, space: space)])
         }
         if let cached, cached.phrases.allSatisfy({ excluding.contains($0.id) }) { return CognitiveCueRead([]) }
         guard let file = cached else {
             requestDreamThemeExtraction(dataRoot: dataRoot, diary: diary, space: space, embed: embed)
-            return CognitiveCueRead([], unreadable: [dreamThemeExtractionStatus(dataRoot: dataRoot, diary: diary, space: space)])
+            return CognitiveCueRead([], unreadable: [dreamThemeExtractionStatus(diary: diary, space: space)])
         }
         let query: [Float]
         do { query = try await messageVector(message, space: space, embed: embedQuery) } catch {
@@ -84,7 +84,7 @@ extension NativeCognitionRuntime {
         }
         guard !file.phrases.contains(where: { $0.vector.count != query.count }) else {
             requestDreamThemeExtraction(dataRoot: dataRoot, diary: diary, space: space, embed: embed)
-            return CognitiveCueRead([], unreadable: [dreamThemeExtractionStatus(dataRoot: dataRoot, diary: diary, space: space)])
+            return CognitiveCueRead([], unreadable: [dreamThemeExtractionStatus(diary: diary, space: space)])
         }
         return CognitiveCueRead(file.phrases
             .filter { !excluding.contains($0.id) }
@@ -165,7 +165,7 @@ extension NativeCognitionRuntime {
     }
     private static let dreamThemeExtractions = OSAllocatedUnfairLock<[String: DreamThemeExtractionState]>(initialState: [:])
 
-    nonisolated static func dreamThemeExtractionStatus(dataRoot: URL, diary: LivingDiary, space: DreamThemeSpace) -> String {
+    nonisolated static func dreamThemeExtractionStatus(diary: LivingDiary, space: DreamThemeSpace) -> String {
         let state = dreamThemeExtractions.withLock { $0[space.root] }
         if let state, state.matches(diary, space), let failure = state.failure {
             return "dream theme extraction unavailable: " + failure + "; repair the diary or embedding source, then relaunch NativeAgent"
@@ -274,7 +274,6 @@ extension NativeCognitionRuntime {
     nonisolated static func sinceGapItems(
         from: Date,
         to: Date,
-        surface: String,
         dataRoot: URL
     ) async -> CognitiveCueRead<[String]> {
         async let deskRead = Result { try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() }

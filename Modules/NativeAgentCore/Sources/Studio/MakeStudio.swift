@@ -358,10 +358,16 @@ extension MakeStudio {
                 throw Refusal(reason: "export_is_source", message: "An export output is the studio's own file. Pick another place; nothing was exported.")
             }
         }
+        // The save dialog confirmed only the document's name: no prompt means no sidecar, and an existing sidecar is never replaced unasked.
+        let writesPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if writesPrompt, try identity(sidecar) != nil {
+            throw Refusal(reason: "export_prompt_exists", message: "\(sidecar.lastPathComponent) is already there. Pick another name or place; nothing was exported.")
+        }
         let bytes = try Data(contentsOf: file)
         let promptBytes = Data(prompt.utf8)
         do { try bytes.write(to: target, options: .atomic) }
         catch { return ExportResult(work: .unconfirmed(target, error.localizedDescription), prompt: .notAttempted(sidecar)) }
+        guard writesPrompt else { return ExportResult(work: .saved(target), prompt: .notAttempted(sidecar)) }
         do { try promptBytes.write(to: sidecar, options: .atomic) }
         catch { return ExportResult(work: .saved(target), prompt: .unconfirmed(sidecar, error.localizedDescription)) }
         return ExportResult(work: .saved(target), prompt: .saved(sidecar))

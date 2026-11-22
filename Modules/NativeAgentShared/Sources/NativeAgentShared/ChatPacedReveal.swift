@@ -3,8 +3,7 @@ import SwiftUI
 // Blueprint: | `ChatPacedReveal.swift` | `ChatStreamPacer`: paragraph reveal, fade and settle shared by Mac/phone |
 
 
-/// One Text per paragraph, with the same gap and inline styling as settled replies. The pacer retains paragraph offsets and the styled edge;
-/// fade-only frames change the edge's renderer without splitting or parsing the source.
+/// One Text per paragraph, with the same gap and inline styling as settled replies.
 @available(macOS 15, iOS 18, *)
 public struct StreamingParagraphText: View {
     let text: Substring
@@ -12,9 +11,6 @@ public struct StreamingParagraphText: View {
     var now: TimeInterval = 0
     /// The settled reply's inline markdown parse; nil streams raw text.
     var inline: ChatInlineMarkdown?
-    fileprivate var projectedParagraphs: [Substring]?
-    fileprivate var projectedStyles: [Bool]?
-    fileprivate var preparedEdge: Text?
     @Environment(\.lineSpacing) private var lineSpacing
 
     public init(
@@ -32,15 +28,15 @@ public struct StreamingParagraphText: View {
     nonisolated public static let paragraphGap: CGFloat = 10
 
     public var body: some View {
-        let paragraphs = projectedParagraphs ?? Self.paragraphs(text)
+        let paragraphs = Self.paragraphs(text)
         let last = paragraphs.count - 1
-        let styled = projectedStyles ?? Self.styledParagraphs(paragraphs, enabled: inline != nil)
+        let styled = Self.styledParagraphs(paragraphs, enabled: inline != nil)
         VStack(alignment: .leading, spacing: lineSpacing + Self.paragraphGap) {
             // Positional ids: paragraphs only append while a reply streams, so a finished one keeps its id and its layout.
             ForEach(paragraphs.indices, id: \.self) { index in
                 let parse = styled[index] ? inline : nil
                 if index == last {
-                    (preparedEdge ?? Self.paragraph(paragraphs[index], fades: fades, inline: parse, atEdge: true))
+                    Self.paragraph(paragraphs[index], fades: fades, inline: parse, atEdge: true)
                         .textRenderer(ChatEdgeFadeRenderer(now: now))
                 } else {
                     FinishedParagraph(text: paragraphs[index], inline: parse).equatable()
@@ -212,78 +208,7 @@ public struct ChatInlineMarkdown: Sendable {
     }
 }
 
-/// The live reply reveals words smoothly and pauses when caught up or hidden. Mounts, hidden-window returns and excessive backlog show current words;
-/// Reduce Motion bypasses pacing and fades.
-@available(macOS 15, iOS 18, *)
-public struct PacedStreamingText: View {
-    let text: String
-    /// Further behind than this, jump. The iPhone's ~1 s batches run up to ~1,200 bytes, so it passes a larger lag than the Mac's 70 ms publishes.
-    var maxLagBytes: Int
-    var inline: ChatInlineMarkdown?
-    var isVisible: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pacer = ChatStreamPacer()
-    /// The text length the pacer last came to rest at; paused only while that is still the whole text, so a jump to the end also pauses.
-    @State private var restedAt = -1
-
-    var onCaughtUp: (() -> Void)?
-
-    public init(text: String, maxLagBytes: Int = ChatStreamPacer.maxLagBytes, inline: ChatInlineMarkdown? = nil,
-                isVisible: Bool = true, onCaughtUp: (() -> Void)? = nil) {
-        self.text = text
-        self.maxLagBytes = maxLagBytes
-        self.inline = inline
-        self.isVisible = isVisible
-        self.onCaughtUp = onCaughtUp
-    }
-
-    public var body: some View {
-        let _ = pacer.setSource(text)
-        Group {
-            if !isVisible {
-                if let prepared = pacer.preparedView { prepared }
-            } else if reduceMotion {
-                visible(text[...])
-                    .onChange(of: text, initial: true) { onCaughtUp?() }
-            } else {
-                TimelineView(.animation(minimumInterval: 1.0 / 60, paused: restedAt == text.utf8.count)) { context in
-                    let now = context.date.timeIntervalSinceReferenceDate
-                    let shown = pacer.advance(text, now: now, maxLagBytes: maxLagBytes)
-                    let restMark = pacer.isResting(text) ? text.utf8.count : -1
-                    visible(text[..<text.utf8.index(text.utf8.startIndex, offsetBy: shown)], now: now)
-                        .onChange(of: restMark, initial: true) { _, mark in
-                            restedAt = mark
-                            if mark >= 0 { onCaughtUp?() }
-                        }
-                }
-            }
-        }
-        .onChange(of: isVisible) { _, visible in
-            if visible { pacer.resetReveal(); restedAt = -1 }
-        }
-        .onChange(of: reduceMotion) {
-            pacer.resetReveal()
-            restedAt = -1
-        }
-    }
-
-    /// Nothing visible yet keeps the one blank line the empty bubble drew.
-    @ViewBuilder
-    private func visible(_ revealed: Substring, now: TimeInterval = 0) -> some View {
-        if revealed.contains(where: { !$0.isWhitespace }) {
-            if reduceMotion {
-                StreamingParagraphText(text: revealed, inline: inline)
-            } else {
-                pacer.paragraphText(revealed, inline: inline, now: now)
-            }
-        } else {
-            StreamingParagraphText(text: " ")
-        }
-    }
-}
-
-/// The paced reveal's clock. Lives in `PacedStreamingText`'s state, is read and advanced only inside its timeline, and is never observed. 80 words/s
-/// over a ~50-character buffer balances smooth reveal and catch-up; cap at two words per frame.
+/// The paced reveal's clock. 80 words/s over a ~50-character buffer balances smooth reveal and catch-up; cap at two words per frame.
 @available(macOS 15, iOS 18, *)
 @MainActor
 public final class ChatStreamPacer {
@@ -307,86 +232,14 @@ public final class ChatStreamPacer {
     private var budget = 0.0
     private var lastTick: TimeInterval?
     private var waitingAtLastTick = false
-    private var source = ""
-    private var completedParagraphs: [Range<Int>] = []
-    private var completedStyles: [Bool] = []
-    private var paragraphStart = 0
-    private var inFence = false
-    fileprivate var preparedView: StreamingParagraphText?
-    private var preparedBytes = -1
 
     public init() {}
-
-    fileprivate func setSource(_ text: String) {
-        guard source != text else { return }
-        if !text.hasPrefix(source) {
-            completedParagraphs = []
-            completedStyles = []
-            paragraphStart = 0
-            inFence = false
-            preparedView = nil
-            preparedBytes = -1
-            resetReveal()
-        }
-        source = text
-    }
-
-    fileprivate func resetReveal() {
-        shown = -1
-        lastTick = nil
-        fades = []
-        budget = 0
-        preparedBytes = -1
-    }
-
-    fileprivate func paragraphText(_ revealed: Substring, inline: ChatInlineMarkdown?, now: TimeInterval) -> StreamingParagraphText {
-        let bytes = revealed.utf8.count
-        if bytes != preparedBytes || (preparedView?.inline == nil) != (inline == nil) {
-            let start = revealed.utf8.index(revealed.utf8.startIndex, offsetBy: paragraphStart)
-            let tail = StreamingParagraphText.paragraphs(revealed[start...])
-            var styles: [Bool] = []
-            var fenced = inFence
-            for (index, paragraph) in tail.enumerated() {
-                let fences = paragraph.contains("```") ? paragraph.components(separatedBy: "```").count - 1 : 0
-                styles.append(inline != nil && !fenced && fences == 0)
-                if fences % 2 == 1 { fenced.toggle() }
-                if index < tail.count - 1 { inFence = fenced }
-            }
-            var view = StreamingParagraphText(text: revealed, fades: fades, inline: inline)
-            let utf8 = revealed.utf8
-            view.projectedParagraphs = completedParagraphs.map {
-                revealed[utf8.index(utf8.startIndex, offsetBy: $0.lowerBound)..<utf8.index(utf8.startIndex, offsetBy: $0.upperBound)]
-            } + tail
-            view.projectedStyles = completedStyles + styles
-            if let edge = tail.last {
-                view.preparedEdge = StreamingParagraphText.paragraph(edge, fades: fades,
-                    inline: styles.last == true ? inline : nil, atEdge: true)
-                if tail.count > 1 {
-                    completedParagraphs.append(contentsOf: tail.dropLast().map {
-                        utf8.distance(from: utf8.startIndex, to: $0.startIndex)..<utf8.distance(from: utf8.startIndex, to: $0.endIndex)
-                    })
-                    completedStyles.append(contentsOf: styles.dropLast())
-                    paragraphStart = revealed.utf8.distance(from: revealed.utf8.startIndex, to: edge.startIndex)
-                }
-            }
-            preparedView = view
-            preparedBytes = bytes
-        }
-        var view = preparedView ?? StreamingParagraphText(text: revealed, inline: inline)
-        view.now = now
-        return view
-    }
 
     static func multiplier(backlog: Int) -> Double {
         let buffered = Double(backlog)
         if buffered < 37.5 { return 0.9 }
         if buffered <= 75 { return 1 }
         return min(2, 1 + 0.75 * (buffered - 75) / 75)
-    }
-
-    /// Caught up, and the last words have finished fading in.
-    func isResting(_ text: String) -> Bool {
-        shown == text.utf8.count && fades.isEmpty
     }
 
     /// Reveals what is due at `now` and returns the revealed UTF-8 length, always on a scalar boundary.
@@ -484,30 +337,4 @@ struct ChatEdgeFadeRenderer: TextRenderer, Equatable {
             }
         }
     }
-}
-
-/// Overlays crossfading phases and takes the size of the one tagged `current`.
-public struct ChatCrossfadeStack: Layout {
-    public var current: Int
-
-    public init(current: Int) {
-        self.current = current
-    }
-
-    public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let shown = subviews.last { $0[ChatCrossfadePhase.self] == current } ?? subviews.last
-        return shown?.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil)) ?? .zero
-    }
-
-    public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        // The parent's width, not the incoming phase's: an outgoing reply keeps wrapping where it did while it fades.
-        let width = ProposedViewSize(width: proposal.width ?? bounds.width, height: nil)
-        for subview in subviews {
-            subview.place(at: bounds.origin, anchor: .topLeading, proposal: width)
-        }
-    }
-}
-
-public struct ChatCrossfadePhase: LayoutValueKey {
-    public static let defaultValue = -1
 }

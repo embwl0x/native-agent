@@ -31,6 +31,8 @@ extension OwnedProgramRunner {
         /// Positive evidence from the notebook owner's committed-write boundary, including writes outside the call ledger.
         var notebookChanged = false
         var notebookChangeKnown = true
+        private var notebookEffect: ToolFailureError.Effects = .none
+        private var lastNotebookWrite: (at: Int, value: JSONValue?)?
         var stopped: [String: JSONValue]?
         /// An ordinary script's refused calls by number: each throws to the code, and becomes the stop only if the script ends on it uncaught.
         var refusals: [Int: [String: JSONValue]] = [:]
@@ -57,7 +59,7 @@ extension OwnedProgramRunner {
         var newest: [String: String] = [:]
         var seen: Set<String> = []
         var stale: [String: JSONValue]?
-        /// Replay reads superseded by the run's own writes only while its last write's page_version still matches.
+        /// Replay superseded reads only while the later write's version still verifies the scope originally read.
         let ownWrites: [(at: Int, page: String, item: String?, version: String?)]
         var isCancelled: Bool { Task.isCancelled }
         init(source: String, preview: Bool, program: OwnedProgram, replay: Replay?,
@@ -76,14 +78,31 @@ extension OwnedProgramRunner {
             do { ownWrites = try (replay?.journal ?? []).enumerated().compactMap { at, entry in
                 // A caught failure still counts as a write if it landed or may have landed.
                 guard let target = try OwnedProgramRunner.target(entry, host: host), target.write, case .object(let fields) = entry,
-                      case .object(let row)? = fields["row"],
-                      ["ok", "unconfirmed"].contains(row["status"]?.scalarText ?? "")
-                          || ["occurred", "partial", "unknown"].contains(row["effects"]?.scalarText ?? "") else { return nil }
+                      case .object(let row)? = fields["row"] else { return nil }
+                let wrote = if let effects = row["effects"]?.stringValue { ["occurred", "partial", "unknown"].contains(effects) }
+                    else { ["ok", "unconfirmed"].contains(row["status"]?.scalarText ?? "") }
+                guard wrote else { return nil }
                 let out = fields["out"]?.scalarText.map(OwnedProgramRunner.readValue)
                 let version: String? = if case .object(let value)? = out { value["page_version"]?.scalarText } else { nil }
                 return (at, target.page, target.item, version)
             } } catch { resolutionFailure = error }
             self.ownWrites = ownWrites
+            for (at, entry) in self.replay.enumerated() {
+                guard let fields = entry.objectValue, let call = fields["call"]?.arrayValue, call.count == 4,
+                      call[0] == .string("state"), call[1] == .string("set"), let args = call[2].stringValue,
+                      let values = (try? JSONValue.parse(Data(args.utf8)))?.arrayValue, values.count == 1,
+                      let out = fields["out"]?.stringValue else { continue }
+                // Older checkpoints know the acknowledged value of a set, but didn't record whether it changed disk.
+                let effects = fields["notebook_effects"]?.stringValue ?? "unknown"
+                if effects == "occurred" { notebookChanged = true }
+                if effects == "unknown" { notebookChangeKnown = false }
+                let reply = try? JSONValue.parse(Data(out.utf8))
+                if reply?.objectValue?["ok"] == .bool(true) {
+                    lastNotebookWrite = (at, values[0])
+                } else if effects != "none" {
+                    lastNotebookWrite = (at, nil)
+                }
+            }
             if let resolutionFailure {
                 stopped = ["reason": .string("action_catalog_unavailable"), "detail": .string(resolutionFailure.localizedDescription)]
             }
@@ -160,6 +179,12 @@ extension OwnedProgramRunner {
                                 "origin": .string("javascript")] }
             }
             returned = fields["returned"] ?? .null
+            if stopped == nil, error == nil, !timedOut, replayed < replay.count {
+                stopped = ["reason": .string("diverged"), "detail": .string(
+                    "This resumed run returned after matching \(replayed) of \(replay.count) saved calls. "
+                    + "It did not use your answer. Read the recorded effects before deciding what remains.")]
+                returned = .null
+            }
             if strict, stopped == nil, !timedOut, let code = expectFail {
                 stopped = ["reason": .string("expected_failure_not_seen"),
                            "detail": .string("app.expect_fail(\"\(code)\") was never closed, so nothing failed as declared.")]
@@ -215,9 +240,11 @@ extension OwnedProgramRunner {
             guard replayed < replay.count else {
                 let rows = ledger.count
                 let out = await dispatch(kind: kind, id: id, args: args, line: line)
-                retain(.object(["call": signature, "out": .string(out),
-                                        "row": ledger.count > rows ? ledger[ledger.count - 1] : .null,
-                                        "read_content": readContent, "read_projections": readProjections]))
+                var entry: [String: JSONValue] = ["call": signature, "out": .string(out),
+                    "row": ledger.count > rows ? ledger[ledger.count - 1] : .null,
+                    "read_content": readContent, "read_projections": readProjections]
+                if kind == "state", id == "set" { entry["notebook_effects"] = .string(notebookEffect.rawValue) }
+                retain(.object(entry))
                 return out
             }
             let n = ledger.count + 1
@@ -264,10 +291,29 @@ extension OwnedProgramRunner {
                     fields["status"] = .string("answered")
                     row = .object(fields)
                 }
-            } else if reread, let mine = try writtenLater(replay[replayed - 1], at: replayed - 1) {
-                // An own-write superseded read can replay only if the last such write still matches; later changes belong to another actor.
-                if let left = mine.version, let now = await currentVersion(left), now != left {
-                    return changed("read " + OwnedProgramRunner.versionScope(left), was: .string(left), now: .string(now))
+            } else if recheckReads, kind == "state", id == "get" {
+                let now = await dispatch(kind: kind, id: id, args: args, line: line)
+                let observed = (try? JSONValue.parse(Data(now.utf8)))?.objectValue?["value"]
+                let expected: JSONValue?
+                if let later = lastNotebookWrite, later.at >= replayed {
+                    expected = later.value
+                } else {
+                    expected = (try? JSONValue.parse(Data(out.utf8)))?.objectValue?["value"]
+                }
+                guard stopped == nil, observed != nil, expected == observed else {
+                    return changed("ability notebook",
+                        was: expected.flatMap { try? CallLedger.measured($0) }.map(JSONValue.object) ?? .null,
+                        now: observed.flatMap { try? CallLedger.measured($0) }.map(JSONValue.object) ?? .null)
+                }
+            } else if reread, let mine = try writtenLater(.object(entry), at: replayed - 1) {
+                let readVersion = OwnedProgramRunner.readValue(out).objectValue?["version"]?.stringValue
+                // An item's version cannot verify the siblings included in a whole-page read.
+                let now: String? = if let readVersion, let left = mine.version,
+                    OwnedProgramRunner.versionScope(readVersion) == OwnedProgramRunner.versionScope(left) {
+                    await currentVersion(left)
+                } else { nil }
+                if mine.version == nil || now != mine.version {
+                    return changed("read " + mine.page, was: mine.version.map(JSONValue.string) ?? .null, now: now.map(JSONValue.string) ?? .null)
                 }
             } else if reread {
                 // Authoritative reads must still match; advisory answers replay as saved.
@@ -297,9 +343,11 @@ extension OwnedProgramRunner {
                 }
             }
             replayContent.include(entry["read_projections"] ?? .null)
-            retain(.object(["call": signature, "out": .string(out), "row": row,
-                                    "read_content": entry["read_content"] ?? .null,
-                                    "read_projections": entry["read_projections"] ?? .array([])]))
+            var recorded = entry
+            recorded["call"] = signature
+            recorded["out"] = .string(out)
+            recorded["row"] = row
+            retain(.object(recorded))
             return out
             } catch {
                 let detail = """
@@ -384,6 +432,7 @@ extension OwnedProgramRunner {
         func dispatch(kind: String, id: String, args: String, line: Int) async -> String {
             readContent = .null
             readProjections = .array([])
+            notebookEffect = .none
             unjournaled = kind == "primitive" && host.primitiveAction(id)?.journaled == false
             if part, ledgerBytes >= 4 * 1024 * 1024 {
                 stopped = ["reason": .string("output_limit"), "detail": .string("The run's receipt ledger reached 4 MiB; no further call ran.")]
@@ -396,113 +445,75 @@ extension OwnedProgramRunner {
             guard case .array(let given)? = try? JSONValue.parse(Data(args.utf8)) else {
                 return encode(["ok": .bool(false), "reason": .string("invalid_args"), "stopped": .bool(true)], line: line, n: n)
             }
-            let named: [String: JSONValue] = if case .object(let named)? = given.first { named } else { [:] }
-            func answer(_ fields: [String: JSONValue]) -> String { encode(fields, line: line, n: n) }
+            let job = DispatchedCall(journal: self, kind: kind, id: id, line: line, n: n, given: given, row: row)
+            // Close expect_fail after Stop too, so the script can rethrow its call's failure.
+            if strict, kind == "expect_fail_end" { return closeExpectFail(job) }
+            if let stopped {
+                refusedAfterStop += 1
+                let at = stopped["line"]?.scalarText ?? "?"
+                return job.refuse("stopped", "The script stopped at line \(at); no app call runs after that.", stop: true)
+            }
+            let registeredAction: OwnedProgramAction?
+            do { registeredAction = kind == "action" ? try host.action(id) : nil }
+            catch { return job.mark("action_catalog_unavailable", """
+                The action catalog could not be read: \(error.localizedDescription). Repair its source before running this call.
+                """) }
+            if kind == "state" { return notebook(job, args: args) }
+            if strict, ["step", "expect", "expect_fail", "decide"].contains(kind) { return await strictVerb(job) }
+            if let refusal = admitCall(job) { return refusal }
+            if let refusal = prepareInput(job, registeredAction: registeredAction) { return refusal }
+            return await perform(job, registeredAction: registeredAction)
+        }
+
+        /// One dispatched call: its number and line, its arguments, and the ledger row it grows; every answer is stamped with both.
+        final class DispatchedCall {
+            let journal: Journal
+            let kind: String
+            let id: String
+            let line: Int
+            let n: Int
+            let given: [JSONValue]
+            let named: [String: JSONValue]
+            var row: [String: JSONValue]
+            /// The failure code an open app.expect_fail declared, when this is its one call.
+            var expected: String?
+            var input: [String: JSONValue] = [:]
+            var name = ""
+
+            init(journal: Journal, kind: String, id: String, line: Int, n: Int, given: [JSONValue], row: [String: JSONValue]) {
+                self.journal = journal
+                self.kind = kind
+                self.id = id
+                self.line = line
+                self.n = n
+                self.given = given
+                let named: [String: JSONValue] = if case .object(let named)? = given.first { named } else { [:] }
+                self.named = named
+                self.row = row
+            }
+
+            func answer(_ fields: [String: JSONValue]) -> String { journal.encode(fields, line: line, n: n) }
             func refuse(_ reason: String, _ detail: String, stop: Bool) -> String {
                 answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail), "stopped": .bool(stop)])
             }
             func mark(_ reason: String, _ detail: String) -> String {
-                stopped = ["line": .int(Int64(line)), "source": sourceLine(line), "reason": .string(reason), "detail": .string(detail)]
+                journal.stopped = ["line": .int(Int64(line)), "source": journal.sourceLine(line), "reason": .string(reason), "detail": .string(detail)]
                 return refuse(reason, detail, stop: true)
-            }
-            // Close expect_fail after Stop too, so the script can rethrow its call's failure.
-            if strict, kind == "expect_fail_end" {
-                defer { expectFail = nil }
-                guard stopped == nil, let code = expectFail else { return answer(["ok": .bool(true), "value": .null]) }
-                if given.first == .bool(true) {
-                    return mark("expect_fail_async", "app.expect_fail(\"\(code)\") was given an async function; it takes one plain call.")
-                }
-                guard expectFailMatched else {
-                    return mark("expected_failure_not_seen", "app.expect_fail(\"\(code)\") saw no call fail with \(code)"
-                        + (expectFailOther.map { "; it failed with \($0)." } ?? "."))
-                }
-                return answer(["ok": .bool(true), "value": .null])
-            }
-            if let stopped {
-                refusedAfterStop += 1
-                let at = stopped["line"]?.scalarText ?? "?"
-                return refuse("stopped", "The script stopped at line \(at); no app call runs after that.", stop: true)
-            }
-            let registeredAction: OwnedProgramAction?
-            do { registeredAction = kind == "action" ? try host.action(id) : nil }
-            catch { return mark("action_catalog_unavailable", """
-                The action catalog could not be read: \(error.localizedDescription). Repair its source before running this call.
-                """) }
-            if kind == "state" {
-                if programEntry == .face { return refuse("projection_only", "A face reads only its frozen sources, never a notebook.", stop: true) }
-                guard case .array(let values)? = try? JSONValue.parse(Data(args.utf8)),
-                      id == "get" && values.isEmpty || id == "set" && values.count == 1 else {
-                    notebookChangeKnown = false
-                    return refuse("bad_state", "Use host.state.get() or host.state.set(value).", stop: false)
-                }
-                do {
-                    let value = try AbilityStore.notebook(dataRoot: notebookRoot, id: partID,
-                        setting: id == "set", value: values.first ?? .null,
-                        writing: { self.notebookChanged = true }, failure: { SenseFailure(code: $0, message: $1) })
-                    return answer(["ok": .bool(true), "value": value])
-                } catch {
-                    // A failed durable write may already have renamed the file. Even a caught notebook error cannot certify no change.
-                    notebookChangeKnown = false
-                    return refuse("bad_state", error.localizedDescription, stop: false)
-                }
             }
             func halt(_ reason: String, _ detail: String, call name: String) -> String {
                 row["call"] = .string(name)
                 row["status"] = .string("not_run")
                 row["reason"] = .string(reason)
-                append(.object(row))
-                stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
+                journal.append(.object(row))
+                journal.stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": journal.sourceLine(line), "call": .string(name),
                            "reason": .string(reason), "detail": .string(detail)]
                 return refuse(reason, detail, stop: true)
             }
-            if strict, ["step", "expect", "expect_fail", "decide"].contains(kind) {
-                func text(_ i: Int) -> String { given.indices.contains(i) ? given[i].scalarText ?? "" : "" }
-                switch kind {
-                case "step":
-                    guard steps.count < OwnedProgramRunner.stepLimit else {
-                        return mark("step_limit", "A run declares at most \(OwnedProgramRunner.stepLimit) steps.")
-                    }
-                    steps.append((String(text(0).prefix(160)), String(text(1).prefix(400))))
-                    if given.count > 2, case .object(let options) = given[2], case .int(let of)? = options["of"], of > 0 {
-                        stepTotal = Int(of)
-                    }
-                case "expect" where given.first != .bool(true):
-                    return mark("expect_failed", "Expected: \(text(1).prefix(400)). It was not so.")
-                case "expect_fail":
-                    guard expectFail == nil else {
-                        return mark("expect_fail_nested", "app.expect_fail can't be nested; each one wraps one call.")
-                    }
-                    expectFail = text(0); expectFailSeen = false; expectFailMatched = false; expectFailOther = nil
-                case "decide":
-                    let data = given.count > 1 ? given[1] : .null
-                    do {
-                        if let value = try await host.decide(text(0), data: data, execution: execution) {
-                            row["call"] = .string("app.decide")
-                            row["status"] = .string("answered")
-                            row["effects"] = .string("none")
-                            append(.object(row))
-                            return answer(["ok": .bool(true), "value": value])
-                        }
-                    } catch { return mark("fixture_mismatch", error.localizedDescription) }
-                    let bytes = (try? data.serialize(pretty: false)) ?? ""
-                    decideData = bytes.utf8.count <= OwnedProgramRunner.logLimit ? data : .string(String(bytes.prefix(OwnedProgramRunner.logLimit)))
-                    return mark("decide", String(text(0).prefix(400)))
-                default: break
-                }
-                return answer(["ok": .bool(true), "value": .null])
-            }
-            // An expect_fail wraps exactly one call; a second call must not execute.
-            if expectFail != nil, expectFailSeen {
-                return halt("expect_fail_one_call", "app.expect_fail wraps one app call; this second one did not run.",
-                            call: kind == "action" ? id : kind)
-            }
-            let expected = expectFail
-            if expected != nil { expectFailSeen = true }
             /// Action failures remain catchable AppErrors; only script failure, an explicit script stop or turn cancellation ends the run. Preserve every
             /// call's effects.
             func failed(_ reason: String) {
                 guard expected != nil else { return }
-                if reason == expected { row["expected"] = .bool(true); expectFailMatched = true } else { expectFailOther = reason }
+                if reason == expected { row["expected"] = .bool(true); journal.expectFailMatched = true } else { journal.expectFailOther = reason }
             }
             /// Pre-dispatch refusal proves no effect occurred.
             func refused(_ reason: String, _ detail: String, call name: String, tryInstead: JSONValue? = nil) -> String {
@@ -513,17 +524,17 @@ extension OwnedProgramRunner {
                 row["effects"] = .string("none")
                 row["try_instead"] = tryInstead
                 failed(reason)
-                append(.object(row))
+                journal.append(.object(row))
                 var reply: [String: JSONValue] = ["ok": .bool(false), "reason": .string(reason), "detail": .string(detail),
                     "stopped": .bool(false), "effects": .string("none"), "call": .string(name)]
                 reply["try_instead"] = tryInstead
                 return answer(reply)
             }
             func stopCall(_ reason: String, _ detail: String, call name: String, receipt: JSONValue?) -> String {
-                stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
+                journal.stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": journal.sourceLine(line), "call": .string(name),
                            "reason": .string(reason), "detail": .string(detail)]
                 if case .object(let fields)? = receipt {
-                    for key in ["try_instead", "remedy", "argument_path"] { stopped?[key] = fields[key] }
+                    for key in ["try_instead", "remedy", "argument_path"] { journal.stopped?[key] = fields[key] }
                 }
                 var fields: [String: JSONValue] = ["ok": .bool(false), "reason": .string(reason), "detail": .string(detail),
                                                    "stopped": .bool(true), "call": .string(name), "effects": row["effects"] ?? .string("none")]
@@ -535,39 +546,132 @@ extension OwnedProgramRunner {
                 stopCall("expected_failure_succeeded", "This call was declared to fail with \(code) (app.expect_fail), "
                     + "but it answered without failing; the run stopped.", call: row["call"]?.scalarText ?? kind, receipt: receipt)
             }
-            if isCancelled {
-                return halt("cancelled", "The turn was stopped, so no app call runs from here.", call: kind == "action" ? id : kind)
+        }
+
+        /// The end of an app.expect_fail block: its one call must have failed with the declared code.
+        private func closeExpectFail(_ job: DispatchedCall) -> String {
+            let given = job.given
+            defer { expectFail = nil }
+            guard stopped == nil, let code = expectFail else { return job.answer(["ok": .bool(true), "value": .null]) }
+            if given.first == .bool(true) {
+                return job.mark("expect_fail_async", "app.expect_fail(\"\(code)\") was given an async function; it takes one plain call.")
             }
+            guard expectFailMatched else {
+                return job.mark("expected_failure_not_seen", "app.expect_fail(\"\(code)\") saw no call fail with \(code)"
+                    + (expectFailOther.map { "; it failed with \($0)." } ?? "."))
+            }
+            return job.answer(["ok": .bool(true), "value": .null])
+        }
+
+        /// host.state.get() and host.state.set(value): the part's own notebook, never a face's.
+        private func notebook(_ job: DispatchedCall, args: String) -> String {
+            let id = job.id
+            if programEntry == .face { return job.refuse("projection_only", "A face reads only its frozen sources, never a notebook.", stop: true) }
+            guard case .array(let values)? = try? JSONValue.parse(Data(args.utf8)),
+                  id == "get" && values.isEmpty || id == "set" && values.count == 1 else {
+                return job.refuse("bad_state", "Use host.state.get() or host.state.set(value).", stop: false)
+            }
+            do {
+                let value = try AbilityStore.notebook(dataRoot: notebookRoot, id: partID,
+                    setting: id == "set", value: values.first ?? .null,
+                    writing: { self.notebookChanged = true; self.notebookEffect = .occurred },
+                    writeUncertain: { self.notebookChangeKnown = false; self.notebookEffect = .unknown },
+                    failure: { SenseFailure(code: $0, message: $1) })
+                return job.answer(["ok": .bool(true), "value": value])
+            } catch {
+                return job.refuse("bad_state", error.localizedDescription, stop: false)
+            }
+        }
+
+        /// A strict run's own verbs: step, expect, expect_fail's opening and decide.
+        private func strictVerb(_ job: DispatchedCall) async -> String {
+            let kind = job.kind, given = job.given
+            func text(_ i: Int) -> String { given.indices.contains(i) ? given[i].scalarText ?? "" : "" }
+            switch kind {
+            case "step":
+                guard steps.count < OwnedProgramRunner.stepLimit else {
+                    return job.mark("step_limit", "A run declares at most \(OwnedProgramRunner.stepLimit) steps.")
+                }
+                steps.append((String(text(0).prefix(160)), String(text(1).prefix(400))))
+                if given.count > 2, case .object(let options) = given[2], case .int(let of)? = options["of"], of > 0 {
+                    stepTotal = Int(of)
+                }
+            case "expect" where given.first != .bool(true):
+                return job.mark("expect_failed", "Expected: \(text(1).prefix(400)). It was not so.")
+            case "expect_fail":
+                guard expectFail == nil else {
+                    return job.mark("expect_fail_nested", "app.expect_fail can't be nested; each one wraps one call.")
+                }
+                expectFail = text(0); expectFailSeen = false; expectFailMatched = false; expectFailOther = nil
+            case "decide":
+                let data = given.count > 1 ? given[1] : .null
+                do {
+                    if let value = try await host.decide(text(0), data: data, execution: execution) {
+                        job.row["call"] = .string("app.decide")
+                        job.row["status"] = .string("answered")
+                        job.row["effects"] = .string("none")
+                        append(.object(job.row))
+                        return job.answer(["ok": .bool(true), "value": value])
+                    }
+                } catch { return job.mark("fixture_mismatch", error.localizedDescription) }
+                let bytes = (try? data.serialize(pretty: false)) ?? ""
+                decideData = bytes.utf8.count <= OwnedProgramRunner.logLimit ? data : .string(String(bytes.prefix(OwnedProgramRunner.logLimit)))
+                return job.mark("decide", String(text(0).prefix(400)))
+            default: break
+            }
+            return job.answer(["ok": .bool(true), "value": .null])
+        }
+
+        /// An open expect_fail admits one call; a stopped turn admits none.
+        private func admitCall(_ job: DispatchedCall) -> String? {
+            let kind = job.kind, id = job.id
+            // An expect_fail wraps exactly one call; a second call must not execute.
+            if expectFail != nil, expectFailSeen {
+                return job.halt("expect_fail_one_call", "app.expect_fail wraps one app call; this second one did not run.",
+                            call: kind == "action" ? id : kind)
+            }
+            let expected = expectFail
+            job.expected = expected
+            if expected != nil { expectFailSeen = true }
+            if isCancelled {
+                return job.halt("cancelled", "The turn was stopped, so no app call runs from here.", call: kind == "action" ? id : kind)
+            }
+            return nil
+        }
+
+        /// The door input and call name: a primitive's, an action's (with its own read version on strict writes), or a read's.
+        private func prepareInput(_ job: DispatchedCall, registeredAction: OwnedProgramAction?) -> String? {
+            let kind = job.kind, id = job.id, given = job.given
             var input: [String: JSONValue]
             let name: String
             switch kind {
             case "primitive":
                 name = id
                 guard given.count <= 1 else {
-                    return refused("invalid_args", "\(id) takes one named-argument object; nothing ran.", call: name)
+                    return job.refused("invalid_args", "\(id) takes one named-argument object; nothing ran.", call: name)
                 }
                 guard part || actions < OwnedProgramRunner.actionLimit else {
-                    return halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
+                    return job.halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
                 }
                 actions += 1
                 input = [:]
             case "action":
                 name = id
                 guard part || actions < OwnedProgramRunner.actionLimit else {
-                    return halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
+                    return job.halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
                 }
                 switch host.doorInput(id: id, given: given) {
                 case .success(let built):
                     input = built
                     if !host.scriptKey.isEmpty { input[host.scriptKey] = .bool(true) }
-                case .failure(let problem): return refused(problem.reason, problem.detail, call: name, tryInstead: problem.tryInstead)
+                case .failure(let problem): return job.refused(problem.reason, problem.detail, call: name, tryInstead: problem.tryInstead)
                 }
                 // Strict writes must use the version of the page this run read.
                 let callArgs: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
                 if strict, let action = registeredAction, action.versioned, !action.readOnly(callArgs) {
                     if case .string(let given)? = input["expected_version"], !given.isEmpty {
                         guard seen.contains(given) else {
-                            return refused("not_own_version", """
+                            return job.refused("not_own_version", """
                                 \(id) passed a version this run never read; an ability's write goes on its own read's version. It was not run.
                                 """, call: name)
                         }
@@ -576,17 +680,17 @@ extension OwnedProgramRunner {
                 actions += 1
                 if preview { input["preview"] = .bool(true) }
             default:
-                row["read_only"] = .bool(true)
-                row["effects"] = .string("none")
+                job.row["read_only"] = .bool(true)
+                job.row["effects"] = .string("none")
                 let words = given.compactMap(\.scalarText)
                 name = kind == "find" ? "find " + (words.first ?? "") : "read " + words.joined(separator: "/")
                 if kind == "read", given.count > 2 {
-                    row["argument_path"] = .string("app.read.arguments[2]")
-                    return refused("invalid_args", "app.read takes page and optional item, not extra arguments. Use app.<action>({args}) "
+                    job.row["argument_path"] = .string("app.read.arguments[2]")
+                    return job.refused("invalid_args", "app.read takes page and optional item, not extra arguments. Use app.<action>({args}) "
                         + "to select a target. Nothing was read.", call: name)
                 }
                 guard part || reads < OwnedProgramRunner.readLimit else {
-                    return halt("read_limit", "A script does at most \(OwnedProgramRunner.readLimit) reads.", call: name)
+                    return job.halt("read_limit", "A script does at most \(OwnedProgramRunner.readLimit) reads.", call: name)
                 }
                 reads += 1
                 input = kind == "find" ? ["find": given.first ?? .null] : ["page": given.first ?? .null]
@@ -594,16 +698,25 @@ extension OwnedProgramRunner {
                 // Home items can have effects, so scripts may read home but cannot open its items; the door rechecks page classification.
                 input[host.scriptKey] = .bool(true)
                 if host.opensHomeItem(input) {
-                    return refused("action_required", "A home item can send or change something, so a script never opens one. "
+                    return job.refused("action_required", "A home item can send or change something, so a script never opens one. "
                         + "Read home with app.read(\"home\") and open the item yourself.", call: name)
                 }
             }
-            row["call"] = .string(name)
+            job.input = input
+            job.name = name
+            return nil
+        }
+
+        /// Runs the call once, classifies its receipt, journals its row and answers the script.
+        private func perform(_ job: DispatchedCall, registeredAction: OwnedProgramAction?) async -> String {
+            let kind = job.kind, id = job.id, line = job.line, n = job.n, given = job.given, named = job.named
+            let input = job.input, name = job.name, expected = job.expected
+            job.row["call"] = .string(name)
             let arguments = if case .object(let args)? = input["args"] { args } else { named }
             let write = kind == "primitive" ? host.primitiveAction(id)?.readOnly(named) != true
                 : kind == "action" && registeredAction?.readOnly(arguments) != true
             // read_only classifies possible behavior and replay policy; effects records what actually happened.
-            row["read_only"] = .bool(!write)
+            job.row["read_only"] = .bool(!write)
             let readContent = ReadContent()
             var callExecution = execution
             callExecution.readContent = readContent
@@ -619,7 +732,7 @@ extension OwnedProgramRunner {
             let envelope: JSONValue = if kind == "primitive", case .object(let fields) = receipt {
                 .object(fields.filter { $0.key != "result" })
             } else { receipt }
-            if case .object(let fields) = envelope { row["effects"] = OwnedProgramRunner.effects(fields) }
+            if case .object(let fields) = envelope { job.row["effects"] = OwnedProgramRunner.effects(fields) }
             var readIdentityFailure: String?
             if strict, !write {
                 do {
@@ -636,7 +749,8 @@ extension OwnedProgramRunner {
             }
             // Primitive result payloads are data; classify outcomes and effects only from the broker envelope.
             let receipted = if case .object(let fields) = receipt {
-                fields["status"]?.scalarText != nil && ["none", "occurred", "partial", "unknown"].contains(text(fields["effects"]))
+                fields["status"]?.scalarText != nil
+                    && ["none", "occurred", "partial", "unknown"].contains(JSONValue.trimmedScalarTextOrEmpty(fields["effects"]))
                     && (!host.evidence(envelope).successful || fields["result"] != nil)
             } else { false }
             let (outcome, reason, detail): (Outcome, String, String)
@@ -651,17 +765,17 @@ extension OwnedProgramRunner {
                 guard kind == "action" || kind == "primitive", case .object(var fields) = host.answer(receipt) else { return receipt }
                 if kind == "primitive" { return fields["result"] ?? .null }
                 fields["call"] = .string(name)
-                fields["effects"] = row["effects"] ?? .string(write ? "occurred" : "none")
+                fields["effects"] = job.row["effects"] ?? .string(write ? "occurred" : "none")
                 return .object(fields)
             }
             // The raw result stays in this call's private journal entry (`out`); its row keeps the result's measured identity only.
-            do { row.merge(try CallLedger.measured(receipt)) { _, new in new } }
+            do { job.row.merge(try CallLedger.measured(receipt)) { _, new in new } }
             catch {
-                row["result_bytes"] = .null
+                job.row["result_bytes"] = .null
                 if part { unserializable(error) }
             }
-            if kind == "action" || kind == "primitive" { record(receipt, envelope: envelope, into: &row) } else if case .object(let read) = receipt {
-                if let version = read["version"] { row["version"] = version }
+            if kind == "action" || kind == "primitive" { record(receipt, envelope: envelope, into: &job.row) } else if case .object(let read) = receipt {
+                if let version = read["version"] { job.row["version"] = version }
             }
             if strict, case .object(let fields) = receipt {
                 if kind == "read", case .string(let version)? = fields["version"] { own(version) }
@@ -678,44 +792,44 @@ extension OwnedProgramRunner {
             }
             switch outcome {
             case .ok, .preview:
-                row["status"] = .string(row["captured"] == .bool(true) ? "captured" : outcome == .ok ? "ok" : "preview")
-                append(.object(row))
-                if outcome == .ok, let code = expected { return unexpected(code, receipt) }
-                return answer(["ok": .bool(true), "value": hand(receipt)])
+                job.row["status"] = .string(job.row["captured"] == .bool(true) ? "captured" : outcome == .ok ? "ok" : "preview")
+                append(.object(job.row))
+                if outcome == .ok, let code = expected { return job.unexpected(code, receipt) }
+                return job.answer(["ok": .bool(true), "value": hand(receipt)])
             case .failed:
-                row["status"] = .string("failed")
-                row["reason"] = .string(reason)
-                if !detail.isEmpty { row["detail"] = .string(detail) }
+                job.row["status"] = .string("failed")
+                job.row["reason"] = .string(reason)
+                if !detail.isEmpty { job.row["detail"] = .string(detail) }
                 // Match failures against their actual changes; previews must have none.
                 if strict, case .object(let fields) = envelope {
                     let effects = OwnedProgramRunner.effects(fields) ?? (fields["status"] == .string("preview") ? .string("none") : nil)
-                    if let effects { row["effects"] = effects }
+                    if let effects { job.row["effects"] = effects }
                 }
-                failed(reason)
-                append(.object(row))
-                return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
-                               "stopped": .bool(false), "receipt": receipt, "effects": row["effects"] ?? .string("unknown"),
+                job.failed(reason)
+                append(.object(job.row))
+                return job.answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
+                               "stopped": .bool(false), "receipt": receipt, "effects": job.row["effects"] ?? .string("unknown"),
                                "call": .string(name)])
             case .unclear:
                 // Unverified completion keeps the receipt for script judgment and records unknown write effects.
-                row["status"] = .string("unconfirmed")
-                row["reason"] = .string(reason)
-                row["detail"] = .string(detail)
-                if write, row["effects"] == nil { row["effects"] = .string("unknown") }
-                append(.object(row))
+                job.row["status"] = .string("unconfirmed")
+                job.row["reason"] = .string(reason)
+                job.row["detail"] = .string(detail)
+                if write, job.row["effects"] == nil { job.row["effects"] = .string("unknown") }
+                append(.object(job.row))
                 if let readIdentityFailure {
-                    return answer(["ok": .bool(false), "reason": .string("read_identity_unavailable"),
+                    return job.answer(["ok": .bool(false), "reason": .string("read_identity_unavailable"),
                         "detail": .string(readIdentityFailure), "stopped": .bool(true),
-                        "receipt": receipt, "effects": row["effects"] ?? .string("unknown"), "call": .string(name)])
+                        "receipt": receipt, "effects": job.row["effects"] ?? .string("unknown"), "call": .string(name)])
                 }
-                if let code = expected { return unexpected(code, receipt) }
-                return answer(["ok": .bool(true), "value": hand(receipt)])
+                if let code = expected { return job.unexpected(code, receipt) }
+                return job.answer(["ok": .bool(true), "value": hand(receipt)])
             case .stop:
                 let previewed = if case .object(let fields) = receipt { fields["status"] == .string("preview") } else { false }
-                row["status"] = .string(reason == "cancelled" ? "not_run" : previewed ? "preview" : "refused")
-                row["reason"] = .string(reason)
-                if !detail.isEmpty { row["detail"] = .string(detail) }
-                append(.object(row))
+                job.row["status"] = .string(reason == "cancelled" ? "not_run" : previewed ? "preview" : "refused")
+                job.row["reason"] = .string(reason)
+                if !detail.isEmpty { job.row["detail"] = .string(detail) }
+                append(.object(job.row))
                 var stop: [String: JSONValue] = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
                                                  "reason": .string(reason), "detail": .string(detail)]
                 if case .object(let fields) = receipt {
@@ -729,8 +843,8 @@ extension OwnedProgramRunner {
                     || said["status"] == .string("needs_glass")
                 let catchable = !strict && !preview && !previewed && !held && stopped == nil && reason != "cancelled"
                 if catchable { refusals[n] = stop } else { stopped = stop }
-                return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
-                               "stopped": .bool(!catchable), "receipt": receipt, "call": .string(name), "effects": row["effects"] ?? .string("none")])
+                return job.answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
+                               "stopped": .bool(!catchable), "receipt": receipt, "call": .string(name), "effects": job.row["effects"] ?? .string("none")])
             }
         }
         /// A nested call's row keeps its identity and outcome; its answer stays in the private journal entry, never in the row.
@@ -797,7 +911,7 @@ extension OwnedProgramRunner {
                 partial = partial || fields["effects"] == .string("partial")
                 guard let call = fields["call"]?.scalarText else { continue }
                 let ok = fields["status"] == .string("ok")
-                let took = ["occurred", "partial"].contains(text(fields["effects"]))
+                let took = ["occurred", "partial"].contains(JSONValue.trimmedScalarTextOrEmpty(fields["effects"]))
                 // Hand-back IDs do not require numbered source-line evidence.
                 if strict, ok || took, !call.hasPrefix("read "), !call.hasPrefix("find ") {
                     var item: [String: JSONValue] = ["n": fields["n"] ?? .null, "call": .string(call)]
@@ -819,6 +933,9 @@ extension OwnedProgramRunner {
             let withheld = preview && stopped == nil && !timedOut && error?["origin"] == .string("javascript")
                 && ledger.contains { $0.objectValue?["status"] == .string("preview") }
             let status = stopped != nil ? "stopped" : timedOut ? "timed_out" : error != nil && !withheld ? "error" : "ok"
+            let liveNotebook = !preview && !(host is OwnedProgramFixtures)
+            let notebookTook = liveNotebook && notebookChanged
+            let notebookUnknown = liveNotebook && !notebookChangeKnown
             var out: [String: JSONValue] = [
                 "status": .string(status),
                 // A nested call's not_run verdict cannot erase work already performed by its containing program.
@@ -852,8 +969,8 @@ extension OwnedProgramRunner {
                 out["error"] = .object(error)
                 if part, error["origin"] == .string("javascript") { out["detail"] = error["message"] }
             }
-            out["effects"] = .string(!unknown.isEmpty || !unsure.isEmpty ? "unknown" : partial ? "partial"
-                : changed.isEmpty ? "none" : "occurred")
+            out["effects"] = .string(notebookUnknown || !unknown.isEmpty || !unsure.isEmpty ? "unknown" : partial ? "partial"
+                : notebookTook || !changed.isEmpty ? "occurred" : "none")
             if !changed.isEmpty { out["changed"] = .array(changed) }
             // A stopped strict run's journal is what its checkpoint or rehearsal replays; it stays private and the receipt names it.
             if strict, status == "stopped" { out["journal_ref"] = .string(OwnedProgramRunner.journals.keep(journal)) }
@@ -887,14 +1004,14 @@ extension OwnedProgramRunner {
                 out["remedy"] = .object([
                     "kind": .string(users ? "drop_owners_line" : asked ? "decide"
                         : cardPreview ? "request_approval" : "read_ledger"),
-                    "instruction": .string(changed.isEmpty
+                    "instruction": .string(changed.isEmpty && !notebookTook && !notebookUnknown
                         ? (!unknown.isEmpty || !unsure.isEmpty ? check
                             : users ? nothing + drop : asked ? nothing + ask
                             : cardPreview ? cardInstruction : nothing + (at?["instruction"]?.scalarText
                                 ?? "Fix what stopped it, then run it again."))
-                        : "The calls in changed took effect; don't run them again. "
+                        : (changed.isEmpty ? "" : "The calls in changed took effect; don't run them again. ")
                             + (!unknown.isEmpty || !unsure.isEmpty ? check : users ? drop : asked ? ask
-                                : "Read the page, then do only what is left.")),
+                                : "Inspect the recorded effects, then do only what is left.")),
                     "next_call": .null,
                 ])
                 if let recovery = at?["remedy"], recovery != .null {
@@ -910,6 +1027,14 @@ extension OwnedProgramRunner {
                         nextCall: .object([
                             "tool": .string("app"),
                             "input": .object(["action": .string("ability.read"), "args": .object(["id": .string(partID)])])]))
+                }
+                if notebookUnknown || notebookTook, var remedy = out["remedy"]?.objectValue,
+                   let instruction = remedy["instruction"]?.stringValue {
+                    let evidence = notebookUnknown
+                        ? "A notebook write has an unconfirmed result. Check the ability's notebook before repeating a write. "
+                        : "The ability's notebook changed. Do not repeat its completed writes. "
+                    remedy["instruction"] = .string(evidence + instruction)
+                    out["remedy"] = .object(remedy)
                 }
                 if strict {
                     var back: [String: JSONValue] = ["reason": .string(code.isEmpty ? status : code), "landed": .array(handed)]

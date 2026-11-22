@@ -85,24 +85,23 @@ extension AgentScreen {
     static func coreProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         guard tool == "app", input["item"] == .string("doctor"), case .object(let read) = result,
               case .object(let row)? = read["item"], row["checks"] != nil else { return nil }
-        func text(_ value: JSONValue?) -> String? { if case .string(let s)? = value, !s.isEmpty { return s }; return nil }
-        let checks: [[String: JSONValue]] = { if case .array(let list)? = row["checks"] { return list.compactMap { if case .object(let o) = $0 { o } else { nil
-            } } }; return [] }()
-        let bad = checks.filter { text($0["status"]) != "ok" }
-        let overall = text(row["overall_status"]) ?? text(row["active_path_status"]) ?? text(row["status"]) ?? "unknown"
-        let items = (bad + checks.filter { text($0["status"]) == "ok" }).map { check in
+        let checks = JSONValue.objectArray(row["checks"])
+        let bad = checks.filter { $0["status"]?.nonemptyString != "ok" }
+        let overall = row["overall_status"]?.nonemptyString ?? row["active_path_status"]?.nonemptyString ?? row["status"]?.nonemptyString ?? "unknown"
+        let items = (bad + checks.filter { $0["status"]?.nonemptyString == "ok" }).map { check in
             var content = check
             content["summary"] = check["repair_face"] ?? check["detail"] ?? .null
             var actions: [AgentWorkspaceButton] = []
             if case .object(let remedy)? = check["remedy"],
-               case .object(let call)? = remedy["next_call"], let tool = text(call["tool"]),
+               case .object(let call)? = remedy["next_call"], let tool = call["tool"]?.nonemptyString,
                case .object(let input)? = call["input"] {
                 actions.append(.init(label: "Repair", action: .perform(tool: tool, input: input,
-                    title: text(check["title"]) ?? "Repair", textField: nil, isEffect: true)))
+                    title: check["title"]?.nonemptyString ?? "Repair", textField: nil, isEffect: true)))
             }
-            return AgentWorkspaceItem(title: (text(check["title"]) ?? text(check["id"]) ?? "Check") + " · " + (text(check["status"]) ?? "?")
-                                   + (text(check["owner"]).map { " · owner " + $0 } ?? ""),
-                               content: .object(content), actions: actions)
+            let title = check["title"]?.nonemptyString ?? check["id"]?.nonemptyString ?? "Check"
+            let status = check["status"]?.nonemptyString ?? "?"
+            let owner = check["owner"]?.nonemptyString.map { " · owner " + $0 } ?? ""
+            return AgentWorkspaceItem(title: title + " · " + status + owner, content: .object(content), actions: actions)
         }
         return .init(title: "Doctor", content: .object(["status": .string("ok"),
             "message": .string("Last report · Overall \(overall): \(checks.count - bad.count) of \(checks.count) checks ok.")]), items: items,

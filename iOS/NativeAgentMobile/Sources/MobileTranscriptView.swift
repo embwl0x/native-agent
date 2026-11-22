@@ -58,7 +58,7 @@ struct MobileTranscriptActions {
     var openExchange: @MainActor (OtherRoomExchange) -> Void = { _ in }
     /// Answer again reaches only the last reply, and only while the store can replace it.
     var canRegenerate = false
-    var regenerate: @MainActor () -> Void = {}
+    var regenerate: @MainActor (UUID, String) -> Void = { _, _ in }
     /// Read aloud is offered while spoken replies are on, the voice the phone already speaks replies in.
     var canReadAloud = false
     var isReading = false

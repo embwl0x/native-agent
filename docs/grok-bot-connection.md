@@ -116,6 +116,11 @@ its pending handover in one durable transition. A failed write leaves it
 claimable; an identical webhook replay keeps the saved handover intact.
 `GrokInboundReply` projects that saved answer onto the exact conversation
 exchange, repeating only this projection after a failed response or restart.
+Failed receipt restoration owes repair by file. Subsequent contact reconciliation
+retries those receipts while other receipts and contacts continue. Retention keeps
+receipts with open restoration debt, and a successful restoration settles that
+debt before the receipt can expire. If restoration debt is unreadable, retention
+logs the failure and keeps the receipts while new sends continue.
 If the agent's waiting turn, a read in the asking chat or the room already took the
 answer, it does not start a second turn; otherwise the answer is handed into the initiating
 chat with peer authorship. A person-initiated quiet send settles without waking
@@ -144,5 +149,5 @@ Release and development scripts still explicitly sign the helper
   pending requests, webhook delivery and reply-helper instructions.
 - `Modules/NativeAgentCore/Sources/Agents/GrokInboundReply.swift`: correlation
   and answer handoff.
-- `Sources/NativeAgentApp/GrokSecureSetupCard.swift`: secure credentials for the exact contact supplied by its Agents row.
+- `Sources/NativeAgentFace/GrokSecureSetupCard.swift`: secure credentials for the exact contact supplied by its Agents row.
 - `Sources/NativeAgentLink/NativeAgentLink.swift`: local reply command.

@@ -39,6 +39,13 @@ struct TranscriptDocumentView: View {
             }
         }
         .sheet(item: $model.dataMessage) { MessageJSONSheet(message: $0) }
+        .sheet(item: $model.revising) { revision in
+            TranscriptReviseSheet(revision: revision) { text in
+                guard let controller = model.controller else { throw WireFailure(code: "face_unavailable", message: "The transcript closed.",
+                    cause: nil, effects: .none) }
+                try await controller.sendRevision(revision, text: text)
+            }
+        }
         .sheet(isPresented: Binding(get: { model.openedContact != nil }, set: { if !$0 { model.openedContact = nil } })) {
             if let contact = model.openedContact {
                 SimpleContactThread(contactID: contact) { model.openedContact = nil }.frame(minWidth: 600, minHeight: 500)
@@ -103,6 +110,7 @@ final class TranscriptDocumentModel {
     /// Each feedback occurrence displays for 2.5 seconds.
     let toasts = ChatToastQueue(displayDuration: 2.5)
     var dataMessage: TranscriptMessageReference?
+    var revising: TranscriptRevision?
     var openedContact: String?
     var retryRequested = false
     @ObservationIgnored var retryMessage: String?
@@ -238,6 +246,50 @@ private struct TranscriptDocumentRepresentable: NSViewRepresentable {
 }
 
 /// A menu holds the identity and finished eligibility it draws; the body rechecks every act.
+/// Her message the user is revising, with the words the revision starts from.
+struct TranscriptRevision: Identifiable, Equatable {
+    var session: String
+    var id: String
+    var text: String
+}
+
+/// The user's revision: her words, editable; their version is sent as their message and both are kept.
+struct TranscriptReviseSheet: View {
+    let revision: TranscriptRevision
+    let send: (String) async throws -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var sending = false
+    @State private var failure: String?
+
+    var body: some View {
+        PageSheetHost(title: "Revise", onDone: { dismiss() }) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Change these words the way you'd have them. Your version is sent as your message, and both versions are kept.")
+                    .font(.callout).foregroundStyle(.secondary)
+                TextEditor(text: $text).font(.body).frame(minHeight: 220)
+                HStack {
+                    // A refused send keeps the sheet and the user's words; only acceptance closes it.
+                    if let failure { Text(failure).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
+                    Spacer()
+                    Button("Send revision") {
+                        sending = true; failure = nil
+                        Task {
+                            defer { sending = false }
+                            do { try await send(text); dismiss() } catch { failure = error.localizedDescription }
+                        }
+                    }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(sending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || text.trimmingCharacters(in: .whitespacesAndNewlines) == revision.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }.padding(16)
+        }
+        .frame(width: 560, height: 420)
+        .onAppear { text = revision.text }
+    }
+}
+
 struct TranscriptMessageReference: Identifiable, Equatable {
     var session: String
     var id: String

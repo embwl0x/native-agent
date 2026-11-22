@@ -1,7 +1,6 @@
 import AgentConversations
 import AuthoredCapabilities
 import Foundation
-import CryptoKit
 import ChatTurnRuntime
 import ChatSessionWork
 import ChatToolParsing
@@ -230,11 +229,7 @@ extension NativeAgentEngine {
     /// Derive stable UUIDs for non-UUID transcript ids so every phone snapshot names the same message.
     nonisolated static func phoneMessageID(_ id: String) -> String {
         if UUID(uuidString: id) != nil { return id }
-        var bytes = Array(SHA256.hash(data: Data(("nativeagent.message:" + id).utf8)).prefix(16))
-        bytes[6] = (bytes[6] & 0x0F) | 0x50  // name-based (v5 layout)
-        bytes[8] = (bytes[8] & 0x3F) | 0x80  // RFC 4122 variant
-        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15])).uuidString
+        return TranscriptMessageID.derived(id).uuidString
     }
 }
 
@@ -553,9 +548,6 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
 }
 
 public protocol EngineDeviceSyncPlatform: Sendable {
-    @MainActor func settingsHost() throws -> any QuietSettingsHost
-    @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { get }
-    @MainActor func adoptProvider(_ id: String) async
     @MainActor func runMacControl(path: String, bodyData: Data, turn: Turn, context: MacOperationContext) async throws -> JSONValue
 }
 
@@ -659,13 +651,13 @@ public struct EngineICloudIncomingTurnPort: ICloudIncomingTurnPort {
         let appModel = try presentation()
         let turns = engine.turns
         let sync = engine.deviceSync!
-        let runID = sync.engine.activeChatRunID(for: sessionID)
+        let runIDs = sync.engine.chatRunIDsForControlHandoff(for: sessionID)
         let activity = turns.lifecycle(for: sessionID)?.presentation.currentAction
         turns.runtime.phoneControlHandoffSentAt[sessionID] = max(
             turns.runtime.phoneControlHandoffSentAt[sessionID] ?? messageDate, messageDate
         )
         await appModel.releaseControlForHandoff(sessionId: sessionID) {
-            if let runID { _ = sync.engine.cancelActiveChatTask(for: sessionID, runIDs: [runID]) }
+            if !runIDs.isEmpty { _ = sync.engine.cancelActiveChatTask(for: sessionID, runIDs: runIDs) }
         }
         return UserMessageIntentSignals.controlHandoffReply(lastActivity: activity)
     }

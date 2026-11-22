@@ -1,14 +1,11 @@
 import Foundation
-import CryptoKit
 // Blueprint: | `TrustPolicy.swift` | Shared checked policy presentation and its typed surface values |
 
 /// This UI subset cannot replace raw authority, whose additional blocks also reach the phone.
 public struct TrustPolicy: Sendable, Codable, Hashable {
     /// Existing policies without a timestamp still have a checked edit identity.
     public func editRevision() throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return SHA256.hash(data: try encoder.encode(self)).map { String(format: "%02x", $0) }.joined()
+        try StableHash.sortedJSONSHA256(self)
     }
     public var permissionLevel: String
     public var autonomyDefault: String?

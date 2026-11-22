@@ -17,10 +17,10 @@ extension AgentConversationSession {
     package static func waitForReply(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, input: [String: JSONValue], scope: String,
         dataRoot: URL, admit: Bool = false,
                              read: @escaping Dispatch) async throws -> JSONValue {
-        guard let agent = string(input["agent"]) else { throw AgentConversationStore.Failure(message: "Name the contact to wait for.") }
+        guard let agent = input["agent"]?.nonblankString else { throw AgentConversationStore.Failure(message: "Name the contact to wait for.") }
         let store = AgentConversationStore(dataRoot: dataRoot)
         let records = Result { try store.records() }
-        let pinned = named(string(input["conversation"]), agent: agent, scope: scope, rows: try records.get())
+        let pinned = named(input["conversation"]?.nonblankString, agent: agent, scope: scope, rows: try records.get())
         let label = pinned.label
         let exact = input.filter { ["conversation_id", "message_id", "task_id"].contains($0.key) && $0.value != .null && $0.value != .string("") }
         let retained = exact.isEmpty ? nil : try records.get().filter { row in
@@ -135,8 +135,8 @@ extension AgentConversationSession {
         guard case .object(var fields)? = snapshot else { return .object(["wait_outcome": .string(outcome)]) }
         // Claim only the exact routine answer returned by this wait; stopped or timed-out waits cannot consume it.
         if transport == .grokBot, ["settled", "nothing_in_flight"].contains(outcome), !Task.isCancelled,
-           let delivered = string(fields["reply"]), let latest, agent.hasPrefix("peer:"),
-           let message = string(latest.readInput?["message_id"]) {
+           let delivered = fields["reply"]?.nonblankString, let latest, agent.hasPrefix("peer:"),
+           let message = latest.readInput?["message_id"]?.nonblankString {
             let clipped = fields["reply_truncated"] == .bool(true)
             try GrokRequestStore(dataRoot: dataRoot).shown(message, peer: String(agent.dropFirst(5)), by: "wait") {
                 $0 == delivered || (clipped && $0.hasPrefix(delivered))
@@ -208,8 +208,8 @@ extension AgentConversationSession {
             do {
                 let peer = peers.first { "peer:" + $0.id == row.agent && AgentConversationStore.sameRoute(row.peerRouteFingerprint, $0) }
                 if let peer, [.a2a, .nativeAgent].contains(peer.transport), let input = row.readInput,
-                   (peer.transport == .a2a ? string(input["task_id"]) != nil
-                    : string(input["message_id"]) != nil && string(input["conversation_id"]) != nil),
+                   (peer.transport == .a2a ? input["task_id"]?.nonblankString != nil
+                    : input["message_id"]?.nonblankString != nil && input["conversation_id"]?.nonblankString != nil),
                    try orphaned(row) || ownerless(row) && row.phase == "waiting" && row.automaticRead {
                     _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
                         guard try orphaned($0) || ownerless($0) && $0.phase == "waiting" && $0.automaticRead else { return }
@@ -241,7 +241,7 @@ extension AgentConversationSession {
                     catch { replay = nil }
                     try Task.checkCancellation()
                     if let replay, case .object(let fields) = replay, !readRefused(replay),
-                       let exchange, let prompt = exchange.prompt, !prompt.isEmpty, let replayedPrompt = string(fields["prompt"]),
+                       let exchange, let prompt = exchange.prompt, !prompt.isEmpty, let replayedPrompt = fields["prompt"]?.nonblankString,
                        replayedPrompt.hasSuffix(prompt) || exchange.promptTruncated && replayedPrompt.hasPrefix(prompt) {
                         if let text = AgentConversationExchange.answer(fields).text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             receipt = try await store.retainReply(replay, for: row)
@@ -280,7 +280,7 @@ extension AgentConversationSession {
         guard row.phase == "attention", !stoppedOrReleased(row), case .object(let root)? = row.receipt else { return false }
         let value = row.sendEvidence
         if root["sent"] == .bool(false) || value["sent"] == .bool(false) { return false }
-        let status = string(value["run_status"]) ?? string(value["status"]) ?? ""
+        let status = value["run_status"]?.nonblankString ?? value["status"]?.nonblankString ?? ""
         // Unknown outcomes hold the thread only while their owning call can still produce a reply: a call that ended produces none.
         return ["outcome_unknown", "delivery_unknown"].contains(status) && value["terminal"] != .bool(true)
                 && AgentConversationRunning.shared.live(row: row.id, operation: row.operationID)
@@ -290,10 +290,10 @@ extension AgentConversationSession {
     static func unsettledAttentionChecked(_ row: AgentConversationRecord, dataRoot: URL) throws -> Bool {
         guard unsettledAttention(row) else { return false }
         let value = row.sendEvidence
-        let status = string(value["run_status"]) ?? string(value["status"]) ?? ""
+        let status = value["run_status"]?.nonblankString ?? value["status"]?.nonblankString ?? ""
         if AgentConversationRecord.approvalWaits(status), case .object(let root)? = row.receipt {
             let operation = "agent.approval-wait:" + row.operationID
-            let approval = string(value["approvalId"]) ?? string(root["approvalId"])
+            let approval = value["approvalId"]?.nonblankString ?? root["approvalId"]?.nonblankString
             let inbox = SwiftNativeApprovalInbox(root: dataRoot)
             do {
                 guard let approval, !approval.isEmpty else {
@@ -321,7 +321,7 @@ extension AgentConversationSession {
     static func awaitingApproval(_ row: AgentConversationRecord) -> Bool {
         guard unsettledAttention(row) else { return false }
         let value = row.sendEvidence
-        return AgentConversationRecord.approvalWaits(string(value["run_status"]) ?? string(value["status"]) ?? "")
+        return AgentConversationRecord.approvalWaits(value["run_status"]?.nonblankString ?? value["status"]?.nonblankString ?? "")
     }
     /// Cancellation settles the local wait; a retired desktop reader leaves late remote answers in their chat.
     package static func stoppedOrReleased(_ row: AgentConversationRecord) -> Bool {

@@ -10,7 +10,6 @@ final class AppModel {
     var face: FaceFeed { client.face }
     let systemToasts = SystemToastCenter()
     var statusText = "Connecting…"
-    var statusCause: String?
     var faceLinkIssue: String?
     var faceRefreshIssue: String?
     var manualRefreshRequest: UUID?
@@ -23,7 +22,6 @@ final class AppModel {
     var pendingChatMessageID: String?
     var pendingMemoryFaceTarget: FaceDestination?
     var pendingPaletteDestination: PaletteSavedDestination?
-    var pendingDeskHandle: String?
     var pendingActivitySectionRaw: String?
     var diagnosticsRunID: String?
     var chatRestoreIssue: String?
@@ -45,11 +43,7 @@ final class AppModel {
     var agentAddressName: String { agentDisplayName }
 
     func setFailureStatus(_ error: any Error, action: String) {
-        setFailureStatus(FaceActionFeedback.message(error, action: action), cause: error)
-    }
-    func setFailureStatus(_ line: String, cause error: any Error) {
-        statusText = line
-        statusCause = error.localizedDescription
+        statusText = FaceActionFeedback.message(error, action: action)
     }
 
     func maybeSendFirstRunGreeting() async -> String? {

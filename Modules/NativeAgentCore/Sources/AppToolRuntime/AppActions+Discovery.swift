@@ -145,7 +145,7 @@ extension AppActions {
     }
 
     /// Retain the native schema's descriptions, enums and nested constraints.
-    static func discovery(_ action: AppAction, blocker: String? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> JSONValue {
+    static func discovery(_ action: AppAction, blocker: String? = nil) throws -> JSONValue {
         let native = try schema(action).map { try JSONValue.parse($0.parametersJSON) }
         let properties: [String: JSONValue]
         if let native {
@@ -337,7 +337,10 @@ extension AppActions {
                 } else { meaning = translated }
                 return declaresType(property, value: meaning) && accepts(meaning, property)
             }
-            guard candidates.count == 1, let name = candidates.first else { return (given, address.understood) }
+            // Spellings of one declared argument (find's what|query) are one meaning; bind its first spelling that fits.
+            let slots = Set(candidates.map { name in action.argSpecs.first { $0.names.contains(name) }?.names.first ?? name })
+            guard slots.count == 1, let slot = slots.first,
+                  let name = candidates.contains(slot) ? slot : candidates.sorted().first else { return (given, address.understood) }
             if let meanings = action.argumentValues[name], let spelling = known(argument)?.stringValue, let translated = meanings[spelling] {
                 bound[name] = make(translated)
             } else { bound[name] = translated }
@@ -354,18 +357,11 @@ extension AppActions {
         return (bound, understood)
     }
 
-    /// The closest declared form is one explicit next call; unresolved values remain beside it, never become an automatic dispatch.
-    static func advisedCall(_ advice: JSONValue) -> [String: JSONValue]? {
-        if let fields = advice.objectValue {
-            if fields["action"]?.stringValue != nil, fields["args"]?.objectValue != nil { return fields }
-            if let next = fields["next_call"]?.objectValue { return next }
-            if let example = fields["example"]?.objectValue { return example }
-            if let actions = fields["actions"] { return advisedCall(actions) }
-        }
-        if let forms = advice.arrayValue {
-            for form in forms { if let call = advisedCall(form) { return call } }
-        }
-        return nil
+    /// The one call a refusal's remedy may name for the body to follow: an exact call built from her own values. A proposed
+    /// form or a suggestion keeps its slots in try_instead as advice.
+    static func determinedCall(_ advice: JSONValue) -> [String: JSONValue]? {
+        guard let fields = advice.objectValue, fields["action"]?.stringValue != nil, fields["args"]?.objectValue != nil else { return nil }
+        return fields
     }
 
     /// Preserve supplied values in an exact call when it fits, otherwise show one proposed form beside the unresolved input.
@@ -402,7 +398,7 @@ extension AppActions {
             } else {
                 call["args"] = .object(args)
                 for key in ["preview", "expected_version"] { if let value = input[key] { call[key] = value } }
-                shape["next_call"] = .object(call)
+                shape["proposed_call"] = .object(call)
                 shape["instruction"] = .string("Review this proposed form against supplied_args; fill missing values before sending it. Nothing ran.")
             }
         }
@@ -413,7 +409,7 @@ extension AppActions {
     static func callAdvice(_ id: String, input: [String: JSONValue], pages: [String: QuietToolPage], dataRoot: URL,
                            memory: SwiftNativeMemoryV2, turn: Turn?) async throws -> JSONValue {
         if let action = try action(id, dataRoot: dataRoot, turn: turn) {
-            return callAdvice(action, input: input, discovery: try discovery(action, dataRoot: dataRoot).objectValue ?? [:])
+            return callAdvice(action, input: input, discovery: try discovery(action).objectValue ?? [:])
         }
         let intent = words(id).joined(separator: " ")
         let ranking = try await ranked(intent, pages: pages, dataRoot: dataRoot, memory: memory, intentOnly: true, turn: turn)
@@ -433,7 +429,7 @@ extension AppActions {
         }
         for action in nearest {
             do {
-                let contract = try discovery(action, dataRoot: dataRoot).objectValue ?? [:]
+                let contract = try discovery(action).objectValue ?? [:]
                 suggestions.append(.object(["action": .string(action.id), "effects": .string(action.read ? "read" : "changes something"),
                     "args_schema": contract["args_schema"] ?? .null, "example": contract["example"] ?? .null]))
             } catch {

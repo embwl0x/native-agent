@@ -561,11 +561,6 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
         self.fileNotice = fileNotice
     }
 
-    /// Calendar-day keys prevent duplicate accounting across every driver.
-    static func dayKey(_ date: Date) -> String {
-        NativeTimestampFormat.calendarDay(date)
-    }
-
     private var marker: URL {
         dataRoot
             .appendingPathComponent("logs", isDirectory: true)
@@ -583,7 +578,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
     }
 
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        guard (try? String(contentsOf: marker, encoding: .utf8)) == Self.dayKey(now) else {
+        guard (try? String(contentsOf: marker, encoding: .utf8)) == NativeTimestampFormat.calendarDay(now) else {
             // Retry hourly only while the day remains unreserved.
             return now.addingTimeInterval(60 * 60)
         }
@@ -600,7 +595,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
             return .failed(error: "disk hygiene marker directory: \(error)")
         }
         let rollback: @Sendable () async -> Void
-        switch await reserveOncePerPeriod(key: Self.dayKey(now), at: marker) {
+        switch await reserveOncePerPeriod(key: NativeTimestampFormat.calendarDay(now), at: marker) {
         case .alreadyReserved:
             return .notNeeded("disk hygiene already ran today")
         case .failed(let error):

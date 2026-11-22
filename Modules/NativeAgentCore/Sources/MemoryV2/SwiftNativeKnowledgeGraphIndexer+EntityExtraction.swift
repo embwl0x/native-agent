@@ -1,19 +1,10 @@
 import Foundation
 import NaturalLanguage
-// Blueprint: | `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` | `SwiftNativeKnowledgeGraphIndexer`: `extractEntities`, `taggedNameIsCredible` |
+// Blueprint: | `SwiftNativeKnowledgeGraphIndexer+EntityExtraction.swift` | `SwiftNativeKnowledgeGraphIndexer`: `extractCorpus`, `taggedNameIsCredible` |
 
 extension SwiftNativeKnowledgeGraphIndexer {
     /// Lowercased alias to the one entity it names: that entity's name and its one type, and the alias as the text wrote it.
     typealias StatedAliases = [String: (name: String, type: String, alias: String)]
-
-    /// One text alone: an alias it states merges only within it. Indexing reads the aliases every fact states (`extractCorpus`).
-    public nonisolated static func extractEntities(
-        from content: String,
-        knownPeople: [String] = [],
-        knownAgents: [String: String] = [:]
-    ) -> [KnowledgeGraphExtractedEntity] {
-        extractCorpus([content], knownPeople: knownPeople, knownAgents: knownAgents)[0]
-    }
 
     /// Each text's entities, with every alias any of the texts states merged into one entity wherever either name is written.
     nonisolated static func extractCorpus(_ contents: [String], knownPeople: [String],

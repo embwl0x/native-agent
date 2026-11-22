@@ -84,7 +84,7 @@ public enum DeskLiveActivityPresentation {
         let moving = deskItems.items.compactMap { item -> Date? in
             guard !item.requiresOwnerInput,
                   DeskMovementPresentation.activity(item, evidence: evidence[item.handle], now: now) == .working,
-                  let updated = DeskActivityState.movementDate(evidence[item.handle]?.lastMovementAt)
+                  let updated = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(evidence[item.handle]?.lastMovementAt)
             else { return nil }
             return max(0, now.timeIntervalSince(updated)) <= window ? updated : nil
         }

@@ -58,7 +58,7 @@ extension ConnectorReadiness {
             let on = records.filter(\.enabled).count
             // The line names who is asking: a count sends the reader down the page to find out.
             let waiting = records.filter { $0.needsConnectionAttention }.map(\.name)
-            line = "\(on) of \(records.count) \(records.count == 1 ? "door is" : "doors are") on. "
+            line = "\(on) of \(records.count) \(records.count == 1 ? "connection is" : "connections are") on. "
                 + (waiting.isEmpty ? "No account is asking for setup."
                     : ListFormatter.localizedString(byJoining: waiting) + (waiting.count == 1 ? " needs" : " need") + " your attention.")
             accountRows = records.isEmpty ? [.init(id: "accounts-empty", title: "No accounts are listed.", tone: .quiet)]
@@ -233,11 +233,11 @@ extension ConnectorReadiness {
         let card = InlineInteractionRegistry.connector(id, why: why, dataRoot: root)
         let envelope = TurnEnvelope.native(origin)
         let turn = turn.with(\.session, session).with(\.envelope, envelope).with(\.verifiedSessionID, session)
-        guard let raised = await InlineInteractionResolver.raise(card, sessionID: session, resumable: false,
-            origin: envelope, turn: turn, dataRoot: root) else {
+        guard await InlineInteractionResolver.raise(card, sessionID: session, resumable: false,
+            origin: envelope, turn: turn, dataRoot: root) != nil else {
             throw PartCallError(code: "card_unavailable", message: "The \(name) setup card could not be saved. Open chat and choose this again.")
         }
-        return "Connect \(name) on the setup card in chat (card:\(raised.id))."
+        return "\(name) is waiting on its setup card in chat."
     }
 
     @concurrent private static func currentSession(root: URL) async throws -> String? {
@@ -289,7 +289,7 @@ extension NativeAgentEngine {
     /// documents on demand.
     @MainActor func connectorsFaceBody() -> PartFaces.Body {
         { [weak self] item in
-            guard let self else { throw PartCallError(code: "connectors_closed", message: "The connectors owner has closed.") }
+            guard let self else { throw PartCallError(code: "connectors_closed", message: "Connectors closed. Open it again.") }
             if item == "iphone.senses-guide" { return PhoneSensesGuide.steps }
             if item.hasPrefix("agent-thread:") { return try await agentThreadDocument(String(item.dropFirst("agent-thread:".count))) }
             guard let snapshot = await pages.snapshots["connectors"] else {
@@ -337,7 +337,7 @@ extension NativeAgentEngine {
     /// The `connections` verbs' one switch: every lookup a verb needs (the account, secret, chat, contact, phone, record or value it names,
     /// read now) throws its owner's refusal, or the verb's effect comes back to run. Nil for a verb that is not the engine's.
     @MainActor func prepareConnections(_ verb: String, _ input: [String: JSONValue], _ turn: Turn) async throws -> HostVerbEffect? {
-        func text(_ key: String) -> String { input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+        func text(_ key: String) -> String { JSONValue.trimmedScalarTextOrEmpty(input[key]) }
         let version: Int? = if case .int(let number)? = input["version"] { Int(number) } else { nil }
         switch verb {
         case "provider_choose": return try await chooseProviderFace(group: text("group"), setting: text("setting"), value: input["value"])
@@ -448,8 +448,10 @@ extension ConnectorRecord {
     var connectionReadFailed: Bool {
         authState == "failed" || healthStatus.map { ["failed", "unavailable"].contains($0) } == true
     }
+    /// Asks the person for something: a failed read, or sign-in, setup, permission or a check. Never checked is not asking: a working
+    /// connector with no receipt yet (Telegram on, Shortcuts, Browser) reads "Not checked" and waits quietly.
     var needsConnectionAttention: Bool {
-        connectionReadFailed || [.needsAuth, .unverified].contains(connectionState)
+        connectionReadFailed || connectionState == .needsAuth
     }
     var hasLiveConnectionProof: Bool {
         enabled && connectionState == .live

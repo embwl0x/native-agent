@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `TranscriptDocument.swift` | The conversation as one document on Mac and iPhone: blocks, attachment references, the edit between two |
+// Blueprint: | `TranscriptDocument.swift` | The conversation as one document on Mac and iPhone: blocks, attachment references, the block ids both sides derive |
 
 /// The conversation as one document. Every row becomes blocks in reading order, and one block is one paragraph of the text view.
 /// Place is a text location, never a measured height: block ids are stable across rebuilds, so the view edits only what changed.
@@ -12,31 +12,6 @@ public struct TranscriptDocument: Equatable, Sendable {
     }
 
     public static let empty = TranscriptDocument(blocks: [])
-
-    /// The one edit that turns this document into `next`: the blocks before `start` and the last `kept` blocks are equal in both.
-    /// Appends and a growing tail touch only the end, so everything the reader sees above stays where it is.
-    public func edit(to next: TranscriptDocument) -> TranscriptDocumentEdit? {
-        let old = blocks, new = next.blocks
-        var start = 0
-        while start < old.count, start < new.count, old[start] == new[start] { start += 1 }
-        if start == old.count, start == new.count { return nil }
-        var kept = 0
-        while kept < old.count - start, kept < new.count - start, old[old.count - 1 - kept] == new[new.count - 1 - kept] { kept += 1 }
-        return TranscriptDocumentEdit(start: start, removed: old.count - start - kept, inserted: Array(new[start..<(new.count - kept)]))
-    }
-}
-
-/// Replace `removed` blocks at `start` with `inserted`.
-public struct TranscriptDocumentEdit: Equatable, Sendable {
-    public var start: Int
-    public var removed: Int
-    public var inserted: [TranscriptBlock]
-
-    public init(start: Int, removed: Int, inserted: [TranscriptBlock]) {
-        self.start = start
-        self.removed = removed
-        self.inserted = inserted
-    }
 }
 
 public struct TranscriptBlock: Equatable, Sendable, Codable, Identifiable {
@@ -133,4 +108,39 @@ public enum TranscriptAttachmentRef: Equatable, Sendable, Codable {
     case otherRoom(OtherRoomExchange)
     case envelope(messageID: String)
     case trouble
+}
+
+/// The ids a block takes from its row. The builder names blocks by them and the Mac's attachment face keys what it resolved by the
+/// same strings, so both read them here.
+public enum TranscriptBlockID {
+    /// A row's words, one per piece: "<messageID>#<index>". The first also names a live waiting line and an envelope.
+    public static func words(_ messageID: String, _ index: Int) -> String { "\(messageID)#\(index)" }
+    public static func card(_ cardID: String) -> String { "card-" + cardID }
+    public static func approval(_ rowID: String) -> String { "approval-" + rowID }
+    /// The turn-failure line after the last row.
+    public static let trouble = "trouble"
+}
+
+/// What a row's attached file draws as, read from its type: audio a voice note, image an image, anything else a file.
+public enum TranscriptAttachmentKind: String, Sendable {
+    case image, voice, file
+
+    public init(type: String) {
+        switch type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "audio": self = .voice
+        case "image": self = .image
+        default: self = .file
+        }
+    }
+
+    /// "<messageID>@<kind>-<index>", the index counting into the row's attachments.
+    public func blockID(messageID: String, index: Int) -> String { "\(messageID)@\(rawValue)-\(index)" }
+}
+
+/// The UUID a Mac transcript row goes by on the phone when its own id is not one: name-based on the id, so every snapshot names the
+/// same message. The Mac's phone projection (`NativeAgentEngine.phoneMessageID`) derives the same value and passes real UUIDs through.
+public enum TranscriptMessageID {
+    public static func derived(_ id: String) -> UUID {
+        StableHash.sha256UUID(utf8: "nativeagent.message:" + id)
+    }
 }

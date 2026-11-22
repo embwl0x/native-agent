@@ -384,7 +384,8 @@ extension AbilityStore {
                 operation["input_preview"] = .string(String(try Self.inputDescription(input).serialize(pretty: false).prefix(1024)))
                 let result = outcome == "ok" ? "completed" : outcome
                 operation[result] = .int(try Self.increment(operation[result], field: field + ".operations.\(digest)." + result))
-                operation["at"] = .string(at); operation["last_run"] = .int(count)
+                // The newest run's outcome beside its time: the counters accumulate, so an older success cannot stand for the latest run.
+                operation["at"] = .string(at); operation["last_run"] = .int(count); operation["last"] = .string(result)
                 operations[digest] = .object(operation)
                 // Retain recent scopes, not every distinct input. Version totals above never expire.
                 if operations.count > CapabilityLifecycle.inputLimit {

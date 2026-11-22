@@ -68,26 +68,6 @@ enum AppScriptRunner {
     }
 
     /// The receipt's own bookkeeping around what an action returned.
-    static let formEnvelope: Set<String> = ["action", "result", "status", "execution", "argument_form", "understood", "effect", "read_only", "irreversible"]
-
-    /// What came back from a call: object results unwrapped, model guidance, remedies, provenance and her own echoed arguments kept out.
-    /// A script receives this; a batch's expect and found read it.
-    static func answer(_ receipt: JSONValue) -> JSONValue {
-        guard case .object(var fields) = receipt else { return receipt }
-        if fields["action"] != nil, fields["argument_form"] != nil, fields.keys.allSatisfy(formEnvelope.contains),
-           let result = fields["result"], result.objectValue == nil {
-            return result
-        }
-        fields.removeValue(forKey: "argument_form")
-        fields.removeValue(forKey: "understood")
-        if fields["action"] != nil, case .object(let result)? = fields["result"] {
-            fields.removeValue(forKey: "result")
-            fields.merge(result) { _, own in own }
-        }
-        for key in ["guide", "remedy", "next_call", "sense_provenance"] { fields.removeValue(forKey: key) }
-        return .object(fields)
-    }
-
     static func doorInput(id: String, given: [JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
                           turn: Turn?) -> Result<[String: JSONValue], ScriptError> {
         let checked: AppAction?
@@ -102,7 +82,7 @@ enum AppScriptRunner {
         }
         func argumentFailure(_ reason: String, _ detail: String) -> ScriptError {
             do {
-                let contract = try AppActions.discovery(action, dataRoot: dataRoot).objectValue ?? [:]
+                let contract = try AppActions.discovery(action).objectValue ?? [:]
                 return ScriptError(reason: reason, detail: detail,
                     tryInstead: AppActions.callAdvice(action, input: ["args": .null], discovery: contract))
             } catch {
@@ -187,7 +167,7 @@ enum AppScriptRunner {
             if let given, given.count == 1 { input["args"] = given[0].value ?? .null }
             if let action = try resolved(id) {
                 return try AppActions.callAdvice(action, input: input,
-                    discovery: AppActions.discovery(action, dataRoot: dataRoot).objectValue ?? [:])
+                    discovery: AppActions.discovery(action).objectValue ?? [:])
             }
             let pages = Dictionary(([QuietToolPage.inbox] + QuietToolPage.all).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             return try await AppActions.callAdvice(id, input: input, pages: pages, dataRoot: dataRoot,
@@ -229,13 +209,13 @@ enum AppScriptRunner {
                 successful: ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome),
                 waiting: ChatToolOutcome.isWaitingApproval(reply.payload) || reply.isWaitingInteraction,
                 resultClass: reply.outcome.rawValue,
-                pending: ChatToolOutcome.pendingStatuses.contains(AppToolExecutor.doorText(fields["status"]).lowercased()),
+                pending: ChatToolOutcome.pendingStatuses.contains(JSONValue.trimmedScalarTextOrEmpty(fields["status"]).lowercased()),
                 effectUnconfirmed: mac == .running || mac == .effectUnconfirmed)
         }
         func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? {
             ChatTranscriptEvidenceRendering.receiptField(key, in: receipt)
         }
-        func answer(_ receipt: JSONValue) -> JSONValue { AppScriptRunner.answer(receipt) }
+        func answer(_ receipt: JSONValue) -> JSONValue { ToolResult.stepAnswer(receipt) }
         func perform(_ input: [String: JSONValue], execution program: OwnedProgramExecution) async -> JSONValue {
             guard let turn = program.turn else {
                 return AppToolExecutor.failure("door_unavailable", "An app action needs its originating turn.")
@@ -266,13 +246,13 @@ enum AppScriptRunner {
         }
         /// Only a current action has a dependency contract.
         func dependencyShape(_ id: String) throws -> JSONValue? {
-            if let action = try resolved(id) { return try AppActions.dependencyContract(action, dataRoot: dataRoot) }
+            if let action = try resolved(id) { return try AppActions.dependencyContract(action) }
             return nil
         }
         func callProblem(_ id: String, given: [OwnedProgram.Calls.Argument], schema ownSchema: JSONValue?) throws -> String? {
             if let problem = AppScriptRunner.namedCallProblem(given) { return problem.detail }
             let action = try resolved(id)
-            guard let schema = try ownSchema ?? action.flatMap({ try AppActions.discovery($0, dataRoot: dataRoot)
+            guard let schema = try ownSchema ?? action.flatMap({ try AppActions.discovery($0)
                 .objectValue?["args_schema"] }) else { return nil }
             typealias Argument = OwnedProgram.Calls.Argument
             func normalize(_ argument: Argument, schema: JSONValue, root: Bool = false) -> Argument {

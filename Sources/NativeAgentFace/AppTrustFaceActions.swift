@@ -36,24 +36,6 @@ import UniformTypeIdentifiers
     }
 }
 
-/// Typed outcomes keep a missing session or preserved draft from being called a successful build.
-enum SkillBuildRequestPresentation {
-    enum DraftOutcome: Equatable {
-        case draftPrepared
-        case existingDraftPreserved
-        case awaitingChatSession
-    }
-
-    static func build(activeSessionID: String, existingDraft: String) -> DraftOutcome {
-        guard !activeSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .awaitingChatSession
-        }
-        return existingDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? .draftPrepared
-            : .existingDraftPreserved
-    }
-}
-
 extension Notification.Name {
     static let skillBuildRequest = Notification.Name("NativeAgent.skillBuildRequest")
 }

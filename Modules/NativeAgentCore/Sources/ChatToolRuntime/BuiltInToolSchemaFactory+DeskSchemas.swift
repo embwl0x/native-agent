@@ -9,7 +9,6 @@ import ProviderRouting
 import ToolRegistry
 import NativeAgentShared
 import CoreGraphics
-import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
 import Dispatcher
@@ -52,7 +51,7 @@ extension BuiltInToolSchemaFactory {
                             Filter items updated on today or YYYY-MM-DD in the Mac's local timezone. With include_archived, filters archives by \
                             their closed date. Can combine with query.
                             """)),
-                        ("sort", ToolSchema.strSchema("""
+                        ("sort", ToolSchema.enumStringSchema(["recent", "stale"], """
                             recent (default) or stale (oldest first). Changes order only; fields and matching items are unchanged.
                             """)),
                         ("limit", ToolSchema.intSchema("Rows per page, 1–100; default 25.")),

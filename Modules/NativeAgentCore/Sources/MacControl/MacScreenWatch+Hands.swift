@@ -25,7 +25,7 @@ extension MacScreenWatch {
         let window = try liveWindow()
         let geometry = MacScreenViewGeometry(bounds: place(window), pixelWidth: width, pixelHeight: height)
         func point(_ x: String, _ y: String) throws -> MacPointerPosition {
-            guard let px = args[x].flatMap(Self.number), let py = args[y].flatMap(Self.number),
+            guard let px = args[x].flatMap(\.finiteDoubleValue), let py = args[y].flatMap(\.finiteDoubleValue),
                   let point = geometry.screenPoint(imageX: px, imageY: py) else {
                 throw SenseFailure(code: "point_outside_frame", message: """
                     hand.\(verb) takes \(x), \(y) inside the \(width)×\(height) frame; nothing was sent.

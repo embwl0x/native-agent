@@ -24,8 +24,13 @@ extension MemoryStorage {
     static func semanticDuplicate(
         _ left: String, _ right: String, similarity: Double
     ) -> Bool {
+        // A vector sees only the first 126 WordPieces; beyond that two facts can differ where it never looked. WordPiece never makes
+        // more pieces than a text has bytes, so meaning-duplicates are judged only between texts that surely fit; longer ones dedupe by exact text.
+        guard left.utf8.count <= embeddingWindowBytes, right.utf8.count <= embeddingWindowBytes else { return false }
         return similarity >= memoryNearVerbatimSimilarity && sameQuantityAndNegation(left, right)
     }
+
+    static let embeddingWindowBytes = 126
 
     /// Similar wording cannot prove equal quantities or polarity. ASCII digits and English negation only guard lexical duplicates; semantic interpretation
     /// still judges changed claims across languages.

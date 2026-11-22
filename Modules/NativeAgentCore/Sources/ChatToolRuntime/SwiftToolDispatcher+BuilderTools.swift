@@ -3,7 +3,6 @@ import ChatToolParsing
 import NativeAgentShared
 import Darwin
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -255,18 +254,6 @@ extension SwiftToolDispatcher {
         }
         return defaultSeconds
     }
-    static func builderResolveString(
-        _ input: [String: JSONValue],
-        keys: [String]
-    ) -> String? {
-        for key in keys {
-            if case .string(let raw)? = input[key] {
-                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        return nil
-    }
     static func builderResolveBool(
         _ input: [String: JSONValue],
         keys: [String],
@@ -287,7 +274,7 @@ extension SwiftToolDispatcher {
         _ input: [String: JSONValue],
         tool: String
     ) -> (configuration: String?, failure: JSONValue?) {
-        let raw = builderResolveString(input, keys: ["configuration"]) ?? "debug"
+        let raw = JSONValue.firstTrimmedString(input, keys: ["configuration"]) ?? "debug"
         let normalized = raw.lowercased()
         switch normalized {
         case "debug", "release":
@@ -308,7 +295,7 @@ extension SwiftToolDispatcher {
         _ input: [String: JSONValue],
         dataRoot: URL
     ) -> String {
-        builderResolveString(input, keys: ["package_path"])
+        JSONValue.firstTrimmedString(input, keys: ["package_path"])
             ?? builderDefaultCwd(dataRoot: dataRoot)
     }
     static func impl_shell(turn: Turn, input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -406,8 +393,8 @@ extension SwiftToolDispatcher {
         let configuration = resolvedConfiguration.configuration ?? "debug"
         var selectors: [String] = []
         if command == "build" {
-            let product = builderResolveString(input, keys: ["product"])
-            let target = builderResolveString(input, keys: ["target"])
+            let product = JSONValue.firstTrimmedString(input, keys: ["product"])
+            let target = JSONValue.firstTrimmedString(input, keys: ["target"])
             if product != nil && target != nil {
                 return .object([
                     "status": .string("failed"),
@@ -419,7 +406,7 @@ extension SwiftToolDispatcher {
             }
             if let product { selectors += ["--product", product] }
             if let target { selectors += ["--target", target] }
-        } else if let filter = builderResolveString(input, keys: ["filter"]) {
+        } else if let filter = JSONValue.firstTrimmedString(input, keys: ["filter"]) {
             selectors += ["--filter", filter]
         }
         var args = ["swift", command]

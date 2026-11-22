@@ -25,6 +25,7 @@ public final class ProvidersFacade {
     var providerProbeStarts: [String: Date] = [:] { didSet { publishProviderState() } }
     var catalogRefreshStarted: Date? { didSet { publishProviderState() } }
     var catalogRefreshTask: Task<SettingsRefreshOutcome, Never>?
+    private var missingModelRoutesTask: Task<Void, Never>?
     /// Accounts whose provider is being asked for its list now, as the catalog's one refresh in flight.
     var askingModelRoutes: Set<String> = []
     public var codexAuth: CodexAuthStatus? { didSet { publishProviderState() } }
@@ -174,6 +175,7 @@ public final class ProvidersFacade {
         faceChanges.finish()
         faceProjectionTask.cancel()
         accountModelUpdatesTask?.cancel()
+        missingModelRoutesTask?.cancel()
         catalogRefreshTask?.cancel()
     }
 
@@ -193,27 +195,26 @@ public final class ProvidersFacade {
     /// settings are read again in a task of their own and show the list or the plain sentence. A read never waits for it, and nothing here reads a
     /// credential on the main actor: which routes are missing (credential locks, the Keychain) is worked out off it, as the task's first step.
     public func startAskingMissingModelLists() {
-        guard catalogRefreshTask == nil else { return }
+        guard catalogRefreshTask == nil, missingModelRoutesTask == nil else { return }
         let dataRoot = self.dataRoot
-        catalogRefreshTask = Task { [weak self] in
+        missingModelRoutesTask = Task { [weak self] in
             let routes = await Task.detached(priority: .utility) { FirstPartyModelDiscovery.missingRoutes(dataRoot: dataRoot) }.value
-            guard let self else { return .failed("The providers owner closed.") }
-            guard !routes.isEmpty, !Task.isCancelled else {
-                self.catalogRefreshTask = nil
-                return .failed("No model list is missing.")
-            }
+            guard let self else { return }
+            self.missingModelRoutesTask = nil
+            guard !routes.isEmpty, !Task.isCancelled, self.catalogRefreshTask == nil else { return }
             // The asking state is set from what was found, and shown at once.
             self.askingModelRoutes = Set(routes)
             self.catalogRefreshStarted = Date()
-            Task { [weak self] in _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription } }
-            _ = await FirstPartyModelDiscovery.fetchMissing(dataRoot: dataRoot, routes: routes)
-            let cancelled = Task.isCancelled
-            self.askingModelRoutes = []
-            self.catalogRefreshTask = nil
-            self.catalogRefreshStarted = nil
-            // The final read runs outside this task, so a cancel cannot stop it from replacing "Asking…" with the account's true state.
-            Task { [weak self] in _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription } }
-            return .failed(cancelled ? "Model catalog refresh cancelled." : "The model lists were asked for.")
+            self.catalogRefreshTask = Task {
+                Task { [weak self] in _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription } }
+                _ = await FirstPartyModelDiscovery.fetchMissing(dataRoot: dataRoot, routes: routes)
+                self.askingModelRoutes = []
+                self.catalogRefreshTask = nil
+                self.catalogRefreshStarted = nil
+                // The final read runs outside this task, so a cancel cannot stop it from replacing "Asking…" with the account's true state.
+                Task { [weak self] in _ = await self?.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription } }
+                return .failed(Task.isCancelled ? "Model catalog refresh cancelled." : "The model lists were asked for.")
+            }
         }
     }
 
@@ -247,12 +248,13 @@ public final class ProvidersFacade {
 
 extension ProvidersFacade {
     public nonisolated func disconnectProvider(_ id: String) async throws -> (ok: Bool, detail: String) {
+        // OAuth credentials have their own store, cleared first while the file naming its Keychain grant is still there to read;
+        // deleting a registry row alone cannot prove disconnect.
+        let clearedOAuth = await NativeOAuthFlow.clearTokens(providerId: id, dataRoot: dataRoot)
         try await clearProvider(id)
         Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
-        // OAuth credentials have their own store; deleting a registry row alone cannot prove disconnect.
-        let clearedOAuth = await NativeOAuthFlow.clearTokens(providerId: id, dataRoot: dataRoot)
         let oauthID = NativeOAuthFlow.normalizedOAuthProviderId(id)
-        if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
+        if ["openai_oauth_direct", "codex", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
            !clearedOAuth {
             return (false, "Clear failed: the OAuth credential could not be removed.")
         }

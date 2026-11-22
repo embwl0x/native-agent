@@ -92,7 +92,6 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     var subtitlePage: SidebarItem? = nil
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
-    var alive: Bool = false
     @ViewBuilder let content: (Key) -> Content
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Environment(\.quietRailTab) private var quietRailTab
@@ -104,19 +103,17 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
             : selection
         ShellPageFrame(
             title: title,
-            subtitle: subtitlePage.flatMap { ShellPageSubtitle.line($0, appModel) },
-            alive: alive
+            subtitle: subtitlePage.flatMap { ShellPageSubtitle.line($0, appModel) }
         ) {
             VStack(alignment: .leading, spacing: 0) {
                 ShellTabs(tabs: tabs, selection: quietOffscreenRead ? .constant(shown) : $selection)
-                    .padding(.bottom, alive ? 0 : 18)
                 content(shown)
                     .id(shown)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .aliveTopDissolve(alive ? 18 : 0)
+                    .aliveTopDissolve(18)
             }
         }
-        .modifier(FaceObservation(demand: subtitlePage.flatMap { ShellPageContent.doorPage($0) }.map { .key(.page($0)) }))
+        .modifier(FaceObservation(demand: subtitlePage.flatMap(SidebarItem.doorPage).map { .key(.page($0)) }))
     }
 }
 
@@ -126,29 +123,24 @@ extension View {
     /// Use static safe-area geometry to keep scrolling responsive; safeAreaBar can block the main thread.
     /// Fade over the header gap and clear its first points so clipped partial glyphs stay invisible.
     /// Keep the fade within the gap so resting content retains full opacity.
-    @ViewBuilder
     func aliveTopDissolve(_ gap: CGFloat) -> some View {
-        if gap > 0 {
-            safeAreaPadding(.top, gap)
-                .mask(alignment: .top) {
-                    VStack(spacing: 0) {
-                        Color.clear
-                            .frame(height: min(aliveTopClearBand, gap))
-                        LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                            .frame(height: max(gap - aliveTopClearBand, 0))
-                        Color.black
-                    }
-                    .ignoresSafeArea(edges: .bottom)
+        safeAreaPadding(.top, gap)
+            .mask(alignment: .top) {
+                VStack(spacing: 0) {
+                    Color.clear
+                        .frame(height: min(aliveTopClearBand, gap))
+                    LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                        .frame(height: max(gap - aliveTopClearBand, 0))
+                    Color.black
                 }
-        } else {
-            self
-        }
+                .ignoresSafeArea(edges: .bottom)
+            }
     }
 }
 
 enum ShellPageSubtitle {
     @MainActor static func line(_ page: SidebarItem, _ appModel: AppModel) -> String? {
-        ShellPageContent.doorPage(page).flatMap {
+        SidebarItem.doorPage(page).flatMap {
             appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self)?.face?.line
         }
     }

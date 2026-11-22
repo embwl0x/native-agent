@@ -1,7 +1,6 @@
 import ChatTurnRuntime
 import ChatTurnContracts
 import AgentWorkspace
-import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -253,14 +252,7 @@ public enum AgentBridgeCompletionRouter {
       return lifecycleUnavailable(surface: surface, delivery: "none", reason: error.localizedDescription)
     }
     if admission.response?.isSilentCompletion == true {
-      let result = AgentBridgeCompletionDelivery(status: "completed", surface: surface, delivery: "silence",
-        artifactCount: 0, attempts: 0, reason: nil)
-      do {
-        try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
-        return result
-      } catch {
-        return lifecycleUnavailable(surface: surface, delivery: "silence", reason: error.localizedDescription)
-      }
+      return await deliverSilence(surface: surface, deliveryId: deliveryId, requestDigest: requestDigest, lifecycle: lifecycle)
     }
     if let askingChatClient, route.turnSessionId != nil, let asking = route.sessionId, surface == "chat" {
       do {
@@ -289,26 +281,8 @@ public enum AgentBridgeCompletionRouter {
     }
 
     if case .failure(let failure) = validatedRoute {
-      let result = AgentBridgeCompletionDelivery(
-        status: "failed_pre_dispatch",
-        surface: surface.isEmpty ? "unknown" : surface,
-        delivery: delivery,
-        artifactCount: 0,
-        attempts: 0,
-        reason: failure.reason
-      )
-      do {
-        try await lifecycle.recordDelivery(
-          result, deliveryId: deliveryId, requestDigest: requestDigest
-        )
-        return result
-      } catch {
-        return lifecycleUnavailable(
-          surface: result.surface,
-          delivery: delivery,
-          reason: "invalid_route_receipt_unavailable:\(error.localizedDescription)"
-        )
-      }
+      return await recordInvalidRoute(failure, surface: surface, delivery: delivery, deliveryId: deliveryId,
+                                      requestDigest: requestDigest, lifecycle: lifecycle)
     }
 
     if validatedRoute != .success(.callerResult), validatedRoute != .success(.ios) {
@@ -316,54 +290,125 @@ public enum AgentBridgeCompletionRouter {
     }
     // A tool-authored reply to another human conversation is part of the enclosing turn's work. That turn owns the single result notification.
     if validatedRoute == .success(.local) {
-      if notifyRequestedResult {
-        do {
-          guard let response = admission.response,
-                let session = route.turnSessionId ?? response.sessionId else { throw CodexCompletionLifecycle.LifecycleError.responseMissing }
-          try await SwiftNativeChatOrchestrationClient.retainRequestedResult(dataRoot: lifecycle.dataRoot,
-            sessionId: session, runId: response.runId, deliveryId: "requested-result:" + deliveryId)
-        } catch {
-          return lifecycleUnavailable(surface: surface, delivery: delivery,
-            reason: "requested_result_intent_not_durable:\(error.localizedDescription)")
-        }
-      }
-      let result = AgentBridgeCompletionDelivery(status: "completed", surface: surface, delivery: delivery,
-        artifactCount: text.isEmpty ? attachments.count : attachments.count + 1, attempts: 0, reason: nil)
-      do {
-        try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
-        return result
-      } catch {
-        return lifecycleUnavailable(surface: surface, delivery: delivery,
-          reason: "local_settlement_not_durable:\(error.localizedDescription)")
-      }
+      return await deliverLocally(response: admission.response, surface: surface, delivery: delivery, deliveryId: deliveryId,
+                                  requestDigest: requestDigest, text: text, attachments: attachments, route: route,
+                                  lifecycle: lifecycle, notifyRequestedResult: notifyRequestedResult)
     }
     if [.success(.telegram), .success(.slack), .success(.ios)].contains(validatedRoute) {
+      return await deliverThroughRoute(turn: turn, validatedRoute: validatedRoute, surface: surface, deliveryId: deliveryId,
+                                       requestDigest: requestDigest, text: text, attachments: attachments, route: route,
+                                       sender: sender, lifecycle: lifecycle, notifyRequestedResult: notifyRequestedResult,
+                                       askingChatClient: askingChatClient)
+    }
+    return await deliverCallerArtifacts(surface: surface, delivery: delivery, deliveryId: deliveryId, requestDigest: requestDigest,
+                                        text: text, attachments: attachments, route: route, sender: sender, lifecycle: lifecycle)
+  }
+
+  /// Settle a silent completion without dispatching a reply.
+  private static func deliverSilence(surface: String, deliveryId: String, requestDigest: String,
+                                     lifecycle: CodexCompletionLifecycle) async -> AgentBridgeCompletionDelivery {
+    let result = AgentBridgeCompletionDelivery(status: "completed", surface: surface, delivery: "silence",
+      artifactCount: 0, attempts: 0, reason: nil)
+    do {
+      try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
+      return result
+    } catch {
+      return lifecycleUnavailable(surface: surface, delivery: "silence", reason: error.localizedDescription)
+    }
+  }
+
+  /// Record the refusal for an invalid delivery route.
+  private static func recordInvalidRoute(_ failure: RouteValidationFailure, surface: String, delivery: String,
+                                         deliveryId: String, requestDigest: String,
+                                         lifecycle: CodexCompletionLifecycle) async -> AgentBridgeCompletionDelivery {
+    let result = AgentBridgeCompletionDelivery(
+      status: "failed_pre_dispatch",
+      surface: surface.isEmpty ? "unknown" : surface,
+      delivery: delivery,
+      artifactCount: 0,
+      attempts: 0,
+      reason: failure.reason
+    )
+    do {
+      try await lifecycle.recordDelivery(
+        result, deliveryId: deliveryId, requestDigest: requestDigest
+      )
+      return result
+    } catch {
+      return lifecycleUnavailable(
+        surface: result.surface,
+        delivery: delivery,
+        reason: "invalid_route_receipt_unavailable:\(error.localizedDescription)"
+      )
+    }
+  }
+
+  /// Retain the local completion and any requested phone notification.
+  private static func deliverLocally(response: ChatResponse?, surface: String, delivery: String, deliveryId: String,
+                                     requestDigest: String, text: String, attachments: [ChatTurnRuntime.MultimodalAttachment],
+                                     route: AgentBridgeCompletionRoute, lifecycle: CodexCompletionLifecycle,
+                                     notifyRequestedResult: Bool) async -> AgentBridgeCompletionDelivery {
+    if notifyRequestedResult {
       do {
-        let admission = try await lifecycle.deliveryAdmission(deliveryId: deliveryId, requestDigest: requestDigest)
-        if let letGo = admission.letGo { return letGo }
-        guard var response = admission.response else {
-          throw CodexCompletionLifecycle.LifecycleError.responseMissing
-        }
-        response.output = text
-        response.attachments = attachments
-        let result = try await sender.deliverReply(response, deliveryId: deliveryId, route: route,
-          priorVerdict: admission.priorVerdict, notifyRequestedResult: notifyRequestedResult)
-        if result.status != "owed" {
-          if validatedRoute == .success(.ios) {
-            if route.turnSessionId != nil, let asking = route.sessionId, let askingChatClient {
-              try await askingChatClient.appendAnswerForAskingChat(sessionID: asking, text: text, attachments: attachments,
-                                                                  surface: surface, deliveryID: deliveryId, turn: turn)
-            }
-            await sender.refreshLocalChat(sessionId: route.sessionId)
-          }
-          try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
-        }
-        return result
+        guard let response,
+              let session = route.turnSessionId ?? response.sessionId else { throw CodexCompletionLifecycle.LifecycleError.responseMissing }
+        try await SwiftNativeChatOrchestrationClient.retainRequestedResult(dataRoot: lifecycle.dataRoot,
+          sessionId: session, runId: response.runId, deliveryId: "requested-result:" + deliveryId)
       } catch {
-        return AgentBridgeCompletionDelivery(status: "owed", surface: surface, delivery: "route_journal",
-          artifactCount: 0, attempts: 0, reason: error.localizedDescription)
+        return lifecycleUnavailable(surface: surface, delivery: delivery,
+          reason: "requested_result_intent_not_durable:\(error.localizedDescription)")
       }
     }
+    let result = AgentBridgeCompletionDelivery(status: "completed", surface: surface, delivery: delivery,
+      artifactCount: text.isEmpty ? attachments.count : attachments.count + 1, attempts: 0, reason: nil)
+    do {
+      try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
+      return result
+    } catch {
+      return lifecycleUnavailable(surface: surface, delivery: delivery,
+        reason: "local_settlement_not_durable:\(error.localizedDescription)")
+    }
+  }
+
+  /// Deliver through the originating connector's reply journal.
+  private static func deliverThroughRoute(turn: Turn, validatedRoute: Result<AgentBridgeCompletionRoute.Kind, RouteValidationFailure>,
+                                           surface: String, deliveryId: String, requestDigest: String, text: String,
+                                           attachments: [ChatTurnRuntime.MultimodalAttachment], route: AgentBridgeCompletionRoute,
+                                           sender: any AgentBridgeCompletionSending, lifecycle: CodexCompletionLifecycle,
+                                           notifyRequestedResult: Bool,
+                                           askingChatClient: SwiftNativeChatOrchestrationClient?) async -> AgentBridgeCompletionDelivery {
+    do {
+      let admission = try await lifecycle.deliveryAdmission(deliveryId: deliveryId, requestDigest: requestDigest)
+      if let letGo = admission.letGo { return letGo }
+      guard var response = admission.response else {
+        throw CodexCompletionLifecycle.LifecycleError.responseMissing
+      }
+      response.output = text
+      response.attachments = attachments
+      let result = try await sender.deliverReply(response, deliveryId: deliveryId, route: route,
+        priorVerdict: admission.priorVerdict, notifyRequestedResult: notifyRequestedResult)
+      if result.status != "owed" {
+        if validatedRoute == .success(.ios) {
+          if route.turnSessionId != nil, let asking = route.sessionId, let askingChatClient {
+            try await askingChatClient.appendAnswerForAskingChat(sessionID: asking, text: text, attachments: attachments,
+                                                                surface: surface, deliveryID: deliveryId, turn: turn)
+          }
+          await sender.refreshLocalChat(sessionId: route.sessionId)
+        }
+        try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
+      }
+      return result
+    } catch {
+      return AgentBridgeCompletionDelivery(status: "owed", surface: surface, delivery: "route_journal",
+        artifactCount: 0, attempts: 0, reason: error.localizedDescription)
+    }
+  }
+
+  /// Validate caller artifacts, admit dispatch, and record the resulting verdict.
+  private static func deliverCallerArtifacts(surface: String, delivery: String, deliveryId: String, requestDigest: String,
+                                              text: String, attachments: [ChatTurnRuntime.MultimodalAttachment],
+                                              route: AgentBridgeCompletionRoute, sender: any AgentBridgeCompletionSending,
+                                              lifecycle: CodexCompletionLifecycle) async -> AgentBridgeCompletionDelivery {
     let artifacts: [AgentBridgeCompletionArtifact]
     do {
       artifacts = try Self.artifacts(
@@ -543,7 +588,7 @@ public enum AgentBridgeCompletionRouter {
       return (attachment, .init(
         path: rawPath,
         byteSize: data.count,
-        digest: dataDigest(data)
+        digest: SHA256Hex.of(data)
       ))
     }
     var result: [AgentBridgeCompletionArtifact] = []
@@ -577,14 +622,10 @@ public enum AgentBridgeCompletionRouter {
       guard data.count == expectation.byteSize else {
         throw ArtifactBuildError.attachmentSizeMismatch
       }
-      guard dataDigest(data) == expectation.digest else {
+      guard SHA256Hex.of(data) == expectation.digest else {
         throw ArtifactBuildError.attachmentDigestMismatch
       }
     }
-  }
-
-  private static func dataDigest(_ data: Data) -> String {
-    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
   }
 
   private static func lifecycleUnavailable(
@@ -605,14 +646,6 @@ public enum AgentBridgeCompletionRouter {
   }
 
   public static func stableUUID(_ value: String) -> String {
-    var bytes = Array(SHA256.hash(data: Data(value.utf8)).prefix(16))
-    bytes[6] = (bytes[6] & 0x0F) | 0x50
-    bytes[8] = (bytes[8] & 0x3F) | 0x80
-    return UUID(uuid: (
-      bytes[0], bytes[1], bytes[2], bytes[3],
-      bytes[4], bytes[5], bytes[6], bytes[7],
-      bytes[8], bytes[9], bytes[10], bytes[11],
-      bytes[12], bytes[13], bytes[14], bytes[15]
-    )).uuidString.lowercased()
+    StableHash.sha256UUID(utf8: value).uuidString.lowercased()
   }
 }

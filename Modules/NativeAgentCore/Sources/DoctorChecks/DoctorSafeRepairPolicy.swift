@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `DoctorSafeRepairPolicy.swift` | `DoctorSafeRepairPolicy` enum; `checkIDs`, `appliedRepairCount` |
 
 public enum DoctorRepairScope: Sendable {
@@ -65,10 +66,6 @@ public enum DoctorSafeRepairPolicy {
     }
 
     public static func isAdverse(_ status: String) -> Bool {
-        ["warning", "failing"].contains(DoctorPlainCopy.bucket(for: normalized(status)))
-    }
-
-    private static func normalized(_ value: String?) -> String {
-        (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        ["warning", "failing"].contains(DoctorPlainCopy.bucket(for: TextNormalization.trimmedLowercasedOrEmpty(status)))
     }
 }

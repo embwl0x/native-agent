@@ -22,12 +22,9 @@ extension TelegramPollLoop {
     }
     func handleControlHandoff(update: TelegramUpdate, message: TelegramMessage, text: String,
                               admissionReady: @escaping @Sendable () -> Void) async {
-        let (turnId, card) = await turnCoordinator.prepareControlHandoff(destination: message.destination)
+        let (settlement, card) = await turnCoordinator.requestControlHandoff(destination: message.destination)
         await revokeDriverControl()
         admissionReady()
-        let settlement = await requestLiveTurnStop(
-            destination: message.destination, turnId: turnId ?? UUID(), pauseQueuedTurns: true
-        )
         let outcome = await settlement.value
         let activity = await card?.snapshot().state.activities.last(where: { !$0.phase.isTerminal })?.detail
         let reply = UserMessageIntentSignals.controlHandoffReply(lastActivity: activity)
@@ -39,16 +36,19 @@ extension TelegramPollLoop {
     func handleSlashCommand(
         update: TelegramUpdate,
         message: TelegramMessage,
-        text: String
+        text: String,
+        admissionReady: @Sendable () -> Void
     ) async -> Bool {
         let turn = Turn().with(\.envelope, TurnEnvelope(surface: "telegram", verifiedChatId: String(message.chatId),
             verifiedUserId: message.fromUserId.map(String.init), commandSignatureVerified: nil,
             workIdentity: "telegram:command:\(botIdentity):\(update.updateId)"))
-        return await handleAdmittedSlashCommand(update: update, message: message, text: text, turn: turn)
+        return await handleAdmittedSlashCommand(update: update, message: message, text: text, turn: turn,
+            admissionReady: admissionReady)
     }
 
     private func handleAdmittedSlashCommand(
-        update: TelegramUpdate, message: TelegramMessage, text: String, turn: Turn
+        update: TelegramUpdate, message: TelegramMessage, text: String, turn: Turn,
+        admissionReady: @Sendable () -> Void
     ) async -> Bool {
         guard text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") else {
             return false
@@ -107,7 +107,8 @@ extension TelegramPollLoop {
             return false
 
         case .retry:
-            return await handleRetryCommand(args: parsed.args, update: update, message: message, text: text)
+            return await handleRetryCommand(args: parsed.args, update: update, message: message, text: text,
+                admissionReady: admissionReady)
 
         case .sessions, .resume:
             await handleExistingBotCommand(parsed: parsed, update: update, message: message, text: text, turn: turn)
@@ -129,7 +130,7 @@ extension TelegramPollLoop {
             return false
 
         case .model where parsed.args.isEmpty:
-            await handleModelMenuCommand(parsed: parsed, update: update, message: message, text: text, turn: turn)
+            await handleModelMenuCommand(update: update, message: message, text: text, turn: turn)
             return false
 
         case .approve, .deny:
@@ -271,7 +272,6 @@ extension TelegramPollLoop {
     }
 
     private func handleModelMenuCommand(
-        parsed: TelegramParsedSlashCommand,
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String,
@@ -365,12 +365,16 @@ extension TelegramPollLoop {
         args: [String],
         update: TelegramUpdate,
         message: TelegramMessage,
-        text: String
+        text: String,
+        admissionReady: @Sendable () -> Void
     ) async -> Bool {
+        defer { admissionReady() }
         let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
+        let claims: [TelegramUpdateClaim]
         do {
+            claims = try await updateInbox.snapshots()
             var pending: TelegramUpdateClaim?
-            for claim in try await updateInbox.snapshots().reversed()
+            for claim in claims.reversed()
                 where claim.update.message?.destination == message.destination {
                 if await turnCoordinator.isUpdateProcessing(claim.updateId) {
                     if claim.assistantDelivery?.isDelivered == false {
@@ -385,6 +389,7 @@ extension TelegramPollLoop {
                 }
             }
             if let saved = pending {
+                admissionReady()
                 if await turnCoordinator.isUpdateProcessing(saved.updateId) {
                     await sendCommandReply("I'm still delivering that answer.", kind: "retry_busy", update: update, message: message, text: text)
                 } else {
@@ -418,16 +423,19 @@ extension TelegramPollLoop {
                 return false
             }
         } catch {
+            admissionReady()
             await recordError(context: "retry_saved_reply", error: String(describing: error), update: update)
             await sendCommandReply("I couldn't read the saved answer delivery. Check the Mac error log before retrying.",
                 kind: "retry_unavailable", update: update, message: message, text: text)
             return false
         }
         if args == ["resend"] {
+            admissionReady()
             await sendCommandReply("There's no saved answer waiting to be delivered.", kind: "retry_unavailable", update: update, message: message, text: text)
             return false
         }
         guard attachmentChatHandler != nil else {
+            admissionReady()
             await sendCommandReply(
                 "I can't run anything here right now — chat isn't wired up on this surface.",
                 kind: "retry_unavailable",
@@ -438,24 +446,42 @@ extension TelegramPollLoop {
             return false
         }
         // Queued retries retain their resolved request across restart.
-        let retryText: String
-        let retryMessage: TelegramMessage?
         let retryClaim: TelegramUpdateClaim
+        let boundSessionId: String?
         do {
             retryClaim = try updateInbox.claim(updateId: update.updateId)
+            boundSessionId = try await TelegramSessionStore(dataRoot: dataRoot).boundSessionId(destination: message.destination)
         } catch {
-            await recordError(context: "retry_claim_read", error: String(describing: error), update: update)
+            await recordError(context: "retry_input_read", error: String(describing: error), update: update)
             return false
         }
+        let input: (text: String, message: TelegramMessage?, sessionId: String?)?
         if let pinned = retryClaim.resolvedRetryText {
-            retryText = pinned
-            retryMessage = retryClaim.resolvedRetryMessage
-        } else if let last = await turnCoordinator.lastUserMessage(destination: message.destination) {
-            retryText = last.text
-            retryMessage = last.message
+            var sourceSessionId = retryClaim.resolvedRetrySourceSessionId
+            if sourceSessionId == nil, let original = retryClaim.resolvedRetryMessage,
+               original.destination == message.destination {
+                let sessions = Set(claims.compactMap { claim -> String? in
+                    guard claim.updateId >= 0, claim.updateId != retryClaim.updateId,
+                          claim.phase != .quarantined, let source = claim.update.message,
+                          source.destination == original.destination, source.messageId == original.messageId,
+                          source.fromUserId == original.fromUserId else { return nil }
+                    return claim.resolvedSessionId ?? claim.assistantSessionId
+                })
+                if sessions.count == 1 { sourceSessionId = sessions.first }
+            }
+            input = (pinned, retryClaim.resolvedRetryMessage, sourceSessionId)
         } else {
+            input = await turnCoordinator.lastUserMessage(destination: message.destination).map {
+                ($0.text, $0.message, $0.sessionId)
+            }
+        }
+        guard let input, let sessionId = input.sessionId, sessionId == boundSessionId,
+              retryClaim.resolvedSessionId == nil || retryClaim.resolvedSessionId == sessionId else {
+            admissionReady()
             await sendCommandReply(
-                "There's nothing of yours to retry yet.",
+                retryClaim.resolvedRetryText != nil && input?.sessionId == nil
+                    ? "I couldn't verify which conversation that saved retry belongs to."
+                    : "There's no message to retry in this conversation.",
                 kind: "retry_unavailable",
                 update: update,
                 message: message,
@@ -463,21 +489,11 @@ extension TelegramPollLoop {
             )
             return false
         }
-        let sessionId: String
-        do {
-            if let saved = retryClaim.resolvedSessionId {
-                sessionId = saved
-            } else {
-                sessionId = try await TelegramSessionStore(dataRoot: dataRoot)
-                    .activeSessionId(destination: message.destination)
-            }
-        } catch {
-            await recordError(context: "retry_session", error: String(describing: error), update: update)
-            return false
-        }
+        let (retryText, retryMessage, _) = input
         do {
             _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing], to: .processing,
-                resolvedRetryText: retryText, resolvedRetryMessage: retryMessage, resolvedSessionId: sessionId)
+                resolvedRetryText: retryText, resolvedRetryMessage: retryMessage,
+                resolvedRetrySourceSessionId: sessionId, resolvedSessionId: sessionId)
         } catch {
             await recordError(context: "retry_input", error: String(describing: error), update: update)
             return false
@@ -508,7 +524,7 @@ extension TelegramPollLoop {
         }
 
         return await turnCoordinator.startTrackedTurn(destination: message.destination, text: retryText,
-            operation: retryOperation) != nil
+            operation: retryOperation)
     }
 
     /// Claim ownership begins before processing and ends after delivery settlement.
@@ -561,6 +577,7 @@ extension TelegramPollLoop {
             }
             preparedText = prepared.text
             await card.transition(.working(action: nil))
+            try Task.checkCancellation()
             let (reply, imagePaths, readingTurn) = try await runChatHandler(
                 destination: message.destination, text: prepared.text, attachments: prepared.attachments,
                 progress: makeProgressSink(delivery: delivery, card: card), context: prepared.context)
@@ -749,9 +766,9 @@ extension TelegramPollLoop {
                 )
                 transferred = false
             } else {
-                admissionReady()
+                if command?.definition.handler != .retry { admissionReady() }
                 transferred = await loop.handleSlashCommand(
-                    update: update, message: message, text: text
+                    update: update, message: message, text: text, admissionReady: admissionReady
                 )
             }
             // `true` means a tracked turn took the claim; that turn settles it.

@@ -4,7 +4,7 @@ import PersistenceCore
 import ToolRegistry
 import TrustCenter
 import TurnTrace
-// Blueprint: | `ParallelToolDispatch.swift` | `ParallelToolDispatch`; `isSerialFallbackForced`; `isParallelSafe` |
+// Blueprint: | `ParallelToolDispatch.swift` | `ParallelToolDispatch`; `isParallelSafe` |
 
 // MARK: - Parallel dispatch of independent tool calls
 // Group consecutive certified-safe reads under the concurrency cap; run unsafe calls alone and retain original slot order.
@@ -13,20 +13,6 @@ import TurnTrace
 public enum ParallelToolDispatch {
     /// Cap the live window and refill on completion so larger batches cannot create unbounded child work.
     static let maxConcurrentPerIteration = 4
-
-    /// Read the serial override once per process so dispatch policy stays stable.
-    static let serialFallbackEnvVar = "NATIVE_AGENT_SERIAL_TOOL_DISPATCH"
-
-    static func isSerialFallbackForced(env: [String: String]) -> Bool {
-        guard let raw = env[serialFallbackEnvVar]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !raw.isEmpty else { return false }
-        return ["1", "true", "yes", "on"].contains(raw)
-    }
-
-    static let effectiveForceSerial =
-        isSerialFallbackForced(env: ProcessInfo.processInfo.environment)
 
     /// Trust's declared class and catalog bucket certify parallel reads. Device, app-door and unplaced reads share one serial pair of hands.
     /// Writes always run alone.

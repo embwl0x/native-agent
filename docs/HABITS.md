@@ -28,10 +28,11 @@ the sibling lane's design and are not claimed by this lane.
   `ability.save`, 177 abilities kept. The keep fires on ONE occurrence (no
   repetition test; turn.js:22-32), so most of what it keeps is a one-off and
   most of what it costs is waste (~60 extra model calls a day).
-- Nothing binds what they kept to the moment that calls for it: a MY QUEUE
-  step's `action` is display only (Desk/DeskText.swift:379), the keep never
-  sets a wake, so every intention wake is a model turn. The office check-in
-  (desk.68, 9/16 daily) costs 5.2 calls a run and its words tell the model
+- At `c115aef637`, a MY QUEUE step's `action` appeared as a planned call.
+  `ResidentWake.carriedFingerprint` included it, so changing it could make the
+  step eligible for another wake. They still needed a model turn to run the call,
+  and the keep never set a wake. The office check-in
+  (desk.68, 9/16 daily) cost 5.2 calls a run and its words told the model
   "Run authored.office-checkin exactly ONCE".
 - Inside those turns they redoes kept abilities by hand (14:28Z: desk.close ×2
   by hand 17 min after keeping desk-close-with-proof).
@@ -87,7 +88,7 @@ There is no planning model call. An ability that itself declares model work
 can still do that work. The authored runner's `returned` value is inspected
 for `needs_me`, inside the door's result receipt.
 
-MY QUEUE's carried ledger (`AgentWorkspace/MyQueueCarried.swift`,
+MY QUEUE's carried ledger (`Desk/MyQueueCarried.swift`,
 `desk/my-queue-carried.json`) keeps the latest attempted occurrences (at most 256). It reserves an unknown-outcome receipt before effects and
 keeps the actual receipt through `settle` afterward. A stopped or interrupted
 attempt reaches their with that unknown outcome instead of running again.
@@ -95,17 +96,21 @@ An already-run receipt's `already_looked` handoff is also awaited through
 `settle`, under its original occurrence and route, before the next occurrence
 can replace the run. Readiness changes and Stop can cancel new work, never this handoff.
 Successful action plus speech reuses the run receipt if speech needs a retry.
+The receipt also saves its `Ran` note while speech is pending. If the step is
+closed or refiled first, the completed action's note still lands.
 Successful delivery records the occurrence and its owed Desk settlement in
 one carried-ledger write, then keeps its `Ran h:mm a` one-line note (and `Said`
 note when present) idempotently and closes a `once` step using a fresh
 unchanged-step snapshot. Launch and each carried pass finish saved debts
 without running the habit or speaking again, then mark them settled.
-Changed or already closed steps are left alone. Standing and rhythms remain open;
+Queue closure also finishes saved debts first. A changed or already closed
+step still receives its notes and keeps its status. An archived step receives
+them in its archive receipt. Rebinding a habit gives it a new occurrence key
+even at the same scheduled instant. Standing and rhythms remain open;
 their next occurrence is still owned by `IntentionClock`. An until condition
 in words still needs judgment: they reads it when the moment comes, and the
 after-turn judgment can close the step with quoted evidence that it is met. An unfinished/refused/needs-me result
-rides the step's moment as `already_looked` text. What comes out is the
-display-only planned call and the routine thought merely to decide to run it.
+rides the step's moment as `already_looked` text.
 
 ### H2 — a habit forms from what they keeps doing (their law, their choice)
 
@@ -151,21 +156,26 @@ its existing work-identification event now also names its work identity.
 Keeping happens inside the turn. After each tool round the native stem meets
 the turn's hand work so far, once per route per turn. The first meeting only
 records its `practice: ` line through `FamiliarLines.firstMet` in
-`mind/familiar.bin`. On the **second** and later meetings, while no active
-ability covers it, the round's last result carries `practice: {route, hand,
-loop?}`, at most once a turn, and the shipped turn makes it the note of their next
-`model.call`. There is no private call after the reply.
+`mind/familiar.bin`. On the **second** and later meetings the round's last
+result carries `practice: {route, hand, loop?, ability?}`, at most once a turn,
+and the shipped turn makes it the note of their next `model.call`. There is no private call after the reply.
 
 A practice is the ordered tool/action ids of the turn's landed writes or
 irreversible non-ability calls, without arguments or incidental reads. When
 there is no such hand work, it is the one call repeated 3+ rounds, counted
 once. A practice worth keeping replaces at least two calls (or is that one
 call looped 3+ rounds): a lone write, however often they makes it, is just
-using the tool. An active ability's current learned-use or validation route
-suppresses the note when it contains those ids in order; declared reach proves
-no route.
+using the tool. When an active ability's current learned-use or validation
+route makes exactly those ids in order (its other steps only reads: a call
+recorded with no effect, or a read verb such as `.read`, `.query`, `.list`),
+the note names it instead of asking for a new one:
+`ability: {id, description, worked: true}` when its newest covering run's own
+outcome (`last`, beside its time) completed or it passed validation, so they
+uses it next time; otherwise `ability: {id, description, failed}` with the step
+that run failed at, so they repairs it under its id. The note never asks their to
+redo work that has landed. Declared reach proves no route.
 
-`practice.keep` traces `{practice, met: "first"|"again", noted: bool}`, or
+`practice.keep` traces `{practice, met: "first"|"again", noted: bool, ability?}`, or
 `failed` with the cause when familiarity or the ability index cannot be read
 (the turn goes on without the note). `noted` says the note was sent, not that
 they saved an ability. Familiarity uses the existing bounded line record; it is
@@ -202,8 +212,9 @@ The `compiled` manifest field has no reader or producer.
   `needs_me` opens a thought with `already_looked`.
 - The habit line appears on a step they have handled the same way ≥ standing.
 - H3: first hand-work meeting traces `met:first, noted:false`; a later meeting
-  traces `met:again`, with `noted:true` only when no active recorded route covers
-  it, and the turn's next `llm.call` carries the note. Installed proof belongs to
+  traces `met:again, noted:true`, and the turn's next `llm.call` carries the
+  note, naming the covering ability (to run, or with its failed step to
+  repair) when an active recorded route covers it. Installed proof belongs to
   the release lead; lanes run no separate tests or builds.
 
 ## Lanes

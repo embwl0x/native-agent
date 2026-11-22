@@ -5,15 +5,9 @@ import NativeAgentCore
 import TrustCenter
 import PersistenceCore
 import ApplicationServices
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(UserNotifications)
 import UserNotifications
-#endif
 // Blueprint: | `MacSavePanelPlacement.swift` | Event-ordered Go-to-folder sheet, focused-field delivery and native directory URL proof |
 extension SwiftNativeMacControl {
     /// Directory and basename use separate controls; the common act loop verifies both.

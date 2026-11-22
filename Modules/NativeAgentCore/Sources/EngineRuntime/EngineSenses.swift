@@ -33,16 +33,15 @@ public final class SensesFacade {
                 presentationIssue = nil
             case .failure(let error): presentationIssue = error.localizedDescription
             }
-            let view = next.view.flatMap { $0.isCurrent(in: records) ? $0 : nil }
-            if interactiveView != view {
-                interactiveView = view
-                interactiveRevision = view.map { _ in UUID().uuidString }
-            }
+            let view = next.presentation.flatMap { $0.view.isCurrent(in: records) ? $0 : nil }
+            if interactiveView != view?.view { interactiveView = view?.view }
+            if interactiveRevision != view?.revision { interactiveRevision = view?.revision }
         })
     }
 
-    private func readPresentation() async -> (registry: Result<([SenseRecord], [SenseCorner: String]), Error>, view: SenseInteractiveView?) {
-        async let view = SenseNewsBoard.shared.interactiveView()
+    private func readPresentation() async -> (registry: Result<([SenseRecord], [SenseCorner: String]), Error>,
+                                             presentation: (view: SenseInteractiveView, revision: String)?) {
+        async let view = SenseNewsBoard.shared.interactivePresentation()
         let registry: Result<([SenseRecord], [SenseCorner: String]), Error>
         do {
             registry = .success(try await SensesHub.shared.presentationRecords())

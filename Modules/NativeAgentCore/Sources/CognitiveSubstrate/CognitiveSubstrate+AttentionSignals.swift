@@ -1,3 +1,4 @@
+import NativeAgentShared
 // A bounded projection of resident attention for context selection. Publication compiles accepted state; cancellation belongs to the turn read. Empty attention
 // contributes no packet input.
 
@@ -88,7 +89,7 @@ extension CognitiveSubstrate {
         let summary = node.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !summary.isEmpty else { return nil }
         // The constructor bounds to 200; clip the summary first so the framing prefix always survives the bound.
-        let snippet = bounded(summary, maxCharacters: 150)
+        let snippet = TextClipping.prefixOrWhole(summary, maxCharacters: 150)
         return ("Still waiting to see how this landed: \(snippet)", window)
     }
 

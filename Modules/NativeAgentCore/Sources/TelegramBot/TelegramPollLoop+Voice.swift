@@ -13,7 +13,7 @@ extension TelegramPollLoop {
     ) async {
         var row: [String: JSONValue] = [
             "id": .string(UUID().uuidString),
-            "at": .string(_tgNowString()),
+            "at": .string(NativeTimestampFormat.fractionalZulu(Date())),
             "kind": .string("voice_transcription"),
             "chatId": .string(String(message.chatId)),
             "messageId": .int(Int64(message.messageId)),
@@ -46,36 +46,41 @@ extension TelegramPollLoop {
         }
     }
 
+    /// Plain words first, what to do next; the raw cause only at the end, in parentheses.
     static func voiceTranscriptionNotice(for error: Error) -> String {
         let cause = TurnSecretRedactor.redactText(error.localizedDescription)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ". \n"))
         switch error {
         case is CancellationError:
-            return "voice_cancelled: Voice transcription was cancelled. No transcript was confirmed; no further action is needed for this attempt."
+            return "Voice transcription was cancelled. No transcript was confirmed; no further action is needed for this attempt."
         case TelegramMediaDownloadError.oversized(let bytes, let cap):
-            return "voice_oversized: Voice note is \(bytes) bytes; limit \(cap). Send a shorter note in this conversation."
+            return "This voice note is too big to transcribe (\(bytes) bytes; the limit is \(cap)). Send a shorter note in this conversation."
         case TelegramVoiceTranscriptionError.speechPermissionDenied(let state):
             if state == "not determined" {
-                return "voice_permission_required: \(cause). In Telegram setup, choose Set up Telegram voice and approve Speech Recognition."
+                return "Speech Recognition has not been allowed on the Mac yet, so this voice note was not transcribed. "
+                    + "In Telegram setup, choose Set up Telegram voice and approve Speech Recognition."
             }
             return """
-                voice_permission_denied: \(cause). Allow NativeAgent in System Settings → Privacy & Security → Speech Recognition; \
-                a restricted grant needs the Mac administrator.
+                Speech Recognition is turned off for NativeAgent on the Mac, so this voice note was not transcribed. Allow NativeAgent in \
+                System Settings → Privacy & Security → Speech Recognition; a restricted grant needs the Mac administrator.
                 """
         case TelegramVoiceTranscriptionError.speechUnavailable:
-            return "voice_speech_unavailable: \(cause). Check the recognition language and service availability in macOS Dictation settings."
+            return "\(cause). Check the recognition language and service availability in macOS Dictation settings."
         case TelegramVoiceTranscriptionError.conversionFailed:
-            return "voice_conversion_failed: \(cause). Send M4A, MP3 or WAV audio in this conversation."
+            return "\(cause). Send M4A, MP3 or WAV audio in this conversation."
+        case TelegramVoiceTranscriptionError.malformedResponse:
+            return "No words could be made out in that voice note. Type the message in this conversation."
         case TelegramVoiceTranscriptionError.speechRecognitionFailed(let detail):
             let description = detail.lowercased()
             if description.contains("dictation") {
-                return "voice_dictation_blocked: \(cause). Enable Dictation in System Settings → Keyboard → Dictation."
+                return "I can't hear voice notes yet: turn on Dictation on the Mac (System Settings → Keyboard → Dictation), or send it as text."
             }
             if description.contains("timed out") {
-                return "voice_timeout: \(cause). No transcript was confirmed; type the message in this conversation."
+                return "Transcribing the voice note timed out. No transcript was confirmed; type the message in this conversation. (\(cause))"
             }
         default: break
         }
-        return "voice_transcription_failed: \(cause). Type the message in this conversation."
+        return "The voice note could not be transcribed. Type the message in this conversation. (\(cause))"
     }
 
     static func voiceAttachment(from message: TelegramMessage) -> TelegramMediaAttachment? {

@@ -9,15 +9,14 @@ import ProviderRouting
 public struct SessionContextRequest: Sendable {
     public let characters: Int
     public let historyCharacters: Int
-    public let rowCharacters: [String: Int]
     public init(messages: [LLMMessage], system: String?, tools: [LLMToolSchema],
-                historyCharacters: Int, rowCharacters: [String: Int]) throws {
+                historyCharacters: Int) throws {
         try self.init(messages: messages,
             systemAndToolsCharacters: LLMMessage.inputCharacters([], system: system, tools: tools),
-            historyCharacters: historyCharacters, rowCharacters: rowCharacters)
+            historyCharacters: historyCharacters)
     }
     package init(messages: [LLMMessage], systemAndToolsCharacters: Int,
-                 historyCharacters: Int, rowCharacters: [String: Int]) throws {
+                 historyCharacters: Int) throws {
         let (count, overflow) = LLMMessage.inputCharacters(messages, system: nil, tools: [])
             .addingReportingOverflow(systemAndToolsCharacters)
         guard !overflow, systemAndToolsCharacters >= 0 else {
@@ -25,7 +24,6 @@ public struct SessionContextRequest: Sendable {
         }
         characters = count
         self.historyCharacters = historyCharacters
-        self.rowCharacters = rowCharacters
     }
     public typealias Builder = @Sendable ([JSONValue], Int, Data?) async throws -> SessionContextRequest
 
@@ -56,7 +54,7 @@ package struct SessionReplaySpec: Codable, Sendable {
 
     package func messages(_ rows: [JSONValue], sessionId: String, dataRoot: URL) throws -> [ChatMessage] {
         let selected = SessionHistoryReader(dataRoot: dataRoot).promptMessagesWithStats(
-            transcript: try SessionContextRequest.transcript(rows), excludingRunId: nil).prompt
+            transcript: try SessionContextRequest.transcript(rows), excludingRunId: nil)
         return SessionHistoryTail.select(
             try selected.checkedMessages(), beforeQuestionID: replacementUserMessageID, excludingRunID: excludedRunID)
     }
@@ -129,7 +127,7 @@ package struct SessionContextPlan: Codable, Sendable {
             let seed = SessionRequestMessages.seed(history: history.messages, block: sent.block,
                 model: model, provider: provider, userText: "", images: [])
             return try SessionContextRequest(messages: seed.messages, systemAndToolsCharacters: fixedCharacters,
-                historyCharacters: history.characters, rowCharacters: history.rowCharacters)
+                historyCharacters: history.characters)
         }
         guard let admission else { return try request(.empty) }
         let history = SessionHistoryMessages.project(admission)

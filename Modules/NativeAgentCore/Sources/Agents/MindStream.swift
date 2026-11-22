@@ -275,8 +275,9 @@ public actor MindStream: AttentionStream {
                 let hit = acted || wonderingSaved == true
                 // A thought its record ended on CPU is withheld: it is no evidence for the record that ended it.
                 let status = hit ? "hit" : wonderingSaved == nil ? "failed" : silent && response.isSilentCompletion ? "withheld" : "empty"
-                await Attention.record(thought: recorded, id: "thought:" + held.run, status: status, cause: thought.happenings, dataRoot: dataRoot, steeredBy: held.steeringStamp(sources: earlierSources))
+                // What it carried is accepted first: a quit before the record then loses a learning row, never re-offers work already done.
                 await Attention.settle(happenings, by: .init(source: "thought", id: "thought:" + held.run), dataRoot: dataRoot)
+                await Attention.record(thought: recorded, id: "thought:" + held.run, status: status, cause: thought.happenings, dataRoot: dataRoot, steeredBy: held.steeringStamp(sources: earlierSources))
             }
         } catch {
             nativeLog("MindStream: thought did not settle; what it carried stays owed: %@", error.localizedDescription)
@@ -491,18 +492,7 @@ public actor MindStream: AttentionStream {
     private func readReturns(_ session: String) async -> ReturnRead? {
         guard let owed = try? await owedOnRoute(session) else { return nil }
         do {
-            var batches = try await Attention.batches(on: session, dataRoot: dataRoot)
-            for claim in try await lifecycle.attentionReturns(in: session, excluding: Set(batches.map { $0.batch.deliveryID })) {
-                // The old form did not record membership. Preserve its whole-route behavior once, with the claim's original digest.
-                let held = Set(batches.flatMap { $0.batch.members })
-                let anchorID = String(claim.id.dropFirst("return:".count))
-                guard !held.contains(anchorID), let anchor = owed.first(where: { $0.id == anchorID }) else { continue }
-                var members = [anchor]
-                members.append(contentsOf: owed.filter { $0.id != anchorID && !held.contains($0.id) })
-                let batch = try await Attention.accept(.init(route: session, deliveryID: claim.id,
-                    members: members.map(\.id), digest: claim.digest), dataRoot: dataRoot)
-                batches.append((batch, nil))
-            }
+            let batches = try await Attention.batches(on: session, dataRoot: dataRoot)
             return ReturnRead(owed: owed, batches: batches)
         } catch {
             oweRead(session, error: error)

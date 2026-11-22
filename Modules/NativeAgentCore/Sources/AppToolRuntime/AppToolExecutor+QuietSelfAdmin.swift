@@ -146,11 +146,6 @@ extension AppToolExecutor {
             extra: ["requested": .string(raw), "pages": .array(pages.map { .string($0) })])
     }
 
-    private static func text(_ value: JSONValue?) -> String {
-        guard case .string(let raw)? = value else { return "" }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
     // MARK: - Chat
 
     /// Full Mac permits user effects. Below it, only verified user-started turns may move their screen, speak or touch their conversation.
@@ -269,7 +264,7 @@ extension AppToolExecutor {
     /// each setting's item read (`settings_read`).
     @MainActor
     func runAppPageRead(input: [String: JSONValue], turn: Turn) async -> JSONValue {
-        let requested = Self.text(input["page"])
+        let requested = JSONValue.trimmedStringOrEmpty(input["page"])
         if requested.lowercased() == "context" { return await presentation.contextReceiptRead(input: input) }
         if requested.lowercased() == "agent_view" { return await presentation.agentViewRead(input: input) }
         let current = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "current"
@@ -325,8 +320,8 @@ extension AppToolExecutor {
     @MainActor
     private func settingGate(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> Result<GatedSetting, GateRefusal> {
         func refuse(_ answer: JSONValue) -> Result<GatedSetting, GateRefusal> { .failure(GateRefusal(answer: answer)) }
-        let requestedPage = Self.text(input["page"])
-        let requestedSetting = Self.text(input["setting"])
+        let requestedPage = JSONValue.trimmedStringOrEmpty(input["page"])
+        let requestedSetting = JSONValue.trimmedStringOrEmpty(input["setting"])
         guard !requestedSetting.isEmpty else {
             return refuse(Self.failure("missing_setting", "Name the setting. Its page read (app {page}) has the names."))
         }
@@ -373,14 +368,14 @@ extension AppToolExecutor {
                   receipt["new_value"] == currentValue else {
                 return refuse(Self.failure("stale_setting", "The setting changed after that receipt. Read its page again. Nothing was written."))
             }
-            request = Self.text(receipt["user_request"])
+            request = JSONValue.trimmedStringOrEmpty(receipt["user_request"])
             restoresPrevious = true
         } else if !setting.mindOwned, !decided,
                   await Self.freshQuietPosture()?.name != Self.fullMacModeName {
             // Under Full Mac the agent's own dials are its own; below it the agent's change needs someone's ask: in the person's own turn,
             // their ask (`Turn.personsAsk`); in any other turn, words asking for it quoted in because, said in this conversation by someone
             // whose words count.
-            let quoted = Self.text(input["because"] ?? input["__because"])
+            let quoted = JSONValue.trimmedStringOrEmpty(input["because"] ?? input["__because"])
             let value = input["value"] ?? .null
             if let asked = await turn.personsAsk?() {
                 request = asked
@@ -522,7 +517,7 @@ extension AppToolExecutor {
     /// setting.get reads the same page-owned state and names as setting.set.
     @MainActor
     func runAppSettingGet(input: [String: JSONValue], turn: Turn) async -> JSONValue {
-        let requested = Self.text(input["setting"])
+        let requested = JSONValue.trimmedStringOrEmpty(input["setting"])
         guard !requested.isEmpty else {
             return Self.failure("missing_setting", "Name the setting. Its page read (app {page}) has the names.")
         }

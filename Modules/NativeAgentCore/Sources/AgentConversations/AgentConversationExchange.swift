@@ -31,21 +31,21 @@ extension AgentConversationExchange {
         let root: [String: JSONValue]
         if case .object(let fields)? = row.receipt { root = fields } else { root = [:] }
         let value = row.sendEvidence
-        resultID = Self.string(value["entry_id"]).flatMap(UUID.init(uuidString:))
+        resultID = value["entry_id"]?.nonblankString.flatMap(UUID.init(uuidString:))
         status = Self.state(row.sendStatus)
-        if let card = Self.string(root["approvalId"]) { approvalId = card }
+        if let card = root["approvalId"]?.nonblankString { approvalId = card }
         let answer = row.sendFailed ? (text: nil as String?, truncated: false) : Self.answer(root)
         // Replace, never carry an older answer through a failed/unknown read.
         let text = answer.text.map { Self.clipped($0, limit: Self.textLimit) }
         reply = text?.text
-        partialReply = Self.string(value["partial_reply"]).map { Self.clipped($0, limit: Self.textLimit).text }
+        partialReply = value["partial_reply"]?.nonblankString.map { Self.clipped($0, limit: Self.textLimit).text }
         replyTruncated = text.map { answer.truncated || $0.truncated } ?? false
     }
 
     /// Extract full words before receipt clipping; the canonical contact thread must retain the complete reply.
     static func answer(_ root: [String: JSONValue]) -> (text: String?, truncated: Bool) {
         let value = AgentConversationRecord.sendEvidence(.object(root))
-        return (Self.string(value["reply"]) ?? Self.string(value["answer"]) ?? Self.string(value["findings"]),
+        return (value["reply"]?.nonblankString ?? value["answer"]?.nonblankString ?? value["findings"]?.nonblankString,
                 value["reply_truncated"] == .bool(true))
     }
 
@@ -137,15 +137,10 @@ extension AgentConversationExchange {
     }
 
     private static func repliedAt(_ receipt: JSONValue?, after sent: Date, key: String) -> Date? {
-        guard case .object(let fields)? = receipt, let text = string(fields[key]) else { return nil }
+        guard case .object(let fields)? = receipt, let text = fields[key]?.nonblankString else { return nil }
         let at = key == "ended_at" ? NativeTimestampFormat.parseISO8601(text) : NativeTimestampFormat.parseISO8601FractionalFirst(text)
         guard let at, at >= sent, at <= Date() else { return nil }
         return at
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return text
     }
 
     private static func state(_ text: String) -> String {

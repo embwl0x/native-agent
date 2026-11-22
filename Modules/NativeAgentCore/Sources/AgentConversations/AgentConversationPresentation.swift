@@ -24,7 +24,7 @@ extension AgentConversationSession {
             if row.readInput == nil { current = row }
             else { current = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform) }
             result = AgentConversationView.view(current, details: false, read: true, dataRoot: dataRoot, includeHistory: conversation.returnsHistory)
-            consumeRead(result, turn: turn, peer: peer, message: string(current.readInput?["message_id"]), scope: scope, conversation: conversation,
+            consumeRead(result, turn: turn, peer: peer, message: current.readInput?["message_id"]?.nonblankString, scope: scope, conversation: conversation,
                             dataRoot: dataRoot)
         }
         // Deduplicate identical replies within ten minutes when merging contact and asking-chat history.
@@ -33,8 +33,7 @@ extension AgentConversationSession {
         let turns = try await AgentScreen.routineReplies(workspace: workspace, dataRoot: dataRoot).filter { turn in
             !said.contains { !$0.mine && $0.text == turn.text && abs($0.at.timeIntervalSince(turn.date ?? $0.at)) < 600 }
         }
-        let talk = ContactThread.project((said + turns).sorted { $0.at < $1.at }.suffix(8), names: [agent: name], unattested: name,
-            mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
+        let talk = ContactThread.project((said + turns).sorted { $0.at < $1.at }.suffix(8), names: [agent: name], unattested: name)
         guard case .object(var fields) = result, !talk.isEmpty else { return result }
         if talk.contains(where: { !$0.mine }) {
             // A superseded ask’s late answer must not settle the current ask.
@@ -93,7 +92,7 @@ extension AgentConversationSession {
     static func consumeRead(_ result: JSONValue, turn: Turn, peer: AgentPeerContact?, message: String?, scope: String, conversation: AgentConversationContext,
                             dataRoot: URL) {
         guard conversation.consumesAnswer, let peer, peer.transport == .grokBot, let message, case .object(let fields) = result,
-              let reply = string(fields["reply"]) else { return }
+              let reply = fields["reply"]?.nonblankString else { return }
         do {
             try GrokRequestStore(dataRoot: dataRoot).shown(byReadIn: scope, message, peer: peer.id, reply: reply,
                                                            truncated: fields["reply_truncated"] == .bool(true))
@@ -115,12 +114,12 @@ extension AgentConversationSession {
             absorb(receipt, into: &$0)
             // A held send's record begins before the row that hands it out is saved: no held message goes out without its record.
             if heldSend($0) {
-                let task = if case .object(let fields) = receipt { string(fields["task_id"]) } else { nil as String? }
+                let task = if case .object(let fields) = receipt { fields["task_id"]?.nonblankString } else { nil as String? }
                 try store.held.send($0, conversation: $0.conversationID ?? AgentConversationStore.heldThread(peerID: String($0.agent.dropFirst(5))),
                     task: task)
             }
-            if stopped, !AgentConversationRunning.shared.observing(row: row.id, operation: row.operationID) {
-                let detail = if case .object(let fields) = receipt { string(fields["detail"]) } else { nil as String? }
+            if stopped {
+                let detail = if case .object(let fields) = receipt { fields["detail"]?.nonblankString } else { nil as String? }
                 $0.stop = AgentConversationStop(state: "released", operationID: row.operationID, at: Date(), detail: detail
                     ?? stoppedDetail(row.name))
                 $0.phase = "ready"
@@ -176,16 +175,16 @@ extension AgentConversationSession {
         let fields: [String: JSONValue] = if case .object(let value) = receipt { value } else { [:] }
         let remedy: [String: JSONValue] = if case .object(let value)? = reply.remedy { value } else { [:] }
         let call = remedy["next_call"].flatMap { $0.objectValue }.flatMap { try? JSONValue.object($0).serialize(pretty: false) }
-        let kind = string(remedy["kind"])
-        let status = string(fields["status"])
-        return ToolFailureError(string(fields["detail"]) ?? string(fields["error"]) ?? "The agent read returned no conversation receipt.",
-            effects: .none, owner: string(remedy["owner"]) ?? agent,
+        let kind = remedy["kind"]?.nonblankString
+        let status = fields["status"]?.nonblankString
+        return ToolFailureError(fields["detail"]?.nonblankString ?? fields["error"]?.nonblankString ?? "The agent read returned no conversation receipt.",
+            effects: .none, owner: remedy["owner"]?.nonblankString ?? agent,
             nextCall: call ?? (kind == "terminal" || remedy["tap"] != nil ? nil : ToolFailureError.call("app", ["action": .string("agent.contacts")])),
-            tap: string(remedy["tap"]), personDecides: kind == "person_decides",
-            code: string(fields["failure_code"]) ?? string(fields["reason"]) ?? status ?? "agent_conversation_read_unavailable",
+            tap: remedy["tap"]?.nonblankString, personDecides: kind == "person_decides",
+            code: fields["failure_code"]?.nonblankString ?? fields["reason"]?.nonblankString ?? status ?? "agent_conversation_read_unavailable",
             status: status.flatMap(ToolFailureError.Status.init(rawValue:)) ?? (["blocked", "denied", "blocked_by_trust"].contains(status ?? "")
                 || AgentConversationRecord.approvalWaits(status ?? "") ? .refused : .failed),
-            instruction: string(remedy["instruction"]) ?? "Read contacts for this agent's access requirement before opening the conversation.",
+            instruction: remedy["instruction"]?.nonblankString ?? "Read contacts for this agent's access requirement before opening the conversation.",
             recovery: kind.flatMap(ToolFailureError.Recovery.init(rawValue:)) ?? (call == nil ? .inspect : .repair))
     }
     package static func absorb(_ receipt: JSONValue, into row: inout AgentConversationRecord) {
@@ -198,15 +197,15 @@ extension AgentConversationSession {
         // A lookup before its work is visible, or while its receipt is unreadable, is not a terminal no-reply result.
         if row.readInput != nil, row.phase == "waiting",
            case .object(let root) = receipt,
-           ["not_found", "unavailable", "unknown"].contains(string(root["status"]) ?? ""),
+           ["not_found", "unavailable", "unknown"].contains(root["status"]?.nonblankString ?? ""),
            root["terminal"] != .bool(true), root["sent"] != .bool(false) {
             return
         }
         row.receipt = AgentConversationStore.cacheReceipt(receipt)
         guard case .object(let root) = receipt else { row.phase = "attention"; return }
         let value = row.sendEvidence
-        if let conversation = string(value["conversation_id"]) ?? string(value["conversationId"]) { row.conversationID = conversation }
-        else if let thread = string(value["thread_id"]) { row.conversationID = "codex:" + thread }
+        if let conversation = value["conversation_id"]?.nonblankString ?? value["conversationId"]?.nonblankString { row.conversationID = conversation }
+        else if let thread = value["thread_id"]?.nonblankString { row.conversationID = "codex:" + thread }
         // No saved chat remains null until an explicit send opens one.
         else if value["conversation_id"] == .null { row.conversationID = nil }
         if case .object(let action)? = root["read_with"], case .object(var read)? = action["input"] {
@@ -246,23 +245,20 @@ extension AgentConversationSession {
         // Only a new explicit message may try again after a pre-dispatch refusal. Pending approvals and uncertain/accepted sends still require recovery; the
         // adapter rechecks current authority and connection on every attempt.
         return ["reconnect_required", "unavailable", "needs_setup", "no_outbound_route",
-                "blocked", "denied", "blocked_by_trust", "busy", "invalid_arguments"].contains(string(receipt["status"]) ?? "")
+                "blocked", "denied", "blocked_by_trust", "busy", "invalid_arguments"].contains(receipt["status"]?.nonblankString ?? "")
     }
     static func isRefusal(_ receipt: JSONValue) -> Bool {
         guard case .object(let row) = receipt else { return true }
         return readRefused(receipt) || row["sent"] == .bool(false)
-            || ["needs_setup", "no_outbound_route"].contains(string(row["status"]) ?? "")
+            || ["needs_setup", "no_outbound_route"].contains(row["status"]?.nonblankString ?? "")
     }
     /// Read refusals require errors or explicit gates; `sent: false` and missing outbound routes permit reads.
     package static func readRefused(_ receipt: JSONValue) -> Bool {
         guard case .object(let row) = receipt else { return true }
-        if ["needs_setup", "no_outbound_route"].contains(string(row["status"]) ?? "") { return false }
+        if ["needs_setup", "no_outbound_route"].contains(row["status"]?.nonblankString ?? "") { return false }
         let reply = ToolResult(.object(row.filter { $0.key != "result" }))
         return (row["terminal"] != .bool(true) && reply.carriesFailureEvidence)
-            || AgentConversationRecord.approvalWaits(string(row["status"]) ?? "")
-    }
-    static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let value)? = value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }; return value
+            || AgentConversationRecord.approvalWaits(row["status"]?.nonblankString ?? "")
     }
     static func unknownContact(_ agent: String, contacts: [(String, String)]) -> JSONValue {
         let requested = Array(agent.lowercased())
@@ -280,7 +276,7 @@ extension AgentConversationSession {
             "detail": .string("No contact has that name. Choose one of the nearest contacts or read agent.contacts.")])
     }
     static func agentIsBot(_ input: [String: JSONValue]) -> Bool {
-        string(input["agent"])?.hasPrefix("bot:") == true
+        input["agent"]?.nonblankString?.hasPrefix("bot:") == true
     }
     static func attention(_ name: String, label: String, _ text: String) -> JSONValue {
         .object(["agent": .string(name), "conversation": .string(label), "state": .string("attention"), "detail": .string(text), "sent": .bool(false)])

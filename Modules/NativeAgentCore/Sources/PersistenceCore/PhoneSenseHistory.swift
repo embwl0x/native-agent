@@ -34,7 +34,8 @@ public enum PhoneSenseHistory {
             func on(_ source: PhoneSenseEvent.Source) -> Bool {
                 events.filter { $0.source == source && $0.isSetup }.max { $0.timestamp < $1.timestamp }?.setup?.enabled != false
             }
-            var readings = PhoneSenseEvent.Source.allCases.filter(on).compactMap { source -> String? in
+            // Location is there to look at when wanted, not carried along with every phone message.
+            var readings = PhoneSenseEvent.Source.allCases.filter { $0 != .location && on($0) }.compactMap { source -> String? in
                 guard let latest = events.filter({ $0.source == source && !$0.isSetup }).max(by: { $0.timestamp < $1.timestamp }),
                       (0...freshFor).contains(now.timeIntervalSince(latest.timestamp)) else { return nil }
                 return observationLine(latest, now: now)
@@ -64,6 +65,7 @@ public enum PhoneSenseHistory {
                 """]
             if let reading = events.filter({ $0.source == source && !$0.isSetup }).max(by: { $0.timestamp < $1.timestamp }) {
                 lines.append("phone \(source.title) \(reading.value)" + (reading.confidence.map { " (\($0) confidence)" } ?? "")
+                    + (reading.summary.map { "; \($0)" } ?? "") + " at \(reading.timestamp.formatted(.iso8601))"
                     + ((0...freshFor).contains(now.timeIntervalSince(reading.timestamp)) ? "" : "; current unknown"))
             } else if source != .places { lines.append(
                 "\(source.title): no observation received; use its setup steps below, then open the phone app. Silence is not a verdict.") }

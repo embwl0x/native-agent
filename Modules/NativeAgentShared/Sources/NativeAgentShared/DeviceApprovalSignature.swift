@@ -6,7 +6,7 @@ import Foundation
 /// The device ID is the fingerprint of its Ed25519 public key. The outer transport HMAC covers this signature too; neither signature replaces it.
 public enum DeviceApprovalSignature {
     public static func deviceID(publicKey: Data) -> String {
-        SHA256.hash(data: publicKey).map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(publicKey)
     }
 
     public static func canonicalBody(_ envelope: Data) throws -> Data {

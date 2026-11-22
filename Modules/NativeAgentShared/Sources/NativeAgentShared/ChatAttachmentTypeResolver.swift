@@ -1,9 +1,17 @@
 import Foundation
-// Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver`, `typeAndMime`, `fileByteLimit`, `submittingSpeech` |
+// Blueprint: | `ChatAttachmentTypeResolver.swift` | Chat file types and byte limits, speech correction in attachments, and voice-draft joining |
 
 /// Supported chat files have the same type and byte ceiling on every door.
 public enum ChatAttachmentTypeResolver {
     public static let fileByteLimit = 10_000_000
+
+    public static func voiceDraft(base: String, transcript: String) -> String {
+        let base = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { return spoken }
+        if spoken.isEmpty { return base }
+        return base + " " + spoken
+    }
 
     public static func submittingSpeech(_ attachments: [MultimodalAttachment], text: String) -> [MultimodalAttachment] {
         attachments.map {

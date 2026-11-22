@@ -161,10 +161,12 @@ public struct MacActStep: Sendable, Equatable {
     public let button: String?
     public let handle: String?
     public let frameID: String?
+    public let direction: String?
+    public let scrollAmount: Int?
 
     public init(verb: String, target: String, text: String? = nil, mode: MacTypeMode = .replace,
                 to: String? = nil, place: MacImagePlace? = nil, holding: String? = nil, button: String? = nil,
-                handle: String? = nil, frameID: String? = nil) {
+                handle: String? = nil, frameID: String? = nil, direction: String? = nil, scrollAmount: Int? = nil) {
         self.verb = verb
         self.target = target
         self.text = text
@@ -175,6 +177,8 @@ public struct MacActStep: Sendable, Equatable {
         self.button = button
         self.handle = handle
         self.frameID = frameID
+        self.direction = direction
+        self.scrollAmount = scrollAmount
     }
 }
 

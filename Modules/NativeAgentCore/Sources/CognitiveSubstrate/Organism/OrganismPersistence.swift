@@ -231,7 +231,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
                 return copy
             }
         // Count an expiry only when its row turns terminal, using the same live-sweep rule. Decay prior evidence before adding this newly observed outcome.
-        next.outcomeCountsByKind = forgottenOutcomeCounts(next.outcomeCountsByKind, at: now, hours: evidenceHours)
+        next.outcomeCountsByKind = forgottenOutcomeCounts(next.outcomeCountsByKind, hours: evidenceHours)
         next.expiredCount = min(next.expiredCount, Int.max - expiredHorizons) + expiredHorizons
         for kind in expiredKinds.sorted(by: { $0.rawValue < $1.rawValue }) {
             next.expiredCount = min(next.expiredCount, Int.max - 1) + 1
@@ -248,7 +248,6 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
     /// relax.
     private func forgottenOutcomeCounts(
         _ counts: [String: OrganismPredictionOutcomeCounts],
-        at now: Date,
         hours: Double
     ) -> [String: OrganismPredictionOutcomeCounts] {
         let halfLifeHours = OrganismCapabilitySelfModel.evidenceHalfLife / 3_600

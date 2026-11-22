@@ -120,202 +120,18 @@ extension InlineInteractionResolver {
     ) async -> Verification {
         switch interaction.kind {
         case .connector:
-            if interaction.target == "mail" {
-                let readiness = await platform.mailReadiness(root: dataRoot, check: checkMail)
-                guard readiness.status == "ready" else {
-                    if let next = readiness.next { return .failure(next) }
-                    return .failure(readiness.word)
-                }
-                let summary = "Mail connected" + (readiness.next.map { ". " + $0 } ?? "")
-                return .success(.init(selection: "mail", summary: summary))
-            }
-            if interaction.target == "chrome" {
-                let status = await platform.chromeConnectionStatus()
-                guard status.enabled, status.connected else {
-                    return .failure("Chrome isn't connected yet. "
-                        + platform.chromeSteps)
-                }
-                return .success(.init(selection: "chrome", summary: "Chrome connected"))
-            }
-            if interaction.target == "iphone" {
-                guard let standing = await platform.phoneStanding() else {
-                    return .failure("Paired iPhone storage is unavailable. Restore access to the paired-phone store before checking setup again.")
-                }
-                // The card asks for a phone that can approve: its device key paired with the Pair button, not merely a phone that chats.
-                guard standing.canApprove else {
-                    return .failure(standing.line + " Open NativeAgent on the iPhone, then choose Pair here when the codes match.")
-                }
-                return .success(.init(selection: "iphone", summary: "iPhone can approve"))
-            }
-            // Read derived connector auth state so a rejected saved token cannot count as connected.
-            let target = ConnectorSetup.canonicalID(interaction.target)
-            let records: [InlineInteractionConnectorStatus]
-            do { records = try await platform.connectorRecords(root: dataRoot) }
-            catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
-            guard let record = records.first(where: {
-                ConnectorSetup.canonicalID($0.id) == target
-            }) else {
-                return .failure("\(interaction.title) isn't in Connectors on this Mac.")
-            }
-            // Telegram configuration proves a saved enabled bot; only a successful poll proves health.
-            let name = await Task.detached { InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot) }.value
-            guard record.authState == "connected"
-                || (target == "telegram" && record.authState == "configured" && record.healthStatus != "disabled")
-            else {
-                return .failure(
-                    "\(name) still isn't connected."
-                )
-            }
-            return .success(.init(
-                selection: target,
-                summary: "\(name) connected"
-            ))
+            return await verifyConnector(interaction, dataRoot: dataRoot, checkMail: checkMail)
         case .permission:
-            // Verify the entire chain against each capability's owner; integration axes and Trust categories have separate stores.
-            let granted: [String: MacIntegrationPermission]
-            if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
-                do { granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked() }
-                catch { return .failure(error.localizedDescription) }
-            } else { granted = [:] } // This card has no integration axes to read.
-            var missing: [String] = []
-            for capability in interaction.allTargets {
-                if capability == "applescript" || capability == "automation" {
-                    return .failure("Automation consent is per app. Request permission with target applescript:<bundle_id>.")
-                }
-                if InlineInteractionRegistry.isMacControlCategory(capability) {
-                    do {
-                    let allowed = try await Task.detached {
-                        try InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
-                    }.value
-                    if !allowed {
-                        missing.append(capability)
-                    }
-                    } catch { return .failure(error.localizedDescription) }
-                    continue
-                }
-                if !MacIntegrationID.all.contains(capability),
-                   SystemPermissionPreflight.cardSettingsCapability(capability) != nil { continue }
-                let permission = granted[capability]
-                // Only the requested axis can settle this need.
-                let mode = interaction.mode
-                let readOK = (permission?.read ?? false)
-                let writeOK = (permission?.write ?? false)
-                let allowed: Bool
-                switch mode {
-                case .read: allowed = readOK
-                case .write: allowed = writeOK
-                case .readWrite, .none:
-                    // Both axes must land when the card promises reading and changing, including needs without a mode.
-                    let promisedRead = MacIntegrationID.supportsRead(capability)
-                    let promisedWrite = MacIntegrationID.supportsWrite(capability)
-                    allowed = (!promisedRead || readOK) && (!promisedWrite || writeOK)
-                }
-                if !allowed { missing.append(capability) }
-            }
-            guard missing.isEmpty else {
-                let names = missing.map { InlineInteractionRegistry.macCapabilityDisplayName($0) }
-                // A launch-applied grant's probe can stay denied until the process restarts, so a denial does not prove the switch is off.
-                let launchApplied = SystemPermissionPreflight.launchPending(missing)
-                let restart = launchApplied.isEmpty ? "" : " If you turned "
-                    + InlineInteractionRegistry.englishList(launchApplied.map(\.displayName))
-                    + " on, it takes effect after I restart: use Restart on this card."
-                return .failure(
-                    "Still not allowed: \(InlineInteractionRegistry.englishList(names))." + restart
-                )
-            }
-            // A launch-applied grant needs a restart even when its probe already agrees.
-            let atLaunch = SystemPermissionPreflight.awaitingLaunch(interaction.allTargets)
-            guard atLaunch.isEmpty else {
-                let names = InlineInteractionRegistry.englishList(atLaunch.map(\.displayName))
-                return .failure("\(names) is on, and it takes effect after I restart: use Restart on this card.")
-            }
-            if let blocked = await platform.cardBlockReason(interaction.allTargets, mode: interaction.mode) {
-                return .failure(blocked)
-            }
-            let names = interaction.allTargets.map {
-                InlineInteractionRegistry.macCapabilityDisplayName($0)
-            }
-            return .success(.init(
-                selection: interaction.target,
-                summary: "\(InlineInteractionRegistry.englishList(names)) allowed"
-            ))
+            return await verifyPermission(interaction, dataRoot: dataRoot)
         case .modelChoice:
-            let resolvedScope = scope ?? interaction.primaryScope ?? .persistent
-            guard let picked = selection, !picked.isEmpty else {
-                return .failure("No model was chosen.")
-            }
-            guard let qualified = InlineInteractionRegistry.splitModelOptionID(picked) else {
-                return .failure("This model choice does not name its account. Choose an account-qualified model in Providers.")
-            }
-            let model = qualified.modelID
-            if resolvedScope == .thisRequestOnly {
-                // Request-only binding is verified by construction because the resumed turn carries the named model.
-                return .success(.init(
-                    // Qualified identity preserves the account the person selected.
-                    selection: picked,
-                    summary: "Using \(model) for this one",
-                    scope: .thisRequestOnly
-                ))
-            }
-            // Confirm a permanent choice against Providers' saved routing snapshot before claiming it landed.
-            let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
-            let snapshot: ProviderRoutingSnapshot
-            do { snapshot = try await router.checkedRoutingSnapshotReadOnly() }
-            catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
-            let group = ProviderSurfaceGroups.all.first { $0.id == interaction.target }
-            let surfaces = group?.surfaces ?? [interaction.target]
-            let matched = surfaces.contains { surface in
-                ProviderRoutingSurfaceLookup.value(snapshot.preferences, surface)?.model == model
-                    && ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, surface) == qualified.providerID
-            }
-            guard matched else {
-                return .failure("\(group?.title ?? interaction.target) isn't on \(model) yet.")
-            }
-            return .success(.init(
-                selection: picked,
-                summary: "\(group?.title ?? interaction.target) now uses \(model)",
-                scope: .persistent
-            ))
+            return await verifyModelChoice(interaction, selection: selection, scope: scope, dataRoot: dataRoot)
         case .apiKey where interaction.secret != nil:
             // The checked credential and executable identities never visit MainActor; only the credential-free verification returns.
             return await Task.detached { verifySecret(interaction) }.value
         case .apiKey:
-            // Readiness belongs to the requested account. Another account cannot satisfy an unchanged API-key route.
-            let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
-            let providers: [InlineInteractionProviderStatus]
-            do { providers = try await platform.providers(root: dataRoot) }
-            catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
-            guard let provider = providers.first(where: { $0.providerID == target }) else {
-                return .failure("No provider named \(interaction.target).")
-            }
-            guard provider.eligible, provider.authState == "ready" else {
-                return .failure("\(provider.displayName)'s saved connection is not verified yet. Test the connection in Providers on the Mac.")
-            }
-            let model = provider.defaultModel ?? provider.firstModel
-            return .success(.init(
-                selection: provider.providerID,
-                summary: model.map { "Connected \u{00B7} \($0) ready" } ?? "\(provider.displayName) ready"
-            ))
+            return await verifyProviderConnection(interaction, dataRoot: dataRoot)
         case .capability:
-            // Trust re-read. The flag is the authority; the tap is not.
-            guard let flag = InlineInteractionRegistry.capabilityFlags[interaction.target] else {
-                return .failure("That isn't a switch this build has.")
-            }
-            let policy: [String: JSONValue]
-            do { policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked() }
-            catch { return .failure("Trust policy is unavailable: \(error.localizedDescription)") }
-            guard case .object(let block)? = policy[flag.policyBlock],
-                  block[flag.policyKey] == .bool(true)
-            else {
-                return .failure("\(flag.displayName) is still off.")
-            }
-            if let blocked = await platform.cardBlockReason([flag.id], mode: nil) {
-                return .failure(blocked)
-            }
-            return .success(.init(
-                selection: flag.id,
-                summary: "\(flag.displayName) on"
-            ))
+            return await verifyCapability(interaction, dataRoot: dataRoot)
         case .choose:
             guard let picked = selection,
                   let option = interaction.options.first(where: { $0.id == picked })
@@ -326,6 +142,220 @@ extension InlineInteractionResolver {
         case .unknown:
             return .failure("This build doesn't know that kind of request.")
         }
+    }
+
+    private static func verifyConnector(
+        _ interaction: InlineInteraction, dataRoot: URL, checkMail: Bool
+    ) async -> Verification {
+        if interaction.target == "mail" {
+            let readiness = await platform.mailReadiness(root: dataRoot, check: checkMail)
+            guard readiness.status == "ready" else {
+                if let next = readiness.next { return .failure(next) }
+                return .failure(readiness.word)
+            }
+            let summary = "Mail connected" + (readiness.next.map { ". " + $0 } ?? "")
+            return .success(.init(selection: "mail", summary: summary))
+        }
+        if interaction.target == "chrome" {
+            let status = await platform.chromeConnectionStatus()
+            guard status.enabled, status.connected else {
+                return .failure("Chrome isn't connected yet. "
+                    + platform.chromeSteps)
+            }
+            return .success(.init(selection: "chrome", summary: "Chrome connected"))
+        }
+        if interaction.target == "iphone" {
+            guard let standing = await platform.phoneStanding() else {
+                return .failure("Paired iPhone storage is unavailable. Restore access to the paired-phone store before checking setup again.")
+            }
+            // The card asks for a phone that can approve: its device key paired with the Pair button, not merely a phone that chats.
+            guard standing.canApprove else {
+                return .failure(standing.line + " Open NativeAgent on the iPhone, then choose Pair here when the codes match.")
+            }
+            return .success(.init(selection: "iphone", summary: "iPhone can approve"))
+        }
+        // Read derived connector auth state so a rejected saved token cannot count as connected.
+        let target = ConnectorSetup.canonicalID(interaction.target)
+        let records: [InlineInteractionConnectorStatus]
+        do { records = try await platform.connectorRecords(root: dataRoot) }
+        catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
+        guard let record = records.first(where: {
+            ConnectorSetup.canonicalID($0.id) == target
+        }) else {
+            return .failure("\(interaction.title) isn't in Connectors on this Mac.")
+        }
+        // Telegram configuration proves a saved enabled bot; only a successful poll proves health.
+        let name = await Task.detached { InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot) }.value
+        guard record.authState == "connected"
+            || (target == "telegram" && record.authState == "configured" && record.healthStatus != "disabled")
+        else {
+            return .failure(
+                "\(name) still isn't connected."
+            )
+        }
+        return .success(.init(
+            selection: target,
+            summary: "\(name) connected"
+        ))
+    }
+
+    private static func verifyPermission(
+        _ interaction: InlineInteraction, dataRoot: URL
+    ) async -> Verification {
+        // Verify the entire chain against each capability's owner; integration axes and Trust categories have separate stores.
+        let granted: [String: MacIntegrationPermission]
+        if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
+            do { granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked() }
+            catch { return .failure(error.localizedDescription) }
+        } else { granted = [:] } // This card has no integration axes to read.
+        var missing: [String] = []
+        for capability in interaction.allTargets {
+            if capability == "applescript" || capability == "automation" {
+                return .failure("Automation consent is per app. Request permission with target applescript:<bundle_id>.")
+            }
+            if InlineInteractionRegistry.isMacControlCategory(capability) {
+                do {
+                let allowed = try await Task.detached {
+                    try InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
+                }.value
+                if !allowed {
+                    missing.append(capability)
+                }
+                } catch { return .failure(error.localizedDescription) }
+                continue
+            }
+            if !MacIntegrationID.all.contains(capability),
+               SystemPermissionPreflight.cardSettingsCapability(capability) != nil { continue }
+            let permission = granted[capability]
+            // Only the requested axis can settle this need.
+            let mode = interaction.mode
+            let readOK = (permission?.read ?? false)
+            let writeOK = (permission?.write ?? false)
+            let allowed: Bool
+            switch mode {
+            case .read: allowed = readOK
+            case .write: allowed = writeOK
+            case .readWrite, .none:
+                // Both axes must land when the card promises reading and changing, including needs without a mode.
+                let promisedRead = MacIntegrationID.supportsRead(capability)
+                let promisedWrite = MacIntegrationID.supportsWrite(capability)
+                allowed = (!promisedRead || readOK) && (!promisedWrite || writeOK)
+            }
+            if !allowed { missing.append(capability) }
+        }
+        guard missing.isEmpty else {
+            let names = missing.map { InlineInteractionRegistry.macCapabilityDisplayName($0) }
+            // A launch-applied grant's probe can stay denied until the process restarts, so a denial does not prove the switch is off.
+            let launchApplied = SystemPermissionPreflight.launchPending(missing)
+            let restart = launchApplied.isEmpty ? "" : " If you turned "
+                + InlineInteractionRegistry.englishList(launchApplied.map(\.displayName))
+                + " on, it takes effect after I restart: use Restart on this card."
+            return .failure(
+                "Still not allowed: \(InlineInteractionRegistry.englishList(names))." + restart
+            )
+        }
+        // A launch-applied grant needs a restart even when its probe already agrees.
+        let atLaunch = SystemPermissionPreflight.awaitingLaunch(interaction.allTargets)
+        guard atLaunch.isEmpty else {
+            let names = InlineInteractionRegistry.englishList(atLaunch.map(\.displayName))
+            return .failure("\(names) is on, and it takes effect after I restart: use Restart on this card.")
+        }
+        if let blocked = await platform.cardBlockReason(interaction.allTargets, mode: interaction.mode) {
+            return .failure(blocked)
+        }
+        let names = interaction.allTargets.map {
+            InlineInteractionRegistry.macCapabilityDisplayName($0)
+        }
+        return .success(.init(
+            selection: interaction.target,
+            summary: "\(InlineInteractionRegistry.englishList(names)) allowed"
+        ))
+    }
+
+    private static func verifyModelChoice(
+        _ interaction: InlineInteraction, selection: String?, scope: InlineInteraction.Scope?, dataRoot: URL
+    ) async -> Verification {
+        let resolvedScope = scope ?? interaction.primaryScope ?? .persistent
+        guard let picked = selection, !picked.isEmpty else {
+            return .failure("No model was chosen.")
+        }
+        guard let qualified = InlineInteractionRegistry.splitModelOptionID(picked) else {
+            return .failure("This model choice does not name its account. Choose an account-qualified model in Providers.")
+        }
+        let model = qualified.modelID
+        if resolvedScope == .thisRequestOnly {
+            // Request-only binding is verified by construction because the resumed turn carries the named model.
+            return .success(.init(
+                // Qualified identity preserves the account the person selected.
+                selection: picked,
+                summary: "Using \(model) for this one",
+                scope: .thisRequestOnly
+            ))
+        }
+        // Confirm a permanent choice against Providers' saved routing snapshot before claiming it landed.
+        let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
+        let snapshot: ProviderRoutingSnapshot
+        do { snapshot = try await router.checkedRoutingSnapshotReadOnly() }
+        catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
+        let group = ProviderSurfaceGroups.all.first { $0.id == interaction.target }
+        let surfaces = group?.surfaces ?? [interaction.target]
+        let matched = surfaces.contains { surface in
+            ProviderRoutingSurfaceLookup.value(snapshot.preferences, surface)?.model == model
+                && ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, surface) == qualified.providerID
+        }
+        guard matched else {
+            return .failure("\(group?.title ?? interaction.target) isn't on \(model) yet.")
+        }
+        return .success(.init(
+            selection: picked,
+            summary: "\(group?.title ?? interaction.target) now uses \(model)",
+            scope: .persistent
+        ))
+    }
+
+    private static func verifyProviderConnection(
+        _ interaction: InlineInteraction, dataRoot: URL
+    ) async -> Verification {
+        // Readiness belongs to the requested account. Another account cannot satisfy an unchanged API-key route.
+        let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
+        let providers: [InlineInteractionProviderStatus]
+        do { providers = try await platform.providers(root: dataRoot) }
+        catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
+        guard let provider = providers.first(where: { $0.providerID == target }) else {
+            return .failure("No provider named \(interaction.target).")
+        }
+        guard provider.eligible, provider.authState == "ready" else {
+            return .failure("\(provider.displayName)'s saved connection is not verified yet. Test the connection in Providers on the Mac.")
+        }
+        let model = provider.defaultModel ?? provider.firstModel
+        return .success(.init(
+            selection: provider.providerID,
+            summary: model.map { "Connected \u{00B7} \($0) ready" } ?? "\(provider.displayName) ready"
+        ))
+    }
+
+    private static func verifyCapability(
+        _ interaction: InlineInteraction, dataRoot: URL
+    ) async -> Verification {
+        // Trust re-read. The flag is the authority; the tap is not.
+        guard let flag = InlineInteractionRegistry.capabilityFlags[interaction.target] else {
+            return .failure("That isn't a switch this build has.")
+        }
+        let policy: [String: JSONValue]
+        do { policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked() }
+        catch { return .failure("Trust policy is unavailable: \(error.localizedDescription)") }
+        guard case .object(let block)? = policy[flag.policyBlock],
+              block[flag.policyKey] == .bool(true)
+        else {
+            return .failure("\(flag.displayName) is still off.")
+        }
+        if let blocked = await platform.cardBlockReason([flag.id], mode: nil) {
+            return .failure(blocked)
+        }
+        return .success(.init(
+            selection: flag.id,
+            summary: "\(flag.displayName) on"
+        ))
     }
 
     private nonisolated static func verifySecret(_ interaction: InlineInteraction) -> Verification {

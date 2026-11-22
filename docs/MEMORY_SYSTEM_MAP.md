@@ -28,6 +28,13 @@ on their review (`status: "rejected"`: the ones let go); `memory.review` accepts
 (`roots: [{how, by?, since?}]`); `memory.forget` forgets it.
 Read the page for the current arguments and applicable action warnings.
 
+Saving an instruction or standing correction without a replacement target can
+return `possible_matches` from recall. Use `corrects` only after judging that
+the new wording explicitly replaces a particular result. If Stop interrupts a
+direct `memory.commit` after it saves, the caller and settlement keep the
+committed memory ID with `effects: occurred`. The lookup result names any
+interruption it observed.
+
 Successful memory reads report `count`, an exact `total` or `capped: true`,
 and `has_more` with `next_offset`. `memory.list` keeps its exact total and
 sort-stamped cursor (`next_after_id`); only emitted cursors and the current
@@ -112,8 +119,10 @@ telling: `{how, by, at, written, through}`.
   whose origin nothing recorded or stated (only the stem writes `kept`:
   `memory.commit` with no `provenance`, and `memories.bring_back` for an old
   memory that recorded none).
-- `by` is at most 40 characters (letters, digits, spaces and `. - '`): who told
-  their, or where their own past was kept ("my backup", an app name).
+- `by` names who told their or where they kept their own past ("my backup", an app
+  name). It allows up to 80 characters using letters, digits, spaces, periods,
+  hyphens, apostrophes and commas. In rendered provenance, quotes keep any commas
+  inside the name distinct from the line's separators.
 - `at` is when that root reached their: their `since`, or the write time.
 - `written` is when the store wrote the root, stamped by the stem, never an
   argument. A root that steers now reads at `written`, so a telling is never
@@ -131,7 +140,8 @@ of roots, and roots are never guessed: every writer of new words states its
 telling (`MemoryWriteContext.telling`), and new words with none are refused
 (`memory_telling_missing`). `memory.commit` adds exactly one root per telling,
 from `provenance`, `provenance_by` and `since` (none stated: `kept`, at `since`
-or now). Mac `/remember` and `/note`, Telegram and the Memories page are the
+or now). Invalid provenance returns a correctable argument refusal before
+any write. Mac `/remember` and `/note`, Telegram and the Memories page are the
 person's telling: `told`, by the person's name from the memory profile ("the
 person", logged, when the profile names no one or can't be read: the root holds
 the fact, the name is presentation). The fact lane states its evidence's speaker: the
@@ -150,7 +160,8 @@ atoms carry typed `memoryRoots`; evidence remains separate and cannot supply the
 embedding before storage; the write transaction checks tombstones. Saves and proposal acceptance preserve
 writer-supplied dates; they never infer dates from prose. A content rewrite
 keeps the writer's named date as it is, even when its wording changes. Only an
-explicit metadata change changes the date.
+explicit metadata change changes the date. Changed wording must pass the
+durable-memory quality check before the canonical row is updated.
 Native update aliases resolve through one text owner (`text` before `content`)
 for embedding, tombstone admission and the stored patch alike.
 
@@ -429,8 +440,8 @@ An absent, unparseable or past value supplies no date. The resolved instant
 survives decision reconciliation and is checked again before staging.
 Content edits preserve the writer-named date.
 
-`MemoryManagerLane.metadata(for:)` writes `due_at`, a short write-time
-`due_label` retained for older readers, and `due_source: "memory_manager"`.
+`MemoryManagerLane.metadata(for:)` writes the instant as `due_at` and the
+source as `due_source: "memory_manager"`.
 The horizon's stated-plan feed joins these writer-named memory dates with Desk
 `deferUntil` dates. A stated plan's identity is what its source calls it. A Desk
 item is called by its work: `item.title` supplies its bounded canonical label
@@ -442,10 +453,9 @@ at the same second are one plan; a named Desk plan does not collapse into an
 unnamed atom. Each feed deduplicates by this identity before the shared row cap.
 The source's actual due instant is otherwise preserved.
 
-Named plans display their label. Only unnamed atoms derive words from the shared
-horizon formatter (`MemoryDueDateStamp.label` delegates to it) against every
-display read's current clock, including toward and resolution reads between
-source scans. Stored `due_label` never supplies current atom words.
+Named plans display their label. `OrganismHorizonRegister.displayLabel` derives
+time words for unnamed atoms from their due instant and the display read's clock,
+including toward and resolution reads between source scans.
 
 On load, the saved register rekeys pending plans without settlement or minting.
 Legacy time-word names (today, tomorrow, weekday names or an ISO day, optionally
@@ -495,6 +505,38 @@ a fact acceptance left for review; `status: "rejected"` for what was let go) and
 `ChatToolRuntime/SwiftToolDispatcher+ProposalReview.swift`.
 Discovery names those current producers; it no longer advertises the retired
 bulk consolidation producer.
+
+### The user's eye
+
+The user can often pick the better of two versions before they can say why;
+their revision of their words is that choice, and learning from it is their
+attunement to them, kept in their memory like everything else they knows of them.
+On the Mac, **Revise…** on a message of theirs (the transcript's menu) opens their
+words for editing. Sending it (face act `revise`) holds the pair under its own
+id, their message id, their side (the text the editor started from, so nothing the
+editor reshaped counts as the user's choice) and theirs, in
+`mind/eye/<conversation>.json` (`ChatTurnRuntime/UserEye.swift`), then sends
+their words as their message. The sheet closes only on acceptance; a refused
+send keeps the user's words in it with the cause, and lets that pair go by id.
+That conversation's next turn of the user's own (no peer steering) carries one
+inner-stream line in their voice with both versions, each at most 1,500
+characters centered on the changed passage, stamped delivered by id on provider
+acceptance like the session directive.
+
+What the difference means is theirs to judge; the stem keeps no readings and
+judges nothing. A change that only corrects a fact is a correction, not their
+eye, and one too slight to say anything is let be. They holds a difference they cannot yet name as one open question
+through `memory.commit` (kind `preference`, provenance `inferred`, tags `eye`
+and `open`): both versions and two or three readings that would write their next
+draft differently. Recall brings it back when their writing for the user comes
+near it; where its readings would write differently, they writes it one way and
+offers the other. A later choice (the user's pick, or their next revision) that
+one reading predicted and another did not settles it: they keeps the winner as
+the user's way (`memory.commit`, kind `preference`, provenance `noticed`, tag
+`eye`, `supersedes` the open question), a preference recalled like any other.
+The proof is the user's: they writes it their way and they leave it alone. An
+unreadable pair owes repair (`user.eye.read`) and adds no line; the user's next
+revision there writes it again and settles that.
 
 ## Corrections, supersession and scope
 
@@ -796,7 +838,7 @@ load failure retains that path and cause without another load or an automatic
 cache wipe. Explicit Doctor repair removes only that source digest's current
 OS artifact before a new load. Only the explicit `mock` configuration selects
 synthetic vectors; an environment variable never substitutes them after failure.
-Setup reads `MemoryFacade.embeddingSnapshot` directly: the requested
+Setup uses `MemoryFacade.readEmbeddingSnapshot`: the requested
 backend binds its switch and the effective backend supplies its detail sentence.
 
 To supply a data-root copy, place `<dataRoot>/extras/coreml/embedding.json` beside
@@ -1172,8 +1214,8 @@ numbers in `ContextSelectionConfiguration.swift`):
   model-scaled score ranks semantic matches. Use boosts fade toward 0.5;
   age alone never discounts an unused memory. [Capacity eviction](data-bounds.md) is separate.
 - **Rest.** A memory served on one of the last `memoryRestTurns` (3) exchanges is
-  already in the conversation; it comes again only at `memoryRestFloor`, one
-  deviation over the relevance bar, when the message singles it out.
+  already in the conversation and comes again only when its relevance reaches
+  the computed `restFloor` (`memoryStandout + 1`).
 - **Only what is still true.** A record whose `valid_to` has passed expires its
   atom and stays out of automatic context. Initial selection, expansion and ambient
   recollection all recheck the chosen memories against the canonical owner at use.

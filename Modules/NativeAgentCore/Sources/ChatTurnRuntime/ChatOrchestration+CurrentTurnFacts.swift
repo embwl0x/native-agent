@@ -12,10 +12,10 @@ import Context
 import Experiences
 import ChatToolRuntime
 import CognitiveSubstrate
-// Blueprint: | `ChatOrchestration+CurrentTurnFacts.swift` | Parallel facts; the last clean thought and body lead every turn's inner stream |
+// Blueprint: | `ChatOrchestration+CurrentTurnFacts.swift` | Parallel facts; the last clean thought and body lead every turn's inner stream, then a revision the user made of their words (`UserEye`) on the user's own turn |
 
 extension SwiftNativeTurnEngine {
-    /// Gather read-only facts before context exists so failed assembly consumes nothing; defer consuming reads until composition.
+    /// Gather read-only facts before context exists, then select the words for this turn during composition.
     typealias ReadOnlyTurnFacts = (
         clock: String, note: String?, directive: String?,
         voiceStep: String?, place: String?, glance: PreparedWorkspaceGlance?, contacts: JSONValue,
@@ -28,7 +28,7 @@ extension SwiftNativeTurnEngine {
         return (value, Int64((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000))
     }
 
-    /// Independent facts gather beside history and context assembly; consuming reads wait for composition.
+    /// Independent facts gather beside history and context assembly.
     func currentTurnFacts(
         clockNow: Date,
         quietHours: TurnQuietHoursWindow?,
@@ -69,8 +69,7 @@ extension SwiftNativeTurnEngine {
         }
         async let elsewhere = Self.timedFact { () async -> AgentScreen.ElsewhereReading? in
             guard let dataRoot else { return nil }
-            return await ChatWorkspaceBinding.readElsewhere(turn: turn, invocation: work.invocation,
-                dataRoot: dataRoot, scope: sessionID, at: clockNow)
+            return await ChatWorkspaceBinding.readElsewhere(dataRoot: dataRoot, scope: sessionID, at: clockNow)
         }
         let (readContacts, readPlace, readGlance, readElsewhere, readBody) = await (contacts, place, glance, elsewhere, body)
         return (clock, note, directive, voiceStep, readPlace.value, readGlance.value, readContacts.value,
@@ -78,7 +77,7 @@ extension SwiftNativeTurnEngine {
                                   .factsGlance: readGlance.ms, .factsElsewhereRead: readElsewhere.ms])
     }
 
-    /// Consume elsewhere words after history binds taint and announce workspace arrivals only on delivery.
+    /// Select elsewhere words; a turn with a steering stamp omits the person's. Workspace arrivals are announced on delivery.
     /// Compose dynamic facts before the runtime line so it names the route admitted for this context.
     func contextByAppendingCurrentTurnFacts(
         _ context: TurnContext,
@@ -99,8 +98,7 @@ extension SwiftNativeTurnEngine {
                 .first { AgentScreen.door($0) != nil } ?? context.surface
             let peer = !turn.steeringStamp().isEmpty
             if try peer || Self.personContinuityAllowed(root: dataRoot, sessionID: sessionID, turn: turn) {
-                elsewhere = await ChatWorkspaceBinding.elsewhere(turn: turn, invocation: work.invocation,
-                    dataRoot: dataRoot, scope: sessionID, surface: surface,
+                elsewhere = await ChatWorkspaceBinding.elsewhere(dataRoot: dataRoot, scope: sessionID, surface: surface,
                     peer: peer, at: clockNowOverride, reading: facts.elsewhere, shown: context.recentLifeActs)
                 if AgentScreen.door(surface) != nil {
                     agentNow = AgentNowCursor(at: facts.elsewhere?.failed == true ? nil : clockNowOverride ?? Date())
@@ -121,7 +119,7 @@ extension SwiftNativeTurnEngine {
         let all = [facts.clock, facts.note, facts.directive, elsewhere, facts.voiceStep, arrivals,
                    facts.place, facts.glance?.text].compactMap { $0 }
         var withFacts = all.reduce(context) { Self.contextByAppendingRuntimeContext($0, runtimeContext: $1) }
-        withFacts.innerStream = [thought, facts.body?.line]
+        withFacts.innerStream = [thought, facts.body?.line, Self.eyeLine(dataRoot: remPinsDataRoot, sessionID: sessionID, turn: turn)]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         withFacts.partsDelivery = facts.glance?.delivered
         withFacts.bodyFelt = facts.body
@@ -156,6 +154,18 @@ extension SwiftNativeTurnEngine {
         await ChatWorkspaceBinding.announceDelivered(dataRoot: dataRoot, scope: sessionID, in: Self.deliveredInput(context))
     }
 
+    /// The user's revision held for this conversation (`UserEye`), for the user's own turn only; an unreadable record owes repair and adds nothing.
+    nonisolated static func eyeLine(dataRoot: URL?, sessionID: String?, turn: Turn) -> String? {
+        guard let dataRoot, let sessionID, turn.steeringStamp().isEmpty else { return nil }
+        do { return try UserEye.pending(dataRoot: dataRoot, sessionID: sessionID)?.line }
+        catch {
+            RepairOwed.owe(dataRoot, id: "user-eye:" + sessionID, kind: .run, operation: UserEye.readOperation, owner: "mind/eye",
+                words: "A revision the user made of my words could not be read: \(error.localizedDescription).",
+                lever: "Remove the conversation's file under mind/eye; the user's next revision there writes it again and settles this.")
+            return nil
+        }
+    }
+
     static func deliveredInput(_ context: TurnContext) -> String {
         (context.innerStream + [context.systemPrompt, context.turnVolatileBlock].compactMap { $0 }).joined(separator: "\n\n")
     }
@@ -172,10 +182,12 @@ extension SwiftNativeTurnEngine {
         let voice = try FirstConversationPersonaProgression.pendingVoiceDirective(dataRoot: dataRoot, sessionID: sessionID)
             .flatMap { input.contains($0) ? $0 : nil }
         let body = context.bodyFelt.flatMap { input.contains($0.line) ? $0 : nil }
-        guard note != nil || directive != nil || voice != nil || body != nil else { return nil }
+        // An unreadable revision was owed repair when the context was built; it carried no line to stamp.
+        let eye = (try? sessionID.flatMap { try UserEye.pending(dataRoot: dataRoot, sessionID: $0) }).flatMap { input.contains($0.line) ? $0 : nil }
+        guard note != nil || directive != nil || voice != nil || body != nil || eye != nil else { return nil }
         return {
             if let body { BodyFelt.markSaid(body, dataRoot: dataRoot) }
-            guard note != nil || directive != nil || voice != nil else { return }
+            guard note != nil || directive != nil || voice != nil || eye != nil else { return }
             do {
             if let note {
                 try ChatUpdateNote.markDelivered(dataRoot: dataRoot, expectedNote: note)
@@ -187,6 +199,7 @@ extension SwiftNativeTurnEngine {
                 try FirstConversationPersonaProgression.markVoiceDirectiveDelivered(
                     dataRoot: dataRoot, sessionID: sessionID, expectedDirective: voice)
             }
+            if let eye, let sessionID { try UserEye.markDelivered(dataRoot: dataRoot, sessionID: sessionID, id: eye.id) }
             RepairOwed.settle(dataRoot, operation: "turn.instructions.delivered:" + (sessionID ?? "update"), evidence: .init(source: "context",
                 id: sessionID ?? "update_note"))
             } catch {
@@ -255,9 +268,9 @@ extension SwiftNativeTurnEngine {
     /// Human wall-clock and active quiet hours belong in the dynamic segment to keep the prefix stable.
     nonisolated static func renderClockContext(
         now: Date,
-        localTimeZone: TimeZone = .current,
         quietHours: TurnQuietHoursWindow? = nil
     ) -> String {
+        let localTimeZone = TimeZone.current
         let local = formatClockDate(now, timeZone: localTimeZone)
         var line = "Local time: \(local) (\(localTimeZone.identifier))."
         if let quietHours {

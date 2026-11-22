@@ -10,7 +10,6 @@ import ChatTurnContracts
 import ChatToolRuntime
 import AgentConversations
 import ChatToolParsing
-import CryptoKit
 import Privacy
 import MacIntegration
 import NativeAgentCore

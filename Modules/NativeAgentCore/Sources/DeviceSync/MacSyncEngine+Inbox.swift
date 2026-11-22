@@ -159,6 +159,18 @@ extension MacSyncEngine {
               ids.messageID == declaredID else {
             return true
         }
+        if let handled = await authenticateCloudKitAction(action, data: data, message: message, generation: generation) {
+            return handled
+        }
+        return await processAuthenticatedCloudKitAction(
+            action, ids: ids, data: data, message: message, generation: generation, actionStateRoot: actionStateRoot
+        )
+    }
+
+    /// A terminal result is present only when authentication ends processing.
+    private func authenticateCloudKitAction(
+        _ action: InboxAction, data: Data, message: BridgeMessage, generation: UInt64
+    ) async -> Bool? {
         // Authenticate the inner envelope before consulting any ID-owned state.
         let authenticationError: String?
         if let signature = action.signature {
@@ -168,11 +180,22 @@ extension MacSyncEngine {
         }
         guard isActive, generation == snapshotLifecycleGeneration else { return false }
         if let authenticationError {
-            syncError = "Rejected CloudKit action: \(authenticationError)"
-            if authenticationError.contains("pairing secret unavailable") { return false }
+            // This Mac's own missing secret is its storage to repair; any other failure is the phone signing with a key this Mac does not hold.
+            if authenticationError.contains("pairing secret unavailable") {
+                syncError = "Rejected CloudKit action: \(authenticationError)"
+                return false
+            }
+            await sync.bridge.notePhoneRejected(at: message.timestamp)
             await sync.bridge.answerUnverifiablePhoneMessage(message.id)
             return true
         }
+        return nil
+    }
+
+    private func processAuthenticatedCloudKitAction(
+        _ action: InboxAction, ids: ValidatedInboxActionIDs, data: Data, message: BridgeMessage,
+        generation: UInt64, actionStateRoot: URL
+    ) async -> Bool {
         guard isActive, generation == snapshotLifecycleGeneration, let responsesDir, let transactionDir,
               let responseURL = InboxActionFileBoundary.jsonURL(
                 in: responsesDir,
@@ -225,6 +248,18 @@ extension MacSyncEngine {
             }
         }
 
+        return await settleCloudKitAction(
+            action, transactionId: transactionId, actionDigest: actionDigest, generation: generation,
+            actionStateRoot: actionStateRoot, transactionDir: transactionDir, responseURL: responseURL,
+            alreadyExecuted: alreadyExecuted, priorTransaction: priorTransaction, freshnessError: freshnessError
+        )
+    }
+
+    private func settleCloudKitAction(
+        _ action: InboxAction, transactionId: String, actionDigest: String?, generation: UInt64,
+        actionStateRoot: URL, transactionDir: URL, responseURL: URL, alreadyExecuted: Bool,
+        priorTransaction: ICloudTransactionRecord?, freshnessError: String?
+    ) async -> Bool {
         if !alreadyExecuted, freshnessError == nil {
             await writeTransaction(
                 id: transactionId,
@@ -301,6 +336,16 @@ extension MacSyncEngine {
             await settleInboxAction(action, transactionId: transactionId, response: response, directory: transactionDir)
         }
 
+        return await deliverCloudKitActionResponse(
+            response, action: action, responseURL: responseURL, inboundActionVerified: inboundActionVerified,
+            actionStateRoot: actionStateRoot, generation: generation
+        )
+    }
+
+    private func deliverCloudKitActionResponse(
+        _ response: [String: String], action: InboxAction, responseURL: URL,
+        inboundActionVerified: Bool, actionStateRoot: URL, generation: UInt64
+    ) async -> Bool {
         // Persist before delivery so a retry sends the response without repeating the external effect.
         guard await writeInboxResponse(response, to: responseURL) else {
             if generation == snapshotLifecycleGeneration {

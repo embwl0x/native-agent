@@ -14,6 +14,7 @@ extension AgentScreen {
     /// An exchange concludes when its answer lands, not when it starts.
     struct DoorLine: Sendable {
         var id: String = ""
+        var run: String? = nil
         let session: String
         var at: Date
         let door: String, text: String
@@ -71,9 +72,8 @@ extension AgentScreen {
         static let shared = DoorIndex()
         struct Entry {
             var inode: UInt64 = 0, offset: UInt64 = 0
-            var lines: [DoorLine] = [], open = false
-            /// Runs that carried a person's or the agent's own row here: the agent's row answers only in one of them; any other run is its own post.
-            var askedRuns: Set<String> = []
+            var lines: [DoorLine] = []
+            var adjacentInput = false
             var personSends: Set<String> = []
         }
         let lock = NSLock()
@@ -154,22 +154,28 @@ extension AgentScreen {
                     continue
                 }
                 guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
-                if let run = speech.run, !entry.askedRuns.contains(run) { entry.open = false }
-                if entry.open {
-                    entry.lines[entry.lines.count - 1].reply = ChatSecretRedactor.redactText(content)
-                    entry.lines[entry.lines.count - 1].active = at
-                    if own { entry.lines[entry.lines.count - 1].at = at }
+                let index: Int?
+                if let run = speech.run {
+                    index = entry.lines.lastIndex { $0.run == run }
+                } else if entry.adjacentInput {
+                    index = entry.lines.indices.last
+                } else {
+                    index = nil
                 }
+                entry.adjacentInput = false
+                guard let index else { continue }
+                entry.lines[index].reply = ChatSecretRedactor.redactText(content)
+                entry.lines[index].active = at
+                if own { entry.lines[index].at = at }
             case "user":
-                entry.open = false
+                let previousCount = entry.lines.count
+                defer { entry.adjacentInput = entry.lines.count > previousCount }
                 guard metadata["mechanicalKind"] == nil else { continue }
                 // The agent's own work opens with its incoming context; its reply is outgoing speech.
                 if own {
-                    entry.lines.append(.init(id: speech.id, session: session, at: at, door: ownDoor,
+                    entry.lines.append(.init(id: speech.id, run: speech.run, session: session, at: at, door: ownDoor,
                                              text: ChatSecretRedactor.redactText(content),
                                              stamp: speech.stamp, active: at))
-                    entry.open = true
-                    if let run = speech.run { entry.askedRuns.insert(run) }
                     continue
                 }
                 guard let door = spokenDoor(speech, kind: kind) else { continue }
@@ -183,13 +189,11 @@ extension AgentScreen {
                 }
                 // A pasted token must never enter provider context.
                 text = ChatSecretRedactor.redactText(text.trimmingCharacters(in: .whitespacesAndNewlines))
-                entry.lines.append(.init(id: speech.id, session: session, at: at, door: door,
+                entry.lines.append(.init(id: speech.id, run: speech.run, session: session, at: at, door: door,
                                          text: text.isEmpty ? "(no text: an image or file)" : text,
                                          stamp: speech.stamp,
                                          byPerson: speech.human || speech.byPerson || speech.answers.map { entry.personSends.contains($0) } == true,
                                              active: at))
-                entry.open = true
-                if let run = speech.run { entry.askedRuns.insert(run) }
             default: continue
             }
         }
@@ -232,7 +236,7 @@ extension AgentScreen {
     }
 
     static func elsewhereRoom(workspace: WorkspaceOperation, dataRoot: URL, scope: String, now: Date = Date()) async -> String {
-        guard let reading = await readElsewhere(workspace: workspace, dataRoot: dataRoot, scope: scope, turn: now, since: nil) else {
+        guard let reading = await readElsewhere(dataRoot: dataRoot, scope: scope, turn: now, since: nil) else {
             return screen(["ELSEWHERE", "closed"], [["Remember across conversations is off."]], verbs: [])
         }
         if let failure = reading.failure { return failure }
@@ -258,7 +262,7 @@ extension AgentScreen {
         package var failed: Bool { failure != nil }
     }
 
-    package static func readElsewhere(workspace: WorkspaceOperation, dataRoot: URL, scope: String?, turn: Date,
+    package static func readElsewhere(dataRoot: URL, scope: String?, turn: Date,
                                       since: Date?) async -> ElsewhereReading? {
         do {
             guard try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return nil }
@@ -404,9 +408,9 @@ extension AgentScreen {
         reading.acts.filter { (!peer || $0.personDoor) && !shown.contains($0.id) }
     }
 
-    package static func breath(workspace: WorkspaceOperation, dataRoot: URL, scope: String, peer: Bool, since: Date?, shown: Set<String>,
+    package static func breath(dataRoot: URL, scope: String, peer: Bool, since: Date?, shown: Set<String>,
                                now: Date) async -> (text: String?, read: Bool, acts: [String]) {
-        guard let reading = await readElsewhere(workspace: workspace, dataRoot: dataRoot, scope: scope, turn: now, since: since)
+        guard let reading = await readElsewhere(dataRoot: dataRoot, scope: scope, turn: now, since: since)
         else { return (nil, true, []) }
         if let failure = reading.failure { return (failure, false, []) }
         let lines = lifeLines(reading, scope: scope, peer: peer, shown: shown, now: now)
@@ -414,7 +418,7 @@ extension AgentScreen {
         return (lines.isEmpty ? nil : "Elsewhere since your last step:\n" + lines.joined(separator: "\n"), !reading.failed, acts)
     }
 
-    package static func elsewhere(workspace: WorkspaceOperation, dataRoot: URL, scope: String, surface: String, peer: Bool, turn: Date?,
+    package static func elsewhere(dataRoot: URL, scope: String, surface: String, peer: Bool, turn: Date?,
                                   reading: ElsewhereReading? = nil, shown: Set<String> = []) async -> String? {
         guard door(surface) != nil else { return nil }
         do { guard try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return nil } }
@@ -422,7 +426,7 @@ extension AgentScreen {
         let now = turn ?? Date()
         let gathered: ElsewhereReading?
         if let reading { gathered = reading }
-        else { gathered = await readElsewhere(workspace: workspace, dataRoot: dataRoot, scope: scope, turn: now, since: nil) }
+        else { gathered = await readElsewhere(dataRoot: dataRoot, scope: scope, turn: now, since: nil) }
         guard let reading = gathered else { return nil }
         if let failure = reading.failure { return failure }
         let lines = lifeLines(reading, scope: scope, peer: peer, shown: shown, now: now)

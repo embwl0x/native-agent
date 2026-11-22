@@ -23,7 +23,7 @@ extension SwiftToolDispatcher {
         let reader = FileBackedDreamDiary(dataRoot: dataRoot)
 
         // An exact date takes precedence and must reach archived entries by name.
-        if let rawDate = optionalString(input, "date"),
+        if let rawDate = input["date"]?.nonblankString,
            !rawDate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let key = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
             // A read failure is not a missing night; every answer names storage availability.
@@ -90,7 +90,7 @@ extension SwiftToolDispatcher {
             ]
             : Self.dreamDiaryStorageFields(listing.storage)
 
-        if let rawQuery = optionalString(input, "query"),
+        if let rawQuery = input["query"]?.nonblankString,
            !rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let needle = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
             let limit = max(1, min(
@@ -118,7 +118,17 @@ extension SwiftToolDispatcher {
             Self.dreamDiaryMaximumWeeks,
             Self.jsonInt(input["weeks"]) ?? Self.dreamDiaryDefaultWeeks))
         let allWeeks = Self.dreamDiaryWeeks(entries, activeFilenames: listing.activeFilenames)
-        let shown = Array(allWeeks.prefix(weeksAsked))
+        var shown = Array(allWeeks.prefix(weeksAsked))
+        // A browse with `limit` shows only the newest that many entries, across the weeks it reads.
+        if let limit = Self.jsonInt(input["limit"]), limit > 0 {
+            var left = limit
+            shown = shown.compactMap { week in
+                guard left > 0 else { return nil }
+                let trimmed = DreamDiaryWeekGroup(title: week.title, rows: Array(week.rows.prefix(left)))
+                left -= trimmed.count
+                return trimmed
+            }
+        }
         let listed = shown.reduce(0) { $0 + $1.count }
         return .object(unreadable.merging([
             "status": .string("ok"),
@@ -131,8 +141,8 @@ extension SwiftToolDispatcher {
             "weeks_returned": .int(Int64(shown.count)),
             "weeks_requested": .int(Int64(weeksAsked)),
             "entries_listed": .int(Int64(listed)),
-            "entries_total": .int(Int64(entries.count)),
-            "has_more": .bool(allWeeks.count > shown.count),
+            "entries_total": .int(Int64(listing.totalEntries)),
+            "has_more": .bool(listed < entries.count || listing.totalEntries > Self.dreamDiaryScanLimit),
         ]) { _, new in new }.merging(unreadable) { _, carried in carried })
     }
 

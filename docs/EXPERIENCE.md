@@ -129,8 +129,11 @@ filters in that snapshot. Missing attention provenance remains unknown.
 ## Implemented boundaries
 
 - **A happening is written once under its key.** Every change attention takes in is an experience of kind `happening`
-  (`Experiences/Attention.swift`, `Attention.post`), id `happening:<once>`, its cause the door it came through and its
-  `happening` field the line itself. A second post under the same key writes nothing. An owed happening (`returned`,
+  (`Experiences/Attention.swift`), id `happening:<once>`, its cause the door it came through and its
+  `happening` field the line itself. An ordinary repeat stops when the birth matches, without reading its later events.
+  `Attention.postChecked` verifies the return's material from the committed row. At the display limit the row must carry the
+  digest of the full material. On retry it offers an exact return to attention while still owed and durably settles any repair
+  for that post before its source can complete. An owed happening (`returned`,
   `moment`, `body`) is addressed to and owes `conversation:<route>` or `conversation:mind`; it settles `accepted` when a
   thought (evidence `thought:<run>`) or that conversation's own turn attends it, and a thought that fails leaves it owed.
   `world` and `self` happenings owe nothing; what attention made of them is a detail of source `attention`
@@ -264,11 +267,19 @@ while OpenAI input includes cached tokens. They are not one spend total.
   without rewriting their conversation history. The [conversation owner](agent-communication.md)
   owns admission, event-driven release and terminal not-sent receipts.
 - **The face is one.** The transcript row is the face's durable copy: their words, every image their generation made in the turn, and every image they attached to it with `reply.attach` (by path, behind the read fence), chosen straight into the turn it runs in, from a direct call, a batch or a script alike; with no turn answering, it attaches nothing and says so. Nothing is inferred from their text. Mac chat and Telegram (live, recovered and delayed) render it; the experience's face is that row's, redacted.
-- **A message sent while they works joins their working turn** (User 10-18; every door since 11-04). Their generating round finishes its words first, then reads the arrival at its next step boundary; no arrival cancels the stream. Stop still cancels at once. That turn's one reply keeps the completed prose and answers the arrival in streamed order, including prose before later tool calls, so the door it came from posts nothing of its own. One their turn never reads runs as its own turn through its own door. A peer's words ride only into a turn from that same door; a card's continuation stays hidden.
+- **An eligible message can join their working turn.** Their turn program's optional
+  CPU `hear` can cut a generating round, keeping its prose and discarding its
+  proposed calls. Otherwise they can read the arrival at a step boundary. Stop
+  still cancels at once. The working turn's one reply keeps prose in streamed
+  order and answers joined arrivals. Their doors post nothing separately.
+  Unread arrivals run through their own doors. Mac `intent:chat` arrivals always
+  wait for their own turns. A peer's words can join across surfaces when the
+  [turn's admission rules](ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn) for
+  principal, steering sources and file access are met. A card's continuation stays hidden.
 
 ### Phone projection
 
-`NativeAgentShared/Experience.swift` owns `Experience`, `currentAct` and the
+`NativeAgentShared/Experience.swift` owns `Experience` and the
 `ObligationPhase` transition law. `MobileWorkActivity.swift` owns only the mobile
 experience projection, activity DTOs and activity snapshot. Moving the domain
 definitions does not change their value or wire shape.
@@ -390,7 +401,7 @@ shows what is owed.
 The evidence: in Resolve they ran one seven-step render flow four times because it stopped on its last step, and every run did the six landed steps again; on a fresh install eight wakes spent 49 model rounds re-reading the same waiting work, because a wait was a note; and discovery rebuilt its action vectors in memory, so the first find after a launch paid for the whole inventory.
 
 - **A flow that stopped unfinished is an experience that owes `finish` to them** (`Experiences/Flow.swift`, RepairOwed's shape). Its claims record step outcomes in order as digests, backed by the owner's raw record. Asking for it again continues it: what landed, or may have, is answered from that record and never done again (an effect that stopped unknown gets its recorded outcome again, never a blind resend), and only what did nothing runs, on a fresh read, or what its owner keeps progress for itself. A flow that finished, asked again, is a new flow. `again: true` is their "start over". A stopped Mac batch creates a flow when at least one step landed or may have acted.
-- **Current owners:** `mac.act` owns stopped screen batches. It marks unverified step digests with `~`, skips repeating those steps and counts them as unverified on resume. `OwnedProgram.isStrict` selects journaled part runs; `AppToolExecutor+PartRun.swift` saves their stops and atomically claims a run for resume. Resume rechecks admission, code, dependencies and reads, and returns saved receipts for landed writes. The [manifest spec](skill_manifest_spec.md#execution-and-ownership) owns the full contract and the outside-world restriction. **History, 10-19:** an earlier strict-flow implementation was cut after review found resume and hand-back holes; that is not the current execution contract.
+- **Current owners:** `mac.act` owns stopped screen batches. It marks steps whose effects may have landed but remain unverified with `~` and counts them as unverified on resume. It marks steps known to have sent no input with `?`, so they are eligible to run on resume. `OwnedProgram.isStrict` selects journaled part runs; `AppToolExecutor+PartRun.swift` saves their stops and atomically claims a run for resume. Resume rechecks admission, code, dependencies and reads, and returns saved receipts for landed writes. The [manifest spec](skill_manifest_spec.md#execution-and-ownership) owns the full contract and the outside-world restriction. **History, 10-19:** an earlier strict-flow implementation was cut after review found resume and hand-back holes; that is not the current execution contract.
 - **Mac identities:** each batch step hashes one canonical object containing the app, verb, target, text, mode, destination, image place, held keys, mouse button, handle and frame id, including null optional values. Landed receipts match only that current representation. Before changing it, reconcile any unfinished `mac.act/<session>` flows; an unmatched old digest cannot establish that its effect did not happen. Mac operation rows separately require their canonical request digest: a missing or invalid digest makes `mac_control/operations.json` unreadable, preserving the bytes and refusing journaled work for reconciliation. Every in-memory screen frame carries its producer's compile caps, and effect comparison requires both cap records; there is no pre-cap frame representation.
 - **A wait names its condition** (`desk.wait {handle, on, note?}`; [Desk contract](DESK.md)): a person's name, a Desk item, or any experience the agent was
   shown (a card, a message the agent sent another agent, a repair debt, an answer). A person wait uses the existing `waitingOn` field and reads as `waiting

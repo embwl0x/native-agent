@@ -10,7 +10,7 @@ extension TranscriptDocument {
         for (index, piece) in pieces.enumerated() {
             let blockLead: TranscriptBlock.Lead = index == 0 ? lead
                 : (piece.isListItem && pieces[index - 1].isListItem ? .listItem : .paragraph)
-            out.append(TranscriptBlock(id: "\(messageID)#\(index)", messageID: messageID, role: role, kind: piece.kind,
+            out.append(TranscriptBlock(id: TranscriptBlockID.words(messageID, index), messageID: messageID, role: role, kind: piece.kind,
                                        source: piece.source, lead: blockLead, foldGroup: nil))
         }
         return out

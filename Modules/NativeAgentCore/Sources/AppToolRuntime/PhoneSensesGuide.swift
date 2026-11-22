@@ -24,6 +24,10 @@ public enum PhoneSensesGuide {
     iPhone Settings, reopen NativeAgent to refresh setup. iOS may defer a background wake indefinitely; foreground is the direct way to request a reading. \
     There is no promise of continuous sensing.
 
+    Two senses are about where the phone is, and they are different. Places are arrival and departure: the phone tells the Mac when it enters or leaves a \
+    place the person saved. Location is the phone's last known position, which the agent can look up when wanted. A one-time look at where the phone is now \
+    is neither: it is a phone request (phone.location) the person answers on the phone, so do not send them to turn on Places for it.
+
     Places: stand at the place. NativeAgent → Settings → Places → Place name → Home, Work or Custom (enter Place name) → Save this location. Turn on \
     the saved place's own switch. No Home place is assumed or created for someone. Allow location when asked, then iPhone Settings → Apps → NativeAgent \
     → Location → Always; turn Precise Location on. If global location is off: Settings → Privacy & Security → Location Services → on. Enabled place \
@@ -34,6 +38,10 @@ public enum PhoneSensesGuide {
     ids use setting.get and setting.set. The phone app must be open. Enabling a sense or saved place asks on the existing phone request sheet before any \
     permission acquisition; disabling uses the same owner without a card. No answer remains unconfirmed after the bounded wait. New current-location capture \
     and place deletion remain the phone's Places actions.
+
+    Location: NativeAgent → Settings → Phone senses → Location → on; allow Location Always (iPhone Settings → Apps → NativeAgent → Location → \
+    Always, Precise on). The phone sends its last known position when iOS wakes the app or it moves about 500 m; this page holds the latest one with \
+    its time. It is for looking up when wanted, not live tracking; an old time means where the phone was then. A one-time fresh fix is the phone request phone.location.
 
     Motion: NativeAgent → Settings → Phone senses → Motion → on; allow Motion & Fitness when asked. To repair denial: iPhone Settings → Privacy & \
     Security → Motion & Fitness → Fitness Tracking on and NativeAgent on (also exposed under Settings → Apps → NativeAgent → Motion & Fitness). \

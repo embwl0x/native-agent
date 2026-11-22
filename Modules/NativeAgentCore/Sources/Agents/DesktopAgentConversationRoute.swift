@@ -30,8 +30,8 @@ public actor DesktopAgentConversationRoute {
     /// was typed) it is held in its conversation's queue, holding nothing, and goes when the Mac is free.
     public func run(turn: Turn, work: ChatTurnWork, mac: MacOperationContext, plan: [String: JSONValue], inner: any ToolDispatchClient,
         surface: String, conversation: AgentConversationContext, parts: Parts.Invocation) async -> JSONValue {
-        let agent = string(plan["agent"]) ?? "unknown"
-        let text = string(plan["requested_text"]) ?? ""
+        let agent = plan["agent"]?.stringValue ?? "unknown"
+        let text = plan["requested_text"]?.stringValue ?? ""
         let person = DesktopLane.askedByPerson(turn)
         if !person, DesktopLane.personHere {
             return await Self.held(agent, text: text, conversation: conversation, detail: MacAttentionSessionStore.personUsingMac)
@@ -87,12 +87,12 @@ public actor DesktopAgentConversationRoute {
 
     private func operate(turn: Turn, work: ChatTurnWork, mac: MacOperationContext, plan: [String: JSONValue], inner: any ToolDispatchClient,
         surface: String, lane: DesktopLane.Ticket, parts: Parts.Invocation) async -> JSONValue {
-        let agent = string(plan["agent"]) ?? "unknown"
-        guard case .object(let target)? = plan["target"], let bundle = string(target["app_bundle_id"]),
-              let label = string(target["conversation_label"]), !label.isEmpty else {
+        let agent = plan["agent"]?.stringValue ?? "unknown"
+        guard case .object(let target)? = plan["target"], let bundle = target["app_bundle_id"]?.stringValue,
+              let label = target["conversation_label"]?.stringValue, !label.isEmpty else {
             return result(agent, "needs_setup", "This desktop contact needs an exact conversation label before it can be operated automatically.")
         }
-        guard let requested = string(plan["requested_text"]), !requested.isEmpty else {
+        guard let requested = plan["requested_text"]?.stringValue, !requested.isEmpty else {
             return result(agent, "needs_setup", "A desktop contact is send-only; this route carries a message or nothing at all.")
         }
         // Wake covered screens before activation.
@@ -168,9 +168,6 @@ public actor DesktopAgentConversationRoute {
     }
     private func result(_ agent: String, _ status: String, _ detail: String) -> JSONValue {
         .object(["agent": .string(agent), "status": .string(status), "detail": .string(detail), "completed": .bool(false), "automatic_resend": .bool(false)])
-    }
-    private func string(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value else { return nil }; return text
     }
 }
 
@@ -255,9 +252,9 @@ package actor DesktopConversationTools: ToolDispatchClient {
             } else {
                 // Act can omit its target only after the foreground app is pinned and verified.
                 args.removeValue(forKey: "app")
-                let target = string(args["target"])
+                let target = JSONValue.stringOrEmpty(args["target"])
                 // Interpret press as a key only for key names, matching MacControl’s own parser.
-                let verb = string(args["verb"]) == "press" ? (["return", "enter"].contains(target.lowercased()) ? "key" : "click") : string(args["verb"])
+                let verb = JSONValue.stringOrEmpty(args["verb"]) == "press" ? (["return", "enter"].contains(target.lowercased()) ? "key" : "click") : JSONValue.stringOrEmpty(args["verb"])
                 for key in ["holding", "to", "to_app"] where args[key] == .string("") { args.removeValue(forKey: key) }
                 for key in ["seconds", "interval"] where args[key] == .int(0) || args[key] == .double(0) { args.removeValue(forKey: key) }
                 if args["repeat"] == .int(1) { args.removeValue(forKey: "repeat") }
@@ -275,7 +272,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
                 }
                 switch verb {
                 case "type":
-                    guard !typed, string(args["text"]) == message else { throw refusal("Only the exact requested message may be typed once.") }
+                    guard !typed, JSONValue.stringOrEmpty(args["text"]) == message else { throw refusal("Only the exact requested message may be typed once.") }
                     guard selectionSucceeded, let composer = try await Self.verifiedComposerTarget(mac: mac, bundle: bundle, label: label, content: "") else {
                         throw refusal("The exact conversation and an empty message box could not be verified. Nothing was typed.")
                     }
@@ -387,7 +384,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
             problem = "No native outgoing-transcript baseline was available; delivery is unconfirmed."
         }
         // Frame model-written notes inside fixed evidence from this request’s fence.
-        let note = String(string(answer["detail"]).prefix(300))
+        let note = String(JSONValue.stringOrEmpty(answer["detail"]).prefix(300))
         let why = [problem, note.isEmpty ? "" : "operator: " + note].filter { !$0.isEmpty }.joined(separator: " ")
         return stopped(agent, why: why)
     }
@@ -395,7 +392,6 @@ package actor DesktopConversationTools: ToolDispatchClient {
         DesktopAgentConversationRoute.stopped(agent, app: "the app", stage: stage, typed: typed, submitted: submitted,
                                               why: why.isEmpty ? problem : why)
     }
-    private func string(_ value: JSONValue?) -> String { if case .string(let s)? = value { return s }; return "" }
     private func flatten(_ value: JSONValue) -> String {
         switch value {
         case .string(let text): text

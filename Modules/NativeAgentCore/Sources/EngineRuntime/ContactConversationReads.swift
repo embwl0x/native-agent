@@ -25,7 +25,6 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
     public var appBundleID: String? = nil
     /// Distinguish desktop and routine connections that share one app.
     public var link: Link? = nil
-    public var clawd = false
     /// Use the chat session for direct chat contacts.
     public var dot = false
     public var health: AgentLocalHealth? = nil
@@ -245,10 +244,6 @@ public enum AgentContactThreads {
         return bundle.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) == nil ? nil : $0 }
     }
 
-    private static func isClaude(_ row: AgentContactRow) -> Bool {
-        row.contact?.endpoint.absoluteString == "mcp://claude-desktop"
-    }
-
     private static func sendRestriction(_ row: AgentContactRow) -> String? {
         guard let contact = row.contact else { return nil }
         if ChatGPTDotIPCTransport.owns(contact), !contact.canStartTurn { return ChatGPTDotIPCTransport.detail }
@@ -342,7 +337,6 @@ public enum AgentContactThreads {
                                    .compactMap { $0.flatMap(NativeTimestampFormat.parseISO8601) }.max(),
                                  appBundleID: appBundleID(row),
                                  link: link(row),
-                                 clawd: isClaude(row),
                                  dot: row.contact.map(ChatGPTDotIPCTransport.owns) ?? false,
                                  health: row.health)
         }

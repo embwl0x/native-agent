@@ -45,14 +45,14 @@ public enum ConnectorHealthDecay {
         now: Date,
         window: TimeInterval = provenWindow
     ) -> [String: JSONValue] {
-        guard stringField(row[proofSourceKey])?.lowercased() == credentialProofSource
+        guard row[proofSourceKey]?.trimmedString?.lowercased() == credentialProofSource
         else { return row }
         var out = row
         out["authState"] = .string(configuredAuth)
         if let outcome, !outcome.succeeded {
             if outcome.authorizationFailed { out["authState"] = .string("failed") }
             out["healthStatus"] = .string("failed")
-            out["lastCheckedAt"] = .string(isoTimestamp(outcome.at))
+            out["lastCheckedAt"] = .string(NativeTimestampFormat.fractionalUTCOffset(outcome.at))
             return out
         }
         let lastSuccessAt = outcome?.at
@@ -60,10 +60,10 @@ public enum ConnectorHealthDecay {
         case .fresh:
             out["authState"] = .string("connected")
             out["healthStatus"] = .string("ok")
-            out["lastCheckedAt"] = .string(isoTimestamp(lastSuccessAt!))
+            out["lastCheckedAt"] = .string(NativeTimestampFormat.fractionalUTCOffset(lastSuccessAt!))
         case .stale:
             out["healthStatus"] = .string(unverifiedHealth)
-            out["lastCheckedAt"] = .string(isoTimestamp(lastSuccessAt!))
+            out["lastCheckedAt"] = .string(NativeTimestampFormat.fractionalUTCOffset(lastSuccessAt!))
         case .configured:
             // Without a real check there is no honest lastCheckedAt to retain.
             out["authState"] = .string(configuredAuth)
@@ -71,16 +71,6 @@ public enum ConnectorHealthDecay {
             out["lastCheckedAt"] = .null
         }
         return out
-    }
-
-    private static func stringField(_ value: JSONValue?) -> String? {
-        guard case .string(let string)? = value else { return nil }
-        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    public static func isoTimestamp(_ date: Date) -> String {
-        SwiftNativeConnectorsClient.isoTimestamp(date)
     }
 }
 

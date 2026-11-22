@@ -88,11 +88,16 @@ public actor OneClock {
         handlers[owner] = nil
     }
 
-    /// Declare (or replace) one time.
-    public func declare(_ time: Time) async throws {
+    /// Declare (or replace) one time. `creating` refuses an id already declared, in the same step that saves it.
+    public func declare(_ time: Time, creating: Bool = false) async throws {
         var time = time
         try time.resolve(in: .current)
         var times = try read()
+        // Only a pending time holds its id; an ended one (cancelled, finished) frees it, and its delivery history carries over below.
+        if creating, let existing = times[time.id], existing.ended != true {
+            throw TriggerSchedulerError.schedulerInvalid("A scheduled read with id \(time.id) already exists; cancel it first or choose another id",
+                                                         path: "$.id")
+        }
         if let previous = times[time.id]?.delivered,
            time.delivered.map({ $0 < previous }) ?? true {
             time.delivered = previous
@@ -130,17 +135,6 @@ public actor OneClock {
         times[id] = time
         try save(times)
         return true
-    }
-
-    /// Import an old owner's time only once. Pending, delivered and withdrawn ids are all durably accounted for by this clock.
-    public func carryOver(_ time: Time) async throws {
-        var times = try read()
-        guard times[time.id] == nil else { return }
-        var time = time
-        try time.resolve(in: .current)
-        times[time.id] = time
-        try save(times)
-        await fire()
     }
 
     /// Withdraw a time; withdrawing one that is not declared does nothing.

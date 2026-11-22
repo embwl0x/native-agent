@@ -20,6 +20,60 @@ public struct ContextSelector: Sendable {
         sourceReadFailures: [ContextDegradedSourceNotice]
     ) throws -> ContextPacket {
         let selectionStarted = DispatchTime.now().uptimeNanoseconds
+        try validate(need, generation: generation, snapshot: snapshot)
+        let run = SelectionRun(need: need, generation: generation, snapshot: snapshot)
+        try admit(run)
+        let scoreContext = scoreCandidates(run)
+        seedMandatory(run)
+        rankMemory(run, scoreContext: scoreContext)
+        pack(run)
+        return packet(run, sourceReadFailures: sourceReadFailures, selectionStarted: selectionStarted)
+    }
+}
+
+// MARK: - Selection stages
+
+/// One selection's working state: what each stage leaves for the next.
+private final class SelectionRun {
+    let need: NeedSignal
+    let generation: ContextStoredGeneration
+    let snapshot: ContextGenerationSnapshot?
+    let memoryKinds: Set<ContextAtomKind> = [.memory, .correction]
+    // Admission
+    var decisions: [ContextEligibilityDecision] = []
+    var eligible: [ContextStoredAtom] = []
+    var mandatoryIDs: Set<ContextAtomID> = []
+    var mandatoryAtoms: [ContextStoredAtom] = []
+    var mandatoryCharacters = 0
+    // Scores
+    var scorable: [ContextStoredAtom] = []
+    var lexicalIndex: [ContextAtomID: ContextSelectionIndexEntry] = [:]
+    var scores: [ContextAtomID: ContextCandidateScoreFeatures] = [:]
+    var baseScores: [ContextAtomID: ContextCandidateScoreFeatures] = [:]
+    // Memory
+    var rankedCandidates: [ContextStoredAtom] = []
+    var memoryTouch: (relevance: [ContextAtomID: Double], cosines: [ContextAtomID: Double], looks: Int) = ([:], [:], 0)
+    var flooredMemoryIDs: Set<ContextAtomID> = []
+    var memoryRecall: [ContextMemoryRecallScore] = []
+    var memoryPicks: [ContextStoredAtom] = []
+    var effectiveMemoryRowLimit: Int?
+    // Pack
+    var selectedItems: [ContextPacketItem] = []
+    var selectedIDs = Set<ContextAtomID>()
+    var selectionOrdinals: [ContextAtomID: Int] = [:]
+    var candidateIDs = Set<ContextAtomID>()
+    var usedCharacters = 0
+
+    init(need: NeedSignal, generation: ContextStoredGeneration, snapshot: ContextGenerationSnapshot?) {
+        self.need = need
+        self.generation = generation
+        self.snapshot = snapshot
+    }
+}
+
+private extension ContextSelector {
+    /// The budget, the requested generation and a pinned snapshot must all match before anything is read.
+    func validate(_ need: NeedSignal, generation: ContextStoredGeneration, snapshot: ContextGenerationSnapshot?) throws {
         guard need.characterBudget > 0 else { throw ContextSelectionError.invalidCharacterBudget }
         if let requested = need.availableGenerationID, requested != generation.generation.id {
             throw ContextSelectionError.requestedGenerationMismatch(
@@ -38,7 +92,11 @@ public struct ContextSelector: Sendable {
                 throw ContextSelectionError.snapshotFingerprintMismatch
             }
         }
+    }
 
+    /// Eligibility receipts for every atom, then the mandatory set within its own budget.
+    func admit(_ run: SelectionRun) throws {
+        let need = run.need, generation = run.generation
         let sourceByID = Dictionary(generation.sources.map {
             ($0.descriptor.id, $0)
         }, uniquingKeysWith: { first, _ in first })
@@ -61,6 +119,8 @@ public struct ContextSelector: Sendable {
             ))
             if reason == nil { eligible.append(atom) }
         }
+        run.decisions = decisions
+        run.eligible = eligible
 
         var mandatoryIDs = need.mandatoryAtomIDs
         // Always-atoms are mandatory only within this request's authorized source scope.
@@ -68,6 +128,7 @@ public struct ContextSelector: Sendable {
             $0.draft.injectionPolicy == .always
                 && !need.precoveredSourceIDs.contains($0.draft.sourceID)
         }.map(\.draft.id))
+        run.mandatoryIDs = mandatoryIDs
         let eligibleIDs = Set(eligible.map(\.draft.id))
         let unavailableMandatory = mandatoryIDs.subtracting(eligibleIDs).sorted()
         guard unavailableMandatory.isEmpty else {
@@ -77,6 +138,8 @@ public struct ContextSelector: Sendable {
         // Budget expansion must not pay for a scoring pass it will discard.
         let mandatoryAtoms = mandatoryIDs.compactMap { atomByID[$0] }.sorted(by: mandatoryOrder)
         let mandatoryCharacters = mandatoryAtoms.reduce(0) { $0 + $1.draft.body.count }
+        run.mandatoryAtoms = mandatoryAtoms
+        run.mandatoryCharacters = mandatoryCharacters
         let mandatoryLimit = min(need.characterBudget, need.mandatoryCharacterBudget)
         guard mandatoryCharacters <= mandatoryLimit else {
             throw ContextSelectionError.mandatoryBudgetExceeded(
@@ -84,9 +147,13 @@ public struct ContextSelector: Sendable {
                 limit: mandatoryLimit
             )
         }
+    }
 
+    /// Scores every scorable atom once; `baseScores` keeps that pass while packing reranks `scores`.
+    func scoreCandidates(_ run: SelectionRun) -> ScoreContext {
+        let need = run.need, snapshot = run.snapshot, mandatoryIDs = run.mandatoryIDs
         // Precovered sources need eligibility receipts but no dynamic ranking work; explicit mandatory atoms remain scorable for complete receipts.
-        let scorable = eligible.filter {
+        let scorable = run.eligible.filter {
             !need.precoveredSourceIDs.contains($0.draft.sourceID)
                 || mandatoryIDs.contains($0.draft.id)
         }
@@ -109,33 +176,44 @@ public struct ContextSelector: Sendable {
             )
         }
         let baseScores = scores
+        run.scorable = scorable
+        run.lexicalIndex = lexicalIndex
+        run.scores = scores
+        run.baseScores = baseScores
+        return scoreContext
+    }
 
-        var selectedItems: [ContextPacketItem] = []
-        var selectedIDs = Set<ContextAtomID>()
-        var selectionOrdinals: [ContextAtomID: Int] = [:]
-        for atom in mandatoryAtoms {
-            selectedItems.append(ContextPacketItem(
+    /// Mandatory atoms land first, whole, in mandatory order.
+    func seedMandatory(_ run: SelectionRun) {
+        for atom in run.mandatoryAtoms {
+            run.selectedItems.append(ContextPacketItem(
                 atom: atom,
-                generationID: generation.generation.id,
+                generationID: run.generation.generation.id,
                 text: atom.draft.body,
                 representation: .body,
                 mandatory: true
             ))
-            selectedIDs.insert(atom.draft.id)
-            selectionOrdinals[atom.draft.id] = selectedItems.count
+            run.selectedIDs.insert(atom.draft.id)
+            run.selectionOrdinals[atom.draft.id] = run.selectedItems.count
         }
+    }
 
-        let rankedCandidates = eligible
+    /// Ranks the dynamic candidates, then decides which memories the message touched, which rest, and their row limit.
+    func rankMemory(_ run: SelectionRun, scoreContext: ScoreContext) {
+        let need = run.need, mandatoryIDs = run.mandatoryIDs, scores = run.scores, baseScores = run.baseScores
+        let memoryKinds = run.memoryKinds
+        let rankedCandidates = run.eligible
             .filter { !mandatoryIDs.contains($0.draft.id) }
             .filter { !need.precoveredSourceIDs.contains($0.draft.sourceID) }
             .filter { relevance(of: scores[$0.draft.id]) >= configuration.minimumRelevance }
             .sorted { rankedBefore($0, $1, scores: scores) }
+        run.rankedCandidates = rankedCandidates
         // Touch gates memory admission; relevance × reachability ranks it. Recent service rests unless singled out; triggered scoped corrections remain
         // mandatory.
-        let memoryKinds: Set<ContextAtomKind> = [.memory, .correction]
         let memoryTouch = memoryRelevance(
-            scorable.filter { memoryKinds.contains($0.draft.kind) }, need: need, scores: baseScores
+            run.scorable.filter { memoryKinds.contains($0.draft.kind) }, need: need, scores: baseScores
         )
+        run.memoryTouch = memoryTouch
         let relevanceByAtom = memoryTouch.relevance
         let smallMemoryPopulation = relevanceByAtom.count < 3
         // The floor is fixed; receipt population does not adjust it.
@@ -153,6 +231,7 @@ public struct ContextSelector: Sendable {
         }
         let memoryCandidates = rankedCandidates.filter { memoryKinds.contains($0.draft.kind) }
         let flooredMemoryIDs = Set(memoryCandidates.filter { !touched($0) }.map(\.draft.id))
+        run.flooredMemoryIDs = flooredMemoryIDs
         var memoryRecall: [ContextMemoryRecallScore] = []
         var memoryRank: [ContextAtomID: Double] = [:]
         for atom in memoryCandidates where !flooredMemoryIDs.contains(atom.draft.id) {
@@ -180,7 +259,8 @@ public struct ContextSelector: Sendable {
                 memoryRank[id] = rank * reachability
             }
         }
-        let memoryPicks = memoryCandidates.filter {
+        run.memoryRecall = memoryRecall
+        run.memoryPicks = memoryCandidates.filter {
             memoryRank[$0.draft.id] != nil
         }.sorted {
             let left = memoryRank[$0.draft.id] ?? 0, right = memoryRank[$1.draft.id] ?? 0
@@ -189,7 +269,7 @@ public struct ContextSelector: Sendable {
         }
 
         // Short messages narrow memory rows at the message-coverage damp's own threshold.
-        let effectiveMemoryRowLimit: Int? = {
+        run.effectiveMemoryRowLimit = {
             guard configuration.shortMessageMemoryRowCap > 0,
                   scoreContext.messageTokens.count
                     <= ContextSelectionConfiguration.shortMessageTokenCount else {
@@ -198,9 +278,17 @@ public struct ContextSelector: Sendable {
             let short = configuration.shortMessageMemoryRowCap
             return min(need.memoryAtomRowLimit ?? short, short)
         }()
+    }
 
+    /// Reserves touched memory rows, then greedily packs the rest by reranked score, diversity and redundancy within budget and quotas.
+    func pack(_ run: SelectionRun) {
+        let need = run.need, generation = run.generation, memoryKinds = run.memoryKinds
+        let rankedCandidates = run.rankedCandidates, memoryPicks = run.memoryPicks, flooredMemoryIDs = run.flooredMemoryIDs
+        let effectiveMemoryRowLimit = run.effectiveMemoryRowLimit, lexicalIndex = run.lexicalIndex, baseScores = run.baseScores
+        var selectedItems = run.selectedItems, selectedIDs = run.selectedIDs, selectionOrdinals = run.selectionOrdinals
+        var scores = run.scores
         let boundedCandidates = Array(rankedCandidates.prefix(configuration.maximumCandidates))
-        let candidateIDs = Set(boundedCandidates.map(\.draft.id)).union(memoryPicks.map(\.draft.id))
+        run.candidateIDs = Set(boundedCandidates.map(\.draft.id)).union(memoryPicks.map(\.draft.id))
 
         let admittedCandidates = boundedCandidates.filter {
             !flooredMemoryIDs.contains($0.draft.id) && !memoryKinds.contains($0.draft.kind)
@@ -209,7 +297,7 @@ public struct ContextSelector: Sendable {
             SelectionUnit(stableKey: "atom:\($0.draft.id.rawValue)", atoms: [$0])
         }
         var selectedDynamicCount = 0
-        var usedCharacters = mandatoryCharacters
+        var usedCharacters = run.mandatoryCharacters
         var sourceCounts: [ContextSourceID: Int] = [:]
         var kindCounts: [ContextAtomKind: Int] = [:]
         // Reserve memory rows before ordinary selection so operations cannot crowd out what the message touched.
@@ -322,7 +410,16 @@ public struct ContextSelector: Sendable {
                 }
             }
         }
+        run.selectedItems = selectedItems
+        run.selectedIDs = selectedIDs
+        run.selectionOrdinals = selectionOrdinals
+        run.scores = scores
+        run.usedCharacters = usedCharacters
+    }
 
+    /// Expansion pointers, degraded sources and the receipt, timed to the receipt's own construction.
+    func packet(_ run: SelectionRun, sourceReadFailures: [ContextDegradedSourceNotice], selectionStarted: UInt64) -> ContextPacket {
+        let need = run.need, generation = run.generation, selectedItems = run.selectedItems, mandatoryIDs = run.mandatoryIDs
         // Summaries and renderer-truncated bodies retain a route to the full atom. This adds at most one pointer per bounded selected item.
         var pointers: [ContextAtomPointer] = []
         var published: Set<ContextAtomID> = []
@@ -342,20 +439,20 @@ public struct ContextSelector: Sendable {
             uniquingKeysWith: { _, current in current }).values.sorted { $0.sourceID < $1.sourceID }
         let budget = ContextBudgetUsage(
             characterLimit: need.characterBudget,
-            usedCharacters: usedCharacters,
-            mandatoryCharacters: mandatoryCharacters
+            usedCharacters: run.usedCharacters,
+            mandatoryCharacters: run.mandatoryCharacters
         )
         let selectedIDList = selectedItems.map(\.pointer.atomID)
         let pointerIDList = pointers.map(\.atomID)
         let mandatoryIDList = mandatoryIDs.sorted()
-        let coveredMandatory = mandatoryIDList.filter { selectedIDs.contains($0) }
-        let scoreReceiptIDs = mandatoryIDs.union(candidateIDs)
-        let scoreReceipts = scores.compactMap { atomID, features -> ContextCandidateScore? in
+        let coveredMandatory = mandatoryIDList.filter { run.selectedIDs.contains($0) }
+        let scoreReceiptIDs = mandatoryIDs.union(run.candidateIDs)
+        let scoreReceipts = run.scores.compactMap { atomID, features -> ContextCandidateScore? in
             guard scoreReceiptIDs.contains(atomID) else { return nil }
             return ContextCandidateScore(
                 atomID: atomID,
                 features: features,
-                selectionOrdinal: selectionOrdinals[atomID]
+                selectionOrdinal: run.selectionOrdinals[atomID]
             )
         }.sorted { $0.atomID < $1.atomID }
         let needFingerprint = need.deterministicFingerprint
@@ -371,7 +468,7 @@ public struct ContextSelector: Sendable {
             generationID: generation.generation.id,
             sourceFingerprint: generation.generation.sourceFingerprint,
             selectionTimeBucket: need.selectionTimeBucket,
-            eligibility: decisions,
+            eligibility: run.decisions,
             candidateScores: scoreReceipts,
             selectedAtomIDs: selectedIDList,
             pointerAtomIDs: pointerIDList,
@@ -385,9 +482,9 @@ public struct ContextSelector: Sendable {
             cacheState: need.cacheState,
             measuredSelectionMicroseconds: measuredSelectionMicroseconds,
             selectionLatencyProvenance: .monotonicClock,
-            memoryPopulation: memoryTouch.looks,
-            memoryFloorDroppedCount: flooredMemoryIDs.count,
-            memoryRecall: memoryRecall.sorted { $0.atomID < $1.atomID }
+            memoryPopulation: run.memoryTouch.looks,
+            memoryFloorDroppedCount: run.flooredMemoryIDs.count,
+            memoryRecall: run.memoryRecall.sorted { $0.atomID < $1.atomID }
         )
 
         return ContextPacket(

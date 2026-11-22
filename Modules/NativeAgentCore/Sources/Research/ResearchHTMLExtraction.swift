@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 
 // Blueprint: | `ResearchHTMLExtraction.swift` | `ResearchHTMLExtraction`: cancellable HTML extraction |
 
@@ -29,6 +30,15 @@ enum ResearchHTMLExtraction {
     }
 
     static func extract(_ html: String, base: URL, decode: (String) throws -> String) throws -> Evidence {
+        let (root, linkBase, scriptCharacters, scripts, canvases) = try parse(html, base: base, decode: decode)
+        let (text, bodyCharacters) = try renderEvidence(root, base: base, linkBase: linkBase)
+        return Evidence(text: text, scriptCharacters: scriptCharacters, scripts: scripts,
+                        canvases: canvases, bodyCharacters: bodyCharacters)
+    }
+
+    /// Parse the bounded response and collect source coverage.
+    private static func parse(_ html: String, base: URL, decode: (String) throws -> String) throws
+        -> (root: Node, linkBase: URL, scriptCharacters: Int, scripts: Int, canvases: Int) {
         let chars = Array(html), n = chars.count
         let root = Node("document")
         var stack = [root], i = 0
@@ -164,8 +174,11 @@ enum ResearchHTMLExtraction {
                 stack.append(node)
             }
         }
+        return (root, linkBase, scriptCharacters, scripts, canvases)
+    }
 
-        func compact(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+    /// Render the extracted tree with and without link targets.
+    private static func renderEvidence(_ root: Node, base: URL, linkBase: URL) throws -> (String, Int) {
         func excluded(_ node: Node) -> Bool {
             if ["head", "nav", "footer", "svg", "template", "script", "style", "noscript"].contains(node.tag) { return true }
             let attrs = node.attributes
@@ -218,7 +231,7 @@ enum ResearchHTMLExtraction {
             if hackerNews && (node.hasClass("votelinks") || node.hasClass("sitebit") || node.hasClass("reply")) { return "" }
             if hackerNews && node.hasClass("comhead") {
                 let byline = try descendants(node, matching: { $0.hasClass("hnuser") || $0.hasClass("age") })
-                return "\n" + (try byline.map { compact(try render($0, links: false)) }.joined(separator: " · ")) + "\n"
+                return "\n" + (try byline.map { TextNormalization.collapseWhitespace(try render($0, links: false)) }.joined(separator: " · ")) + "\n"
             }
             if hackerNews && node.hasClass("comment") {
                 return "\n" + (try node.children.map { try render($0, links: links) }.joined()) + "\n"
@@ -232,19 +245,19 @@ enum ResearchHTMLExtraction {
                     if child.tag == "tr", child.hasClass("athing"),
                        let title = try descendants(child, matching: { $0.hasClass("titleline") }).first {
                         let rank = try descendants(child, matching: { $0.hasClass("rank") }).first
-                        out += "\n" + (try rank.map { compact(try render($0, links: false)) + " " } ?? "")
-                        out += compact(try render(title, links: links))
+                        out += "\n" + (try rank.map { TextNormalization.collapseWhitespace(try render($0, links: false)) + " " } ?? "")
+                        out += TextNormalization.collapseWhitespace(try render(title, links: links))
                         var next = index + 1
                         while next < node.children.count && node.children[next].tag == "text" { next += 1 }
                         if next < node.children.count, node.children[next].tag == "tr",
                            let subtext = try descendants(node.children[next], matching: { $0.hasClass("subtext") }).first {
                             let scores = try descendants(subtext, matching: { $0.hasClass("score") })
                             let comments = try descendants(subtext, matching: { $0.tag == "a" }).filter {
-                                let label = compact(try render($0, links: false))
+                                let label = TextNormalization.collapseWhitespace(try render($0, links: false))
                                 return label.contains("comment") || label == "discuss"
                             }
-                            let details = try scores.map { compact(try render($0, links: false)) }
-                                + comments.map { compact(try render($0, links: links)) }
+                            let details = try scores.map { TextNormalization.collapseWhitespace(try render($0, links: false)) }
+                                + comments.map { TextNormalization.collapseWhitespace(try render($0, links: links)) }
                             if !details.isEmpty { out += " (" + details.joined(separator: ", ") + ")" }
                             index = next
                         }
@@ -261,20 +274,19 @@ enum ResearchHTMLExtraction {
                 }
                 var cells: [String] = []
                 for child in node.children where child.tag == "td" || child.tag == "th" {
-                    let value = compact(try render(child, links: links))
+                    let value = TextNormalization.collapseWhitespace(try render(child, links: links))
                     cells.append(value)
                 }
                 return "\n" + cells.joined(separator: " | ") + "\n"
             }
             let body = try node.children.map { try render($0, links: links) }.joined()
-            if node.tag == "a" { return links ? link(node, compact(body)) : body }
+            if node.tag == "a" { return links ? link(node, TextNormalization.collapseWhitespace(body)) : body }
             if blocks.contains(node.tag) { return "\n" + body + "\n" }
             return body
         }
-        let text = try render(root).split(separator: "\n").map { compact(String($0)) }
+        let text = try render(root).split(separator: "\n").map { TextNormalization.collapseWhitespace(String($0)) }
             .filter { !$0.isEmpty }.joined(separator: "\n")
-        let bodyCharacters = compact(try render(root, links: false)).count
-        return Evidence(text: text, scriptCharacters: scriptCharacters, scripts: scripts,
-                        canvases: canvases, bodyCharacters: bodyCharacters)
+        let bodyCharacters = TextNormalization.collapseWhitespace(try render(root, links: false)).count
+        return (text, bodyCharacters)
     }
 }

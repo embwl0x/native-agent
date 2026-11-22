@@ -290,7 +290,7 @@ extension ProvidersFacade {
         reasoningOptions(from: catalog, selectedModel: providerModels(providers: providers, providerID: providerID).first { $0.id == model })
     }
 
-    public nonisolated static func normalizedReasoningEffort(from catalog: ModelCatalogResponse?, providers: [ProviderInfo], providerID: String, model: String,
+    public nonisolated static func normalizedReasoningEffort(providers: [ProviderInfo], providerID: String, model: String,
         selected: String) -> String {
         let selectedModel = providerModels(providers: providers, providerID: providerID).first { $0.id == model }
         guard selectedModel?.supportedReasoningEfforts != nil else { return selected }
@@ -536,7 +536,7 @@ extension ProvidersFacade {
             "detail": .string(account.auth_status.detail),
             "fallback_model": .string(account.default_model ?? ""),
             // What the account offers to choose from; the build's rows standing in for a missing list are not offered.
-            "models": .array(account.offeredModels.map { .string($0.id) }),
+            "models": .array(account.auth_status.eligible ? account.offeredModels.map { .string($0.id) } : []),
         ]
         if let note = account.models_note { row["models_note"] = .string(note) }
         return .object(row)

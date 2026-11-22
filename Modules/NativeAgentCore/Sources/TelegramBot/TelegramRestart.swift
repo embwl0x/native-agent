@@ -35,23 +35,19 @@ public struct TelegramRestartBridge: Sendable {
                 reply: "Restart failed: unexpected coordinator response."
             )
         }
-        func str(_ key: String) -> String? {
-            if case .string(let s)? = obj[key] { return s }
-            return nil
-        }
-        if str("status") == "restarting", let armTerminate {
+        if obj["status"]?.stringValue == "restarting", let armTerminate {
             return TelegramSlashDispatchOutcome(
-                reply: "Restarting NativeAgent — back in under a minute. \(str("note") ?? "")",
+                reply: "Restarting NativeAgent — back in under a minute. \(obj["note"]?.stringValue ?? "")",
                 afterReplySent: armTerminate
             )
         }
-        if str("status") == "restarting" {
+        if obj["status"]?.stringValue == "restarting" {
             // Refuse a restart without the post-reply termination handoff.
             return TelegramSlashDispatchOutcome(
                 reply: "Restart failed: restart handoff was incomplete; NativeAgent is still running."
             )
         }
-        if str("reason") == "cooldown" {
+        if obj["reason"]?.stringValue == "cooldown" {
             let retry: String = {
                 if case .double(let n)? = obj["retryAfterSeconds"],
                    let seconds = Int(exactly: n.rounded(.towardZero)) { return String(seconds) }
@@ -62,7 +58,7 @@ public struct TelegramRestartBridge: Sendable {
             )
         }
         return TelegramSlashDispatchOutcome(
-            reply: "Restart failed: \(str("reason") ?? "unknown"). \(str("detail") ?? "")"
+            reply: "Restart failed: \(obj["reason"]?.stringValue ?? "unknown"). \(obj["detail"]?.stringValue ?? "")"
         )
     }
 }

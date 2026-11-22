@@ -878,8 +878,13 @@ Cognitive persistence is `<dataRoot>/cognition/cognition.sqlite`, owned by
 reflection receipt decodes once; a shared codec validates every present evidence field and nested cause/judgment before projection. Affect requires all four finite dimensions; disposition validates its claims and every transition; dream residue is wholly present or absent; the mind ledger requires typed suppression terms and complete undo values. Capsule counters, dates and nested rests and the consolidation counts are checked too. Wrongly typed arrays or members, malformed identifiers and nonfinite values refuse the artifact with its field path before any reconciliation write, preserving the damaged bytes. `CognitiveSubstrate+Restore.swift` stages those values until the whole bundle is valid, then publishes with resident precedence. Approval-decision source failures remain unavailable beside the proposal; an empty substitute never certifies an outcome.
 Replay requires each dream's valid calendar day and each REM proposal's valid
 `createdAt`; a refused record appears in the replay receipt's
-`unavailableEvidence` while valid siblings proceed. Studio feeling requires
-the journal owner's valid `recorded_at`, otherwise `studio_journal.unavailable`
+`unavailableEvidence` while valid siblings proceed. Replay stages episodes,
+schema proposals, and timeline events until the SQLite commit. Maintenance
+and dream previews can proceed while replay writes. Maintenance also stages
+its timeline events until commit. Each applies resident retention after
+publishing. With persistence disabled, publication follows the in-memory
+transition.
+Studio feeling requires the journal owner's valid `recorded_at`, otherwise `studio_journal.unavailable`
 names the entry and cause. None of these sources is redated to the present.
 Failed restoration blocks writes. `commitMaintenance` removes only absent nodes
 and updates only nodes whose stored fields differ, retaining an unchanged node's
@@ -889,7 +894,9 @@ minted residue, with no checkpoint-time stamp. Node, artifact and receipt
 retention share the transaction; a retention failure leaves that snapshot
 uncommitted. Immediate saves, including folds and sleep, checkpoint affect,
 consumed dream residue and nodes together; microcycles carry the same affect
-and residue state. Minting still checks its night claim before node admission.
+and residue state. A newly admitted night saves its claim, residue and felt event in
+the same checkpoint. An older claim awaiting mood delivery can finish that event
+without minting the residue again.
 This is continuity state, not another fact or persona store.
 The mind ledger holds one optional disposition undo. Its `undo` field and read
 response remain arrays with the `disposition` key; undo consumes only its matched entry.
@@ -918,11 +925,12 @@ the hold releases and the resident state, the four seeds and the emptied body
 are saved. Residue consumption travels with the affect checkpoint under the
 same exclusion. Clear and restore exclude each other
 under the same hold (a restore waiting out a Clear finds the cleared mind
-already read). Clear is also a maintenance transition: it waits out undo,
-maintenance and a microcycle commit in flight and holds the transition (and the
-microcycle's commit ownership) for its whole duration, so none of them commits
-into the hold. Each per-piece write the hold still discards is noted by kind
-and id, and returns a not-durable result (`CognitiveWriteDiscarded`), never a
+already read). Clear waits out undo, maintenance, replay, and any microcycle
+commit in flight. It holds the maintenance transition and microcycle commit
+ownership across the clear. Undo and replay wait for that transition to
+finish, and maintenance reports the slot is busy. Each per-piece write the
+hold still discards is noted by kind and id, and returns a not-durable result
+(`CognitiveWriteDiscarded`), never a
 silent success: a moment whose piece hit one stays meant. A Clear whose store transaction fails writes nothing extra: it owes
 one repair (stage `clear`) naming those writes, marks their mind dirty so the
 next microcycle re-saves affect and nodes from RAM, and every other piece saves
@@ -930,10 +938,13 @@ on its own next write. A successful Clear drops the list and settles the
 superseded SQLite unsaved stages, including persisted repair claims from an
 earlier process, with its committed forgetting epoch as evidence. Clear reads
 those claims from the experience owner before deletion; an unavailable repair
-ledger refuses Clear. Self-file deletion remains checked separately; any failure of that
-deletion or the fresh checkpoint remains degraded. The
-substrate's body epoch follows the kernel's on every exit of reset, settle and
-clear. Reset and Settle share checked mutation, persistence and revision-owned
+ledger refuses Clear. Self-file deletion remains checked separately. If
+`mind/self.json` cannot be deleted after the store commits, Clear still finishes
+the body reset. `mind.clear` reports `status: partial` and `effects: partial`
+with the surviving file and any body save failure. A failed deletion or fresh
+checkpoint leaves persistence degraded. The substrate's body epoch follows
+the kernel's on every exit of reset, settle and clear. Reset and Settle share
+checked mutation, persistence and revision-owned
 recovery; only Reset holds the door, permits damaged-body replacement and clears
 the body-line window. The body checks a turn's epoch inside its own actor for the dose,
 the after-turn reaction and the correction cause. On a store or body whose restore
@@ -1099,7 +1110,7 @@ whole substrate during that read.
 ## Attention
 
 **The agent thinks when something in its mind is worth a thought.** A source never decides that: it posts a happening
-(`NativeAgentShared/Happening.swift`) through `Attention.post` and is done. The happening is written once in the record as an
+(`NativeAgentShared/Happening.swift`) through Attention's intake. The happening is written once in the record as an
 experience of kind `happening` under its key `once`; the cognition runtime takes it (`Cognition/NativeCognitionRuntime+Attention.swift`).
 
 - **Owed** (`returned`, `moment`, `body`) is a record obligation to `conversation:<route or mind>` and opens a thought at once:
@@ -1378,9 +1389,11 @@ The composite body evidence read retains its two-second sampled cache because
 its host/transport gauges have no complete shared push owner. Daily integrity
 sweeps remain.
 
-Reflection has an enable switch, an in-flight reservation and a rolling
-24-hour call ceiling. Dream and replay supply its evidence; there is no daily
-reflection registration, spontaneous-demand gate or same-material cooldown.
+Reflection has an enable switch and an in-flight reservation. A positive budget
+counts and caps only waking calls over a rolling 24 hours. A zero budget
+disables all reflection, including dream reflection. Dream and replay supply
+its evidence; there is no daily reflection registration, spontaneous-demand
+gate or same-material cooldown.
 The retired `cognitiveSubstrateReflectionLoadThreshold` preference has no reader;
 any saved value is left untouched and needs no data move.
 One checked `cognition_reflection` model/account/Think/Fast tuple binds execution
@@ -1392,7 +1405,8 @@ tokens and cost. The proposal-yield metric is removed; retained SQLite
 Body posture does not throttle work; fatigue and heat color presentation.
 Waking reflection also obeys the
 [shared work-slot admission](COGNITION_WIRING.md#shared-work-slot-admission).
-A dream's reflection proceeds even without a slot claim, still bound by the daily ceiling and single flight.
+A dream's reflection proceeds even without a slot claim and shares
+single-flight admission.
 
 ### Speaking unasked
 
@@ -1413,11 +1427,11 @@ the hour switch permits one `self` happening per local day: subject `hour`, door
 hour supplies no opportunity; an unreadable source names its repair. The record's daily happening identity owns admission across restarts.
 There is no hour clock, quiet wait or refractory.
 
-Enable the hour switch in Setup (`Sources/NativeAgentApp/SetupView.swift`);
+The hour switch is `settings.wander_hour` (Settings → Inner life);
 `studioWanderEnabled` defaults on (`StudioWanderLane.enabledByDefault`) and requires Subconscious. Configure its
 provider/model under **Providers → Memory and mind**, which owns **Creative
 exploration**. `Cognition/StudioWanderLane.swift`
-enforces explicit enablement, the Subconscious master, and onboarding clearance
+enforces the switch, the Subconscious master, and onboarding clearance
 for public-safe builds in `resolveInstallation`.
 
 The line carries `rest` and their curiosity. The seed gives it worth `2 * curiosity * learned`, where
@@ -1472,7 +1486,7 @@ vocabulary and checked evidence references retain their owner-defined forms.
 This read arrives through the door; the former Expansion prediction layer is removed.
 
 The human-facing Observatory is
-`Sources/NativeAgentApp/CognitionObservatoryView.swift`, reached through
+`Sources/NativeAgentFace/CognitionObservatoryView.swift`, reached through
 **Diagnostics → Cognition** in Advanced view. It subscribes to owner changes
 and exposes the runtime's last committed live capsule separately from inspection
 reads, alongside organism, affect, context and Desk state. Its counters

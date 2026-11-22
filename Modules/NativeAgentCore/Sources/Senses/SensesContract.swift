@@ -321,7 +321,7 @@ public enum SenseRequest: Sendable, Equatable {
     case act(verb: String, address: String, args: JSONValue)
     case watch
     /// View and part-wake handling grants no door action authority.
-    case event(JSONValue)
+    case event(JSONValue, revision: String? = nil)
 }
 
 /// An act's explicitly supplied callback re-enters normal app gates.

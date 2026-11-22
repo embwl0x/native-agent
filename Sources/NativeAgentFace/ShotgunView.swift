@@ -265,15 +265,19 @@ struct ShotgunView: View {
         let draft = appModel.composerDraft(for: sessionId)
         let submitted = draft.text
         let editedAt = draft.editedAt
+        let revision = draft.manualEditRevision
         let text = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !sending else { return }
+        // The conversation's draft is its text and its attachments together, whichever composer sends it.
+        let attachments = appModel.chatPendingAttachments[sessionId] ?? []
+        guard !text.isEmpty || !attachments.isEmpty, !sending else { return }
         sending = true
         Task { @MainActor in
             defer { sending = false }
-            switch await appModel.startChatTurnForSession(text, sessionId: sessionId) {
+            switch await appModel.startChatTurnForSession(text, attachments: attachments, sessionId: sessionId, composerRevision: revision) {
             case .accepted:
                 let unchanged = draft.text == submitted && draft.editedAt == editedAt
                 appModel.clearChatDraftAfterSend(submitted, sessionId: sessionId, editedAt: editedAt)
+                if appModel.chatPendingAttachments[sessionId] == attachments { appModel.chatPendingAttachments[sessionId] = [] }
                 // Return keyboard ownership after acceptance so the drive can continue.
                 if ShotgunController.shared.selectedSessionID == sessionId, unchanged {
                     ShotgunController.shared.giveKeyboardBack()

@@ -151,8 +151,12 @@ extension NativeCognitionRuntime {
 
     /// The record owns night identity; part accounting and dream consumption have independent cursors.
     public func restReading(at: Date) async throws -> JSONValue {
+        // Rest is the last night whose accounting advanced; a failed pass records through == since only so it can retry.
         let last = try await ExperienceStore.at(dataRoot).details(.init(sources: [Attention.detailSource], subjects: ["sleep"],
-            kinds: [Attention.nightKind], limit: 1, newestFirst: true)).first?.at
+            kinds: [Attention.nightKind], newestFirst: true)).first(where: { night in
+                guard let row = (try? JSONValue.parse(night.row))?.objectValue else { return false }
+                return row["through"] != row["since"]
+            })?.at
         let presence = PersonPresence.read(dataRoot: dataRoot, now: at).transition
         let value = try loadRhythm()
         let hour = Calendar.current.component(.hour, from: at)
@@ -174,7 +178,7 @@ extension NativeCognitionRuntime {
         if rhythm.nightDue != nil {
             fields["reason"] = .string("The next reading of the night; sleep is my judgment.")
         } else if let presence = PersonPresence.read(dataRoot: dataRoot, now: at).transition {
-            fields["reason"] = .string("Waiting for the person to be away.")
+            fields["reason"] = .string("Waiting for you to step away.")
             if presence.here { fields["hereSince"] = .double(presence.since.timeIntervalSince1970) }
         } else {
             fields["reason"] = .string(Self.presenceUnknownCause)
@@ -261,7 +265,8 @@ extension NativeCognitionRuntime {
                 rhythm.due = calendar.date(bySettingHour: claim.to / 60, minute: claim.to % 60, second: 0, of: day)
             }
             if value.started(on: day) { rhythm.due = nil }
-            if let due = rhythm.due, satisfyWait || due <= at, let claim = rhythm.dueClaim {
+            // A missed start is claimed only once its time has passed; a manual run refreshes the evidence, never claims early.
+            if let due = rhythm.due, due <= at, let claim = rhythm.dueClaim {
                 rhythm.due = nil
                 if !value.started(on: day) {
                     try keepRhythmBreak("starts", claim: claim, at: at, in: &value)

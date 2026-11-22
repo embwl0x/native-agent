@@ -201,8 +201,8 @@ extension ChatView {
             loadWholeMessage: { id in Task { await store.loadWholeMessage(id) } },
             retrySend: { id in store.sendQueuedNow(id, client: bridgeClient) },
             openExchange: { exchange in openedAgentContactID = exchange.contactID },
-            canRegenerate: store.canRegenerateLast,
-            regenerate: { store.regenerateLast(client: bridgeClient, controls: runtimeControls) },
+            canRegenerate: store.regenerationTarget != nil,
+            regenerate: { id, session in store.regenerate(id, in: session, client: bridgeClient, controls: runtimeControls) },
             canReadAloud: voiceOutput.enabled,
             isReading: voiceOutput.isSpeaking,
             readAloud: { text in voiceOutput.speak(text) },
@@ -373,7 +373,7 @@ extension ChatView {
                 guard !runs.isEmpty else { return }
                 Task {
                     do { try await bridgeClient.cancelChat(sessionID: session, runIDs: runs) }
-                    catch { store.errorBanner = "Stop is unconfirmed: \(error.localizedDescription)" }
+                    catch { store.errorBanner = "Not sure Stop worked: \(error.localizedDescription)" }
                 }
             }
         )

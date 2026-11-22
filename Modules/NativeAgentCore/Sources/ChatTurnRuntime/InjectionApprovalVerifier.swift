@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
@@ -54,14 +55,14 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
         }
         guard case .object(let payload) = record.payload else { return .malformedRecord }
 
-        let recordTool = Self.string(payload["toolName"])
-            ?? Self.string(payload["tool"])
+        let recordTool = payload["toolName"]?.trimmedString
+            ?? payload["tool"]?.trimmedString
             ?? record.action
-        guard Self.normalized(recordTool) == Self.normalized(tool) else { return .toolMismatch }
+        guard TextNormalization.trimmedLowercased(recordTool) == TextNormalization.trimmedLowercased(tool) else { return .toolMismatch }
 
         // Check recorded surface when present; its absence never bypasses the exact tool and body checks.
-        if let recordSurface = Self.string(payload["surface"]),
-           Self.normalized(recordSurface) != Self.normalized(surface) {
+        if let recordSurface = payload["surface"]?.trimmedString,
+           TextNormalization.trimmedLowercased(recordSurface) != TextNormalization.trimmedLowercased(surface) {
             return .surfaceMismatch
         }
 
@@ -87,15 +88,5 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
         }
 
         return .verified
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let s)? = value else { return nil }
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func normalized(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 }

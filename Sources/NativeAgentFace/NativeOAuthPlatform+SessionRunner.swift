@@ -56,6 +56,7 @@ extension NativeOAuthPlatform {
             guard let outcome = response.outcome else {
                 throw PartCallError(code: "oauth_unconfirmed", message: "Authentication ended without a callback.")
             }
+            if case .failure(let error) = outcome, (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin { return .cancelled }
             return .oauthCallback(url: try outcome.get().absoluteString)
         } onCancel: {
             Task { @MainActor in response.finish(.failure(CancellationError())) }

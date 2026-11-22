@@ -36,12 +36,10 @@ public struct ContextSelectionIndexEntry: Equatable, Sendable {
         self.normalizedSearchableText = normalizedSearchableText
     }
 }
-/// Live selection measures with the monotonic clock. Other provenance remains decodable for archived receipts and never enters a production latency window.
+/// Live selection measures with the monotonic clock. Other provenance never enters a production latency window.
 public enum ContextSelectionLatencyProvenance: String, Codable, Equatable, Sendable {
     case monotonicClock = "monotonic_clock"
-    case callerSupplied = "caller_supplied"
     case unavailable
-    case invalidCallerSupplied = "invalid_caller_supplied"
 }
 public struct ContextSelectionReceipt: Equatable, Sendable {
     public let id: String

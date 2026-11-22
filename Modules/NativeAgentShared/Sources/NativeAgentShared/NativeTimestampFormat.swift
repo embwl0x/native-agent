@@ -37,6 +37,13 @@ public enum NativeTimestampFormat {
             formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
             return formatter
         }()
+        lazy var compactUTC: DateFormatter = {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(identifier: "UTC")
+            formatter.dateFormat = "yyyyMMdd'T'HHmmss"
+            return formatter
+        }()
     }
 
     private static let formatsKey = "NativeTimestampFormat.formats"
@@ -92,6 +99,11 @@ public enum NativeTimestampFormat {
         let formatter = formats.calendarDay
         formatter.timeZone = timeZone
         return formatter.string(from: date)
+    }
+
+    public static func calendarDay(_ date: Date, calendar: Calendar) -> String {
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
     }
 
     public static func parseCalendarDay(_ text: String) -> Date? {
@@ -155,6 +167,11 @@ public enum NativeTimestampFormat {
         formats.plainISO.string(from: date)
     }
 
+    /// Compact UTC timestamp for filenames.
+    public static func compactUTC(_ date: Date) -> String {
+        formats.compactUTC.string(from: date)
+    }
+
     public static func basicZulu(_ date: Date) -> String {
         formats.basicZulu.string(from: date)
     }
@@ -170,6 +187,16 @@ public enum NativeTimestampFormat {
     public static func parseISO8601FractionalFirst(_ text: String) -> Date? {
         zulu(text, fractional: true) ?? zulu(text, fractional: false)
             ?? formats.fractionalISO.date(from: text) ?? formats.plainISO.date(from: text)
+    }
+
+    /// The fractional-first reader for a stamp that may be absent: absent or empty reads nil.
+    public static func parseOptionalISO8601FractionalFirst(_ text: String?) -> Date? {
+        text.flatMap { parseISO8601FractionalFirst($0) }
+    }
+
+    /// The fractional-first reader after trimming whitespace and newlines: absent or blank reads nil.
+    public static func parseTrimmedISO8601FractionalFirst(_ text: String?) -> Date? {
+        text.flatMap { parseISO8601FractionalFirst($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
 
     public static func fractionalUTCOffset(_ date: Date) -> String {

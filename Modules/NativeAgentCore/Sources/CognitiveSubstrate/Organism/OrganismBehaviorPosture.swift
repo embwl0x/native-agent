@@ -70,13 +70,11 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
                 predictionSummary: snapshot.predictionSummary
             ),
             toolStrategy: toolStrategy(
-                chemicalState: snapshot.chemicalState,
                 bodySchema: snapshot.bodySchema,
                 predictionSummary: snapshot.predictionSummary
             ),
             notificationRequiresReceipt: notificationRequiresReceipt(bodySchema: snapshot.bodySchema),
             directives: directives(
-                chemicalState: snapshot.chemicalState,
                 bodySchema: snapshot.bodySchema,
                 predictionSummary: snapshot.predictionSummary
             )
@@ -140,7 +138,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
     }
 
     private static func toolStrategy(
-        chemicalState: ChemicalState,
         bodySchema: BodySchema,
         predictionSummary: OrganismPredictionSummary
     ) -> OrganismToolStrategy {
@@ -163,7 +160,6 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
     }
 
     private static func directives(
-        chemicalState: ChemicalState,
         bodySchema: BodySchema,
         predictionSummary: OrganismPredictionSummary
     ) -> [String] {

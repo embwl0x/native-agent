@@ -99,12 +99,6 @@ public final class SystemToastCenter {
         dismissTasks.removeValue(forKey: id)?.cancel()
         queue.removeAll { $0.id == id }
     }
-
-    public func dismissAll() {
-        for task in dismissTasks.values { task.cancel() }
-        dismissTasks.removeAll()
-        queue.removeAll()
-    }
 }
 
 #if os(iOS)

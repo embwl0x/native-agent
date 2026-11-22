@@ -1,6 +1,4 @@
 import Foundation
-import AppKit
-import UniformTypeIdentifiers
 import NativeAgentShared
 
 // Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver`; Bounded off-main attachment admission |
@@ -8,47 +6,6 @@ import NativeAgentShared
 public typealias ChatAttachmentTypeResolver = NativeAgentShared.ChatAttachmentTypeResolver
 
 public extension ChatAttachmentTypeResolver {
-    static let clipboardImageByteLimit = 10 * 1024 * 1024
-
-    static func imageType(in identifiers: [String]) -> String? {
-        let preferred = [UTType.png.identifier, UTType.jpeg.identifier, UTType.tiff.identifier]
-        return preferred.first(where: identifiers.contains)
-            ?? identifiers.first { UTType($0)?.conforms(to: .image) == true }
-    }
-
-    static func localFileURL(_ item: Any?) -> URL? {
-        if let value = item as? URL { return value }
-        if let value = item as? Data { return URL(dataRepresentation: value, relativeTo: nil) }
-        if let value = item as? String { return URL(string: value) }
-        return nil
-    }
-
-    static func imageAttachment(
-        _ data: Data?, typeIdentifier: String
-    ) -> Result<NativeAgentShared.MultimodalAttachment, AttachmentRefusal> {
-        guard let data else { return .failure(.init(message: "Couldn't read the attached image")) }
-        guard data.count <= clipboardImageByteLimit else {
-            return .failure(.init(message: "Image too large (limit: 10 MB)"))
-        }
-        let bytes: Data
-        let mime: String
-        switch typeIdentifier {
-        case UTType.png.identifier: bytes = data; mime = "image/png"
-        case UTType.jpeg.identifier: bytes = data; mime = "image/jpeg"
-        default:
-            guard let png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) else {
-                return .failure(.init(message: "Couldn't read the attached image"))
-            }
-            bytes = png; mime = "image/png"
-        }
-        guard bytes.count <= clipboardImageByteLimit else {
-            return .failure(.init(message: "Image too large (limit: 10 MB)"))
-        }
-        return .success(NativeAgentShared.MultimodalAttachment(
-            type: "image", base64: bytes.base64EncodedString(), mime: mime, byteSize: bytes.count
-        ))
-    }
-
     /// Read one overflow byte so a growing file cannot bypass the attachment
     /// cap or allocate an unbounded buffer before it is rejected.
     static func readAttachmentFile(_ url: URL) throws -> Data {
@@ -62,14 +19,6 @@ public extension ChatAttachmentTypeResolver {
             data.append(chunk)
         }
         return data
-    }
-
-    static func voiceDraft(base: String, transcript: String) -> String {
-        let base = base.trimmingCharacters(in: .whitespacesAndNewlines)
-        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if base.isEmpty { return spoken }
-        if spoken.isEmpty { return base }
-        return "\(base) \(spoken)"
     }
 
     struct AttachmentRefusal: Error, Sendable {

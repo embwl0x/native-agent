@@ -258,6 +258,7 @@ public final class CodexProcess: LLMTransport {
     private let streamingRunner: CodexStreamingProcessRunner
     private let processEnvironment: [String: String]
     private let dataRootOverride: URL?
+    public var telemetry: LLMCallTraceRecorder { LLMCallTraceRecorder(dataRootOverride: dataRootOverride) }
 
     public init(
         codexBin: String? = nil,
@@ -269,11 +270,6 @@ public final class CodexProcess: LLMTransport {
         self.streamingRunner = streamingRunner
         self.processEnvironment = processEnvironmentOverride ?? ProcessInfo.processInfo.environment
         self.dataRootOverride = dataRootOverride
-    }
-
-    /// NativeAgent tools never reach the CLI; its tool wire is unsupported.
-    public func complete(prompt: String, system: String?, model: String, tools: [LLMToolSchema]?, call: LLMCall) async throws -> String {
-        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
     }
 
     private func resolvedAuthPath() -> URL {
@@ -417,7 +413,7 @@ public final class CodexProcess: LLMTransport {
     @concurrent nonisolated private func retainProducedReply(_ output: String, error: Error?, call: LLMCall) async {
         guard !call.preview else { return }
         var payload: [String: JSONValue] = [
-            "outputPreview": .string(TurnTraceRedactor.redactText(String(output.prefix(2_000)))),
+            "outputPreview": .string(String(TurnTraceRedactor.redactText(output).prefix(2_000))),
             "outputBytes": .int(Int64(output.utf8.count)),
         ]
         if let error { payload["error"] = .string(ProviderFailure.diagnosticDescription(error)) }
@@ -441,17 +437,6 @@ public final class CodexProcess: LLMTransport {
     }
 
     // MARK: - Text-only messages contract
-
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        try await LLMMessageStreamEvent.reply(collecting: { held in
-            self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held)
-        }, using: LLMCallTraceRecorder(dataRootOverride: dataRootOverride), call: call)
-    }
 
     private func messagesPrompt(_ messages: [LLMMessage], model: String, call: LLMCall) async throws -> String {
         let flattened = try llmCompatibilityPrompt(messages: messages) { role in

@@ -3,13 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(Darwin)
 import Darwin
-#endif
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import Carbon
 import OSAKit
@@ -21,7 +15,6 @@ private final class ApplicationLaunchResult {
     let done = ScopedWaiter()
     var result: Result<NSRunningApplication, Error>?
 }
-#endif
 
 // Blueprint: | `MacAppNavigation.swift` | `MacApplications`, `AppControlRunResult`, `OpenTarget`: Checked app identity and workspace-owned activation |
 
@@ -62,52 +55,35 @@ public final class MacApplications: Sendable {
     public func focusApp(named name: String, context: MacOperationContext) async throws -> AppControlRunResult {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
-        #if canImport(AppKit)
         let indexedURL = await Self.indexedApplicationURL(named: query, context: context)
         return try await Self.openAppOnMain(named: query, front: true, indexedURL: indexedURL, context: context)
-        #else
-        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
-        #endif
     }
 
     public func launchApp(named name: String, context: MacOperationContext) async throws -> AppControlRunResult {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
-        #if canImport(AppKit)
         let indexedURL = await Self.indexedApplicationURL(named: query, context: context)
         return try await Self.openAppOnMain(named: query, front: false, indexedURL: indexedURL, context: context)
-        #else
-        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
-        #endif
     }
 
     public func quitApp(named name: String, context: MacOperationContext) async throws -> AppControlRunResult {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
-        #if canImport(AppKit)
         let indexedURL = await Self.indexedApplicationURL(named: query, context: context)
         return try await Self.quitAppOnMain(named: query, indexedURL: indexedURL, context: context)
-        #else
-        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
-        #endif
     }
 
     public func isApplicationRunning(matching name: String, context: MacOperationContext) async throws -> Bool {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
-        #if canImport(AppKit)
         let indexedURL = await Self.indexedApplicationURL(named: query, context: context)
         return try await Self.isApplicationRunningOnMain(matching: query, indexedURL: indexedURL)
-        #else
-        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
-        #endif
     }
 
     private func normalizedAppQuery(_ name: String) -> String {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    #if canImport(AppKit)
     @MainActor
     private static func isApplicationRunningOnMain(matching query: String, indexedURL: Result<URL?, Error>) throws -> Bool {
         try !runningApplications(matching: query, indexedURL: indexedURL).isEmpty
@@ -118,7 +94,7 @@ public final class MacApplications: Sendable {
         context: MacOperationContext) async throws -> AppControlRunResult {
         try Task.checkCancellation()
         let running = try runningApp(matching: query, indexedURL: indexedURL)
-        guard let url = try running?.bundleURL ?? applicationURL(matching: query, indexedURL: indexedURL) else {
+        guard let url = try running?.bundleURL ?? indexedURL.get() else {
             throw ToolFailureError("app_not_found: \(query)", argumentPath: "name",
                 accepted: "An installed app's exact name, bundle identifier or .app path.", effects: .none)
         }
@@ -190,7 +166,7 @@ public final class MacApplications: Sendable {
     private static func quitAppOnMain(named query: String, indexedURL: Result<URL?, Error>, context: MacOperationContext) async throws -> AppControlRunResult {
         let running = try runningApplications(matching: query, indexedURL: indexedURL)
         guard let first = running.first else {
-            if let url = try applicationURL(matching: query, indexedURL: indexedURL) {
+            if let url = try indexedURL.get() {
                 return AppControlRunResult(
                     requestedName: query,
                     matchedName: url.deletingPathExtension().lastPathComponent,
@@ -345,7 +321,7 @@ public final class MacApplications: Sendable {
         let exactBundle = running.filter { ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame }
         if !exactBundle.isEmpty { return preferRegular(exactBundle) }
         // "Mail" with Mail stopped and MailMate running means Mail: a partial name only when no app by that exact name is installed either.
-        guard try applicationURL(matching: query, indexedURL: indexedURL) == nil else { return [] }
+        guard indexed == nil else { return [] }
         let partial = running.filter { app in
             let name = (app.localizedName ?? "").lowercased()
             let bundle = (app.bundleIdentifier ?? "").lowercased()
@@ -354,12 +330,7 @@ public final class MacApplications: Sendable {
         return preferRegular(partial)
     }
 
-    @MainActor
-    private static func applicationURL(matching query: String, indexedURL: Result<URL?, Error>) throws -> URL? {
-        try indexedURL.get()
-    }
-
-    public static func installedApplicationURL(named query: String, context: MacOperationContext) throws -> URL? {
+    public static func installedApplicationURL(named query: String) throws -> URL? {
         try installedApplicationURL(named: query, apps: { try MacAppIndex.shared.apps() })
     }
 
@@ -455,21 +426,15 @@ public final class MacApplications: Sendable {
             terminated: terminated
         )
     }
-    #endif
 }
 
 public struct OpenTarget: Sendable {
     public init() {}
 
     public func requestOpen(_ url: URL, background: Bool, context: MacOperationContext) async throws -> [String: JSONValue] {
-        #if canImport(AppKit)
         return try await Self.requestOpenOnMain(url, background: background, context: context)
-        #else
-        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
-        #endif
     }
 
-    #if canImport(AppKit)
     @MainActor
     private static func requestOpenOnMain(_ url: URL, background: Bool, context: MacOperationContext) async throws -> [String: JSONValue] {
         try Task.checkCancellation()
@@ -485,5 +450,4 @@ public struct OpenTarget: Sendable {
             "process_identifier": .int(Int64(app.processIdentifier)),
         ]
     }
-    #endif
 }

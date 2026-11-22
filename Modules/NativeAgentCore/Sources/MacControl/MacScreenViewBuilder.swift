@@ -4,23 +4,14 @@ import NativeAgentShared
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(CoreText)
 import CoreText
-#endif
-#if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import ApplicationServices
 import UserNotifications
 import Experiences
-import CryptoKit
 import os
-#endif
 // Blueprint: | `MacScreenViewBuilder.swift` | View and mark construction from captured geometry and accessibility |
 public enum MacScreenViewBuilder {
     /// Hard ceilings prevent dense controls or 4K pixels from consuming a turn; callers may lower them only.
@@ -126,7 +117,9 @@ public enum MacScreenViewBuilder {
         if role == "AXSecureTextField" || subrole == "AXSecureTextField" { return true }
         if let shown = value?.trimmingCharacters(in: .whitespaces), !shown.isEmpty,
            shown.allSatisfy({ ["\u{2022}", "\u{25CF}", "\u{00B7}", "\u{2024}", "*"].contains($0) }) { return true }
-        guard let label = label?.lowercased(), !label.isEmpty else { return false }
+        // A label names a secret only on a field that takes text: a row or button titled "token cost" is not one.
+        guard ["AXTextField", "AXTextArea", "AXComboBox"].contains(role),
+              let label = label?.lowercased(), !label.isEmpty else { return false }
         return MacScreenViewTextRedaction.secretFieldLabelTokens.contains { label.contains($0) }
     }
     /// Mark actionable or structurally interactive elements only so decoration cannot overwhelm the picture.

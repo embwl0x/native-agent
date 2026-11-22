@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -96,8 +97,8 @@ public struct TurnEnvelope: Sendable, Equatable {
     ) {
         self.surface = surface
         self.agent = agent
-        self.verifiedChatId = Self.cleaned(verifiedChatId)
-        self.verifiedUserId = Self.cleaned(verifiedUserId)
+        self.verifiedChatId = verifiedChatId.trimmedNonEmpty
+        self.verifiedUserId = verifiedUserId.trimmedNonEmpty
         self.commandSignatureVerified = commandSignatureVerified
         self.deliveryRoute = deliveryRoute
         self.declaredRemote = declaredRemote
@@ -142,7 +143,7 @@ public struct TurnEnvelope: Sendable, Equatable {
             guard let value, !value.isEmpty else { return }
             object[key] = .string(value)
         }
-        put("agent", Self.cleaned(agent))
+        put("agent", agent.trimmedNonEmpty)
         if let declaredRemote { object["declaredRemote"] = .bool(declaredRemote) }
         put("workIdentity", workIdentity)
         put("answerExperienceID", answerExperienceID)
@@ -152,13 +153,13 @@ public struct TurnEnvelope: Sendable, Equatable {
         // caller's result): restored from history, the route still names the door that owns the turn.
         // Only a contact's caller-result door is kept: every other door (Telegram, phone, a peer reply's asker) restores from the turn's own
         // surface with its own destination, as before.
-        if let door = Self.cleaned(deliveryRoute?.surface), door != surface, door == "caller-result" { object["routeSurface"] = .string(door) }
-        put("requesterUserId", Self.cleaned(deliveryRoute?.requesterUserId))
-        put("destinationId", Self.cleaned(deliveryRoute?.destinationId))
-        put("threadId", Self.cleaned(deliveryRoute?.threadId))
-        put("sourceKey", Self.cleaned(deliveryRoute?.sourceKey))
-        put("replyTo", Self.cleaned(deliveryRoute?.replyTo))
-        put("correlationId", Self.cleaned(deliveryRoute?.correlationId))
+        if let door = deliveryRoute?.surface.trimmedNonEmpty, door != surface, door == "caller-result" { object["routeSurface"] = .string(door) }
+        put("requesterUserId", deliveryRoute?.requesterUserId.trimmedNonEmpty)
+        put("destinationId", deliveryRoute?.destinationId.trimmedNonEmpty)
+        put("threadId", deliveryRoute?.threadId.trimmedNonEmpty)
+        put("sourceKey", deliveryRoute?.sourceKey.trimmedNonEmpty)
+        put("replyTo", deliveryRoute?.replyTo.trimmedNonEmpty)
+        put("correlationId", deliveryRoute?.correlationId.trimmedNonEmpty)
         return .object(object)
     }
 
@@ -167,7 +168,7 @@ public struct TurnEnvelope: Sendable, Equatable {
         guard case .object(let object)? = value else { return nil }
         func read(_ key: String) -> String? {
             guard case .string(let string)? = object[key] else { return nil }
-            return cleaned(string)
+            return string.trimmedNonEmpty
         }
         guard let surface = read("surface") else { return nil }
         let declaredRemote: Bool?
@@ -207,12 +208,6 @@ public struct TurnEnvelope: Sendable, Equatable {
             surface: surface,
             declaredRemote: true
         )
-    }
-
-    private static func cleaned(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty else { return nil }
-        return trimmed
     }
 }
 

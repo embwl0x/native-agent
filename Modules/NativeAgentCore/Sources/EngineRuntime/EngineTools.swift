@@ -77,16 +77,15 @@ public enum ToolCatalogStatus: String, Sendable {
 
 extension ChatToolCatalogSnapshot {
     public func status(for tool: ChatCatalogTool) -> ToolCatalogStatus {
-        func normalized(_ value: String?) -> String { (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-        let name = normalized(tool.name)
-        if !name.isEmpty, (builderPolicyLocked + macAppPolicyLocked).map(normalized).contains(name) { return .locked }
+        let name = TextNormalization.trimmedLowercased(tool.name)
+        if !name.isEmpty, (builderPolicyLocked + macAppPolicyLocked).map(TextNormalization.trimmedLowercased).contains(name) { return .locked }
         if tool.availableNow == false { return .unavailable }
         guard let recordedAutonomy = tool.effectiveAutonomy else { return .unknown }
-        let autonomy = normalized(recordedAutonomy)
+        let autonomy = TextNormalization.trimmedLowercased(recordedAutonomy)
         if autonomy == "blocked" { return .blocked }
         guard tool.availableNow == true, ["auto", "confirm"].contains(autonomy) else { return .unknown }
         if autonomy == "confirm" { return .approval }
-        if !name.isEmpty, alwaysOnTools.map(normalized).contains(name) { return .active }
+        if !name.isEmpty, alwaysOnTools.map(TextNormalization.trimmedLowercased).contains(name) { return .active }
         return tool.modelVisible == nil ? .unknown : .available
     }
 }
@@ -95,33 +94,14 @@ extension ChatToolCatalogSnapshot {
 @MainActor
 @Observable
 public final class ToolsFacade {
-    public private(set) var skills: [SkillRecord] = []
-    public private(set) var skillsReadError: String?
-    @ObservationIgnored private let skillsRead = LatestRead()
     @ObservationIgnored private let nativePowerRead = LatestRead()
 
     @discardableResult
     public func refreshSkills(includingSource: Bool = false) async throws -> [SkillRecord] {
-        let result: Result<[SkillRecord], Error> = await skillsRead.read({
-            do { return .success(try await RuntimeReadouts.skills(dataRoot: dataRoot, includingSource: true)) }
-            catch { return .failure(error) }
-        }, publish: { result in
-            switch result {
-            case .success(let inventory): skills = inventory; skillsReadError = nil
-            case .failure(let error): skillsReadError = error.localizedDescription
-            }
-        })
-        let read = try result.get()
-        return includingSource ? read : read.map { skill in
-            var metadata = skill
-            metadata.body = nil
-            metadata.bodyRevision = nil
-            return metadata
-        }
+        try await RuntimeReadouts.skills(dataRoot: dataRoot, includingSource: includingSource)
     }
     public var nativeActions: [NativeActionRecord] { NativeActionRoutes.swiftNativeActionRecords() }
     public private(set) var nativeActionReceipts: [NativeActionReceipt] = []
-    public private(set) var notificationStatus: NotificationRuntimeStatus?
     public private(set) var browserStatus: BrowserRuntimeStatus?
     public private(set) var nativePowerRefresh: PanelRefreshStatus?
     public internal(set) var browserDryRunStartedAt: Date?
@@ -145,26 +125,22 @@ public final class ToolsFacade {
             let receiptRead: (rows: [NativeActionReceipt], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool,
                 failure: String?) = await RuntimeReadouts.tailJSONL(
                 path: SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot).nativeActionsReceiptsPath, limit: 50)
-            var notification: NotificationRuntimeStatus?
             var browser: BrowserRuntimeStatus?
             var failures: [(endpoint: String, label: String, error: Error)] = []
             if let failure = receiptRead.failure {
                 failures.append(("native action receipts", "tailJSONL", RuntimeReadError.unreadableFeed(failure)))
             }
-            do { notification = try await RuntimeReadouts.getNotificationStatus(dataRoot: dataRoot) }
-            catch { failures.append(("notification status", "getNotificationStatus", error)) }
             do { browser = try await RuntimeReadouts.getBrowserStatus(dataRoot: dataRoot) }
             catch { failures.append(("browser status", "getBrowserStatus", error)) }
-            return (receiptRead.failure == nil ? receiptRead.rows : nil, notification, browser, failures)
+            return (receiptRead.failure == nil ? receiptRead.rows : nil, browser, failures)
         }, publish: { read in
             if let receipts = read.0 { nativeActionReceipts = receipts }
-            if let value = read.1 { notificationStatus = value }
-            if let value = read.2 { browserStatus = value }
+            if let value = read.1 { browserStatus = value }
             nativePowerRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
-                lastSuccessAt: read.3.isEmpty ? Date() : nativePowerRefresh?.lastSuccessAt, failedEndpoints: read.3.map { $0.endpoint })
+                lastSuccessAt: read.2.isEmpty ? Date() : nativePowerRefresh?.lastSuccessAt, failedEndpoints: read.2.map { $0.endpoint })
         })
         await capabilitiesDidChange?()
-        return read.3
+        return read.2
     }
 
     public nonisolated init(dataRoot: URL, manifestReader: @escaping @Sendable (String?, Turn) async throws -> JSONValue) {

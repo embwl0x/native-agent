@@ -46,13 +46,13 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
         infoDictionary: [String: Any],
         resourcesURL: URL?
     ) -> NativeAgentBuildIdentity {
-        guard let version = nonempty(infoDictionary["CFBundleShortVersionString"] as? String),
-              let build = nonempty(infoDictionary["CFBundleVersion"] as? String),
-              let revision = nonempty(infoDictionary["NativeAgentSourceRevision"] as? String),
+        guard let version = (infoDictionary["CFBundleShortVersionString"] as? String).trimmedNonEmpty,
+              let build = (infoDictionary["CFBundleVersion"] as? String).trimmedNonEmpty,
+              let revision = (infoDictionary["NativeAgentSourceRevision"] as? String).trimmedNonEmpty,
               Self.isFullGitObjectID(revision),
               let dirty = infoDictionary["NativeAgentSourceDirty"] as? NSNumber,
               CFGetTypeID(dirty) == CFBooleanGetTypeID(),
-              let contentID = nonempty(infoDictionary["NativeAgentSourceContentID"] as? String),
+              let contentID = (infoDictionary["NativeAgentSourceContentID"] as? String).trimmedNonEmpty,
               Self.isFullGitObjectID(contentID),
               let resourcesURL else {
             return Self(unavailable: """
@@ -131,13 +131,6 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
         return stamp["version"] as? String == version && stamp["build"] as? String == build
             && (stamp["sourceRevision"] as? String)?.lowercased() == sourceRevision?.lowercased()
             && (stamp["sourceContentID"] as? String)?.lowercased() == sourceContentID?.lowercased()
-    }
-
-    private static func nonempty(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
-            return nil
-        }
-        return trimmed
     }
 
     private static func isFullGitObjectID(_ value: String) -> Bool {

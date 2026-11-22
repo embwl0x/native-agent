@@ -58,7 +58,7 @@ public enum PermissionLaw {
     public static func posture(_ policy: [String: JSONValue]) -> PermissionPosture {
         posture(permissionLevel: policy["permissionLevel"]?.scalarText ?? "",
                 outsideWorkspaceDefault: (
-                    SwiftNativeSecurityCenter.object(policy["filePolicy"])["outsideWorkspaceDefault"])?.scalarText ?? "")
+                    JSONValue.objectOrEmpty(policy["filePolicy"])["outsideWorkspaceDefault"])?.scalarText ?? "")
     }
 
     /// All gates read the same saved pair so it cannot express different postures.
@@ -75,7 +75,7 @@ public enum PermissionLaw {
     public static func answer(tool: String, input: [String: JSONValue]?, policy: [String: JSONValue],
                               dataRoot: URL, turn: Turn?) throws -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
         let roots = SwiftNativeSecurityCenter.trustedWorkspaceRoots(
-            filePolicy: SwiftNativeSecurityCenter.object(policy["filePolicy"]), dataRoot: dataRoot)
+            filePolicy: JSONValue.objectOrEmpty(policy["filePolicy"]), dataRoot: dataRoot)
         let capabilities = try input.map { try SwiftNativeSecurityCenter.profile(tool: SwiftNativeSecurityCenter.policyToolName(tool),
                                                                          input: $0, dataRoot: dataRoot, turn: turn, trustedWorkspaceRoots: roots).capabilities }
         return try answer(tool: tool, input: input, policy: policy, capabilities: capabilities, turn: turn)
@@ -101,7 +101,8 @@ public enum PermissionLaw {
         if let input, let lever = try lever(tool: tool, input: input, turn: turn),
            !(lever.asks && agentOwnsLevers(posture: posture, turn: turn)) {
             let why = "\(named)" + (lever.name.isEmpty ? "" : " (\(lever.name))") + " is the person's lever: \(lever.why)."
-            let reason = level == "confirm" ? why + " The agent's call asks them on a card and runs only on their yes."
+            // The card says the act in words, never the action id.
+            let reason = level == "confirm" ? "\(lever.name.isEmpty ? named : lever.name) is the person's to decide: \(lever.why). It runs only if they approve."
                 : lever.asks ? why + " Safe allows no ask for it; nothing ran."
                 : why + " It needs the person themself, so the agent's call is refused; nothing ran."
             return (toolClass, level, reason, Repair.why(owner: "the person's lever \(named)",

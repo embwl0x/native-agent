@@ -1,21 +1,9 @@
+import NativeAgentShared
 import Foundation
 import Darwin
 import Network
 import Security
 // Blueprint: | `BridgeCore.swift` | Shared HTTP framing, bearer comparison, loopback/authentication admission and response transport |
-
-/// Identity-gated state for one accepted connection's exact request-read deadline. The token prevents a late deadline work item from cancelling a different
-/// connection if an `ObjectIdentifier` is reused after the original connection deallocated.
-public struct BridgeReadDeadlineState: Sendable, Equatable {
-    public let token: UUID
-    public var routed: Bool = false
-
-    public init(token: UUID) { self.token = token }
-
-    public func shouldCancel(firingToken: UUID) -> Bool {
-        token == firingToken && !routed
-    }
-}
 
 public enum BridgeAuthDecision: Equatable {
     case authorized
@@ -69,10 +57,7 @@ public enum BridgeCore {
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
             return nil
         }
-        return Data(bytes).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        return Data(bytes).base64URLEncodedString()
     }
 
     // MARK: - Auth

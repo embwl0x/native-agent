@@ -54,23 +54,24 @@ extension NativeAgentEngine {
                     trustFaceToggle("trust.pause_everything", "Pause everything", status.killSwitchEnabled,
                                     "On, every action stops until you lift it.", safe: true))
             ]
+            let states = ["configured": "Set up", "limited": "Limited", "required": "Required", "partial": "Partly recorded", "unavailable": "Unavailable"]
             rows += status.flags.filter { $0.id != "security_center" }.map {
-                .init(id: "security.flag." + $0.id, title: $0.title, detail: $0.detail, value: $0.status)
+                .init(id: "security.flag." + $0.id, title: $0.title, detail: $0.detail, value: states[$0.status] ?? $0.status.capitalized)
             }
             security = .init(id: "security", title: "Security", rows: rows)
-            record.append(.init(id: "security_receipts", title: "Recent security receipts", style: .timeline,
-                footer: status.recentReceipts.isEmpty ? status.flags.first { $0.id == "audit_receipts" }?.detail
-                    : "Every receipt is kept in " + status.auditReceiptsPath,
+            let decisions = ["allow": "Allowed", "ask": "Asked you", "block": "Blocked"]
+            record.append(.init(id: "security_receipts", title: "Recent security log", style: .timeline,
+                footer: status.recentReceipts.isEmpty ? status.flags.first { $0.id == "audit_receipts" }?.detail : nil,
                 rows: status.recentReceipts.map {
-                    .init(id: "security.receipt." + $0.id, title: $0.tool, detail: $0.reason + " · " + $0.surface + " · " + $0.risk,
-                        value: $0.decision, at: $0.at)
+                    .init(id: "security.receipt." + $0.id, title: ToolActivityPresentation.title($0.tool), detail: $0.reason,
+                        value: decisions[$0.decision] ?? $0.decision.capitalized, at: $0.at)
                 }))
         } catch { security = trustFaceFailure("security", "Security", error) }
         switch await trust.auditLog(limit: 100) {
         case .entries(let entries, let malformed):
             record.append(.init(id: "mac_audit", title: "Mac control audit", style: .timeline,
                 footer: malformed > 0 ? "Could not decode \(malformed) audit entries."
-                    : entries.isEmpty ? "No Mac control refusal receipts retained in the experience record. The Mac Control inventory counts operation files."
+                    : entries.isEmpty ? "Nothing has been blocked yet."
                         : nil,
                 rows: entries.map { .init(id: "audit." + $0.id, title: $0.action, detail: $0.detail,
                     value: $0.allowed.map { $0 ? "Allowed" : "Blocked" } ?? "Outcome not recorded", at: $0.ts) }))

@@ -106,7 +106,7 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             title: title,
             summary: summary,
             detail: detailLines.joined(separator: "\n"),
-            createdAt: DelegationOutcomeCursor.formatISO(now)
+            createdAt: NativeTimestampFormat.fractionalZulu(now)
         )
         card.reachesAgent = job.reachesAgent
         return card

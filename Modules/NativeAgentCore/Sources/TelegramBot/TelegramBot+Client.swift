@@ -47,7 +47,6 @@ public struct TelegramBotCompletenessDeps: Sendable {
 
 public actor SwiftNativeTelegramBot {
     let dataRoot: URL
-    private let backgroundLoopsManager: BackgroundLoopLifetimes
     let completenessDeps: TelegramBotCompletenessDeps?
     let partCall: TelegramPartCall?
     let partFace: PartFaces.Call?
@@ -55,13 +54,11 @@ public actor SwiftNativeTelegramBot {
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        backgroundLoopsManager: BackgroundLoopLifetimes = .shared,
         completenessDeps: TelegramBotCompletenessDeps? = nil,
         partCall: TelegramPartCall? = nil,
         partFace: PartFaces.Call? = nil
     ) {
         self.dataRoot = dataRoot
-        self.backgroundLoopsManager = backgroundLoopsManager
         self.completenessDeps = completenessDeps
         self.partCall = partCall
         self.partFace = partFace
@@ -99,38 +96,6 @@ public actor SwiftNativeTelegramBot {
         } catch {
             return .object(["status": .string("unavailable")])
         }
-    }
-
-    public func getStatus() async throws -> TelegramStatus {
-        let read = await Self.readTransportStatus(dataRoot: dataRoot, manager: backgroundLoopsManager)
-        if let error = read.stateError { throw error }
-        var status = read.status
-        let configuration = try read.configuration.get()
-        if configuration == nil, status.lastError == "No bot token saved — paste one to enable." {
-            status.lastError = "No bot token saved - paste one to enable."
-        }
-        let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
-        async let receipts = SwiftNativePersistenceCore.tailJSONL(
-            telegramDir.appendingPathComponent("receipts.jsonl"),
-            limit: 25,
-            maxBytes: 1_048_576
-        )
-        async let blocked = SwiftNativePersistenceCore.tailJSONL(
-            telegramDir.appendingPathComponent("blocked.jsonl"),
-            limit: 25,
-            maxBytes: 1_048_576
-        )
-        async let errors = SwiftNativePersistenceCore.tailJSONL(
-            telegramDir.appendingPathComponent("errors.jsonl"),
-            limit: 25,
-            maxBytes: 1_048_576
-        )
-        var extras = status.extras?.objectValue ?? [:]
-        extras["receipts"] = .array(try await receipts)
-        extras["blocked"] = .array(try await blocked)
-        extras["errors"] = .array(try await errors)
-        status.extras = .object(extras)
-        return status
     }
 
     /// One checked transport read; callers decide how to present unavailable settings or state.

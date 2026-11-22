@@ -244,14 +244,6 @@ public struct AppAction: Sendable {
         return text
     }
 
-    /// `line` for `app`'s own description: a long argument list is cut to its required args and "…"; a page read lists them all.
-    public var hotLine: String {
-        guard args.count > 4 else { return line }
-        let required = zip(args, argSpecs).filter { !$0.1.optional }.map(\.0)
-        return line.replacingOccurrences(of: "(\(args.joined(separator: ", ")))",
-                                          with: "(\((required + ["…"]).joined(separator: ", ")))")
-    }
-
     var argSpecs: [(names: [String], optional: Bool)] {
         args.map { raw in
             let head = raw.split(separator: ":", maxSplits: 1).first.map(String.init) ?? raw

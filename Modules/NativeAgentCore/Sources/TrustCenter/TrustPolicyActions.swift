@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions`, `developerModePatchBody`, `saveMemoryPolicy`, `saveAgentAccessMode`, `saveMacControlPolicy` |
+// Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions`, `saveMemoryPolicy`, `saveAgentAccessMode`, `saveMacControlPolicy` |
 
 
 public struct TrustPolicyActions: Sendable {
@@ -14,21 +14,6 @@ public struct TrustPolicyActions: Sendable {
 
     private func postTrustWrite(body: [String: Any]) async throws -> TrustPolicy {
         try await TrustPolicyToolWriter.applyTrustPolicyPatch(body: body, dataRoot: dataRoot)
-    }
-
-    /// Developer Mode applies on restart independently of Full Mac; patch dependent shell/system gates without replacing unrelated policy.
-    public static func developerModePatchBody(enabled: Bool) -> [String: Any] {
-        [
-            "developerMode": enabled,
-            "macControlPolicy": [
-                "shell_allowed": enabled,
-                "system_control_allowed": enabled,
-            ],
-        ]
-    }
-
-    public func saveEnableAutonomy(_ enabled: Bool) async throws -> TrustPolicy {
-        try await postTrustWrite(body: ["enableAutonomy": enabled])
     }
 
     public func saveChromeControlEnabled(_ enabled: Bool) async throws -> TrustPolicy {

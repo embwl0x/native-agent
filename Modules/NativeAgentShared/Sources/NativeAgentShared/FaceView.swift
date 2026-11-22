@@ -22,18 +22,6 @@ public struct FaceView: View {
     @Environment(\.faceHoldsDocuments) private var holdsDocuments
 
     public init(face: PartFace, levers: [PartFace.Section] = [], words: String? = nil, keyed: [PartFace.Section] = [],
-                open: @escaping (String) -> Void, act: @escaping (String, String, String?) async -> Void) {
-        self.init(face: face, levers: levers, words: words, keyed: keyed,
-                  door: ClosureFaceDoor(open: open, act: act), session: FacePageSession(), retaining: false)
-    }
-
-    public init(snapshot: PartFaceSnapshot, title: String, header: Bool = true, open: @escaping (String) -> Void,
-                act: @escaping (String, String, String?) async -> Void) {
-        self.init(snapshot: snapshot, title: title, header: header,
-                  door: ClosureFaceDoor(open: open, act: act), session: FacePageSession(), retaining: false)
-    }
-
-    public init(face: PartFace, levers: [PartFace.Section] = [], words: String? = nil, keyed: [PartFace.Section] = [],
                 door: any FaceDoor, session: FacePageSession, retaining: Bool = true,
                 leaf: ((PartFace.Block) -> AnyView)? = nil, rowFilter: ((PartFace.Row) -> Bool)? = nil) {
         self.face = face

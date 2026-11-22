@@ -143,7 +143,7 @@ struct SimpleThreadActions: View {
                 case .stop(let contact, let record): act = .stopContactMessage(contact: contact, record: record)
                 case .resend(let contact, let item, let session): act = .resendContactMessage(contact: contact, item: item, session: session)
                 }
-                _ = try await appModel.client.act(act).checkedValue()
+                _ = try await appModel.client.act(act).checkedCommit()
             } catch { issue = error.localizedDescription }
         }
     }

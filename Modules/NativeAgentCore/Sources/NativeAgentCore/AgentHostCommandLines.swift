@@ -193,14 +193,30 @@ public enum AgentHostLaunches {
 }
 
 public enum AgentHostCommandLines {
-    /// Read once per app launch, with the same startup files as a login terminal.
-    public static let loginEnvironment: Result<[String: String], ToolFailureError> = {
+    /// Read with the same startup files as a login terminal. A read that worked holds for the launch; one that failed (a login
+    /// shell slowed by a busy moment, say) is read again on a later use, at most every 30 seconds, so one slow start never
+    /// hides every program until the next launch.
+    public static var loginEnvironment: Result<[String: String], ToolFailureError> {
+        loginRead.withLock { held in
+            if let (result, at) = held {
+                if case .success = result { return result }
+                if Date().timeIntervalSince(at) < 30 { return result }
+            }
+            let result = readLoginEnvironment()
+            held = (result, Date())
+            return result
+        }
+    }
+
+    private static let loginRead = OSAllocatedUnfairLock<(Result<[String: String], ToolFailureError>, Date)?>(initialState: nil)
+
+    private static func readLoginEnvironment() -> Result<[String: String], ToolFailureError> {
         let shell = getpwuid(getuid()).flatMap { $0.pointee.pw_shell }.map { String(cString: $0) } ?? ""
         func refused(_ reason: String) -> Result<[String: String], ToolFailureError> {
             let files = shell.hasSuffix("/zsh") ? "~/.zshenv, ~/.zprofile, ~/.zshrc, ~/.zlogin" : "\(shell)'s login startup files"
-            return .failure(ToolFailureError("Login shell \(shell): \(reason). Repair its startup files, then restart the app to read PATH again.",
+            return .failure(ToolFailureError("Login shell \(shell): \(reason). Repair its startup files; the app reads PATH again within 30 seconds.",
                 effects: .none, owner: "login shell \(shell) startup files",
-                tap: "Repair \(files); the app reads PATH again at its next launch", personDecides: true))
+                tap: "Repair \(files); the app reads PATH again within 30 seconds", personDecides: true))
         }
         guard shell.hasPrefix("/"), access(shell, X_OK) == 0 else { return refused("the account's shell is not executable") }
         let process = ManagedProcess(), output = Pipe(), exited = DispatchSemaphore(value: 0)
@@ -233,7 +249,7 @@ public enum AgentHostCommandLines {
             environment["PATH"] = path
             return .success(environment)
         } catch { return refused(error.localizedDescription) }
-    }()
+    }
 
     public static func resolveExecutable(_ name: String) -> String? {
         resolveExecutable(name, directories: [],

@@ -22,16 +22,6 @@ public enum MemoryMoments {
         return false
     }
 
-    public static func metadataNumber(_ metadata: JSONValue?, _ key: String) -> Double? {
-        guard case .object(let obj)? = metadata else { return nil }
-        switch obj[key] {
-        case .double(let d)?: return d
-        case .int(let i)?: return Double(i)
-        case .string(let s)?: return Double(s.trimmingCharacters(in: .whitespaces))
-        default: return nil
-        }
-    }
-
     /// Keep the conversation seat visible without treating acceptance as proof that the person said it. The promoter's source names the original seat.
     public static func recallOrigin(source: String?, metadata: JSONValue?, dataRoot: URL = defaultDataRoot()) -> JSONValue? {
         guard isMoment(metadata) || source?.hasPrefix("\(sourcePrefix):") == true else { return nil }

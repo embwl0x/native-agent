@@ -1,5 +1,4 @@
 import AppKit
-import CoreFoundation
 import AppToolRuntime
 import ChatSessionWork
 import EngineRuntime
@@ -195,11 +194,11 @@ final class SettingsFaceUpdates {
         let feed = appModel.engine.settingsFeed
         preferences = Task.detached {
             let changes = EventDeadlinePhysiology.storeAndFileEvents(paths: [], notifications: [UserDefaults.didChangeNotification])
-            var previous = Self.preferenceValues(keys, declared: declared)
+            var previous = await BodySettingsPreferences.readPreferences(keys, declared: declared)
             feed.updatePreferences(previous.values, issues: previous.issues, declared: declared)
             for await _ in changes {
                 guard !Task.isCancelled else { return }
-                let current = Self.preferenceValues(keys, declared: declared)
+                let current = await BodySettingsPreferences.readPreferences(keys, declared: declared)
                 guard previous != current else { continue }
                 previous = current
                 feed.updatePreferences(current.values, issues: current.issues, declared: declared)
@@ -219,49 +218,6 @@ final class SettingsFaceUpdates {
          ShotgunShortcut.storageKey: .string(ShotgunShortcut.optionSpace.rawValue), MoodTintPreference.key: .bool(true),
          "studioWanderEnabled": .bool(true), "cognitiveSubstrateEnabled": .bool(true), "chatFileAccess": .string("auto"),
          WindowFollowsPreference.key: .bool(true)]
-    }
-
-    private struct PreferenceReading: Equatable, Sendable {
-        var values: [String: PartFace.Value] = [:]
-        var issues: [String: String] = [:]
-    }
-
-    private nonisolated static func preferenceValues(_ keys: Set<String>, declared: [String: PartFace.Value]) -> PreferenceReading {
-        var reading = PreferenceReading()
-        for key in keys {
-            guard let saved = UserDefaults.standard.object(forKey: key) else {
-                reading.values[key] = declared[key]
-                continue
-            }
-            let value: PartFace.Value?
-            if let number = saved as? NSNumber {
-                if CFGetTypeID(number) == CFBooleanGetTypeID() { value = .bool(number.boolValue) }
-                else { value = .double(number.doubleValue) }
-            } else if let text = saved as? String { value = .string(text) }
-            else { value = nil }
-            let expected = declared[key]
-            let valid: Bool
-            switch (expected, value) {
-            case (.some(.bool), .some(.bool)), (.some(.string), .some(.string)), (.some(.double), .some(.double)), (nil, .some): valid = true
-            default: valid = false
-            }
-            if valid, let value {
-                if key == SimpleViewMode.key, case .string(let mode) = value, !SimpleViewMode.choices.contains(mode) {
-                    reading.issues[key] = "The saved view is unavailable. Choose Simple, Advanced or Agent explicitly."
-                    reading.values[key] = value
-                } else if key == HazeColor.key, case .string(let color) = value,
-                          !HazeColor.allCases.contains(where: { $0.rawValue == color }) {
-                    reading.issues[key] = "The saved glass color is unsupported. Choose a glass color explicitly in Settings."
-                } else if case .double(let number) = value, !number.isFinite {
-                    reading.issues[key] = "The saved preference \(key) is not a finite number. Set it explicitly in Settings."
-                } else {
-                    reading.values[key] = value
-                }
-            } else {
-                reading.issues[key] = "The saved preference \(key) has an unsupported value. Set it explicitly in Settings."
-            }
-        }
-        return reading
     }
 
     private static func observe(_ appModel: AppModel?, changed: ScopedWaiter) async -> Reading? {

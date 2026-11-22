@@ -22,8 +22,8 @@ public struct JSONRow {
         self.fields = fields
     }
 
-    public func string(_ key: String) throws -> String { try required(key, Self.string) }
-    public func optionalString(_ key: String) throws -> String? { try optional(key, Self.string) }
+    public func string(_ key: String) throws -> String { try required(key) { $0.stringValue } }
+    public func optionalString(_ key: String) throws -> String? { try optional(key) { $0.stringValue } }
     public func strings(_ key: String) throws -> [String] { try required(key, Self.strings) }
     public func optionalStrings(_ key: String) throws -> [String]? { try optional(key, Self.strings) }
     public func array(_ key: String) throws -> [JSONValue] {
@@ -50,14 +50,9 @@ public struct JSONRow {
         return value
     }
 
-    private static func string(_ value: JSONValue) -> String? {
-        if case .string(let string) = value { return string }
-        return nil
-    }
-
     private static func strings(_ value: JSONValue) -> [String]? {
         guard case .array(let values) = value else { return nil }
-        let strings = values.compactMap(string)
+        let strings = values.compactMap { $0.stringValue }
         return strings.count == values.count ? strings : nil
     }
 }

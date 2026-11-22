@@ -9,6 +9,7 @@ enum MobileNotificationActions {
         let category: String
         let approvalID: String?
         let sessionID: String?
+        let replyEnvelope: String?
         let text: String?
         init(_ response: UNNotificationResponse) {
             action = response.actionIdentifier
@@ -16,6 +17,7 @@ enum MobileNotificationActions {
             category = content.categoryIdentifier
             approvalID = content.userInfo["approvalId"] as? String
             sessionID = content.userInfo["sessionId"] as? String
+            replyEnvelope = content.userInfo[MobileNotificationRouting.replyEnvelopeKey] as? String
             text = (response as? UNTextInputNotificationResponse)?.userText
         }
         var isAction: Bool {
@@ -35,18 +37,26 @@ enum MobileNotificationActions {
                 }
                 let approve = response.action == MobileNotificationRouting.approve
                 try await MobileIntentRuntime.decide(id: id, approve: approve)
-                SystemToastCenter.shared.push(success: approve ? "Approved on your Mac." : "Denied on your Mac.")
+                SystemToastCenter.shared.push(success: approve ? "Approved on your Mac." : "Declined on your Mac.")
             case (MobileNotificationRouting.messageCategory, MobileNotificationRouting.reply):
-                guard let session = response.sessionID, !session.isEmpty,
-                      let text = response.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw MobileIntentRuntime.failure("This notification has no conversation or the reply is empty.")
+                guard let text = response.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw MobileIntentRuntime.failure("The notification reply is empty.")
                 }
-                open(screen: "chat", sessionID: session)
                 let store = ChatStore.shared
                 await store.restorationTask?.value
-                guard let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else {
+                guard let secret = iCloudBridge.shared.pairingSecretForPhoneRequests,
+                      let pairing = AgentNameCache.fingerprint(secret) else {
                     throw MobileIntentRuntime.failure("Connect this iPhone to a Mac before submitting a reply.")
                 }
+                guard let payload = response.replyEnvelope,
+                      let envelope = try? MobileNotificationRouting.decodeReplyEnvelope(payload),
+                      envelope.sender == "mac", envelope.verifySignature(secret: secret),
+                      let metadata = envelope.metadata, metadata[BridgeMessage.notificationPairingKey] == pairing,
+                      let session = MobileNotificationRouting.replySession(metadata),
+                      session == response.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                    throw MobileIntentRuntime.failure("This notification could not be verified for the current Mac pairing. Open Chat to start a new reply.")
+                }
+                open(screen: "chat", sessionID: session)
                 let queued = QueuedChatSend(id: UUID(), sessionID: session, text: text,
                                             controls: .defaults, attachments: [], createdAt: Date(),
                                             pairingFingerprint: pairing)

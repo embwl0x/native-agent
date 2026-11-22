@@ -70,6 +70,7 @@ extension CloudKitDeviceTransport {
                 try await self.reconcileMessage(fields, recordType: recordType, saveError: error)
             }
         }
+        ringBell(fields.recordName)
     }
 
     /// The existing signed record proves acceptance of this identity; a different payload remains a conflict.
@@ -142,6 +143,17 @@ extension CloudKitDeviceTransport {
     /// covers their wake, and repeated timer ticks must not keep that owner running.
     @discardableResult
     public func drainIncoming(queueIfBusy: Bool = true, recovery: DeviceSyncRecovery = .init()) async -> DeviceSyncDrainResult {
+        await drainSerially(viaBell: false, queueIfBusy: queueIfBusy, recovery: recovery)
+    }
+
+    /// The fast read: the peer's bell by ID, then each unclaimed record it lists by ID, through the query's own decoding and delivery. With no
+    /// bell to read (an older peer, or nothing sent yet under this pairing) it is the query. Same slot and coalescing as `drainIncoming`.
+    @discardableResult
+    public func drainBell(queueIfBusy: Bool = true, recovery: DeviceSyncRecovery = .init()) async -> DeviceSyncDrainResult {
+        await drainSerially(viaBell: true, queueIfBusy: queueIfBusy, recovery: recovery)
+    }
+
+    private func drainSerially(viaBell: Bool, queueIfBusy: Bool, recovery: DeviceSyncRecovery) async -> DeviceSyncDrainResult {
         guard recovery.isActive else { return .skipped(0) }
         guard holdsPairing else { return .skipped(0) }
         // Acquire the single drain slot under a synchronous lock, never across an await.
@@ -151,8 +163,21 @@ extension CloudKitDeviceTransport {
         }
         var total = 0
         var outcome: DeviceSyncDrainResult = .skipped(0)
+        var bell = viaBell
         while true {
-            outcome = await drainIncomingBody(recovery: recovery)
+            // A coalesced pass may be owed to a query caller, so it runs the query; the bell is read first on every pass, so a listed record
+            // never waits behind a slow query.
+            if bell { outcome = await drainBellBody(recovery: recovery) } else {
+                let rung = await drainBellBody(recovery: recovery, fallingBackToQuery: false)
+                outcome = await drainIncomingBody(recovery: recovery)
+                // What the bell delivered counts whatever the query then did, so applied work is never reported as none.
+                switch outcome {
+                case .success(let count): outcome = .success(count + rung.dispatchedCount)
+                case .skipped(let count): outcome = .skipped(count + rung.dispatchedCount)
+                case .failure(let error, let count): outcome = .failure(error, dispatched: count + rung.dispatchedCount)
+                }
+            }
+            bell = false
             total += outcome.dispatchedCount
             if endDrainOrContinue(recovery: recovery) { continue }
             break
@@ -232,6 +257,111 @@ extension CloudKitDeviceTransport {
         return .success(dispatched)
     }
 
+    // MARK: bell
+
+    /// A by-ID read is consistent at once, while CloudKit's query index lags new records by seconds to minutes. Each side keeps one signed status
+    /// record naming what it just sent, so the peer fetches those records by name. An older peer never reads it; the query stays the backstop.
+    static let bellKey = "chat.bell"
+    static let bellCapacity = 32
+
+    /// Message first, then bell. The bell never fails or delays the send it follows; a lost write is carried by the next send's bell.
+    private func ringBell(_ recordName: String) {
+        lock.lock()
+        bellEntries.removeAll { $0.name == recordName }
+        bellEntries.append(DeviceBellEntry(name: recordName, sentAt: Date()))
+        if bellEntries.count > Self.bellCapacity { bellEntries.removeFirst(bellEntries.count - Self.bellCapacity) }
+        lock.unlock()
+        Task {
+            guard let secret = await self.loadAssetSecretProvider()?(), secret.count == 32 else { return }
+            do { try await self.writeStatus(key: Self.bellKey, pairingSecret: secret) { try self.bellValue(secret: secret) } }
+            catch { nativeLog("[ck-device] bell after %@ not written: %@", recordName, error.localizedDescription) }
+        }
+    }
+
+    /// Signed as the phone's contact status is: a signed envelope whose text is the list.
+    private func bellValue(secret: Data) throws -> String {
+        lock.lock(); let entries = bellEntries; lock.unlock()
+        let list = String(decoding: try JSONEncoder().encode(entries), as: UTF8.self)
+        let message = try BridgeMessage.make(sender: role.rawValue, text: list, metadata: ["kind": Self.bellKey]).signed(with: secret)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return String(decoding: try encoder.encode(message), as: UTF8.self)
+    }
+
+    /// The peer's bell, or nil when it has none that verifies under this pairing.
+    private func readBell(secret: Data) async throws -> [DeviceBellEntry]? {
+        let peerRole: NADeviceRole = role == .mac ? .ios : .mac
+        let recordName = Self.statusRecordName(role: peerRole, key: Self.bellKey, pairingSecret: secret)
+        let value = try await withDeviceCKOperation("CloudKitDeviceTransport.readBell", onFailure: accountFailureReporter) {
+            () async throws -> String? in
+            do {
+                let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
+                guard record["key"] as? String == Self.bellKey, record["role"] as? String == peerRole.rawValue else { return nil }
+                return record["value"] as? String
+            } catch let error as CKError where error.code == .unknownItem {
+                return nil
+            }
+        }
+        guard let value else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let message = try? decoder.decode(BridgeMessage.self, from: Data(value.utf8)),
+              message.sender == peerRole.rawValue, message.metadata?["kind"] == Self.bellKey,
+              message.verifySignature(secret: secret),
+              let entries = try? JSONDecoder().decode([DeviceBellEntry].self, from: Data(message.text.utf8)) else {
+            nativeLog("[ck-device] the peer's bell does not verify under this pairing; reading by query")
+            return nil
+        }
+        return entries
+    }
+
+    /// Only the serialized drain runs this body. The bell never moves the cursor.
+    private func drainBellBody(recovery: DeviceSyncRecovery, fallingBackToQuery: Bool = true) async -> DeviceSyncDrainResult {
+        let (handler, since) = loadHandlerAndCursor()
+        guard handler != nil else { return .skipped(0) }
+        guard let secret = await loadAssetSecretProvider()?(), secret.count == 32 else {
+            return fallingBackToQuery ? await drainIncomingBody(recovery: recovery) : .skipped(0)
+        }
+        let fetched: DeviceCKPullResult
+        do {
+            guard let entries = try await readBell(secret: secret) else {
+                return fallingBackToQuery ? await drainIncomingBody(recovery: recovery) : .skipped(0)
+            }
+            // Every listed record not yet delivered, whatever the cursor says: an idle query can slide the cursor past a record CloudKit had
+            // not indexed yet, and the bell is what still names it. Delivered records are already claimed, so a quiet bell fetches nothing.
+            let names = unclaimedRecordNames(entries.map(\.name))
+            guard !names.isEmpty else { return .success(0) }
+            fetched = try await fetchListed(names, assetSecret: secret)
+        } catch {
+            nativeLog("[ck-device] drainBell read failed: \(error)")
+            return .failure(Self.mapError(error), dispatched: 0)
+        }
+        let delivery = await deliverIncoming(fetched.records, since: since, queryStartedAt: Date(), advanceCursor: false, recovery: recovery)
+        if case .failure = delivery { return delivery }
+        if let error = fetched.payloadError { return .failure(error, dispatched: delivery.dispatchedCount) }
+        return delivery
+    }
+
+    /// The query's own filter and decoding, by ID. A listed record not fetchable yet is left for the next read, never an error.
+    private func fetchListed(_ names: [String], assetSecret: Data) async throws -> DeviceCKPullResult {
+        try await withDeviceCKOperation("CloudKitDeviceTransport.fetchListed", onFailure: accountFailureReporter) {
+            () async throws -> DeviceCKPullResult in
+            var result = DeviceCKPullResult()
+            let fetches = try await self.database.records(for: names.map { CKRecord.ID(recordName: $0) })
+            for (_, fetch) in fetches {
+                guard case .success(let ck) = fetch else { continue }
+                do {
+                    let fields = try Self.chatFields(in: ck, assetSecret: assetSecret)
+                    result.records.append((fields: fields, modDate: ck.modificationDate))
+                } catch {
+                    nativeLog("[ck-device] chat payload unavailable for %@: %@", ck.recordID.recordName, error.localizedDescription)
+                    result.payloadError = result.payloadError ?? Self.mapError(error)
+                }
+            }
+            return result
+        }
+    }
+
     func deliverIncoming(_ fetched: [(fields: NAChatMessageFields, modDate: Date?)], since: Date?, queryStartedAt: Date,
                          advanceCursor: Bool = true, recovery: DeviceSyncRecovery) async -> DeviceSyncDrainResult {
         guard let handler = loadHandlerAndCursor().0 else { return .skipped(0) }
@@ -248,7 +378,7 @@ extension CloudKitDeviceTransport {
         var halted = false
         var failure: DeviceSyncError?
         for (index, item) in sorted.enumerated() {
-            // A concurrent cancellation has not yet earned acknowledgement. Never advance the ordinary cursor past its temporary claim.
+            // A concurrent input has not yet earned acknowledgement. Never advance the ordinary cursor past its temporary claim.
             if isControlDrainInFlight() { halted = true; break }
             if !recovery.isActive { halted = true; break }
             if halted && role != .ios { break }
@@ -310,8 +440,7 @@ extension CloudKitDeviceTransport {
         }
     }
 
-    /// Mac-only admission; the bridge authenticates phone actions and handoffs. Ordinary chat delivery and its terminal receipt retain their original
-    /// owner.
+    /// Mac-only admission for authenticated input that must reach its owner while ordinary chat is held.
     public func setControlAdmission(_ admission: @escaping @Sendable (BridgeMessage) async -> Bool) {
         lock.lock(); defer { lock.unlock() }
         controlAdmission = admission
@@ -324,16 +453,31 @@ extension CloudKitDeviceTransport {
         defer { endControlDrain() }
         let (_, since) = loadHandlerAndCursor()
         let assetSecret = await loadAssetSecretProvider()?()
+        var delivered = 0
+        if let assetSecret, assetSecret.count == 32 {
+            do {
+                if let entries = try await readBell(secret: assetSecret) {
+                    let names = unclaimedRecordNames(entries.map(\.name))
+                    if !names.isEmpty {
+                        let listed = try await fetchListed(names, assetSecret: assetSecret)
+                        var decoded: [Int: (id: String, message: Result<BridgeMessage, Error>?)] = [:]
+                        delivered = await deliverAdmittedControls(Self.orderedIncoming(listed.records), decoded: &decoded, recovery: recovery)
+                    }
+                }
+            } catch {
+                nativeLog("[ck-device] concurrent bell read failed: \(error)")
+            }
+        }
         do {
             let records = try await pull(recordType: NADeviceSyncRecordType.chatMessage,
                                          since: since, inboundDirection: role.inboundDirection.rawValue,
                                          assetSecret: assetSecret, recovery: recovery)
-            if let error = records.payloadError { nativeLog("[ck-device] cancellation payload failed: %@", error.localizedDescription) }
+            if let error = records.payloadError { nativeLog("[ck-device] concurrent receive payload failed: %@", error.localizedDescription) }
             var decoded: [Int: (id: String, message: Result<BridgeMessage, Error>?)] = [:]
-            return await deliverAdmittedControls(Self.orderedIncoming(records.records), decoded: &decoded, recovery: recovery)
+            return delivered + (await deliverAdmittedControls(Self.orderedIncoming(records.records), decoded: &decoded, recovery: recovery))
         } catch {
-            nativeLog("[ck-device] cancellation pull failed: \(error)")
-            return 0
+            nativeLog("[ck-device] concurrent receive pull failed: \(error)")
+            return delivered
         }
     }
 
@@ -419,8 +563,10 @@ extension CloudKitDeviceTransport {
         // On a first-ever empty pull, retain nil so the next attempt still performs a complete bootstrap read. Once a durable cursor exists (or this
         // pull saw a record), successful emptiness is an observed high watermark and can slide the overlap window forward safely.
         guard previousCursor != nil || safeRecordDate != nil else { return nil }
-        let highWatermark = max(queryStartedAt, safeRecordDate ?? queryStartedAt)
-        let candidate = highWatermark.addingTimeInterval(-overlap)
+        // The cursor moves only by record dates the server stamped, never by this device's clock: a fast clock on an empty pull would
+        // otherwise jump past messages the server has not yet shown.
+        guard let safeRecordDate else { return previousCursor }
+        let candidate = safeRecordDate.addingTimeInterval(-overlap)
         guard let previousCursor else { return candidate }
         return max(previousCursor, candidate)
     }

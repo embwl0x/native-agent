@@ -253,7 +253,7 @@ extension AppDelegate {
         let producerDrain = NativeAgentEngine.beginQuitProducerSettlement(appLaunch: Self.launchTask,
             appObservers: [approvalNotificationTask].compactMap { $0 })
         let runs = NativeAgentEngine.live.turns.inFlightRunIDs()
-        let settlement = NativeAgentEngine.beginQuitSleep(after: producerDrain, runs: runs,
+        let settlement = NativeAgentEngine.beginQuitSleep(after: producerDrain,
             retireBrowser: { BrowserWindowController.shared.stopIPCServer() })
         let waitsForTurns = !runs.isEmpty && !Self.restartQuit.withLock({ $0 })
         Self.quitWaitingForTurns = true

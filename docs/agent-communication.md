@@ -23,7 +23,7 @@ other helpers and agent conversations still publish their readable results.
 - **Who.** One saved contact: a stable id, the name the person or they gave it, and the history between them. Nothing else establishes identity. A product name, a vendor, a host, a bridge route or a lane name never makes two contacts one, and never makes a contact anyone else. On a stranger's Mac, Claude Code is "Claude Code". On User's Mac, "the builder agent" is a who that they named, reached through Claude Code's and Claude Desktop's doors.
 - **Door.** One authenticated way to reach a who: a recipe route (MCP entry, ACP launch, desktop chat, A2A endpoint, bot routine), its own credential, and the recipe's two declarations: how the door **wakes** its agent (none, open the app, run a command, start an ACP session) and what counts as **acceptance** (the agent read it through its door, answered, or acknowledged it). Joining several doors into one who is an explicit association written on the contact by the person or by them; there is no implicit one. Authority lives on a door: a call is elevated only when it authenticates with that door's own key and the person granted that door. Associating a new door with a trusted who grants it nothing. A door may instead be one of their own abilities (`ability` on the contact): a message runs it with the text, the contact, the exchange and the recent talk, and it answers as that contact with `agent.reply`, which settles the exchange as any route's answer does; the who, its thread, trust and replay claims stay the contact's.
 - **Owed until received.** A message is an experience that owes `accept` to its who. It settles when a door's acceptance evidence arrives; a send, a queue write or a launch never settles it. While it is owed, their home shows it as waiting on that who, with the lever: their next call (wake it through a door that can) or the person's exact tap (open that app) when no door can. A who with no door that can deliver says so with the owner (the recipe, the vendor) and what would change it.
-- **Found as it is.** A host is found the way the person's own Mac finds it: its app by bundle or markers, its command line through the person's own login PATH and the recipe's paths, resolved once into one installation binding that discovery, connect and launch share. Installation events settle together before comparing the candidate programs, bundle locations, app metadata and executables; unrelated directory changes keep the binding and do not scan running programs. Explicit discovery still refreshes immediately. An update keeps the who, its doors' keys, the person's grants and authored recipe changes; only owned configuration is rewritten.
+- **Found as it is.** A host is found the way the person's own Mac finds it: its app by bundle or markers, its command line through the person's own login PATH (a read that worked holds for the launch; a failed read is tried again on a later use, at most every 30 seconds, and no binding is kept while it fails) and the recipe's paths, resolved once into one installation binding that discovery, connect and launch share. Installation events settle together before comparing the candidate programs, bundle locations, app metadata and executables; unrelated directory changes keep the binding and do not scan running programs. Explicit discovery still refreshes immediately. An update keeps the who, its doors' keys, the person's grants and authored recipe changes; only owned configuration is rewritten.
   A supplied card URL is exact: failed resolution reports that URL instead of
   guessing another endpoint. An explicit executable path must validate as configured.
   Peer credentials require an install identity. Reads, writes and deletion use
@@ -140,7 +140,7 @@ helper bot is still its own mind and is not a line.
 | `agent.read {job}` | Read the job: its beat (working, needs you, done, failed), its deliverable and the check's output. A line of their shows its `conversation`, `instructions` and its answer as their own words. |
 | `agent.cancel {job}` | Stop the job through its transport; a line of their stops its turn. |
 | `agent.apply {job}` | Merge a repo job's diff with the agent's own git call, gated by Trust; the commit carries `Assisted-by: <contact>:<model it reported>`. |
-| `agent.discard {job}` | Drop a repo job's worktree and branch. |
+| `agent.discard {job}` | Drop a settled repo job's worktree, including uncommitted work, and delete its branch. |
 
 What the agent commissions comes back as its own: the deliverable returns as the result of its
 own call and registers with native provenance plus "made by ‹who› for ‹job›". The organ's prose
@@ -151,9 +151,7 @@ A2A returned-file decoding or write failures keep the files that did land and th
 report, and end the job failed with the missing-file cause.
 Each agent takes jobs through its own native headless door: Codex `app-server`, Claude Code
 `-p` stream-json, ACP and A2A. The Codex and Claude Code doors refuse any stdout JSON line
-over 16 MiB, excluding the newline, before parsing it. A worktree idle for seven days with no
-unique commits, no dirty or untracked files and no uncertain ownership may be retired when a
-new one is cut; its branch is kept, and the outcome is a `builder.worktree_retirement` turn-trace event.
+over 16 MiB, excluding the newline, before parsing it.
 
 Home's **Connection details** opens the detailed contact read,
 preserving its doors, connection evidence and discovery details.
@@ -205,9 +203,11 @@ Continuation pre-run update failures retain `not_started` and their exact cause;
 once execution is entered, interruption remains uncertain. Completion delivery
 uses only its saved route; a missing route owes a named repair. A caller-result
 artifact cancelled after preflight and before dispatch records `failed_pre_dispatch`.
-A missing approval holds and names only its own send;
-unrelated launch queues continue. The finished October contact-history import
-and its marker dependency are removed after canonical transcript coverage was checked.
+A missing approval holds and names only its own send. A failed Grok receipt
+restoration owes repair by file, stays queued for the next contact reconciliation
+and retains its evidence through retention. Unrelated launch queues continue.
+The finished October contact-history import and its marker dependency are
+removed after canonical transcript coverage was checked.
 
 The canonical task store restores accepted contact and builder work. A failed
 backlog read keeps restoration unavailable, with its source and repair lever;
@@ -215,8 +215,11 @@ it never counts as an empty backlog. Admission reports that failure rather than
 waiting forever. A failed conversation read holds that conversation while other
 conversations restore. Saved reply-file recovery has its own typed debt: known
 execution state and recovered parts remain retained, damaged files are named,
-and a later task read reconstructs only the payload after repair. Such payloads
-are excluded from expiry while repair is owed.
+and a later task read reconstructs only the payload after repair. Live and
+recovered jobs share the aggregate reply limit and name any omitted files by
+their saved paths. A task receipt must fit the encoded size limit when
+committed; a read accepts any receipt that decodes, since an older writer's larger
+receipt is still a valid record. Payloads with outstanding repair are excluded from expiry.
 
 Registered A2A callbacks retain their owed task update in the task's receipt.
 If Keychain restoration fails or the destination is missing, recovery saves
@@ -856,20 +859,30 @@ life normalization still commits when it differs from saved state.
 
 Builder, MCP and A2A ingress share `AgentContactTasks` admission, record-owned
 execution, output settlement and retained receipts. Builder formatting remains
-at its door. Enqueue acknowledgment (30 seconds) and reply (600 seconds) bounds
-end only the HTTP wait: a late enqueue still admits its original run. `enqueued` is answered once the task's worker has
-saved the input in its conversation and bound its run to the task (or the message answered a held send by its reply_to); a message
-that failed before it was saved returns its failure instead. The bridge
+at its door. A peer send that fails or is canceled before its task is durably
+retained releases that attempt's replay claim. A retained task or replay receipt
+keeps the claim.
+
+Enqueue acknowledgment (30 seconds) and reply (600 seconds) bounds
+end only the HTTP wait: a late enqueue still admits its original run. The worker
+retains the session and run before writing input. `enqueued` confirms that the
+input committed in that conversation. A message that failed before saving
+returns its failure. A matching `reply_to` that answers a held send returns
+`completed` immediately with the held-send ID. The bridge
 reads the app's actual selected chat; recent activity cannot select a chat.
 Discovery publication must commit before readiness, admission and recovery begin;
 its file failure is exposed in listener health. HTTP JSON, SSE and gRPC record
 reply acknowledgment through the same task operation after successful writes.
 Retained reply reads keep `attachments` at the top level: builder attachment
-descriptors retain their saved paths; canonical file parts carry their bytes as
-`base64` with `mime`, `name` and `byteSize`. Reading produced words or files
-acknowledges that output even when execution failed or was canceled; the
-execution verdict stays unchanged. An empty reply or a failed transport write
-does not acknowledge output.
+descriptors retain their saved paths. Canonical file parts carry their bytes as
+`base64` with `mime`, `name` and `byteSize`. Live delivery and restart recovery
+both take a job's files from its job folder. Reading produced words or files
+acknowledges that output even when execution failed or was canceled. The
+conversation marks a reply read once its terminal prose has been transmitted in
+full, including across out-of-order pages. Draft pages and stream deltas count
+only where their bytes match that prose. An A2A file-only stream acknowledges
+the reply once all file artifacts have been written.
+Older read records without terminal evidence leave the marker unknown.
 MCP acceptance and requested retrieval are independent: an accepted message with
 a failed waited read retains enqueue evidence and returns `isError: true` with
 the read failure and repair lever, without suggesting a resend.
@@ -883,11 +896,15 @@ calls `agent_reply` with the same session/request, an exact content-digest
 with `next_offset` and `has_more`. Concatenating decoded chunks yields JSON with
 the original `attachments` and `delegated_completions`, including every file's
 bytes. `nativeagent-link reply --artifact <id> --offset <n>` reaches the same
-read. The canonical task remains the only payload owner; a changed, expired,
-missing or unreadable payload is unavailable, never another send. References
-alone do not acknowledge output; returned words, inline files or the last
-artifact chunk do. Oversized non-file fields report a projection failure while
-retaining execution evidence and held-message settlement.
+read. The canonical task remains the only payload owner. A compacted answer
+returns `status: expired`, `reply_payload_expired: true` and
+`retrieval_result_class: failed` on direct reads and waited replays, with the
+retained execution verdict and the expiry detail. A later delegated completion
+can still be read from that receipt. Older compacted tool receipts that lost
+their dispatch verdict report an unknown outcome. Returned words, inline files
+or a nonempty last artifact chunk supply read evidence. Oversized non-file
+fields report a projection failure while retaining execution evidence and
+held-message settlement.
 
 The old builder receipt reader remains solely for retained historical rows that
 have no canonical task. Missing execution fields stay unknown; combined delivery
@@ -897,7 +914,8 @@ builder ingress writes the old message-reply log.
 
 A builder completion response reports the retained execution state, never a
 successful receipt read as successful execution; a failed task returns HTTP 409
-with `status: failed`.
+with `status: failed`. A replayed bridge tool receipt preserves a thrown
+dispatch's failed or unknown execution verdict independently of retrieval.
 A queued builder turn recovered after restart consumes
 its exact saved session/run and framed input, then uses the same contact-reply
 settlement as live ingress: recording the incoming reply and routing their answer
@@ -917,6 +935,10 @@ message clears an older unavailable mark on its credential-bound return door;
 ACP and desktop routes still require their own round trip. Request-file
 reconciliation reads Grok request records only for Grok Bot contacts; other
 contact kinds retain their own receipt and reply owner.
+
+For hosts with an automatic MCP connection check, Reconnect checks a repaired entry
+or one missing its return-path proof. The check succeeds when the same contact sends
+the outstanding one-time challenge in a newly accepted MCP message.
 
 ### Identity and authority
 
@@ -940,6 +962,9 @@ Mac chat in time order, as compact reading copies opening the contact's thread.
 The phone carries the same rows beside its Mac transcript snapshot, in an
 additive `otherRooms` field; these rows never enter the person's session or
 become model chat messages. AgentScreen's `doorLines` and `otherRoomExchanges` retain this presentation.
+The saved run ID pairs an answer with its input, including when another input
+arrives before the answer. A legacy answer without a run ID pairs with its
+adjacent input even when an older input is still unanswered.
 Turn continuity instead reads their one experience record: exchanges, sends,
 thoughts and happenings share one newest-first character budget. Birth steering
 stamps decide whether each row carries words or shape; peer-steered receiving
@@ -954,7 +979,7 @@ reads preserve unavailable classification/history evidence through the checked
 workspace owner; see the [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled).
 The inbound header names `app {action:"chat.post",args:{message:"your message"}}`
 to speak into the person's current conversation. This registry action uses the
-existing Reach `speakProactively` owner, claim, quota and deduplication; it does
+existing Reach `speakProactively` owner with locked claims and deduplication; it does
 not start a turn, call a model, or create another delivery path.
 
 ## Remote interoperability
@@ -1021,7 +1046,8 @@ send/subscribe carries that metadata on its first event payload, across
 JSON-RPC, HTTP+JSON and gRPC. Empty batches omit these optional fields. A door
 without an authenticated principal peer ID drains nothing. A drain failure
 returns that call's error, leaving the messages held. Only a written JSON
-response or first stream event settles the batch as delivered; failed writes,
+response or first stream event settles the batch as delivered. The response
+writer settles each claim once from the write outcome. Failed writes,
 encoding failures and cancellation before writing release it back to held.
 Later stream events do not repeat the batch. Delivery alone does not end the
 sender's wait for the contact's answer, regardless of the original transport.
@@ -1039,7 +1065,9 @@ turn. No message words enter the delivery happening. The attention record owns
 its once-key; saves and launch restoration re-offer committed acceptance,
 including dropped records, without another delivery-state copy or sent marker.
 Pruned exchanges retain their acceptance obligation, and the transcript retains
-the send's authorship. Missing or unreadable evidence owes repair for that send;
+the send's authorship. The release entry keeps the terminal state until the
+transcript owner confirms it on the send row, including in archived history.
+Missing or unreadable evidence owes repair for that send;
 it never means delivered or not delivered. A failed response write leaves the
 send held and creates no delivery news. A contact that never calls leaves the
 note held, with the existing read lever and the agent's withdrawal, and no clock deciding its outcome.
@@ -1060,7 +1088,10 @@ effect exactly as for any turn an agent's message starts (a contact the person
 trusts restricts nothing; one not trusted gets the one card and no automatic
 recall). Reply reads and their continuation pages use the agent's native authority.
 The contact's words keep their provenance in its thread and their untrusted-data
-framing in the arrival. Reply reads
+framing in the arrival: a conversation receipt that carries `untrusted_remote_data`
+(a peer's words, to be read as data) also carries `trusted`, whether the person trusts that
+contact; so does an arrival notice for a peer's conversation, and so does each peer message in a
+read's `session_history` (the agent's own words carry neither). Helper jobs still set the flag from trust. Reply reads
 remain independent of delegation notices: a retained notice is eligible
 on its own, including for push-only contacts, and recording or settling it
 preserves the reply's read marker. Every non-delivered notice outcome, returned
@@ -1111,8 +1142,9 @@ row identified, including in continuity; it cannot disappear from an `ok` feed.
 External MCP clients use `/agent/mcp`, or the bundled `nativeagent-link`
 executable with argument `mcp` for stdio. This protocol exposes
 `agent_message`, `agent_reply` and `agent_desk`: these are external MCP names, not
-additional tools in the agent's turn. The message call can wait for an answer; an
-`enqueued` result requires recovery through `agent_reply` with the returned IDs.
+additional tools in the agent's turn. The message call can wait for an answer.
+An `enqueued` result provides IDs for `agent_reply`. A message that answers a
+held send returns `completed` with `reply_to`.
 
 #### The table
 
@@ -1247,7 +1279,13 @@ Use the generated connection's environment for these commands:
 nativeagent-link message <text> [--session id] [--request id]
 nativeagent-link reply --session <returned-id> --request <returned-id> [--offset n]
 nativeagent-link mcp
+nativeagent-link contacts
 ```
+
+If the local helper reports a rejected credential, `contacts` opens the
+Connections page of its own installed app. Select the intended saved host and
+choose Reconnect. That row identifies the existing peer by ID. Retain the
+session and request IDs and check the original request after reconnecting.
 
 The CLI `message` command generates `request_id` when `--request` is omitted;
 MCP callers must supply it themselves. `message` waits up to
@@ -1268,7 +1306,7 @@ Paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
 | Owner | Responsibility |
 | --- | --- |
-| `Transcripts/TranscriptRows.swift` | `ContactThread.project`: one stamped-row reading for session, thread, preview and cached-reply displays. Their own rows (assistant or source `self`) and human-authored bridge rows stay theirs and the person's, never contact evidence. Unattested speech may display its recorded route/routine name with ` (unattested)`; `consume` still marks it as `another agent`. Only contact speech is consumed, marking its speaker alone; recorded steering remains provenance. |
+| `Transcripts/TranscriptRows.swift` | `ContactThread.project`: one stamped-row reading for session and thread displays; indexed previews return their validated saved text, and cached replies come from the receipt. Their own rows (assistant or source `self`) and human-authored bridge rows stay theirs and the person's, never contact evidence. Unattested speech may display its recorded route/routine name with ` (unattested)`. Its speaker provenance is still `another agent`. Recorded steering stays in the stamp. |
 | `AppToolRuntime/AppActions+Declarations.swift` | Agent actions exposed through `app`. |
 | `ChatToolRuntime/CanonicalToolNameDispatcher.swift` | Contact selection, conversation continuity and dispatch gates. |
 | `AgentConversations/AgentConversationStore.swift` | Scoped conversation bindings and retained exchange evidence in `agents/conversations.json`. |

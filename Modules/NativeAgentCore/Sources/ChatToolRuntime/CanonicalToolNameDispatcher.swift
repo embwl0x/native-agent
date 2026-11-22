@@ -1,7 +1,6 @@
 import AgentWorkspace
 import Foundation
 import ApprovalInbox
-import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -126,7 +125,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
                 default: return false
                 }
             } else {
-                func text(_ key: String) -> String { input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+                func text(_ key: String) -> String { JSONValue.trimmedScalarTextOrEmpty(input[key]) }
                 return text("page").lowercased() == "inbox" && text("action").isEmpty && text("find").isEmpty
             }
         }
@@ -258,8 +257,8 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         }
         if (Self.canonical(tool) == "wait" && input["agent"] != nil) || waitsOnRead {
             guard let root = peerDataRoot,
-                  let scope = try turn.verifiedSessionID ?? conversationScope
-                    ?? (waitsOnRead ? Self.contactSession(input, dataRoot: root) : nil), !scope.isEmpty else {
+                  let scope = turn.verifiedSessionID ?? conversationScope
+                    ?? (waitsOnRead ? Self.contactSession(input) : nil), !scope.isEmpty else {
                 if waitsOnRead { throw AgentConversationStore.Failure(message: """
                     wait_seconds needs this chat's conversation, which this call does not have. Nothing was read.
                     """) }
@@ -275,7 +274,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         }
         if !invocation.internalRead, !invocation.dryRun,
            ["agent_message", "agent_read", "agent_cancel"].contains(tool), let root = peerDataRoot,
-           let scope = try turn.verifiedSessionID ?? conversationScope ?? Self.contactSession(input, dataRoot: root),
+           let scope = turn.verifiedSessionID ?? conversationScope ?? Self.contactSession(input),
            !scope.isEmpty {
             return try await AgentConversationSession.dispatch(turn: turn, mac: invocation.macContext(dataRoot: root),
                 conversation: invocation.conversation, workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
@@ -287,7 +286,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         return try await dispatchExact(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
     }
 
-    private static func contactSession(_ input: [String: JSONValue], dataRoot: URL) throws -> String? {
+    private static func contactSession(_ input: [String: JSONValue]) -> String? {
         guard case .string(let agent)? = input["agent"] else { return nil }
         return agent.hasPrefix("peer:") ? ContactThread.session(owner: String(agent.dropFirst(5))) : nil
     }

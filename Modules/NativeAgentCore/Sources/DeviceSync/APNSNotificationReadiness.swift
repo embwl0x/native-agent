@@ -74,13 +74,13 @@ extension SwiftNativeAPNSSender {
                 guard case .object(let obj) = value else { throw CocoaError(.propertyListReadCorrupt) }
                 // Revocation removes this device's alert token but retains its work activity.
                 guard obj["token"] != nil else { continue }
-                guard let token = Self.string(obj["token"])?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !token.isEmpty, let deviceID = Self.string(obj["deviceId"]), !deviceID.isEmpty,
-                      deviceID == key, let environment = Self.string(obj["environment"]),
-                      let bundleID = Self.string(obj["bundleId"]), !bundleID.isEmpty,
-                      let lastSeen = Self.string(obj["lastSeen"]) else { throw CocoaError(.propertyListReadCorrupt) }
+                guard let token = obj["token"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !token.isEmpty, let deviceID = obj["deviceId"]?.stringValue, !deviceID.isEmpty,
+                      deviceID == key, let environment = obj["environment"]?.stringValue,
+                      let bundleID = obj["bundleId"]?.stringValue, !bundleID.isEmpty,
+                      let lastSeen = obj["lastSeen"]?.stringValue else { throw CocoaError(.propertyListReadCorrupt) }
                 tokens.append(APNSToken(
-                    deviceId: deviceID, pairedDeviceID: Self.string(obj["pairedDeviceID"]),
+                    deviceId: deviceID, pairedDeviceID: obj["pairedDeviceID"]?.stringValue,
                     token: token, environment: try Environment.checked(environment), bundleId: bundleID,
                     source: "swift_push_tokens", updatedAt: lastSeen))
             } catch {
@@ -107,10 +107,6 @@ extension SwiftNativeAPNSSender {
             case .development: "api.sandbox.push.apple.com"
             }
         }
-    }
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let string) = value else { return nil }
-        return string
     }
     struct APNSConfig: Sendable {
         let teamId: String

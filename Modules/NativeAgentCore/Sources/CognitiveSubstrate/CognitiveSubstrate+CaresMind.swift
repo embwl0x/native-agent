@@ -163,12 +163,6 @@ extension CognitiveSubstrate {
         return capsuleLineText(line, maxCharacters: 280)
     }
 
-    /// The cares `text` touches, closest first (`caresStandingOut`), on the warm vector cache. nil while the embedder is cold.
-    func caresTouched(by text: String, among candidates: [CognitiveCare], turn: Turn) async throws -> [CognitiveCare]? {
-        guard let cosines = try await careCosines(to: text, among: candidates, turn: turn) else { return nil }
-        return Self.caresStandingOut(cosines, among: candidates).map(\.care)
-    }
-
     /// Use relative cosine standing, not an absolute floor: high shared similarity moves the mean. All candidates count; eligibility only limits selection.
     static func caresStandingOut(_ cosines: [UUID: Double], among candidates: [CognitiveCare],
                                  eligible: (CognitiveCare) -> Bool = { _ in true })
@@ -300,6 +294,10 @@ extension CognitiveSubstrate {
     public func feelRhythmBreak(_ event: CognitiveEvent) async throws -> Bool {
         guard configuration.enabled, event.subject.type == "person_rhythm", event.kind == .organismResolutionFelt else { return false }
         let admitted = await ingestResident(event)
+        // An appraisal that could not run is not "nothing felt": the break stays pending until the embedder can read it.
+        if case .string(let why)? = admitted.semanticMetadata["appraisalUnavailable"] {
+            throw CognitiveCareNotSaved(detail: "The break could not be appraised: " + why)
+        }
         guard admitted.accepted || field.hasSeenEvent(event) else { return false }
         await waitForMaintenanceTransition()
         if let kept = cares.values.first(where: { $0.story.contains(where: { $0.source == event.id }) }) {

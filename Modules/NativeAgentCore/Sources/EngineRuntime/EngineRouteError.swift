@@ -2,10 +2,8 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import ProviderRouting
-#if canImport(CloudKit)
 import CloudKit
 // Blueprint: | `EngineRouteError.swift` | Plain failure remedies and full-width POSIX error interpretation |
-#endif
 /// Keep raw errors in logs; user-facing failures need a plain cause and remedy.
 public enum UserFacingError {
     private static let logger = ModuleLog(subsystem: "com.nativeagent.app", category: "user-facing-error")
@@ -34,7 +32,6 @@ public enum UserFacingError {
 
     private static let fallback = "Something went wrong. Try again; if it keeps happening, the details are in the log."
 
-    #if canImport(CloudKit)
     public static func iCloudAccount(_ status: CKAccountStatus) -> String {
         switch status {
         case .available: return iCloudSignedIn
@@ -45,7 +42,6 @@ public enum UserFacingError {
         @unknown default: return "Couldn't check iCloud"
         }
     }
-    #endif
     public static let iCloudSignedIn = "Signed in to iCloud"
 
     /// Use authored localized errors as written; system NSError bridges and wrapped underlying errors can contain raw diagnostic text.
@@ -72,7 +68,6 @@ public enum UserFacingError {
 
     public static func advice(for error: Error) -> String {
         let ns = error as NSError
-        #if canImport(CloudKit)
         if let ck = error as? CKError {
             switch ck.code {
             case .notAuthenticated:
@@ -89,7 +84,6 @@ public enum UserFacingError {
                 break
             }
         }
-        #endif
         switch ProviderFailure.classify(error) {
         case .authExpired?, .codexCLISessionExpired?:
             return "The sign-in has expired. Reconnect it in Settings, then try again."

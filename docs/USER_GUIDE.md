@@ -67,7 +67,7 @@ stop and completes without indexing a missing step.
   while it works, as they do from the composer, and the line says so. The page
   redraws by itself when the agent changes it. Pictures of a page do not show
   the bar.
-- **Agent** shows the agent's home and rooms read-only.
+- **Agent** shows the agent's home and rooms; a conversation opened there shows in Simple.
 
 An absent view preference starts in Simple, independently of saved chats.
 A saved supported choice is preserved. Page names in this guide refer to Advanced.
@@ -226,6 +226,7 @@ provider refuses as unauthorized marks that credential rejected as a failed test
 Accounts still waiting for a key or sign-in sit under one **Add a provider** row that says how many
 are available and opens from its chevron. On the Mac, an unconnected account's **Add key** or **Sign in**
 opens its protected entry directly, without filing a conversation or Inbox request.
+The agent's Providers page lists models only for connected accounts.
 Anthropic offers an API key and the same Claude sign-in/setup-token controls as onboarding;
 ChatGPT, Codex and Grok offer their browser sign-in. A provider secret is entered only
 in protected Mac entry, never on a card, face, in chat, on the phone or in Telegram.
@@ -242,12 +243,13 @@ with their identity unknown, while readable siblings proceed.
 The Codex CLI offer keeps **Use it**, **Ignore**, and confirmed consent repair; until you answer it,
 its row is marked as waiting on you.
 **Catalog → Models → Refresh** asks every connected account's provider again and shows whether the model lists are
-fresh, cached, partial or unavailable, naming each list it could not fetch. Entering Providers asks only an account
-with no list for its current key or sign-in; saving a key or signing in asks at once, and a connection check saves the
-list it fetched.
+fresh, cached, partial or unavailable, naming each list it could not fetch. Entering Providers asks connected
+accounts whose current key or sign-in has no complete list from the last day. Saving a key or signing in asks at once,
+and a connection check saves the list it fetched.
 Connection checks and catalog refreshes show that they are running and publish their result when they end.
 While a catalog refresh waits for a response or connectivity, its Models row offers **Cancel**.
 Providers owns and joins that refresh task; cancelling releases the refresh slot so **Refresh** is available again.
+A ChatGPT model-list request shared with another reader continues while that reader still needs it.
 An unavailable account or catalog reports its cause on that account; other accounts remain usable.
 The onboarding connection sheet and its sign-in controls remain available.
 An open protected entry reads its saved account baseline from Providers after a
@@ -346,9 +348,11 @@ other controls remain available. Notifications and Right now follow; **Updates
 and help** (update checks, data limits, build identity and app status) is
 folded until opened, unless one of its rows needs attention or failed. The
 tour switch is under Other. The reflection allowance opens Cognition's shared
-number control, from zero through eight reflections in 24 hours. Other text and
-numeric Settings values remain available through `setting.set`. A meaning-based
-memory change still rebuilds the index, and its switch asks before it does.
+number control, from zero to eight waking reflections per rolling 24-hour
+window. Dream reflection is exempt from a positive limit. Zero turns all
+reflection off. Other text and numeric Settings values remain available through
+`setting.set`. A meaning-based memory change still rebuilds the index, and its
+switch asks before it does.
 Settings' Mac access summary and Trust's app switches read the checked permission
 store directly. Reading those rows does not probe macOS grants or refresh Mac watches;
 grant badges and watch readiness remain with their own permission and watch owners.
@@ -464,8 +468,8 @@ diagnostics keep their cause beside retained readings; missing evidence never
 proves that there are no memories. The search-model download keeps its own
 system progress and Pause / Check or resume controls.
 
-Search from `/memory [thing]` (at least three characters), or use command search
-to open a saved memory. The page has no inline search field. A failed
+Search in Memories under **Search what I've kept** or use `/memory [thing]`
+(at least three characters). Command search can open a saved memory. A failed
 meaning-based query shows its owner's cause; retained results identify the
 query that produced them. Store changes refresh the results even when the page
 is closed; **Check again** retries the query. **Show all memories** clears it.
@@ -505,31 +509,50 @@ The agent reaches the Mac through `app` actions such as `mac.look`,
 determine what it can do; a successful input is not by itself proof of the
 intended result.
 
-`mac.act` can run up to 12 ordered `steps`. Each object step can carry
+`mac.act` can run up to 12 ordered `steps`. Name and point steps can carry
 `holding` (keys/modifiers held around physical input) and `button`
 (`auto`, `left`, or `right`), including points addressed with `at`/`from`
 and `frame_id`/`image`. These use the same gesture checks as a single act:
 explicit mouse buttons require a click, open, drag or pointer hold; real
 input requires the app in front. A failed step stops the batch. Optional
-targets and retries retain the gesture options. The app and every step field
-are part of the receipt identity for continuing a stopped batch. A resumed
-batch keeps matching landed and unverified steps without repeating their
-input, and reports how many of the kept steps were unverified.
+targets and retries retain the gesture options. The app and step fields
+identify the step when continuing a stopped batch. Omitting `scroll_amount`
+and supplying 0 identify the same step. A resumed batch keeps matching landed
+and unverified steps without repeating their input, and reports how many of
+the kept steps were unverified.
+explicit mouse buttons require a click, open, drag or pointer hold. Real input
+requires the app in front. A batch without `app` binds to the process in
+front when it starts. During a pending takeover, it binds to the app captured
+when the request arrived. The process can change windows between steps. A
+failed step stops the batch. Optional targets and retries retain the gesture
+options. The app and every step field are part of the receipt identity for
+continuing a stopped batch. A resumed
+batch keeps matching landed steps and steps whose input may have reached the
+app, and reports how many of the kept steps were unverified. A refusal that
+confirmed no input was sent leaves the step eligible to run on resume.
 
 Steps also accept `{verb,handle,frame_id}` (the frame may be inherited from
 the call). Each step resolves that recorded control identity in the live
 window; a missing, changed, expired or ambiguous identity stops at that step.
 Each step's effect is judged against its own fresh before-read; a
 declared-effect mismatch stops later steps.
+An explicit `app` also constrains a single exact selection to that app.
 Editing a field's contents preserves its handle when the control identity is
 unchanged. Handles grant no authority.
+A scroll by handle or by name can specify `direction` and `scroll_amount`
+in a single act or a step. A handle step can use `to` as an alias for
+`direction`. A step with `verb:"scroll", direction:"up", scroll_amount:3`
+scrolls its target up three wheel lines. Scroll target resolution skips the
+AX enabled-state read.
 
 `type` with `at:{x,y}` clicks that image point, then types into the editor
-that takes focus. A targetless `type` uses the focused editor, including when
-the call carries `frame_id` without a handle. AX editability is required;
-unreadable contents do not block keys, but return unverified with a pixel look
+that takes focus. A targetless `type` sends literal text, such as indentation,
+to the focused editor. This also works when the call carries `frame_id`
+without a handle. AX editability is required. Unreadable contents do not
+block keys, but return unverified with a pixel look
 offered. Unknown, noneditable or secure focus still stops typing. Append
 still requires a named, readable editor and a verified insertion point.
+
 Key chords post keys directly, so duplicate menu titles cannot make ⌘W
 ambiguous. A scroll without a target chooses the window's largest visible
 scrollable content region, or its observed content area when AX supplies no
@@ -537,6 +560,8 @@ scroll region. `app` selects that app's window under the usual foreground rules.
 When resolving an application name, an exact bundle filename wins over a
 shared display name: `Numbers.app` wins over `Numbers Creator Studio.app`
 for `Numbers`. Two installed bundles with the winning filename require a path.
+The Screen preview reflects the result of `mac.go`. A background request for
+an already-running app reports that the app is already running.
 An app quit reports `terminated:true` only after the resolved processes exit.
 Accepting a quit request does not prove termination. Quit uses the shared
 navigation settlement patience (1.5 seconds), waking on the app's termination
@@ -584,7 +609,8 @@ Manual's accepted
 write can still read false: the receipt reports that uncertainty, and only the
 subsequent tree and action effect establish what is usable. Incomplete probes
 never establish emptiness. The diagnostic `renderer_activation` in a raw look's
-detail carries bounded before/after element counts, role lists and completeness,
+detail carries bounded before/after element counts, role lists and `probe_complete`
+(the probe's own walk, not the look's `partial`),
 plus attempted writes' AX status and Boolean readback.
 Async admission arms descendant observation before activation, then suspends
 outside the AX lane while the content judge waits. Every descendant notification,
@@ -632,12 +658,20 @@ element seen in both walks once by native identity, using the later menu
 observation for an overlap. Counts describe only observed elements, even
 when traversal is cut; zero never establishes that
 unseen attributes were readable. Unsupported/no-value answers stay absent.
+Under Full Mac, the agent's own looks are not masked: they sees the screen as
+the person does, keys included, because a picture goes only to that turn's model
+request and is never saved; the text of a look and every saved receipt keep their
+redaction. Other agents' looks and every other posture keep the masking below.
 Pixel masking covers what it could not read. A text element (a field, a text
 area, a combo box, static text, a heading) whose value, caption or subrole read
 failed is masked over its entire finite frame, and so is everything its words
 could have named: what it holds, a row or cell named by what it holds, and what
 sits where it would be the label. An unread title covers the same way on any
-element. The rest of the picture is released. Any other failed read on another
+element. An unread description is a caption only for a value that could be a
+secret it names, one unbroken run of characters: over read prose (words with
+spaces, such as a document's text) it covers nothing and withholds no words, so
+an app that fails its text area's description (TextEdit does) still shows its
+page. The rest of the picture is released. Any other failed read on another
 element (apps answer failure for a window's value, an image's description, a
 button's subrole) is reported as a gap and covers nothing.
 An element with no role, a missing or nonfinite frame on such an element, or a
@@ -1075,9 +1109,9 @@ Activity's Inbox and Approvals open the same Inbox face, also read by
 `app {page:"inbox"}`. Requests appear in **Waiting for the person**, followed
 by **Went wrong**, then **News** with unread matters first. Rows retain the
 recorded time, symbol, destination and choices. Approval buttons say
-**Approve** and **Deny**, or **Just this**, **For this task** and **Deny** for an untrusted agent; requests keep their choices,
+**Approve** and **Decline**, or **Just this**, **For this task** and **Decline** for an untrusted agent; requests keep their choices,
 **Open request** and **Not now**. Other notes offer **Mark read**, **Archive**
-and **Dismiss**. Deny, Not now, Archive and Dismiss ask for confirmation.
+and **Dismiss**. Decline, Not now, Archive and Dismiss ask for confirmation.
 Putting a note away removes the note from the active face. In **News** and
 **Earlier**, decisions the agent made itself of one kind (every ability it kept,
 say) sit under one row that shows the first of them, how many more, and how many
@@ -1370,7 +1404,7 @@ The old catalog, loading and per-area tool calls are refused with a translated
   exemption for agents enabled in Trust.
 - An MCP server is an ability the agent grows, a resident one keeping the
   server running; NativeAgent has no MCP page of its own.
-- `web.search` searches SearXNG and returns its results or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
+- `web.search` searches SearXNG and returns its results (with the engines' direct `answers` and up to three `infoboxes` knowledge panels, each a title, summary and page, when SearXNG has them) or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
   In Research's search service settings, Find and Save run one at a time.
   Editing the URL while either runs preserves that edit; its earlier result
   cannot clear the new draft or replace its feedback.
@@ -1511,7 +1545,7 @@ Chrome control, Mac access and control, Security, Connected agents, Apps and
 features, macOS grants, Background watches, Activity capture and the Privacy
 map. A block with something that needs you (a grant not yet given, a reading
 that failed) stays open and comes first. Backups stays open, its restore
-points under one row; the recent security receipts and the Mac control audit
+points under one row; the recent security log and the Mac control audit
 come last, folded. The agent reads that same face as text; a folded block keeps
 its rows that carry a control or an action, by name, state and call, and counts the
 rest, and its item reads it whole. Every switch on it stays in the page's settings
@@ -1534,9 +1568,8 @@ recognized source action says readiness is unavailable and explains why. A faile
 the retained reading with its cause. Reading these recipes creates no schedules.
 
 Security shows whether remote command signing is required and whether verified
-trusted origins have a signature waiver. Audit Receipts shows the recording
-setting, retained receipt count for this view and any read or decoding failure;
-retained history does not establish complete recording. A damaged receipt
+trusted origins have a signature waiver. Security log shows the recording
+setting, the number of entries and any read or decoding failure. A damaged receipt
 keeps its own named gap beside the readable receipts. Mac control audit reads
 retained refusal receipts in the experience record; the Mac Control inventory
 counts operation files, including their lock, rather than those receipts.
@@ -1683,10 +1716,10 @@ nor that unrelated work has stopped. Missing approval records remain unavailable
 
 Use **Desk** for durable multi-step work: dependencies, schedules, checkpoints,
 approval pauses and outcomes stay with the task. A **held** row has a blocker,
-defer or held ancestor; its reason explains what needs to change. A task you
-start from the Mac's new-task sheet, the phone or Shortcuts becomes a Desk item
-that a [line of theirs](#lines-of-their-own) carries; they settles it when the line
-ends.
+defer or held ancestor; its reason explains what needs to change. On Mac,
+**New task** or the Shortcuts intent creates a Desk item for a
+[line of theirs](#lines-of-their-own) to carry and settle. On iPhone, ask for a Desk
+task in Chat.
 The [Desk vocabulary](DESK.md) describes its actions, person waits, paged reads
 and the separate shared task ledger.
 
@@ -1763,9 +1796,8 @@ conversation from its helper or run row; a helper without one says
 shows its reason. An unreadable or not-yet-read conversation index says so
 instead of claiming that a conversation does not exist. Palette replies open
 their saved conversation. Full replies, artifacts and earlier runs live in chat.
-To make a helper or change one, tell the agent in chat; the Mac editor is gone.
-The phone's existing helpers snapshot and editing actions remain available to
-older phone builds while its Helpers page moves to the shared face.
+To make a helper or change one, tell the agent in chat. On iPhone, the shared
+Helpers page shows runs and opens their conversations.
 By default it **follows Providers**: every turn uses Chat's current provider,
 model, Think and Fast, without saving a per-helper choice. A missing legacy
 `modelPinned` flag means the same as false. **Pin a model** gives the helper
@@ -1844,9 +1876,10 @@ A brief does not change permissions.
 Deleting a helper excludes it from new runs and listings while retaining its
 definition and audit so an already running job can save its result.
 
-Scheduled and event-triggered helpers use **Trust → Self-Improvement → Let me
-work unattended**. Turn it off to stop unattended runs outside Full Mac. Under
-Full Mac, change the access mode instead. **Run once** remains available.
+Scheduled and event-triggered helpers use **Trust → Features → Let me work
+unattended**. Turn it off to stop unattended runs outside Full Mac. Full Mac
+shows it as On under **Trust → Standing**. Choose a narrower standing to
+change it. **Run once** remains available.
 
 The helper's page shows run summaries; open chat for full replies and session
 activity. Durations use the recorded seconds; invalid saved durations fail the
@@ -1988,6 +2021,7 @@ Readable captions, text and successfully downloaded attachments reach the turn
 even when another attachment fails; a named missing-media fact accompanies them.
 Telegram's first delivery and `/retry` use the same media preparation, including
 that caption and missing-media fact when the attachment cannot be read.
+To run a message again with `/retry`, stay in the conversation that received it.
 An attachment-only failure reports the unavailable media explicitly. Telegram
 approval text uses bounded UTF-16 consent parts, with answer buttons on the last
 part. Its progress ledger writes only changed durable card facts, and group
@@ -1999,7 +2033,8 @@ confirmed progress per bounded text part before images; a truncation warning
 never establishes complete delivery. Slack `/retry resend` continues the saved
 answer after its confirmed text and images. Confirmed files need no local copy
 for the remaining images to send. Its journal explicitly retains turns
-completed without a post. Settings acquire one asynchronous checked Slack policy
+completed without a post. Saved replies still need the current Slack workspace
+and allowlists to permit their destination. Settings acquire one asynchronous checked Slack policy
 for the three rows; a save restarts the socket worker immediately while accepted
 handlers remain owned by the journal. There is no deferred settings queue.
 Telegram notification failures after an accepted part and Slack's potentially

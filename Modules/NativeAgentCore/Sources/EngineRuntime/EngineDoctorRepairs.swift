@@ -57,15 +57,18 @@ extension EngineDoctorRuntime {
                     let snapshot = try await (FileManager.default.fileExists(atPath: pendingPath.path)
                         ? routing.checkedRoutingSnapshot()
                         : routing.checkedRoutingSnapshotReadOnly())
-                    guard let providerID = ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") else {
+                    guard ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") != nil else {
                         let row = await providerDoctorCoverageCheck()
                         return .unverified("Repair could not test the active provider: \(row.detail)")
                     }
-                    let test = try await NativeAgentEngine.live.providers.testProvider(providerID)
-                    // Share the Providers page’s connection-test verdict.
-                    guard test.tested && test.status == "ok" else {
-                        return .unverified(
-                            "Repair attempted: the \(providerID) connection test did not pass: \(Self.safeDetail(test.detail ?? test.error ?? test.status))")
+                    // Doctor may have measured any surface's route (a Telegram turn on another provider): test every routed provider.
+                    for providerID in Set(snapshot.activeProviders.values).sorted() {
+                        let test = try await NativeAgentEngine.live.providers.testProvider(providerID)
+                        // Share the Providers page’s connection-test verdict.
+                        guard test.tested && test.status == "ok" else {
+                            return .unverified(
+                                "Repair attempted: the \(providerID) connection test did not pass: \(Self.safeDetail(test.detail ?? test.error ?? test.status))")
+                        }
                     }
                     let row = await providerDoctorCoverageCheck()
                     return row.status == "ok"
@@ -168,36 +171,24 @@ extension EngineDoctorRuntime {
             }.map(\.name)
             guard !names.isEmpty else { return nil }
             return DoctorExecutableRepair(checkID: check.id) {
-                // Ready callbacks publish bridge descriptors; observe those transitions before reading listener health.
-                let changes = FileChangeEvents(paths: [
-                    AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot).appendingPathComponent("bridge.json"),
-                    dataRoot.appendingPathComponent("browser_ipc.json"),
-                ])
-                defer { changes.cancel() }
-                guard await changes.waitUntilArmed() else {
-                    throw ToolFailureError("Bridge descriptor changes could not be observed. Repair remains unconfirmed.", effects: .none)
-                }
-                try Task.checkCancellation()
                 // Start methods retain their own gates, callbacks and tokens.
                 for name in names {
                     try Task.checkCancellation()
                     await port.doctorStartBridge(name: name)
                 }
-                try Task.checkCancellation()
-                var iterator = changes.stream.makeAsyncIterator()
-                repeat {
+                // A bind can fail in memory with no file changing, so the listeners are read again each second, for half a minute.
+                for _ in 0..<30 {
                     try Task.checkCancellation()
                     let rows = await doctorBridgeSnapshots().filter { names.contains($0.name) }
-                    try Task.checkCancellation()
                     for row in rows {
                         if let failure = row.health.failure { throw ToolFailureError("\(row.name): \(failure)", effects: .unknown) }
                     }
                     if Set(rows.map(\.name)) == Set(names), rows.allSatisfy({ $0.health.boundPort != nil }) {
                         return .completed("Completed: rebound \(names.joined(separator: ", ")) and verified the listening ports.")
                     }
-                } while await iterator.next() != nil
-                try Task.checkCancellation()
-                throw ToolFailureError("Bridge descriptor observation ended before listening ports were confirmed.", effects: .unknown)
+                    try await Task.sleep(for: .seconds(1))
+                }
+                throw ToolFailureError("The bridges did not report listening ports within 30 seconds. Repair remains unconfirmed.", effects: .unknown)
             }
         case DoctorLoopHealth.doctorCheckID:
             return await DoctorLoopHealth.safeRepair(manager: port.doctorManager)

@@ -275,20 +275,7 @@ public enum MemoryDataProvenance {
 
     /// Calendar-day key (local zone) used by the REM evidence owner.
     public static func dayKey(_ instant: Date, calendar: Calendar = .current) -> String {
-        let parts = calendar.dateComponents([.year, .month, .day], from: instant)
-        return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
-    }
-
-    public static func parseTimestamp(_ raw: String?) -> Date? {
-        guard let raw, !raw.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
-    }
-
-    /// Words only, single-spaced, lowercase: a copied span with a comma added or a period dropped is still the same span.
-    static func wordFold(_ text: String) -> String {
-        text.lowercased()
-            .split { !$0.isLetter && !$0.isNumber }
-            .joined(separator: " ")
+        NativeTimestampFormat.calendarDay(instant, calendar: calendar)
     }
 }
 

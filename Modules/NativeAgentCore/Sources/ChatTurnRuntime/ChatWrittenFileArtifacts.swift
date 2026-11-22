@@ -1,5 +1,5 @@
 import Foundation
-import CryptoKit
+import NativeAgentShared
 import UniformTypeIdentifiers
 import PersistenceCore
 import ChatToolRuntime
@@ -34,7 +34,7 @@ public enum ChatWrittenFileArtifacts {
             var reference: [String: JSONValue] = [
                 "type": .string("file"), "name": .string(name), "mime": .string(mime),
                 "byteSize": .int(Int64(bytes.count)),
-                "sha256": .string(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()),
+                "sha256": .string(SHA256Hex.of(bytes)),
             ]
             // Use the writer's resolved path, never the input's relative alias.
             // A missing reference remains visible to recovery as incomplete.

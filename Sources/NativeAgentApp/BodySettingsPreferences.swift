@@ -44,12 +44,12 @@ enum BodySettingsPreferences {
         return reading.values
     }
 
-    private struct PreferenceReading: Equatable, Sendable {
+    struct PreferenceReading: Equatable, Sendable {
         var values: [String: PartFace.Value] = [:]
         var issues: [String: String] = [:]
     }
 
-    @concurrent private static func readPreferences(_ keys: Set<String>, declared: [String: PartFace.Value]) async -> PreferenceReading {
+    @concurrent static func readPreferences(_ keys: Set<String>, declared: [String: PartFace.Value]) async -> PreferenceReading {
         var reading = PreferenceReading()
         for key in keys {
             guard let saved = UserDefaults.standard.object(forKey: key) else {

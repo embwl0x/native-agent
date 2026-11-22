@@ -95,17 +95,4 @@ public struct MemoryProposalRecord: Codable, Identifiable, Hashable, Sendable {
         try c.encodeIfPresent(createdAt, forKey: .createdAt)
         try c.encodeIfPresent(rejectionReason, forKey: .rejectionReason)
     }
-
-    public var evidenceSummary: String {
-        Self.evidenceDescription(sessionCount: supportingSessionIds.count, recurrenceCount: recurrenceCount, error: evidenceError)
-    }
-
-    public static func evidenceDescription(sessionCount: Int, recurrenceCount: Int?, error: String?) -> String {
-        if let error { return "Recorded evidence is malformed: \(error)" }
-        guard let recurrenceCount else { return "Observation count not recorded" }
-        guard recurrenceCount > 0 else { return "Recorded observation count is invalid" }
-        let observation = recurrenceCount == 1 ? "Observed once" : "Observed \(recurrenceCount)x"
-        guard sessionCount > 0 else { return observation + "; session evidence unavailable" }
-        return "\(observation) in \(sessionCount) session\(sessionCount == 1 ? "" : "s")"
-    }
 }

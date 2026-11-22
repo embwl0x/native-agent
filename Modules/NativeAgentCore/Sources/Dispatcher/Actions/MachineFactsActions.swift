@@ -1,6 +1,5 @@
 import AuthoredCapabilities
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import MacControl
 import PersistenceCore
@@ -16,7 +15,7 @@ import Darwin
 extension FileSystemActions {
     // MARK: - system_info
 
-    static func systemInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
+    static func systemInfo(_ input: [String: JSONValue]) -> JSONValue {
         if input["person"] == .bool(true) {
             var out: [String: JSONValue] = ["ok": .bool(true), "status": .string("ok")]
             if case .object(let fact) = MacPersonInput.presenceDetail { out.merge(fact) { $1 } }
@@ -34,8 +33,7 @@ extension FileSystemActions {
                 return errResult("Use app for an installed app version or check_updates for macOS updates, separately.", code: "bad_input")
             }
             let installedURL: URL?
-            do { installedURL = try MacApplications.installedApplicationURL(named: app,
-                context: MacOperationContext(dataRoot: ctx.dataRoot ?? PersistenceCore.defaultDataRoot())) }
+            do { installedURL = try MacApplications.installedApplicationURL(named: app) }
             catch { return errResult(error.localizedDescription, code: "app_index_unavailable") }
             guard !app.isEmpty, let url = installedURL,
                   let bundle = Bundle(url: url), let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,

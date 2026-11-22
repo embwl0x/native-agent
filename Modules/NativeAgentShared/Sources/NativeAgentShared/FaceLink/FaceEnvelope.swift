@@ -70,6 +70,9 @@ public enum FaceAct: Codable, Sendable {
     case send(SendRequest)
     case stop(session: String, expectedTurn: String?)
     case regenerate(session: String, message: String, choice: RetryChoice)
+    /// The user's revision of her message: `from` is the text the editor started from (both sides of the comparison read it), `text` their
+    /// version, sent as their message; her next turn there is handed both.
+    case revise(session: String, message: String, from: String, text: String)
     case prepareRetryDraft(session: String, message: String)
     case exportConversation(ConversationExportRequest)
     case appendSlashHelp(session: String)

@@ -17,7 +17,7 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "artifact_find needs a description between 1 and 500 characters.")
         }
         let topic = WorkContextQuery(query)
-        let requestedSession = optionalString(input, "session_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedSession = input["session_id"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
         let session: String?
         if let requestedSession, !requestedSession.isEmpty {
             guard let safe = NativeAgentChatSessionID.normalizedPathComponent(requestedSession) else {
@@ -135,14 +135,9 @@ struct ArtifactContextCandidate {
 }
 
 enum ArtifactContext {
-    static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value else { return nil }
-        return text
-    }
-
     static func object(_ value: JSONValue?) -> [String: JSONValue] {
         if case .object(let object)? = value { return object }
-        if let text = string(value), text.utf8.count <= 128 * 1024,
+        if let text = value?.stringValue, text.utf8.count <= 128 * 1024,
            let parsed = try? JSONValue.parse(Data(text.utf8)), case .object(let object) = parsed { return object }
         return [:]
     }
@@ -213,7 +208,7 @@ enum ArtifactContext {
         ]
         value.merge(SwiftToolDispatcher.historyEvidence(SwiftToolDispatcher.persistedHistoryPeer(role: message.role, row: row),
                                                         words: display, dataRoot: dataRoot)) { _, new in new }
-        if let id = string(row["id"]), !id.isEmpty {
+        if let id = row["id"]?.stringValue, !id.isEmpty {
             value["message_id"] = .string(id)
             value["read"] = .object(["tool": .string("read_chat_message"), "arguments": .object([
                 "message_id": .string(id), "session_id": .string(sessionID),
@@ -234,9 +229,9 @@ enum ArtifactContext {
             if message.role == "tool" {
                 let row = object(message.extras)
                 // An app call of a folded action is redacted as the tool it ran.
-                let tool = ToolNameAliases.shown(string(meta["toolName"]) ?? "unknown",
-                                                 inputJSON: string(meta["inputJSON"])).name
-                let raw = string(meta["resultSummary"]) ?? message.content
+                let tool = ToolNameAliases.shown(meta["toolName"]?.stringValue ?? "unknown",
+                                                 inputJSON: meta["inputJSON"]?.stringValue).name
+                let raw = meta["resultSummary"]?.stringValue ?? message.content
                 if raw.utf8.count <= 128 * 1024 {
                     let safe = ChatToolJSONRedaction.redactedResultJSON(tool: tool, json: raw, turn: turn)
                     refs += receiptReferences(object(.string(ChatSecretRedactor.redactText(safe))))
@@ -256,11 +251,11 @@ enum ArtifactContext {
             let context = neighbors.filter { $0.role != "tool" }.map { safeText($0.content) }.joined(separator: " ")
             var seen: Set<String> = []
             for ref in refs {
-                let rawPath = string(ref["path"]) ?? string(ref["file_path"]) ?? string(ref["url"])
+                let rawPath = ref["path"]?.stringValue ?? ref["file_path"]?.stringValue ?? ref["url"]?.stringValue
                 let path = rawPath.flatMap { locator($0, dataRoot: dataRoot, turn: turn) }
                 if rawPath != nil && path == nil { continue }
-                let name = string(ref["name"]) ?? string(ref["filename"]) ?? path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Recorded attachment"
-                let id = string(ref["id"])
+                let name = ref["name"]?.stringValue ?? ref["filename"]?.stringValue ?? path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Recorded attachment"
+                let id = ref["id"]?.stringValue
                 guard path != nil || id != nil, seen.insert(path ?? id ?? name).inserted else { continue }
                 guard let match = relevance(query: query, topic: topic, name: name, context: context, locator: path) else { continue }
                 var value: [String: JSONValue] = [
@@ -322,9 +317,9 @@ enum ArtifactContext {
         for item in items {
             for ref in item.refs {
                 let recorded = object(ref.toJSON())
-                guard let raw = string(recorded["path"]) ?? string(recorded["url"]),
+                guard let raw = recorded["path"]?.stringValue ?? recorded["url"]?.stringValue,
                       let path = locator(raw, dataRoot: dataRoot, turn: turn) else { continue }
-                let label = string(recorded["label"]) ?? string(recorded["title"]) ?? path
+                let label = recorded["label"]?.stringValue ?? recorded["title"]?.stringValue ?? path
                 guard let match = relevance(query: query, topic: topic, name: label,
                     context: "\(item.title) \(item.summary ?? "")", locator: path) else { continue }
                 var value: [String: JSONValue] = [

@@ -381,18 +381,20 @@ public struct AbilityStore: Sendable {
     }
     package static func notebook(dataRoot: URL, id: String, setting: Bool, value: JSONValue,
                                writing: () -> Void = {},
+                               writeUncertain: () -> Void = {},
                                failure: (String, String) -> any Error) throws -> JSONValue {
         guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
             throw failure("bad_state", "Part notebook id is invalid.")
         }
         var changed = false
         let result = try notebook(notebookPath(dataRoot: dataRoot, id: id), key: "part", setting: setting, value: value,
-            writing: { changed = true; writing() }, failure: failure)
+            writing: { changed = true; writing() }, writeUncertain: writeUncertain, failure: failure)
         if changed { NotificationCenter.default.post(name: notebookDidChange, object: id) }
         return result
     }
     package static func notebook(_ notebook: URL, key: String, setting: Bool, value: JSONValue,
                                writing: () -> Void = {},
+                               writeUncertain: () -> Void = {},
                                failure: (String, String) -> any Error) throws -> JSONValue {
         try withLock {
             guard notebook.resolvingSymlinksInPath().path == notebook.standardizedFileURL.path else {
@@ -416,7 +418,12 @@ public struct AbilityStore: Sendable {
             state[key] = value
             let data = try JSONEncoder().encode(state)
             guard data.count <= 65_536 else { throw failure("state_limit", "Sense notebook exceeds 64 KiB.") }
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: notebook)
+            do { try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: notebook) }
+            catch {
+                // The durable write can fail after rename.
+                writeUncertain()
+                throw error
+            }
             writing()
             return .null
         }

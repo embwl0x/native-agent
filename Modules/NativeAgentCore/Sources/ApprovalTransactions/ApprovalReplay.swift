@@ -44,22 +44,22 @@ extension ApprovalExecution {
         guard case .object(let payload) = rec.payload,
               payload["kind"] == .string("chat_tool_approval"),
               case .object(let origin)? = payload["origin"],
-              let toolName = Self.nonEmptyPayloadString(payload["toolName"]),
-              let surface = Self.nonEmptyPayloadString(payload["surface"]),
+              let toolName = payload["toolName"]?.trimmedString,
+              let surface = payload["surface"]?.trimmedString,
               case .object(let input)? = payload["input"] else { return nil }
-        let sessionId = Self.nonEmptyPayloadString(origin["sessionId"])
-        let chatId = Self.nonEmptyPayloadString(origin["chatId"])
-        let verifiedUserId = Self.nonEmptyPayloadString(origin["userId"])
-        let destinationId = Self.nonEmptyPayloadString(origin["destinationId"])
-        let threadId = Self.nonEmptyPayloadString(origin["threadId"])
-        let sourceKey = Self.nonEmptyPayloadString(origin["sourceKey"])
-        let replyTo = Self.nonEmptyPayloadString(origin["replyTo"])
-        let correlationId = Self.nonEmptyPayloadString(origin["correlationId"])
+        let sessionId = origin["sessionId"]?.trimmedString
+        let chatId = origin["chatId"]?.trimmedString
+        let verifiedUserId = origin["userId"]?.trimmedString
+        let destinationId = origin["destinationId"]?.trimmedString
+        let threadId = origin["threadId"]?.trimmedString
+        let sourceKey = origin["sourceKey"]?.trimmedString
+        let replyTo = origin["replyTo"]?.trimmedString
+        let correlationId = origin["correlationId"]?.trimmedString
         let replyRoute: TurnEnvelope.DeliveryRoute? = [
             destinationId, threadId, sourceKey, replyTo, correlationId,
         ].contains(where: { $0 != nil })
             ? TurnEnvelope.DeliveryRoute(
-                surface: Self.nonEmptyPayloadString(origin["surface"]) ?? surface,
+                surface: origin["surface"]?.trimmedString ?? surface,
                 destinationId: destinationId,
                 threadId: threadId,
                 sourceKey: sourceKey,
@@ -89,21 +89,15 @@ extension ApprovalExecution {
             replyRoute: replyRoute,
             envelope: TurnEnvelope(
                 surface: surface,
-                agent: Self.nonEmptyPayloadString(origin["agent"]),
+                agent: origin["agent"]?.trimmedString,
                 verifiedChatId: chatId,
                 verifiedUserId: verifiedUserId,
                 commandSignatureVerified: signedDecision,
                 deliveryRoute: replyRoute,
                 declaredRemote: origin["declaredRemote"] == .bool(true) ? true : nil,
-                answerExperienceID: Self.nonEmptyPayloadString(origin["answerExperienceID"])
+                answerExperienceID: origin["answerExperienceID"]?.trimmedString
             )
         )
-    }
-    private static func nonEmptyPayloadString(_ value: JSONValue?) -> String? {
-        guard case .string(let raw)? = value else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return trimmed
     }
     @discardableResult
     public func reconcileUnappliedChatToolApprovalExecutions(

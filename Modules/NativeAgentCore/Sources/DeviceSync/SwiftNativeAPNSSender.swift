@@ -127,16 +127,10 @@ public actor SwiftNativeAPNSSender {
         let pem = try String(contentsOf: URL(fileURLWithPath: keyPath), encoding: .utf8)
         let key = try P256.Signing.PrivateKey(pemRepresentation: pem)
         let signature = try key.signature(for: Data(signingInput.utf8)).rawRepresentation
-        return "\(signingInput).\(base64URL(signature))"
+        return "\(signingInput).\(signature.base64URLEncodedString())"
     }
     private static func base64URLJSON(_ obj: [String: Any]) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
-        return base64URL(data)
-    }
-    private static func base64URL(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        return data.base64URLEncodedString()
     }
 }

@@ -5,7 +5,6 @@ import CognitiveSubstrate
 import Foundation
 import StandingBots
 import Research
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine

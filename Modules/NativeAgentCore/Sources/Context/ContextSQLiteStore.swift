@@ -6,27 +6,12 @@ import PersistenceCore
 // Blueprint: | `ContextSQLiteStore.swift` | `ContextSQLiteStore`: derived generations; canonical sources remain truth |
 
 public struct ContextStoreHealthSnapshot: Sendable, Equatable {
-    public let databaseURL: URL
     public let activeGenerationID: Int64?
-    public let healthySources: Int
     public let degradedSources: Int
-    public let removedSources: Int
-    public let activeAtoms: Int
 
-    public init(
-        databaseURL: URL,
-        activeGenerationID: Int64?,
-        healthySources: Int,
-        degradedSources: Int,
-        removedSources: Int,
-        activeAtoms: Int
-    ) {
-        self.databaseURL = databaseURL
+    public init(activeGenerationID: Int64?, degradedSources: Int) {
         self.activeGenerationID = activeGenerationID
-        self.healthySources = healthySources
         self.degradedSources = degradedSources
-        self.removedSources = removedSources
-        self.activeAtoms = activeAtoms
     }
 }
 

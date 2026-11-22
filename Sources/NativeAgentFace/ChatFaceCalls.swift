@@ -43,9 +43,7 @@ extension AppModel {
             default: return nil
             }
         }, disconnect: {
-            for session in DetachedChatWindowController.shared.detachedSessionIDs {
-                DetachedChatWindowController.shared.close(sessionId: session)
-            }
+            DetachedChatWindowController.shared.closeAllKeepingPersisted()
         })
     }
 }

@@ -4,15 +4,10 @@ import PersistenceCore
 import Senses
 import TrustCenter
 import Darwin
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import Carbon
 import OSAKit
 import os
-#endif
 
 // Blueprint: | `MacFileAccess.swift` | `FileBytes`, `MacFileText`: Checked regular-file IO and lossless bounded text windows |
 
@@ -81,15 +76,11 @@ public final class FileBytes: Sendable {
     public func entry(at url: URL) -> CheckedRead<Void> {
         // Entry existence includes a dangling symlink: move/trash manipulate the link itself, so following it cannot verify the mutation.
         checkedRead {
-            #if canImport(Darwin)
             var metadata = stat()
             guard lstat(url.path, &metadata) == 0 else {
                 let code = errno
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
             }
-            #else
-            _ = try FileManager.default.attributesOfItem(atPath: url.path)
-            #endif
         }
     }
 

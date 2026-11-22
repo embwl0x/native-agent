@@ -173,7 +173,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             return receipt.recorded
         }) { return }
         let accountingOverflow: Bool
-        let measuredInput = usage?.logicalInputTokens(provider: provider)
+        let measuredInput = usage?.logicalInputTokens()
         let measuredOutput = usage?.outputTokens
         let usageComplete = measuredInput != nil && measuredOutput != nil
         if let spent = Self.spent {
@@ -284,7 +284,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                   let requestCharacters = request.requestCharacters,
                   let requestPlan = request.requestPlan,
                   let usage,
-                  let logicalInputTokens = usage.logicalInputTokens(provider: provider),
+                  let logicalInputTokens = usage.logicalInputTokens(),
                   let rawSessionID = call.session,
                   let sessionID = NativeAgentChatSessionID.normalizedPathComponent(rawSessionID) else {
                 return nil

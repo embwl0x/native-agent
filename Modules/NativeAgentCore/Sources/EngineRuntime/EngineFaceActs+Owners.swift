@@ -34,7 +34,7 @@ extension EngineFaceActs {
             PartFace.Value.object(["title": .string(value.title), "url": .string(value.url), "snippet": .string(value.snippet),
                 "source": value.source.map(PartFace.Value.string) ?? .null])
         }
-        return .result(.object(["results": .array(rows), "unresponsiveEngines": .array(result.unresponsiveEngines.map(PartFace.Value.string)),
+        return .result(.object(["results": .array(rows), "unresponsive_engines": .array(result.unresponsiveEngines.map(PartFace.Value.string)),
             "gaps": .array(result.gaps.map(PartFace.Value.string))]))
     }
 

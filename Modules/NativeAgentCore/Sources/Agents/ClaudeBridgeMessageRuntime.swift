@@ -207,7 +207,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         } else { requestIdentity = requestID }
         handleRetainedMessage(response: response, request: baseRequest, principal: principal, owner: owner,
             claudeReplyID: claudeReplyID, rawText: rawText, requestID: requestIdentity,
-            started: started, digest: AgentPeerReplayClaimStore.digest(body), ackMode: ackMode)
+            started: started, digest: SHA256Hex.of(body), ackMode: ackMode)
     }
 
     static func bridgeMessageSessionID(requested: String?, active: String?) -> String? {

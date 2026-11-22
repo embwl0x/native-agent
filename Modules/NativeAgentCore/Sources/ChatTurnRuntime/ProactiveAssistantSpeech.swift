@@ -123,7 +123,7 @@ extension SwiftNativeChatOrchestrationClient {
         content: String
     ) -> String {
         // FNV-1a keeps nonadversarial deduplication keys short and stable; it never grants trust.
-        let hash = fnv1a64(content.trimmingCharacters(in: .whitespacesAndNewlines))
+        let hash = StableHash.fnv1a64(content.trimmingCharacters(in: .whitespacesAndNewlines))
         return "\(scope.trimmingCharacters(in: .whitespacesAndNewlines))#\(String(hash, radix: 16))"
     }
 
@@ -190,22 +190,6 @@ extension SwiftNativeChatOrchestrationClient {
             // Failures retain the pending claim. Its next attempt must prove
             // commitment or clean absence before doing anything else.
             return .posted(sessionId: destination.sessionId, messageRunId: destination.runId)
-        }
-    }
-
-    /// A claim does not prove posting. Absence is conclusive only after the corresponding append has ended.
-    public static func proactiveSpeechCommitted(
-        dataRoot: URL, caller: ProactiveSpeechCaller, idempotencyScope: String, sessionId: String
-    ) async throws -> Bool {
-        let session = try resolveSessionId(sessionId)
-        let prefix = idempotencyScope.trimmingCharacters(in: .whitespacesAndNewlines) + "#"
-        return try await readProactiveSpeechCommitment(
-            dataRoot: dataRoot, sessionId: session
-        ) { object in
-            guard object["source"] == .string(caller.rawValue),
-                  case .object(let metadata)? = object["metadata"],
-                  case .string(let key)? = metadata["proactiveSpeechIdempotencyKey"] else { return false }
-            return key.hasPrefix(prefix)
         }
     }
 

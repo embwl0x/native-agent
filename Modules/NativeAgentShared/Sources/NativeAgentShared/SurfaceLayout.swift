@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` owns the document shape, vocabulary and seed; `SurfaceLayoutAvailability` carries its checked value or `SurfaceLayoutFailure` path/detail/repair across Mac and phone, and exposes shipped content names through their shipped profiles without supplying a substitute layout. `addMissing`, `shown`, `arranged` project validated layouts; `QuietToolPage` owns shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases and door resolution (`step`, `place`, home rooms), deriving accepted part face pages from those definitions and the ids a page of the agent's own may have (`ownPageRefusal`); `ownPage` reads a `page:<id>` block on the surfaces that take one (rail, more) |
+// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` owns the document shape, vocabulary and seed; `SurfaceLayoutAvailability` carries its checked value or `SurfaceLayoutFailure` path/detail/repair across Mac and phone, and exposes shipped content names through their shipped profiles without supplying a substitute layout. `addMissing`, `shown`, `arranged` project validated layouts; `QuietToolPage` owns shared page definitions and authored-page descriptions; `AppDoorNames` shares page/item aliases and door resolution (`step`, `place`, home rooms), deriving accepted part face pages from those definitions and the ids a page of the agent's own may have (`ownPageRefusal`); `ownPage` reads a `page:<id>` block on the surfaces that take one (rail, more) |
 
 public enum SurfaceLayoutAvailability: Codable, Sendable, Equatable {
     case available(SurfaceLayout)
@@ -170,6 +170,21 @@ public struct QuietToolPage: Sendable, Equatable {
         let key = AppDoorNames.resolve(raw)
         return all.first { $0.id == key }
     }
+
+    public static func descriptions(_ catalog: PartFaceCatalog, ids: Set<String>,
+                                    snapshot: (String) -> PartFaceSnapshot?) -> [QuietToolPage] {
+        catalog.claims.filter { ids.contains($0.key) }.sorted { $0.key < $1.key }.map { id, claim in
+            let title = snapshot(id)?.face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? id
+            let summary: String
+            if let failure = catalog.failure { summary = failure.message } else {
+                switch claim {
+                case .success(let part): summary = "A page of the agent's own, drawn by its part \(part) from that part's notebook."
+                case .failure(let failure): summary = failure.message
+                }
+            }
+            return QuietToolPage(id: id, title: title, summary: summary)
+        }
+    }
 }
 
 /// The door's read names. Layout block ids remain storage keys, never aliases on disk.
@@ -231,7 +246,10 @@ public enum AppDoorNames {
         let canonical = resolve(requested)
         let parts = canonical.split(separator: "/", maxSplits: 1).map(String.init)
         if !requested.isEmpty, let first = parts.first, requested != canonical || parts.count == 2 {
-            return (first, parts.count == 2 ? parts[1] : nil, canonical)
+            // The page name normalizes; the item keeps its own text, so page:"chat/ABC123" reads ABC123 as item:"ABC123" does.
+            let typedItem = requested.split(separator: "/", maxSplits: 1).dropFirst().first.map(String.init)
+            let item = parts.count == 2 ? (typedItem.flatMap { $0.lowercased() == parts[1].lowercased() ? $0 : nil } ?? parts[1]) : nil
+            return (first, item, canonical)
         }
         let named = item.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !action, named.isEmpty, homeItems.contains(canonical) || canonical == "app" else { return nil }

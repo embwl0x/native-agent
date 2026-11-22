@@ -58,7 +58,7 @@ The agent's one door, `app`, is always on. `app {}` reads home, where they left 
 ```mermaid
 flowchart TD
     S["Surface input"] --> T["Core turn runtime"]
-    H["Happening (Attention.post)"] -->|owed| MS["Mind stream thought or return"]
+    H["Happening (Attention intake)"] -->|owed| MS["Mind stream thought or return"]
     H -->|world and self, weighed| SUB
     SUB -->|drive at one| MS
     MS --> T
@@ -425,7 +425,9 @@ Dream/REM carry typed reports through background processing; cognition returns `
 with no scheduler timeout. `EngineDreams` constructs
 external responses after commit signals, care processing and practice admission.
 Replacement commits share PersistenceCore's durable byte writer; Dream/REM owners retain their encodings and commit order.
-Dream input selects complete exchanges paired by `ConversationHistory`; `oversized_conversation_input` preserves the watermark.
+Dream input selects complete exchanges paired by `ConversationHistory`. If the
+first exchange alone exceeds the budget, the dream reads as much of its ending
+as fits and advances the watermark through that exchange.
 Required surprise-read or assembly failure stops before generation and preserves the watermark.
 Each returned dream first saves one `dream_diary/work/<section UUID>.json` record before
 publication or the consumed cutoff commits. That record lists the exact diary publication,
@@ -551,7 +553,9 @@ They stays active while the Mac is on; fatigue and heat color presentation.
 window of the Desk day (`background_lease.json`) before substrate planning.
 A claimed window skips waking reflection. A dream's reflection proceeds to
 substrate planning even when acquisition fails, without consulting the claim
-read or its failures; the daily ceiling and single flight still bound it.
+read or its failures. Single-flight admission still applies. `reflectionAdmission`
+counts and caps only waking calls against a positive rolling 24-hour budget.
+A zero budget disables all reflection, including dream reflection.
 A dream that acquires a free slot keeps it, pacing waking reflection in that slot.
 Only a call that acquired the holder's newest unused claim releases it; spent
 windows remain claimed.

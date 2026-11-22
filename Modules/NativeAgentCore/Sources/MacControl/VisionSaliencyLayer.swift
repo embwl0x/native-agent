@@ -1,9 +1,7 @@
 import Foundation
 import CoreGraphics
-#if canImport(Vision)
 import Vision
 // Blueprint: | `VisionSaliencyLayer.swift` | `VisionSaliencyLayer`, `VisionKitSalienceProvider` |
-#endif
 
 // MARK: - ELEMENT LAYER (c): saliency
 // Saliency may improve target confidence but knows no semantic role; saliency-only candidates therefore remain low-confidence AXUnknown.
@@ -77,7 +75,6 @@ public enum VisionSaliencyLayer {
     }
 }
 
-#if canImport(Vision)
 public struct VisionKitSalienceProvider: Sendable {
     public init() {}
 
@@ -102,4 +99,3 @@ public struct VisionKitSalienceProvider: Sendable {
         }
     }
 }
-#endif

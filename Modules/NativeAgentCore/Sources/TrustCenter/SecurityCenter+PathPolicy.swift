@@ -17,7 +17,7 @@ extension SwiftNativeSecurityCenter {
         let operation = ToolNameAliases.canonical(binding?.tool ?? tool)
         let pathInput = input
         if ["write_file", "copy_file", "move_file", "trash_file"].contains(operation) {
-            let arguments = binding?.arguments(object(input["args"])) ?? input
+            let arguments = binding?.arguments(JSONValue.objectOrEmpty(input["args"])) ?? input
             let keys = ["copy_file", "move_file"].contains(operation) ? ["path", "destination"] : ["path"]
             for key in keys {
                 guard case .string(let raw)? = arguments[key], !raw.isEmpty else {

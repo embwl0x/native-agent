@@ -28,8 +28,7 @@ public struct AgentConversationRecord: Codable, Sendable, Equatable {
     public var sendEvidence: [String: JSONValue] { Self.sendEvidence(receipt) }
 
     public static func sendEvidence(_ receipt: JSONValue?) -> [String: JSONValue] {
-        guard case .object(let root)? = receipt else { return [:] }
-        return root
+        JSONValue.objectOrEmpty(receipt)
     }
 
     public var sendFailed: Bool { Self.failedSend(sendEvidence) }
@@ -108,15 +107,6 @@ public struct AgentConversationRecord: Codable, Sendable, Equatable {
     public var shownInline: String?
     /// A built-in delegate's stall or bad outcome on the current send, held until the continuation tells the agent in this chat (once per event).
     public var notice: AgentConversationNotice?
-    /// Reply attribution comes from the answering turn's stamp or the exact transport that supplied its receipt.
-    public var cachedReplyStamp: TranscriptRowStamp {
-        guard case .object(let receipt)? = receipt, case .string(let from)? = receipt["reply_from"] else { return .init(source: agent, steeredBy: [],
-            contact: true) }
-        let steering: [String] = if case .array(let values)? = receipt["reply_steered_by"] {
-            values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
-        } else { [] }
-        return .init(source: from, steeredBy: steering, contact: true)
-    }
 
     package init(id: String,
                  scopeSessionID: String,
@@ -334,7 +324,7 @@ extension ContactThread {
         let paths = plan.map(\.1) + [ContactReplyReads.url(dataRoot)]
         let stamp = paths.map { fileStamp($0.path) }
         if !stamp.contains(nil), let hit = cache.withLock({ $0[key] }), hit.paths == paths, hit.stamp == stamp { return hit.lines }
-        let fetched = try ContactReplyReads.read(dataRoot)
+        let fetched = try ContactReplyReads.read(dataRoot).filter { $0.final == true }
         var rows: [Line] = []
         for (session, file) in plan {
             let text = try read(file, tailBytes: tailBytes)

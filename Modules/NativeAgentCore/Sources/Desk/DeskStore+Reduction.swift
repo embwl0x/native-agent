@@ -11,13 +11,24 @@ extension SwiftNativeDeskStore {
         var createOrder: [String] = []
         var archived: Set<String> = []
         var accounting = base?.state ?? DeskState(items: [], generatedTs: "")
+        seedCompaction(base, byHandle: &byHandle, createOrder: &createOrder)
+        applyCompactionTail(ops, byHandle: &byHandle, createOrder: &createOrder, archived: &archived, accounting: &accounting)
+        return retainCompactedState(base: base, ops: ops, byHandle: byHandle, createOrder: createOrder, archived: archived, accounting: &accounting)
+    }
+
+    /// Seed item lookup and creation order from the retained base.
+    private static func seedCompaction(_ base: DeskCompactionBase?, byHandle: inout [String: DeskItem], createOrder: inout [String]) {
         if let base {
             for item in base.state.items {
                 byHandle[item.handle] = item
                 createOrder.append(item.handle)
             }
         }
+    }
 
+    /// Apply the journal tail in order.
+    private static func applyCompactionTail(_ ops: [DeskOp], byHandle: inout [String: DeskItem], createOrder: inout [String],
+        archived: inout Set<String>, accounting: inout DeskState) {
         for op in ops {
             switch op.body {
             case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit, findingKey):
@@ -73,9 +84,10 @@ extension SwiftNativeDeskStore {
                 Self.appendRefCapped(&item, ref)
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
-            case let .appendNote(text, author, releaseCondition):
+            case let .appendNote(text, author, releaseCondition, carriedOccurrence):
                 guard var item = byHandle[op.handle] else { continue }
-                let note = DeskNote(ts: op.ts, text: text, author: author, releaseCondition: releaseCondition)
+                let note = DeskNote(ts: op.ts, text: text, author: author, releaseCondition: releaseCondition,
+                                    carriedOccurrence: carriedOccurrence)
                 Self.appendNoteCapped(&item, note)
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
@@ -117,41 +129,10 @@ extension SwiftNativeDeskStore {
             case .archiveItem:
                 archived.insert(op.handle)
             case let .reserveWorkAttempt(attemptId, lane, day, slot):
-                guard var item = byHandle[op.handle] else { continue }
-                if lane == .pursuit, item.pursuit == nil { continue }
-                if !accounting.hasWorkSlot(handle: op.handle, id: attemptId),
-                   !item.workAttempts.contains(where: { $0.attemptId == attemptId }) {
-                    item.workAttempts.append(DeskWorkAttempt(
-                        attemptId: attemptId,
-                        lane: lane,
-                        day: day,
-                        slot: slot,
-                        reservedAt: op.ts
-                    ))
-                    accounting.chargeWorkSlot(handle: op.handle, day: day, id: attemptId)
-                }
-                item.updatedAt = op.ts
-                byHandle[op.handle] = item
+                reserveCompactedAttempt(op, attemptId: attemptId, lane: lane, day: day, slot: slot, byHandle: &byHandle, accounting: &accounting)
             case let .completeWorkAttempt(attemptId, receipt, disposition, artifactRefs):
-                guard var item = byHandle[op.handle],
-                      let index = item.workAttempts.firstIndex(where: { $0.attemptId == attemptId }) else { continue }
-                item.workAttempts[index].receipt = receipt
-                item.workAttempts[index].completedAt = op.ts
-                item.workAttempts[index].disposition = disposition
-                item.workAttempts[index].artifactRefs = Array(artifactRefs.prefix(16))
-                if disposition == .unstarted {
-                    accounting.releaseWorkSlot(handle: op.handle, day: item.workAttempts[index].day, id: attemptId)
-                }
-                Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
-                if var pursuit = item.pursuit, item.workAttempts[index].lane == .pursuit {
-                    if disposition != .unstarted { pursuit.lastWorkedAt = op.ts }
-                    item.pursuit = pursuit
-                } else if disposition != .unstarted {
-                    item.cadence.lastRefreshAt = op.ts
-                    item.cadence.nextRefreshAt = Self.nextCadenceRefresh(after: op.ts, cadence: item.cadence)
-                }
-                item.updatedAt = op.ts
-                byHandle[op.handle] = item
+                completeCompactedAttempt(op, attemptId: attemptId, receipt: receipt, disposition: disposition, artifactRefs: artifactRefs,
+                    byHandle: &byHandle, accounting: &accounting)
             case let .handOffWorkReceipt(reservationId):
                 guard var item = byHandle[op.handle] else { continue }
                 if let index = item.workAttempts.firstIndex(where: { $0.attemptId == reservationId }),
@@ -183,7 +164,55 @@ extension SwiftNativeDeskStore {
                 byHandle[op.handle] = item
             }
         }
+    }
 
+    /// Add a work reservation and charge its slot when it has not already been recorded.
+    private static func reserveCompactedAttempt(_ op: DeskOp, attemptId: String, lane: DeskWorkAttempt.Lane, day: String, slot: String,
+        byHandle: inout [String: DeskItem], accounting: inout DeskState) {
+        guard var item = byHandle[op.handle] else { return }
+        if lane == .pursuit, item.pursuit == nil { return }
+        if !accounting.hasWorkSlot(handle: op.handle, id: attemptId),
+           !item.workAttempts.contains(where: { $0.attemptId == attemptId }) {
+            item.workAttempts.append(DeskWorkAttempt(
+                attemptId: attemptId,
+                lane: lane,
+                day: day,
+                slot: slot,
+                reservedAt: op.ts
+            ))
+            accounting.chargeWorkSlot(handle: op.handle, day: day, id: attemptId)
+        }
+        item.updatedAt = op.ts
+        byHandle[op.handle] = item
+    }
+
+    /// Settle a recorded attempt and advance the owning work schedule.
+    private static func completeCompactedAttempt(_ op: DeskOp, attemptId: String, receipt: String, disposition: DeskWorkDisposition?,
+        artifactRefs: [String], byHandle: inout [String: DeskItem], accounting: inout DeskState) {
+        guard var item = byHandle[op.handle],
+              let index = item.workAttempts.firstIndex(where: { $0.attemptId == attemptId }) else { return }
+        item.workAttempts[index].receipt = receipt
+        item.workAttempts[index].completedAt = op.ts
+        item.workAttempts[index].disposition = disposition
+        item.workAttempts[index].artifactRefs = Array(artifactRefs.prefix(16))
+        if disposition == .unstarted {
+            accounting.releaseWorkSlot(handle: op.handle, day: item.workAttempts[index].day, id: attemptId)
+        }
+        Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
+        if var pursuit = item.pursuit, item.workAttempts[index].lane == .pursuit {
+            if disposition != .unstarted { pursuit.lastWorkedAt = op.ts }
+            item.pursuit = pursuit
+        } else if disposition != .unstarted {
+            item.cadence.lastRefreshAt = op.ts
+            item.cadence.nextRefreshAt = Self.nextCadenceRefresh(after: op.ts, cadence: item.cadence)
+        }
+        item.updatedAt = op.ts
+        byHandle[op.handle] = item
+    }
+
+    /// Retain live items and prune historical work accounting at the committed revision.
+    private static func retainCompactedState(base: DeskCompactionBase?, ops: [DeskOp], byHandle: [String: DeskItem],
+        createOrder: [String], archived: Set<String>, accounting: inout DeskState) -> DeskState {
         // Revision and retention share the committed feed clock, never wall time.
         let revision = [ops.last?.ts, base?.state.generatedTs].compactMap { $0 }.max() ?? ""
         let currentDay = DeskClock.parseISO(revision).map(DeskClock.dayStamp)

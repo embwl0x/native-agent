@@ -22,7 +22,7 @@ underlying Trust checks still apply.
 | Paired iOS transport | Signed requests checked by `MacSyncEngine` before dispatch; pairing material owned by `PairingSecret` |
 | APNS | HTTP 2xx means provider acceptance, not proof of user display; `MobileNotificationDeliveryReceipt.swift` reports display as unverified |
 | Peer-steered turns | **Just this** admits one call; **For this task** elevates its peers for the run; [Trust](ONE_DOOR.md#authority-and-receipts) applies |
-| Contacts at the table | A contact reads the Desk and the pieces laid on it through MCP `agent_desk` with its own key, only while the person's per-contact lever (`readsDesk`) is on; it writes nothing, reaches only pieces laid on open board items (each document's words bounded at 2 MB), the lever is rechecked before any words go back, and the contact's last read is kept on its own record, shown on Connectors and in the agent's line for it |
+| Contacts at the table | A saved contact with a table door reads the standing table through MCP `agent_desk` with its own key; the rest of the Desk and the pieces laid on it need the person's per-contact lever (`readsDesk`) or Trust (`atTable`). Only a trusted contact writes, and only on the standing table (`put`, `cross`, `remove`, signed with its own identity, editing only its own elements). Reads reach only pieces laid on open board items (each document's words bounded at 2 MB), the lever is rechecked before any words go back, and the contact's last read or write is kept on its own record, shown on Connectors and in the agent's line for it |
 | Model input from web, tools or peers | Content is input, not operator authority |
 
 Loopback is a network boundary, not privilege separation from another process

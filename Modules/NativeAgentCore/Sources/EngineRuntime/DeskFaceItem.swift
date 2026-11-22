@@ -19,7 +19,7 @@ extension NativeAgentEngine {
                 return .object(["kind": .string("execution"), "id": .string(id), "found": .bool(false),
                                 "unavailable": faceText(snapshot.agentJobs.unavailableReason)])
             }
-            let row = WorkOverviewRead.row(for: job, now: now)
+            let row = WorkOverviewRead.row(for: job)
             return .object(["kind": .string("execution"), "id": .string(id), "found": .bool(true), "title": .string(row.title),
                             "text": .string(WorkOverviewRead.text(for: job)), "asking": faceText(job.request?.title),
                             "state": .string(row.stateLabel(at: now)), "at": .string(row.updatedAt)])

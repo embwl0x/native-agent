@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -53,11 +52,7 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
     public static func parse(_ raw: Any?, shown: [CognitiveCareLine]) -> (judgments: [CognitiveCareJudgment], faults: [String])? {
         guard let items = raw as? [Any] else { return nil }
         let ids = Dictionary(shown.map { ($0.key.lowercased(), $0.id) }, uniquingKeysWith: { first, _ in first })
-        func text(_ value: Any?) -> String? {
-            guard let value = value as? String else { return nil }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
+        func text(_ value: Any?) -> String? { (value as? String).trimmedNonEmpty }
         func optionalText(_ value: Any?) -> String?? {
             if value == nil || value is NSNull { return .some(nil) }
             guard value is String else { return nil }
@@ -404,12 +399,7 @@ extension CognitiveSubstrate {
 
     /// A new care's identity for a lived moment: derived from (moment, ordinal), so a refold finds the care its first fold created.
     static func momentCareID(_ momentID: String, ordinal: Int) -> UUID {
-        let digest = Array(SHA256.hash(data: Data("\(momentID)|care|\(ordinal)".utf8)))
-        var bytes = Array(digest.prefix(16))
-        bytes[6] = (bytes[6] & 0x0F) | 0x50
-        bytes[8] = (bytes[8] & 0x3F) | 0x80
-        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+        StableHash.sha256UUID(utf8: "\(momentID)|care|\(ordinal)")
     }
 
     /// Read each care watermark once before applying all judgments, then stamp after the last one; pre-Clear generations apply nothing.
@@ -444,6 +434,24 @@ extension CognitiveSubstrate {
         }
         var provenance = provenance
         provenance.speaker = CognitiveCareProvenance.personKey(provenance.speaker, aliases: carePersonAliases)
+        guard let birth = try await prepareCareBirths(judgments, provenance: provenance, generation: generation,
+            momentID: momentID, reflectionReceipt: reflectionReceipt) else { return [] }
+        if let receipt = reflectionReceipt {
+            guard receipt.integrationEpoch == mindEpoch,
+                  reflectionReceipts[receipt.id]?.careIntegrationPending == true else { throw CognitiveWriteDiscarded() }
+        }
+        let changes = try applyPreparedCareJudgments(judgments, provenance: provenance, seq: seq, momentID: momentID,
+            joinReflectionTakeaway: joinReflectionTakeaway, birth: birth)
+        return try await persistCareJudgments(changes, provenance: provenance, generation: generation,
+            seq: seq, reflectionReceipt: reflectionReceipt)
+    }
+
+    private typealias CareBirthVectors = (queries: [String: [Float]], inventory: [UUID: [Float]], epoch: String?)
+    private typealias CareJudgmentChanges = (touched: [UUID], relived: [UUID], created: Int, refused: Int)
+
+    private func prepareCareBirths(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
+                                   generation: UInt64, momentID: String?, reflectionReceipt: CognitiveReflectionReceipt?) async throws
+        -> CareBirthVectors? {
         // Resolve birth words once, before any mutation. A cold embedder leaves the whole appraisal owed, never half-applied. No suspension splits the moment's
         // in-memory care applications.
         let birthTexts = judgments.enumerated().flatMap { ordinal, judgment -> [String] in
@@ -467,7 +475,7 @@ extension CognitiveSubstrate {
                 await waitForMaintenanceTransition()
                 guard configuration.enabled, generation == caringAppraisalGeneration else {
                     if reflectionReceipt != nil { throw CognitiveWriteDiscarded() }
-                    return []
+                    return nil
                 }
                 // Another moment may have moved the agent while embedding suspended. Match the inventory the agent actually holds when this one applies.
                 guard inventory == cares.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) else {
@@ -482,10 +490,14 @@ extension CognitiveSubstrate {
                 break
             }
         }
-        if let receipt = reflectionReceipt {
-            guard receipt.integrationEpoch == mindEpoch,
-                  reflectionReceipts[receipt.id]?.careIntegrationPending == true else { throw CognitiveWriteDiscarded() }
-        }
+        return (birthQueries, birthInventory, birthEpoch)
+    }
+
+    private func applyPreparedCareJudgments(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
+                                            seq: UInt64?, momentID: String?, joinReflectionTakeaway: Bool,
+                                            birth: CareBirthVectors) throws -> CareJudgmentChanges {
+        let (birthQueries, inventory, birthEpoch) = birth
+        var birthInventory = inventory
         var touched: [UUID] = []
         var created = 0
         var refused = 0
@@ -591,6 +603,12 @@ extension CognitiveSubstrate {
             if !touched.contains(care.id) { touched.append(care.id) }
         }
         cares = workingCares
+        return (touched, relived, created, refused)
+    }
+
+    private func persistCareJudgments(_ changes: CareJudgmentChanges, provenance: CognitiveCareProvenance,
+                                      generation: UInt64, seq: UInt64?, reflectionReceipt: CognitiveReflectionReceipt?) async throws -> [UUID] {
+        let (touched, relived, created, refused) = changes
         let now = dependencies.now()
         let payload: JSONValue = .object([
             "cares": .array(touched.map { .string($0.uuidString) }),

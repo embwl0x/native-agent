@@ -8,7 +8,7 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import ChatSessionWork
 import ToolExecution
-// Blueprint: | `AppModel+ChatActions.swift` | Chat mutations, regeneration and turn admission through `MacChatTurnCommands`. |
+// Blueprint: | `AppModel+ChatActions.swift` | Chat mutations, regeneration and turn admission through `MacChatTurnRuntime`. |
 
 struct AppMutationResult: Equatable, Sendable {
     let succeeded: Bool

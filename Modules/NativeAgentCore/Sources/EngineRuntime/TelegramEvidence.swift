@@ -224,12 +224,12 @@ public struct TelegramErrorEvent: Identifiable, Codable, Hashable, Sendable {
 extension TelegramPresentationSnapshot {
     func toolStatusEnvelope(now: Date) -> JSONValue {
         let status = self
-        let lastSuccessfulPoll = telegramDiagnosticDate(status.lastPollAt)
+        let lastSuccessfulPoll = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(status.lastPollAt)
         let datedErrors = status.errors.compactMap { event in
-            telegramDiagnosticDate(event.at).map { (event.at, $0) }
+            NativeTimestampFormat.parseOptionalISO8601FractionalFirst(event.at).map { (event.at, $0) }
         }
         let datedBlocked = status.blocked.compactMap { event in
-            telegramDiagnosticDate(event.at).map { (event.at, $0) }
+            NativeTimestampFormat.parseOptionalISO8601FractionalFirst(event.at).map { (event.at, $0) }
         }
         let errorsAfterLastSuccessfulPoll = lastSuccessfulPoll.map { pollAt in
             datedErrors.filter { $0.1 > pollAt }.count
@@ -315,10 +315,5 @@ extension TelegramPresentationSnapshot {
             ])
         }
         return .object(object)
-    }
-
-    private func telegramDiagnosticDate(_ raw: String?) -> Date? {
-        guard let raw else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 }

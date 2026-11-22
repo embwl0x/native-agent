@@ -196,13 +196,4 @@ extension SwiftNativeApprovalInbox {
         case .array, .object: return ""
         }
     }
-    /// Authority accepts only literal JSON Booleans; undeclared values remain fail-closed.
-    nonisolated static func strictBool(_ value: JSONValue?) -> Bool? {
-        guard case .bool(let b)? = value else { return nil }
-        return b
-    }
-    /// Match the shared ISO-8601 shape: fractional seconds and a +00:00 offset.
-    nonisolated static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalUTCOffset(date)
-    }
 }

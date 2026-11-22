@@ -69,15 +69,15 @@ public enum QuietChatSessionCommands {
         case .failure(let refusal): return refusal.json
         case .success(let found?): session = found
         case .success(nil):
-            if verb == "new" { return await newChat(title: text(input["title"]), appModel: appModel) }
+            if verb == "new" { return await newChat(title: JSONValue.trimmedStringOrEmpty(input["title"]), appModel: appModel) }
             if verb == "list" { return await list(input, appModel: appModel) }
-            return stopOthers(calling: text(input["__session_id"]), reachesUser: reachesUser, appModel: appModel, scope: scope)
+            return stopOthers(calling: JSONValue.trimmedStringOrEmpty(input["__session_id"]), reachesUser: reachesUser, appModel: appModel, scope: scope)
         }
         switch verb {
         case "show":
             return failure("window_presentation_required", "This command needs the window's checked presentation owner.", session)
         case "rename":
-            let title = text(input["title"])
+            let title = JSONValue.trimmedStringOrEmpty(input["title"])
             guard !title.isEmpty else { return failure("missing_title", "Pass the new name in title.", session) }
             await appModel.renameChatSession(id: session.id, title: title)
             let now = appModel.chatCommandTranscripts.sessions.first { $0.id == session.id }
@@ -153,11 +153,11 @@ public enum QuietChatSessionCommands {
         verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host, turn: Turn,
         scope: QuietChatSessionScope? = nil
     ) -> Result<ChatSessionRef?, Refusal> {
-        if ["new", "list"].contains(verb) || (verb == "stop" && text(input["session_id"]).lowercased() == "others") {
+        if ["new", "list"].contains(verb) || (verb == "stop" && JSONValue.trimmedStringOrEmpty(input["session_id"]).lowercased() == "others") {
             return .success(nil)
         }
         let session: ChatSessionRef
-        switch resolve(text(input["session_id"]), appModel: appModel, turn: turn, scope: scope) {
+        switch resolve(JSONValue.trimmedStringOrEmpty(input["session_id"]), appModel: appModel, turn: turn, scope: scope) {
         case .success(let found): session = found
         case .failure(let refusal): return .failure(refusal)
         }
@@ -183,7 +183,7 @@ public enum QuietChatSessionCommands {
             )))
             }
         }
-        guard session.id == text(input["__session_id"]) else { return .success(session) }
+        guard session.id == JSONValue.trimmedStringOrEmpty(input["__session_id"]) else { return .success(session) }
         if ["stop", "archive", "regenerate", "clear"].contains(verb) {
             return .failure(Refusal(json: ownTurn(verb, session)))
         }
@@ -385,8 +385,4 @@ public enum QuietChatSessionCommands {
         )
     }
 
-    private static func text(_ value: JSONValue?) -> String {
-        guard case .string(let raw)? = value else { return "" }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }

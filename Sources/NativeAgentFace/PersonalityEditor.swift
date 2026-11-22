@@ -67,7 +67,7 @@ struct PersonalityEditor: View {
     private var starterPanel: some View {
         FaceView(face: PartFace(title: "Create the agent", line: "Everything here can grow and change later.", sections: [
             .init(id: "persona.starter", rows: [], block: starterBlock)
-        ]), door: ClosureFaceDoor(open: { _ in }, waitingOn: "the identity owner", perform: createStarter), session: session)
+        ]), door: ClosureFaceDoor(open: { _ in }, waitingOn: "the save", perform: createStarter), session: session)
     }
     private func createStarter(_ input: FaceActSubmission) async -> FaceActOutcome {
         var committed: [FaceCommittedField] = []
@@ -210,7 +210,7 @@ struct PersonalityEditor: View {
     }
 
     private var identityDoor: ClosureFaceDoor {
-        ClosureFaceDoor(open: { _ in }, waitingOn: "the identity owner") { submission in
+        ClosureFaceDoor(open: { _ in }, waitingOn: "the save") { submission in
             do {
                 if submission.checking { return await readFormOutcome(submission) }
                 switch submission.expectedCall.action {

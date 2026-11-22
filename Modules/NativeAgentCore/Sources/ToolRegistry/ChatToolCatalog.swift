@@ -48,35 +48,15 @@ public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     public var tools: [ChatCatalogTool]
     /// Always-on schemas must also exist in this catalog.
     public var alwaysOnTools: Set<String>
-    public var builderAvailable: [String]
     public var builderPolicyLocked: [String]
-    public var macAppAvailable: [String]
     public var macAppPolicyLocked: [String]
     public var fullMacActive: Bool
     public var fileOpsAllowed: Bool
     public var systemAllowed: Bool
-    public var appControlAllowed: Bool
-    public var builderModeDetail: String
     public var permissionLevel: String
 
     public init?(envelope value: JSONValue) {
         guard case .object(let obj) = value else { return nil }
-
-        func stringArray(_ key: String) -> [String] {
-            guard case .array(let arr)? = obj[key] else { return [] }
-            return arr.compactMap { v in
-                if case .string(let s) = v { return s }
-                return nil
-            }
-        }
-        func boolVal(_ key: String) -> Bool {
-            if case .bool(let b)? = obj[key] { return b }
-            return false
-        }
-        func stringVal(_ key: String) -> String {
-            if case .string(let s)? = obj[key] { return s }
-            return ""
-        }
 
         var tools: [ChatCatalogTool] = []
         if case .array(let rows)? = obj["tools"] {
@@ -135,16 +115,12 @@ public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
         }
 
         self.tools = tools
-        self.alwaysOnTools = Set(stringArray("always_on_tools"))
-        self.builderAvailable = stringArray("builder_available_tools")
-        self.builderPolicyLocked = stringArray("builder_policy_locked_tools")
-        self.macAppAvailable = stringArray("mac_app_available_tools")
-        self.macAppPolicyLocked = stringArray("mac_app_policy_locked_tools")
-        self.fullMacActive = boolVal("full_mac_active")
-        self.fileOpsAllowed = boolVal("file_ops_allowed")
-        self.systemAllowed = boolVal("system_allowed")
-        self.appControlAllowed = boolVal("app_control_allowed")
-        self.builderModeDetail = stringVal("builder_mode_detail")
-        self.permissionLevel = stringVal("permission_level")
+        self.alwaysOnTools = Set(JSONValue.stringArray(obj["always_on_tools"]))
+        self.builderPolicyLocked = JSONValue.stringArray(obj["builder_policy_locked_tools"])
+        self.macAppPolicyLocked = JSONValue.stringArray(obj["mac_app_policy_locked_tools"])
+        self.fullMacActive = JSONValue.boolOrFalse(obj["full_mac_active"])
+        self.fileOpsAllowed = JSONValue.boolOrFalse(obj["file_ops_allowed"])
+        self.systemAllowed = JSONValue.boolOrFalse(obj["system_allowed"])
+        self.permissionLevel = JSONValue.stringOrEmpty(obj["permission_level"])
     }
 }

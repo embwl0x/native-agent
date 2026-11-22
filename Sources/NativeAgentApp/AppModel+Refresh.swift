@@ -55,7 +55,6 @@ extension AppModel {
         for failure in await engine.trust.refreshCapabilityCatalog() { recordRefreshFailure(failure.label, error: failure.error) }
         _ = await decodeLogged("getApprovals") { try await engine.approvals.list() }
         _ = await decodeLogged("getInboxItems") { try await engine.inbox.list() }
-        await engine.turns.refreshCapabilityTraces()
         await engine.memory.loadGraph()
         for failure in await engine.tools.refreshNativePower() { recordRefreshFailure(failure.label, error: failure.error) }
         for failure in await engine.memory.refreshStatuses() { recordRefreshFailure(failure.label, error: failure.error) }

@@ -69,7 +69,6 @@ struct ChatComposerInput: View {
 /// Character changes and slash filtering stay in the field's subtree.
 private struct ChatComposerField: View {
     let input: ChatComposerInput
-    @Environment(AppModel.self) private var appModel
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Binding var focusWordToken: Int
     @State private var showSlashMenu = false

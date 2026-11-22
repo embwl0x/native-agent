@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import SlackBot
-// Blueprint: | `ConnectorOAuthRegistry.swift` | Registry owner: `mutateConnectorRegistryEntry`, `removeConnectorRegistryEntries` |
+// Blueprint: | `ConnectorOAuthRegistry.swift` | Registry owner: `mutateConnectorRegistryEntry` |
 
 extension ConnectorOAuthRegistry {
     public static func mutateConnectorRegistryEntry(
@@ -35,17 +35,6 @@ extension ConnectorOAuthRegistry {
             let updated = JSONValue.array(try checkedConnectorRows(from: .array(rows.map(JSONValue.object))).map(JSONValue.object))
             try await publish(updated) { try writeRegistry(updated, at: path) }
             return entry
-        }
-    }
-
-    public static func removeConnectorRegistryEntries(root: URL, ids: Set<String>) async throws {
-        let path = connectorRegistryPath(root: root)
-        try await SwiftNativePersistenceCore.withFileLock(path) {
-            try SlackCredentials.recoverPendingSave(dataRoot: root)
-            let rows = try readRegistry(at: path)
-            let kept = rows.filter { !ids.contains(normalizedConnectorID(connectorString($0["id"]) ?? "")) }
-            guard kept.count != rows.count else { return }
-            try writeRegistry(.array(kept.map(JSONValue.object)), at: path)
         }
     }
 }

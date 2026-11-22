@@ -233,7 +233,7 @@ user's end, never at ours.
   against one fewer step for a person, take the bigger file.
 - Fresh-install defaults belong to their permission stores: Mac Integration
   reads start on where supported; writes start off except notifications and
-  scheduler. OpenAI TTS, activity recording and their hour are opt-in. Settings
+  scheduler. OpenAI TTS and activity recording are opt-in; their hour defaults on, held back only by onboarding and the Subconscious master. Settings
   explain the cause and offer one recovery action.
 - Canonical: 0.4.7 split the model out of the DMG to shrink it after a slow
   download that turned out to be a router, not the artifact. It added a

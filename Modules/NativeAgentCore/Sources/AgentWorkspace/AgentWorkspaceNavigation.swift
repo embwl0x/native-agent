@@ -64,7 +64,7 @@ package actor AgentWorkspaceNavigation {
         sessions[dataRoot.standardizedFileURL.path + "\u{0}" + scope]?.lastDoorPage
     }
 
-    package func rememberDoorPage(workspace: WorkspaceOperation, _ page: String?, dataRoot: URL, scope: String) throws {
+    package func rememberDoorPage(_ page: String?, dataRoot: URL, scope: String) throws {
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
         var session = try session(key: key)
         session.lastDoorPage = page
@@ -72,7 +72,7 @@ package actor AgentWorkspaceNavigation {
         sessions[key] = session
     }
 
-    package func rememberUndo(workspace: WorkspaceOperation, _ receipt: JSONValue, dataRoot: URL, scope: String) throws {
+    package func rememberUndo(_ receipt: JSONValue, dataRoot: URL, scope: String) throws {
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
         var session = try session(key: key)
         session.lastUndoReceipt = receipt

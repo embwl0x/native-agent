@@ -2,21 +2,16 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 import TrustCenter
 import CoreGraphics
 import UserNotifications
 import Senses
 import Experiences
-import CryptoKit
 import os
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacAXValues.swift` | AX identity, geometry and queries preserve gaps and bounded failure evidence |
 public struct MacAXFrame: Sendable, Hashable {
     public let x: Double
@@ -172,7 +167,6 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
     public let attributeGaps: [String]
     /// The document AX names for this window when it was read (AXDocument, else AXFilename), or nil where AX gives none or the read had a gap.
     package var document: String? = nil
-    #if canImport(ApplicationServices) && os(macOS)
     package var nativeWindow: MacAXNativeWindowIdentity?
     package func retaining(_ window: AXUIElement) -> Self {
         var identity = self
@@ -185,10 +179,8 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         var role: CFTypeRef?
         return MacAXExecutionLane.sync { AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) } == .invalidUIElement
     }
-    #endif
     /// Keep the read window itself and the document it shows, so a later step can tell this exact window from any other.
     func retainingWindow(_ ref: MacAXElementRef, in source: any MacAXElementSource, context: MacOperationContext) -> Self {
-        #if canImport(ApplicationServices) && os(macOS)
         if let source = source as? SystemMacAXElementSource, let window = source.element(ref) {
             var identity = retaining(window)
             // An optional attribute: a gap leaves the document unrecorded and never fails the enclosing read.
@@ -200,7 +192,6 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
             }
             return identity
         }
-        #endif
         return self
     }
     public init(
@@ -259,14 +250,12 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         _ identity: MacAXWindowIdentity,
         among candidates: [(handle: Handle, identity: MacAXWindowIdentity)]
     ) -> Match<Handle> {
-        #if canImport(ApplicationServices) && os(macOS)
         if let native = identity.nativeWindow {
             guard let candidate = candidates.first(where: {
                 $0.identity.pid == identity.pid && $0.identity.nativeWindow == native
             }) else { return .gone }
             return .matched(candidate.handle, reason: "captured_native_window")
         }
-        #endif
         var scored: [(handle: Handle, score: Int)] = []
         for candidate in candidates {
             guard let score = identity.score(against: candidate.identity) else { continue }
@@ -309,13 +298,11 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         return .object(object)
     }
 }
-#if canImport(ApplicationServices) && os(macOS)
 /// AXUIElement references are immutable CF identities, shared for comparison.
 package struct MacAXNativeWindowIdentity: @unchecked Sendable, Equatable {
     let element: AXUIElement
     package static func == (lhs: Self, rhs: Self) -> Bool { CFEqual(lhs.element, rhs.element) }
 }
-#endif
 /// Window identity must survive read-source handles.
 public struct MacAXWindowHandle: Sendable {
     public let ref: MacAXElementRef
@@ -332,21 +319,17 @@ public struct MacAXLimits: Sendable, Equatable {
     public static let hardMaxNodes = 400
     public static let hardMaxDepth = 12
     public static let hardValueChars = 200
-    public static let hardMaxMatches = 20
     public private(set) var maxNodes: Int
     public private(set) var maxDepth: Int
     public let valueChars: Int
-    public let maxMatches: Int
     public init(
         maxNodes: Int = MacAXLimits.hardMaxNodes,
         maxDepth: Int = MacAXLimits.hardMaxDepth,
-        valueChars: Int = MacAXLimits.hardValueChars,
-        maxMatches: Int = MacAXLimits.hardMaxMatches
+        valueChars: Int = MacAXLimits.hardValueChars
     ) {
         self.maxNodes = max(1, min(maxNodes, MacAXLimits.hardMaxNodes))
         self.maxDepth = max(1, min(maxDepth, MacAXLimits.hardMaxDepth))
         self.valueChars = max(1, min(valueChars, MacAXLimits.hardValueChars))
-        self.maxMatches = max(1, min(maxMatches, MacAXLimits.hardMaxMatches))
     }
     /// Web controls can sit beyond ordinary depth/node caps; only a size-cut page walk earns this deeper bounded budget.
     public static let deepPageMaxNodes = 1_200
@@ -416,30 +399,6 @@ public struct MacAXTreeSnapshot: Sendable, Equatable {
         self.truncationReasons = truncationReasons
         self.skippedAtLeast = skippedAtLeast
         self.readFailures = readFailures
-    }
-}
-public struct MacAXQuery: Sendable, Equatable {
-    public let role: String?
-    public let title: String?
-    public let value: String?
-    public init(role: String? = nil, title: String? = nil, value: String? = nil) {
-        func clean(_ s: String?) -> String? {
-            guard let s else { return nil }
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return t.isEmpty ? nil : t
-        }
-        self.role = clean(role)
-        self.title = clean(title)
-        self.value = clean(value)
-    }
-    public var isEmpty: Bool { role == nil && title == nil && value == nil }
-}
-public struct MacAXMatch: Sendable, Equatable {
-    public let node: MacAXNode
-    public let score: Double
-    public init(node: MacAXNode, score: Double) {
-        self.node = node
-        self.score = score
     }
 }
 /// Element IDs are opaque; only their source may interpret them.

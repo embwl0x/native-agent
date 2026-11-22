@@ -71,9 +71,6 @@ extension TelegramPollLoop {
             face: face,
             destination: destination,
             turnId: turnId,
-            sendCard: Self.defaultSendMessageWithReplyMarkupReturningId,
-            editCard: Self.defaultEditMessageTextWithReplyMarkup,
-            deleteCard: Self.defaultDeleteMessage,
             recordFailure: { redactedError in
                 await recordError(
                     context: errorContext,
@@ -109,10 +106,7 @@ extension TelegramPollLoop {
             draftKey: draftKey,
             turn: turn,
             savedDelivery: savedDelivery,
-            sendRichDraft: Self.defaultSendRichMessageDraft,
-            sendRichFinal: silent ? Self.defaultSendSilentRichMessage : Self.defaultSendRichMessage,
-            editRichMessage: Self.defaultEditRichMessage,
-            deleteMessage: Self.defaultDeleteMessage,
+            silent: silent,
             recordFailure: { redactedError in
                 await recordError(
                     context: errorContext,
@@ -219,7 +213,7 @@ extension TelegramPollLoop {
             let lower = name.lowercased()
             switch lower {
             case "read_skill":
-                if let skill = progressInputString(input, keys: ["name", "skill", "id"]) {
+                if let fields = input.objectValue, let skill = JSONValue.firstTrimmedString(fields, keys: ["name", "skill", "id"]) {
                     return "Loading skill: \(skill)"
                 }
                 return "Loading skill"
@@ -227,17 +221,6 @@ extension TelegramPollLoop {
                 return ToolActivityPresentation.progress(name, args: input.stringFields)
             }
         }
-    }
-
-    static func progressInputString(_ input: JSONValue?, keys: [String]) -> String? {
-        guard case .object(let obj)? = input else { return nil }
-        for key in keys {
-            if case .string(let value)? = obj[key] {
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        return nil
     }
 
     func runChatHandler(

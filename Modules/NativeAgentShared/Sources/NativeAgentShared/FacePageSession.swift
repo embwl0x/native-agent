@@ -113,7 +113,6 @@ enum FaceFocus: Hashable {
         refusals.removeValue(forKey: subject)
         let submission = FaceActSubmission(id: UUID(), row: row, action: action, value: value, expectedCall: call, undoOf: undoOf,
                                            values: values, formRevision: formRevision)
-        if !door.answersOnRow, action != "set", values == nil { Task { _ = await door.act(submission) }; return }
         let key = draftKey(item)
         let revision = drafts.revision(key)
         let audience = viewers

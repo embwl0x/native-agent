@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
@@ -49,31 +48,6 @@ public enum NativeOAuthFlow {
 
     /// ASWebAuthenticationSession intercepts the registered scheme; its host selects the provider.
     public static let callbackURLScheme = "nativeagent"
-
-    public static func validateSignInDestination(providerId: String, dataRoot: URL) throws {
-        let path: URL
-        switch normalizedOAuthProviderId(providerId) {
-        case "openai_oauth_direct": path = openAIAppOwnedAuthPath(dataRoot: dataRoot)
-        case "anthropic_oauth_direct": path = anthropicTokenPath(dataRoot: dataRoot)
-        case "xai_oauth_direct": path = XAIOAuthTransport.tokenPath(dataRoot: dataRoot)
-        default: throw ProviderRoutingError.providerNotFound
-        }
-        do {
-            if normalizedOAuthProviderId(providerId) == "xai_oauth_direct" {
-                _ = try ProviderStateValidation.credentialMetadata(at: path)
-            } else {
-                _ = try ProviderStateValidation.credential(at: path)
-            }
-        } catch {
-            // Only confirmed absence clears destination validation.
-            throw ToolFailureError(
-                """
-                    Sign-in was not started: \(path.path) could not be read as a saved sign-in (\(error.localizedDescription)). Move that file aside on \
-                    the Mac, then sign in again.
-                    """,
-                effects: .none, owner: path.path, tap: "Finder › \(path.path)", personDecides: true)
-        }
-    }
 
     // MARK: - Public entry
 

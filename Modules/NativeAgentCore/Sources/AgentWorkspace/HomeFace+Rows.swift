@@ -123,7 +123,7 @@ extension HomeFace {
             catch { verb = "Repair call unreadable: " + error.localizedDescription }
             let words = [act.face?.words, debt.tap, verb].compactMap { $0 }.map(AgentScreen.failureReason).joined(separator: " · ")
             let row = fact(["key": .string(act.id), "kind": .string("repair"), "title": .string(AgentScreen.failureReason(repairTitle(debt.operation))),
-                "detail": .string(AgentScreen.clip(words, 240)), "state": text(act.outcome?.status), "at": .string(act.at)])
+                "detail": .string(AgentScreen.clip(words, 240)), "state": text(act.outcome?.status), "at": .string(act.updatedAt ?? act.at)])
             cache[act.id] = RepairRow(source: act, facts: row)
             return row
         }
@@ -134,9 +134,12 @@ extension HomeFace {
     static func repairTitle(_ operation: String?) -> String {
         guard let operation, let head = operation.split(separator: ":").first, !head.isEmpty else { return "A repair with no recorded operation" }
         func words(_ part: Substring) -> String { part.replacingOccurrences(of: ".", with: " ").replacingOccurrences(of: "_", with: " ") }
-        let subject = operation.split(separator: ":").dropFirst().filter { part in
-            part.count <= 40 && !part.contains(where: { $0.isNumber || $0 == "/" })
-        }.map(words)
+        func wordShaped(_ part: Substring) -> Bool { part.count <= 40 && !part.contains(where: { $0.isNumber || $0 == "/" }) }
+        // A word that only labels the id after it (`peer:<id>`) goes with that id; the row's words name who it is.
+        let parts = Array(operation.split(separator: ":").dropFirst())
+        let subject = parts.indices.filter { index in
+            wordShaped(parts[index]) && !(index + 1 < parts.count && !wordShaped(parts[index + 1]))
+        }.map { words(parts[$0]) }
         let named = words(head)
         let title = named.prefix(1).uppercased() + named.dropFirst() + " failed"
         return subject.isEmpty ? title : title + ": " + subject.joined(separator: ", ")
@@ -279,7 +282,7 @@ extension HomeFace {
             let exchangeAt = record?.exchanges?.last?.settledAt ?? record?.operationStartedAt ?? record?.updatedAt ?? .distantPast
             if !world.unread.contains("people"), record?.sendFailed != true, health?.problem == nil,
                let job = world.jobs.first(where: { $0.agent == contact.id || contact.agents.contains($0.agent) }),
-               let jobAt = (job.completedAt ?? job.startedAt ?? job.createdAt).flatMap(AgentScreen.date),
+               let jobAt = (job.completedAt ?? job.startedAt ?? job.createdAt).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst),
                jobAt > max(exchangeAt, chat?.at ?? .distantPast) {
                 state = "execution"
                 execution = ["run": .string(job.runStatus ?? job.status ?? job.state ?? "not recorded"), "delivery": text(job.deliveryOutcome),
@@ -360,7 +363,7 @@ extension HomeFace {
             if place == "browser" {
                 detail = BrowserConnectionMirror.connected.map { $0 ? "Chrome connected" : "Chrome not connected" } ?? "Chrome connection unobserved"
             } else if place == "desk", let state = world.desk {
-                detail = "\(world.split.active.count) active · \(world.split.parked.count) parked · \(world.split.waiting.count) waiting · "
+                detail = "board: \(world.split.active.count) active · \(world.split.parked.count) parked · \(world.split.waiting.count) waiting · "
                     + state.boardCountSummary
             } else { detail = badge?.words }
             keys.add(place, open: "page:home/" + place)

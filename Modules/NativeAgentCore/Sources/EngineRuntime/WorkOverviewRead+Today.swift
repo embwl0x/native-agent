@@ -203,13 +203,6 @@ public enum TodayWords {
         return String(first).uppercased() + text.dropFirst()
     }
 
-    /// Accept both ISO-8601 timestamp shapes current stores write.
-    public static func parseTimestamp(_ raw: String?) -> Date? {
-        guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return NativeTimestampFormat.parseISO8601FractionalFirst(text)
-    }
-
 }
 
 // MARK: - The dream digest
@@ -251,7 +244,7 @@ extension WorkOverviewRead {
         let calendar = Calendar.autoupdatingCurrent
         return Dictionary(sessions.filter {
             guard ($0.messageCount ?? 0) > 0,
-                  let at = TodayWords.parseTimestamp($0.updatedAt ?? $0.createdAt),
+                  let at = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst($0.updatedAt ?? $0.createdAt),
                   calendar.isDate(at, inSameDayAs: now) else { return false }
             return !ChatShellConversationRow.isWorking($0) && !ChatShellConversationRow.isAgentOwn($0, reading: openingLines)
         }
@@ -360,7 +353,7 @@ private struct TodaySource: Sendable, Equatable {
                 return .object(["id": .string("card:" + item.id), "title": .string(item.title), "detail": .string(detail)])
             }
             let notes = items.filter { $0.isActivityPending && !$0.isSystemLane }.compactMap { item -> JSONValue? in
-                if let at = TodayWords.parseTimestamp(item.created_at) {
+                if let at = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(item.created_at) {
                     let key = "inbox:" + item.id
                     // Only native owner job identity may bind a folded group.
                     let job = item.relatedDelegationID.flatMap { $0.isEmpty ? nil : $0 }
@@ -465,7 +458,7 @@ private struct TodaySource: Sendable, Equatable {
                     unavailable = true
                     source.unavailable.append("Dream entry is empty.")
                 }
-                if let at = TodayWords.parseTimestamp(entry.modifiedAt), today(at) {
+                if let at = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(entry.modifiedAt), today(at) {
                     if let digest = TodayDreamDigest.parse(markdown) {
                         source.input["dream"] = .object(["state": .string(unavailable ? "partial" : "available"),
                             "title": .string(digest.title), "mood": .string(digest.mood), "at": .double(at.timeIntervalSince1970)])
@@ -475,7 +468,7 @@ private struct TodaySource: Sendable, Equatable {
                         source.unavailable.append("Dream title unavailable.")
                         source.input["dream"] = .object(["state": .string("unavailable"), "reason": .string("Dream title unavailable.")])
                     }
-                } else if TodayWords.parseTimestamp(entry.modifiedAt) == nil {
+                } else if NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(entry.modifiedAt) == nil {
                     unavailable = true
                     source.input["dream"] = .object(["state":.string("unavailable"),"reason":.string("Dream time unavailable.")])
                 } else { source.input["dream"] = .object(["state": .string("empty")]) }
@@ -635,7 +628,7 @@ private struct TodayConversations: Sendable {
         var result = Transcript()
         for message in messages {
             guard message.sessionId == nil || message.sessionId == session,
-                  let at = TodayWords.parseTimestamp(message.createdAt), at <= now, calendar.isDate(at, inSameDayAs: now) else { continue }
+                  let at = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(message.createdAt), at <= now, calendar.isDate(at, inSameDayAs: now) else { continue }
             if result.first == nil { result.first = at }
             let automated = SessionMessageProvenance.make(role: message.role, source: message.source,
                 hasEnvelope: message.metadata?.envelope != nil, surface: message.metadata?.envelope?.surface,
@@ -664,9 +657,9 @@ private struct TodayConversations: Sendable {
         var conversations: [JSONValue] = [], builders: [JSONValue] = []
         for session in sessions {
             if let issue = openings[session.id]?.issue { source.unavailable.append("Conversation \(session.id): " + issue) }
-            if let end = TodayWords.parseTimestamp(session.updatedAt ?? session.createdAt), calendar.isDate(end, inSameDayAs: now),
+            if let end = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(session.updatedAt ?? session.createdAt), calendar.isDate(end, inSameDayAs: now),
                (session.messageCount ?? 0) > 0, let surface = surfaces[session.id] {
-                let began = TodayWords.parseTimestamp(session.createdAt) ?? end
+                let began = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(session.createdAt) ?? end
                 let reading = transcripts[session.id]
                 let start = reading?.human ?? reading?.first ?? (calendar.isDate(began, inSameDayAs: now) ? began : nil)
                 let key = "conversation:" + session.id

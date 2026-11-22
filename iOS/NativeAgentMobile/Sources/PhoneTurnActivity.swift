@@ -1,5 +1,4 @@
 import ActivityKit
-import CryptoKit
 import Foundation
 import NativeAgentShared
 import SwiftUI
@@ -62,7 +61,7 @@ final class PhoneTurnActivity: ObservableObject {
     var activityPairing: String? { AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) }
     var activityPushPairing: String? {
         guard let secret = iCloudBridge.shared.pairingSecretForPhoneRequests else { return nil }
-        return SHA256.hash(data: Data(secret.base64EncodedString().utf8)).map { String(format: "%02x", $0) }.joined()
+        return SHA256Hex.of(utf8: secret.base64EncodedString())
     }
     /// Retire a pairing's projections before its replacement can make them visible.
     func adoptWorkPairing(_ pairing: String?) {

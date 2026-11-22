@@ -1,6 +1,5 @@
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
@@ -106,23 +105,10 @@ extension SwiftNativeProviderRouting {
         return normalized
     }
     nonisolated static func normalizeServiceTierStatic(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        TextNormalization.trimmedLowercased(raw)
     }
     /// Scalar reads consume already checked state.
     nonisolated static func stringFrom(_ node: JSONValue, key: String) -> String? {
-        guard case .object(let obj) = node, case .string(let value)? = obj[key], !value.isEmpty else { return nil }
-        return value
-    }
-    nonisolated static func firstString(
-        _ obj: [String: JSONValue],
-        keys: [String]
-    ) -> String? {
-        for key in keys {
-            if case .string(let s)? = obj[key] {
-                let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        return nil
+        node.objectValue?[key]?.nonemptyString
     }
 }

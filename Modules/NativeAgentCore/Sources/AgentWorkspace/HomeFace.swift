@@ -168,7 +168,7 @@ package enum HomeFace {
         let repairs = world.repairs.filter(RepairOwed.isOwed)
         let repairIDs = Set(repairs.map(\.id))
         repairRows = repairRows.filter { repairIDs.contains($0.key) }
-        let person = world.profile?.userName.flatMap(AgentScreen.nonEmpty).map { AgentScreen.clip($0, 40) } ?? "the person"
+        let person = world.profile?.userName.trimmedNonEmpty.map { AgentScreen.clip($0, 40) } ?? "the person"
         let order = layout.contentNames("home", profile: SurfaceLayoutStore.profile)
         var mail: JSONValue = .null
         if world.mailPreviewAllowed == true,

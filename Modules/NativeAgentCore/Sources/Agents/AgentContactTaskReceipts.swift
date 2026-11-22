@@ -11,16 +11,13 @@ import ApprovalInbox
 import Darwin
 import CoreFoundation
 import ProviderRouting
-import CryptoKit
 import SQLite3
 // Blueprint: | `AgentContactTaskReceipts.swift` | SQLite owns checked task receipts and payload debt. |
 extension AgentContactTasks {
     private func taskKey(id: String, owner: String) -> String {
-        AgentPeerReplayClaimStore.digest(Data((owner + "\u{1f}" + id).utf8))
+        SHA256Hex.of(Data((owner + "\u{1f}" + id).utf8))
     }
     func retain(_ task: AgentContactTask) throws {
-        var task = task
-        if task.state.terminal, task.replyRecovery == nil, !task.owesCallbacks, !task.hasReplyPayload { task.replyPayloadExpired = true }
         try saveTasks([task])
         if task.state.terminal, task.hasReplyPayload {
             terminalPayloadWrites += 1
@@ -31,8 +28,7 @@ extension AgentContactTasks {
         }
     }
     private func compactReplyPayloads() throws {
-        let retained = try retainedTasks().filter { $0.state.terminal && $0.replyRecovery == nil && !$0.owesCallbacks
-            && $0.replyPayloadExpired != true && $0.hasReplyPayload }
+        let retained = try retainedTasks().filter { $0.state.terminal && $0.replyRecovery == nil && !$0.owesCallbacks && $0.hasReplyPayload }
         var expired: [AgentContactTask] = []
         for saved in retained.sorted(by: { $0.updated < $1.updated }).prefix(max(0, retained.count - capacity)) {
             var compact = saved
@@ -41,10 +37,11 @@ extension AgentContactTasks {
                 digests[id] = try Self.completionDigest(part)
             }
             compact.delegatedCompletionDigests = digests
+            compact.toolExecutionResultClass = saved.retainedToolExecution
             compact.text = ""; compact.parts = []; compact.toolResult = nil; compact.delegatedCompletions = nil
             compact.failure = nil
             compact.replyPayloadExpired = true
-            compact.detail = "The saved reply has expired. This task's outcome is retained; do not resend automatically."
+            compact.detail = AgentContactTask.expiredReplyDetail
             expired.append(compact)
         }
         if !expired.isEmpty {
@@ -109,7 +106,8 @@ extension AgentContactTasks {
                 }
                 let storedKey = String(cString: rawKey)
                 let count = Int(sqlite3_column_bytes(statement, 1))
-                guard count > 0, count <= AgentContactPart.maximumOutputBytes * 2,
+                // Older writers committed larger valid receipts. The write budget does not invalidate existing rows.
+                guard count > 0,
                       let bytes = sqlite3_column_blob(statement, 1),
                       let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(bytes: bytes, count: count)),
                       NativeAgentA2AWire.locator(task.id) != nil,
@@ -142,6 +140,9 @@ extension AgentContactTasks {
             for task in tasks {
                 let key = taskKey(id: task.id, owner: task.owner)
                 let data = try JSONEncoder().encode(task)
+                guard data.count <= AgentContactTask.maximumReceiptBytes else {
+                    throw AgentContactFailure(code: -32602, message: "The retained reply reached its size limit")
+                }
                 sqlite3_reset(statement)
                 sqlite3_clear_bindings(statement)
                 let bound = data.withUnsafeBytes { bytes in
@@ -161,6 +162,6 @@ extension AgentContactTasks {
     static func completionDigest(_ part: AgentContactPart) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        return AgentPeerReplayClaimStore.digest(try encoder.encode(part))
+        return SHA256Hex.of(try encoder.encode(part))
     }
 }

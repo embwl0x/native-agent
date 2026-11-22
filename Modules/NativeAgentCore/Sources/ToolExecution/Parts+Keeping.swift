@@ -30,7 +30,7 @@ extension Parts {
         let fields = fields(origin ?? .null)
         switch originKind(origin) {
         case "peer"?: return """
-            \(name) came from untrusted agents \(strings(fields["peers"]).joined(separator: ", ")), so keeping it is the owner's card for this exact \
+            \(name) came from untrusted agents \(JSONValue.stringArray(fields["peers"]).joined(separator: ", ")), so keeping it is the owner's card for this exact \
             version
             """
         case nil: return "\(name) has no attested origin, so keeping it is the owner's"

@@ -4,21 +4,14 @@ import Senses
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
 import UserNotifications
 import Experiences
-import CryptoKit
 import os
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacAttentionObservation.swift` | Bounded attention readout and observation continuity |
 extension SwiftNativeMacControl {
     /// Wait on passive events or a bounded deadline, then capture once; no frame loop or model call drives continuity. Stop must remove observers and
@@ -172,7 +165,8 @@ extension SwiftNativeMacControl {
             now: now()
         , context: context) else {
             // Capture may outlive Stop, expiry, or replacement. The store owns continuity; this old capture cannot reactivate it or its marks.
-            await screenViewStore.invalidate()
+            await screenViewStore.invalidate(viewId: viewId)
+            output["view_current"] = .bool(false)
             let actual = await attentionStore.status(now: now(), context: context)
             output["active"] = .bool(actual != nil)
             output["status"] = .string(actual == nil ? "not_active" : "session_replaced")
@@ -183,7 +177,8 @@ extension SwiftNativeMacControl {
         }
         if current.refreshRequired {
             // Input raced the capture. Never leave its marks usable while the result truthfully says the agent must yield and look again.
-            await screenViewStore.invalidate()
+            await screenViewStore.invalidate(viewId: viewId)
+            output["view_current"] = .bool(false)
         }
         output["status"] = .string(
             current.yieldRequired ? "yield_required"

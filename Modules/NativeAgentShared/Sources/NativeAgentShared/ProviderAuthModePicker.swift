@@ -1,10 +1,9 @@
 import Foundation
-// Blueprint: | `ProviderAuthModePicker.swift` | Canonical advertised authentication choices and unresolved saved-mode presentation |
+// Blueprint: | `ProviderAuthModePicker.swift` | Canonical advertised authentication choices; a saved mode the account no longer offers selects nothing |
 
 public struct ProviderAuthModePicker: Equatable, Sendable {
     public let supportedModes: [String]
     public let selectedMode: String
-    public let unresolvedSavedMode: String?
     public var canSave: Bool { supportedModes.contains(selectedMode) }
 
     public init(advertisedModes: [String], savedMode: String?) {
@@ -16,10 +15,8 @@ public struct ProviderAuthModePicker: Equatable, Sendable {
         let saved = savedMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let saved, supportedModes.contains(saved) {
             selectedMode = saved
-            unresolvedSavedMode = nil
         } else {
             selectedMode = ""
-            unresolvedSavedMode = saved?.isEmpty == false ? saved : nil
         }
     }
 }

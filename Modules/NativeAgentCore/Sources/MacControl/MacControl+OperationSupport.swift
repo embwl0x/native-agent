@@ -321,9 +321,7 @@ extension SwiftNativeMacControl {
     }
 
     static func resultTimedOut(_ result: MacControlResult) -> Bool {
-        guard case .object(let object) = result.output,
-              case .bool(let timedOut)? = object["timed_out"] else { return false }
-        return timedOut
+        JSONValue.boolOrFalse(result.output.objectValue?["timed_out"])
     }
 
     static func exitOutcomeCode(_ result: MacControlResult) -> String? {
@@ -344,14 +342,14 @@ extension SwiftNativeMacControl {
         }
         switch action {
         // These reads return observed state. The document read restores its temporary scroll; menu reads never press an item.
-        case "file/read", "file/list", "spotlight", "ax_status", "ax_tree", "ax_find",
+        case "file/read", "file/list", "spotlight",
              "view", "look", "menu", "clipboard_read", "read":
             return .satisfied
-        // Posting input or rereading a control does not verify the intended effect. An explicit verified flag (including wake and clipboard write read-back) is
+        // Posting input or rereading a control does not verify the intended effect. An explicit verified flag (including clipboard write read-back) is
         // handled above, before this default classification.
         case "notify", "file/write", "file/move", "file/trash", "focus_app", "quit_app",
-             "applescript", "shell", "keystroke", "click", "scroll", "ax_act", "hand",
-             "menu_press", "act", "wake", "nudge":
+             "applescript", "shell", "keystroke", "click", "ax_act", "hand",
+             "menu_press", "act":
             return .unverified
         default:
             return .notRequired

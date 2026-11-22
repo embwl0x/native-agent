@@ -1,7 +1,6 @@
 import SwiftUI
 import NativeAgentShared
 import Foundation
-import CryptoKit
 // Blueprint: | `InboxNotesCapsule.swift` | Shared unread-note capsule/list, bounded continuations and checked batch read outcomes |
 
 struct InboxNotesCapsule: View {
@@ -28,7 +27,7 @@ struct InboxNotesCapsule: View {
                                   : "\(failedReads.count) updates need review", open: "page:inbox/notes"),
                         ]),
                     ]),
-                ]), open: { _ in showsList.toggle() }, act: { _, _, _ in })
+                ]), door: ReadOnlyFaceDoor(open: { _ in showsList.toggle() }), session: FacePageSession(), retaining: false)
                 .help("Unread notes")
                 .accessibilityLabel(failedReads.isEmpty
                                     ? "\(unread.count) unread \(unread.count == 1 ? "update" : "updates")"
@@ -43,7 +42,6 @@ struct InboxNotesCapsule: View {
         .sheet(item: $selectedItem) { item in
             InboxItemDetailSheet(
                 item: item,
-                allItems: appModel.countPart("inbox.detailRows") { $0?.inbox.rows ?? [] },
                 onAction: { actionID in
                     await actionFlight.perform {
                         try await onAction(item.id, actionID)
@@ -66,8 +64,7 @@ struct InboxNotesCapsule: View {
     }
 
     private func notesRevision(_ unread: [String]) -> String {
-        SHA256.hash(data: Data(unread.map { String($0.utf8.count) + ":" + $0 }.joined().utf8))
-            .map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(utf8: unread.map { String($0.utf8.count) + ":" + $0 }.joined())
     }
 
     private var failureText: String {

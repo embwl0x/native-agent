@@ -373,14 +373,6 @@ extension NativeCognitionRuntime {
         )
     }
 
-    nonisolated static func hasReadableContent(_ url: URL) -> Bool {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? NSNumber else {
-            return false
-        }
-        return size.intValue > 2
-    }
-
     nonisolated static func bodySourceFailure(_ error: Error, source: String, dataRoot: URL) -> String {
         let cause = source + ": " + error.localizedDescription
         RepairOwed.owe(dataRoot, id: "body-source:" + UUID().uuidString, kind: .run,

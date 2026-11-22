@@ -290,7 +290,7 @@ extension NativeAgentEngine {
                 switch setting {
                 case "model":
                     let choice = providers.selection(for: "telegram")
-                    let effort = ProvidersFacade.normalizedReasoningEffort(from: providers.catalog, providers: providers.connections,
+                    let effort = ProvidersFacade.normalizedReasoningEffort(providers: providers.connections,
                         providerID: choice.provider, model: value, selected: choice.reasoningEffort)
                     try await saveTelegramLever(saved, model: value, effort: effort)
                 default:

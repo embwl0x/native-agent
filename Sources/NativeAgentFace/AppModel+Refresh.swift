@@ -9,8 +9,8 @@ enum FaceActionFeedback {
     }
 
     static func unexpected(_ expected: String) -> WireFailure {
-        WireFailure(code: "unexpected_face_reply", message: "The body did not return \(expected).",
-                    cause: "The operation's outcome is unknown. Do not repeat a write without checking its owner.", effects: .unknown)
+        WireFailure(code: "unexpected_face_reply", message: "Not sure that went through. Check before trying again.",
+                    cause: "The body did not return \(expected). The operation's outcome is unknown.", effects: .unknown)
     }
 }
 

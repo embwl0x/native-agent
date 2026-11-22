@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `ApprovalInbox+InjectionSpend.swift` | `SwiftNativeApprovalInbox`: `consumeInjectionApproval`, `loadSpends` |
@@ -19,7 +20,7 @@ extension SwiftNativeApprovalInbox {
         guard !id.isEmpty else { return .unavailable }
         return await consumeApprovedEffect(id: id, marker: [
             "digest": .string(digest), "tool": .string(tool),
-            "surface": .string(surface), "spentAt": .string(Self.isoTimestamp(Date())),
+            "surface": .string(surface), "spentAt": .string(NativeTimestampFormat.fractionalUTCOffset(Date())),
         ], at: injectionSpendPath, schema: Self.injectionSpendSchema, actionField: "tool")
     }
 }

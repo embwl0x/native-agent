@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import Experiences
@@ -107,7 +108,7 @@ extension CognitiveSubstrate {
                     lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
                     lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt,
                     failureStage: "unsaved",
-                    failureDetail: bounded("unsaved: \(unsavedStages.sorted().joined(separator: ", ")); last cause: \(error)",
+                    failureDetail: TextClipping.prefixOrWhole("unsaved: \(unsavedStages.sorted().joined(separator: ", ")); last cause: \(error)",
                                            maxCharacters: 320))
             }
             throw error

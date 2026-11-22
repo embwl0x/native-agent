@@ -10,7 +10,7 @@ import SystemOps
 
 public enum TrustBackupPersistence {
     public static func createBackup(reason: String, dataRoot root: URL) async throws -> BackupRecord {
-        let now = Self.nativeArtifactTimestamp()
+        let now = NativeTimestampFormat.plainZulu(Date())
         let id = UUID().uuidString.lowercased()
         let backupRoot = root.appendingPathComponent("backups", isDirectory: true)
         let backupDir = backupRoot.appendingPathComponent(id, isDirectory: true)
@@ -93,7 +93,7 @@ public enum TrustBackupPersistence {
                 switch relative {
                 case "chat":
                     // Retention moves bytes between tiers while holding this lock; capture the entire group in that transaction.
-                    copied += try await SwiftNativePersistenceCore.withFileLock(Self.chatSessionIndexPath(in: root), copy)
+                    copied += try await SwiftNativePersistenceCore.withFileLock(DataRootPaths.chatSessionIndex(in: root), copy)
                 case "clock":
                     copied += try await SwiftNativePersistenceCore.withFileLock(root.appendingNativeRelativePath("clock/times.json"), copy)
                 default:
@@ -131,7 +131,7 @@ public enum TrustBackupPersistence {
                 return ["clock"]
             }
             // Retention publishes archive bytes and locators under the session index lock.
-            copied += try await SwiftNativePersistenceCore.withFileLock(Self.chatSessionIndexPath(in: root)) {
+            copied += try await SwiftNativePersistenceCore.withFileLock(DataRootPaths.chatSessionIndex(in: root)) {
                 var paths: [String] = []
                 for relative in Self.backupRelativePaths.filter({ $0.hasPrefix("chat/") }) {
                     let source = root.appendingNativeRelativePath(relative)
@@ -227,10 +227,6 @@ public enum TrustBackupPersistence {
             return PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot).appendingNativeRelativePath(String(relative.dropFirst("persona/".count)))
         }
         return dataRoot.appendingNativeRelativePath(relative)
-    }
-
-    public static func nativeArtifactTimestamp() -> String {
-        ISO8601DateFormatter().string(from: Date())
     }
 
     public static func copySelectedDataPaths(

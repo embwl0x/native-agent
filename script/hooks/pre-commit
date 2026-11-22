@@ -20,6 +20,17 @@ elif ! gitleaks git --staged --no-banner --redact -c "$ROOT/.gitleaks.toml"; the
   exit 1
 fi
 
+# Her identity lines stay word for word (script/identity_pins.tsv). Read from the staged tree.
+while IFS=$'\t' read -r pin_path pin_text; do
+  [[ -z "$pin_path" || "$pin_path" == \#* ]] && continue
+  if ! git show ":$pin_path" 2>/dev/null | grep -qF -- "$pin_text"; then
+    echo "[pre-commit] BLOCKED: her identity line changed in $pin_path:" >&2
+    echo "[pre-commit]   \"$pin_text\"" >&2
+    echo "[pre-commit] These lines are pinned (script/identity_pins.tsv). Bring the change to Claude and Agent." >&2
+    exit 1
+  fi
+done < <(git show :script/identity_pins.tsv 2>/dev/null || cat "$ROOT/script/identity_pins.tsv")
+
 # The classifier owns primitive recognition. Check a single immutable staged
 # tree (source, policy, classifier and inventory), including deletions/moves.
 if [[ -n "$(git diff --cached --name-only -- '*.swift' 'script/timer_inventory.tsv' 'docs/ARCHITECTURE_BLUEPRINT.md' 'script/hooks/pre-commit')" ]]; then

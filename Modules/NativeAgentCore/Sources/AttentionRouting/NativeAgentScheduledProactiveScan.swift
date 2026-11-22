@@ -17,12 +17,6 @@ public enum NativeAgentScheduledProactiveScan {
         public let score: Double
     }
 
-    public struct Result: Sendable, Equatable {
-        public let scannedCount: Int
-        public let eligibleCount: Int
-        public let surfaced: [Opportunity]
-    }
-
     // MARK: - W6/G5 — a project-shaped opportunity
 
     /// Five days gives active work about a working week before asking, avoiding progress-time nagging. Only now/next claim to be current work; watch/todo are
@@ -34,12 +28,12 @@ public enum NativeAgentScheduledProactiveScan {
         payload: [String: JSONValue],
         seen: [String],
         now: Date = Date()
-    ) async throws -> Result {
+    ) async throws -> [Opportunity] {
         let arguments = try ProactiveScanArguments(payload)
         let limit = arguments.limit
         let surfaceLimit = arguments.surfaceLimit
         guard surfaceLimit > 0 else {
-            return Result(scannedCount: 0, eligibleCount: 0, surfaced: [])
+            return []
         }
 
         let pendingApprovals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending).count
@@ -64,11 +58,7 @@ public enum NativeAgentScheduledProactiveScan {
             .prefix(limit)
             .prefix(surfaceLimit)
 
-        return Result(
-            scannedCount: live.count,
-            eligibleCount: eligible.count,
-            surfaced: Array(surfaced)
-        )
+        return Array(surfaced)
     }
 
     private static func liveOpportunities(
@@ -106,7 +96,7 @@ public enum NativeAgentScheduledProactiveScan {
             guard deskOpportunityStatuses.contains(item.status), !item.status.isTerminal else { return nil }
             guard !item.isPursuit else { return nil }
             guard !DeskSequencing.isDeferred(item, now: now) else { return nil }
-            guard let updated = parseDeskInstant(item.updatedAt), updated < cutoff else { return nil }
+            guard let updated = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(item.updatedAt), updated < cutoff else { return nil }
 
             let project = item.project.trimmingCharacters(in: .whitespacesAndNewlines)
             let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -127,13 +117,6 @@ public enum NativeAgentScheduledProactiveScan {
                 score: 0.66
             )
         }
-    }
-
-    /// Desk stamps may include fractional seconds.
-    static func parseDeskInstant(_ raw: String) -> Date? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
     }
 
     /// Use weekdays only while unambiguous; older stalls need an explicit date.

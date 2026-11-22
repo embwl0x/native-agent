@@ -20,7 +20,6 @@ public struct AgentVoice: Equatable {
     public var Subject: String { name }
     public var object: String { name }
     public var possessive: String { name + "'s" }
-    public var Possessive: String { possessive }
     public func verb(_ base: String) -> String {
         let lower = base.lowercased()
         if lower == "have" { return "has" }

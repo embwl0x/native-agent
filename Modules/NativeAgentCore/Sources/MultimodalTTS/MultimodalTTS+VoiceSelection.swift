@@ -358,31 +358,3 @@ extension VoiceOutputController: AVAudioPlayerDelegate {
         }
     }
 }
-
-/// The Voice Auto-Read gate keeps "new reply" stable across SwiftUI re-renders.
-extension VoiceOutputModeSelection {
-    public static func autoReadDecision(
-        enabled: Bool,
-        sessionID: String,
-        isSessionPrimed: Bool,
-        lastMessage: (id: String, sessionId: String?, role: String, content: String)?,
-        lastReadMessageID: String?
-    ) -> (messageID: String, text: String)? {
-        guard enabled else { return nil }
-        guard isSessionPrimed else { return nil }
-        guard let lastMessage else { return nil }
-
-        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanSessionID.isEmpty else { return nil }
-        if let messageSessionID = lastMessage.sessionId {
-            guard messageSessionID.trimmingCharacters(in: .whitespacesAndNewlines) == cleanSessionID else {
-                return nil
-            }
-        }
-        guard lastMessage.role == "assistant" else { return nil }
-        let text = lastMessage.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
-        guard lastMessage.id != lastReadMessageID else { return nil }
-        return (messageID: lastMessage.id, text: text)
-    }
-}

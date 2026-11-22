@@ -27,7 +27,7 @@ public enum WorkOverviewRead {
             })
         }
         for job in board.agentJobs.items where job.state == .needsYou {
-            needs.append((.init(kind: .execution, id: job.id), NativeTimestampFormat.fractionalZulu(job.updatedAt), { Self.row(for: job, now: now) }))
+            needs.append((.init(kind: .execution, id: job.id), NativeTimestampFormat.fractionalZulu(job.updatedAt), { Self.row(for: job) }))
         }
         var needsDeskIDs: Set<String> = []
         for item in board.items where item.requiresOwnerInput {
@@ -57,7 +57,7 @@ public enum WorkOverviewRead {
         let carriedDeskIDs = Set(board.agentJobs.items.filter { !$0.state.isTerminal }.compactMap(\.desk))
         for job in board.agentJobs.items where job.state != .needsYou {
             let result: Candidate = (.init(kind: .execution, id: job.id), NativeTimestampFormat.fractionalZulu(job.updatedAt), {
-                Self.row(for: job, now: now)
+                Self.row(for: job)
             })
             if job.state.isTerminal { recent.append(result) } else { current.append(result) }
         }
@@ -94,7 +94,7 @@ public enum WorkOverviewRead {
     }
 
     /// Overview and id-based detail read the same job record.
-    public static func row(for job: AgentJob, now: Date) -> WorkOverviewRow {
+    public static func row(for job: AgentJob) -> WorkOverviewRow {
         let updated = NativeTimestampFormat.fractionalZulu(job.updatedAt)
         let state = switch job.state {
         case .working: "running"

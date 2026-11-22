@@ -1,6 +1,5 @@
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
@@ -14,6 +13,46 @@ extension SwiftNativeProviderRouting {
         configCache: ProviderConfigCache?,
         revision: Double = 0, preview: Bool = false
     ) throws -> ProviderRoutingSnapshot {
+        let inputs = prepareRoutingSnapshot(
+            surfaces: surfaces, activeProviders: activeProviders, soleConnectedRoute: soleConnectedRoute,
+            configCache: configCache, preview: preview
+        )
+        let groups = resolveRoutingGroups(inputs)
+        return resolveSurfaceRoutes(inputs, groups: groups, revision: revision)
+    }
+
+    private final class RoutingSnapshotInputs {
+        let saved: (models: JSONValue, efforts: JSONValue, tiers: JSONValue, routes: [String: String])
+        let effective: (models: JSONValue, efforts: JSONValue, tiers: JSONValue, routes: [String: String])
+        let catalogs: (accounts: [String: [CodexAccountModelCatalog.Model]], openRouter: [ProviderModelInfo]?, faults: [String: String])
+        let retiredPickSurfaces: Set<String>
+        let unusablePicks: [String: String]
+        let chatRoute: String?
+        let savedDefaults: [String: SavedProviderDefault]
+        let offeredModels: [String: [String]]
+
+        init(
+            saved: (JSONValue, JSONValue, JSONValue, [String: String]),
+            effective: (JSONValue, JSONValue, JSONValue, [String: String]),
+            catalogs: ([String: [CodexAccountModelCatalog.Model]], [ProviderModelInfo]?, [String: String]),
+            retiredPickSurfaces: Set<String>, unusablePicks: [String: String], chatRoute: String?,
+            savedDefaults: [String: SavedProviderDefault], offeredModels: [String: [String]]
+        ) {
+            self.saved = saved
+            self.effective = effective
+            self.catalogs = catalogs
+            self.retiredPickSurfaces = retiredPickSurfaces
+            self.unusablePicks = unusablePicks
+            self.chatRoute = chatRoute
+            self.savedDefaults = savedDefaults
+            self.offeredModels = offeredModels
+        }
+    }
+
+    private func prepareRoutingSnapshot(
+        surfaces: [String: JSONValue], activeProviders: [String: String], soleConnectedRoute: String?,
+        configCache: ProviderConfigCache?, preview: Bool
+    ) -> RoutingSnapshotInputs {
         let surfacesFile = JSONValue.object(surfaces)
         let (parsedSurfaceModels, parsedSurfaceEfforts, parsedSurfaceServiceTiers) = Self.parseSurfacesFile(surfacesFile)
         // Catalog failures belong to their routes, not the whole picker snapshot.
@@ -33,16 +72,6 @@ extension SwiftNativeProviderRouting {
         // Interpret saved picks without rewriting their authority.
         let accountCatalogs = CodexAccountModelCatalog.chatGPTOAuthCatalogs(dataRoot: dataRoot, preview: preview)
         let openRouterCatalog = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)
-        func supportedEfforts(model: String, route: String?) -> [String]? {
-            if Self.normalizeProviderId(route ?? "") == "openrouter" {
-                return openRouterCatalog?.first { $0.id == model }?.supported_reasoning_efforts
-            }
-            if Self.normalizeProviderId(route ?? "") == "moonshot" {
-                return MoonshotModelCatalog.supportedReasoningEfforts(for: model)
-            }
-            return accountCatalogs[route ?? ""]?.first { $0.id == model }?.supportedReasoningEfforts
-                ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: route ?? "", dataRoot: dataRoot)
-        }
         var cachedModelIDs = accountCatalogs.mapValues { Set($0.map { $0.id.lowercased() }) }
         if let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot) {
             cachedModelIDs["moonshot"] = Set(moonshotModels.map { $0.id.lowercased() })
@@ -110,6 +139,38 @@ extension SwiftNativeProviderRouting {
                 unusablePicks[surface] = "\(saved) isn't offered on \(Self.displayName(for: route)), so an available model must be chosen in Providers."
             }
         }
+        return RoutingSnapshotInputs(
+            saved: (parsedSurfaceModels, parsedSurfaceEfforts, parsedSurfaceServiceTiers, routesBeforeRetirement),
+            effective: (surfaceModels, surfaceEfforts, surfaceServiceTiers, activeProviders),
+            catalogs: (accountCatalogs, openRouterCatalog, catalogFaults),
+            retiredPickSurfaces: retiredPickSurfaces, unusablePicks: unusablePicks, chatRoute: chatRoute,
+            savedDefaults: savedDefaults, offeredModels: offeredModels
+        )
+    }
+
+    // ProviderSurfaceGroups owns membership. Only a group with no saved override inherits Chat; partial or conflicting tuples are unavailable.
+    // Independent effort/tier controls keep Chat's current model/account.
+    private struct CanonicalTuple: Equatable {
+        let model: String
+        let effort: String
+        let serviceTier: String
+        let provider: String?
+    }
+
+    private typealias RoutingGroups = (
+        chatTuple: CanonicalTuple, retiredOverrideSurfaces: Set<String>,
+        canonicalByGroup: [String: CanonicalTuple], inconsistentGroups: [String: String]
+    )
+
+    private func resolveRoutingGroups(_ inputs: RoutingSnapshotInputs) -> RoutingGroups {
+        let (parsedSurfaceModels, parsedSurfaceEfforts, parsedSurfaceServiceTiers, routesBeforeRetirement) = inputs.saved
+        let (surfaceModels, surfaceEfforts, surfaceServiceTiers, _) = inputs.effective
+        let (accountCatalogs, openRouterCatalog, _) = inputs.catalogs
+        let retiredPickSurfaces = inputs.retiredPickSurfaces
+        let unusablePicks = inputs.unusablePicks
+        let chatRoute = inputs.chatRoute
+        let savedDefaults = inputs.savedDefaults
+        let offeredModels = inputs.offeredModels
         // An unusable Chat pick stays unset; provider-sheet defaults are explicit picks too.
         let chatModelRaw = Self.stringFrom(surfaceModels, key: "chat")
             ?? (unusablePicks["chat"] != nil
@@ -128,14 +189,6 @@ extension SwiftNativeProviderRouting {
         let chatServiceTier = Self.normalizeServiceTierStatic(
             Self.stringFrom(surfaceServiceTiers, key: "chat") ?? "default"
         )
-        // ProviderSurfaceGroups owns membership. Only a group with no saved override inherits Chat; partial or conflicting tuples are unavailable.
-        // Independent effort/tier controls keep Chat's current model/account.
-        struct CanonicalTuple: Equatable {
-            let model: String
-            let effort: String
-            let serviceTier: String
-            let provider: String?
-        }
         let chatTuple = CanonicalTuple(
             model: chatModel,
             effort: chatEffort,
@@ -197,6 +250,29 @@ extension SwiftNativeProviderRouting {
                     turn Same as Chat on in Providers.
                     """
             }
+        }
+        return (chatTuple, retiredOverrideSurfaces, canonicalByGroup, inconsistentGroups)
+    }
+
+    private func resolveSurfaceRoutes(
+        _ inputs: RoutingSnapshotInputs, groups: RoutingGroups, revision: Double
+    ) -> ProviderRoutingSnapshot {
+        let (surfaceModels, _, _, activeProviders) = inputs.effective
+        let (accountCatalogs, openRouterCatalog, catalogFaults) = inputs.catalogs
+        let (chatTuple, retiredOverrideSurfaces, canonicalByGroup, inconsistentGroups) = groups
+        let chatRoute = inputs.chatRoute
+        let savedDefaults = inputs.savedDefaults
+        let offeredModels = inputs.offeredModels
+        var unusablePicks = inputs.unusablePicks
+        func supportedEfforts(model: String, route: String?) -> [String]? {
+            if Self.normalizeProviderId(route ?? "") == "openrouter" {
+                return openRouterCatalog?.first { $0.id == model }?.supported_reasoning_efforts
+            }
+            if Self.normalizeProviderId(route ?? "") == "moonshot" {
+                return MoonshotModelCatalog.supportedReasoningEfforts(for: model)
+            }
+            return accountCatalogs[route ?? ""]?.first { $0.id == model }?.supportedReasoningEfforts
+                ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: route ?? "", dataRoot: dataRoot)
         }
         var out: [String: SurfacePreference] = [:]
         var resolvedProviders: [String: String] = [:]

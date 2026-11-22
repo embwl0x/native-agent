@@ -61,14 +61,14 @@ public struct SlackSocketModeLoop: LoopRunner {
         do {
             await writeState([
                 "connected": .bool(false),
-                "connectingAt": .string(Self.nowString()),
+                "connectingAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                 "lastError": .null,
             ])
             try Task.checkCancellation()
             let socketURL = try await openSocketURL()
             try Task.checkCancellation()
             await writeState([
-                "socketUrlOpenedAt": .string(Self.nowString()),
+                "socketUrlOpenedAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             ])
             try Task.checkCancellation()
             let socket = session.webSocketTask(with: socketURL)
@@ -88,7 +88,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 let reason = (endingError as? SlackSocketSessionClosure).map(Self.closeReason) ?? "receive_loop_returned"
                 await writeState([
                     "connected": .bool(false),
-                    "receiveLoopEndedAt": .string(Self.nowString()),
+                    "receiveLoopEndedAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                     "lastCloseReason": .string(reason),
                     "waitingOn": .null,
                 ])
@@ -103,14 +103,14 @@ public struct SlackSocketModeLoop: LoopRunner {
         } catch let error where error is CancellationError || Task.isCancelled {
             await writeState([
                 "connected": .bool(false),
-                "cancelledAt": .string(Self.nowString()),
+                "cancelledAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                 "waitingOn": .null,
             ])
             return .skipped(reason: "Slack socket mode canceled")
         } catch {
             await writeState([
                 "connected": .bool(false),
-                "receiveLoopErroredAt": .string(Self.nowString()),
+                "receiveLoopErroredAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                 "waitingOn": .null,
             ])
             await recordError(context: "socket_mode", error: error)
@@ -168,7 +168,7 @@ public struct SlackSocketModeLoop: LoopRunner {
             let type = obj["type"]?.stringValue ?? ""
             // Any received frame proves the socket is alive.
             await writeState([
-                "lastWebSocketMessageAt": .string(Self.nowString()),
+                "lastWebSocketMessageAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                 "lastWebSocketMessageType": .string(type.isEmpty ? "unknown" : type),
             ])
             try Task.checkCancellation()
@@ -176,14 +176,14 @@ public struct SlackSocketModeLoop: LoopRunner {
             case "hello":
                 await writeState([
                     "connected": .bool(true),
-                    "connectedAt": .string(Self.nowString()),
+                    "connectedAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                     "lastError": .null,
                 ])
             case "disconnect":
                 let reason = obj["reason"]?.stringValue ?? "disconnect"
                 await writeState([
                     "connected": .bool(false),
-                    "disconnectedAt": .string(Self.nowString()),
+                    "disconnectedAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                     "disconnectReason": .string(reason),
                 ])
                 throw SlackSocketSessionClosure.disconnect(reason: reason)

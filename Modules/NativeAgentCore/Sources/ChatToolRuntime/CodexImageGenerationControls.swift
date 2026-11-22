@@ -1,6 +1,6 @@
 import Foundation
+import NativeAgentShared
 import ImageIO
-import CryptoKit
 import NativeAgentCore
 // Blueprint: | `CodexImageGenerationControls.swift` | `CodexImageGenerationRequest`: `normalizedForBuiltIn` |
 
@@ -8,7 +8,7 @@ import NativeAgentCore
 struct CodexImageReference: Sendable, Equatable {
     var data: Data
     var mimeType: String
-    var sha256: String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    var sha256: String { SHA256Hex.of(data) }
 
     static let maximumBytes = 8 * 1024 * 1024
     static let maximumTotalBytes = 20 * 1024 * 1024
@@ -60,9 +60,8 @@ struct CodexImageRaster {
 
 extension CodexImageGenerationRequest {
     func normalizedForBuiltIn() throws -> Self {
-        func clean(_ raw: String?) -> String { raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "" }
         var result = self
-        switch clean(quality ?? "auto") {
+        switch TextNormalization.trimmedLowercasedOrEmpty(quality ?? "auto") {
         case "medium": result.quality = "medium"
         case "low": result.quality = "low"
         case "high": result.quality = "high"
@@ -72,7 +71,8 @@ extension CodexImageGenerationRequest {
             """)
         }
         result.outputFormat = try ImageGenerationOutputFormat.decode(outputFormat)
-        result.action = clean(action).isEmpty ? "auto" : clean(action)
+        let normalizedAction = TextNormalization.trimmedLowercasedOrEmpty(action)
+        result.action = normalizedAction.isEmpty ? "auto" : normalizedAction
         guard ["auto", "generate", "edit"].contains(result.action),
               result.action != "edit" || !references.isEmpty else {
             throw ImageGenerationToolError.unsupportedControl("action must be auto, generate or edit; edit requires referenced_image_paths.")

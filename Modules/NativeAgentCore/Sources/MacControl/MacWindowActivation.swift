@@ -1,30 +1,21 @@
 import Foundation
 import Dispatch
 import NativeAgentCore
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(Carbon) && os(macOS)
 import Carbon
 import PersistenceCore
 import TrustCenter
-import CryptoKit
 import CoreGraphics
 import NativeAgentShared
 import UserNotifications
 import Experiences
 import Senses
-#endif
 // Blueprint: | `MacWindowActivation.swift` | `SystemMacAXActSource`: Synchronous raise; event-woken activation off the AX lane; app-only avoids self-AX |
 
-#if canImport(ApplicationServices) && os(macOS)
 extension SystemMacAXActSource {
     /// Only individual AX calls use the AX thread; activation waits stay on the caller's thread.
     public func raise(_ window: MacAXWindowRef, context: MacOperationContext) -> MacAXActOutcome {
-        #if canImport(AppKit)
         // Clear diagnostics before every early return so a refusal cannot inherit another call's cause.
         setRaiseDiagnostic(nil)
         // Apply the same self-process fence as path resolution.
@@ -65,14 +56,10 @@ extension SystemMacAXActSource {
             setRaiseDiagnostic(cause)
             return MacAXActOutcome(status: .failed, emissionAttempted: true, cause: cause, nativeCode: Int(raiseStatus.rawValue))
         }
-        #else
-        return .unsupported
-        #endif
     }
 
     /// App-only activation can restore this app without self-AX; waits stay off the AX thread while inheriting driver authority.
     @concurrent public func activate(pid: Int32, context: MacOperationContext) async -> MacAXActOutcome {
-        #if canImport(AppKit)
         setRaiseDiagnostic(nil)
         guard let app = NSRunningApplication(processIdentifier: pid) else { return .invalidTarget }
         guard context.driver?.allowsEmission(context: context) == true else { return .failed }
@@ -83,9 +70,6 @@ extension SystemMacAXActSource {
             return MacAXActOutcome(status: .failed, emissionAttempted: false, cause: failure)
         }
         return activateAndMeasure(app: app, window: nil, signals: signals, context: context)
-        #else
-        return .unsupported
-        #endif
     }
 
     /// Clear per-attempt diagnostics so later refusals cannot inherit another operation’s cause.
@@ -101,7 +85,6 @@ extension SystemMacAXActSource {
         lastRaiseDiagnostic = value
     }
 
-    #if canImport(AppKit)
     /// Distinguish driver refusal from attempted but unconfirmed activation.
     private func activateAndMeasure(app: NSRunningApplication, window: MacAXWindowRef?, signals: MacWindowActivationSignals,
                                     context: MacOperationContext) -> MacAXActOutcome {
@@ -155,10 +138,8 @@ extension SystemMacAXActSource {
         return !Task.isCancelled && !context.expired && isFrontAndFocused(app: app, window: window, context: context)
     }
 
-    #endif
 }
 
-#if canImport(AppKit)
 /// Each registration is armed before the request and released on every synchronous exit.
 private struct MacWindowActivationSignals {
     let wake: DispatchSemaphore
@@ -181,5 +162,3 @@ private struct MacWindowActivationSignals {
         activation?.stop()
     }
 }
-#endif
-#endif

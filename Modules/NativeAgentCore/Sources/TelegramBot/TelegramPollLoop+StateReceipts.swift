@@ -46,7 +46,7 @@ extension TelegramPollLoop {
             await appendErrorLog(
                 .object([
                     "id": .string(UUID().uuidString),
-                    "at": .string(_tgNowString()),
+                    "at": .string(NativeTimestampFormat.fractionalZulu(Date())),
                     "context": .string("state_read"),
                     "error": .string(String(describing: error)),
                 ]),
@@ -108,7 +108,7 @@ extension TelegramPollLoop {
         if let cached = root["botUsername"]?.stringValue,
            !cached.isEmpty,
            root["botUsernameTokenFingerprint"]?.stringValue == fingerprint,
-           let cachedAt = _tgParseDate(root["botUsernameAt"]?.stringValue),
+           let cachedAt = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(root["botUsernameAt"]?.stringValue),
            Date().timeIntervalSince(cachedAt) < Self.botUsernameCacheSeconds {
             return cached
         }
@@ -119,7 +119,7 @@ extension TelegramPollLoop {
             await writeStatePatch([
                 "botUsername": .string(trimmed),
                 "botUsernameTokenFingerprint": .string(fingerprint),
-                "botUsernameAt": .string(_tgNowString()),
+                "botUsernameAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             ])
             return trimmed
         } catch {
@@ -129,7 +129,6 @@ extension TelegramPollLoop {
     }
 
     func syncCommandMenuIfNeeded() async {
-        guard let syncCommandMenu else { return }
         let root: [String: JSONValue]
         do {
             root = try await Self.readState(dataRoot: dataRoot)
@@ -149,7 +148,7 @@ extension TelegramPollLoop {
                menu["syncedAt"]?.stringValue != nil {
                 return
             }
-            let status = try await syncCommandMenu(token, projection.commands)
+            let status = try await Self.syncCommandMenu(token, projection.commands)
             await commandMenuBackoff.recordSuccess()
             await writeStatePatch([
                 "commandMenu": .object([
@@ -169,7 +168,7 @@ extension TelegramPollLoop {
                     "commandCount": .int(Int64(TelegramCommandRegistry.menuCommandNames.count)),
                     "registryVersion": .string(TelegramCommandRegistry.version),
                     "synced": .bool(false),
-                    "lastAttemptAt": .string(_tgNowString()),
+                    "lastAttemptAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                     "lastSyncError": .string(TurnSecretRedactor.redactText(String(describing: error))),
                     "nextRetryDelaySeconds": .double(retryDelay),
                 ]),
@@ -180,7 +179,7 @@ extension TelegramPollLoop {
     func recordSeen(update: TelegramUpdate) async {
         await writeStatePatch([
             "lastSeenUpdateId": .int(Int64(update.updateId)),
-            "lastSeenAt": .string(_tgNowString()),
+            "lastSeenAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             "lastError": .null,
         ])
     }
@@ -191,7 +190,7 @@ extension TelegramPollLoop {
         message: TelegramMessage?,
         text: String?
     ) async {
-        let at = _tgNowString()
+        let at = NativeTimestampFormat.fractionalZulu(Date())
         var row: [String: JSONValue] = [
             "id": .string(UUID().uuidString),
             "at": .string(at),
@@ -253,7 +252,7 @@ extension TelegramPollLoop {
         text: String? = nil
     ) async {
         let error = TurnSecretRedactor.redactText(rawError)
-        let at = _tgNowString()
+        let at = NativeTimestampFormat.fractionalZulu(Date())
         var row: [String: JSONValue] = [
             "id": .string(UUID().uuidString),
             "at": .string(at),
@@ -345,7 +344,7 @@ extension TelegramPollLoop {
         text: String,
         reply: String
     ) async {
-        let at = _tgNowString()
+        let at = NativeTimestampFormat.fractionalZulu(Date())
         var row: [String: JSONValue] = [
             "id": .string(UUID().uuidString),
             "at": .string(at),

@@ -4,7 +4,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskArchiveQueries.swift` | Archival and locked hierarchy queries; partial archive commits preserve receipts; a retried archive replaces its receipt |
+// Blueprint: | `DeskArchiveQueries.swift` | Locked hierarchy queries and deepest-first archival. Each durable receipt precedes its item's removal and is replaced on retry. |
 extension SwiftNativeDeskStore {
     /// Archive only finished non-standing subtrees: summaries cannot recover unfinished work.
     /// The ops flock keeps validation and deepest-first writes together so no live child is orphaned.
@@ -36,50 +36,69 @@ extension SwiftNativeDeskStore {
             let now = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             // A handle's receipt is the outcome at the archive that removed it: one left by an interrupted archive is replaced, never kept.
             let archived = try await self.archivedRecords()
-            // Deepest-first and receipt-before-op keep partial commits valid and every removal recorded.
-            var targetRecord: ArchiveRecord?
-            var appendedCanonicalOp = false
-            do {
-                for node in Array(subtree.reversed()) + [item] {
-                    let rec = Self.makeArchiveRecord(node, now: now)
-                    let stored = archived.filter { $0.handle == node.handle }
-                    // The caller holds the ops flock; make the receipt durable before removing the item.
-                    if stored.isEmpty {
-                        try await appendJSONLCapped(
-                            rec.toJSON(), to: archivePath, maxLines: JSONLLineCaps.deskArchive,
-                            logLabel: SwiftNativeDeskStore.logLabel,
-                            takeLock: false,
-                            durable: true
-                        )
-                    } else if stored != [rec] {
-                        try await replaceArchiveRecord(rec)
-                    }
-                    let archiveOp = DeskOp(ts: now, handle: node.handle, body: .archiveItem)
-                    // Append every validated op before reducing once for compaction under the same flock.
-                    try await appendOpUnlocked(archiveOp)
-                    feed.ops.append(archiveOp)
-                    feed.noteAppendedRows(1)
-                    appendedCanonicalOp = true
-                    if node.handle == handle { targetRecord = rec }
+            let target = Self.makeArchiveRecord(item, now: now)
+            let records = subtree.reversed().map { Self.makeArchiveRecord($0, now: now) } + [target]
+            // Finish each item's removal before staging the next receipt on the archive shelf.
+            for record in records {
+                let stored = archived.filter { $0.handle == record.handle }
+                if stored.isEmpty {
+                    try await appendJSONLCapped(
+                        record.toJSON(), to: archivePath, maxLines: JSONLLineCaps.deskArchive,
+                        logLabel: SwiftNativeDeskStore.logLabel,
+                        takeLock: false,
+                        durable: true
+                    )
+                } else if stored != [record] {
+                    try await replaceArchiveRecord(record)
                 }
-            } catch {
-                // The feeds cannot commit atomically; readers must observe even a partial committed removal.
-                if appendedCanonicalOp {
-                    changeBus.emit(StoreChange(store: .desk, path: opsPath))
-                }
-                throw error
+                let op = DeskOp(handle: record.handle, body: .archiveItem)
+                feed = try await commitUnlocked([op], feed: feed).feed
             }
-            let archivedState = Self.compact(base: feed.base, feed.ops)
-            changeBus.emit(StoreChange(store: .desk, path: opsPath))
-            _ = try await compactIfNeededUnlocked(state: archivedState, feed: feed)
-            return targetRecord ?? Self.makeArchiveRecord(item, now: now)
+            return target
         }
     }
     /// Durably rewrite the archive with `record` in place of every receipt for its handle. The caller holds the ops flock.
     private func replaceArchiveRecord(_ record: ArchiveRecord) async throws {
-        let others = try await SwiftNativePersistenceCore.readJSONL(archivePath).filter { ArchiveRecord.fromJSON($0)?.handle != record.handle }
+        let replacement = record.toJSON()
+        let saved = try await SwiftNativePersistenceCore.readJSONL(archivePath)
+        var replaced = false
+        var records = saved.compactMap { row -> JSONValue? in
+            guard ArchiveRecord.fromJSON(row)?.handle == record.handle else { return row }
+            guard !replaced else { return nil }
+            replaced = true
+            return replacement
+        }
+        if !replaced { records.append(replacement) }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(
-            try SwiftNativePersistenceCore.serializeJSONL(others + [record.toJSON()]), to: archivePath)
+            try SwiftNativePersistenceCore.serializeJSONL(records), to: archivePath)
+    }
+
+    /// The settlement holds the ops flock, so the note lands on the live item or on its archive receipt.
+    func recordCarriedNotes(_ notes: [String], for item: DeskItem, once: String) async throws {
+        guard !notes.isEmpty else { return }
+        guard MyQueueCarried.occurrenceDate(once) != nil else {
+            throw PersistenceCoreError.ioFailure("The intention's settlement occurrence is unreadable.")
+        }
+        if try await liveState().items.contains(where: { $0.handle == item.handle }) {
+            for note in notes {
+                try await appendNoteIfAbsent(item.handle, marker: note, text: note, author: "agent",
+                                             after: item.updatedAt, carriedOccurrence: once)
+            }
+            return
+        }
+        guard var archived = try await archivedRecords().last(where: { $0.handle == item.handle }) else {
+            throw DeskError.unknownHandle(item.handle)
+        }
+        let before = archived.carriedNotes
+        for note in notes {
+            let text = note.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !archived.carriedNotes.contains(where: { $0.carriedOccurrence == once && $0.text == text }) else { continue }
+            archived.carriedNotes.append(DeskNote(ts: DeskClock.nowISO(), text: text, author: "agent", carriedOccurrence: once))
+        }
+        if archived.carriedNotes != before {
+            try await replaceArchiveRecord(archived)
+            changeBus.emit(StoreChange(store: .desk, path: archivePath))
+        }
     }
     /// Memoize replay on both files’ stat identities under the ops flock, preserving compaction isolation.
     /// Atomic base replacement or tail truncation invalidates the memo.
@@ -364,7 +383,8 @@ extension SwiftNativeDeskStore {
             refs: refs,
             decisions: [],
             artifacts: [],
-            findingKey: item.findingKey
+            findingKey: item.findingKey,
+            carriedNotes: item.notes.filter { $0.carriedOccurrence != nil }
         )
     }
 }

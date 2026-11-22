@@ -260,7 +260,7 @@ extension SwiftNativeBrowserClient {
             throw BrowserOperationStoreError.invalidDeadline
         }
         let digest = Self.browserRequestDigest(for: request)
-        let timestamp = Self.nowISO(now())
+        let timestamp = NativeTimestampFormat.sixDigitUTCOffset(now())
 
         return try await withCanonicalRunsLock {
             if let issue = self.recoveryIssue { throw Self.recoveryRefusal(issue) }
@@ -299,7 +299,7 @@ extension SwiftNativeBrowserClient {
             ]
             if let seconds = request.deadlineSeconds, request.initialState == .running {
                 row["deadlineSeconds"] = .int(Int64(seconds))
-                row["deadlineAt"] = .string(Self.nowISO(now().addingTimeInterval(TimeInterval(seconds))))
+                row["deadlineAt"] = .string(NativeTimestampFormat.sixDigitUTCOffset(now().addingTimeInterval(TimeInterval(seconds))))
             }
             let canonical = JSONValue.object(row)
             rows.append(canonical)
@@ -315,7 +315,7 @@ extension SwiftNativeBrowserClient {
         guard !completion.requestDigest.isEmpty else {
             throw BrowserOperationStoreError.invalidRequestDigest
         }
-        let timestamp = Self.nowISO(now())
+        let timestamp = NativeTimestampFormat.sixDigitUTCOffset(now())
         return try await withCanonicalRunsLock {
             let snapshot = try await Self.readCanonicalSnapshot(at: self.runsPath)
             var rows = snapshot.rows
@@ -367,7 +367,7 @@ extension SwiftNativeBrowserClient {
     }
 
     private func commitCancel(requestedID: String?) async throws -> BrowserOperationCommandResult {
-        let timestamp = Self.nowISO(now())
+        let timestamp = NativeTimestampFormat.sixDigitUTCOffset(now())
         let normalized = requestedID?.trimmingCharacters(in: .whitespacesAndNewlines)
         return try await withCanonicalRunsLock {
             let snapshot = try await Self.readCanonicalSnapshot(at: self.runsPath)
@@ -413,7 +413,7 @@ extension SwiftNativeBrowserClient {
 
     private func recoverStrandedRunning() async throws -> BrowserOperationCommandResult {
         let currentDate = now()
-        let timestamp = Self.nowISO(currentDate)
+        let timestamp = NativeTimestampFormat.sixDigitUTCOffset(currentDate)
         return try await withCanonicalRunsLock {
             let snapshot = try await Self.readCanonicalSnapshot(at: self.runsPath)
             var rows = snapshot.rows

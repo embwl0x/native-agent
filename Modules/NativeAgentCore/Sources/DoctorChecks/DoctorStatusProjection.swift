@@ -23,7 +23,8 @@ public enum DoctorReadout {
         }
         do {
             let open = try await ExperienceStore.at(dataRoot).projection()
-            let repairs = open.filter { $0.owes["repair"]?.phase.isSettled == false }
+            // The shared owed rule, as Home reads it: probes and refusals that changed nothing are not repairs owed.
+            let repairs = open.filter { RepairOwed.isOwed($0) }
             let owed = repairs.map { experience -> CheckResult in
                 let reading = rows.first { experience.outcome?.domain == "doctor.check:" + $0.id }
                 // Retained evidence keeps its human step; only a current measured owner can supply executable repair.
@@ -179,7 +180,7 @@ public enum DoctorReadout {
     public static func supportSnapshotOfflineRollup(_ checks: [CheckResult]) -> String {
         doctorRollup(
             checks
-                .filter { !$0.id.hasPrefix("live.") }
+                .filter { !$0.checkID.hasPrefix("live.") }
                 .map(\.status)
         )
     }

@@ -29,8 +29,6 @@ struct CognitiveSourceWakes: Sendable {
     var horizonNextAt: Date?
     var horizonRunning = false
     var clockDirty = true
-    /// Keep only concurrent writes here; item notes own news rest.
-    var newsReleasesInFlight: Set<String> = []
 
     func cancelObservations() {
         canonObservation?.cancel()
@@ -200,7 +198,7 @@ extension NativeCognitionRuntime {
         sourceWakes.clockDirty = true
         sourceWakes.canonDirty = true
         sourceWakes.horizonDirty = true
-        cachedBodyRead = nil
+        bodyReadOrder.write { cachedBodyRead = nil }
         await rescheduleCognitionMaintenanceDeadline(force: true)
         await rescheduleResidualRepairDeadline()
         guard !isFlushedForTermination, !Task.isCancelled else { return }
@@ -223,9 +221,12 @@ extension NativeCognitionRuntime {
                         lever: "Repair this care's recorded timestamp before reading its movement.")
                     continue
                 }
-                let once = "care:\(care.id.uuidString):\(Int64(milliseconds))"
-                guard seen.insert(once).inserted, !sourceWakes.careMoments.contains(once), care.fadedAt == nil,
-                      !Task.isCancelled else { continue }
+                // Two movements in the same millisecond are two moments: the second gets its own key, the first keeps the key it always had.
+                let base = "care:\(care.id.uuidString):\(Int64(milliseconds))"
+                var once = base, occurrence = 1
+                while seen.contains(once) { occurrence += 1; once = base + "#\(occurrence)" }
+                seen.insert(once)
+                guard !sourceWakes.careMoments.contains(once), care.fadedAt == nil, !Task.isCancelled else { continue }
                 moved.append((care, index, once))
             }
         }

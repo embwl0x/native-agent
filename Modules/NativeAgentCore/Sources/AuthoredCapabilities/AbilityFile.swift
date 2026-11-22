@@ -1,4 +1,3 @@
-import CryptoKit
 import Experiences
 import Darwin
 import Foundation
@@ -350,12 +349,12 @@ extension AbilityStore {
         public var id: String
         public var kind: Kind
         public var metadata: [String: JSONValue]
-        public var body: String { didSet { bodyDigest = Self.digest(body) } }
+        public var body: String { didSet { bodyDigest = SHA256Hex.of(utf8: body) } }
         public private(set) var bodyDigest: String
         public var pathExtension: String
         public init(id: String, kind: Kind, metadata: [String: JSONValue], body: String, pathExtension: String) throws {
             self.id = id; self.kind = kind; self.metadata = metadata; self.body = body; self.pathExtension = pathExtension
-            self.bodyDigest = Self.digest(body)
+            self.bodyDigest = SHA256Hex.of(utf8: body)
             if self.metadata["version"] == nil { self.metadata["version"] = .int(1) }
             let candidate = metadata["candidate"]?.objectValue ?? [:]
             let manifest = candidate["manifest"]?.objectValue ?? [:]
@@ -402,9 +401,6 @@ extension AbilityStore {
             return (metadata["wake"]?.arrayValue ?? []).compactMap(\.stringValue)
         }
         /// The checked decoded file carries its digest; changing its body refreshes it. Derived data does not change source-field equality.
-        private static func digest(_ body: String) -> String {
-            SHA256.hash(data: Data(body.utf8)).map { String(format: "%02x", $0) }.joined()
-        }
         public static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.id == rhs.id && lhs.kind == rhs.kind && lhs.metadata == rhs.metadata
                 && lhs.body == rhs.body && lhs.pathExtension == rhs.pathExtension

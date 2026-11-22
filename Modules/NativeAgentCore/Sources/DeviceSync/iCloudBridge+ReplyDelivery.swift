@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import AppKit
 import Cognition
 import Combine
@@ -9,6 +8,7 @@ import NativeAgentCore
 import ChatTurnRuntime
 import PersistenceCore
 import ProviderRouting
+import Privacy
 import OSLog
 import Network
 // Blueprint: | `iCloudBridge+ReplyDelivery.swift` | Observed acceptance, retained signed recovery and stable control/reply identities. |
@@ -48,7 +48,7 @@ extension iCloudBridge {
                 NotificationCenter.default.post(name: .chatTurnCompleted, object: message.sessionID)
             }
         } catch {
-            syncStatus = "Phone steering outcome delivery remains owed: \(error.localizedDescription)"
+            syncStatus = "Phone outcome delivery remains owed: \(error.localizedDescription)"
         }
     }
 
@@ -60,6 +60,49 @@ extension iCloudBridge {
     nonisolated static func isOutcomePublication(_ metadata: [String: String]?) -> Bool {
         ["steered", "steer_returned"].contains(metadata?["kind"] ?? "")
             || metadata?["kind"] == "notice" && metadata?["steering"] == "true" || isNoPostPublication(metadata)
+            || metadata?["uncheckpointedEnding"] == "true"
+    }
+
+    nonisolated static func terminalPublicationID(_ requestID: String) -> String {
+        "phone-ending-" + MacSyncSnapshotIntegrity.digest(Data(requestID.utf8))
+    }
+
+    nonisolated static func noPostPublicationID(_ requestID: String) -> String {
+        "no-post-" + MacSyncSnapshotIntegrity.digest(Data(requestID.utf8))
+    }
+
+    nonisolated static func phoneErrorDetail(_ text: String) -> String {
+        String(NativeAppSecretRedactor.redactedRemoteErrorDetail(text).prefix(400))
+    }
+
+    /// Retain the terminal envelope when there is no saved response for the run owner to recover.
+    func sendTerminalWithoutSavedReply(_ text: String, kind: String, to message: BridgeMessage,
+                                       sessionID: String?, route: ICloudPhoneRoute, partial: Bool = false,
+                                       notifyCancellation: Bool = false) async -> Bool {
+        let id = Self.terminalPublicationID(message.id)
+        var metadata = ["kind": kind, "uncheckpointedEnding": "true", "transport": "icloud", "source": "mac",
+                        "replyTo": route.replyTo, "targetSourceKey": route.routeKey]
+        if partial { metadata["partialReply"] = "true" }
+        if notifyCancellation { metadata["notifyCancellation"] = "true" }
+        if kind == "error" { metadata["errorDetail"] = Self.phoneErrorDetail(text) }
+        do {
+            _ = try await sendChatMessage(text: text, sessionID: sessionID, correlationID: message.id,
+                metadata: metadata, messageID: id)
+            return true
+        } catch {
+            syncStatus = "Phone outcome delivery remains owed: \(error.localizedDescription)"
+            do {
+                let root = sync.dataRoot
+                return try await sync.storage.perform {
+                    let saved = try Self.retainedReplyPublication(id: id, correlationID: message.id, dataRoot: root)
+                    return saved?.metadata?["uncheckpointedEnding"] == "true"
+                        && saved?.metadata?["targetSourceKey"] == route.routeKey
+                }
+            } catch {
+                nativeLog("[iCloudBridge] phone ending %@ could not be read: %@", id, error.localizedDescription)
+                return false
+            }
+        }
     }
 
     func retainedNoPostState(id: String, correlationID: String) async throws -> String? {
@@ -107,7 +150,7 @@ extension iCloudBridge {
     }
 
     public func recoverReply(_ response: ChatResponse, route: AgentBridgeCompletionRoute, priorVerdict: String? = nil,
-                             liveTurn: Bool = false) async throws -> String {
+                             liveTurn: Bool = false, firstPublication: Bool = false) async throws -> String {
         guard let answerSession = response.sessionId else { throw BridgeError.containerUnavailable }
         // Every phone route is minted with its device and surface (ICloudPhoneRoute, steerChat); a reply never guesses either.
         guard let sourceKey = route.sourceKey, AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(sourceKey) else {
@@ -125,7 +168,9 @@ extension iCloudBridge {
         let transportID = "reply-" + MacSyncSnapshotIntegrity.digest(Data("\(answerSession)\n\(response.runId)".utf8))
         let root = sync.dataRoot
         let reservation = try Self.replyReservation(correlation, session: session, sourceKey: sourceKey, dataRoot: root)
-        let verdict = try await Self.replyVerdict(correlationID: correlation, runID: response.runId, dataRoot: root)
+        let receipts = try await Self.replyReceipts(dataRoot: root)
+        let matching = Self.matchingReplyReceipts(receipts, correlationID: correlation, runID: response.runId)
+        let verdict = Self.replyVerdict(matching: matching)
         if verdict != "completed" {
             var metadata = ["transport": "icloud", "source": "mac", "assistantRunId": response.runId, "replyTo": replyTo,
                             "targetSourceKey": sourceKey, "canonicalAnswerRunId": response.runId,
@@ -135,7 +180,7 @@ extension iCloudBridge {
             switch response.terminalState {
             case .failed:
                 metadata["kind"] = "error"
-                metadata["errorDetail"] = response.statusDetail ?? "The reply could not be completed."
+                metadata["errorDetail"] = Self.phoneErrorDetail(response.statusDetail ?? "The reply could not be completed.")
             case .stopped: metadata["kind"] = "cancelled"
             case .waiting, .interrupted:
                 metadata["kind"] = "incomplete"
@@ -160,17 +205,43 @@ extension iCloudBridge {
                     secret: secret, dataRoot: root) else { throw CocoaError(.fileWriteUnknown) }
             } else {
                 do {
-                    if let saved = try await sync.storage.perform({
-                        try Self.retainedReplyPublication(correlationID: correlation, runID: response.runId, dataRoot: root)
-                    }) {
+                    let legacyIDs = Set(matching.compactMap { $0["messageId"]?.stringValue })
+                    guard reservation.replyPublicationId != nil || legacyIDs.count <= 1 else { throw DeviceSyncError.conflict }
+                    let id = reservation.replyPublicationId ?? legacyIDs.first ?? reservation.outboundMessage?.id ?? transportID
+                    let lookupLegacy = !firstPublication && reservation.replyPublicationId == nil
+                        && legacyIDs.isEmpty && reservation.outboundMessage == nil
+                    let runID = response.runId
+                    let saved = try await sync.storage.perform {
+                        if lookupLegacy {
+                            return try Self.unlinkedReplyPublication(correlationID: correlation, runID: runID, dataRoot: root)
+                        }
+                        return try Self.retainedReplyPublication(id: id, correlationID: correlation, dataRoot: root)
+                    }
+                    if let saved {
+                        guard Self.matchesReplyPublication(saved, correlationID: correlation, runID: runID) else {
+                            throw CocoaError(.fileReadCorruptFile)
+                        }
                         guard saved.sessionID == session else { throw DeviceSyncError.conflict }
                         if let target = saved.metadata?["targetSourceKey"], target != sourceKey { throw DeviceSyncError.conflict }
                         _ = try await sendChatMessage(text: saved.text, sessionID: saved.sessionID, correlationID: saved.correlationID,
                             metadata: saved.metadata, attachments: saved.attachments ?? [], messageID: saved.id, timestamp: saved.timestamp)
                     } else {
-                        let attachments = try ICloudIncomingTurnForwarder.bridgeAttachments(from: response.attachments ?? [],
-                            text: response.output, sessionID: session, correlationID: correlation, metadata: metadata)
-                        _ = try await sendChatMessage(text: response.output, sessionID: session, correlationID: correlation,
+                        guard reservation.replyPublicationId == nil else { throw CocoaError(.fileReadNoSuchFile) }
+                        var text = response.output
+                        let attachments: [NativeAgentShared.MultimodalAttachment]
+                        do {
+                            attachments = try ICloudIncomingTurnForwarder.bridgeAttachments(from: response.attachments ?? [],
+                                text: text, sessionID: session, correlationID: correlation, metadata: metadata)
+                        } catch where firstPublication {
+                            let detail = "NativeAgent couldn't send the reply's attachments to your phone."
+                            nativeLog("[iCloudBridge] reply attachments for %@ could not be prepared: %@", correlation, error.localizedDescription)
+                            metadata["kind"] = "error"
+                            metadata["errorDetail"] = detail
+                            if text.isEmpty { text = detail }
+                            else { metadata["partialReply"] = "true" }
+                            attachments = []
+                        }
+                        _ = try await sendChatMessage(text: text, sessionID: session, correlationID: correlation,
                             metadata: metadata, attachments: attachments, messageID: transportID)
                     }
                 } catch {
@@ -199,15 +270,22 @@ extension iCloudBridge {
     }
 
     nonisolated private static func replyVerdict(rows: [[String: JSONValue]], correlationID: String, runID: String) -> String? {
-        let statuses = rows.compactMap { fields -> String? in
-            guard fields["direction"] == .string("mac_to_ios"),
-                  fields["correlationId"] == .string(correlationID),
-                  isRetainedChatReply(kind: fields["kind"]?.stringValue, canonicalRun: fields["canonicalAnswerRunId"]?.stringValue),
-                  (fields["assistantRunId"] ?? fields["correlationId"]) == .string(runID)
-                    || fields["kind"] == .string("codex_completion") && fields["assistantRunId"] == .string(correlationID),
-                  case .string(let status)? = fields["status"] else { return nil }
-            return status
+        replyVerdict(matching: matchingReplyReceipts(rows, correlationID: correlationID, runID: runID))
+    }
+
+    nonisolated private static func matchingReplyReceipts(_ rows: [[String: JSONValue]], correlationID: String,
+                                                           runID: String) -> [[String: JSONValue]] {
+        rows.filter { fields in
+            fields["direction"] == .string("mac_to_ios")
+                && fields["correlationId"] == .string(correlationID)
+                && isRetainedChatReply(kind: fields["kind"]?.stringValue, canonicalRun: fields["canonicalAnswerRunId"]?.stringValue)
+                && ((fields["assistantRunId"] ?? fields["correlationId"]) == .string(runID)
+                    || fields["kind"] == .string("codex_completion") && fields["assistantRunId"] == .string(correlationID))
         }
+    }
+
+    nonisolated private static func replyVerdict(matching: [[String: JSONValue]]) -> String? {
+        let statuses = matching.compactMap { $0["status"]?.stringValue }
         if statuses.contains("accepted_by_transport") || statuses.contains("confirmed_by_peer") { return "completed" }
         // Unconfirmed submissions remain owed; recovery reuses correlation so the phone retains one reply.
         if statuses.contains("submission_unknown") { return "sent_unconfirmed" }
@@ -217,7 +295,11 @@ extension iCloudBridge {
     func resendSavedReply(_ message: BridgeMessage, route phone: ICloudPhoneRoute, dataRoot: URL) async -> Bool? {
         guard message.text.trimmingCharacters(in: .whitespacesAndNewlines) == "/retry resend" else { return nil }
         do {
-            guard let session = message.sessionID, NativeAgentChatSessionID.normalizedPathComponent(session) == session else { return false }
+            guard let session = message.sessionID, NativeAgentChatSessionID.normalizedPathComponent(session) == session else {
+                guard await sendTerminalWithoutSavedReply("Open a conversation before asking to resend a saved reply.",
+                    kind: "error", to: message, sessionID: nil, route: phone) else { return false }
+                return await Self.finishChat(message, dataRoot: dataRoot)
+            }
             let source = phone.routeKey
             let route = AgentBridgeCompletionRoute(surface: "ios", sessionId: session, sourceKey: source,
                 replyTo: phone.replyTo, correlationId: message.id)
@@ -273,7 +355,8 @@ extension iCloudBridge {
         metadata: [String: String]? = nil,
         attachments: [NativeAgentShared.MultimodalAttachment] = [],
         messageID: String = UUID().uuidString,
-        timestamp: Date? = nil
+        timestamp: Date? = nil,
+        bindNotificationPairing: Bool = false
     ) async throws -> BridgeMessage {
         let root = sync.dataRoot
         let finalReply = correlationID != nil && Self.isRetainedChatReply(
@@ -295,23 +378,28 @@ extension iCloudBridge {
             let values = try JSONValue.fromEncodable(attachments).mapStrings(TurnSecretRedactor.redactText)
             let safeAttachments = try JSONDecoder().decode([NativeAgentShared.MultimodalAttachment].self,
                 from: values.serializedData(pretty: false))
+            let secret = try PairingSecret.loadOrGenerateSecret()
+            var signedMetadata = metadata?.mapValues(TurnSecretRedactor.redactText)
+            if bindNotificationPairing {
+                signedMetadata?[BridgeMessage.notificationPairingKey] = BridgeMessage.pairingFingerprint(secret)
+            }
             let unsigned = BridgeMessage.make(
                 id: messageID,
                 sender: "mac",
                 text: TurnSecretRedactor.redactText(text),
                 sessionID: sessionID,
                 correlationID: correlationID,
-                metadata: metadata?.mapValues(TurnSecretRedactor.redactText),
+                metadata: signedMetadata,
                 attachments: safeAttachments.isEmpty ? nil : safeAttachments,
                 timestamp: timestamp ?? Date()
             )
-            let secret = try PairingSecret.loadOrGenerateSecret()
             return (secret, try unsigned.signed(with: secret))
         }
         let runID = metadata?["assistantRunId"] ?? correlationID ?? messageID
-        if finalReply, !inFlightReplyIDs.insert(runID).inserted { throw BridgeError.containerUnavailable }
-        defer { if finalReply { inFlightReplyIDs.remove(runID) } }
         let outcomePublication = Self.isOutcomePublication(metadata)
+        let inFlightID = finalReply ? runID : outcomePublication ? messageID : nil
+        if let inFlightID, !inFlightReplyIDs.insert(inFlightID).inserted { throw BridgeError.containerUnavailable }
+        defer { if let inFlightID { inFlightReplyIDs.remove(inFlightID) } }
         let retainedPublication = finalReply || outcomePublication
         if outcomePublication, pendingOutcomePublications[messageID] == nil { pendingOutcomePublications[messageID] = signed }
         if finalReply, let correlationID {
@@ -340,6 +428,7 @@ extension iCloudBridge {
         let msg: BridgeMessage
         if retainedPublication {
             msg = try await Self.retainPublication(pendingOutcomePublications[messageID] ?? signed, secret: secret, dataRoot: root)
+            if finalReply { try await Self.linkReplyPublication(msg, dataRoot: root) }
             if outcomePublication { pendingOutcomePublications[messageID] = nil }
         }
         else { msg = signed }
@@ -394,6 +483,12 @@ extension iCloudBridge {
             }
             lastSyncAt = Date()
             syncStatus = "CloudKit accepted message — waiting for iOS"
+            if msg.metadata?["notifyCancellation"] == "true", msg.metadata?["kind"] == "cancelled",
+               let correlationID = msg.correlationID {
+                await sync.relay.sendICloudReplyPushNotification(
+                    text: msg.metadata?["partialReply"] == "true" ? msg.text : "NativeAgent cancelled that reply.",
+                    sessionID: msg.sessionID, correlationID: correlationID, kind: "cancelled")
+            }
             return msg
         }
     }

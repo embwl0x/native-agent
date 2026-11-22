@@ -11,7 +11,6 @@ import ApprovalInbox
 import Darwin
 import CoreFoundation
 import ProviderRouting
-import CryptoKit
 import SQLite3
 import UniformTypeIdentifiers
 // Blueprint: | `AgentContactTaskValues.swift` | Execution and payload debt remain distinct. |
@@ -20,6 +19,9 @@ public enum AgentContactTaskState: String, Codable, Sendable {
     public var terminal: Bool { self == .completed || self == .failed || self == .canceled || self == .stopped }
 }
 public struct AgentContactTask: Codable, Sendable {
+    static let maximumReceiptBytes = AgentContactPart.maximumOutputBytes * 2
+    static let expiredReplyDetail = "The saved reply has expired. This task's outcome is retained; do not resend automatically."
+
     public var lifeID: String?
     public let id: String
     public let context: String
@@ -32,6 +34,8 @@ public struct AgentContactTask: Codable, Sendable {
     public var updated = Date()
     public var canonicalSession: String?
     public var canonicalRunID: String?
+    /// A run pinned before its user row commits is a recovery locator, not acceptance.
+    var awaitingInputCommit: Bool?
     /// Builder routing/provenance only; transcript owns its accepted words and files.
     public var bridgeInput: AgentContactBridgeInput?
     public var acceptedOutputModes: [String]?
@@ -40,6 +44,7 @@ public struct AgentContactTask: Codable, Sendable {
     /// The held send this message names as the one it answers. Whether it did is the send's record, never a copy here.
     public var replyTo: String?
     public var toolResult: JSONValue?
+    var toolExecutionResultClass: ChatToolOutcome.ExactResultClass?
     public var delegatedCompletions: [String: AgentContactPart]?
     public var approvalIDs: Set<String>?
     public var replyPayloadExpired: Bool?
@@ -58,6 +63,36 @@ public struct AgentContactTask: Codable, Sendable {
         !text.isEmpty || !parts.isEmpty || toolResult != nil || failure != nil
             || delegatedCompletions?.isEmpty == false
     }
+    var hasExpiredReplyPayload: Bool {
+        // Older receipts also set the flag for tasks that never had a payload.
+        replyPayloadExpired == true && detail == Self.expiredReplyDetail
+    }
+    var executionResultClass: ChatToolOutcome.ExactResultClass {
+        if let outcome = retainedToolExecution { return outcome }
+        switch state {
+        case .completed:
+            // Old compaction erased raw tool outcomes while keeping their unconditional completed state.
+            if hasExpiredReplyPayload, canonicalRunID == nil, bridgeInput == nil, replyTo == nil { return .unknown }
+            return .succeeded
+        case .failed: return .failed
+        case .canceled, .stopped: return .cancelled
+        default: return .unknown
+        }
+    }
+    var retainedToolExecution: ChatToolOutcome.ExactResultClass? {
+        if let toolExecutionResultClass { return toolExecutionResultClass }
+        // Older bridge dispatch failures were stored as completed with this two-field result.
+        guard state == .completed, canonicalRunID == nil, bridgeInput == nil,
+              let fields = toolResult?.objectValue, fields.count == 2, fields["detail"]?.stringValue != nil else { return nil }
+        switch fields["status"]?.stringValue {
+        case "failed": return .failed
+        case "outcome_unknown": return .unknown
+        default: return nil
+        }
+    }
+    var answeredHeldSend: String? {
+        state == .completed && canonicalRunID == nil ? replyTo : nil
+    }
 }
 public struct AgentContactReplyRecovery: Codable, Sendable {
     public let source: String
@@ -75,6 +110,7 @@ struct AgentContactTurn: Sendable {
     let principal: AgentBridgePrincipal
     let parts: [AgentContactPart]
     var bindRun: @Sendable (String, String) async throws -> Void = { _, _ in }
+    var inputCommitted: @Sendable () async -> Void = {}
     /// Restarted queued input is already canonical in the conversation.
     var accepted: EnqueuedUserMessage? = nil
     var bridgeInput: AgentContactBridgeInput? = nil
@@ -125,11 +161,13 @@ public struct AgentContactJob: Codable, Sendable, Equatable {
     }
 
     /// Retain each readable artifact and name every file whose delivery needs repair.
-    static func fileParts(taskID: String, dataRoot: URL) throws -> (parts: [AgentContactPart], failures: [String]) {
+    static func fileParts(taskID: String, dataRoot: URL, following report: [AgentContactPart]) throws
+        -> (parts: [AgentContactPart], failures: [String]) {
         let entries = try FileManager.default.contentsOfDirectory(at: folder(taskID: taskID, dataRoot: dataRoot),
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        var parts: [AgentContactPart] = []
+        var parts = report
+        var size = try JSONSerialization.data(withJSONObject: parts.map(\.wire03)).count
         var failures: [String] = []
         for entry in entries where !entry.lastPathComponent.hasPrefix(".") {
             do {
@@ -141,7 +179,13 @@ public struct AgentContactJob: Codable, Sendable, Equatable {
                 guard regular else { continue }
                 let mime = UTType(filenameExtension: entry.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
                 let attachment = ChatTurnRuntime.MultimodalAttachment(type: "file", base64: "", mime: mime, name: entry.lastPathComponent, path: entry.path)
-                parts.append(try AgentContactPart.output(attachment, taskID: taskID))
+                let part = try AgentContactPart.output(attachment, taskID: taskID)
+                let added = try JSONSerialization.data(withJSONObject: part.wire03).count + (parts.isEmpty ? 0 : 1)
+                guard size + added <= AgentContactPart.maximumOutputBytes else {
+                    throw AgentContactFailure(code: -32603, message: "File exceeds the remaining reply limit")
+                }
+                parts.append(part)
+                size += added
             } catch { failures.append(entry.path + ": " + ((error as? AgentContactFailure)?.message ?? error.localizedDescription)) }
         }
         return (parts, failures)

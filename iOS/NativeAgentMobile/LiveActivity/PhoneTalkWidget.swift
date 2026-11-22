@@ -47,7 +47,7 @@ struct PhoneTalkWidget: Widget {
 
     private func talkButtons(_ context: ActivityViewContext<PhoneTalkAttributes>) -> some View {
         HStack(spacing: 12) {
-            Button(intent: PhoneTalkMuteIntent(callID: context.attributes.callID)) {
+            Button(intent: PhoneTalkMuteIntent(callID: context.attributes.callID, muted: !context.state.muted)) {
                 Image(systemName: context.state.muted ? "mic.slash.fill" : "mic.fill").frame(width: 44, height: 44)
             }.accessibilityLabel(context.state.muted ? "Unmute" : "Mute")
             Button(intent: PhoneTalkEndIntent(callID: context.attributes.callID)) {

@@ -36,9 +36,7 @@ public enum AgentBridgeSurface {
     }
 
     public static func message(inTurn text: String) -> String? {
-        guard let contact = text.range(of: "\n[Contact: "),
-              let end = text.range(of: "]\n", range: contact.upperBound..<text.endIndex) else { return nil }
-        return String(text[end.upperBound...])
+        PeerTurnEffectPolicy.contactMessage(in: text)
     }
 
     /// Prepend bracketed speaker context so the agent knows its peer and voice learning can exclude routing metadata.

@@ -203,6 +203,22 @@ public enum ContactReplyReads {
         public let request: String
         public let run: String
         public let at: Date
+        public let final: Bool?
+        let textDigest: String?
+        // Older rows stored character offsets.
+        let delivered: [Range<Int>]?
+        let deliveredBytes: [Range<Int>]?
+
+        func byteCoverage(in text: String) -> RangeSet<Int> {
+            if let deliveredBytes { return RangeSet(deliveredBytes) }
+            let ranges: [Range<Int>] = (delivered ?? []).compactMap { range in
+                guard range.lowerBound >= 0,
+                      let start = text.index(text.startIndex, offsetBy: range.lowerBound, limitedBy: text.endIndex),
+                      let end = text.index(start, offsetBy: range.count, limitedBy: text.endIndex) else { return nil }
+                return text[..<start].utf8.count..<text[..<end].utf8.count
+            }
+            return RangeSet(ranges)
+        }
     }
     private static let lock = NSLock()
     public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/reply-reads.json") }
@@ -210,14 +226,25 @@ public enum ContactReplyReads {
         do { return try JSONDecoder().decode([Read].self, from: Data(contentsOf: url(root))) }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
     }
-    public static func record(dataRoot: URL, session: String, request: String, run: String) {
+    public static func record(dataRoot: URL, session: String, request: String, run: String,
+                              text: String, delivered: RangeSet<Int>) {
         guard !session.isEmpty, !request.isEmpty, !run.isEmpty else { return }
+        let digest = SHA256Hex.of(Data(text.utf8))
+        let complete = 0..<text.utf8.count
         lock.withLock {
             do {
                 let file = url(dataRoot)
                 var rows = try read(dataRoot)
-                guard !rows.contains(where: { $0.session == session && $0.request == request && $0.run == run }) else { return }
-                rows.append(Read(session: session, request: request, run: run, at: Date()))
+                let index = rows.lastIndex { $0.session == session && $0.request == request && $0.run == run }
+                let previous = index.map { rows[$0] }.flatMap { $0.textDigest == digest ? $0 : nil }
+                if previous?.final == true { return }
+                let merged = (previous?.byteCoverage(in: text) ?? RangeSet()).union(delivered)
+                let final = complete.isEmpty || merged.ranges.first == complete
+                let coverage = final ? nil : Array(merged.ranges)
+                if previous?.deliveredBytes == coverage, previous?.final == final { return }
+                if let index { rows.remove(at: index) }
+                rows.append(Read(session: session, request: request, run: run, at: Date(),
+                                 final: final, textDigest: digest, delivered: nil, deliveredBytes: coverage))
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(Array(rows.suffix(2048))), to: file)
             } catch {
                 RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "contacts.reply_read", owner: url(dataRoot).path,

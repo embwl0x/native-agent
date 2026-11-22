@@ -3,7 +3,7 @@ import Foundation
 import os
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PeerDataTaint.swift` | `PeerDataTaint`; `mark`; `markConsumed`; `elevate`; `steer` |
+// Blueprint: | `PeerDataTaint.swift` | `PeerDataTaint`; `mark`; `elevate`; `steer` |
 
 public final class PeerDataTaint: @unchecked Sendable {
     private let lock = NSLock()
@@ -62,8 +62,6 @@ public final class PeerDataTaint: @unchecked Sendable {
         let sources = try list("sources"), elevated = try list("elevated")
         return (sources, elevated + (scope == "task" ? sources.filter { !ownerTrusts($0) && !elevated.contains($0) } : []))
     }
-
-    public static func markConsumed(peer: String, line: String = "") {}
 
     public func elevate(peer: String) {
         let name = Self.principal(peer.trimmingCharacters(in: .whitespacesAndNewlines))

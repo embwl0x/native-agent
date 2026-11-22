@@ -82,16 +82,8 @@ extension SchedulerJobNormalizer {
     }
 
     static func scheduleType(_ schedule: [String: JSONValue]) -> String {
-        (string(schedule["type"]) ?? string(schedule["kind"]) ?? "")
+        (schedule["type"]?.stringValue ?? schedule["kind"]?.stringValue ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    /// Current schedule type and the saved oneShot projection agree.
-    public static func isOneShot(_ body: [String: JSONValue], schedule: [String: JSONValue]? = nil) -> Bool {
-        if let minutes = body["in_minutes"], minutes != .null { return true }
-        if case .string? = body["schedule"] { return true }
-        return scheduleType(schedule ?? body["schedule"]?.objectValue ?? [:]) == "once"
-            || body["oneShot"] == .bool(true)
     }
 
     /// Find the next occurrence in the supplied zone, defaulting to the Mac's current zone.
@@ -130,7 +122,7 @@ extension SchedulerJobNormalizer {
                 schedule["day"], schedule["monthday"], schedule["monthDay"],
                 default: 1
             )))
-            let expression = (string(firstPresent(schedule["expression"], schedule["cron"], .string(""))) ?? "")
+            let expression = (firstPresent(schedule["expression"], schedule["cron"], .string(""))?.stringValue ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let fields: CronFields = try typ == "cron" ? cronFields(expression) : (
                 minute: [minute], hour: typ == "hourly" ? Set(0...23) : [hour],

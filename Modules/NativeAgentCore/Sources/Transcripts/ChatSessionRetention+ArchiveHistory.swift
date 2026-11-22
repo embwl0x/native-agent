@@ -7,6 +7,19 @@ import os
 // Blueprint: | `ChatSessionRetention+ArchiveHistory.swift` | Checked archive restoration under index → transcript locks |
 
 extension ChatSessionRetention {
+    /// An append that never finished is cut off before the next one, so it never becomes a damaged interior row.
+    package static func dropUnfinishedArchiveAppend(at index: URL) throws {
+        // Only a missing index is a fresh one; any other read failure refuses the append, never lets a torn tail become an interior row.
+        let bytes: Data
+        do { bytes = try Data(contentsOf: index) } catch CocoaError.fileReadNoSuchFile { return }
+        guard let last = bytes.last, last != 10 else { return }
+        let keep = bytes.lastIndex(of: 10).map { $0 + 1 } ?? bytes.startIndex
+        let handle = try FileHandle(forWritingTo: index)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: UInt64(keep))
+        try handle.synchronize()
+    }
+
     package static func archiveIndexRows(dataRoot: URL) throws -> [[String: JSONValue]] {
         let index = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
         let bytes: Data
@@ -14,7 +27,9 @@ extension ChatSessionRetention {
         catch CocoaError.fileReadNoSuchFile { return [] }
         let directory = dataRoot.appendingPathComponent("chat/archive/messages", isDirectory: true)
             .resolvingSymlinksInPath().standardizedFileURL
-        return try bytes.split(separator: 10).map { line in
+        // A final row without its newline is an append that never finished: not a row. Interior damage still refuses the read.
+        let committed = bytes.last == 10 ? bytes : bytes[..<(bytes.lastIndex(of: 10).map { $0 + 1 } ?? bytes.startIndex)]
+        return try committed.split(separator: 10).map { line in
             guard case .object(let row) = try JSONValue.parse(Data(line)),
                   case .string(let id)? = row["id"],
                   NativeAgentChatSessionID.normalizedPathComponent(id) != nil else {
@@ -81,11 +96,15 @@ extension ChatSessionRetention {
         }
         let chat = dataRoot.appendingPathComponent("chat", isDirectory: true)
         guard var row = try archiveIndexRows(dataRoot: dataRoot).last(where: { $0["id"] == .string(sessionId) }) else { return nil }
-        guard case .string(let relative)? = row["messagesArchivePath"] else {
+        // A conversation archived as verified empty (zero messages, no transcript file) has nothing to recover: it restores empty.
+        let relative: String?
+        if case .string(let path)? = row["messagesArchivePath"] { relative = path }
+        else if row["messageCount"] == .int(0) { relative = nil }
+        else {
             throw PersistenceCoreError.ioFailure("The archived conversation has no transcript path. Its saved history must be repaired before opening it.")
         }
         let archivedBytes: Data
-        do { archivedBytes = try Data(contentsOf: dataRoot.appendingPathComponent(relative)) }
+        do { archivedBytes = try relative.map { try Data(contentsOf: dataRoot.appendingPathComponent($0)) } ?? Data() }
         catch {
             throw PersistenceCoreError.ioFailure(
                 """
@@ -102,7 +121,9 @@ extension ChatSessionRetention {
             catch CocoaError.fileReadNoSuchFile { hot = Data() }
             // The atomic copy may have succeeded before the caller's index commit failed. Its exact prefix also survives later appends.
             if !archivedBytes.isEmpty, hot.starts(with: archivedBytes) { return }
-            try ContactThread.replace(archivedBytes + hot, to: messagesPath)
+            // Two rows are joined by one LF: an archive that ends without its final newline never fuses with the next row.
+            let joint: Data = !archivedBytes.isEmpty && !hot.isEmpty && archivedBytes.last != 10 ? Data([10]) : Data()
+            try ContactThread.replace(archivedBytes + joint + hot, to: messagesPath)
         }
         for key in ["archivedBy", "retentionArchivedAt", "retentionReason", "messagesArchivePath"] {
             row.removeValue(forKey: key)

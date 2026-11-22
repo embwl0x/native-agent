@@ -16,7 +16,7 @@ extension ProvidersFacade {
     func faceRead(on pages: PartFaces) -> PartFaces.Read {
         facePages = pages
         return { [weak self] in
-            guard let self else { throw PartCallError(code: "providers_closed", message: "The provider owner has closed.") }
+            guard let self else { throw PartCallError(code: "providers_closed", message: "Providers closed. Open it again.") }
             return await self.readFace()
         }
     }
@@ -93,7 +93,9 @@ extension ProvidersFacade {
         func words(_ pick: ProviderTurnChoice) -> String {
             let account = settings.providers.first { $0.provider_id == pick.provider }?.display_name ?? pick.provider
             let name = Self.modelsForProvider(pick.provider, providers: settings.providers).first { $0.id == pick.model }?.name
-            return "\(name.flatMap { $0.isEmpty ? nil : $0 } ?? pick.model) on \(account)"
+            // "(OAuth)" says how the account signs in, not what thinks; the account's own row keeps it.
+            let shown = account.replacingOccurrences(of: " \\(OAuth[^)]*\\)", with: "", options: .regularExpression)
+            return "\(name.flatMap { $0.isEmpty ? nil : $0 } ?? pick.model) on \(shown)"
         }
         let overrides = [ProviderSurfaceGroups.work, ProviderSurfaceGroups.mind].compactMap { group -> String? in
             let lead = Self.leadSurface(group, selections: selections)
@@ -137,7 +139,7 @@ extension ProvidersFacade {
         // A picker names its choice; only without one does the row say the saved model itself.
         var rows: [PartFace.Row] = [
             .init(id: prefix + "model", title: "Model", detail: offered.isEmpty ? emptyWords
-                    : "Choosing a model uses its declared thinking default and turns Fast off.",
+                    : "A new model resets thinking and Fast.",
                   value: offered.isEmpty ? pick?.model : nil, tone: offered.isEmpty || unresolvedSelection ? .attention : nil,
                   control: offered.isEmpty ? nil : .choice(options, selected: selected, call: choose("model")))
         ]
@@ -163,7 +165,7 @@ extension ProvidersFacade {
         }
         if group.id != ProviderSurfaceGroups.chat.id {
             rows.append(.init(id: prefix + "use_chat", title: "Same as Chat",
-                detail: "Off pins Chat's current model, account and controls to this group.",
+                detail: "Off: this group keeps its own model and settings.",
                 control: .toggle(!Self.groupHasOverride(group, explicitSurfaces: settings.routing.modelOverrideSurfaces), call: choose("use_chat"))))
         }
         for surface in group.surfaces {
@@ -298,10 +300,10 @@ extension NativeAgentEngine {
                 let ids = settings.providers.map(\.provider_id)
                 let named = provider.isEmpty ? "Pass provider" : "No account called \(provider) is listed"
                 throw PartCallError(code: "provider_row_unavailable", message: named
-                    + (ids.isEmpty ? "; no account is listed. Read Providers again." : ". The accounts listed are: \(ids.joined(separator: ", "))."))
+                    + (ids.isEmpty ? "; no account is listed. Refresh Models." : ". The accounts listed are: \(ids.joined(separator: ", "))."))
             }
             guard account.auth_modes.contains("api_key") || account.auth_modes.contains("oauth") else {
-                throw PartCallError(code: "provider_sign_in_unavailable", message: "Read Providers again for this account's current actions.")
+                throw PartCallError(code: "provider_sign_in_unavailable", message: "Refresh Models for this account's current actions.")
             }
             let opened = "Opened protected entry for \(account.display_name) on the Mac. The connection is ready only after verification."
             if let renderer {
@@ -395,7 +397,7 @@ extension NativeAgentEngine {
             guard let effort = value.stringValue, let pick = selections[lead],
                   let model = ProvidersFacade.modelsForProvider(pick.provider, providers: settings.providers).first(where: { $0.id == pick.model }),
                   model.reasoningCapabilitiesKnown, model.supportedReasoningEfforts.contains(effort) else {
-                throw PartCallError(code: "provider_thinking_unavailable", message: "That thinking level is no longer offered. Read Providers again.")
+                throw PartCallError(code: "provider_thinking_unavailable", message: "That thinking level is no longer offered. Refresh Models.")
             }
             return { [self] in _ = try await saveProviderGroupSelection(group: group, reasoningEffort: effort) }
         case "fast":
@@ -405,7 +407,7 @@ extension NativeAgentEngine {
             guard let pick = selections[lead],
                   ProvidersFacade.modelsForProvider(pick.provider, providers: settings.providers)
                     .first(where: { $0.id == pick.model })?.supportsFast == true else {
-                throw PartCallError(code: "provider_fast_unavailable", message: "This account and model do not offer Fast. Read Providers again.")
+                throw PartCallError(code: "provider_fast_unavailable", message: "This account and model do not offer Fast. Refresh Models.")
             }
             return { [self] in _ = try await saveProviderGroupSelection(group: group, serviceTier: on ? "priority" : "default") }
         case "use_chat":
@@ -436,7 +438,7 @@ extension NativeAgentEngine {
     @MainActor
     private func codexOfferAction(_ answer: String, settings: ProviderSettingsSnapshot) throws -> HostVerbEffect {
         guard let offer = settings.codexCLISessionOffer else {
-            throw PartCallError(code: "codex_offer_unavailable", message: "No Codex CLI sign-in offer is available. Read Providers again.")
+            throw PartCallError(code: "codex_offer_unavailable", message: "No Codex CLI sign-in offer is available. Refresh Models.")
         }
         switch (offer, answer) {
         case (.available, "use"):
@@ -464,7 +466,7 @@ extension NativeAgentEngine {
                 _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
                 return "Unreadable consent backed up as \(backup.lastPathComponent). Choose Use it or Ignore again."
             }
-        default: throw PartCallError(code: "codex_action_unavailable", message: "Read Providers again for this offer's current actions.")
+        default: throw PartCallError(code: "codex_action_unavailable", message: "Refresh Models for this offer's current actions.")
         }
     }
 }

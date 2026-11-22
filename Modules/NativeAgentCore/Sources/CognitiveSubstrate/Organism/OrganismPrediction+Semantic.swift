@@ -1,5 +1,5 @@
 import Foundation
-import CryptoKit
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `OrganismPrediction+Semantic.swift` | `OrganismPredictiveBody`: scoped expectations, reactions and stable IDs |
@@ -40,10 +40,7 @@ public enum OrganismSemanticExpectation {
     }
 
     static func field(_ field: String, in metadata: [String: JSONValue], key: String) -> String? {
-        guard case .object(let object)? = metadata[key],
-              case .string(let raw)? = object[field] else { return nil }
-        let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return clean.isEmpty ? nil : clean
+        metadata[key]?.objectValue?[field]?.trimmedString
     }
 }
 
@@ -180,7 +177,7 @@ extension OrganismPredictiveBody {
             String(format: "%.0f", signal.occurredAt.timeIntervalSince1970.rounded(.towardZero) + 0),
         ]
         let identity = components.map { "\($0.utf8.count):\($0)" }.joined()
-        let digest = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256Hex.of(Data(identity.utf8))
         return "\(OrganismSemanticExpectation.idPrefix):\(digest)"
     }
 }

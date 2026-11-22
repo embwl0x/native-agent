@@ -2,11 +2,9 @@ import Foundation
 import PersistenceCore
 import Senses
 import NativeAgentCore
-#if canImport(Vision) && canImport(ApplicationServices)
 import Vision
 import ApplicationServices
 // Blueprint: | `MacAppWindowText.swift` | `MacAppWindowText`: On-device window OCR; retain only redacted text/positions |
-#endif
 
 /// Read only the named window's pixels so background text recognition cannot capture unrelated desktop content or change focus.
 public enum MacAppWindowText {
@@ -14,17 +12,17 @@ public enum MacAppWindowText {
         if context.observationMode == .passive, try MacScreenLock.isCovered() {
             throw SenseFailure(code: "source_unavailable", message: MacScreenLock.passiveReply)
         }
-        #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
         let source = defaultMacAXElementSource()
         guard case .matched(let app) = MacBackgroundSight.resolve(bundleID, among: source.runningApps()),
               case .object(let anchor)? = window, case .int(let pid)? = anchor["pid"], pid == Int64(app.processIdentifier),
               case .string(let role)? = anchor["role"], case .object(let rect)? = anchor["frame"],
-              let x = number(rect["x"]), let y = number(rect["y"]), let w = number(rect["w"]), let h = number(rect["h"]) else {
+              let x = rect["x"]?.finiteDoubleValue, let y = rect["y"]?.finiteDoubleValue,
+              let w = rect["w"]?.finiteDoubleValue, let h = rect["h"]?.finiteDoubleValue else {
             throw SenseFailure(code: "source_unavailable", message: "App text recognition needs an already-running app with a visible window.")
         }
         let frame = MacAXFrame(x: x, y: y, w: w, h: h)
         let identity = MacAXWindowIdentity(pid: app.processIdentifier, index: nil, role: role,
-            subrole: string(anchor["subrole"]), title: string(anchor["title"]), frame: frame)
+            subrole: anchor["subrole"]?.stringValue, title: anchor["title"]?.stringValue, frame: frame)
         let candidates = source.windowRoots(pid: app.processIdentifier, context: context)
         guard case .matched(let selected, _) = MacAXWindowIdentity.match(identity, among: candidates.map { (handle: $0, identity: $0.identity) }),
               let node = source.attributes(of: selected.ref, context: context), node.frame == frame, node.title == identity.title else {
@@ -69,14 +67,10 @@ public enum MacAppWindowText {
                 message: "The app window changed; recognized text was discarded.")
         }
         return recognized
-        #else
-        throw SenseFailure(code: "source_unavailable", message: "On-device app window text recognition requires macOS Vision.")
-        #endif
     }
 
     /// Whole-window caption redaction precedes mask filtering. Callers supply complete pre/post AX masks for this exact capture.
     public static func readCaptured(_ shot: MacScreenShot, excluding masks: [MacAXFrame]) async throws -> (rows: JSONValue, text: String) {
-        #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
         let bounds = shot.bounds
         guard let image = shot.cgImage, bounds.w > 0, bounds.h > 0,
               shot.pixelWidth > 0, shot.pixelHeight > 0, image.width == shot.pixelWidth, image.height == shot.pixelHeight,
@@ -112,9 +106,6 @@ public enum MacAppWindowText {
             return !imageMasks.contains { $0.intersection(rect).area > 0 }
         }
         return material(visible, geometry: geometry)
-        #else
-        throw SenseFailure(code: "source_unavailable", message: "On-device app window text recognition requires macOS Vision.")
-        #endif
     }
 
     private static func material(_ text: [VisionRecognizedText], geometry: MacScreenViewGeometry) -> (rows: JSONValue, text: String) {
@@ -125,7 +116,6 @@ public enum MacAppWindowText {
         return (.array(rows), text.compactMap { $0.text.display }.joined(separator: "\n"))
     }
 
-    #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
     public static func recognize(image: CGImage) async throws -> [VisionRecognizedText] {
         try Task.checkCancellation()
         let request = VNRecognizeTextRequest()
@@ -167,18 +157,11 @@ public enum MacAppWindowText {
             }.map(\.element)
         }
     }
-    #endif
-    private static func number(_ value: JSONValue?) -> Double? {
-        switch value { case .double(let n)? where n.isFinite: return n; case .int(let n)?: return Double(n); default: return nil }
-    }
-    private static func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value { text } else { nil } }
 }
 
-#if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
 /// VNRequest explicitly supports cancellation from another thread while its synchronous image handler is running.
 private final class WindowTextRecognition: @unchecked Sendable {
     private let request: VNRecognizeTextRequest
     init(request: VNRecognizeTextRequest) { self.request = request }
     func cancel() { request.cancel() }
 }
-#endif

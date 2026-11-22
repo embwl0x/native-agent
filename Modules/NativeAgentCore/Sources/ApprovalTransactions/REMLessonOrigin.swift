@@ -1,5 +1,6 @@
 
 import ChatTurnContracts
+import enum NativeAgentShared.NativeTimestampFormat
 import DreamREMCycle
 import Foundation
 import MemoryV2
@@ -45,7 +46,7 @@ public enum REMLessonOrigin {
         let ranked: [(MemoryRecord, Int)] = try moments.compactMap { record in
             guard (record.status ?? "active") == "active", MemoryMoments.isMoment(record.extras),
                   let session = record.extras?.objectValue?["session_id"]?.stringValue,
-                  let at = MemoryDataProvenance.parseTimestamp(record.observedAt ?? record.createdAt),
+                  let at = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(record.observedAt ?? record.createdAt),
                   days.contains("\(session)|\(MemoryDataProvenance.dayKey(at))"),
                   try ownExchange(record, session: session, peerSessionTrusted: peerSessionTrusted, dataRoot: dataRoot) else { return nil }
             let shared = words(record.text).intersection(about).count
@@ -70,7 +71,7 @@ public enum REMLessonOrigin {
     public static func originText(for row: REMProposalRow, moment: MemoryRecord?) -> String? {
         guard let changed = row.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines),
               !changed.isEmpty else { return nil }
-        let lived = moment.flatMap { MemoryDataProvenance.parseTimestamp($0.observedAt ?? $0.createdAt) }.map { MemoryDataProvenance.dayKey($0) }
+        let lived = moment.flatMap { NativeTimestampFormat.parseOptionalISO8601FractionalFirst($0.observedAt ?? $0.createdAt) }.map { MemoryDataProvenance.dayKey($0) }
             ?? row.livedDates?.last
         let livedClause = lived.map { " (lived \($0))" } ?? ""
         guard let said = moment.flatMap({ $0.extras?.objectValue?["quote"]?.stringValue })?

@@ -1,20 +1,12 @@
 import AuthoredCapabilities
-import CryptoKit
 import ChatTurnContracts
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-import Privacy
 // Blueprint: | `EngineDocumentRead.swift` | Canonical document and structured page reads with held revision-checked phone continuations |
 
 extension NativeAgentEngine {
-    @concurrent public nonisolated func documentPresentation(title: String, text: String, format: String = "plain") async throws
-        -> FaceDocumentPresentation {
-        let safe = NativeAppSecretRedactor.redactText(text)
-        return FaceDocumentPresentation(text: safe, face: try await documentFace(
-            title: NativeAppSecretRedactor.redactText(title), text: safe, format: format))
-    }
     /// This native packet gives the editable document part no calls or levers to act through.
     @concurrent public nonisolated func documentFace(title: String, text: String, format: String = "plain") async throws -> PartFace {
         guard let file = try AbilityStore(dataRoot: dataRoot).read(id: "native-document"),
@@ -37,15 +29,6 @@ extension NativeAgentEngine {
             }
             return face
         }
-    }
-
-    @concurrent public nonisolated func readDocumentPresentation(subject: DocumentSubject) async throws -> FaceDocumentPresentation {
-        let request = DocumentRequest(id: UUID(), subject: subject, presentation: true)
-        let reply = try await EngineFaceProjection.document(request, engine: self, publish: false)
-        guard case .result(let value) = reply else {
-            throw PartCallError(code: "document_unconfirmed", message: "The owner did not return its document presentation.")
-        }
-        return try JSONDecoder().decode(FaceDocumentPresentation.self, from: JSONEncoder().encode(value))
     }
 
     @concurrent public nonisolated func readDocument(subject: DocumentSubject, expectedCall: PartFace.Call? = nil,
@@ -90,7 +73,7 @@ extension NativeAgentEngine {
             guard encoded.count <= 4 * 1024 * 1024 else {
                 throw PartCallError(code: "page_read_too_large", message: "The page demand exceeds 4 MiB; its owner must provide a continuation.")
             }
-            let current = SHA256.hash(data: encoded).map { String(format: "%02x", $0) }.joined()
+            let current = SHA256Hex.of(encoded)
             if let revision, revision != current {
                 throw PartCallError(code: "page_read_changed", message: "This held page changed. Open it again to read a complete revision.")
             }
@@ -110,7 +93,7 @@ extension NativeAgentEngine {
         let text = try await readDocument(subject: request.subject, expectedCall: request.expectedCall, surface: "ios", readUsing: { [tools] call in
             try await tools.pageRead(call, envelope: envelope, turn: turn)
         })
-        let current = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let current = SHA256Hex.of(Data(text.utf8))
         if let revision, revision != current {
             throw PartCallError(code: "document_changed", message: "This document changed during the read. Open it again to read its current revision.")
         }

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Dispatcher
@@ -55,7 +56,7 @@ extension BrowserActionRoutes {
             if dryRun {
                 return NativeActionReceipt(id: UUID().uuidString.lowercased(), actionId: action.id,
                     name: action.name, kind: action.kind, status: "dry_run", dryRun: true,
-                    createdAt: SwiftNativeBrowserClient.nowISO(Date()))
+                    createdAt: NativeTimestampFormat.sixDigitUTCOffset(Date()))
             }
             let capture = try await captureCurrentVisibleBrowser(
                 readText: action.id == "browser.read_text",

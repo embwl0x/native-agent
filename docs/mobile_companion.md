@@ -109,10 +109,17 @@ Every new session creator writes transcript generation zero for its initially
 empty transcript; later transcript writes and clears advance that same index
 counter. A missing generation never authorizes clearing phone history.
 History pages merge both raw records and projected messages in the Mac's order,
-by row identity. The historical membership includes tool records, so overlapping
-later snapshots retain their tool rows and any Mac-provided face/provenance.
-A snapshot with no overlapping records, or an authoritative empty transcript,
-does not retain that historical page.
+by row identity. **Load earlier messages** uses the oldest retained Mac
+record's original ID, including tool records with no chat bubble. Overlapping
+later tail snapshots retain the contiguous prefix of a paged transcript, including
+rows that slid out of the snapshot window and their Mac-provided face and
+provenance. The paging flag follows the oldest retained record. A snapshot that
+starts a different window takes over its own paging cursor, and a complete
+snapshot supplies the full transcript. An unversioned tool-only snapshot preserves
+existing chat bubbles.
+**Answer again** carries the selected reply ID and conversation from the menu. The
+phone submits it only while that reply is still eligible as the last answer in
+the same conversation.
 The phone persists unfinished
 requests and attachment bytes in `ChatPendingExchange.request`; signed expiry
 retains that request for “Send now”. The saved form requires that request and
@@ -130,10 +137,25 @@ the mounted ChatView or talk cover. Push, activation, network/account changes,
 explicit refresh and App Intents request reads. Pending exchanges show waiting
 status immediately and remain observable until signed progress, rejection,
 cancellation or a terminal reply supplies evidence. Silence changes no outcome.
+The Mac's transcript is evidence too: a sent message it shows as received, with an
+answer after it and none of its own (a quit or crash ended that turn), is past; its
+wait closes and the sent words stay.
 
 Session changes retire visible callbacks and waits without deleting durable exchanges or signed sends.
-Stop derives its named runs from the selected conversation's exchange, queue
-and visible transcript provenance. It releases the local composer immediately
+Before sending its first message, Chat binds it to a conversation, creating and
+retaining an ID on the phone when there is no nonarchived anchor in the published
+session list to use.
+The message and Stop carry the same ID whichever reaches the Mac first.
+Before offering a Steer, the phone saves its run ID with the queued message
+until it learns the outcome. Stop captures the selected conversation's open
+runs and those saved Steer IDs at the tap. A delayed Stop cannot cancel a later
+Steer with a different ID. A pending Steer stays available to Stop, and its
+queue control disables Remove while the offer is unresolved for the current
+pairing. If connection repair blocks submission, the phone releases the offer
+for retry. A control handoff from either device stops waiting Steers in that
+conversation. The phone handoff captures the active run and waiting Steer IDs
+together.
+Stop releases the local composer immediately
 and pauses that conversation's queue, retaining the original signed send,
 exchange and delivery evidence until a signed refusal/cancel/terminal receipt
 or saved terminal transcript settles it. Missing acknowledgment never proves
@@ -295,8 +317,9 @@ Only call start/end haptics run, before opening and after closing capture.
 
 An active talk session may keep its audio, existing receive loop and signed
 contact beat running after leaving the app or locking the phone. A Live Activity
-and Dynamic Island show elapsed time, mute and end; their intents reach the
-current call ID in the app process. Audio frames renew the activity's freshness
+and Dynamic Island show elapsed time, mute and end. The button sets the mute
+state shown by its action for that call ID, so repeating the same action leaves
+the microphone in the same state. Audio frames renew the activity's freshness
 every 30 seconds; after 60 seconds without renewal it asks to open the app to
 check, rather than asserting that talk is still active. A cold launch retires
 orphaned talk activities. Live Activities can be disabled by the person; talk
@@ -474,7 +497,7 @@ Use the same Apple Account on the Mac and phone:
    Mac rail, and **Pair with Mac** on the phone.
 2. Wait for the pairing key to arrive through iCloud. Tap **Check for Mac** if
    it has not arrived; tap **Connect** when available.
-3. Match **This phone’s code** to the waiting device on the Mac and choose
+3. Match **This phone’s code** (two groups of four) to the **Code** on the waiting device on the Mac and choose
    **Pair** there. Then tap **Connect** on the phone again.
 4. Keep both apps open until the Mac confirms the connection.
 
@@ -530,12 +553,11 @@ The shared factory alone constructs a CloudKit transport, after
 `DeviceCloudKitPreflight` admits the service and exact container entitlements.
 
 The signed bundle supplies `NativeAgentICloudContainerID` and
-`NativeAgentMobileSourceKey`; the Mac also supplies
-`NativeAgentBackgroundTaskIDPrefix`. The shared identity reader rejects missing,
+`NativeAgentMobileSourceKey`. The shared identity reader rejects missing,
 non-string, unresolved or malformed values. These identities have no process
 environment override or hardcoded runtime default; source-build defaults live in
-the xcconfig files. Invalid configuration refuses transport, message metadata or
-background registration at its caller and reports the build repair. Doctor
+the xcconfig files. Invalid configuration refuses transport or message metadata
+at its caller and reports the build repair. Doctor
 reports an invalid container as a builder-owned failure before checking transport
 health. The Mac publishes chat, cumulative text, pairing and snapshots through
 CloudKit. It sends no KVS progress, notices, snapshot signals or delivery nudges.
@@ -634,8 +656,21 @@ CloudKit has no stream, so reading never rests on a push alone: an open phone re
 every 0.75 s, reads signed Mac presence and renews its own presence every 30 s.
 The Mac's transport owns an independent 20-second receive beat, and reads at the
 phone's 0.75 s pace while the phone has spoken in the last
-60 s. A turn holding the chat drain leaves that pace reading controls, so Stop still
-lands. Each side keeps one dirty follow-up behind an active drain.
+60 s. While a turn holds the chat drain, a concurrent read delivers authenticated
+controls and replies to phone requests the Mac is waiting on. It can fetch those
+records from the bell by ID. Each side keeps one dirty follow-up behind an active drain.
+CloudKit's query index lags a new record by seconds to minutes; a read by ID does
+not. So each side, after a record's save succeeds, rewrites one signed status
+record, its bell (`chat.bell`), naming its newest 32 sent records. The 0.75 s
+reads on both sides, and the Mac's push-woken read, fetch the peer's bell by ID,
+then fetch each listed record they have not yet claimed by ID and deliver it through
+the query's own decoding, delivery and claims, inside the same single drain slot.
+The bell never moves the pull cursor and fetches every listed record not yet delivered, whatever the cursor says: an idle query can slide the cursor past a record CloudKit had not indexed yet, and the bell is what still names it. With no bell
+that verifies (an older peer, or nothing sent yet under this pairing) that read is
+the query. Every other read pass on either side, the Mac's 20-second beat and
+coalesced passes included, reads the bell first and then runs the query as the
+backstop, so a listed record never waits behind a slow query; on an open phone the backstop reads are the push-woken, activation and owed catch-up reads, so a record
+missing from the bell waits for one of them.
 Catch-up has two facts: incomplete work stays owed; a completed failed incoming
 or status read raises the catch-up warning. A skipped/coalesced or still-running
 read alone raises no warning. Only after both the incoming query and the entire
@@ -677,10 +712,13 @@ acceptance and phone seen-ID bookkeeping do not establish that end-to-end fact.
 Reply dispatch reservation, unknown submission and CloudKit acceptance are
 separate receipt states. Only observed acceptance suppresses another send or
 retires a reply checkpoint. The existing chat ledger retains the exact signed
-publication before sending; reconciliation reuses its timestamp, signature and
-record identity by reading the producer's envelope from that ledger, even when
-its receipt was not saved. Ambiguous older receipts without that envelope remain unknown
-until server/phone evidence resolves them. A missing saved reply and checkpoint
+publication before sending and links its ID from the request transaction.
+Reconciliation reads that exact envelope and reuses its timestamp, signature and
+record identity. Older receipts can name their publication directly. When an
+older reply was retained before the transaction or receipt named it, recovery
+verifies and links the matching signed envelope under its original ID.
+Ambiguous older receipts without that envelope remain unknown until server/phone
+evidence resolves them. A missing saved reply and checkpoint
 never manufactures a failed assistant reply. Required receipt writes are checked;
 their failure retains the original request/publication for reconciliation.
 An accepted no-text publication completes its retained ledger row before recovery
@@ -802,7 +840,7 @@ repeated after different movement also has a fresh id, so phone message-id
 deduplication cannot discard it. Run correlation keeps them on the same bubble.
 It uses the phone's existing working line and cannot settle the bubble; only an
 explicit ending does that. Unsent movement coalesces and an ending takes its place.
-Every recovered reply serializes its canonical ending, including on the
+Live and recovered replies serialize the producer's settled ending, including on the
 original correlation: failure, Stop and waiting/interruption use `error`,
 `cancelled` and `incomplete`; completed replies explicitly use `final`.
 An absent canonical ending is `incomplete`, never success. The phone decoder
@@ -824,10 +862,28 @@ A named phone Stop is saved in the existing `icloud/chat_transactions` admission
 row before the Mac acknowledges holding it. The old five-minute, 64-entry
 process-local Stop map is removed. Stop-only rows survive restart and are not
 terminal-retention candidates; absent requests leave their Stop evidence held.
-Admission checks that exact message/session before dispatch, and the forwarder
-checks it again before starting its task's work. Late arrival receives a
+Admission checks that exact message/session before dispatch. The forwarder
+checks again after session preparation, before registering the task that could
+offer the message to an open turn. Late arrival receives a
 `cancelled` reply without executing the request. Unreadable evidence blocks
 admission; a failed Stop write is reported as an action error, never acceptance.
+The signed input stays reserved through forwarder preparation and while it
+waits for turn admission. The admitted operation claims execution. A quit
+before dispatch leaves that exact request eligible to enter again under the
+same ID, within its original request window. Older running rows without a
+bound session also reenter as reservations within that window.
+A superseded request retains its signed cancellation before its input is
+completed. The outstanding publication stays owed on an unconfirmed upload,
+as it does for a request stopped before task registration. Both settle without
+a reply push. Cancellations reported by the registered turn task send the
+reply push after CloudKit accepts the reply.
+A sessionless `/retry resend` receives a retained refusal asking the person to
+open a conversation.
+
+Phone failure details remove absolute directory paths and keep at most
+400 characters. Attachment preparation failures during live delivery retain
+a correlated error, preserving any reply text. If preparation fails during
+recovery, the saved attachment and its reply checkpoint stay owed for retry.
 
 Incoming turns publish snapshots, progress, tool presentation and notices
 through one retained sender, conflated by channel. Stream
@@ -846,11 +902,12 @@ completed CloudKit actions retain their snapshot readback.
 
 The phone sends signed `NativeAgentShared.InboxAction` envelopes and waits for Mac responses.
 Current action payloads use `sessionId`, `runId`, `eventId`, `direction`,
-`deviceId` and `bundleId` where those fields apply. A Desk task is
-`submitDeskTask`, which starts a line of theirs that carries it ([Desk](DESK.md)).
-Memory, approval and inbox actions name `memoryId`, `approvalId`, `itemId` and
-`actionId` respectively. The deployed builds 61/63 still send `approveApproval`,
-`rejectApproval`, `cancelApproval`, `inboxAction` and sealed `interaction_action`.
+`deviceId` and `bundleId` where those fields apply. On iPhone, ask for a
+[Desk task](DESK.md) in Chat. The Desk page's **New task** action opens on Mac.
+Memory rows send `faceAction`. Legacy approval and inbox actions name
+`approvalId` or `itemId` and `actionId`. The deployed builds 61/63 still send
+`approveApproval`, `rejectApproval`, `cancelApproval`, `inboxAction` and sealed
+`interaction_action`.
 The Mac translates those envelopes to its current approval transaction or Inbox
 row, preserving verified paired-device provenance and their readback fields.
 There is no second card executor, no credential admission from these forms, and
@@ -885,12 +942,6 @@ response event, connection lifecycle or explicit cancellation settles the waiter
 a clock. Cancel stops the phone's waiter; it neither claims that the Mac ran nor retracts
 the already signed read. The saved context disclosure remains Mac-only. Memory document
 reads apply the memory owner's iOS disclosure policy.
-
-`MobileHelperEdit.fastIsSet` is a required Boolean in edits and receipts.
-The current phone writes true only when its pinned Fast control was submitted;
-false leaves that control unsubmitted. Missing intent fails decoding before a
-helper mutation. Helper drafts/details are in-memory projections, not another
-persisted edit format. Mac and iPhone ship this contract together.
 
 The signed response carries the approval owner's `result_class` through string serialization; Mac and iPhone transaction settlement share `InboxAction.responseTransactionState`, preserving approval waits and unknown execution independently of decision acceptance.
 Remote cognition consumes that same verdict for provider-failure observations.
@@ -955,8 +1006,9 @@ for location. Keep NativeAgent active on the phone and choose **Share location**
 **Choose photo** or **Open camera**, or cancel. Location and camera permissions
 apply. Requests use CloudKit, one at a time. `wait_seconds` still supplies the
 required `expiresAt` wire field decoded by deployed phones (1–120, default 60;
-`phone.location` uses 20). The current phone and Mac request channel do not use
-that field to expire execution. The enclosing Mac operation deadline still ends
+`phone.location` uses 90, so its call ends at 120 seconds with settlement). The phone fails a request still
+waiting to be presented once `expiresAt` has passed ("Request expired."); a request already presented or in
+progress is never expired by it. The enclosing Mac operation deadline still ends
 its caller's observation; it proves no phone outcome and undoes no action.
 
 The Mac publishes separate snapshots for sessions, trust/providers, approvals,
@@ -1043,7 +1095,8 @@ The remaining minute covers acceptance and the phone's next contact read; an
 unanswered or failed CloudKit operation does not prove availability. The independent
 20-second receive lifetime starts with transport setup and ends on teardown;
 presence failure, ineligibility or an open publication cannot hold it. A held chat
-drain keeps its one queued follow-up and reads controls meanwhile. Presence
+drain keeps its one queued follow-up and reads controls and outstanding phone
+request results meanwhile. Presence
 publication writes only canonical presence; it never advances an unchanged
 faces record's `updatedAt` to satisfy an older freshness display. Builds 61/63
 still decode the unchanged payload shapes, but their fixed freshness labels can
@@ -1181,9 +1234,7 @@ Its shared continuation releases a waiting caller on Stop or an explicitly
 inherited deadline; it adds no default deadline. Queued work that has not started
 is skipped after cancellation; issued filesystem operations retain their own
 completion and cleanup. A write whose wait ended has an unverified commit,
-never proof of non-dispatch. Mac Drive reply receipts keep `commit_unverified`
-until the actual queued file or transport acceptance is observed; replay
-reconciles those receipts before sending. Off-disk copies retain their staged
+never proof of non-dispatch. Off-disk copies retain their staged
 source until physical completion, even after their caller stops waiting.
 `iCloudSyncEngine+Snapshots.swift` composes refresh through Shared's `LatestRead`;
 `SnapshotReading` owns replica/byte decoding and `Transcripts` owns reconciliation/history:
@@ -1195,10 +1246,10 @@ Inbox acceptance immediately. A narrow read cannot retire another snapshot's pen
 read. Every Trust reader (lightweight, Settings, provider controls and direct Trust)
 uses `trustRead`; confirmed Trust receipts and pairing invalidation publish through
 its `write`, so a pre-save read cannot replace the saved policy. Missing or damaged
-Trust reads preserve the accepted policy and report unavailable evidence. Mac app-setting
-rows separately share `appSettingsRead`; admitted saves invalidate pending reads
-and successful row readbacks publish through `write`. Publication advances only;
-each read returns its own result. Lifecycle guards protect transport/root replacement.
+Trust reads preserve the accepted policy and report unavailable evidence. The
+phone's Settings screen draws Mac-owned rows from the shared `settings` face
+in `faces.json` and sends their actions through `faceAction`. Lifecycle guards
+protect transport/root replacement.
 Snapshot loaders return value and health together; only accepted publication updates
 the engine's diagnostics. Refresh outcomes carry the diagnostic text from that acceptance.
 The phone displays Mac-owned state without separate tool or policy authority.
@@ -1214,8 +1265,9 @@ person has disabled Live Activities.
 The Mac's notification router owns approval, Inbox and Desk alerts. The phone
 renders their snapshots and reports snapshot health; it does not create local
 approval or Desk alerts, seed notification baselines, or retry alerts on snapshot
-refresh. `InboxStore` owns refresh and the request for notification permission;
-`ApprovalsStore` exposes the approval snapshot's health. Permission failure is
+refresh. `InboxStore` owns inbox refresh; `MobilePushNotifications.swift` owns the request
+for notification permission; `iCloudSyncEngine` exposes the approval snapshot's
+health (`snapshotHealth`). Permission failure is
 reported by the request, never treated as a posted alert.
 The APNS registration cache distinguishes absence from a malformed present
 record: unreadable bytes are retained and the failure is reported, without
@@ -1265,11 +1317,11 @@ urgency from the router and use the system interruption level; adverse
 importance bypasses the Mac's quiet-hours hold, while iPhone Focus still applies.
 Requested results retain their signed reader's urgency handling.
 The Mac retains each immutable publication before sending, so retries preserve
-its original signed timestamp and content; unreadable or conflicting publication
-state surfaces a repair failure with its bytes preserved. A retry sends the
-retained publication itself; the incoming attempt must match its words. A send
-whose server acceptance is unknown leaves the delivery prediction open; it is
-never reported as a failed delivery.
+its original signed timestamp and content. Unreadable or conflicting publication
+state leaves the retained bytes intact and reports unknown delivery with the
+localized error description. A retry must match the retained publication it
+sends. A send whose server acceptance is unknown leaves the delivery prediction
+open.
 Delivery receipts name the published record and optional wake; a signed phone
 receipt confirms record receipt, not a banner. Without CloudKit, ordinary alert
 publication refuses rather than claiming that a Drive record will render it.
@@ -1296,6 +1348,9 @@ attached photos”. Other attachment kinds add no photo/audio progress label.
 Notification taps persist one destination with its screen and applicable chat,
 Desk or directed-task identity. ContentView consumes it once and hands the
 identity to the destination view, including on cold launch.
+Notification Reply verifies the alert's signed envelope against the current Mac
+pairing before opening the conversation and attempting to queue text. See
+[Siri and notification actions](siri-notification-actions.md#iphone-and-ipad).
 
 Mac and phone toasts use NativeAgentShared's `SystemToastCenter`, with separate
 queue instances and platform rendering. Replacing an ID cancels its prior timer;
@@ -1318,6 +1373,6 @@ presentation. Mac toast capsules render independently in one vertical stack.
 | iOS chat and share import | `iOS/NativeAgentMobile/Sources/ChatStore+*.swift` |
 | Voice-note capture and recognition | `VoiceInputController.swift`, `MobileSpeechAnalyzer.swift`, `ComposerVoiceMicrophone.swift` in iOS Sources |
 | Hands-free talk and voice | `TalkModeController.swift`, `MobileTalkAudio.swift`, `TalkModeView.swift`, `ChatStore+ReplyObservation.swift`; `LiveActivityShared/PhoneTalkAttributes.swift`, `LiveActivity/PhoneTalkWidget.swift`, `ControlSupport/MobileTalkRoute.swift` under iOS; `MultimodalTTS/MultimodalTTS+VoiceSelection.swift` owns Mac voice identity |
-| Shared voice-note presentation | `Modules/NativeAgentShared/Sources/NativeAgentShared/VoiceNoteBubble.swift`; phone `MobileTranscriptAttachments.swift`, Mac `MessageBubble.swift` |
+| Shared voice-note presentation | `Modules/NativeAgentShared/Sources/NativeAgentShared/VoiceNoteBubble.swift`; phone `MobileTranscriptAttachments.swift`, Mac `Sources/NativeAgentFace/TranscriptAttachmentViews.swift` |
 | Phone senses, setup and preferences | `iOS/NativeAgentMobile/Sources/PhonePlaces.swift`, `PhoneSenses.swift`, `PhoneBodyReadings.swift`; shared `PhonePlaceEvent.swift`, `PhoneSenseEvent.swift`; `AppToolRuntime/PhoneSensesGuide.swift` reads setup and exact steps on the pairing page |
 | Mac person presence and evidence | `MacControl/PersonPresence.swift`; `PersistenceCore/PhoneSenseHistory.swift`, `PhonePlaceHistory` in `PersistenceCore.swift`; admission in `DeviceSync/ICloudReceiving.swift` |

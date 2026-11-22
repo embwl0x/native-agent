@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 #if canImport(Compression)
@@ -156,7 +155,7 @@ public enum NAMobileSnapshotStatusCodec {
             group: group,
             encoding: "zlib+base64",
             uncompressedBytes: payload.count,
-            payloadSHA256: sha256(payload),
+            payloadSHA256: SHA256Hex.of(payload),
             payloadBase64: compressed.base64EncodedString()
         )
         let encoder = JSONEncoder()
@@ -200,7 +199,7 @@ public enum NAMobileSnapshotStatusCodec {
             compressed,
             expectedByteCount: envelope.uncompressedBytes
         )
-        guard sha256(payload) == envelope.payloadSHA256 else {
+        guard SHA256Hex.of(payload) == envelope.payloadSHA256 else {
             throw DeviceSyncError.underlying(message: "mobile snapshot payload digest mismatch")
         }
         let decoded = try JSONDecoder().decode(NAMobileSnapshotPayload.self, from: payload)
@@ -210,10 +209,6 @@ public enum NAMobileSnapshotStatusCodec {
             throw DeviceSyncError.underlying(message: "mobile snapshot contained an unsupported filename")
         }
         return decoded.files
-    }
-
-    private static func sha256(_ data: Data) -> String {
-        Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func zlibCompress(_ data: Data) throws -> Data {

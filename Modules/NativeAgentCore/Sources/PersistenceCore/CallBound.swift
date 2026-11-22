@@ -25,18 +25,12 @@ public enum CallBound {
     /// The time the call itself declares, plus settlement; nil when it declares none. Declared times are seconds: `timeout_seconds` on tools,
     /// `timeout` on Mac acts and watch frames, `wait_seconds` on reply observations.
     public static func declaredSeconds(input: [String: JSONValue]) -> TimeInterval? {
-        if let declared = number(input["timeout_seconds"]) ?? number(input["timeout"]) { return max(30, min(3600, declared)) + settlementSeconds }
-        // A contact reply observation ends at its wait and returns while separately admitted work goes on; its call's end comes after it.
-        if let wait = number(input["wait_seconds"]) { return max(0, min(3600, wait)) + settlementSeconds }
-        return nil
-    }
-
-    private static func number(_ value: JSONValue?) -> TimeInterval? {
-        switch value {
-        case .int(let whole)?: TimeInterval(whole)
-        case .double(let real)? where real.isFinite: real
-        default: nil
+        if let declared = input["timeout_seconds"]?.finiteDoubleValue ?? input["timeout"]?.finiteDoubleValue {
+            return max(30, min(3600, declared)) + settlementSeconds
         }
+        // A contact reply observation ends at its wait and returns while separately admitted work goes on; its call's end comes after it.
+        if let wait = input["wait_seconds"]?.finiteDoubleValue { return max(0, min(3600, wait)) + settlementSeconds }
+        return nil
     }
 
     /// The call's own declared time passed; `seconds` is that time with its settlement.

@@ -10,7 +10,8 @@ enum BodyFaceMotor {
         Task {
             for await point in points {
                 do { try await acknowledge(.agentPointerMoved(point), connection: connection, acts: acts) }
-                catch { ModuleLog.app("[face] pointer feedback failed: %@", error.localizedDescription); return }
+                // One failed update loses one frame, never the rest of the drive: the stream ends when the connection does.
+                catch { ModuleLog.app("[face] pointer feedback failed: %@", error.localizedDescription) }
             }
         }
         PersonOnlyWindows.installRenderer(connection: connection, motor: .init(

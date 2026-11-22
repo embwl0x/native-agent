@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentShared
 import MemoryV2
 import Observation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -18,18 +17,13 @@ extension SwiftNativeOnboardingClient {
             return OnboardingCompleteResult(ok: false, error: "invalid_persona_type")
         }
         return try await SwiftNativePersistenceCore.withFileLock(transactionManifestPath) {
-            let targets = Self.expectedTargetURLs(
-                personaRoot: personaRoot,
-                profilePath: profileJSONPath,
-                dataRoot: dataRoot
-            )
             // Refuse before reconciliation can remove persona documents.
-            if let refusal = try profileRepairRefusalLocked(targets: targets) {
+            if let refusal = try profileRepairRefusalLocked() {
                 return refusal
             }
             try await reconcilePendingResetLocked()
             // Reset reconciliation may remove the anchor; decide again over its resulting state.
-            if let refusal = try profileRepairRefusalLocked(targets: targets) {
+            if let refusal = try profileRepairRefusalLocked() {
                 return refusal
             }
             // Absence checking and writing share the profile-file lock.
@@ -51,7 +45,7 @@ extension SwiftNativeOnboardingClient {
                 let intent = OnboardingTargetIntent(
                     role: "profile",
                     content: plan.content,
-                    sha256: Self.sha256(Data(plan.content.utf8)),
+                    sha256: SHA256Hex.of(Data(plan.content.utf8)),
                     baseSHA256: plan.baseSHA256
                 )
                 try Self.ensureCommitted(intent, to: profileJSONPath)
@@ -65,9 +59,7 @@ extension SwiftNativeOnboardingClient {
         }
     }
     /// Caller holds the completion-manifest lock; nil permits repair. Recheck after reset reconciliation.
-    private func profileRepairRefusalLocked(
-        targets: [String: URL]
-    ) throws -> OnboardingCompleteResult? {
+    private func profileRepairRefusalLocked() throws -> OnboardingCompleteResult? {
         if try Self.loadTransactionIfPresent(
             at: transactionManifestPath,
             personaRoot: personaRoot,

@@ -283,33 +283,60 @@ public struct DesktopChatRoute: Sendable {
         // Person-requested sends (the person's own send, or any send in a turn that is the person's own message) go now or report a blocker; only
         // autonomous sends wait for absence.
         let byPerson = turn.personInitiatedSend?.text == text || DesktopLane.askedByPerson(turn)
-        @Sendable func heldForMac(_ detail: String) async -> JSONValue {
-            guard !byPerson, !Task.isCancelled, sendDriver?.handedBack != true,
-                  let live = sendTarget, let row = live.recordID, let operation = live.operationID else {
-                return .object(["status": .string("unavailable"), "sent": .bool(false), "detail": .string(detail)])
-            }
-            do {
-                try await Task.detached {
-                    try AgentConversationStore(dataRoot: dataRoot).holdForMac(id: row, operation: operation, text: text,
-                        conversation: thread, detail: detail)
-                }.value
-                return .object(["status": .string("held"), "reason": .string("mac_busy"), "sent": .bool(false),
-                    "completed": .bool(false), "detail": .string(detail + " Waiting for the Mac to be free; it will go then. Do not send it again.")])
-            } catch {
-                    return .object(["status": .string("unavailable"), "sent": .bool(false),
-                    "detail": .string(detail + " Saving the waiting message failed: " + error.localizedDescription)])
-            }
+        let send = DesktopSend(peerID: peerID, dataRoot: dataRoot, text: text, thread: thread, first: first, byPerson: byPerson,
+                               sendTarget: sendTarget, sendDriver: sendDriver)
+        return await runDesktopSend(turn: turn, mac: mac, name: name, message: message, store: store, send: send)
+    }
+
+    private struct DesktopSend: Sendable {
+        let peerID: String
+        let dataRoot: URL
+        let text: String
+        let thread: String?
+        let first: String?
+        let byPerson: Bool
+        let sendTarget: AgentConversationLiveTarget?
+        let sendDriver: MacDriverBinding?
+    }
+
+    /// Hold an autonomous send for a free Mac when its operation still owns the wait.
+    private func heldForMac(_ detail: String, send: DesktopSend) async -> JSONValue {
+        let (byPerson, sendDriver, sendTarget) = (send.byPerson, send.sendDriver, send.sendTarget)
+        let (dataRoot, text, thread) = (send.dataRoot, send.text, send.thread)
+        guard !byPerson, !Task.isCancelled, sendDriver?.handedBack != true,
+              let live = sendTarget, let row = live.recordID, let operation = live.operationID else {
+            return .object(["status": .string("unavailable"), "sent": .bool(false), "detail": .string(detail)])
         }
-        @Sendable func remember(_ title: String?) async throws {
-            try await Task.detached { try Self.remember(title, replacing: thread, first: first, peerID: peerID, dataRoot: dataRoot) }.value
+        do {
+            try await Task.detached {
+                try AgentConversationStore(dataRoot: dataRoot).holdForMac(id: row, operation: operation, text: text,
+                    conversation: thread, detail: detail)
+            }.value
+            return .object(["status": .string("held"), "reason": .string("mac_busy"), "sent": .bool(false),
+                "completed": .bool(false), "detail": .string(detail + " Waiting for the Mac to be free; it will go then. Do not send it again.")])
+        } catch {
+                return .object(["status": .string("unavailable"), "sent": .bool(false),
+                "detail": .string(detail + " Saving the waiting message failed: " + error.localizedDescription)])
         }
+    }
+
+    /// Save the chat's exact title and opening message.
+    private func remember(_ title: String?, send: DesktopSend) async throws {
+        let (thread, first, peerID, dataRoot) = (send.thread, send.first, send.peerID, send.dataRoot)
+        try await Task.detached { try Self.remember(title, replacing: thread, first: first, peerID: peerID, dataRoot: dataRoot) }.value
+    }
+
+    /// Drive and confirm submission under the desktop lane, then observe its answer.
+    private func runDesktopSend(turn: Turn, mac: MacOperationContext, name: String, message: String, store: AgentPeerStore,
+                                send: DesktopSend) async -> JSONValue {
+        let (byPerson, thread, first, dataRoot) = (send.byPerson, send.thread, send.first, send.dataRoot)
         var submissionConfirmed = false
         let result: Result<(String, String, JSONValue), Error>
         do {
             try Task.checkCancellation()
             guard byPerson || MacPersonInput.presence()?.here == false else {
                 return await heldForMac(MacPersonInput.presence()?.here == true ? MacAttentionSessionStore.personUsingMac
-                    : "I held off because the Mac's input is not yet known to be free. Nothing was sent.")
+                    : "I held off because the Mac's input is not yet known to be free. Nothing was sent.", send: send)
             }
             // Opening the chat, typing and confirming the outgoing row take the one desktop lane; the reply is observed after it, holding nothing.
             let ticket: DesktopLane.Ticket
@@ -333,7 +360,7 @@ public struct DesktopChatRoute: Sendable {
             }
             if ticket.yieldedUntyped {
                 guard byPerson else {
-                    return await heldForMac("The person asked for the desktop, so this message stepped aside before anything was typed.")
+                    return await heldForMac("The person asked for the desktop, so this message stepped aside before anything was typed.", send: send)
                 }
                 return .object(["status": .string("not_sent"), "sent": .bool(false), "completed": .bool(false), "detail": .string("""
                     Set aside for the person's newer desktop request before anything was typed; nothing was sent and nothing of it waits. Send it \
@@ -347,113 +374,125 @@ public struct DesktopChatRoute: Sendable {
         catch { result = .failure(error) }
         let stopped = Task.isCancelled
         let confirmed = submissionConfirmed
-        // An uncertain send keeps its chat, so the thread resumes instead of being orphaned.
-        @Sendable func uncertain(_ detail: String, _ fields: [String: JSONValue] = [:]) async -> JSONValue {
-            var result = fields.merging(["status": .string("outcome_unknown"), "completed": .bool(false),
-                "terminal": .bool(true), "reply_observation": .string("failed"), "detail": .string(detail)]) { $1 }
-            if !lastReply.isEmpty { result["partial_reply"] = .string(lastReply); result["untrusted_remote_data"] = .bool(true) }
-            if confirmed { result["sent"] = .bool(true) }
-            let chat = lastChat
-            if let chat, chat != untitled {
-                result["conversation_id"] = .string(chat)
-                do { try await remember(chat) }
-                catch { result["identity_persistence_error"] = .string("The sent conversation identity could not be saved: "
-                    + error.localizedDescription + ". Repair its identity file; do not repeat the send.") }
-            }
-            return .object(result)
-        }
         return await settle {
-            do {
-                let (reply, title, observation) = try result.get()
-                let identityError: String?
-                do { try await remember(title); identityError = nil }
-                catch { identityError = "The answer arrived, but its conversation identity could not be saved: " + error.localizedDescription
-                    + ". Repair its identity file; do not repeat the send." }
-                let usedRecipe = recipe
-                await Task.detached {
-                    store.recordProof(peerID: peerID, inbound: true, outbound: true)
-                    store.recordRoundTrip(peerID: peerID, workspace: title, recipe: usedRecipe)
-                }.value
-                var answered: [String: JSONValue] = ["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
-                                "sent": .bool(true), "completed": .bool(true), "reply": .string(reply),
-                                "conversation_id": .string(title), "continued": .bool(thread != nil), "untrusted_remote_data": .bool(true)]
-                answered["reply_observation_receipt"] = observation
-                if let identityError { answered["identity_persistence_error"] = .string(identityError) }
-                if thread == nil { answered["detail"] = .string("Opened a new side chat in \(appName) for this conversation.") }
-                return .object(answered)
-            } catch {
-                if let failure = error as? MacAccessibilityReader.NativeReadFailure {
-                    if pressedReturn || confirmed {
-                        return await uncertain(failure.detail + " " + (confirmed
-                            ? "The message was sent; its answer remains unconfirmed. Nothing was resent."
-                            : "Return was posted; message submission is unconfirmed. Nothing was resent."))
-                    }
-                    return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                        "detail": .string(failure.detail + " Nothing was sent.")])
+            await settleDesktopSend(result, mac: mac, name: name, store: store, send: send, stopped: stopped, confirmed: confirmed)
+        }
+    }
+
+    // An uncertain send keeps its chat, so the thread resumes instead of being orphaned.
+    private func uncertain(_ detail: String, _ fields: [String: JSONValue] = [:], send: DesktopSend, confirmed: Bool) async -> JSONValue {
+        var result = fields.merging(["status": .string("outcome_unknown"), "completed": .bool(false),
+            "terminal": .bool(true), "reply_observation": .string("failed"), "detail": .string(detail)]) { $1 }
+        if !lastReply.isEmpty { result["partial_reply"] = .string(lastReply); result["untrusted_remote_data"] = .bool(true) }
+        if confirmed { result["sent"] = .bool(true) }
+        let chat = lastChat
+        if let chat, chat != untitled {
+            result["conversation_id"] = .string(chat)
+            do { try await remember(chat, send: send) }
+            catch { result["identity_persistence_error"] = .string("The sent conversation identity could not be saved: "
+                + error.localizedDescription + ". Repair its identity file; do not repeat the send.") }
+        }
+        return .object(result)
+    }
+
+    /// Record the reply or reconcile the exact submission evidence after driving.
+    private func settleDesktopSend(_ result: Result<(String, String, JSONValue), Error>, mac: MacOperationContext, name: String,
+                                   store: AgentPeerStore, send: DesktopSend, stopped: Bool, confirmed: Bool) async -> JSONValue {
+        let (peerID, thread, sendDriver) = (send.peerID, send.thread, send.sendDriver)
+        do {
+            let (reply, title, observation) = try result.get()
+            let identityError: String?
+            do { try await remember(title, send: send); identityError = nil }
+            catch { identityError = "The answer arrived, but its conversation identity could not be saved: " + error.localizedDescription
+                + ". Repair its identity file; do not repeat the send." }
+            let usedRecipe = recipe
+            await Task.detached {
+                store.recordProof(peerID: peerID, inbound: true, outbound: true)
+                store.recordRoundTrip(peerID: peerID, workspace: title, recipe: usedRecipe)
+            }.value
+            var answered: [String: JSONValue] = ["status": .string("answered"), "agent": .string("peer:" + peerID), "transport": .string("desktopChat"),
+                            "sent": .bool(true), "completed": .bool(true), "reply": .string(reply),
+                            "conversation_id": .string(title), "continued": .bool(thread != nil), "untrusted_remote_data": .bool(true)]
+            answered["reply_observation_receipt"] = observation
+            if let identityError { answered["identity_persistence_error"] = .string(identityError) }
+            if thread == nil { answered["detail"] = .string("Opened a new side chat in \(appName) for this conversation.") }
+            return .object(answered)
+        } catch {
+            if let failure = error as? MacAccessibilityReader.NativeReadFailure {
+                if pressedReturn || confirmed {
+                    return await uncertain(failure.detail + " " + (confirmed
+                        ? "The message was sent; its answer remains unconfirmed. Nothing was resent."
+                        : "Return was posted; message submission is unconfirmed. Nothing was resent."), send: send, confirmed: confirmed)
                 }
-                if confirmed {
-                    if let blocker = error as? Blocker, blocker == .moved {
-                        return await uncertain(blocker.detail(mac: mac, name, app: appName), ["reply_observation": .string("failed"), "terminal": .bool(true)])
-                    }
-                    return await uncertain("""
-                        \(appName)'s answer couldn't be read. The message was sent; check \(name)'s chat in \(appName). It won't be resent \
-                        automatically.
-                        """)
-                }
-                if let covered = error as? MacScreenLock.Covered {
-                    if pressedReturn { return await uncertain(covered.detail + " Return was posted; submission is unconfirmed. Nothing was resent.") }
-                    if covered.code == "human_takeover", !pressedReturn, !stopped { return await heldForMac(covered.detail) }
-                    return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(
-                        covered.detail + " Nothing was sent.")])
-                }
-                // Return the first recipe/window mismatch with its owning repair.
-                if let miss = error as? Mismatch {
-                    let report = said(mac: mac, miss)
-                    return .object(report.fields.merging(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                        "agent": .string("peer:" + peerID), "transport": .string("desktopChat"), "detail": .string(report.detail)]) { $1 })
-                }
-                if let unconfirmed = error as? Unconfirmed {
-                    let report = self.unconfirmed(mac: mac, unconfirmed.rows, name: name)
-                    return await uncertain(report.detail, report.fields)
-                }
-                if let blocker = error as? Blocker {
-                    if blocker == .heldOff, pressedReturn {
-                        return await uncertain("""
-                            You were typing or switched windows, so \(name) stopped using \(appName). Return had already been posted; message \
-                            submission is unconfirmed. Check \(name)'s chat in \(appName) before trying again; nothing was resent.
-                            """)
-                    }
-                    if [.moved, .submission].contains(blocker) || pressedReturn { return await uncertain(blocker.detail(mac: mac, name,
-                        app: appName)) }
-                    if blocker == .heldOff, !stopped {
-                        let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
-                        return await heldForMac(detail)
-                    }
-                    let shown: String?
-                    if blocker == .window {
-                        do { shown = try await MacAccessibilityReader.read(context: mac) { mac in try showing(mac: mac) } }
-                        catch { shown = "an unreadable window: \(error.localizedDescription)" }
-                    } else { shown = nil }
-                    let detail = shown.map { "\(appName) isn't showing its chat; it shows \($0). Nothing was sent." }
-                    var result: [String: JSONValue] = ["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                        "detail": .string(detail ?? blocker.detail(mac: mac, name, app: appName))]
-                    if blocker == .permission { result.merge(Self.permissionFields) { _, new in new } }
-                    // Drop a definitely removed chat handle so a later explicit send can open a new chat.
-                    if blocker == .missing { result["conversation_id"] = .null }
-                    return .object(result)
-                }
-                if let refusal = error as? MacNativeActionFailure, case .driver = refusal,
-                   !pressedReturn, !stopped {
-                    let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
-                    return await heldForMac(detail)
-                }
-                // Before Return, report the specific failure without implying submission.
-                guard pressedReturn else {
-                    return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                                    "detail": .string("\(appName) couldn't be driven: \(error.localizedDescription). Nothing was sent.")])
-                }
-                return await uncertain(Blocker.submission.detail(mac: mac, name, app: appName))
+                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                    "detail": .string(failure.detail + " Nothing was sent.")])
             }
+            if confirmed {
+                if let blocker = error as? Blocker, blocker == .moved {
+                    return await uncertain(blocker.detail(mac: mac, name, app: appName),
+                        ["reply_observation": .string("failed"), "terminal": .bool(true)], send: send, confirmed: confirmed)
+                }
+                return await uncertain("""
+                    \(appName)'s answer couldn't be read. The message was sent; check \(name)'s chat in \(appName). It won't be resent \
+                    automatically.
+                    """, send: send, confirmed: confirmed)
+            }
+            if let covered = error as? MacScreenLock.Covered {
+                if pressedReturn {
+                    return await uncertain(covered.detail + " Return was posted; submission is unconfirmed. Nothing was resent.",
+                        send: send, confirmed: confirmed)
+                }
+                if covered.code == "human_takeover", !pressedReturn, !stopped { return await heldForMac(covered.detail, send: send) }
+                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(
+                    covered.detail + " Nothing was sent.")])
+            }
+            // Return the first recipe/window mismatch with its owning repair.
+            if let miss = error as? Mismatch {
+                let report = said(mac: mac, miss)
+                return .object(report.fields.merging(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                    "agent": .string("peer:" + peerID), "transport": .string("desktopChat"), "detail": .string(report.detail)]) { $1 })
+            }
+            if let unconfirmed = error as? Unconfirmed {
+                let report = self.unconfirmed(mac: mac, unconfirmed.rows, name: name)
+                return await uncertain(report.detail, report.fields, send: send, confirmed: confirmed)
+            }
+            if let blocker = error as? Blocker {
+                if blocker == .heldOff, pressedReturn {
+                    return await uncertain("""
+                        You were typing or switched windows, so \(name) stopped using \(appName). Return had already been posted; message \
+                        submission is unconfirmed. Check \(name)'s chat in \(appName) before trying again; nothing was resent.
+                        """, send: send, confirmed: confirmed)
+                }
+                if [.moved, .submission].contains(blocker) || pressedReturn { return await uncertain(blocker.detail(mac: mac, name,
+                    app: appName), send: send, confirmed: confirmed) }
+                if blocker == .heldOff, !stopped {
+                    let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
+                    return await heldForMac(detail, send: send)
+                }
+                let shown: String?
+                if blocker == .window {
+                    do { shown = try await MacAccessibilityReader.read(context: mac) { mac in try showing(mac: mac) } }
+                    catch { shown = "an unreadable window: \(error.localizedDescription)" }
+                } else { shown = nil }
+                let detail = shown.map { "\(appName) isn't showing its chat; it shows \($0). Nothing was sent." }
+                var result: [String: JSONValue] = ["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                    "detail": .string(detail ?? blocker.detail(mac: mac, name, app: appName))]
+                if blocker == .permission { result.merge(Self.permissionFields) { _, new in new } }
+                // Drop a definitely removed chat handle so a later explicit send can open a new chat.
+                if blocker == .missing { result["conversation_id"] = .null }
+                return .object(result)
+            }
+            if let refusal = error as? MacNativeActionFailure, case .driver = refusal,
+               !pressedReturn, !stopped {
+                let detail = withAgentMacDriver(mac, driver: sendDriver) { mac in MacAttentionSessionStore.sendRefusal(context: mac) }
+                return await heldForMac(detail, send: send)
+            }
+            // Before Return, report the specific failure without implying submission.
+            guard pressedReturn else {
+                return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                                "detail": .string("\(appName) couldn't be driven: \(error.localizedDescription). Nothing was sent.")])
+            }
+            return await uncertain(Blocker.submission.detail(mac: mac, name, app: appName), send: send, confirmed: confirmed)
         }
     }
 
@@ -481,8 +520,11 @@ public struct DesktopChatRoute: Sendable {
         let reopen = opened.reopen
         let chat = opened.chat
         lastChat = chat
-        let key = flat(message)
-        func sent() throws -> Int { try turns(mac: mac, walk(mac: mac, window(mac: mac))).filter { $0.user && flat($0.text) == key }.count }
+        let key = TextNormalization.collapseWhitespace(message)
+        func sent() throws -> Int {
+            try turns(mac: mac, walk(mac: mac, window(mac: mac)))
+                .filter { $0.user && TextNormalization.collapseWhitespace($0.text) == key }.count
+        }
         func ownsChat() throws -> Bool {
             let all = try turns(mac: mac, walk(mac: mac, window(mac: mac)))
             return thread == nil ? all.isEmpty : opensWith(all, first)
@@ -501,11 +543,11 @@ public struct DesktopChatRoute: Sendable {
 
     /// The send's reply observation, after the lane is released: passive reads only, so it holds nothing.
     @concurrent func observe(mac: MacOperationContext, _ message: String, first: String?, driven: Driven) async throws -> (String, String, JSONValue) {
-        let key = flat(message)
+        let key = TextNormalization.collapseWhitespace(message)
         let before = driven.before
         var chat = driven.chat
         func mine(_ turns: [ChatRow]) -> Int? {
-            turns.indices.filter { turns[$0].user && flat(turns[$0].text) == key }.dropFirst(before).first
+            turns.indices.filter { turns[$0].user && TextNormalization.collapseWhitespace(turns[$0].text) == key }.dropFirst(before).first
         }
         let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac)
         defer { events.stop() }
@@ -734,11 +776,11 @@ public struct DesktopChatRoute: Sendable {
         try await until("the message box to take the text", mac: mac) {
             guard front(), try ownsChat(), try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat else { throw Blocker.heldOff }
             guard CFEqual(currentInput, try composerInput(mac: mac, walk(mac: mac, window(mac: mac)))) else { throw Blocker.thread }
-            return flat(try AX.composerValue(mac: mac, currentInput)) == flat(message)
+            return TextNormalization.collapseWhitespace(try AX.composerValue(mac: mac, currentInput)) == TextNormalization.collapseWhitespace(message)
         }
         guard try openTitle(mac: mac, walk(mac: mac, window(mac: mac))) == chat, try ownsChat() else { throw Blocker.thread }
         guard CFEqual(currentInput, try composerInput(mac: mac, walk(mac: mac, window(mac: mac)))),
-              flat(try AX.composerValue(mac: mac, currentInput)) == flat(message) else {
+              TextNormalization.collapseWhitespace(try AX.composerValue(mac: mac, currentInput)) == TextNormalization.collapseWhitespace(message) else {
             throw AX.Failure(detail: "The exact composer did not confirm the full message. Submission stopped; inspect the retained draft before another send.")
         }
         try await keys(36)
@@ -772,7 +814,8 @@ public struct DesktopChatRoute: Sendable {
         let route = Self(recipe: recipe, bundleID: bundle, ui: ui, live: nil)
         let read = try await route.passiveRead(mac: mac)
         guard read.title == label else { return nil }
-        return read.turns.filter { $0.user && route.flat($0.text) == route.flat(message) }.count
+        let key = TextNormalization.collapseWhitespace(message)
+        return read.turns.filter { $0.user && TextNormalization.collapseWhitespace($0.text) == key }.count
     }
 
     struct ChatRow: Sendable { let user: Bool; let text: String }
@@ -1014,10 +1057,8 @@ public struct DesktopChatRoute: Sendable {
 
     func opensWith(_ turns: [ChatRow], _ first: String?) -> Bool {
         guard let first, let opener = turns.first(where: \.user) else { return false }
-        return flat(opener.text) == flat(first)
+        return TextNormalization.collapseWhitespace(opener.text) == TextNormalization.collapseWhitespace(first)
     }
-
-    func flat(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
 
     /// Read the condition after registration, then after its source changes. Silence is cancellable and bounded by the step's patience; when it runs out
     /// the failure says what the step waited for (`step`, in the person's words) and what the app showed instead.

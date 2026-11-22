@@ -85,8 +85,8 @@ pipe EOF. The owner selects either the reply or cancellation once, including
 Stop before its wait registers. Collection and forwarding settle independently
 through `settle`, joining actual producer exit and drain. A collection failure
 stops its producers without replacing its cause with cancellation. After drain,
-a stopped collection delivers its retained partial to the existing partial-reply
-sink and `llm.reply.partial` trace. A missing exit remains pending settlement,
+a stopped collection passes its retained partial to the trace recorder for
+`llm.reply.partial`. A missing exit remains pending settlement,
 never a terminal receipt, and does not hold the cancelled caller. Live chat's
 Stop also ends its stream wait. Codex's plain, structured and streaming calls
 use the same stdout producer, which saves redacted output through
@@ -256,8 +256,11 @@ Mac tool-call deadlines bound the reporting caller and its work waiters, never
 detached settlement. A reporting timeout or Stop without the body's result is
 an unknown effect, not proof of cancellation acknowledgement; the in-flight
 body alone writes its terminal settlement. Reporting uncertainty has no
-`terminalAt`; actual exit replaces it with the body's real result. The registry
-keeps the newest 32 settled results in memory for matching-operation retrieval,
+`terminalAt`; actual exit replaces it with the body's real result. A
+cancellation request atomically records intent or returns the outcome already
+stored. If cancellation wins during policy preflight and preflight refuses,
+the refusal path acknowledges cancellation before any execution starts.
+The registry keeps the newest 32 settled results in memory for matching-operation retrieval,
 including output if lifecycle settlement failed; it never reruns an action to
 retrieve a result. The lifecycle file remains payload-free. After result eviction
 or restart, a lifecycle-only replay says `result_available:false`; interrupted
@@ -291,14 +294,11 @@ saved in its one durable work record through `settle`, even when Stop raced the
 model response. Publication recovers by the section's immutable diary identity.
 Lessons, reflection, care and dated mood delivery checkpoint that record only
 after their checked durable effects land; diary evidence stays byte-stable.
-Disabled reflection settles with its off reason;
-reflection that must wait (its daily ceiling or one in flight), failed reflection and
-care/self persistence remain owed for the next real run, including older and archived dates;
-scheduling alone clears nothing. A held two-hour slot never defers a dream's reflection.
-A returned weekly analysis and its terminal
-outcome are saved in its digest through `settle`; Stop prevents subsequent mood
-changes, proposal staging and practice. Interpretation and reflection follow
-the same law: returned meaning is settlement, never new work.
+Reflection disabled by a switch or a zero budget settles with its off reason.
+A held two-hour slot or an exhausted positive waking budget leaves dream
+reflection eligible. Reflection deferred by an in-flight judgment, failed
+reflection and care/self persistence remain owed for the next real run,
+including older and archived dates. Scheduling alone clears nothing.
 Reflection decodes and validates a returned judgment even if Stop has arrived,
 then saves its result and receipt through `settle`; Stop prevents a later pursuit.
 The runtime retains their hour too: sleep cancels and joins it before the final
@@ -318,16 +318,17 @@ and the agent reads `reason:found_dead` or `reason:ran_out_of_time` with
 `effects:unknown` while the turn goes on. No call is ended by the app's clock. The
 original body keeps its checkpoint until actual exit, records the real receipt
 through `settle`, and emits `tool.dispatch.settled` with the invocation/call
-IDs. A late receipt is evidence, not a replacement response or another
-dispatch. Missing completion stays unknown; neither Stop nor the bound asserts
-effects stopped. The turn engine retains each dispatch's settlement separately
-from its caller; Quit joins it before the final mind save and dependency
-retirement. A quiet call asks what it waits on whether it is alive, and
+IDs. A late receipt is evidence for the original dispatch. If the action already
+reported its committed ID when Stop selected the response, the caller's receipt
+includes that ID and `effects: occurred`. A direct `memory.commit` reports its
+ID before post-save lookups, and settlement carries that evidence through a
+nested cancellation. Effects without confirmation remain unknown. The turn engine
+retains each dispatch's settlement separately from its caller. Quit joins it
+before the final mind save and dependency retirement. A quiet call asks what
+it waits on whether it is alive, and
 a person's wait is never silence;
 [turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline)
-owns where it comes from and where nested calls take theirs. Practice keep turns retain
-their `TurnBodyLifetime` cancellation/join behavior; `TurnDeadline` owns their
-response verdict separately.
+owns where it comes from and where nested calls take theirs.
 
 Local Calendar and Reminders check cancellation at their EventKit save/remove
 boundary, including writes whose selection awaited an EventKit read.

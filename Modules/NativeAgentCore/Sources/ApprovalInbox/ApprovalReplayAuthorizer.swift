@@ -59,12 +59,12 @@ public struct ApprovalInboxApprovedReplayVerifier: Sendable {
         if record.executedAction != nil { return .alreadyConsumed }
         guard case .object(let payload) = record.payload else { return .malformedRecord }
 
-        let recordTool = Self.string(payload["toolName"])
-            ?? Self.string(payload["tool"])
+        let recordTool = payload["toolName"]?.trimmedString
+            ?? payload["tool"]?.trimmedString
             ?? record.action
         guard sameTool(recordTool, tool) else { return .toolMismatch }
-        if let recordSurface = Self.string(payload["surface"]),
-           Self.normalized(recordSurface) != Self.normalized(surface) {
+        if let recordSurface = payload["surface"]?.trimmedString,
+           TextNormalization.trimmedLowercased(recordSurface) != TextNormalization.trimmedLowercased(surface) {
             return .surfaceMismatch
         }
         guard case .object(let recordInput)? = payload["input"] else { return .malformedRecord }
@@ -73,14 +73,14 @@ public struct ApprovalInboxApprovedReplayVerifier: Sendable {
         // Replay authority requires the executor's durable spend, not just an approval id.
         do {
             return try await inbox.consumeApprovedReplayDispatch(id: id) { marker in
-                guard let spentAction = Self.string(marker["action"]),
+                guard let spentAction = marker["action"]?.trimmedString,
                       sameTool(spentAction, tool),
-                      let spentSurface = Self.string(marker["surface"]),
-                      Self.normalized(spentSurface) == Self.normalized(surface),
-                      let spentAt = Self.string(marker["spentAt"]),
+                      let spentSurface = marker["surface"]?.trimmedString,
+                      TextNormalization.trimmedLowercased(spentSurface) == TextNormalization.trimmedLowercased(surface),
+                      let spentAt = marker["spentAt"]?.trimmedString,
                       let spentDate = NativeTimestampFormat.parseISO8601(spentAt) else { return false }
-                guard let spentDigest = Self.string(marker["digest"]),
-                      Self.normalized(spentDigest) == Self.effectDigest(record.payload) else { return false }
+                guard let spentDigest = marker["digest"]?.trimmedString,
+                      TextNormalization.trimmedLowercased(spentDigest) == Self.effectDigest(record.payload) else { return false }
                 let age = now().timeIntervalSince(spentDate)
                 return age >= -60 && age <= Self.spendFreshnessSeconds
             }
@@ -89,23 +89,13 @@ public struct ApprovalInboxApprovedReplayVerifier: Sendable {
 
     private func sameTool(_ lhs: String, _ rhs: String) -> Bool {
         // Compare canonical names because storage retains caller spelling while dispatch canonicalizes aliases.
-        Self.normalized(canonicalTool(lhs))
-            == Self.normalized(canonicalTool(rhs))
+        TextNormalization.trimmedLowercased(canonicalTool(lhs))
+            == TextNormalization.trimmedLowercased(canonicalTool(rhs))
     }
 
     /// The digest the executor stores in the spend marker: SHA-256 over the approval record payload's compact (sorted-key, so stable) serialization.
     public static func effectDigest(_ payload: JSONValue) -> String {
         let bytes = (try? payload.serializedData(pretty: false)) ?? Data()
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let s)? = value else { return nil }
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func normalized(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 }

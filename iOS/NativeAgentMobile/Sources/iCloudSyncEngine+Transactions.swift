@@ -102,7 +102,7 @@ extension iCloudSyncEngine {
                                    settlesAnswersFromPreviousPairing: true)
             return true
         } catch {
-            syncError = "CloudKit action response could not be read or settled: \(error.localizedDescription)"
+            syncError = "Couldn\u{2019}t read your Mac\u{2019}s reply: \(error.localizedDescription)"
             return false
         }
     }

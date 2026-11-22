@@ -472,17 +472,9 @@ public actor SwiftNativeMemoryV2 {
     }
 
     /// Vectors from the already-resident model, or nil; never loads.
-    public func embedIfWarm(_ texts: [String], requireFullText: Bool = false) async throws -> [[Float]]? {
-        try await embedIfWarmWithEpoch(texts, requireFullText: requireFullText)?.vectors
-    }
-
     public func embedIfWarmWithEpoch(_ texts: [String], requireFullText: Bool = false) async throws -> MemoryEmbeddingBatch? {
         guard let managed = embedder as? ManagedEmbeddingProvider else { return nil }
         return try await managed.embedIfResidentWithEpoch(texts, requireFullText: requireFullText)
-    }
-
-    func coversCompleteTextsIfWarm(_ texts: [String]) -> Bool? {
-        (embedder as? ManagedEmbeddingProvider)?.coversCompleteTextsIfResident(texts)
     }
 
     public func managedEmbeddingRuntime() async throws -> ManagedEmbeddingProvider {
@@ -722,17 +714,12 @@ public actor SwiftNativeMemoryV2 {
     }
 
     private static func patchKind(_ obj: [String: JSONValue]) -> String? {
-        if case .string(let kind)? = obj["kind"] { return trimmedKind(kind) }
-        if case .string(let kind)? = obj["memoryKind"] { return trimmedKind(kind) }
+        if case .string(let kind)? = obj["kind"] { return kind.trimmedNonEmpty }
+        if case .string(let kind)? = obj["memoryKind"] { return kind.trimmedNonEmpty }
         guard case .object(let meta)? = obj["metadata"],
               case .string(let kind)? = meta["kind"] else {
             return nil
         }
-        return trimmedKind(kind)
-    }
-
-    private static func trimmedKind(_ kind: String) -> String? {
-        let trimmed = kind.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        return kind.trimmedNonEmpty
     }
 }

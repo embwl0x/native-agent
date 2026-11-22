@@ -1,7 +1,6 @@
 #if canImport(CloudKit) && !os(Linux)
 import Foundation
 import CloudKit
-import CryptoKit
 import OSLog
 // Blueprint: | `CloudKitDeviceTransport+Retention.swift` | Bounded oldest-page record retention; subsequent sweeps advance through confirmed deletions |
 
@@ -70,7 +69,9 @@ extension CloudKitDeviceTransport {
     /// verify under that key was written under another pairing (an earlier key, an earlier install) and can never be read, so it is deleted.
     /// Only those two record types, only records carrying a signed inline envelope; pairing, status and snapshot records are never touched. A
     /// record whose payload is an encrypted asset, or that carries no signature, is left to retention. Idempotent: a second pass finds nothing.
-    public func deleteRecordsSignedWithOtherKeys(current secret: Data) async throws -> Int {
+    /// `stillCurrent` is asked before every delete: a key rotated during the pass stops it, so a message signed with the new key is never
+    /// judged by the old one.
+    public func deleteRecordsSignedWithOtherKeys(current secret: Data, stillCurrent: @escaping @Sendable () async -> Bool = { true }) async throws -> Int {
         guard role == .mac, holdsPairing, secret.count == 32 else { return 0 }
         var deleted = 0
         for recordType in [NADeviceSyncRecordType.chatMessage, NADeviceSyncRecordType.notification] {
@@ -81,6 +82,7 @@ extension CloudKitDeviceTransport {
                     let page = try await self.foreignKeyPage(recordType: recordType, cursor: cursor, secret: secret)
                     cursor = page.cursor
                     for start in stride(from: 0, to: page.names.count, by: 400) {
+                        guard await stillCurrent() else { return count }
                         let ids = page.names[start..<min(start + 400, page.names.count)].map { CKRecord.ID(recordName: $0) }
                         let op = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: ids)
                         op.qualityOfService = .utility

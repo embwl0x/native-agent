@@ -257,16 +257,16 @@ extension StudioContext {
 
     /// Keep judgments in the journal; canon pointers must lead back to the original entries.
     static func canonBody(_ member: StudioCanonMember) -> String {
-        let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(member.workTitle), to: 120)
+        let title = TextClipping.prefix(NativeContextProjectionText.clean(member.workTitle), to: 120)
         guard !title.isEmpty else { return "" }
         var head = title
         if let creator = member.workCreator.map(NativeContextProjectionText.clean), !creator.isEmpty {
-            head += " — " + NativeContextProjectionText.bounded(creator, to: 80)
+            head += " — " + TextClipping.prefix(creator, to: 80)
         }
         var parts = [
             head,
             member.standing == .canon ? "canon" : "anti-canon",
-            "since \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(member.since), to: 40))",
+            "since \(TextClipping.prefix(NativeContextProjectionText.clean(member.since), to: 40))",
         ]
         if !member.evidenceEntryIDs.isEmpty {
             parts.append("evidence \(member.evidenceEntryIDs.count) entries")
@@ -282,14 +282,14 @@ extension StudioContext {
 
     /// Omit the response so a pointer cannot pre-empt the judgment.
     static func body(_ entry: StudioJournalEntry) -> String {
-        let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(entry.work.title), to: 120)
+        let title = TextClipping.prefix(NativeContextProjectionText.clean(entry.work.title), to: 120)
         guard !title.isEmpty else { return "" }
         var head = title
         if let creator = entry.work.creator.map(NativeContextProjectionText.clean), !creator.isEmpty {
-            head += " — " + NativeContextProjectionText.bounded(creator, to: 80)
+            head += " — " + TextClipping.prefix(creator, to: 80)
         }
         if let medium = entry.work.medium.map(NativeContextProjectionText.clean), !medium.isEmpty {
-            head += " (" + NativeContextProjectionText.bounded(medium, to: 48) + ")"
+            head += " (" + TextClipping.prefix(medium, to: 48) + ")"
         }
         var parts = [head, "journal \(entry.id)", "stance \(entry.stance.kind.rawValue)"]
         // Mark withdrawn claims on the pointer so corrections are visible before the entry is pulled.
@@ -298,9 +298,9 @@ extension StudioContext {
         }
         // Refs stay text; context projection cannot open a path or fetch a URL.
         if let ref = entry.artifactRefs.first.map(NativeContextProjectionText.clean), !ref.isEmpty {
-            parts.append("ref \(NativeContextProjectionText.bounded(ref, to: 120))")
+            parts.append("ref \(TextClipping.prefix(ref, to: 120))")
         }
-        parts.append("pull: app studio.recall title=\"\(NativeContextProjectionText.bounded(title, to: 80))\"")
+        parts.append("pull: app studio.recall title=\"\(TextClipping.prefix(title, to: 80))\"")
         return parts.joined(separator: " · ")
     }
 
@@ -347,7 +347,7 @@ extension StudioContext {
         var result: [ContextEntity] = []
         var seen = Set<String>()
         for label in [work.title, work.creator ?? "", work.medium ?? ""] {
-            let cleaned = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(label), to: 120)
+            let cleaned = TextClipping.prefix(NativeContextProjectionText.clean(label), to: 120)
             guard !cleaned.isEmpty, seen.insert(fold(cleaned)).inserted else { continue }
             result.append(ContextEntity(
                 kind: ContextCorrectionScope.studioEntityKind,

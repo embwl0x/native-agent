@@ -158,7 +158,7 @@ extension SwiftNativePersonaEngine {
             throw PersonaWriteError.ioFailure("Could not create backup: \(error.localizedDescription)")
         }
         // Refuse the edit if backup retention fails, preserving both prior content and the new recovery copy.
-        do { try pruneOldBackups(for: target, keeping: backupRetention) }
+        do { try pruneOldBackups(for: target, keeping: backupRetention, sparing: backupURL) }
         catch {
             throw PersonaWriteError.ioFailure(
                 """
@@ -173,15 +173,23 @@ extension SwiftNativePersonaEngine {
 
     /// Scope retention to the exact target's timestamped backup prefix so cleanup cannot remove unrelated files.
     /// Inspection or deletion failure refuses the pending edit.
-    static func pruneOldBackups(for target: URL, keeping: Int) throws {
+    static func pruneOldBackups(for target: URL, keeping: Int, sparing kept: URL? = nil) throws {
         guard keeping >= 0 else { return }
         let dir = target.deletingLastPathComponent()
         let prefix = target.lastPathComponent + ".pre-"
         let entries = try FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
         )
+        // Only copies this code made: a regular file named exactly <prefix><timestamp>-<8 hex>.bak. A folder or a hand-named copy is never
+        // touched, and the copy just made is never pruned (a clock correction can make older copies sort later).
+        let generated = #/^\d{8}T\d{12}Z-[0-9a-f]{8}$/#
         let backups = entries
-            .filter { $0.lastPathComponent.hasPrefix(prefix) && $0.lastPathComponent.hasSuffix(".bak") && !$0.lastPathComponent.contains(".pre-reset-") }
+            .filter { url in
+                let name = url.lastPathComponent
+                guard name.hasPrefix(prefix), name.hasSuffix(".bak"), url.standardizedFileURL != kept?.standardizedFileURL,
+                      (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { return false }
+                return String(name.dropFirst(prefix.count).dropLast(".bak".count)).wholeMatch(of: generated) != nil
+            }
             .sorted { $0.lastPathComponent > $1.lastPathComponent }
         guard backups.count > keeping else { return }
         for stale in backups.dropFirst(keeping) {

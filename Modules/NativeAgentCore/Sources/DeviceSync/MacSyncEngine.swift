@@ -1,12 +1,11 @@
-import CommonCrypto
 import CognitiveSubstrate
-import CryptoKit
 import AppKit
 import Cognition
 import Foundation
 import Combine
 import NativeAgentShared
 import NativeAgentCore
+import ChatTurnRuntime
 import MemoryV2
 import PersistenceCore
 
@@ -75,9 +74,11 @@ public final class MacSyncEngine: ObservableObject {
         case noActiveTask
     }
 
-    /// One phone message's outcome; `readBy` names the agent's turn in progress when that turn read it instead.
-    public typealias ICloudChatOutcome = (text: String, deltaSeq: Int, error: String?, toolEvents: Int,
-        attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?, readBy: String?)
+    public enum ICloudChatOutcome: Sendable {
+        case undispatched
+        case steered(readBy: String)
+        case ran(Result<ChatResponse, any Error>, partial: String)
+    }
 
     /// The turn's iOS correlation ID binds scoped Stop to its task within the session.
     struct ActiveChatTask {
@@ -112,27 +113,33 @@ public final class MacSyncEngine: ObservableObject {
         }
     }
 
-    public func activeChatRunID(for sessionID: String) -> String? {
-        activeChatTasks[sessionID]?.runID
+    public func chatRunIDsForControlHandoff(for sessionID: String) -> [String] {
+        let active = activeChatTasks[sessionID]?.runID
+        return (active.map { [$0] } ?? []) + Array(waitingSteers[sessionID, default: [:]].keys)
     }
 
     /// The phone's Steers still waiting for the agent's turn, by conversation and run: Stop there settles them as stopped.
     var waitingSteers: [String: [String: @Sendable () -> Void]] = [:]
 
-    /// Stop only the caller's named runs; a different run occupying the session must remain untouched.
-    /// A Stop in the conversation also stops the phone's Steers still waiting there, so none is sent again after it.
+    /// A scoped Stop names exact runs. A session-wide handoff cancels the active task and every waiting Steer.
     public func cancelActiveChatTask(for sessionID: String, runIDs: [String] = []) -> MacSyncChatCancelOutcome {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noActiveTask }
-        for stop in (waitingSteers.removeValue(forKey: trimmed) ?? [:]).values { stop() }
-        guard let entry = activeChatTasks[trimmed] else {
-            // The action router durably retained this named Stop before task cancellation.
-            guard !runIDs.isEmpty else { return .noActiveTask }
-            return .noActiveTask
+        var stoppedSteer = false
+        let steerIDs = runIDs.isEmpty ? (waitingSteers[trimmed].map { Array($0.keys) } ?? []) : runIDs
+        for runID in steerIDs {
+            if let stop = waitingSteers[trimmed]?.removeValue(forKey: runID) {
+                stop()
+                stoppedSteer = true
+            }
         }
-        if !runIDs.isEmpty, let runID = entry.runID, !runIDs.contains(runID) {
+        if waitingSteers[trimmed]?.isEmpty == true { waitingSteers[trimmed] = nil }
+        guard let entry = activeChatTasks[trimmed] else {
+            return stoppedSteer ? .cancelled : .noActiveTask
+        }
+        if !runIDs.isEmpty, !runIDs.contains(where: { $0 == entry.runID }) {
             // Leave the other run untouched; the router retained the named Stop.
-            return .runMismatch
+            return stoppedSteer ? .cancelled : .runMismatch
         }
         entry.task.cancel()
         return .cancelled

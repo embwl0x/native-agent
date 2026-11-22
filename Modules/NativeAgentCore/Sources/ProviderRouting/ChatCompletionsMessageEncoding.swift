@@ -32,7 +32,7 @@ func checkedProviderJSONText(_ data: Data, owner: String) throws -> String {
     return text
 }
 
-/// Tool calls precede their results; images stay on messages without calls. Moonshot replays its retained reasoning with assistant calls.
+/// Tool results follow their calls before any accompanying image message. Moonshot replays its retained reasoning with assistant calls.
 func chatCompletionsMessages(
     from message: LLMMessage,
     reasoning: String? = nil
@@ -76,13 +76,14 @@ func chatCompletionsMessages(
             assistant["reasoning_content"] = reasoning
         }
         output.append(assistant)
-    } else if !contentParts.isEmpty {
+    }
+    output.append(contentsOf: toolResults)
+    if toolCalls.isEmpty, !contentParts.isEmpty {
         let hasImage = message.content.contains { if case .image = $0 { return true }; return false }
         output.append([
             "role": role,
             "content": hasImage ? contentParts : textParts.joined(separator: "\n"),
         ])
     }
-    output.append(contentsOf: toolResults)
     return output
 }

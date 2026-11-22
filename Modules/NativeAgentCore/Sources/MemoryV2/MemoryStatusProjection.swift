@@ -170,50 +170,6 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     public var cloudKitAccountStatus: String
     public var dataRootPath: String
 
-    /// Distinguish real inference readiness from disabled or synthetic search.
-    public enum EmbedderHealth {
-        case working(loadCount: Int)
-        case ready
-        case broken(reason: String)
-        case missing
-        case disabled
-        case mock
-
-        public var needsAttention: Bool {
-            switch self {
-            case .broken, .missing: return true
-            default: return false
-            }
-        }
-    }
-
-    public var embedderHealth: EmbedderHealth {
-        if requestedEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
-            return .disabled
-        }
-        if effectiveEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
-            return .mock
-        }
-        if let err = coreMLLastLoadError {
-            return .broken(reason: err)
-        }
-        if coreMLLoaded {
-            return .working(loadCount: coreMLLoadCount)
-        }
-        if coreMLReady {
-            return .ready
-        }
-        return .missing
-    }
-
-    public var shouldPollEmbeddingStartup: Bool {
-        embeddingMode == ManagedEmbeddingProvider.performanceMode
-            && effectiveEmbeddingBackend == ManagedEmbeddingProvider.coreMLBackend
-            && coreMLReady
-            && !coreMLLoaded
-            && coreMLLastLoadError == nil
-    }
-
     public static let empty = MemoryV2NativeStackSnapshot(
         sqliteRecordCount: 0,
         sqliteProposalCount: 0,
@@ -274,7 +230,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         if snap.spotlightLastError == nil, let storageGeneration,
            let markerData = try? Data(contentsOf: spotMarker),
            String(data: markerData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) == storageGeneration {
+            .trimmingCharacters(in: .whitespacesAndNewlines) == SwiftNativeMemoryIndexer.markerPrefix + storageGeneration {
             snap.spotlightReindexed = true
             snap.spotlightIndexedCount = spotlightEligibleCount
         }

@@ -10,8 +10,6 @@ import Experiences
 
 public enum DoctorLoopRecovery {
     public static let checkPrefix = "live.background_loop."
-    /// A not-needed reading settles an obligation whose loop is outside the mounted fleet.
-    static let retired = ["github_tracking": "GitHub tracking was retired with the GitHub connector; nothing runs it."]
 
     public static func checks(
         manager: BackgroundLoops.BackgroundLoopLifetimes,
@@ -42,7 +40,7 @@ public enum DoctorLoopRecovery {
         var pending: Set<String> = []
         do {
             let open = try await ExperienceStore.at(dataRoot).projection()
-            for id in loopIDs.union(retired.keys) {
+            for id in loopIDs {
                 let owed = open.filter { $0.owes["repair"]?.phase.isSettled == false
                     && RepairDebt($0).operation == "doctor.check:" + checkPrefix + id }
                 if owed.contains(where: { experience in
@@ -65,11 +63,7 @@ public enum DoctorLoopRecovery {
                         settlement history.
                         """))]
         }
-        let retirements = retired.filter { pending.contains($0.key) }.sorted { $0.key < $1.key }.map { id, why in
-            CheckResult(source: "Background loop registration: " + id, id: checkPrefix + id, title: "Background loop: \(id)",
-                        status: "not needed", detail: why)
-        }
-        return retirements + loopIDs.sorted().map { id in
+        return loopIDs.sorted().map { id in
             let status = byID[id]
             let verdict = verdictByID[id]
             let level = verdict?.level ?? .fail

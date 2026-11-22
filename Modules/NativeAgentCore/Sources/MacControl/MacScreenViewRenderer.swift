@@ -1,18 +1,11 @@
 import Foundation
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(CoreText)
 import CoreText
-#endif
-#if canImport(AppKit)
 import AppKit
 // Blueprint: | `MacScreenViewRenderer.swift` | `CoreGraphicsMacScreenImageRenderer` struct; `renderPNG` masks secret frames before encoding; `encodePNG` |
-#endif
 
 // MARK: - Production renderer (CoreGraphics + CoreText)
 
-#if canImport(CoreGraphics) && canImport(CoreText) && os(macOS)
 
 /// White halos under black strokes keep markers legible in both themes without content-dependent pixel sampling.
 public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
@@ -132,31 +125,11 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
     }
 
     static func encodePNG(_ image: CGImage) -> Data? {
-        #if canImport(AppKit)
         return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
-        #else
-        return nil
-        #endif
     }
 }
 
-#endif
-
-/// Unsupported rendering reports encode failure rather than a blank image.
-public struct UnavailableMacScreenImageRenderer: MacScreenImageRenderer {
-    public init() {}
-    public func renderPNG(
-        shot: MacScreenShot,
-        placements: [MacScreenMarkerPlacement],
-        secretFrames: [MacAXFrame],
-        downscale: Double
-    ) -> Data? { nil }
-}
 
 public func defaultMacScreenImageRenderer() -> any MacScreenImageRenderer {
-    #if canImport(CoreGraphics) && canImport(CoreText) && os(macOS)
     return CoreGraphicsMacScreenImageRenderer()
-    #else
-    return UnavailableMacScreenImageRenderer()
-    #endif
 }

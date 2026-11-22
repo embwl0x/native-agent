@@ -1,5 +1,5 @@
 import Foundation
-import CryptoKit
+import NativeAgentShared
 import PersistenceCore
 import PersonaEngine
 import NativeAgentCore
@@ -53,13 +53,8 @@ public func _tombstone_fp(_ text: String) -> String {
         .split(whereSeparator: { $0.isWhitespace })
         .map(String.init)
     let normalized = pieces.joined(separator: " ")
-    let digest = sha256Hex(normalized)
+    let digest = SHA256Hex.of(utf8: normalized)
     return String(digest.prefix(16))
-}
-
-/// Hash the whole input without narrowing its byte count.
-private func sha256Hex(_ s: String) -> String {
-    SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
 /// Keep persisted tombstone keys stable across writes.

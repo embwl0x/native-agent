@@ -9,7 +9,6 @@ import ProviderRouting
 import ToolRegistry
 import NativeAgentShared
 import CoreGraphics
-import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
 import Dispatcher
@@ -74,8 +73,6 @@ actor SwiftToolDispatcherFourVerbLiveScene {
         var scene = scenes[key] ?? Scene()
         scene.generation += 1
         scene.lastUpdated = now
-        var usedTrackIDs: Set<Int> = []
-        var identities: [VisionRect: VisionLiveRegionIdentity] = [:]
         let candidates = VisionPercept.physicalRowSelection(in: rows, frameSize: frameSize).eligible
             .map { rows[$0] }
             .sorted { lhs, rhs in
@@ -87,228 +84,292 @@ actor SwiftToolDispatcherFourVerbLiveScene {
         let colorCounts = candidates.reduce(into: [String: Int]()) { counts, row in
             if let color = row.visualColor { counts[color, default: 0] += 1 }
         }
+        let update = SceneUpdate(scene: scene, colorCounts: colorCounts, origin: origin, logicalSize: logicalSize,
+                                 capturedAt: capturedAt, now: now)
         for row in candidates {
             let frame = geometry.screenRect(row.rect)
-            var bestIndex: Int?
-            var bestScore = -Double.infinity
-            var bestAppearanceOnly = false
-            var bestPredictionConsistent = false
-            for index in scene.tracks.indices {
-                let track = scene.tracks[index]
-                guard !usedTrackIDs.contains(track.id),
-                      scene.generation - track.lastSeenGeneration <= 6 else { continue }
-                if let currentColor = row.visualColor,
-                   let trackedColor = track.colorName,
-                   currentColor != trackedColor {
-                    continue
-                }
-                if let currentShape = row.visualShape,
-                   let trackedShape = track.shapeName,
-                   currentShape != trackedShape {
-                    continue
-                }
-                let distance = Self.centerDistance(frame, track.frame)
-                let largestDimension = max(max(frame.w, frame.h), max(track.frame.w, track.frame.h))
-                let reach = max(48, min(220, largestDimension * 1.5))
-                let overlap = Self.intersectionOverUnion(frame, track.frame)
-                let appearance = Self.appearanceSimilarity(row: row, frame: frame, track: track)
-                let elapsed = capturedAt.timeIntervalSince(track.lastCapturedAt)
-                let confirmedSpeed = hypot(track.velocityX, track.velocityY)
-                let provisionalSpeed = hypot(track.provisionalVelocityX, track.provisionalVelocityY)
-                let usesProvisional = confirmedSpeed < 3 && provisionalSpeed >= 3
-                    && track.lastSeenGeneration == scene.generation - 1
-                let predictionVelocityX = usesProvisional ? track.provisionalVelocityX : track.velocityX
-                let predictionVelocityY = usesProvisional ? track.provisionalVelocityY : track.velocityY
-                let speed = hypot(predictionVelocityX, predictionVelocityY)
-                let predictedTravel = speed * elapsed
-                let predictionConsistent: Bool = {
-                    guard track.seenCount >= 2,
-                          elapsed >= 0.05,
-                          elapsed <= 1.5,
-                          speed >= 3,
-                          predictedTravel <= max(440, largestDimension * 6) else { return false }
-                    let predictedCenterX = track.frame.x + track.frame.w / 2
-                        + predictionVelocityX * elapsed
-                    let predictedCenterY = track.frame.y + track.frame.h / 2
-                        + predictionVelocityY * elapsed
-                    let residual = hypot(
-                        frame.x + frame.w / 2 - predictedCenterX,
-                        frame.y + frame.h / 2 - predictedCenterY
-                    )
-                    guard residual <= reach else { return false }
-                    if usesProvisional {
-                        guard elapsed <= 0.75 else { return false }
-                        let observedX = (frame.x + frame.w / 2 - track.frame.x - track.frame.w / 2) / elapsed
-                        let observedY = (frame.y + frame.h / 2 - track.frame.y - track.frame.h / 2) / elapsed
-                        let observedSpeed = hypot(observedX, observedY)
-                        guard observedSpeed >= speed * 0.65, observedSpeed <= speed * 1.5 else { return false }
-                        let alignment = (observedX * predictionVelocityX + observedY * predictionVelocityY)
-                            / (observedSpeed * speed)
-                        return alignment >= 0.85
-                    }
-                    return true
-                }()
-                // A click can teleport an object; preserve visual identity only for close size/salience/contrast matches. Weaker matches still need overlap,
-                // bounded motion or a short continuation of measured trajectory.
-                guard overlap >= 0.05 || distance <= reach
-                    || predictionConsistent || appearance >= 0.86 else { continue }
-                let score = overlap * 4
-                    + max(0, 1 - distance / reach)
-                    + appearance * 1.5
-                    + (predictionConsistent ? 2 : 0)
-                    - min(0.5, distance / 1_000)
-                if score > bestScore {
-                    bestScore = score
-                    bestIndex = index
-                    bestPredictionConsistent = predictionConsistent
-                    bestAppearanceOnly = overlap < 0.05 && distance > reach
-                        && !predictionConsistent
-                }
-            }
-
-            if let bestIndex {
-                let previous = scene.tracks[bestIndex].frame
-                let id = scene.tracks[bestIndex].id
-                let elapsed = capturedAt.timeIntervalSince(scene.tracks[bestIndex].lastCapturedAt)
-                let displacement = Self.centerDistance(frame, previous)
-                let largestDimension = max(max(frame.w, frame.h), max(previous.w, previous.h))
-                let boundedMotion = !bestAppearanceOnly
-                    && elapsed >= 0.05
-                    && elapsed <= 5
-                    && (displacement <= max(220, largestDimension * 3)
-                        || (bestPredictionConsistent
-                            && displacement <= max(440, largestDimension * 6)))
-                let velocityX = boundedMotion
-                    ? ((frame.x + frame.w / 2) - (previous.x + previous.w / 2)) / elapsed
-                    : 0
-                let velocityY = boundedMotion
-                    ? ((frame.y + frame.h / 2) - (previous.y + previous.h / 2)) / elapsed
-                    : 0
-                let uniqueColor = row.visualColor.map { colorCounts[$0] == 1 } ?? false
-                let provisionalMotion = bestAppearanceOnly && uniqueColor
-                    && elapsed >= 0.05 && elapsed <= 0.75
-                    && displacement <= max(440, largestDimension * 6)
-                scene.tracks[bestIndex].provisionalVelocityX = provisionalMotion
-                    ? ((frame.x + frame.w / 2) - (previous.x + previous.w / 2)) / elapsed : 0
-                scene.tracks[bestIndex].provisionalVelocityY = provisionalMotion
-                    ? ((frame.y + frame.h / 2) - (previous.y + previous.h / 2)) / elapsed : 0
-                // Pixel quantization must not erase a slow trajectory after one still frame; decay it quickly to recognize real stops. Motor lead uses only
-                // this frame’s observed displacement.
-                let priorVelocityX = scene.tracks[bestIndex].velocityX
-                let priorVelocityY = scene.tracks[bestIndex].velocityY
-                let priorSpeed = hypot(priorVelocityX, priorVelocityY)
-                let undersampledContinuity = scene.tracks[bestIndex].seenCount >= 2
-                    && elapsed > 0
-                    && elapsed < 0.05
-                    && priorSpeed >= 3
-                let retainedVelocityX = undersampledContinuity
-                    ? priorVelocityX * 0.85
-                    : boundedMotion && displacement < 3 && elapsed <= 0.5
-                        ? priorVelocityX * 0.75
-                        : velocityX
-                let retainedVelocityY = undersampledContinuity
-                    ? priorVelocityY * 0.85
-                    : boundedMotion && displacement < 3 && elapsed <= 0.5
-                        ? priorVelocityY * 0.75
-                        : velocityY
-                // Lead through perception delay and a dispatch allowance; cap two-frame estimates conservatively. Corroborated tracks may lead at most one
-                // measured frame within surface bounds; reversals get no lead.
-                let horizon = min(0.75, max(0, now.timeIntervalSince(capturedAt)) + 0.05)
-                let speed = hypot(velocityX, velocityY)
-                let corroboratedVelocity = boundedMotion && elapsed <= 0.75
-                    && priorSpeed >= 3 && speed >= priorSpeed * 0.65 && speed <= priorSpeed * 1.5
-                    && (velocityX * priorVelocityX + velocityY * priorVelocityY) / (speed * priorSpeed) >= 0.9
-                // Two positions do not prove stable motion; use a third frame when delay could carry a target past its radius.
-                let needsMotionConfirmation = boundedMotion
-                    && speed * horizon > max(4, min(frame.w, frame.h) / 2)
-                    && !corroboratedVelocity
-                let reversing = scene.tracks[bestIndex].seenCount >= 2
-                    && priorSpeed >= 3
-                    && velocityX * priorVelocityX + velocityY * priorVelocityY <= 0
-                let rawX = displacement >= 3 && !reversing ? velocityX * horizon : 0
-                let rawY = displacement >= 3 && !reversing ? velocityY * horizon : 0
-                let rawDistance = hypot(rawX, rawY)
-                let leadWidths = scene.tracks[bestIndex].seenCount >= 2 ? 2.0 : 0.75
-                let ordinaryMaxLead = max(frame.w, frame.h) * leadWidths
-                let corroboratedTravel = bestPredictionConsistent && boundedMotion
-                    && elapsed <= 0.75 && !reversing
-                    ? min(displacement, hypot(logicalSize.width, logicalSize.height) * 0.12)
-                    : 0
-                // Extra motor lead requires a corroborated trajectory; an appearance jump alone grants no extra motor authority.
-                let maxLead = max(ordinaryMaxLead, corroboratedTravel)
-                let leadScale = rawDistance > maxLead && rawDistance > 0 ? maxLead / rawDistance : 1
-                let motionDescription: String? = {
-                    if boundedMotion {
-                        if let observed = Self.motion(
-                            from: previous,
-                            to: frame,
-                            elapsed: elapsed,
-                            logicalSize: logicalSize
-                        ) {
-                            return observed
-                        }
-                        if scene.tracks[bestIndex].seenCount >= 2,
-                           priorSpeed < 3,
-                           displacement < 3 {
-                            return "stationary"
-                        }
-                        return nil
-                    }
-                    if undersampledContinuity {
-                        return Self.motion(
-                            velocityX: priorVelocityX,
-                            velocityY: priorVelocityY,
-                            logicalSize: logicalSize
-                        )
-                    }
-                    let continuityReach = max(48, largestDimension * 1.5)
-                    return elapsed >= 0.05 && elapsed <= 5 && displacement > continuityReach
-                        ? "repositioned" : nil
-                }()
-                scene.tracks[bestIndex].frame = frame
-                scene.tracks[bestIndex].salience = row.salience
-                scene.tracks[bestIndex].contrast = row.visualContrast ?? 0
-                scene.tracks[bestIndex].colorName = row.visualColor
-                scene.tracks[bestIndex].shapeName = row.visualShape
-                scene.tracks[bestIndex].pointConfidence = Self.pointConfidence(row)
-                scene.tracks[bestIndex].seenCount += 1
-                scene.tracks[bestIndex].velocityX = retainedVelocityX
-                scene.tracks[bestIndex].velocityY = retainedVelocityY
-                scene.tracks[bestIndex].lastCapturedAt = capturedAt
-                scene.tracks[bestIndex].lastSeenGeneration = scene.generation
-                scene.tracks[bestIndex].lastSeenAt = now
-                usedTrackIDs.insert(id)
-                identities[row.rect] = VisionLiveRegionIdentity(
-                    id: id,
-                    motion: motionDescription,
-                    projectedX: rawX * leadScale,
-                    projectedY: rawY * leadScale,
-                    needsMotionConfirmation: needsMotionConfirmation
-                )
+            if let match = bestTrack(for: row, frame: frame, update) {
+                continueTrack(match, row: row, frame: frame, update)
             } else {
-                let id = scene.nextID
-                scene.nextID += 1
-                scene.tracks.append(Track(
-                    id: id,
-                    frame: frame,
-                    salience: row.salience,
-                    contrast: row.visualContrast ?? 0,
-                    colorName: row.visualColor,
-                    shapeName: row.visualShape,
-                    pointConfidence: Self.pointConfidence(row),
-                    seenCount: 1,
-                    velocityX: 0,
-                    velocityY: 0,
-                    lastCapturedAt: capturedAt,
-                    lastSeenGeneration: scene.generation,
-                    lastSeenAt: now
-                ))
-                usedTrackIDs.insert(id)
-                identities[row.rect] = VisionLiveRegionIdentity(id: id)
+                startTrack(row: row, frame: frame, update)
             }
         }
 
-        let temporarilyNotVisible = scene.tracks.compactMap { track -> VisionLiveOccludedRegion? in
+        let temporarilyNotVisible = occludedRegions(update)
+        scene = update.scene
+        scene.tracks.removeAll {
+            scene.generation - $0.lastSeenGeneration > 8
+                || now.timeIntervalSince($0.lastSeenAt) > 20
+        }
+        scenes[key] = scene
+        return VisionLiveSceneSnapshot(
+            identities: update.identities,
+            temporarilyNotVisible: Array(temporarilyNotVisible.prefix(4))
+        )
+    }
+
+    /// One identify call: the scene it advances, the tracks this frame has claimed and the identities it assigns.
+    private final class SceneUpdate {
+        var scene: Scene
+        var usedTrackIDs: Set<Int> = []
+        var identities: [VisionRect: VisionLiveRegionIdentity] = [:]
+        let colorCounts: [String: Int]
+        let origin: (x: Double, y: Double)
+        let logicalSize: (width: Double, height: Double)
+        let capturedAt: Date
+        let now: Date
+
+        init(scene: Scene, colorCounts: [String: Int], origin: (x: Double, y: Double), logicalSize: (width: Double, height: Double),
+             capturedAt: Date, now: Date) {
+            self.scene = scene
+            self.colorCounts = colorCounts
+            self.origin = origin
+            self.logicalSize = logicalSize
+            self.capturedAt = capturedAt
+            self.now = now
+        }
+    }
+
+    /// The unclaimed recent track this row most plausibly continues: matching color and shape, then overlap, reach, appearance or predicted motion.
+    private func bestTrack(for row: VisionAffordanceRow, frame: MacAXFrame, _ update: SceneUpdate)
+        -> (index: Int, appearanceOnly: Bool, predictionConsistent: Bool)? {
+        let scene = update.scene, usedTrackIDs = update.usedTrackIDs, capturedAt = update.capturedAt
+        var bestIndex: Int?
+        var bestScore = -Double.infinity
+        var bestAppearanceOnly = false
+        var bestPredictionConsistent = false
+        for index in scene.tracks.indices {
+            let track = scene.tracks[index]
+            guard !usedTrackIDs.contains(track.id),
+                  scene.generation - track.lastSeenGeneration <= 6 else { continue }
+            if let currentColor = row.visualColor,
+               let trackedColor = track.colorName,
+               currentColor != trackedColor {
+                continue
+            }
+            if let currentShape = row.visualShape,
+               let trackedShape = track.shapeName,
+               currentShape != trackedShape {
+                continue
+            }
+            let distance = Self.centerDistance(frame, track.frame)
+            let largestDimension = max(max(frame.w, frame.h), max(track.frame.w, track.frame.h))
+            let reach = max(48, min(220, largestDimension * 1.5))
+            let overlap = Self.intersectionOverUnion(frame, track.frame)
+            let appearance = Self.appearanceSimilarity(row: row, frame: frame, track: track)
+            let elapsed = capturedAt.timeIntervalSince(track.lastCapturedAt)
+            let confirmedSpeed = hypot(track.velocityX, track.velocityY)
+            let provisionalSpeed = hypot(track.provisionalVelocityX, track.provisionalVelocityY)
+            let usesProvisional = confirmedSpeed < 3 && provisionalSpeed >= 3
+                && track.lastSeenGeneration == scene.generation - 1
+            let predictionVelocityX = usesProvisional ? track.provisionalVelocityX : track.velocityX
+            let predictionVelocityY = usesProvisional ? track.provisionalVelocityY : track.velocityY
+            let speed = hypot(predictionVelocityX, predictionVelocityY)
+            let predictedTravel = speed * elapsed
+            let predictionConsistent: Bool = {
+                guard track.seenCount >= 2,
+                      elapsed >= 0.05,
+                      elapsed <= 1.5,
+                      speed >= 3,
+                      predictedTravel <= max(440, largestDimension * 6) else { return false }
+                let predictedCenterX = track.frame.x + track.frame.w / 2
+                    + predictionVelocityX * elapsed
+                let predictedCenterY = track.frame.y + track.frame.h / 2
+                    + predictionVelocityY * elapsed
+                let residual = hypot(
+                    frame.x + frame.w / 2 - predictedCenterX,
+                    frame.y + frame.h / 2 - predictedCenterY
+                )
+                guard residual <= reach else { return false }
+                if usesProvisional {
+                    guard elapsed <= 0.75 else { return false }
+                    let observedX = (frame.x + frame.w / 2 - track.frame.x - track.frame.w / 2) / elapsed
+                    let observedY = (frame.y + frame.h / 2 - track.frame.y - track.frame.h / 2) / elapsed
+                    let observedSpeed = hypot(observedX, observedY)
+                    guard observedSpeed >= speed * 0.65, observedSpeed <= speed * 1.5 else { return false }
+                    let alignment = (observedX * predictionVelocityX + observedY * predictionVelocityY)
+                        / (observedSpeed * speed)
+                    return alignment >= 0.85
+                }
+                return true
+            }()
+            // A click can teleport an object; preserve visual identity only for close size/salience/contrast matches. Weaker matches still need overlap,
+            // bounded motion or a short continuation of measured trajectory.
+            guard overlap >= 0.05 || distance <= reach
+                || predictionConsistent || appearance >= 0.86 else { continue }
+            let score = overlap * 4
+                + max(0, 1 - distance / reach)
+                + appearance * 1.5
+                + (predictionConsistent ? 2 : 0)
+                - min(0.5, distance / 1_000)
+            if score > bestScore {
+                bestScore = score
+                bestIndex = index
+                bestPredictionConsistent = predictionConsistent
+                bestAppearanceOnly = overlap < 0.05 && distance > reach
+                    && !predictionConsistent
+            }
+        }
+        guard let bestIndex else { return nil }
+        return (bestIndex, bestAppearanceOnly, bestPredictionConsistent)
+    }
+
+    /// The matched track takes this frame: bounded or provisional velocity, a capped motor lead, and the motion it is said to have.
+    private func continueTrack(_ match: (index: Int, appearanceOnly: Bool, predictionConsistent: Bool), row: VisionAffordanceRow,
+                               frame: MacAXFrame, _ update: SceneUpdate) {
+        let bestIndex = match.index, bestAppearanceOnly = match.appearanceOnly, bestPredictionConsistent = match.predictionConsistent
+        let colorCounts = update.colorCounts, logicalSize = update.logicalSize, capturedAt = update.capturedAt, now = update.now
+        let previous = update.scene.tracks[bestIndex].frame
+        let id = update.scene.tracks[bestIndex].id
+        let elapsed = capturedAt.timeIntervalSince(update.scene.tracks[bestIndex].lastCapturedAt)
+        let displacement = Self.centerDistance(frame, previous)
+        let largestDimension = max(max(frame.w, frame.h), max(previous.w, previous.h))
+        let boundedMotion = !bestAppearanceOnly
+            && elapsed >= 0.05
+            && elapsed <= 5
+            && (displacement <= max(220, largestDimension * 3)
+                || (bestPredictionConsistent
+                    && displacement <= max(440, largestDimension * 6)))
+        let velocityX = boundedMotion
+            ? ((frame.x + frame.w / 2) - (previous.x + previous.w / 2)) / elapsed
+            : 0
+        let velocityY = boundedMotion
+            ? ((frame.y + frame.h / 2) - (previous.y + previous.h / 2)) / elapsed
+            : 0
+        let uniqueColor = row.visualColor.map { colorCounts[$0] == 1 } ?? false
+        let provisionalMotion = bestAppearanceOnly && uniqueColor
+            && elapsed >= 0.05 && elapsed <= 0.75
+            && displacement <= max(440, largestDimension * 6)
+        update.scene.tracks[bestIndex].provisionalVelocityX = provisionalMotion
+            ? ((frame.x + frame.w / 2) - (previous.x + previous.w / 2)) / elapsed : 0
+        update.scene.tracks[bestIndex].provisionalVelocityY = provisionalMotion
+            ? ((frame.y + frame.h / 2) - (previous.y + previous.h / 2)) / elapsed : 0
+        // Pixel quantization must not erase a slow trajectory after one still frame; decay it quickly to recognize real stops. Motor lead uses only
+        // this frame’s observed displacement.
+        let priorVelocityX = update.scene.tracks[bestIndex].velocityX
+        let priorVelocityY = update.scene.tracks[bestIndex].velocityY
+        let priorSpeed = hypot(priorVelocityX, priorVelocityY)
+        let undersampledContinuity = update.scene.tracks[bestIndex].seenCount >= 2
+            && elapsed > 0
+            && elapsed < 0.05
+            && priorSpeed >= 3
+        let retainedVelocityX = undersampledContinuity
+            ? priorVelocityX * 0.85
+            : boundedMotion && displacement < 3 && elapsed <= 0.5
+                ? priorVelocityX * 0.75
+                : velocityX
+        let retainedVelocityY = undersampledContinuity
+            ? priorVelocityY * 0.85
+            : boundedMotion && displacement < 3 && elapsed <= 0.5
+                ? priorVelocityY * 0.75
+                : velocityY
+        // Lead through perception delay and a dispatch allowance; cap two-frame estimates conservatively. Corroborated tracks may lead at most one
+        // measured frame within surface bounds; reversals get no lead.
+        let horizon = min(0.75, max(0, now.timeIntervalSince(capturedAt)) + 0.05)
+        let speed = hypot(velocityX, velocityY)
+        let corroboratedVelocity = boundedMotion && elapsed <= 0.75
+            && priorSpeed >= 3 && speed >= priorSpeed * 0.65 && speed <= priorSpeed * 1.5
+            && (velocityX * priorVelocityX + velocityY * priorVelocityY) / (speed * priorSpeed) >= 0.9
+        // Two positions do not prove stable motion; use a third frame when delay could carry a target past its radius.
+        let needsMotionConfirmation = boundedMotion
+            && speed * horizon > max(4, min(frame.w, frame.h) / 2)
+            && !corroboratedVelocity
+        let reversing = update.scene.tracks[bestIndex].seenCount >= 2
+            && priorSpeed >= 3
+            && velocityX * priorVelocityX + velocityY * priorVelocityY <= 0
+        let rawX = displacement >= 3 && !reversing ? velocityX * horizon : 0
+        let rawY = displacement >= 3 && !reversing ? velocityY * horizon : 0
+        let rawDistance = hypot(rawX, rawY)
+        let leadWidths = update.scene.tracks[bestIndex].seenCount >= 2 ? 2.0 : 0.75
+        let ordinaryMaxLead = max(frame.w, frame.h) * leadWidths
+        let corroboratedTravel = bestPredictionConsistent && boundedMotion
+            && elapsed <= 0.75 && !reversing
+            ? min(displacement, hypot(logicalSize.width, logicalSize.height) * 0.12)
+            : 0
+        // Extra motor lead requires a corroborated trajectory; an appearance jump alone grants no extra motor authority.
+        let maxLead = max(ordinaryMaxLead, corroboratedTravel)
+        let leadScale = rawDistance > maxLead && rawDistance > 0 ? maxLead / rawDistance : 1
+        let motionDescription: String? = {
+            if boundedMotion {
+                if let observed = Self.motion(
+                    from: previous,
+                    to: frame,
+                    elapsed: elapsed,
+                    logicalSize: logicalSize
+                ) {
+                    return observed
+                }
+                if update.scene.tracks[bestIndex].seenCount >= 2,
+                   priorSpeed < 3,
+                   displacement < 3 {
+                    return "stationary"
+                }
+                return nil
+            }
+            if undersampledContinuity {
+                return Self.motion(
+                    velocityX: priorVelocityX,
+                    velocityY: priorVelocityY,
+                    logicalSize: logicalSize
+                )
+            }
+            let continuityReach = max(48, largestDimension * 1.5)
+            return elapsed >= 0.05 && elapsed <= 5 && displacement > continuityReach
+                ? "repositioned" : nil
+        }()
+        update.scene.tracks[bestIndex].frame = frame
+        update.scene.tracks[bestIndex].salience = row.salience
+        update.scene.tracks[bestIndex].contrast = row.visualContrast ?? 0
+        update.scene.tracks[bestIndex].colorName = row.visualColor
+        update.scene.tracks[bestIndex].shapeName = row.visualShape
+        update.scene.tracks[bestIndex].pointConfidence = Self.pointConfidence(row)
+        update.scene.tracks[bestIndex].seenCount += 1
+        update.scene.tracks[bestIndex].velocityX = retainedVelocityX
+        update.scene.tracks[bestIndex].velocityY = retainedVelocityY
+        update.scene.tracks[bestIndex].lastCapturedAt = capturedAt
+        let generation = update.scene.generation
+        update.scene.tracks[bestIndex].lastSeenGeneration = generation
+        update.scene.tracks[bestIndex].lastSeenAt = now
+        update.usedTrackIDs.insert(id)
+        update.identities[row.rect] = VisionLiveRegionIdentity(
+            id: id,
+            motion: motionDescription,
+            projectedX: rawX * leadScale,
+            projectedY: rawY * leadScale,
+            needsMotionConfirmation: needsMotionConfirmation
+        )
+    }
+
+    /// A row no track continues starts a new identity.
+    private func startTrack(row: VisionAffordanceRow, frame: MacAXFrame, _ update: SceneUpdate) {
+        let capturedAt = update.capturedAt, now = update.now
+        let id = update.scene.nextID
+        update.scene.nextID += 1
+        let generation = update.scene.generation
+        update.scene.tracks.append(Track(
+            id: id,
+            frame: frame,
+            salience: row.salience,
+            contrast: row.visualContrast ?? 0,
+            colorName: row.visualColor,
+            shapeName: row.visualShape,
+            pointConfidence: Self.pointConfidence(row),
+            seenCount: 1,
+            velocityX: 0,
+            velocityY: 0,
+            lastCapturedAt: capturedAt,
+            lastSeenGeneration: generation,
+            lastSeenAt: now
+        ))
+        update.usedTrackIDs.insert(id)
+        update.identities[row.rect] = VisionLiveRegionIdentity(id: id)
+    }
+
+    /// Recently seen, confident tracks this frame missed: where they were, and where steady motion would put them now.
+    private func occludedRegions(_ update: SceneUpdate) -> [VisionLiveOccludedRegion] {
+        let scene = update.scene, usedTrackIDs = update.usedTrackIDs, origin = update.origin, logicalSize = update.logicalSize
+        let capturedAt = update.capturedAt, now = update.now
+        return scene.tracks.compactMap { track -> VisionLiveOccludedRegion? in
             let missed = scene.generation - track.lastSeenGeneration
             guard !usedTrackIDs.contains(track.id),
                   missed >= 1,
@@ -350,15 +411,6 @@ actor SwiftToolDispatcherFourVerbLiveScene {
                 confidence: track.pointConfidence * (missed == 1 ? 0.8 : 0.6)
             )
         }.sorted { $0.id < $1.id }
-        scene.tracks.removeAll {
-            scene.generation - $0.lastSeenGeneration > 8
-                || now.timeIntervalSince($0.lastSeenAt) > 20
-        }
-        scenes[key] = scene
-        return VisionLiveSceneSnapshot(
-            identities: identities,
-            temporarilyNotVisible: Array(temporarilyNotVisible.prefix(4))
-        )
     }
 
     private static func pointConfidence(_ row: VisionAffordanceRow) -> Double {

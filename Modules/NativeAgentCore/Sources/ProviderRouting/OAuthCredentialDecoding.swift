@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `OAuthCredentialDecoding.swift` | Shared JWT payload and OAuth expiry decoding; `OAuthRefreshBinding`: account identity and refresh continuity |
 
 public func jwtPayload(_ token: String, omittingEmptySubsequences: Bool = true) -> [String: Any]? {
@@ -21,9 +22,7 @@ public func parseExpiresAt(_ raw: Any?) -> Date? {
 /// A refresh belongs to one sign-in. If the endpoint supplies no identity, a fresh local sign-in ID still prevents borrowing a previous grant.
 public enum OAuthRefreshBinding {
     static func string(_ value: Any?) -> String? {
-        guard let value = value as? String else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        (value as? String).trimmedNonEmpty
     }
 
     static func identity(_ tokens: [String: Any], provider: String) -> String? {

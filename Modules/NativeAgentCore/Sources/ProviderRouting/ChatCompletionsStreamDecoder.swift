@@ -355,3 +355,16 @@ func providerErrorDetail(_ data: Data, maxBytes: Int = 400) -> String? {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     return raw.isEmpty ? nil : raw
 }
+
+/// A transport failure no classifier recognises: the provider, what it was doing, and (when the call has one) the host, with the cause bounded.
+func transientNetworkError(_ error: Error, provider: String, host: String?, operation: String) -> LLMError {
+    .transient(message: "\(provider) \(operation) failed\(host.map { " for \($0)" } ?? ""): \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))")
+}
+
+/// Record actual ID rewrites in substitutedFrom so substitutions remain visible in telemetry.
+func substitutionTrace(requested: String?, coerced: String) -> String? {
+    guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
+        return nil
+    }
+    return r == coerced ? nil : r
+}

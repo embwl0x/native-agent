@@ -207,7 +207,7 @@ public enum MoonshotModelCatalog {
     }
 
     private static func boolean(_ value: Any?) -> Bool? {
-        guard let value, case .bool(let flag) = JSONValue(fromFoundation: value) else { return nil }
-        return flag
+        guard let value else { return nil }
+        return JSONValue(fromFoundation: value).boolValue
     }
 }

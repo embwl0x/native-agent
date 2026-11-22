@@ -6,7 +6,6 @@ import PersistenceCore
 /// SearXNG owns web search. Configuration and transport failures remain failed search receipts with the cause and setup remedy.
 public enum WebSearchRoutes {
     public static func search(
-        query: String, categories: String?, timeRange: String?,
         searxng: @Sendable () async throws -> ResearchSearchResponse
     ) async -> JSONValue {
         let started = Date()
@@ -31,8 +30,8 @@ public enum WebSearchRoutes {
                 return failure("searxng_unreadable", "The search response was unreadable. Retry this search.")
             }
             result["route"] = .string("searxng")
-            result["untrusted_remote_data"] = .bool(!response.results.isEmpty)
-            if !response.results.isEmpty { result["agent"] = .string("web") }
+            result["untrusted_remote_data"] = .bool(response.hasContent)
+            if response.hasContent { result["agent"] = .string("web") }
             else { result["message"] = .string(response.gaps.isEmpty
                 ? "No results from SearXNG. Try other words."
                 : "No usable results; the named result gaps do not establish no matches. Repair the reported SearXNG result fields.") }
@@ -41,7 +40,13 @@ public enum WebSearchRoutes {
         } catch where Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
             return cancelled
         } catch ResearchClientError.notConfigured {
-            return failure("searxng_not_configured", "SearXNG is not configured. Configure SearXNG in Research settings, then retry the search.")
+            // The setting is hers: name it and the call that sets it, so the fix is one step.
+            return .object(["status": .string("failed"), "reason": .string("searxng_not_configured"), "route": .string("searxng"),
+                "elapsed_ms": elapsed(),
+                "message": .string("Web search failed. No search service is set: set Search service (research.search_url) to the SearXNG address, or to auto to find one running on this Mac, then search again."),
+                "remedy": .object(["kind": .string("correct_route"), "instruction": .string("Set Search service, then search again."),
+                    "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("setting.set"),
+                        "args": .object(["setting": .string("research.search_url"), "value": .string("auto")])])])])])
         } catch ResearchClientError.httpStatus(let status) {
             return .object(["status": .string("failed"), "reason": .string("http_status"), "route": .string("searxng"),
                 "elapsed_ms": elapsed(), "http_status": .int(Int64(status)),

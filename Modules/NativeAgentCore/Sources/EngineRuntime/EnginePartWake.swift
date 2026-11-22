@@ -135,9 +135,9 @@ actor EnginePartWake {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         // Use shared sense transitions to avoid duplicate body signals.
         observers.append(center.addObserver(forName: MacPersonInput.presenceChanged, object: nil, queue: nil) { note in
-            guard let signal = note.userInfo?["signal"] as? String else { return }
+            guard note.userInfo?["signal"] is String else { return }
             let idle = note.userInfo?["idle_seconds"] as? Double ?? 0
-            Task { await Self.shared.presence(signal, idle: idle, dataRoot: root, epoch: epoch) }
+            Task { await Self.shared.presence(idle: idle, dataRoot: root, epoch: epoch) }
         })
         MacPersonInput.startPresenceWakes()
         observers.append(center.addObserver(forName: PhoneSenseHistory.changed, object: nil, queue: nil) { note in
@@ -168,7 +168,7 @@ actor EnginePartWake {
         await deliver("resumed", [:], dataRoot: root, epoch: epoch)
     }
 
-    private func presence(_ signal: String, idle: Double, dataRoot: URL, epoch: UUID) async {
+    private func presence(idle: Double, dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         let reading = PersonPresence.read(dataRoot: dataRoot)
         guard let transition = reading.transition else { return }

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 
 // Blueprint: | `CognitiveConfiguration.swift` | `CognitiveConfiguration`: cognition settings, Observatory availability and reflection spend ceilings |
 
@@ -51,13 +52,8 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.maximumCapsuleCharacters = max(0, maximumCapsuleCharacters)
         self.maximumWorkspaceItems = max(1, maximumWorkspaceItems)
         self.dailyReflectionCallBudget = max(0, dailyReflectionCallBudget)
-        self.reflectionSurface = Self.cleaned(reflectionSurface, fallback: "cognition_reflection")
+        self.reflectionSurface = reflectionSurface.trimmedNonEmpty ?? "cognition_reflection"
     }
 
     public static let disabled = CognitiveConfiguration(enabled: false)
-
-    private static func cleaned(_ value: String, fallback: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? fallback : trimmed
-    }
 }

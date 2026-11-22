@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 // Blueprint: | `InspectorFace.swift` | Inspector membership, redacted cards and pure shared collection/document projection |
 
 public struct InspectorFace: FaceValue {
@@ -18,14 +17,6 @@ public struct InspectorFace: FaceValue {
 
 public enum InspectorRowStatus: String, Equatable, Sendable, Codable {
     case ok, failed, running, neutral
-    public var themeStatus: String {
-        switch self {
-        case .ok: "ok"
-        case .failed: "fail"
-        case .running: "warn"
-        case .neutral: "info"
-        }
-    }
 }
 
 public struct InspectorEventRow: Identifiable, Equatable, Sendable, Codable {
@@ -181,7 +172,7 @@ private extension InspectorEventRow {
     var documentKey: String { "inspector-event:" + id }
     var detailText: String { detailLines.map { $0.label + ":\n" + $0.value }.joined(separator: "\n\n") }
     var documentRevision: String {
-        SHA256.hash(data: Data(detailText.utf8)).map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(utf8: detailText)
     }
     func detailCall(turn: String) -> PartFace.Call { .init("inspector.event", ["turn": .string(turn), "event": .string(id)]) }
     func documentCall(turn: String) -> PartFace.Call { .init("inspector.event.text", ["turn": .string(turn), "event": .string(id)]) }

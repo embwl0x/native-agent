@@ -104,14 +104,12 @@ extension AppModel {
         engine.trust.publishPolicy(policy)
         if let status {
             statusText = status
-            trustCenterActionOutcome = .saved(status)
         }
     }
 
     func recordTrustActionFailure(_ message: String, cause: Error? = nil) {
         statusText = message
         statusCause = cause?.localizedDescription
-        trustCenterActionOutcome = .failed(message)
     }
 
     /// The command owns its result; UI status is only its projection.
@@ -133,10 +131,6 @@ extension AppModel {
             cause = error.localizedDescription
         }
         await refreshBackupList(preserving: receipt, cause: cause)
-        switch result {
-        case .created: trustCenterActionOutcome = .saved(receipt)
-        case .failed: trustCenterActionOutcome = .failed(receipt)
-        }
         return result
     }
 
@@ -156,7 +150,6 @@ extension AppModel {
                     evidence. A turn in progress when the backup was taken is restored as stopped; nothing from the backup runs on its own.
                     """
                 statusText = message
-                trustCenterActionOutcome = .saved(message)
                 AppRelaunch.relaunchApp(terminate: AppDelegate.terminateFromRunLoop, onSpawnFailure: { error in
                     ModuleLog.app("[relaunch] failed to spawn relaunch helper for %@: %@", Bundle.main.bundlePath, "\(error)")
                 })
@@ -176,7 +169,6 @@ extension AppModel {
             outcome = .failed(receipt)
         }
         await refreshBackupList(preserving: receipt, cause: cause)
-        trustCenterActionOutcome = outcome
         return outcome
     }
 

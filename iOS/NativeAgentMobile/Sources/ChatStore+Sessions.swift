@@ -32,13 +32,12 @@ extension ChatStore {
         }
         setSelectedSessionID(clean)
         loadSelectedSession(
-            loadTranscript: { [weak self] sessionID in
+            loadTranscript: { sessionID in
                 let read = await client.readChatTranscript(sessionID: sessionID)
                 guard read == .unavailable, let sessionID else { return read }
                 // Fetch the newest page when the session lies outside the Mac's published window.
                 let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: sessionID)
-                if page.hasOlder { self?.pagedSessionsWithOlder.insert(sessionID) }
-                return .published(page.messages, generation: nil)
+                return .published(page, generation: nil)
             }
         )
     }

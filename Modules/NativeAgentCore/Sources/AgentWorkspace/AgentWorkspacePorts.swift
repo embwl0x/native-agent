@@ -10,7 +10,6 @@ package protocol AgentWorkspaceConversationPort: Sendable {
     func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth]
     var healthNotifications: [Notification.Name] { get }
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
-    func acceptedSends(dataRoot: URL) throws -> Set<String>
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?
     func peers(dataRoot: URL) throws -> [AgentWorkspacePeer]
     func identity(dataRoot: URL) throws -> AgentContactIdentity
@@ -41,7 +40,7 @@ package protocol AgentWorkspaceToolPort: Sendable {
     func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String>
     func appAction(_ tool: String) -> String?
     func macIntegrationAccess(_ name: String) -> MacIntegrationAccess?
-    func markConsumed(peer: String)
+    func ownerTrusts(_ source: String, dataRoot: URL) -> Bool
     func withWebScheme(_ value: String) -> String
     func builderSourceRepoRoot(dataRoot: URL) -> URL?
     var listedPeerState: String { get }

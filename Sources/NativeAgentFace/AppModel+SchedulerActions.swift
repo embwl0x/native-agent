@@ -11,8 +11,7 @@ extension AppModel {
             statusText = "Desk task created"
             return .created
         } catch {
-            let message = "Task creation was not confirmed. \(error.localizedDescription)"
-            setFailureStatus(message, cause: error)
+            statusText = "Task creation was not confirmed. \(error.localizedDescription)"
             return .failed(.interrupted(error))
         }
     }

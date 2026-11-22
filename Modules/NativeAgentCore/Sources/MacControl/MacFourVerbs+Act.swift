@@ -3,10 +3,9 @@ import NativeAgentCore
 import PersistenceCore
 import AppKit
 import Experiences
-import CryptoKit
 import NativeAgentShared
 import Senses
-// Blueprint: | `MacFourVerbs+Act.swift` | `MacFourVerbs`, `act`, `addAttention`: Deadline-bound named acts, repetition and effect receipts |
+// Blueprint: | `MacFourVerbs+Act.swift` | `MacFourVerbs`, `act`, `actHoldingSerial`, `addAttention`: Deadline-bound named acts, repetition and effect receipts; the act held under the act serial is its own stage |
 
 extension MacFourVerbs {
     // MARK: 2 — HANDS
@@ -114,124 +113,10 @@ extension MacFourVerbs {
                 return .init(ok: false, text: "The action was cancelled before it started.", detail: ["error": .string("cancelled")])
             }
             await MacActSerial.shared.ownInputs(context.driver)
-            let acted: MacFourVerbsReply = await context.holding(\.holdsActSerial, true) {
-            context in let continuation = turn.macContinuation.flatMap { $0.isPending ? $0 : nil }
-            if let continuation, let refusal = continuation.refusal(context: context) {
-                var detail: [String: JSONValue] = ["error": .string("continuation_unavailable")]
-                detail["remedy"] = continuation.refusalOutput(refusal)["remedy"]
-                return .init(ok: false, text: refusal, detail: detail)
-            }
-            if let continuation, let app, let captured = continuation.app,
-               app.caseInsensitiveCompare(captured.name) != .orderedSame,
-               app.caseInsensitiveCompare(captured.bundleIdentifier ?? "") != .orderedSame {
-                return .init(ok: false, text: continuation.modelContext(context: context),
-                    detail: ["error": .string("continuation_target_mismatch")])
-            }
-            let anchor = (continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .flatMap { $0.isEmpty ? nil : $0 }
-            // The screen decides, not the flags: an app already in front is acted on in front (every event still requires its pid), and while Shotgun is up the
-            // person has handed the agent the screen, so an app behind is brought forward for the act. A native surface is never raised.
-            let mayRaise = front || (PersonOnlyWindows.isShowing && context.nativeSurfaceApp == nil)
-            // Continue a stopped batch only when the next batch preserves landed prefixes; another act invalidates that continuity.
-            var flow: ActFlow?
-            if let root = flowRoot, let session = flowSession {
-                let scope = Self.actFlowScope(session)
-                // Keep one app anchor for the batch so later steps cannot drift to unrelated foreground apps.
-                do {
-                    flow = ActFlow(digests: try Self.actStepDigests(steps, app: anchor ?? NSWorkspace.shared.frontmostApplication?.bundleIdentifier))
-                } catch {
-                    return .init(ok: false,
-                        text: "I couldn't encode these action steps (\(error.localizedDescription)); none ran. Correct the supplied values before continuing.",
-                        detail: ["error": .string("act_steps_encoding_failed"), "effects": .string("none")])
-                }
-                if !again, !steps.isEmpty {
-                    let open: Experience?
-                    do { open = try await Flow.open(root, scope: scope) } catch {
-                        return .init(ok: false,
-                            text: "I can't read whether a stopped batch in this chat already did some of these steps (\(error.localizedDescription)), "
-                                + "so none ran. Send it with again:true to run every step.",
-                            detail: ["error": .string("flow_unreadable"), "effects": .string("none")])
-                    }
-                    if let open, flow?.continues(Flow.landed(open)) == true {
-                        flow?.landed = Flow.landed(open)
-                        flow?.at = open.updatedAt ?? open.at
-                    } else {
-                        Flow.dropped(root, scope: scope)
-                    }
-                } else {
-                    Flow.dropped(root, scope: scope)
-                }
-            }
-            let run: ([MacActStep], String?, FrontExpectation?, Sighting?) async -> MacFourVerbsReply = { steps, anchorApp, expect, seen in
-                // In front, every hand event of this act requires that app's pid.
-                await context.holding(\.requiredFrontPid, expect?.pid) { context in await context.holding(\.foregroundRequested, mayRaise) { context in
-                    guard steps.isEmpty else { return await self.actSteps(steps, app: anchorApp, expect: expect, seen: seen, flow: flow, turn: turn,
-                        context: context) }
-                    return await self.actCore(
-                        verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
-                        seconds: seconds, repeat: requestedRepeat, interval: interval, holding: holding,
-                        button: button, scrollAmount: scrollAmount, app: anchorApp, expect: expect, seen: seen, place: place
-                    , turn: turn, context: context)
-                } }
-            }
-            guard let anchor else { return Self.withUncertainActionOutcome(await run(steps, nil, nil, nil)) }
-            // A miss never touches the screen: the (first) thing to act on is resolved in the background read before anything is raised.
-            let missBefore: ([MacActStep], Sighting?) async -> MacFourVerbsReply? = { steps, seen in
-                // Every verb is checked before anything is raised.
-                for (index, step) in (steps.isEmpty ? [MacActStep(verb: rawVerb, target: target)] : steps).enumerated() {
-                    guard let bad = Self.unknownVerb(step.verb, target: step.target) else { continue }
-                    guard !steps.isEmpty else { return bad }
-                    return MacFourVerbsReply(
-                        ok: false, text: "Step \(index + 1): " + bad.text,
-                        detail: bad.detail.merging(["failed_step": .int(Int64(index + 1)), "steps_completed": .int(0)]) { _, new in new }
-                    )
-                }
-                guard let seen else { return nil }
-                guard !steps.isEmpty else { return await self.missBeforeRaise(verb: rawVerb, target: target, in: seen, turn: turn, context: context) }
-                // Skip already-landed steps so continuation cannot duplicate their effects.
-                guard let at = steps.indices.first(where: { flow?.kept($0) != true }) else { return nil }
-                let first = steps[at]
-                // Exact selections resolve through the action owner, never as names.
-                if first.handle != nil || first.place != nil { return nil }
-                // An optional first step ("OK?") that isn't here is skipped once raised, like any optional step — it never stops the batch here.
-                if first.target.hasSuffix("?"), first.target.count > 1 { return nil }
-                guard let miss = await self.missBeforeRaise(verb: first.verb, target: first.target, in: seen, turn: turn, context: context) else { return nil }
-                let reason = Self.string(miss.detail["error"]) ?? "no_match"
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: Self.keptLine(flow) + "Stopped at step \(at + 1) of \(steps.count) (\(reason)); the rest were not run.\n" + miss.text,
-                    detail: miss.detail.merging([
-                        "failed_step": .int(Int64(at + 1)), "steps_completed": .int(Int64(at)), "steps_total": .int(Int64(steps.count)),
-                    ]) { _, new in new }
-                )
-            }
-            let first = steps.first ?? MacActStep(verb: rawVerb, target: target)
-            let menuOrKey = Self.isMenuPath(first.target) || Self.parseVerb(first.verb).0 == "key" || Self.pressMeansKey(first.target)
-            var reply = await actBroughtForward(
-                app: anchor, seek: steps.first?.target ?? target, menuOrKey: menuOrKey, raise: mayRaise,
-                missBefore: { await missBefore(steps, $0) },
-                inBack: { await run(steps, anchor, nil, $0) }
-            , turn: turn, context: context) { await run(steps, nil, $0, $1) }
-            if front, steps.isEmpty, reply.ok {
-                // Lead with observed effects so a suggested next step cannot obscure what already happened.
-                let lines = reply.text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-                reply = MacFourVerbsReply(ok: true, text: ([String(lines[0]), Self.oneCallNudge] + lines.dropFirst().map(String.init))
-                    .joined(separator: "\n"), detail: reply.detail)
-            }
-            if !mayRaise, menuOrKey, Self.windowlessApp(reply.detail) {
-                let reason = "\(anchor) has no window, so its menu bar or keys need it in front"
-                reply = MacFourVerbsReply(
-                    ok: false,
-                    text: "I need the screen because " + reason + ". Nothing came to the front. "
-                        + "Only use front:true when the task explicitly asks to bring \(anchor) forward.\n" + reply.text,
-                    detail: reply.detail.merging([
-                        "error": .string("needs_front"), "status": .string("needs_front"),
-                        "needs_front_reason": .string(reason), "owner_front_changed": .bool(false),
-                    ]) { _, new in new }
-                )
-            }
-            return Self.withUncertainActionOutcome(reply)
+            let acted: MacFourVerbsReply = await context.holding(\.holdsActSerial, true) { context in
+                await actHoldingSerial(verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
+                    seconds: seconds, repeat: requestedRepeat, interval: interval, holding: holding, button: button,
+                    scrollAmount: scrollAmount, app: app, front: front, steps: steps, again: again, place: place, turn: turn, context: context)
             }
             return await settle {
                 let failures = await MacAppMapStore.shared.flush()
@@ -252,6 +137,145 @@ extension MacFourVerbs {
         let elapsed = started.duration(to: .now).components
         detail["duration_ms"] = .int(elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000)
         return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
+    }
+
+    /// The act once it holds the act serial: the continuation's own checks, the batch's flow, then the act brought forward or kept in the
+    /// background, and its reply led by observed effects. Every return here is the held reply that `act` settles.
+    private func actHoldingSerial(
+        verb rawVerb: String, target: String, text: String?, mode: MacTypeMode, to destination: String?, toApp destinationApp: String?,
+        seconds: Double?, repeat requestedRepeat: Int?, interval: Double?, holding: String?, button: String?, scrollAmount: Int?,
+        app: String?, front: Bool, steps: [MacActStep], again: Bool, place: MacImagePlace?, turn: Turn, context: MacOperationContext
+    ) async -> MacFourVerbsReply {
+        let continuation = turn.macContinuation.flatMap { $0.isPending ? $0 : nil }
+        if let continuation, let refusal = continuation.refusal(context: context) {
+            var detail: [String: JSONValue] = ["error": .string("continuation_unavailable")]
+            detail["remedy"] = continuation.refusalOutput(refusal)["remedy"]
+            return .init(ok: false, text: refusal, detail: detail)
+        }
+        if let continuation, let app, let captured = continuation.app,
+           app.caseInsensitiveCompare(captured.name) != .orderedSame,
+           app.caseInsensitiveCompare(captured.bundleIdentifier ?? "") != .orderedSame {
+            return .init(ok: false, text: continuation.modelContext(context: context),
+                detail: ["error": .string("continuation_target_mismatch")])
+        }
+        let anchor = (continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        // One foreground observation anchors both the batch's digests and its input.
+        let batchFront: (pid: Int32, bundleIdentifier: String?)?
+        if anchor == nil, !steps.isEmpty {
+            guard let foreground = NSWorkspace.shared.frontmostApplication, foreground.processIdentifier > 0 else {
+                return .init(ok: false, text: "I can't identify the foreground app for this batch. No steps ran.",
+                    detail: ["error": .string("front_unknown"), "effects": .string("none")])
+            }
+            batchFront = (foreground.processIdentifier, foreground.bundleIdentifier)
+        } else {
+            batchFront = nil
+        }
+        // The screen decides, not the flags: an app already in front is acted on in front (every event still requires its pid), and while Shotgun is up the
+        // person has handed the agent the screen, so an app behind is brought forward for the act. A native surface is never raised.
+        let mayRaise = front || (PersonOnlyWindows.isShowing && context.nativeSurfaceApp == nil)
+        // Continue a stopped batch only when the next batch preserves landed prefixes; another act invalidates that continuity.
+        var flow: ActFlow?
+        if let root = flowRoot, let session = flowSession {
+            let scope = Self.actFlowScope(session)
+            do {
+                flow = ActFlow(digests: try Self.actStepDigests(steps, app: anchor ?? batchFront?.bundleIdentifier))
+            } catch {
+                return .init(ok: false,
+                    text: "I couldn't encode these action steps (\(error.localizedDescription)); none ran. Correct the supplied values before continuing.",
+                    detail: ["error": .string("act_steps_encoding_failed"), "effects": .string("none")])
+            }
+            if !again, !steps.isEmpty {
+                let open: Experience?
+                do { open = try await Flow.open(root, scope: scope) } catch {
+                    return .init(ok: false,
+                        text: "I can't read whether a stopped batch in this chat already did some of these steps (\(error.localizedDescription)), "
+                            + "so none ran. Send it with again:true to run every step.",
+                        detail: ["error": .string("flow_unreadable"), "effects": .string("none")])
+                }
+                if let open, flow?.continues(Flow.landed(open)) == true {
+                    flow?.landed = Flow.landed(open)
+                    flow?.at = open.updatedAt ?? open.at
+                } else {
+                    Flow.dropped(root, scope: scope)
+                }
+            } else {
+                Flow.dropped(root, scope: scope)
+            }
+        }
+        let run: ([MacActStep], String?, FrontExpectation?, Sighting?) async -> MacFourVerbsReply = { steps, anchorApp, expect, seen in
+            // In front, every hand event of this act requires that app's pid.
+            await context.holding(\.requiredFrontPid, expect?.pid) { context in await context.holding(\.foregroundRequested, mayRaise) { context in
+                guard steps.isEmpty else { return await self.actSteps(steps, app: anchorApp, expect: expect, seen: seen, flow: flow, turn: turn,
+                    context: context) }
+                return await self.actCore(
+                    verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
+                    seconds: seconds, repeat: requestedRepeat, interval: interval, holding: holding,
+                    button: button, scrollAmount: scrollAmount, app: anchorApp, expect: expect, seen: seen, place: place
+                , turn: turn, context: context)
+            } }
+        }
+        guard let anchor else {
+            let expect: FrontExpectation? = batchFront.map { ($0.pid, nil) }
+            return Self.withUncertainActionOutcome(await run(steps, nil, expect, nil))
+        }
+        // A miss never touches the screen: the (first) thing to act on is resolved in the background read before anything is raised.
+        let missBefore: ([MacActStep], Sighting?) async -> MacFourVerbsReply? = { steps, seen in
+            // Every verb is checked before anything is raised.
+            for (index, step) in (steps.isEmpty ? [MacActStep(verb: rawVerb, target: target)] : steps).enumerated() {
+                guard let bad = Self.unknownVerb(step.verb, target: step.target) else { continue }
+                guard !steps.isEmpty else { return bad }
+                return MacFourVerbsReply(
+                    ok: false, text: "Step \(index + 1): " + bad.text,
+                    detail: bad.detail.merging(["failed_step": .int(Int64(index + 1)), "steps_completed": .int(0)]) { _, new in new }
+                )
+            }
+            guard let seen else { return nil }
+            guard !steps.isEmpty else { return await self.missBeforeRaise(verb: rawVerb, target: target, in: seen, turn: turn, context: context) }
+            // Skip already-landed steps so continuation cannot duplicate their effects.
+            guard let at = steps.indices.first(where: { flow?.kept($0) != true }) else { return nil }
+            let first = steps[at]
+            // Exact selections resolve through the action owner, never as names.
+            if first.handle != nil || first.place != nil { return nil }
+            // An optional first step ("OK?") that isn't here is skipped once raised, like any optional step — it never stops the batch here.
+            if first.target.hasSuffix("?"), first.target.count > 1 { return nil }
+            guard let miss = await self.missBeforeRaise(verb: first.verb, target: first.target, in: seen, turn: turn, context: context) else { return nil }
+            let reason = Self.string(miss.detail["error"]) ?? "no_match"
+            return MacFourVerbsReply(
+                ok: false,
+                text: Self.keptLine(flow) + "Stopped at step \(at + 1) of \(steps.count) (\(reason)); the rest were not run.\n" + miss.text,
+                detail: miss.detail.merging([
+                    "failed_step": .int(Int64(at + 1)), "steps_completed": .int(Int64(at)), "steps_total": .int(Int64(steps.count)),
+                ]) { _, new in new }
+            )
+        }
+        let first = steps.first ?? MacActStep(verb: rawVerb, target: target)
+        let menuOrKey = Self.isMenuPath(first.target) || Self.parseVerb(first.verb).0 == "key" || Self.pressMeansKey(first.target)
+        var reply = await actBroughtForward(
+            app: anchor, seek: steps.first?.target ?? target, menuOrKey: menuOrKey, raise: mayRaise,
+            missBefore: { await missBefore(steps, $0) },
+            inBack: { await run(steps, anchor, nil, $0) }
+        , turn: turn, context: context) { await run(steps, nil, $0, $1) }
+        if front, steps.isEmpty, reply.ok {
+            // Lead with observed effects so a suggested next step cannot obscure what already happened.
+            let lines = reply.text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            reply = MacFourVerbsReply(ok: true, text: ([String(lines[0]), Self.oneCallNudge] + lines.dropFirst().map(String.init))
+                .joined(separator: "\n"), detail: reply.detail)
+        }
+        if !mayRaise, menuOrKey, Self.windowlessApp(reply.detail) {
+            let reason = "\(anchor) has no window, so its menu bar or keys need it in front"
+            reply = MacFourVerbsReply(
+                ok: false,
+                text: "I need the screen because " + reason + ". Nothing came to the front. "
+                    + "Only use front:true when the task explicitly asks to bring \(anchor) forward.\n" + reply.text,
+                detail: reply.detail.merging([
+                    "error": .string("needs_front"), "status": .string("needs_front"),
+                    "needs_front_reason": .string(reason), "owner_front_changed": .bool(false),
+                ]) { _, new in new }
+            )
+        }
+        return Self.withUncertainActionOutcome(reply)
     }
 
     private func actCore(
@@ -423,13 +447,15 @@ extension MacFourVerbs {
     static func outcomeUnknown(_ reply: MacFourVerbsReply) -> Bool {
         let status = string(reply.detail["status"])
         let state = string(reply.detail["operationState"])
+        let noEffects = reply.detail["effects"] == .string("none")
+            || reply.detail["effects_may_have_occurred"] == .bool(false)
         return !reply.ok && (inputLeftTheHand(reply)
             || bool(reply.detail["ax_emission_attempted"]) == true
             || array(reply.detail["ax_outcomes"]).contains { bool(object($0)["ax_emission_attempted"]) == true }
             || bool(reply.detail["ax_delivered"]) == true
             || bool(reply.detail["outcome_unknown"]) == true
             || status.map({ ["wrong_target", "acted_on_different_target", "acted_mismatch", "acted_unobserved", "outcome_unknown"].contains($0) }) == true
-            || state.map({ ["started", "cancel_requested", "outcome_unknown", "timed_out", "failed"].contains($0) }) == true)
+            || (!noEffects && state.map({ ["started", "cancel_requested", "outcome_unknown", "timed_out", "failed"].contains($0) }) == true))
     }
 
     private static func withUncertainActionOutcome(_ reply: MacFourVerbsReply) -> MacFourVerbsReply {

@@ -28,7 +28,7 @@ extension AppToolExecutor {
             .filter { $0.page != "*" || ($0.id == "setting.set" && hasSettings) }
     }
     @MainActor
-    func doorIndex(_ input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+    func doorIndex(turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
         let posture = await Self.freshQuietPosture()
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let everyPage = try AppActions.all.filter { $0.page == "*" }.map(\.id)
@@ -41,7 +41,7 @@ extension AppToolExecutor {
             shape.append(line)
             pages.append(.string(line))
         }
-        let home = await doorHome([:], input: input, turn: turn, execution: execution)
+        let home = await doorHome([:], turn: turn, execution: execution)
         guard ChatToolOutcome.outputLooksSuccessful(home) else { return home }
         return .object([
             "home": home,
@@ -61,7 +61,7 @@ extension AppToolExecutor {
         ])
     }
     @MainActor
-    func doorHome(_ call: [String: JSONValue], input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
+    func doorHome(_ call: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
         guard let door = execution.invocation.appDoor else {
             return Self.failure("door_unavailable",
                 "Home reads only from inside a chat turn. Nothing was read.",
@@ -86,8 +86,8 @@ extension AppToolExecutor {
                 let record = file.record
                 let native = record["language"] == .string("native")
                 let guidance = file.pathExtension == "md"
-                let digest = doorText(descriptor["program"]?.objectValue?["version"])
-                let status = doorText(record["status"])
+                let digest = JSONValue.trimmedScalarTextOrEmpty(descriptor["program"]?.objectValue?["version"])
+                let status = JSONValue.trimmedScalarTextOrEmpty(record["status"])
                 var blocks: [JSONValue] = []
                 var callFit: JSONValue = .null
                 var validated = native || guidance, admitted = native || guidance
@@ -183,7 +183,7 @@ extension AppToolExecutor {
                 "role": .string("built_in"), "language": .string(sense.language == .native ? "native" : "JS"),
                 "status": .string(sense.status.rawValue), "source": .string("NativeAgent.app/Contents/Resources/Senses"),
                 "selected_version": .int(Int64(sense.version)), "validation": .string("bundled"),
-                "source_digest": body.map { .string(SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()) } ?? .null,
+                "source_digest": body.map { .string(SHA256Hex.of($0)) } ?? .null,
                 "counterpart": .null, "blocks_cutover": .array([]), "part": .string(header.partLine)]
                 .merging(["reach": try .fromEncodable(sense.reach), "mode": .string(sense.mode.rawValue)]) { _, value in value })
         }
@@ -199,7 +199,7 @@ extension AppToolExecutor {
     }
     @concurrent private static func doorStoredParts(page: QuietToolPage, item: String, offset: Int, root: URL) async throws -> JSONValue {
         if page.id == "tools", item.isEmpty {
-            var list = Self.partFields(try Parts(root: root).list(offset: offset))
+            var list = JSONValue.objectOrEmpty(try Parts(root: root).list(offset: offset))
             list["page"] = .string(page.id)
             list["title"] = .string(page.title)
             if list["has_more"] == .bool(true) {
@@ -225,14 +225,17 @@ extension AppToolExecutor {
                   following: Bool = false) async throws -> JSONValue {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         var item = item
-        if ["today", "inbox"].contains(page.id), !item.isEmpty {
+        // An Inbox card's id reads that card from Today and Desk too; a Desk item of its own keeps its own read.
+        var deskOwnsItem = false
+        if page.id == "desk", !item.isEmpty { deskOwnsItem = await quietHost()?.pageItem(page: "desk", named: item) != nil }
+        if ["today", "inbox", "desk"].contains(page.id), !item.isEmpty, !deskOwnsItem {
             let cards = (try? await ForPerson.at(root).inbox()) ?? []
             if let card = cards.first(where: { $0.id == item }) ?? cards.first(where: {
                 $0.interaction_id == item || $0.interaction_id.map { "card:" + $0 } == item
                     || $0.related_approval_id == item || $0.related_approval_id.map { "approval:" + $0 } == item
             }) {
                 item = card.id
-                if page.id == "today", let inbox = await doorPage("inbox") {
+                if page.id != "inbox", let inbox = await doorPage("inbox") {
                     return Self.doorOpened(try await doorRead(page: inbox, item: item, offset: offset, surface: surface, turn: turn,
                         execution: execution, following: true), at: (page: "inbox", item: item))
                 }
@@ -287,8 +290,11 @@ extension AppToolExecutor {
                                 "about": .string(page.summary), "count": list["count"] ?? .null, "shown": list["shown"] ?? .null,
                                 "items": .array(notes.map { note in
                                     guard case .object(let row) = note else { return note }
-                                    let title = String(Self.doorText(row["title"]).split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(120))
-                                    return .string("\(Self.doorText(row["id"])) | kind=\(Self.doorText(row["source"])) | \(title) | "
+                                    let title = String(JSONValue.trimmedScalarTextOrEmpty(row["title"])
+                                        .split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(120))
+                                    let id = JSONValue.trimmedScalarTextOrEmpty(row["id"])
+                                    let source = JSONValue.trimmedScalarTextOrEmpty(row["source"])
+                                    return .string("\(id) | kind=\(source) | \(title) | "
                                         + "unread=\(row["status"] == .string("unread"))")
                                 })])
             }
@@ -443,7 +449,7 @@ extension AppToolExecutor {
         return try read["version"]?.scalarText ?? Self.doorVersion(asked: page.id, item: item, read)
     }
     @MainActor
-    func doorFind(_ query: String, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+    func doorFind(_ query: String, turn: Turn) async throws -> JSONValue {
         let asked = AppActions.intentWords(query)
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let permissions = try await MacIntegrationPermissionStore(dataRoot: root).readinessChecked()
@@ -452,7 +458,7 @@ extension AppToolExecutor {
             let blocker = (action.schema?.macIntegration).flatMap {
                 permissions.refusal(integration: $0.integration, mode: $0.mode)
             }
-            do { return try AppActions.discovery(action, blocker: blocker, dataRoot: root) }
+            do { return try AppActions.discovery(action, blocker: blocker) }
             catch {
                 schemaGaps.append(.object(["action": .string(action.id),
                     "failure": ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)]))
@@ -468,6 +474,13 @@ extension AppToolExecutor {
         }
         if let action = try AppActions.action(query, dataRoot: root, turn: turn),
            action.id.lowercased() == query.lowercased() {
+            // A home item named exactly is read as page and item, as ranked search returns it: it has no action to call.
+            if action.isItemRead {
+                return .object(["status": .string("ok"), "find": .string(query), "matched_actions": .int(0), "shown_actions": .int(0),
+                    "actions": .array([]), "schema_gaps": .array(schemaGaps), "pages": .array([]),
+                    "read_next": .array([.object(action.input.merging(["description": .string(action.label)]) { _, value in value })]),
+                    "effects": .string("none")])
+            }
             var actions: [JSONValue] = []
             if let contract = discover(action) { actions.append(await gaveBack(contract, action.id)) }
             return .object(["status": .string("ok"), "find": .string(query),

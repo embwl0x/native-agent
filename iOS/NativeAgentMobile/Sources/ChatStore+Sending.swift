@@ -77,32 +77,76 @@ extension ChatStore {
         PhoneSenses.shared.wake()
         if isLoading, !steer {
             guard appendUser else { return false }
-            let queued = QueuedChatSend(
-                id: UUID(),
-                sessionID: selectedSessionID,
-                text: text,
-                controls: controls,
-                attachments: attachments,
-                createdAt: Date(), pairingFingerprint: pairing
-            )
-            guard enqueueSend(queued) else { return false }
-            if emitHaptic { Haptics.send() }
-            return true
+            return enqueueBusySend(text: text, controls: controls, attachments: attachments, pairing: pairing, emitHaptic: emitHaptic)
+        }
+        // An already signed send keeps its original session, including envelopes from before phone-side binding.
+        if selectedSessionID == nil,
+           !queuedSends.contains(where: { $0.id == requested && $0.preparedMessage != nil }) {
+            let anchor = iCloudSyncEngine.shared.availableChatAnchorID
+            let session = locallyCreatedSessionID ?? anchor ?? UUID().uuidString
+            if anchor == nil, locallyCreatedSessionID == nil { markLocallyCreatedSession(session) }
+            migrateQueuedSends(from: nil, to: session, unsignedOnly: true)
+            setSelectedSessionID(session)
         }
         // Every send, including Regenerate, retains its payload before admission.
         let queuedSendID: UUID
         if let requested {
             queuedSendID = requested
         } else {
-            let retained = QueuedChatSend(
-                id: UUID(), sessionID: selectedSessionID, text: text,
-                controls: controls, attachments: attachments, createdAt: Date(), pairingFingerprint: pairing,
-                suppressRemoteUserAppend: suppressRemoteUserAppend,
-                replacementAssistantMessageID: replacementAssistantMessageID
-            )
-            guard enqueueSend(retained) else { return false }
-            queuedSendID = retained.id
+            guard let retained = retainSend(text: text, controls: controls, attachments: attachments, pairing: pairing,
+                suppressRemoteUserAppend: suppressRemoteUserAppend, replacementAssistantMessageID: replacementAssistantMessageID) else { return false }
+            queuedSendID = retained
         }
+        let transcript = prepareSendTranscript(queuedSendID: queuedSendID, text: text, attachments: attachments,
+            appendUser: appendUser, emitHaptic: emitHaptic, retainedUserMessageID: retainedUserMessageID,
+            reusePlaceholderId: reusePlaceholderId, steer: steer)
+        startSendTransport(transcript, queuedSendID: queuedSendID, text: text, client: client, controls: controls,
+            attachments: attachments, pairing: pairing, suppressRemoteUserAppend: suppressRemoteUserAppend,
+            replacementAssistantMessageID: replacementAssistantMessageID, onFailure: onFailure, steer: steer)
+        return true
+    }
+
+    /// Queue a new user message while another turn owns the composer.
+    private func enqueueBusySend(
+        text: String, controls: ChatRuntimeControls, attachments: [MultimodalAttachment], pairing: String, emitHaptic: Bool
+    ) -> Bool {
+        let queued = QueuedChatSend(
+            id: UUID(),
+            sessionID: selectedSessionID,
+            text: text,
+            controls: controls,
+            attachments: attachments,
+            createdAt: Date(), pairingFingerprint: pairing
+        )
+        guard enqueueSend(queued) else { return false }
+        if emitHaptic { Haptics.send() }
+        return true
+    }
+
+    /// Keep a new send's payload before it is admitted to transport.
+    private func retainSend(
+        text: String, controls: ChatRuntimeControls, attachments: [MultimodalAttachment], pairing: String,
+        suppressRemoteUserAppend: Bool, replacementAssistantMessageID: UUID?
+    ) -> UUID? {
+        let retained = QueuedChatSend(
+            id: UUID(), sessionID: selectedSessionID, text: text,
+            controls: controls, attachments: attachments, createdAt: Date(), pairingFingerprint: pairing,
+            suppressRemoteUserAppend: suppressRemoteUserAppend,
+            replacementAssistantMessageID: replacementAssistantMessageID
+        )
+        guard enqueueSend(retained) else { return nil }
+        return retained.id
+    }
+
+    private typealias SendTranscript = (
+        appendedUserId: UUID?, placeholderId: UUID, targetSessionID: String?, correlationID: String, preparedMessage: BridgeMessage?
+    )
+
+    /// Prepare the visible exchange and bind its transcript rows to the send's correlation.
+    private func prepareSendTranscript(
+        queuedSendID: UUID, text: String, attachments: [MultimodalAttachment], appendUser: Bool, emitHaptic: Bool,
+        retainedUserMessageID: UUID?, reusePlaceholderId: UUID?, steer: Bool
+    ) -> SendTranscript {
         if appendUser && emitHaptic {
             Haptics.send()
         }
@@ -157,7 +201,16 @@ extension ChatStore {
             messages[index].awaitingMacTranscript = true
         }
         let preparedMessage = queuedSends.first { $0.id == queuedSendID }?.preparedMessage
+        return (appendedUserId, placeholderId, targetSessionID, correlationID, preparedMessage)
+    }
 
+    /// Retain the pending exchange and hand its exact payload to the Mac transport.
+    private func startSendTransport(
+        _ transcript: SendTranscript, queuedSendID: UUID, text: String, client: MacBridgeClient, controls: ChatRuntimeControls,
+        attachments: [MultimodalAttachment], pairing: String, suppressRemoteUserAppend: Bool, replacementAssistantMessageID: UUID?,
+        onFailure: (() -> Void)?, steer: Bool
+    ) {
+        let (appendedUserId, placeholderId, targetSessionID, correlationID, preparedMessage) = transcript
         if !steer { sendTask?.cancel() }
         inFlightSendIDs.insert(correlationID)
         // Install the correlation's placeholder before transport awaits; the Mac can answer first.
@@ -165,7 +218,9 @@ extension ChatStore {
             text: text,
             controls: controls,
             attachments: attachments,
-            appendedUserId: appendedUserId
+            appendedUserId: appendedUserId,
+            suppressRemoteUserAppend: suppressRemoteUserAppend ? true : nil,
+            replacementAssistantMessageID: replacementAssistantMessageID
         )
         pendingICloudPlaceholders[correlationID] = placeholderId
         // Persist when leaving the composer so closing the app restores the same unfinished exchange.
@@ -247,7 +302,6 @@ extension ChatStore {
             }
         }
         if !steer { sendTask = transport }
-        return true
     }
 
     /// Transport completion cannot override a terminal or replacement run.
@@ -260,13 +314,21 @@ extension ChatStore {
                 || retiredPendingPlaceholders[correlationID] == placeholderId)
     }
 
+    func stoppableRunIDs(client: MacBridgeClient) -> Set<String> {
+        let pairing = AgentNameCache.fingerprint(client.pairingStore?.iCloudPairingSecret)
+        let steers = queuedSends.filter {
+            $0.awaitingSteerOutcome == true && $0.sessionID == selectedSessionID && $0.pairingFingerprint == pairing
+        }
+        return activeTurnRunIDs.union(steers.map { $0.id.uuidString })
+    }
+
     /// Stop names every open run here; release the composer now, but settle only on Mac cancellation or terminal transcript evidence.
     func stop(client: MacBridgeClient) {
         if !queuedSendsForSelectedSession.isEmpty {
             pausedQueueSessionKeys.insert(queueSessionKey(selectedSessionID))
         }
         let stoppedSessionID = selectedSessionID
-        let stoppedRunIDs = Array(activeTurnRunIDs)
+        let stoppedRunIDs = stoppableRunIDs(client: client).sorted()
         guard !stoppedRunIDs.isEmpty else { return }
         pausedQueueSessionKeys.insert(queueSessionKey(stoppedSessionID))
         // Missing Stop acknowledgment proves no nonreceipt; retain evidence until the Mac settles this named request.
@@ -281,15 +343,22 @@ extension ChatStore {
                 try await client.cancelChat(sessionID: stoppedSessionID, runIDs: stoppedRunIDs)
             } catch {
                 // A terminal can arrive while Stop waits for its own action receipt.
-                guard stoppedRunIDs.contains(where: {
-                    (pendingExchanges[$0].map { !$0.isExpired } ?? false) || liveTurnBubbles[$0] != nil
+                guard stoppedRunIDs.contains(where: { run in
+                    (pendingExchanges[run].map { !$0.isExpired } ?? false) || liveTurnBubbles[run] != nil
+                        || queuedSends.contains { $0.id.uuidString == run && $0.awaitingSteerOutcome == true }
                 }) else { return }
-                errorBanner = "Stop is unconfirmed: \(error.localizedDescription). Still watching the original request."
+                errorBanner = "Not sure Stop worked: \(error.localizedDescription). Still watching the original request."
             }
         }
     }
 
+    func canRemoveQueuedSend(_ queued: QueuedChatSend) -> Bool {
+        queued.awaitingSteerOutcome != true
+            || (pendingRetryClient?.pairingStore?.iCloudPairingSecret != nil && !canDeliverQueuedSend(queued))
+    }
+
     func removeQueuedSend(_ id: UUID) {
+        guard let queued = queuedSends.first(where: { $0.id == id }), canRemoveQueuedSend(queued) else { return }
         queuedSends.removeAll { $0.id == id }
         let key = queueSessionKey(selectedSessionID)
         if queuedSendsForSelectedSession.isEmpty {
@@ -300,7 +369,8 @@ extension ChatStore {
 
     /// Steer reaches the current Mac turn without cancellation; absent a turn it runs normally, while attachments wait their turn.
     func sendQueuedNow(_ id: UUID, client: MacBridgeClient) {
-        guard let queued = queuedSends.first(where: { $0.id == id }), canDeliverQueuedSend(queued) else { return }
+        guard let queued = queuedSends.first(where: { $0.id == id }), canDeliverQueuedSend(queued),
+              queued.awaitingSteerOutcome != true else { return }
         if pendingExchanges[id.uuidString]?.deliveryUnconfirmed == true {
             // Explicit Retry replays this envelope; it must never become Steer.
             sendAsOwnMessage(id, client: client)
@@ -310,28 +380,48 @@ extension ChatStore {
         let key = queueSessionKey(selectedSessionID)
         pausedQueueSessionKeys.remove(key)
         transportPausedQueueSessionKeys.remove(key)
-        guard isLoading, let next = queuedSends.first(where: { $0.id == id }), next.attachments.isEmpty,
-              let session = Self.cleanSessionID(selectedSessionID), steeringQueuedIDs.insert(id).inserted else {
+        guard isLoading, queued.attachments.isEmpty, let session = Self.cleanSessionID(selectedSessionID),
+              let index = queuedSends.firstIndex(where: { $0.id == id && $0.sessionID == session }) else {
             scheduleQueuedSendDrain()
             return
         }
+        queuedSends[index].awaitingSteerOutcome = true
         Task { @MainActor in
             do {
-                if try await client.steerChat(sessionID: session, runID: id.uuidString, text: next.text) { return }
+                try await checkpointQueuedSend(id)
             } catch {
-                steeringQueuedIDs.remove(id)
-                errorBanner = "Steer didn't reach the Mac: \(error.localizedDescription)"
+                clearPendingSteer(id)
+                errorBanner = "Steer could not be saved: \(error.localizedDescription)"
                 return
             }
-            steeringQueuedIDs.remove(id)
-            sendAsOwnMessage(id, client: client)
+            do {
+                if try await client.steerChat(sessionID: session, runID: id.uuidString, text: queued.text) { return }
+                if clearPendingSteer(id), !pausedQueueSessionKeys.contains(key) { sendAsOwnMessage(id, client: client) }
+            } catch {
+                guard queuedSends.contains(where: { $0.id == id && $0.awaitingSteerOutcome == true }) else { return }
+                switch error as? SyncError {
+                case .macRejected, .notSigned, .notSetup, .sendFailed, .busy:
+                    clearPendingSteer(id)
+                    errorBanner = error.localizedDescription
+                default:
+                    errorBanner = "The Mac hasn't confirmed Steer: \(error.localizedDescription)"
+                }
+            }
         }
+    }
+
+    @discardableResult
+    func clearPendingSteer(_ id: UUID) -> Bool {
+        guard let index = queuedSends.firstIndex(where: { $0.id == id && $0.awaitingSteerOutcome == true }) else { return false }
+        queuedSends[index].awaitingSteerOutcome = nil
+        return true
     }
 
     /// Queued sends belong only to their own conversation; another conversation's queue waits for its drain.
     func sendAsOwnMessage(_ id: UUID, client: MacBridgeClient) {
         guard let next = queuedSends.first(where: { $0.id == id }),
-              queueSessionKey(next.sessionID) == queueSessionKey(selectedSessionID) else { return }
+              queueSessionKey(next.sessionID) == queueSessionKey(selectedSessionID),
+              next.awaitingSteerOutcome != true else { return }
         _ = send(text: next.text, client: client, controls: next.controls,
                  appendUser: next.userMessageID == nil && !next.suppressRemoteUserAppend,
                  attachments: next.attachments, reusePlaceholderId: next.placeholderID,
@@ -376,11 +466,12 @@ extension ChatStore {
         return true
     }
 
-    func migrateQueuedSends(from oldSessionID: String?, to newSessionID: String) {
+    func migrateQueuedSends(from oldSessionID: String?, to newSessionID: String, unsignedOnly: Bool = false) {
         let oldKey = queueSessionKey(oldSessionID)
         let newKey = queueSessionKey(newSessionID)
         guard oldKey != newKey else { return }
-        for index in queuedSends.indices where queueSessionKey(queuedSends[index].sessionID) == oldKey {
+        for index in queuedSends.indices where queueSessionKey(queuedSends[index].sessionID) == oldKey
+            && (!unsignedOnly || queuedSends[index].preparedMessage == nil) {
             queuedSends[index].sessionID = newSessionID
         }
         if pausedQueueSessionKeys.remove(oldKey) != nil {
@@ -406,7 +497,7 @@ extension ChatStore {
         guard !isLoading, !isSwitchingSession, !isSelectedQueuePaused,
               let client = pendingRetryClient,
               let next = queuedSendsForSelectedSession.first(where: {
-                  canDeliverQueuedSend($0) && !steeringQueuedIDs.contains($0.id)
+                  canDeliverQueuedSend($0) && $0.awaitingSteerOutcome != true
                       && pendingExchanges[$0.id.uuidString]?.deliveryUnconfirmed != true
               })
         else { return }
@@ -433,31 +524,27 @@ extension ChatStore {
     }
 
     /// Regeneration waits for a Mac-published message ID naming exactly one persisted replacement row.
-    var canRegenerateLast: Bool {
-        guard !isLoading, !isSwitchingSession,
+    var regenerationTarget: (id: UUID, sessionID: String, prompt: String)? {
+        let messages = self.messages
+        guard !isLoading, !isSwitchingSession, let sessionID = selectedSessionID,
               let assistantIndex = messages.lastIndex(where: { $0.role == .assistant }),
-              let user = messages[..<assistantIndex].last(where: { $0.role == .user }),
-              !user.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return false }
-        return macPublishedMessageIDs.contains(messages[assistantIndex].id)
+              let user = messages[..<assistantIndex].last(where: { $0.role == .user }) else { return nil }
+        let id = messages[assistantIndex].id
+        let prompt = user.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, macPublishedMessageIDs.contains(id) else { return nil }
+        return (id, sessionID, prompt)
     }
 
-    func regenerateLast(client: MacBridgeClient, controls: ChatRuntimeControls = .defaults) {
-        guard canRegenerateLast,
-              let assistantIndex = messages.lastIndex(where: { $0.role == .assistant }),
-              let user = messages[..<assistantIndex].last(where: { $0.role == .user })
-        else { return }
-        let prompt = user.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
+    func regenerate(_ id: UUID, in sessionID: String, client: MacBridgeClient, controls: ChatRuntimeControls = .defaults) {
+        guard let target = regenerationTarget, target.id == id, target.sessionID == sessionID else { return }
         // Keep the saved answer until the Mac publishes the replacement; settle against the new run's identity.
-        let replaced = messages[assistantIndex]
         send(
-            text: prompt,
+            text: target.prompt,
             client: client,
             controls: controls,
             appendUser: false,
             suppressRemoteUserAppend: true,
-            replacementAssistantMessageID: replaced.id
+            replacementAssistantMessageID: id
         )
     }
 
@@ -479,7 +566,9 @@ extension ChatStore {
             createdAt: Date(),
             placeholderID: placeholderId,
             userMessageID: args.appendedUserId,
-            pairingFingerprint: pairing
+            pairingFingerprint: pairing,
+            suppressRemoteUserAppend: args.suppressRemoteUserAppend == true,
+            replacementAssistantMessageID: args.replacementAssistantMessageID
         )
         guard enqueueSend(retained) else { return }
         let retainedID = retained.id
@@ -495,6 +584,8 @@ extension ChatStore {
             attachments: args.attachments,
             reusePlaceholderId: placeholderId,
             retainedUserMessageID: args.appendedUserId,
+            suppressRemoteUserAppend: args.suppressRemoteUserAppend == true,
+            replacementAssistantMessageID: args.replacementAssistantMessageID,
             queuedSendID: retainedID
         )
     }

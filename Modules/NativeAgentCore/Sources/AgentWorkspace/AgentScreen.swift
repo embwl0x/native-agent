@@ -174,7 +174,7 @@ package enum AgentScreen {
                 return .page(await elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope))
             }
             let cachedName = name.hasPrefix("elsewhere.") ? scope + "\u{0}" + name : name
-            if let page = AgentItemPages.shared.page(workspace: workspace, dataRoot, cachedName) { return .page(page) }
+            if let page = AgentItemPages.shared.page(dataRoot, cachedName) { return .page(page) }
             if name == "elsewhere" { return .page(await elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope)) }
             if let action = try namedAction(workspace: workspace, name, dataRoot: dataRoot, scope: scope) {
                 if case .open(let place) = action, case .record = place { return open(place) }
@@ -427,7 +427,8 @@ package enum AgentScreen {
         for act in open.sorted(by: { $0.at > $1.at }) {
             guard RepairOwed.isOwed(act), let owed = act.owes["repair"] else { continue }
             let debt = RepairDebt(act)
-            let when = NativeTimestampFormat.parseISO8601FractionalFirst(act.at).map { " " + age(now.timeIntervalSince($0)) } ?? ""
+            // A debt is dated by its latest evidence (a check that failed again), not the day it was first owed.
+            let when = NativeTimestampFormat.parseISO8601FractionalFirst(act.updatedAt ?? act.at).map { " " + age(now.timeIntervalSince($0)) } ?? ""
             let what = failureReason(debt.operation ?? "a call") + " " + (act.outcome?.status ?? "outcome not recorded")
                 + when + " by " + failureReason(debt.owner ?? "owner not recorded")
             let release = " · or let go: app {action:\"repair.let_go\", args:{id:\"\(act.id)\", reason}}"
@@ -456,7 +457,7 @@ package enum AgentScreen {
     package static func bridgeChats(dataRoot: URL) throws -> [BridgeChat] {
         var chats: [BridgeChat] = try AgentWorkSession.verified(dataRoot: dataRoot).compactMap { session in
             let row = session.row
-            guard let at = row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(date) else { return nil }
+            guard let at = row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) else { return nil }
             let raw = row["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? session.topic
             let named = humanTitle(raw, agentName: nil)
             var title = named.title
@@ -568,7 +569,7 @@ package enum AgentScreen {
                 let exchangeAt = record?.exchanges?.last?.settledAt ?? record?.operationStartedAt ?? record?.updatedAt ?? .distantPast
                 if record?.sendFailed != true, health?.problem == nil,
                    let job = world.jobs.first(where: { $0.agent == contact.id || contact.agents.contains($0.agent) }),
-                   let at = (job.completedAt ?? job.startedAt ?? job.createdAt).flatMap(date),
+                   let at = (job.completedAt ?? job.startedAt ?? job.createdAt).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst),
                    at > max(exchangeAt, chat?.at ?? .distantPast) {
                     return (contact, (jobState(job, now: now), false, ""), at, nil)
                 }
@@ -785,10 +786,6 @@ package enum AgentScreen {
         return "\(s / 86400)d"
     }
 
-    static func date(_ text: String) -> Date? {
-        NativeTimestampFormat.parseISO8601FractionalFirst(text)
-    }
-
     static func firstLine(_ text: String) -> String {
         (plainLines(text).first ?? "").replacingOccurrences(of: "\"", with: "'")
     }
@@ -838,11 +835,6 @@ package enum AgentScreen {
 
     static func pad(_ text: String, _ width: Int) -> String {
         text.count >= width ? text + " " : text + String(repeating: " ", count: width - text.count)
-    }
-
-    static func nonEmpty(_ text: String?) -> String? {
-        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
-        return text
     }
 
 

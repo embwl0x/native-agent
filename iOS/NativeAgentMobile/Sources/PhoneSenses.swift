@@ -30,14 +30,10 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
     private let file = URL.applicationSupportDirectory.appendingPathComponent("phone-senses.json")
     private let motion = CMMotionActivityManager()
     private let location = CLLocationManager()
-    @Published private var motionQuery: UUID?
+    private var motionQuery: UUID?
     private var focusAuthorization: Task<Void, Never>?
     private lazy var bodyReadings = PhoneBodyReadings(owner: self)
     private(set) var restorationTask: Task<Void, Never>?
-
-    var waitingSources: [PhoneSenseEvent.Source] {
-        (motionQuery == nil ? [] : [.motion]) + bodyReadings.waitingSources
-    }
 
     private override init() {
         super.init()
@@ -112,6 +108,9 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
                 self.motionQuery = nil
             }
             if source == .motion, value { self.queryMotion(allowPrompt: true) }
+            if source == .location, value, self.location.authorizationStatus != .authorizedAlways {
+                self.location.requestAlwaysAuthorization()
+            }
             if value { self.bodyReadings.requestPermission(for: source) }
             if !value { try await self.record(source, value: "disabled") }
             try await self.sample()
@@ -196,6 +195,14 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
             try await record(.charging, value: value, night: hour >= 22 || hour < 7)
         }
         if state.enabled.contains(.motion) { queryMotion(allowPrompt: false) }
+        if state.enabled.contains(.location) {
+            let status = location.authorizationStatus
+            if status == .authorizedAlways || status == .authorizedWhenInUse, let fix = location.location, fix.horizontalAccuracy >= 0,
+               fix.timestamp.timeIntervalSinceNow <= 0 {
+                try await record(.location, value: "known", at: fix.timestamp, summary: String(format: "latitude %.5f, longitude %.5f, within %.0f m",
+                    fix.coordinate.latitude, fix.coordinate.longitude, fix.horizontalAccuracy))
+            } else { try await record(.location, value: "unknown") }
+        }
         bodyReadings.sample(enabled: state.enabled, pairing: pairing)
         await publishNow()
     }
@@ -222,6 +229,21 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
             return .init(enabled: on, required: "Focus Status", permission: permission,
                 missing: (on ? [] : ["turn on Focus in NativeAgent Settings → Phone senses"])
                     + (status == .authorized ? [] : ["allow Focus Status in iPhone Settings"]))
+        }
+        if source == .location {
+            let status = location.authorizationStatus
+            let permission: String = switch status {
+            case .authorizedAlways: "always"
+            case .authorizedWhenInUse: "while using the app"
+            case .denied: "denied"
+            case .restricted: "restricted"
+            case .notDetermined: "not determined"
+            @unknown default: "unrecognized iOS status"
+            }
+            return .init(enabled: on, required: "Location Always", permission: permission,
+                missing: (on ? [] : ["turn on Location in NativeAgent Settings → Phone senses"])
+                    + (status == .authorizedAlways ? [] : ["allow Location Always in iPhone Settings → Apps → NativeAgent"]),
+                detail: "Last known position when iOS wakes the app or the phone moves about 500 m; no live tracking.")
         }
         return bodyReadings.setup(for: source, enabled: on)
     }
@@ -391,12 +413,10 @@ struct PhoneSensesSettings: View {
             return .init(id: control.id, title: control.label, detail: row.unavailableReason ?? description(control.id),
                 control: row.value.map { .init(on: $0 == "true", call: .init("phone.sense.set", ["id": .string(control.id)])) })
         }
-        rows += senses.waitingSources.map { .init(id: "waiting-" + $0.rawValue,
-            title: "Waiting on \($0.title)", detail: "Turn off its switch to cancel.", tone: .quiet) }
         if let error = senses.errorMessage { rows.append(.init(id: "error", title: error, tone: .failed)) }
         return .init(sections: [.init(id: "senses", title: "Phone senses", footer: """
             All start off. A switch explicitly allows its summary through paired iCloud to your Mac and the selected AI provider. Setup state is shared \
-            so your agent can help. No coordinates travel through these senses. Always location, if allowed for Places, can wake a reading. \
+            so your agent can help. Only Location shares coordinates. Always location, if allowed, can wake a reading. \
             iOS may delay updates; silence means unknown.
             """, rows: rows)])
     }
@@ -429,6 +449,8 @@ struct PhoneSensesSettings: View {
         case "phone.senses.network": "Shares network kind or unavailability, without names or addresses."
         case "phone.senses.music":
             "Shares Music playback state, song title and artist, without audio or listening history. Requires Media & Apple Music access."
+        case "phone.senses.location":
+            "Shares where this phone last was, kept on your Mac for your agent to look at when it wants. Updates when the phone moves; no live tracking."
         case "phone.senses.photos": "Shares only today's visible photo count; Limited Access counts your selection, never images."
         default: "Read this phone sense's setup before enabling it."
         }

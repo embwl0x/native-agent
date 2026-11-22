@@ -6,39 +6,24 @@ import NativeAgentCore
 public struct TelegramLastUserMessage: Sendable, Equatable {
     public let chatId: Int
     public let text: String
-    public let recordedAt: String
     public let message: TelegramMessage?
+    public let sessionId: String?
 
-    public init(chatId: Int, text: String, recordedAt: String, message: TelegramMessage? = nil) {
+    public init(chatId: Int, text: String, message: TelegramMessage? = nil, sessionId: String? = nil) {
         self.chatId = chatId
         self.text = text
-        self.recordedAt = recordedAt
         self.message = message
+        self.sessionId = sessionId
     }
 }
 
 public struct TelegramTurnSnapshot: Sendable, Equatable {
-    public let chatId: Int
     public let isRunning: Bool
-    public let startedAt: String?
     public let promptPreview: String?
-    public let lastUserMessagePreview: String?
-    public let lastUserMessageAt: String?
 
-    public init(
-        chatId: Int,
-        isRunning: Bool,
-        startedAt: String?,
-        promptPreview: String?,
-        lastUserMessagePreview: String?,
-        lastUserMessageAt: String?
-    ) {
-        self.chatId = chatId
+    public init(isRunning: Bool, promptPreview: String?) {
         self.isRunning = isRunning
-        self.startedAt = startedAt
         self.promptPreview = promptPreview
-        self.lastUserMessagePreview = lastUserMessagePreview
-        self.lastUserMessageAt = lastUserMessageAt
     }
 }
 
@@ -57,8 +42,7 @@ public actor TelegramTurns {
 
     private struct ActiveTurn: Sendable {
         let id: UUID
-        let task: Task<Void, Never>
-        let startedAt: String
+        let task: Task<TelegramTurnProgressCardDriver?, Never>
         let promptPreview: String
         var card: TelegramTurnProgressCardDriver?
         var continuationID: Int? = nil
@@ -76,8 +60,10 @@ public actor TelegramTurns {
     }
 
     private var activeTurns: [TelegramDestination: ActiveTurn] = [:]
-    private var commandTasks: [UUID: Task<Void, Never>] = [:]
+    private var commandTasks: [UUID: Task<TelegramTurnProgressCardDriver?, Never>] = [:]
     private var commandDestinations: [UUID: TelegramDestination] = [:]
+    private enum WaitingTurnState: Equatable { case admitted, stopRequested }
+    private var waitingTurns: [UUID: WaitingTurnState] = [:]
     /// Work cards of arrivals that wait in the agent's turn admission while their destination is busy, by turn id.
     private var commandCards: [UUID: TelegramTurnProgressCardDriver] = [:]
     private var isShuttingDown = false
@@ -110,15 +96,16 @@ public actor TelegramTurns {
     }
 
     public func recordLastUserMessage(destination: TelegramDestination, text: String, message: TelegramMessage? = nil,
-                                      updatingCurrent: Bool = false) {
-        if updatingCurrent, lastMessages[destination]?.message != message { return }
+                                      sessionId: String? = nil, updatingCurrent: Bool = false) {
+        if updatingCurrent, lastMessages[destination]?.message != message
+            || lastMessages[destination]?.sessionId != sessionId { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         lastMessages[destination] = TelegramLastUserMessage(
             chatId: destination.chatId,
             text: trimmed,
-            recordedAt: _tgNowString(),
-            message: message
+            message: message,
+            sessionId: sessionId
         )
     }
 
@@ -133,29 +120,33 @@ public actor TelegramTurns {
         text: String,
         priority: TaskPriority? = nil,
         operation: @escaping @Sendable (_ turnId: UUID) async -> Void
-    ) -> (id: UUID, task: Task<Void, Never>)? {
-        guard !isShuttingDown else { return nil }
+    ) -> Bool {
+        guard !isShuttingDown, !Task.isCancelled else { return false }
         if activeTurns[destination] != nil {
             // A busy destination's arrival starts now and waits in the agent's turn admission, where its turn in progress may read it.
             commandDestinations[id] = destination
-            let task = Task(priority: priority) {
+            waitingTurns[id] = .admitted
+            commandTasks[id] = Task(priority: priority) {
                 await operation(id)
-                await commandCards[id]?.close()
+                let card = commandCards[id]
+                await card?.close()
                 commandCards[id] = nil
                 commandTasks[id] = nil
                 commandDestinations[id] = nil
+                waitingTurns[id] = nil
+                return card
             }
-            commandTasks[id] = task
-            return (id, task)
+            return true
         }
         pausedQueueDestinations.remove(destination)
-        return launchTurn(
+        launchTurn(
             id: id,
             destination: destination,
             text: text,
             priority: priority,
             operation: operation
         )
+        return true
     }
 
     private func launchTurn(
@@ -165,20 +156,18 @@ public actor TelegramTurns {
         priority: TaskPriority? = nil,
         operation: @escaping @Sendable (_ turnId: UUID) async -> Void,
         continuationID: Int? = nil
-    ) -> (id: UUID, task: Task<Void, Never>) {
+    ) {
         let task = Task(priority: priority) { [weak self] in
             await operation(id)
-            await self?.finishTurn(destination: destination, turnId: id)
+            return await self?.finishTurn(destination: destination, turnId: id)
         }
         activeTurns[destination] = ActiveTurn(
             id: id,
             task: task,
-            startedAt: _tgNowString(),
             promptPreview: Self.preview(text),
             card: nil,
             continuationID: continuationID
         )
-        return (id, task)
     }
 
     /// Await an internal follow-up after its destination's turn ends. The slot includes delivery; shutdown/cancellation settles waiters.
@@ -254,9 +243,24 @@ public actor TelegramTurns {
         activeTurns[destination]?.card
     }
 
-    func prepareControlHandoff(destination: TelegramDestination) -> (UUID?, TelegramTurnProgressCardDriver?) {
+    func requestControlHandoff(destination: TelegramDestination) -> (Task<StopOutcome, Never>, TelegramTurnProgressCardDriver?) {
         pausedQueueDestinations.insert(destination)
-        return (activeTurns[destination]?.id, activeTurns[destination]?.card)
+        let active = activeTurns[destination]
+        let waiting = waitingTurns.keys.filter { commandDestinations[$0] == destination }
+        let tasks = [active?.task].compactMap { $0 } + waiting.compactMap { commandTasks[$0] }
+        let card = active?.card ?? waiting.compactMap { commandCards[$0] }.first
+        for id in waiting { cancelCommand(id) }
+        _ = requestActiveStop(destination: destination, turnId: nil)
+        let settlement = Task<StopOutcome, Never> {
+            var outcome: StopOutcome = .notRunning
+            for task in tasks {
+                let card = await task.value
+                if await card?.waitForTerminal() != .canceled { outcome = .outcomeUnknown }
+                else if outcome == .notRunning { outcome = .confirmed }
+            }
+            return outcome
+        }
+        return (settlement, card)
     }
 
     func controlCard(destination: TelegramDestination, turnId: UUID) -> TelegramTurnProgressCardDriver? {
@@ -284,14 +288,15 @@ public actor TelegramTurns {
         return true
     }
 
-    public func finishTurn(destination: TelegramDestination, turnId: UUID) async {
-        guard activeTurns[destination]?.id == turnId else { return }
+    private func finishTurn(destination: TelegramDestination, turnId: UUID) async -> TelegramTurnProgressCardDriver? {
+        guard activeTurns[destination]?.id == turnId else { return nil }
         let card = activeTurns[destination]?.card
         await card?.close()
         if let settlement = activeTurns[destination]?.stopSettlement { _ = await settlement.value }
-        guard activeTurns[destination]?.id == turnId else { return }
+        guard activeTurns[destination]?.id == turnId else { return card }
         activeTurns[destination] = nil
         startNextQueuedTurn(destination: destination)
+        return card
     }
 
     private func startNextQueuedTurn(destination: TelegramDestination) {
@@ -301,7 +306,7 @@ public actor TelegramTurns {
               !queue.isEmpty else { return }
         let next = queue.removeFirst()
         queuedTurns[destination] = queue.isEmpty ? nil : queue
-        _ = launchTurn(
+        launchTurn(
             destination: destination,
             text: next.text,
             priority: .userInitiated,
@@ -317,26 +322,37 @@ public actor TelegramTurns {
     }
 
     func shutdownInterruptedTurn(destination: TelegramDestination, turnId: UUID) -> Bool {
-        if isShuttingDown, commandDestinations[turnId] == destination { return true }
+        if isShuttingDown, commandDestinations[turnId] == destination { return waitingTurns[turnId] != .stopRequested }
         guard isShuttingDown, let active = activeTurns[destination], active.id == turnId else { return false }
         return !active.stopRequested
     }
 
     func requestStop(
         destination: TelegramDestination,
-        turnId: UUID? = nil,
-        pauseQueuedTurns: Bool = false
+        turnId: UUID? = nil
     ) -> Task<StopOutcome, Never> {
-        if pauseQueuedTurns { pausedQueueDestinations.insert(destination) }
         // A turn's own Stop reaches it while it waits in admission; a destination Stop reaches every one.
         let commands = commandDestinations.compactMap {
             $0.value == destination && (turnId == nil || $0.key == turnId) ? $0.key : nil
         }
-        for id in commands { commandTasks[id]?.cancel() }
-        guard let active = activeTurns[destination],
-              turnId == nil || active.id == turnId else {
+        for id in commands { cancelCommand(id) }
+        guard let stop = requestActiveStop(destination: destination, turnId: turnId) else {
             return Task { commands.isEmpty ? .notRunning : .outcomeUnknown }
         }
+        return Task {
+            let outcome = await stop.value
+            return commands.contains(where: { commandTasks[$0] != nil }) ? .outcomeUnknown : outcome
+        }
+    }
+
+    private func cancelCommand(_ id: UUID) {
+        if waitingTurns[id] != nil { waitingTurns[id] = .stopRequested }
+        commandTasks[id]?.cancel()
+    }
+
+    private func requestActiveStop(destination: TelegramDestination, turnId: UUID?) -> Task<StopOutcome, Never>? {
+        guard let active = activeTurns[destination],
+              turnId == nil || active.id == turnId else { return nil }
         activeTurns[destination]?.stopRequested = true
         active.task.cancel()
         if let settlement = active.stopSettlement { return settlement }
@@ -349,7 +365,7 @@ public actor TelegramTurns {
                 if activeTurns[destination]?.id == active.id {
                     activeTurns[destination]?.stopConfirmed = true
                 }
-                return commands.contains(where: { commandTasks[$0] != nil }) ? .outcomeUnknown : .confirmed
+                return .confirmed
             }
             await card.transition(
                 .outcomeUnknown(reason: "Stop requested, but cancellation was not confirmed")
@@ -362,7 +378,7 @@ public actor TelegramTurns {
 
     public func waitUntilAllIdle() async {
         while let task = activeTurns.values.first?.task {
-            await task.value
+            _ = await task.value
         }
     }
 
@@ -375,7 +391,7 @@ public actor TelegramTurns {
         while let task = activeTurns.values.first(where: {
             !turnIds.contains($0.id)
         })?.task {
-            await task.value
+            _ = await task.value
         }
     }
 
@@ -393,6 +409,7 @@ public actor TelegramTurns {
             await operation { done.resume() }
             commandTasks.removeValue(forKey: id)
             commandDestinations.removeValue(forKey: id)
+            return nil
         }
         await Task { await done.park() }.value
         return true
@@ -405,7 +422,7 @@ public actor TelegramTurns {
         pausedQueueDestinations.removeAll()
         let tasks = activeTurns.values.map(\.task) + Array(commandTasks.values)
         for task in tasks { task.cancel() }
-        for task in tasks { await task.value }
+        for task in tasks { _ = await task.value }
         activeTurns.removeAll()
         commandTasks.removeAll()
         commandDestinations.removeAll()
@@ -418,14 +435,9 @@ public actor TelegramTurns {
 
     public func snapshot(destination: TelegramDestination) -> TelegramTurnSnapshot {
         let active = activeTurns[destination]
-        let last = lastMessages[destination]
         return TelegramTurnSnapshot(
-            chatId: destination.chatId,
             isRunning: active.map { !$0.stopConfirmed } ?? false,
-            startedAt: active?.startedAt,
-            promptPreview: active?.promptPreview,
-            lastUserMessagePreview: last.map { Self.preview($0.text) },
-            lastUserMessageAt: last?.recordedAt
+            promptPreview: active?.promptPreview
         )
     }
 

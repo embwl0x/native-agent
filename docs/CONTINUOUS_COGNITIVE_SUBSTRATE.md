@@ -28,17 +28,20 @@ and background switches to enabled. Persistence, workspace, affect, cares
 and replay follow the master. Reflection has a separate enable preference
 and cost ceiling. After onboarding with a configured chat provider, when
 the master preference is absent, `initializeMissingInnerLifePreferences`
-initializes missing inner-life choices, including reflection with a ceiling
-of two calls. This initialization preserves saved choices.
+initializes missing inner-life choices, including a reflection budget of two
+calls. This initialization preserves saved choices. A positive budget counts
+and caps only waking calls over a rolling 24 hours. A zero budget disables all
+reflection, including dream reflection.
 
 The source supports event ingestion, persistence, workspace selection,
 capsules, affect, cares, attention, replay and reflection. It does not support the
 old text-extracted task prediction/commitment system.
 The live Observatory remains available at **Diagnostics → Cognition**, including
 its workspace inclusion controls. The count-based experiment lifecycle, faculty
-ratings, research checks panel and research-export controls are retired. SQLite migration
-`v6_retire_cognitive_experiments` removes only their `experiment` artifacts;
-living cognition, canonical memory/persona and other receipts retain their format.
+ratings, research checks panel and research-export controls are retired. The
+former `v6_retire_cognitive_experiments` migration removed their `experiment`
+artifacts. The `current_cognitive_schema` baseline creates the current tables
+for a new store and checks that an existing store has their required columns.
 
 All source paths below are under `Modules/NativeAgentCore/Sources/` unless
 marked as app or script paths.

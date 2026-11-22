@@ -3,11 +3,9 @@ import Senses
 import NativeAgentCore
 import PersistenceCore
 
-#if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
 import ApplicationServices
 import AppKit
 // Blueprint: | `MacAppSourceEvents.swift` | Descendant AX notifications and coalesced reads retain coverage gaps; bounded content-stall signals |
-#endif
 
 /// Subscribe to descendants because most AX changes do not propagate to application observers. Partial coverage retains working subscriptions and names gaps;
 /// notifications request reads, never prove exhaustive coverage. Coalesce bursts on the AX run loop without clock-driven renewal.
@@ -17,7 +15,6 @@ public final class MacAppSourceEvents: @unchecked Sendable {
     private let continuation: AsyncThrowingStream<Void, Error>.Continuation
     private let onNotification: (@Sendable (String) -> Void)?
 
-    #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
     private let pid: Int32
     private var observer: AXObserver?
     private var subscriptions: [CFHashCode: [Subscription]] = [:]
@@ -60,10 +57,8 @@ public final class MacAppSourceEvents: @unchecked Sendable {
         kAXElementBusyChangedNotification,
         "AXChildrenChanged", "AXLayoutComplete", "AXLoadComplete"
     ]
-    #endif
 
     public convenience init(bundleID: String, context: MacOperationContext) throws {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         let pid = MacAXExecutionLane.sync {
             NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
                 .first(where: { !$0.isTerminated })?.processIdentifier
@@ -72,9 +67,6 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             throw SenseFailure(code: "source_unavailable", message: "App observation needs a concrete already-running app.")
         }
         try self.init(pid: pid, context: context)
-        #else
-        throw SenseFailure(code: "source_unavailable", message: "App accessibility observation requires macOS.")
-        #endif
     }
 
     /// Receives descendant kinds before coalescing; the callback must not perform AX work.
@@ -84,7 +76,6 @@ public final class MacAppSourceEvents: @unchecked Sendable {
         let pair = AsyncThrowingStream<Void, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
         stream = pair.stream
         continuation = pair.continuation
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         self.pid = pid
         continuation.onTermination = { [weak self] _ in self?.cancel() }
         do {
@@ -93,24 +84,15 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             cancel()
             throw error
         }
-        #else
-        throw SenseFailure(code: "source_unavailable", message: "App accessibility observation requires macOS.")
-        #endif
     }
 
     public func cancel() {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         MacAXExecutionLane.async { self.stop(error: nil) }
-        #else
-        continuation.finish()
-        #endif
     }
 
     deinit {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         // Explicit cancellation retains this owner through lane cleanup; a retired source needs no further lane transaction at final release.
         if !stopped { MacAXExecutionLane.sync { self.stop(error: nil) } }
-        #endif
     }
 
     @concurrent public static func open(bundleID: String, context: MacOperationContext) async throws -> MacAppSourceEvents {
@@ -124,21 +106,16 @@ public final class MacAppSourceEvents: @unchecked Sendable {
 
     /// Read the subscription owner, never a caller's mirror of its health.
     public var coverage: JSONValue {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         return MacAXExecutionLane.sync {
             .object(["partial": .bool(coveragePartial), "visited": .int(Int64(coverageVisited)),
                      "gap_count": .int(Int64(coverageGapCount)),
                      "gaps": .array(coverageGaps.map(JSONValue.string))])
         }
-        #else
-        return .object(["unavailable": .bool(true)])
-        #endif
     }
 
     /// Notifications only trigger reads. The reader renews this one-shot deadline when it observes renderer content growth, never on a callback. Expiry
     /// triggers a final read rather than closing the stream: content arriving at the boundary must still be able to renew the wait.
     func watchContentStall(seconds: TimeInterval, context: MacOperationContext) {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         MacAXExecutionLane.sync {
             guard !stopped, stallTimer == nil else { return }
             stallSeconds = seconds
@@ -159,30 +136,22 @@ public final class MacAppSourceEvents: @unchecked Sendable {
             resetStallDeadline()
             timer.resume()
         }
-        #endif
     }
 
     func noteContentGrowth() {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         MacAXExecutionLane.sync {
             guard !stopped else { return }
             resetStallDeadline()
         }
-        #endif
     }
 
     var contentStalled: Bool {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
         return MacAXExecutionLane.sync {
             guard let stallDeadline else { return false }
             return DispatchTime.now() >= stallDeadline
         }
-        #else
-        return false
-        #endif
     }
 
-    #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
     /// All mutable state and every AX transaction belong to MacAXExecutionLane.
     private func install() throws {
         guard !PersonOnlyWindows.isOwnProcess(pid), let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
@@ -496,5 +465,4 @@ public final class MacAppSourceEvents: @unchecked Sendable {
         if let error { continuation.finish(throwing: error) }
         else { continuation.finish() }
     }
-    #endif
 }

@@ -2,23 +2,17 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 import TrustCenter
 import CoreGraphics
 import UserNotifications
 import Senses
 import Experiences
-import CryptoKit
 import os
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `SystemMacAXElementSource.swift` | Scoped locked AX, snapshot focus and renderer-safe continuation; per-node gaps and complete secret evidence |
-#if canImport(ApplicationServices) && os(macOS)
 /// Reads emit no input; only active attribute reads prepare renderer modes. Scope live tables to dispatch and retained continuations, locking every AX
 /// reference access under unchecked Sendable.
 public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Sendable {
@@ -257,7 +251,6 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return false
     }
     public func frontmostApp() -> MacAXAppInfo? {
-        #if canImport(AppKit)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         return MacAXAppInfo(
             name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
@@ -265,21 +258,13 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             processIdentifier: app.processIdentifier,
             isDockApp: app.activationPolicy == .regular
         )
-        #else
-        return nil
-        #endif
     }
     public func frontmostWindowRoot(context: MacOperationContext) -> MacAXElementRef? {
-        #if canImport(AppKit)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         return windowRoot(pid: app.processIdentifier, context: context)
-        #else
-        return nil
-        #endif
     }
     /// Accessory apps remain running after their last window closes; Dock membership is presentation metadata.
     public func runningApps() -> [MacAXAppInfo] {
-        #if canImport(AppKit)
         return NSWorkspace.shared.runningApplications
             .filter { !$0.isTerminated && ($0.activationPolicy == .regular || $0.activationPolicy == .accessory) }
             .map { app in
@@ -290,20 +275,13 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
                     isDockApp: app.activationPolicy == .regular
                 )
             }
-        #else
-        return []
-        #endif
     }
     /// Read the menu bar root only; MacMenuBar owns bounded descent.
     public func menuBarRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef? {
-        #if canImport(AppKit)
         guard !PersonOnlyWindows.isOwnProcess(pid), isTrusted() else { return nil }
         let app = AXUIElementCreateApplication(pid)
         guard let bar = MacAXAttributeRead.copyElement(app, kAXMenuBarAttribute, context: context) else { return nil }
         return mint(bar)
-        #else
-        return nil
-        #endif
     }
     public func transientMenuRoots(pid: Int32, context: MacOperationContext) -> [MacAXElementRef] {
         guard !PersonOnlyWindows.isOwnProcess(pid), isTrusted(), frontmostApp()?.processIdentifier == pid else { return [] }
@@ -343,7 +321,6 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return menus.map { mint($0) }
     }
     public func windowRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef? {
-        #if canImport(AppKit)
         // Direct callers cannot read person-only UI.
         guard !PersonOnlyWindows.isOwnProcess(pid) else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
@@ -363,13 +340,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             return mint(first)
         }
         return nil
-        #else
-        return nil
-        #endif
     }
     /// Use AXWindows order, then union CF-equal focused/main references so omitted Finder sheets retain their identity without duplicates.
     public func windowRoots(pid: Int32, context: MacOperationContext) -> [MacAXWindowHandle] {
-        #if canImport(AppKit)
         // Every window shares the process's person-only boundary.
         guard !PersonOnlyWindows.isOwnProcess(pid) else { return [] }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
@@ -386,13 +359,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
                     identity: try MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index, context: context))
             }
         } catch { MacAXAttributeRead.failed(error, context: context); return [] }
-        #else
-        return []
-        #endif
     }
     /// Named-process metadata must describe the root's pid, even when another app is frontmost.
     public func appInfo(pid: Int32) -> MacAXAppInfo? {
-        #if canImport(AppKit)
         guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return nil }
         return MacAXAppInfo(
             name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
@@ -400,9 +369,6 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             processIdentifier: pid,
             isDockApp: app.activationPolicy == .regular
         )
-        #else
-        return nil
-        #endif
     }
     /// Standalone callers use the same bounded observed topology as other reads.
     public func focusedElementPath(context: MacOperationContext) -> [Int]? {
@@ -424,7 +390,6 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     }
     public func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo rootRef: MacAXElementRef, context: MacOperationContext) -> [Int]? {
         MacAXExecutionLane.sync {
-        #if canImport(AppKit)
         guard let root = element(rootRef) else { return nil }
         var pid: pid_t = 0
         guard AXUIElementGetPid(root, &pid) == .success else { return nil }
@@ -434,9 +399,6 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return snapshot.nodes.first { node in
             node.element.flatMap { element($0) }.map { CFEqual($0, focused) } == true
         }?.path
-        #else
-        return nil
-        #endif
         }
     }
     public func settableAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> [String] {
@@ -676,4 +638,3 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return nil
     }
 }
-#endif

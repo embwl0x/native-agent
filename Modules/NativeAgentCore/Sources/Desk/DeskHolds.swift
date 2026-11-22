@@ -11,18 +11,26 @@ public struct DeskHold: Codable, Sendable, Equatable {
 }
 
 /// Only a stopped run with a retained checkpoint can refuse another caller.
-public struct DeskHoldConflict: Sendable {
+public struct DeskHoldConflict: LocalizedError, Sendable {
     public let holder: DeskHold
+    let subject: String
 
-    public func refusal(_ subject: String) -> JSONValue {
-        let since = NativeTimestampFormat.fractionalUTCOffset(holder.at)
+    private var since: String { NativeTimestampFormat.fractionalUTCOffset(holder.at) }
+
+    private func detail(_ subject: String) -> String {
+        "\(subject) is held by \(holder.by), since \(since), until resumed or released. This call changed no Desk work."
+    }
+
+    public var errorDescription: String? { detail(subject) }
+
+    public func refusal(_ subject: String? = nil) -> JSONValue {
         let next: JSONValue = .object(["tool": .string("app"), "input": .object([
             "action": .string("ability.resume"), "preview": .bool(true),
             "args": .object(["run_id": .string(String(holder.by.dropFirst(4)))])])])
         var fields: [String: JSONValue] = [
             "status": .string("refused"), "reason": .string("held_by"), "effects": .string("none"),
             "held_by": .string(holder.by), "held_since": .string(since), "held_until": .string("resumed or released"),
-            "detail": .string("\(subject) is held by \(holder.by), since \(since), until resumed or released. This call changed no Desk work."),
+            "detail": .string(detail(subject ?? self.subject)),
             "remedy": .object(["kind": .string("inspect"), "owner": .string(holder.by), "next_call": next,
                 "instruction": .string("Read the stopped run's question and resume it with your answer, or release its queued step.")]),
         ]
@@ -46,7 +54,9 @@ extension SwiftNativeDeskStore {
     @concurrent public func runHold(_ refs: [String]) async throws -> DeskHoldConflict? {
         try await editHolds { holds, state in
             for ref in refs {
-                if let item = Self.holdItem(ref, state), let held = holds[item.handle] { return DeskHoldConflict(holder: held) }
+                if let item = Self.holdItem(ref, state), let held = holds[item.handle] {
+                    return DeskHoldConflict(holder: held, subject: "desk." + item.alias)
+                }
             }
             return nil
         }
@@ -76,14 +86,17 @@ extension SwiftNativeDeskStore {
     }
 
     /// A refused resume restores its reservations without stealing another stopped run's items.
-    @concurrent public func returnHolds(_ passed: [String: DeskHold]) async throws {
-        guard !passed.isEmpty else { return }
-        try await editHolds { holds, state in
-            let open = Set(state.items.filter { !$0.status.isTerminal }.map(\.handle))
-            for (handle, held) in passed {
-                guard open.contains(handle), holds[handle] == nil, try retainedRun(held) else { continue }
-                holds[handle] = held
+    @discardableResult
+    @concurrent public func returnHolds(_ passed: [String: DeskHold]) async throws -> [String] {
+        guard !passed.isEmpty else { return [] }
+        return try await editHolds { holds, state in
+            var names: [String] = []
+            for item in state.items where !item.status.isTerminal {
+                guard let held = passed[item.handle], holds[item.handle] == nil, try retainedRun(held) else { continue }
+                holds[item.handle] = held
+                names.append("desk." + item.alias)
             }
+            return names.sorted()
         }
     }
 

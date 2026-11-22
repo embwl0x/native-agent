@@ -12,7 +12,7 @@ public enum ScheduledReads {
     static let owners: [String: String] = ["connector_action": "watch", "proactive_scan": "scan"]
 
     public static func create(_ input: [String: JSONValue], dataRoot: URL, now: Date = Date()) async throws -> JSONValue {
-        let kind = SchedulerJobNormalizer.string(input["kind"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let kind = input["kind"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         var payload: [String: JSONValue]
         switch input["payload"] {
         case .object(let fields)?: payload = fields
@@ -22,7 +22,7 @@ public enum ScheduledReads {
         try SchedulerJobNormalizer.validatePayload(kind: kind, payload: payload)
         guard let owner = owners[kind] else { throw TriggerSchedulerError.schedulerInvalid("kind is unsupported", path: "$.kind") }
         if kind == "connector_action" {
-            let action = SchedulerJobNormalizer.string(payload["actionId"]) ?? ""
+            let action = payload["actionId"]?.stringValue ?? ""
             let read = payload["input"]?.objectValue ?? [:]
             if let refusal = SchedulerJobNormalizer.watchRefusal(action: action, input: read, turn: nil) {
                 throw TriggerSchedulerError.schedulerInvalid(refusal, path: "$.payload.actionId")
@@ -31,20 +31,20 @@ public enum ScheduledReads {
         } else {
             payload = try ProactiveScanArguments(payload).payload
         }
-        let named = SchedulerJobNormalizer.string(input["name"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let named = input["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard named.count <= 160 else { throw TriggerSchedulerError.schedulerInvalid("name must be at most 160 characters", path: "$.name") }
         payload["name"] = .string(named.isEmpty ? (kind == "proactive_scan" ? "Proactive scan" : "Watch " + (payload["actionId"]?.stringValue ?? "")) : named)
-        let key = SchedulerJobNormalizer.string(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let key = input["id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let id = clockID(key.isEmpty ? UUID().uuidString.lowercased() : key, owner: owner)
         let when = try timing(input, now: now)
         let clock = OneClock.at(dataRoot)
-        guard try await clock.times(owner: owner).allSatisfy({ $0.id != id }) else {
+        guard try await clock.times(owner: owner).allSatisfy({ $0.id != id || $0.ended == true }) else {
             throw TriggerSchedulerError.schedulerInvalid("A scheduled read with id \(id) already exists; cancel it first or choose another id", path: "$.id")
         }
         let made = UUID().uuidString.lowercased()
         payload["made"] = .string(made)
         let time = OneClock.Time(id: id, rhythm: when.rhythm, next: when.next, payload: .object(payload))
-        try await clock.declare(time)
+        try await clock.declare(time, creating: true)
         var receipt: [String: JSONValue] = ["status": .string("completed"), "read": try row(time)]
         if owner == "watch" { receipt["baseline"] = .string(try await baseline(id, made: made, clock: clock)) }
         return .object(receipt)

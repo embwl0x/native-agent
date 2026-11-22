@@ -1,7 +1,7 @@
 import ChatSessionWork
 import ChatToolParsing
 import ChatTurnContracts
-import CryptoKit
+import NativeAgentShared
 import Experiences
 import Foundation
 import NativeAgentCore
@@ -33,7 +33,8 @@ package enum ProviderToolResultPage {
         originalResultClass: ChatToolOutcome.ExactResultClass,
         appDoor: Bool,
         inlineLimit: Int = defaultMaxUTF8Bytes,
-        includeSections: Bool = true
+        includeSections: Bool = true,
+        batchActions: [JSONValue]? = nil
     ) async -> View {
         var recovery: JSONValue?
         do {
@@ -62,9 +63,11 @@ package enum ProviderToolResultPage {
             recovery = .object(reference)
             var fields = reference
             if includeSections {
+                let steps = receipt.omittedBytes == 0 && batchActions != nil ? parsed?.objectValue?["receipts"]?.arrayValue : nil
                 let result = await ProviderToolResultRecoveryStore.shared.page(
                     handle: receipt.handle, page: 0, dataRoot: dataRoot, turn: turn, query: "",
-                    pages: ProviderToolResultRecoveryStore.usualSectionPages)
+                    pages: steps == nil ? ProviderToolResultRecoveryStore.usualSectionPages : 1,
+                    overview: steps.flatMap { receipts in batchActions.map { (receipts, $0) } })
                 guard case .object(let page) = result, ToolResult(result).said("completed") else {
                     return View(content: try result.serialize(pretty: false), recovery: recovery, failed: true)
                 }
@@ -194,8 +197,7 @@ package actor ProviderToolResultRecoveryStore {
         let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
         let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
         // The same receipt can have distinct redacted views. Never overwrite bytes already promised by another view's handle.
-        let digest = SHA256.hash(data: Data((toolName + "\u{0}" + content).utf8))
-            .map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256Hex.of(Data((toolName + "\u{0}" + content).utf8))
         let handle = (source == "detail" ? receipt : nil)
             .map { "receipt-" + $0.uuidString.lowercased() + "." + digest } ?? digest
         let url = root.appendingPathComponent(handle)
@@ -283,13 +285,60 @@ package actor ProviderToolResultRecoveryStore {
     /// A read with no `pages` joins as many as one answer holds; the joiner's measure of the answer is what stops it.
     package static let usualSectionPages = Int.max
 
+    /// The page numbers use the very same section layout that result.page will read.
+    private static func batchOverview(receipts: [JSONValue], actions: [JSONValue], pages: [[JSONValue]]) -> JSONValue {
+        var starts: [Int64: Int] = [:]
+        for (page, sections) in pages.enumerated() {
+            for section in sections {
+                guard let path = section.objectValue?["path"]?.arrayValue, path.count >= 2,
+                      path[0] == .string("receipts"), case .int(let index) = path[1], starts[index] == nil else { continue }
+                starts[index] = page
+            }
+        }
+        func excerpt(_ text: String, limit: Int) -> JSONValue {
+            .string(text.utf8.count <= limit ? text : String(decoding: text.utf8.prefix(limit), as: UTF8.self) + "…")
+        }
+        return .array(receipts.enumerated().map { index, value in
+            let fields = value.objectValue ?? [:]
+            let step = fields["step"]?.integerValue.flatMap(Int.init(exactly:)) ?? (receipts.count == actions.count ? index + 1 : nil)
+            var row: [String: JSONValue] = [:]
+            if let step, step > 0, step <= actions.count {
+                row["step"] = .int(Int64(step))
+                let call = actions[step - 1].objectValue ?? [:]
+                if let label = (call["action"] ?? call["page"])?.stringValue {
+                    row["action"] = excerpt(ChatSecretRedactor.redactText(label), limit: 100)
+                }
+            }
+            row["section_page"] = starts[Int64(index)].map { .int(Int64($0)) }
+            for key in ["status", "ok", "reason", "error", "count", "liveItemCount", "has_more"] {
+                guard let fact = fields[key] else { continue }
+                switch fact {
+                case .int, .bool: row[key] = fact
+                case .string(let text): row[key] = excerpt(text, limit: 96)
+                default: break
+                }
+            }
+            let detail = fields["detail"]?.objectValue ?? [:]
+            if let summary = [fields["summary"], fields["detail"], fields["message"], detail["summary"], fields["title"], fields["text"], value]
+                .compactMap({ $0?.stringValue }).first(where: { !$0.isEmpty }) {
+                row["summary"] = excerpt(summary, limit: 220)
+            }
+            if let first = (fields["items"] ?? fields["hits"] ?? fields["contacts"])?.arrayValue?.first?.objectValue,
+               let name = (first["title"] ?? first["name"] ?? first["summary"])?.stringValue {
+                row["first_item"] = excerpt(name, limit: 100)
+            }
+            return .object(row)
+        })
+    }
+
     package func page(
         handle: String,
         page: Int,
         dataRoot: URL,
         turn: Turn,
         query: String? = nil,
-        pages: Int = 1
+        pages: Int = 1,
+        overview: (receipts: [JSONValue], actions: [JSONValue])? = nil
     ) -> JSONValue {
         let key = dataRoot.standardizedFileURL.appendingPathComponent("tool_results/" + handle)
         var result = readPage(handle: handle, page: page, dataRoot: dataRoot, turn: turn, query: query)
@@ -334,6 +383,10 @@ package actor ProviderToolResultRecoveryStore {
         }
         let reply = ToolResult(result)
         if case .object(var object) = result, reply.said("completed"), reply.status == object["status"]?.stringValue {
+            if let overview, let layout = entries[key]?.sectionPages?.pages {
+                object["steps"] = Self.batchOverview(receipts: overview.receipts, actions: overview.actions, pages: layout)
+                object["step_readback"] = .string("To inspect a step, read app result.page with this result_handle and its section_page as page.")
+            }
             let next: Int?
             if case .int(let value)? = object["next_page"] { next = Int(exactly: value) }
             else { next = nil }

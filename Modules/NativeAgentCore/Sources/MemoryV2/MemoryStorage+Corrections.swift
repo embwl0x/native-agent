@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import GRDB
 import PersistenceCore
 // Blueprint: | `MemoryStorage+Corrections.swift` | `MemoryStorage`, `correctionMoments`: idempotent canonical correction occurrences; session-and-time read |
@@ -33,7 +34,7 @@ extension MemoryStorage {
             // A save without a turn has its own row identity and insert time.
             at = createdAt
         }
-        guard let date = MemoryDataProvenance.parseTimestamp(at) else {
+        guard let date = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(at) else {
             throw MemoryStorageError.invalidTemporalEvidence("correction occurrence time is not ISO-8601")
         }
         func string(_ key: String) throws -> String? {
@@ -148,7 +149,7 @@ extension MemoryStorage {
                 """, arguments: [start.timeIntervalSince1970, end.timeIntervalSince1970]).map { row in
                     let instant: Double = try row.decode(forColumn: "correction_date")
                     let at: String = try row.decode(forColumn: "correction_at")
-                    guard instant.isFinite, MemoryDataProvenance.parseTimestamp(at)?.timeIntervalSince1970 == instant else {
+                    guard instant.isFinite, NativeTimestampFormat.parseOptionalISO8601FractionalFirst(at)?.timeIntervalSince1970 == instant else {
                         throw MemoryStorageError.invalidTemporalEvidence("correction occurrence time disagrees with its timestamp")
                     }
                     return try CorrectionOccurrence(memory: Self.decodeMemory(row),

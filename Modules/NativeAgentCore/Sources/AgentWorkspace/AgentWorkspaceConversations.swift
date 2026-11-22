@@ -1,4 +1,5 @@
 import ChatSessionWork
+import NativeAgentShared
 import Foundation
 import PersonaEngine
 import NativeAgentCore
@@ -69,7 +70,7 @@ struct AgentWorkSession {
         }
     }
 
-    /// Newest first, verified independently of display titles or preview consumption.
+    /// Newest first, verified independently of titles and previews.
     static func verified(dataRoot: URL) throws -> [(id: String, sender: String, topic: String, row: [String: JSONValue])] {
         try HumanConversationIndex.rows(dataRoot: dataRoot).compactMap { row in
             guard let id = row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), let sender = try bridgeSender(sessionID: id, dataRoot: dataRoot) else {
@@ -78,12 +79,12 @@ struct AgentWorkSession {
         }
     }
 
-    static func all(workspace: WorkspaceOperation, dataRoot: URL) throws -> [Self] {
+    static func all(dataRoot: URL) throws -> [Self] {
         let profileName = try PersonaCompiler.compileProfile(dataRoot: dataRoot).name.trimmingCharacters(in: .whitespacesAndNewlines)
         let agentName = profileName.isEmpty ? nil : profileName
         var found: [Self] = try verified(dataRoot: dataRoot).map { session in
             let row = session.row
-            let preview = HumanConversationIndex.shownPreview(workspace: workspace, row) ?? ""
+            let preview = HumanConversationIndex.shownPreview(row) ?? ""
             return .init(sessionID: session.id, sender: session.sender, topic: session.topic,
                          latest: String((preview.split(separator: "\n").first ?? "").prefix(160)),
                          updatedAt: row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "",
@@ -91,7 +92,7 @@ struct AgentWorkSession {
                          summary: row["summary"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "", agentName: agentName)
         }
         let titles = AgentScreen.disambiguate(found.map(\.about), who: found.map(\.who),
-            at: found.map { AgentScreen.date($0.createdAt) })
+            at: found.map { NativeTimestampFormat.parseISO8601FractionalFirst($0.createdAt) })
         for index in found.indices where titles[index] != found[index].about { found[index].display = titles[index] }
         return found
     }
@@ -100,17 +101,10 @@ struct AgentWorkSession {
         try AgentScreen.contacts(identity: workspace.ports.conversations.identity(dataRoot: dataRoot)).map { ($0.id, $0.name) }
     }
 
-    /// The one person this sender is, or nil when none or several match.
-    static func owner(_ sender: String, people: [(agent: String, name: String)]) -> (agent: String, name: String)? {
-        let who = sender.lowercased()
-        let matches = people.filter { who == $0.agent.lowercased() }
-        return matches.count == 1 ? matches[0] : nil
-    }
-
     static func sessions(workspace: WorkspaceOperation, with agent: String, dataRoot: URL) throws -> [Self] {
         let people = try people(workspace: workspace, dataRoot: dataRoot)
         let identity = try workspace.ports.conversations.identity(dataRoot: dataRoot)
-        return try all(workspace: workspace, dataRoot: dataRoot).filter { identity.canonical($0.sender) == identity.canonical(agent)
+        return try all(dataRoot: dataRoot).filter { identity.canonical($0.sender) == identity.canonical(agent)
             && people.contains(where: { identity.canonical($0.agent) == identity.canonical(agent) }) }
     }
 }

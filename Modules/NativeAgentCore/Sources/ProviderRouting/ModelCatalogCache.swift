@@ -253,10 +253,10 @@ struct ModelCatalogCache: Sendable {
     }
 
     /// The saved credential and the list bound to it, read together under the credential lock. A list saved for another credential reads as
-    /// absent; only unreadable bytes throw. Refresh-failure provenance is the caller's to consult.
+    /// absent, and a disconnected route has no bound list. Unreadable credentials and their unreadable catalogs throw.
     func boundRead(dataRoot: URL) throws -> (credential: String?, catalog: DecodedModelCatalog?) {
         try CredentialFileLock.withLock(configPath(dataRoot)) {
-            let saved = try credential.current(dataRoot)
+            guard let saved = try credential.current(dataRoot) else { return (nil, nil) }
             guard let decoded = try readCache(dataRoot), decoded.credentialBinding == credentialBinding(saved) else { return (saved, nil) }
             return (saved, decoded)
         }

@@ -190,9 +190,7 @@ public enum MemoryKindBackfill {
     }
 
     public static func payloadKind(_ payload: JSONValue) -> String? {
-        guard case .object(let obj) = payload,
-              case .string(let kind)? = obj["kind"] else { return nil }
-        return kind
+        payload.objectValue?["kind"]?.stringValue
     }
 
     /// Apply only row proposals actually carried by the approved payload.
@@ -270,7 +268,7 @@ public enum MemoryKindBackfill {
         let stamp: JSONValue = .object([
             "kind": .string(stampKind),
             "approval_id": .string(approvalId),
-            "staged_at": .string(MemoryStorage.nowISO8601()),
+            "staged_at": .string(NativeTimestampFormat.fractionalZulu(Date())),
         ])
         try SwiftNativePersistenceCore.writeDataAtomicDurable(stamp.serializedData(pretty: true), to: path)
         RepairOwed.settle(dataRoot, operation: "memory.kind_backfill",
@@ -303,7 +301,7 @@ extension MemoryStorage {
                   MemoryKindStamp.isClassifiable(memory.metadata) else { return (false, nil) }
             var metadata: [String: JSONValue] = [:]
             if case .object(let existing)? = memory.metadata { metadata = existing }
-            let now = Self.nowISO8601()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             metadata["kind"] = .string(proposal.proposedKind)
             metadata["kind_source"] = .string(MemoryKindStamp.backfillSource)
             metadata["kind_backfilled_at"] = .string(now)

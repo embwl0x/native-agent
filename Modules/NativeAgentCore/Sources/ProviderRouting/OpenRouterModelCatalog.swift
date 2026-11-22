@@ -313,8 +313,8 @@ public enum OpenRouterModelCatalog {
         }
         let models = rows.compactMap { value -> ProviderModelInfo? in
             guard case .object(let row) = value,
-                  let id = string(row["id"]),
-                  let name = string(row["name"]),
+                  let id = row["id"]?.trimmedString,
+                  let name = row["name"]?.trimmedString,
                   let context = row["context_length"]?.integerValue.flatMap(Int.init(exactly:)), context >= 0,
                   let streaming = row["supports_streaming"]?.boolValue,
                   let vision = row["supports_vision"]?.boolValue,
@@ -382,11 +382,5 @@ public enum OpenRouterModelCatalog {
         }
         guard let raw else { return nil }
         return raw * 1000
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let s)? = value else { return nil }
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }

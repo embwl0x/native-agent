@@ -16,7 +16,7 @@ extension SwiftToolDispatcher {
         let offset = Self.delegationStatusOffset(input)
         let agentFilter = try Self.delegationStatusAgentFilter(conversation: invocation.conversation, input, dataRoot: dataRoot)
         let fullDetail = Self.delegationStatusFullDetail(input)
-        let snapshot = projector.readSnapshot(now: Date(), limit: limit, offset: offset, agent: agentFilter)
+        let snapshot = projector.readSnapshot(limit: limit, offset: offset, agent: agentFilter)
         let matchedCount = snapshot.matchedCount
         let peers = try AgentPeerStore(dataRoot: dataRoot).list()
         let sources = snapshot.sources.filter { $0.status != "absent" }

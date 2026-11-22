@@ -1,5 +1,4 @@
 import Foundation
-import ChatTurnContracts
 import NativeAgentCore
 // Blueprint: | `NativeAgentNotificationActions.swift` | `NativeAgentNotificationActions` |
 
@@ -12,12 +11,6 @@ public enum NativeAgentNotificationActions {
     public static let approvalKey = "approvalId"
     public static let sessionKey = "chatSessionId"
     public static let newConversationKey = "newNotificationConversation"
-
-    public static func messageRoute(turn: Turn?) -> [String: String] {
-        var route = turn?.verifiedSessionID.map { [sessionKey: $0] } ?? [newConversationKey: "true"]
-        if let connection = turn?[FacePresentationPart.self] { route["faceRenderer"] = connection.uuidString }
-        return route
-    }
 
     public static func category(for userInfo: [String: String]) -> String {
         if let id = userInfo[approvalKey], !id.isEmpty { return approvalCategory }

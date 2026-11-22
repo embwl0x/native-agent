@@ -3,7 +3,7 @@ import NativeAgentShared
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TranscriptRows.swift` | `ContactThread`, `read`, `Line`, `project`, `consume`, `DelegatedReplyEnvelope`: Locked transcripts; shared display |
+// Blueprint: | `TranscriptRows.swift` | `ContactThread`, `read`, `Line`, `project`, `DelegatedReplyEnvelope`: Locked transcripts; shared display |
 
 /// The shared storage and reading of conversations. Routing extends this owner; presentation never derives a speaker from the session that holds a row.
 public enum ContactThread {
@@ -92,7 +92,7 @@ public enum ContactThread {
         public var speakers: [String] { contact ? [source ?? "another agent"] : [] }
         public var human: Bool {
             provenanceFailure == nil && role == "user" && metadata["mechanicalKind"] == nil && !mine && !contact
-                && Self.object(metadata["origin"])["authored"] != .string("agent")
+                && JSONValue.objectOrEmpty(metadata["origin"])["authored"] != .string("agent")
         }
 
         /// Cached previews keep the writer's stamp beside the words they quote.
@@ -103,7 +103,7 @@ public enum ContactThread {
 
         public init(_ row: [String: JSONValue], role: String? = nil, text: String? = nil, timestamp: String? = nil, metadata: [String: JSONValue]? = nil) {
             let role = role ?? row["role"]?.stringValue ?? ""
-            let metadata = metadata ?? Self.object(row["metadata"])
+            let metadata = metadata ?? JSONValue.objectOrEmpty(row["metadata"])
             let id = row["id"]?.stringValue ?? ""
             let failure = Self.provenanceFailure(in: row, metadata: metadata)
             self.init(text: text ?? row["content"]?.stringValue ?? "",
@@ -115,7 +115,7 @@ public enum ContactThread {
             self.date = self.timestamp.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
             self.run = row["runId"]?.stringValue
             self.byPerson = metadata["byPerson"] == .bool(true)
-            self.answers = role == "user" ? Self.object(metadata["origin"])["replyTo"]?.stringValue.flatMap {
+            self.answers = role == "user" ? JSONValue.objectOrEmpty(metadata["origin"])["replyTo"]?.stringValue.flatMap {
                 $0.hasPrefix("agent-conversation:") ? String($0.dropFirst("agent-conversation:".count)) : nil
             } : nil
             self.sendID = role == "assistant" ? metadata["dotClientUserMessageID"]?.stringValue : nil
@@ -132,11 +132,6 @@ public enum ContactThread {
             guard let row = try? ContactThread.decodeRow(data),
                   case .string? = row["content"] else { return nil }
             self.init(row)
-        }
-
-        fileprivate static func object(_ value: JSONValue?) -> [String: JSONValue] {
-            if case .object(let fields)? = value { return fields }
-            return [:]
         }
 
         private static func provenanceFailure(in row: [String: JSONValue], metadata: [String: JSONValue]) -> String? {
@@ -179,19 +174,17 @@ public enum ContactThread {
         return try handle.readToEnd()
     }
 
-    /// One stamped-row projection for sessions, contact threads and retained previews; answer selection requires the matching canonical line. A cache/index
-    /// read omits `mark`; only the selected display supplies it, so each displayed contact line is consumed exactly once.
+    /// One stamped-row projection for sessions, contact threads and retained previews; answer selection requires the matching canonical line.
     public static func project(_ rows: some Sequence<Line>, style: TextStyle = .verbatim, thread owner: String? = nil,
                                person: String = "the person", own: String = "you", names: [String: String] = [:],
                                contactPrefix: String = "", unlistedPeer: String? = nil, unattested: String? = nil,
-                               answering: String? = nil,
-                               mark: ((_ principal: String, _ words: String) -> Void)? = nil) -> [Line] {
+                               answering: String? = nil) -> [Line] {
         var started: Set<String> = [], seen: Set<String> = []
         var lines = rows.filter { row in
             guard row.provenanceFailure == nil else { return false }
             guard let owner else { return true }
             guard !seen.contains(row.id) else { return false }
-            let origin = Line.object(row.metadata["origin"]), envelope = Line.object(row.metadata["envelope"])
+            let origin = JSONValue.objectOrEmpty(row.metadata["origin"]), envelope = JSONValue.objectOrEmpty(row.metadata["envelope"])
             if row.role == "user" {
                 let peers: [JSONValue] = if case .array(let peers)? = origin["peerSources"] { peers } else { [] }
                 guard envelope["surface"] == .string("agent-bridge") || origin["agent"] == .string(owner)
@@ -231,23 +224,15 @@ public enum ContactThread {
             if (style == .log || owner != nil) && row.text.isEmpty {
                 guard row.mine, row.sendID != nil, case .array(let files)? = row.metadata["attachments"], !files.isEmpty else { return nil }
             }
-            // A recorded route can name unattested words for display alone; `consume` still sees only the stamp ("another agent").
-            let source = row.source ?? [unattested, Line.object(row.metadata["origin"])["agent"]?.stringValue,
-                Line.object(row.metadata["envelope"])["agent"]?.stringValue].compactMap { $0 }
+            // A recorded route can name unattested words for display; speaker provenance comes from the stamp.
+            let source = row.source ?? [unattested, JSONValue.objectOrEmpty(row.metadata["origin"])["agent"]?.stringValue,
+                JSONValue.objectOrEmpty(row.metadata["envelope"])["agent"]?.stringValue].compactMap { $0 }
                 .first { !["", "agent", "peer", "another agent"].contains($0) }
             let name = source.map { (names[$0] ?? ($0.hasPrefix("peer:") ? unlistedPeer : nil) ?? $0)
                 + (row.source == nil ? " (unattested)" : "") } ?? "another agent"
             row.speaker = row.byPerson ? person : row.mine ? own : row.contact ? contactPrefix + name : person
-            if let mark { consume(row, mark: mark) }
             return row
         }
-    }
-
-    /// Reading marks the speaker alone. Recorded steering is provenance; reading it never steers this turn or marks the agent's words as someone else's.
-    @discardableResult
-    public static func consume(_ line: Line, mark: (_ principal: String, _ words: String) -> Void) -> [String] {
-        for speaker in line.speakers { mark(speaker, line.text) }
-        return line.speakers
     }
 
     public static func bridgedText(_ content: String) -> String {

@@ -18,7 +18,8 @@ enum EngineCarriedHabits {
             let events = read.events
             guard read.isClean,
                   events.contains(where: { $0.kind == "turn.accepted" && $0.sessionId == Attention.stream }),
-                  let terminal = events.last(where: { TurnTraceEvent.isTerminalKind($0.kind) }),
+                  // Only a turn that finished teaches how a step is handled; a failed or cancelled attempt is a miss, not a way.
+                  let terminal = events.last(where: { TurnTraceEvent.isTerminalKind($0.kind) }), terminal.kind == "turn.terminal",
                   let work = events.first(where: { $0.kind == "work.identified" })?.payload.objectValue?["workIdentity"]?.stringValue,
                   work.hasPrefix("carry.") else { return }
             guard let actions = handling(events) else { return }

@@ -176,22 +176,6 @@ public final class TranscriptsFacade {
             publishSessionFaces()
         })
     }
-    public func watchNavigation() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [ConversationAnchor.path(dataRoot: dataRoot),
-            ChatSessionRetention.macPinnedSessionIdsPath(dataRoot: dataRoot)]) { await self.refreshNavigationIdentity() }
-    }
-    public func prunePinnedSessionIDs(retaining ids: Set<String>) async throws -> (encoded: String, changed: Bool) {
-        let root = dataRoot
-        let (encoded, pins, changed) = try await VolumeIO.run {
-            let current = try ChatSessionRetention.load(dataRoot: root)
-            let next = current.filter { ids.contains($0) }
-            let encoded = try ChatSessionRetention.save(next, dataRoot: root)
-            return (encoded, try ChatSessionRetention.decode(encoded), next != current)
-        }
-        navigationRead.write { pinnedSessionIDs = pins; hasReadPins = true; navigationError = nil }
-        publishSessionFaces()
-        return (encoded, changed)
-    }
     public func pinSession(_ sessionID: String) async throws -> (changed: Bool, shared: Bool) {
         let root = dataRoot
         let (changed, encoded, pins) = try await VolumeIO.run {
@@ -254,12 +238,6 @@ public final class TranscriptsFacade {
         await sessionFaces.observeSearch(query, viewID: viewID)
     }
 
-    public func setPaletteSearch(_ query: String) {
-        guard paletteSearch != query else { return }
-        paletteSearch = query
-        publishSessionFaces()
-    }
-
     func bindSessionFaces() {
         guard sessionUnreadObservation == nil else { return }
         sessionUnreadObservation = Task { @MainActor [weak self] in
@@ -304,10 +282,6 @@ public final class TranscriptsFacade {
     }
 
     /// Message indexing is an engine operation; the window never needs its source session rows.
-    public func refreshPaletteMessageIndex() async throws -> Int {
-        try await refreshPaletteMessageIndexFailures().count
-    }
-
     public func refreshPaletteMessageIndexFailures() async throws -> [String: String] {
         let sessions = try await readSessionIndex().filter { $0.archived != true }
             .map { (id: $0.id, stamp: CommandPaletteMessageIndex.stamp($0) + "|\(structureVersion(for: $0.id))") }
@@ -371,12 +345,6 @@ public final class TranscriptsFacade {
     public func refreshCards(in sessionID: String) async {
         do { _ = try await refreshDisplayedMessages(sessionId: sessionID) }
         catch { ModuleLog.app("[transcript-read] cards unavailable session=%@: %@", sessionID, error.localizedDescription) }
-    }
-    public func watchIndexChanges(refresh: @escaping @MainActor @Sendable () async -> Void) async {
-        await EventDeadlinePhysiology.refreshOnChanges(
-            paths: [dataRoot.appendingPathComponent("chat/sessions.json")],
-            notifications: [AbilityStore.didChange], debounceDelay: .milliseconds(150), refresh: refresh
-        )
     }
     @concurrent public nonisolated func watchChanges(sessionID: String, refresh: @escaping @MainActor @Sendable () async -> Void) async {
         guard let session = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else { return }

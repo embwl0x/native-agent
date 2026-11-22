@@ -70,7 +70,7 @@ enum DeskMacPlace: Equatable {
         case .research: return .request(.research)
         case .board: return .show(nil)
         case .inspect(let row):
-            guard snapshot.agentJobs.items.contains(where: { WorkOverviewRead.row(for: $0, now: snapshot.now).id == row }) else { throw gone }
+            guard snapshot.agentJobs.items.contains(where: { WorkOverviewRead.row(for: $0).id == row }) else { throw gone }
             return .show(row)
         case .note(let handle), .reply(let handle):
             guard let item = snapshot.boardItems.first(where: { $0.handle == handle }), !item.status.isTerminal else { throw gone }

@@ -91,8 +91,9 @@ public final class SyncFacade {
         })
     }
 
-    public func regenerateSecret() async {
-        guard let owner, !isRotatingSecret else { return }
+    /// Returns whether iCloud accepted the new key; false when the rotation failed or the key waits to be delivered.
+    @discardableResult public func regenerateSecret() async -> Bool {
+        guard let owner, !isRotatingSecret else { return false }
         isRotatingSecret = true
         secretRead.write {}
         defer { isRotatingSecret = false }
@@ -122,13 +123,14 @@ public final class SyncFacade {
                 owner.bridge.owePairingPublication(false)
                 await owner.engine.finishPairingSecretRotation(with: nil)
             }
-            return
+            return false
         }
         await owner.engine.finishPairingSecretRotation(with: persistedSecret)
         // Unpublished pairing remains owed and visible in the shared assessment until iCloud accepts the key.
-        _ = await owner.bridge.publishPairingSecret(persistedSecret)
+        let published = await owner.bridge.publishPairingSecret(persistedSecret)
         secretRead.write {
             pairingError = nil
         }
+        return published
     }
 }

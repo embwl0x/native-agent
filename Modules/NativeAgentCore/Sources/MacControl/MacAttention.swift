@@ -4,12 +4,8 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(AppKit) && os(macOS)
 import AppKit
-#endif
-#if canImport(CoreGraphics) && os(macOS)
 import CoreGraphics
-#endif
 // Blueprint: | `MacAttention.swift` | `MacAttentionSessionStore`, `MacDriverBinding`: Driver takeover, view continuity and held-input settlement |
 
 public struct MacAttentionSnapshot: Sendable, Equatable {
@@ -94,7 +90,13 @@ public final class MacDriverBinding: @unchecked Sendable {
     func noteAppActRefusal(_ refusal: MacAppActRefusal) {
         lock.withLock { if refusedAppAct == nil { refusedAppAct = refusal } }
     }
-    private var releases: [String: @Sendable () -> Void] = [:]
+    private struct HeldInputState {
+        var releases: [String: @Sendable () -> Bool] = [:]
+        var recoveryEventCount = 0
+    }
+    private let heldInputs = Mutex(HeldInputState())
+
+    var recoveryEventCount: Int { heldInputs.withLock { $0.recoveryEventCount } }
 
     init(owner: MacAttentionSessionStore, generation: UInt64, granted: Bool, handback: UInt64) {
         self.owner = owner
@@ -157,20 +159,27 @@ public final class MacDriverBinding: @unchecked Sendable {
         MacDriverBinding(owner: owner, generation: generation, granted: granted, handback: handback)
     }
 
-    func held(_ key: String, context: MacOperationContext, release: (@Sendable () -> Void)?) {
-        lock.lock()
-        releases[key] = release
-        lock.unlock()
+    func held(_ key: String, context: MacOperationContext, release: (@Sendable () -> Bool)?) {
+        heldInputs.withLock { $0.releases[key] = release }
         owner.trackHeldInputs(self)
         if stopped(context: context) || !owner.permitsDriver(generation) { releaseHeldInputs() }
     }
 
-    func releaseHeldInputs() {
-        lock.lock()
-        let pending = Array(releases.values)
-        releases.removeAll()
-        lock.unlock()
-        for release in pending { release() }
+    /// Stop, takeover and the executor share settlement. A release remains owed until its post succeeds.
+    @discardableResult
+    func releaseHeldInputs() -> Int {
+        heldInputs.withLock { state in
+            var posted = 0
+            state.releases = state.releases.filter { _, release in
+                if release() {
+                    posted += 1
+                    return false
+                }
+                return true
+            }
+            state.recoveryEventCount += posted
+            return state.recoveryEventCount
+        }
     }
 }
 
@@ -247,18 +256,6 @@ public actor MacAttentionSessionStore {
         }
         held?.releaseHeldInputs()
         Task { await self.publishDriver() }
-    }
-
-    public nonisolated func userHandoffGeneration() -> UInt64? {
-        #if canImport(AppKit) && os(macOS)
-        guard Thread.isMainThread, let event = NSApp.currentEvent,
-              [.leftMouseUp, .keyDown].contains(event.type),
-              let input = event.cgEvent, NativePersonInput.isPerson(input)
-        else { return nil }
-        return handoffGeneration
-        #else
-        return nil
-        #endif
     }
 
     /// Only the person's explicit UI handoff calls this, or a bind under the Full Mac they granted; never a tool or view on its own.
@@ -347,15 +344,11 @@ public actor MacAttentionSessionStore {
 
     private func ensureDriverObservation(eventSource: any MacAttentionEventSource) {
         guard !isShutDown, observation == nil, eventSource.isAvailable else { return }
-        #if canImport(AppKit) && canImport(CoreGraphics) && os(macOS)
         let coalescer = MacAttentionEventCoalescer()
-        #endif
         observation = eventSource.start { [weak self] activity in
             // Revoke before hopping to the actor: a synchronous typing loop must see physical input even while this actor is occupied.
             if activity.kind.isPhysicalUserInput { self?.takeUserControl() }
-            #if canImport(AppKit) && canImport(CoreGraphics) && os(macOS)
             guard coalescer.shouldEmit(kind: activity.kind, atUptime: ProcessInfo.processInfo.systemUptime) else { return }
-            #endif
             Task { await self?.record(activity) }
         }
         // The first ask for the driver is news to the composer's hand-back.

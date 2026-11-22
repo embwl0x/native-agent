@@ -31,11 +31,10 @@ public struct DelegationStatusProjector: Sendable {
 
     /// One disk read reports jobs and availability; only absent or fully readable stores count as readable.
     public func recentJobsWithAvailability(
-        now: Date,
         limit: Int = DelegationStatusProjector.defaultLimit
     ) -> (jobs: [DelegationReadout], allStoresReadable: Bool) {
         let bounded = max(1, min(limit, Self.maxLimit))
-        let snapshot = readSnapshot(now: now, limit: bounded)
+        let snapshot = readSnapshot(limit: bounded)
         return (
             Array(snapshot.jobs.prefix(bounded)),
             snapshot.sources.allSatisfy { $0.status == "available" || $0.status == "absent" }
@@ -43,10 +42,8 @@ public struct DelegationStatusProjector: Sendable {
     }
 
     /// One disk read reports all jobs and availability so cursors never advance past unreadable records.
-    public func allJobsWithAvailability(
-        now: Date
-    ) -> (jobs: [DelegationReadout], allStoresReadable: Bool) {
-        let snapshot = readSnapshot(now: now)
+    public func allJobsWithAvailability() -> (jobs: [DelegationReadout], allStoresReadable: Bool) {
+        let snapshot = readSnapshot()
         return (
             snapshot.jobs,
             snapshot.sources.allSatisfy { $0.status == "available" || $0.status == "absent" }
@@ -54,7 +51,7 @@ public struct DelegationStatusProjector: Sendable {
     }
 
     /// Read jobs and availability together so each verdict describes the same observation.
-    package func readSnapshot(now: Date, limit: Int? = nil, offset: Int = 0,
+    package func readSnapshot(limit: Int? = nil, offset: Int = 0,
                       agent: String? = nil, jobID: String? = nil) -> DelegationStatusReadSnapshot {
         let life: String
         do { life = try DataRootLife.current(in: dataRoot) }
@@ -96,7 +93,7 @@ public struct DelegationStatusProjector: Sendable {
                 row.deliveryUpdatedAt = state.updatedAt
                 row.recordKind = "completion_lifecycle"
                 row.recoveryNote = status == "stopped" ? DataRootLife.stoppedReason : url.path
-                row.recencyKey = Self.date(state.updatedAt)
+                row.recencyKey = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(state.updatedAt)
                 guard (agent == nil || row.agent == agent) && (jobID == nil || row.id == jobID),
                       seen.insert(row.source + ":" + id).inserted else { continue }
                 rows.append(row)
@@ -176,11 +173,5 @@ public struct DelegationStatusProjector: Sendable {
         fileCache.putJobs(directory.path, parsedFiles)
         if availability.unreadableFiles > 0 || availability.malformedRecords > 0 { availability.status = "partial" }
         return (objects, availability)
-    }
-
-    /// Both fractional and whole-second UTC timestamps are valid record times.
-    static func date(_ iso: String?) -> Date? {
-        guard let iso, !iso.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(iso)
     }
 }

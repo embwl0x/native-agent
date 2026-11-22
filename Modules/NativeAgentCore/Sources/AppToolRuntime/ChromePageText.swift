@@ -4,7 +4,6 @@ import NativeAgentCore
 import ChatTurnContracts
 import AgentWorkspace
 import PersistenceCore
-import CryptoKit
 import Senses
 import Privacy
 // Blueprint: | `ChromePageText.swift` | `ChromePageText`, `VisiblePageText`, `project`, `rows`, `next`, `contentVersion`; shared text, rows and versions |
@@ -57,7 +56,7 @@ enum ChromePageText {
         }
         head.append(where_.joined(separator: " · "))
         if nodes.contains(where: { $0.objectValue?["states"]?.objectValue?["blockedByModal"] == .bool(true) }) {
-            let names = Set(nodes.flatMap { strings($0.objectValue?["states"]?.objectValue?["blockingDialogs"]) }).sorted()
+            let names = Set(nodes.flatMap { JSONValue.stringArray($0.objectValue?["states"]?.objectValue?["blockingDialogs"]) }).sorted()
             let dialog = names.isEmpty ? "a dialog" : "the dialog " + names.map { "\"" + safe($0) + "\"" }.joined(separator: ", ")
             head.append("Page content is behind \(dialog); its controls remain blocked. Dialog and overlay rows follow the content.")
         }
@@ -80,7 +79,7 @@ enum ChromePageText {
             rows = ["No readable content in this window."]
         }
         if case .object(let summary)? = page["summary"], summary["truncated"] == .bool(true) {
-            foot.append("Read limited: " + strings(summary["truncationReasons"]).map(safe).joined(separator: ", "))
+            foot.append("Read limited: " + JSONValue.stringArray(summary["truncationReasons"]).map(safe).joined(separator: ", "))
         }
         if case .object(let cursor)? = page["readMore"], let next = next(page, turn: turn) {
             foot.append("Folded: " + safe(cursor["name"]?.stringValue ?? "Remaining page"))
@@ -209,7 +208,7 @@ enum ChromePageText {
         let encoded = try JSONValue.object(["url": page["url"] ?? .null, "title": page["title"] ?? .null,
             "nodes": contentNodes, "readMore": page["readMore"] ?? .null,
             "document": page["document"] ?? .null]).serialize(pretty: false)
-        return SHA256.hash(data: Data(encoded.utf8)).map { String(format: "%02x", $0) }.joined()
+        return SHA256Hex.of(Data(encoded.utf8))
     }
 
     /// Mirror and label lookup share the same row projection.
@@ -231,7 +230,7 @@ enum ChromePageText {
             }
             let (role, label) = roleAndLabel(node)
             let number = id.hasPrefix("n") ? String(id.dropFirst()) : id
-            return .init(node: id, role: role, label: safe(label), acts: Set(strings(node["actions"])), options: options,
+            return .init(node: id, role: role, label: safe(label), acts: Set(JSONValue.stringArray(node["actions"])), options: options,
                          number: numbers.contains(number) ? number : nil, actionBlock: actionBlock(node))
         }
     }
@@ -240,7 +239,7 @@ enum ChromePageText {
     static func actionBlock(_ node: [String: JSONValue]) -> ChromePageMirror.ActionBlock? {
         let states = node["states"]?.objectValue
         if states?["blockedByModal"] == .bool(true) {
-            let names = strings(states?["blockingDialogs"]).map { "\"" + safe($0) + "\"" }
+            let names = JSONValue.stringArray(states?["blockingDialogs"]).map { "\"" + safe($0) + "\"" }
             let dialog = names.isEmpty ? "a modal dialog" : "the modal dialog " + names.joined(separator: ", ")
             return .init(code: "modal_target_required", reason: "Blocked by \(dialog).")
         }
@@ -358,7 +357,7 @@ enum ChromePageText {
             let heading = node["role"]?.stringValue == "heading"
             if heading { section += 1 }
             if contentLinks[id] != nil { continue }
-            let ownActs = !Set(strings(node["actions"])).isDisjoint(with: ["click", "fill", "type", "select", "set_checked", "keypress"])
+            let ownActs = !Set(JSONValue.stringArray(node["actions"])).isDisjoint(with: ["click", "fill", "type", "select", "set_checked", "keypress"])
             if role == "landmark", !ownActs, headingNames.contains(safe(node["name"]?.stringValue ?? "")) {
                 // Only a region that holds nothing but its name repeats the heading.
                 let whole = safe(node["text"]?.stringValue ?? "")
@@ -393,7 +392,7 @@ enum ChromePageText {
             }
             labels[id] = original
             if let parent = node["parentNodeId"]?.stringValue { parents[id] = parent }
-            let acts = !Set(strings(node["actions"])).isDisjoint(with: ["click", "fill", "type", "select", "set_checked", "keypress"])
+            let acts = !Set(JSONValue.stringArray(node["actions"])).isDisjoint(with: ["click", "fill", "type", "select", "set_checked", "keypress"])
             var state = rowState(node)
             for (link, target) in contentLinks where target == id {
                 for flag in rowState(byID[link] ?? [:]) where !state.contains(flag) { state.append(flag) }
@@ -647,7 +646,7 @@ enum ChromePageText {
         }
         if case .object(let form)? = node["formState"] {
             if form["required"] == .bool(true) { state.append("required") }
-            let failures = strings(form["failures"]).map(safe)
+            let failures = JSONValue.stringArray(form["failures"]).map(safe)
             if !failures.isEmpty { state.append("invalid: " + failures.joined(separator: ",")) }
         }
         return state
@@ -667,11 +666,6 @@ enum ChromePageText {
         guard let number = value?.numberValue(coercingStrings: false, finiteOnly: false), number.isFinite,
               let count = Int(exactly: number), (2...maximum).contains(count) else { return nil }
         return count
-    }
-
-    private static func strings(_ value: JSONValue?) -> [String] {
-        guard case .array(let values)? = value else { return [] }
-        return values.compactMap { $0.stringValue }
     }
 
     /// Home and Chrome share UntrustedText so one-line output cannot activate tool markup.

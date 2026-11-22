@@ -2,20 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
 import Carbon
 import NativeAgentShared
-#endif
 // Blueprint: | `MacAccessibilityActuator.swift` | Requested AX mutation only; unsupported outcomes stop without substitution |
 /// Choose the requested AX value write or advertised action before emission. Unsupported operations stop; physical gestures require their own explicit request.
 public enum MacAccessibilityActuator {
@@ -44,7 +35,7 @@ public enum MacAccessibilityActuator {
         let action = (requestedAction?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
             $0.isEmpty ? nil : $0
         } ?? defaultAction
-        guard target.enabled else {
+        guard target.enabled == true else {
             return ActResult(ok: false, method: "none", requestedAction: action,
                 outcome: .unsupported, target: target,
                 postState: source.reread(target, context: context), error: "element_disabled")

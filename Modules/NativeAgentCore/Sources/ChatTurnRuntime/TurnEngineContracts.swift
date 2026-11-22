@@ -32,8 +32,6 @@ public enum TurnEngineError: Error, LocalizedError {
     case streamCancelled(partial: String, underlying: Error)
     /// Report exhaustion of clean turn programs instead of pretending the turn part ran.
     case turnPartFailed(String)
-    /// Keep helper admission failure attached to its own single attempt.
-    case turnHelperUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -56,8 +54,6 @@ public enum TurnEngineError: Error, LocalizedError {
                 turn_part_failed: \(why) The shipped turn part also failed. Read app {action:\"trace.recent\"} for the failing step; repair that \
                 cause before starting new work. This turn ended incomplete.
                 """
-        case .turnHelperUnavailable(let why):
-            return "turn_helper_unavailable: \(why) This turn ended before its helper started."
         }
     }
 }
@@ -257,7 +253,6 @@ public struct TurnEngineResult: Sendable {
         public internal(set) var failedProviderAttemptCount = 0
         /// First issued attempt of each loop iteration; retries are separate.
         public internal(set) var providerRoundCount = 0
-        public internal(set) var contextOverflowRecoveryCount = 0
         public internal(set) var toolRoundCount = 0
         public internal(set) var roundsAfterToolFailureCount = 0
         public internal(set) var protocolViolationRoundCount = 0

@@ -12,7 +12,6 @@ import ApprovalInbox
 import PersonaEngine
 import StandingBots
 import ProviderRouting
-import CryptoKit
 import MemoryV2
 import Dispatcher
 import MacControl
@@ -29,7 +28,7 @@ extension SwiftToolDispatcher {
         let script = repo
             .appendingPathComponent("script", isDirectory: true)
             .appendingPathComponent("install_app.sh")
-        let reason = builderResolveString(input, keys: ["reason"]) ?? "unspecified"
+        let reason = JSONValue.firstTrimmedString(input, keys: ["reason"]) ?? "unspecified"
         let delay: Int = {
             if case .int(let value)? = input["start_delay_seconds"] {
                 return max(5, min(120, Int(value)))

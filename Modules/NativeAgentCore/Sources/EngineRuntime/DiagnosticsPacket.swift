@@ -90,7 +90,7 @@ extension NativeAgentEngine {
             // A run says what it was and, when it did not finish, why: the first line of its own error or skip note.
             let cause = ["succeeded", "completed"].contains(run.status.lowercased()) ? nil : Self.runCause(run)
             recentRuns.append(.object(["id": .string(run.id), "kind": .string(run.kind), "status": .string(run.status),
-                "name": .string(RunKindVocabulary.displayName(run.kind, on: .mac)), "cause": faceText(cause),
+                "name": .string(RunKindVocabulary.displayName(run.kind)), "cause": faceText(cause),
                 "model": faceText(run.model), "durationSeconds": run.durationSeconds.map(JSONValue.double) ?? .null,
                 "createdAt": .string(run.createdAt), "timeReadable": .bool(UserDisplayFormatters.parseISOTimestamp(run.createdAt) != nil)]))
         }

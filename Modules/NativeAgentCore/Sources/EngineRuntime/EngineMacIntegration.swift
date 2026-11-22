@@ -36,7 +36,6 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     public private(set) var isLoading = true
     public private(set) var systemStatuses: [String: String] = [:]
     public private(set) var watchState: MacAssistantWatchSetupLoadState = .loading
-    public private(set) var isLoadingWatches = false
     public private(set) var checkedPermissions: Result<MacIntegrationPermissionStore.Snapshot, Error>?
     @ObservationIgnored private lazy var permissionRead = LatestRead()
     @ObservationIgnored private lazy var watchRead = LatestRead()
@@ -262,7 +261,6 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     }
 
     private func readWatches(lightweight: Bool, refreshPermissions: Bool) async throws -> MacAssistantStatusResult {
-        isLoadingWatches = true
         let result = await watchRead.read {
             // Both pages share the checked snapshot and OS grants.
             if refreshPermissions { await refresh(refreshWatches: false) }
@@ -329,7 +327,6 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             case .success(let response): next = .current(response)
             case .failure(let error): next = watchState.afterFailure(UserFacingError.message(error, action: "refresh background watches"))
             }
-            isLoadingWatches = false
             if !watchState.hasSameContent(as: next) {
                 watchState = next
                 NotificationCenter.default.post(name: Self.watchesDidChange, object: nil)
@@ -438,22 +435,6 @@ public enum MacAssistantWatchSetupLoadState: Equatable, Sendable {
         switch self {
         case .current(let response), .stale(let response, _): response
         case .loading, .unavailable: nil
-        }
-    }
-
-    public var badgeStatus: String {
-        switch self {
-        case .loading: "unknown"
-        case .current(let response): response.status
-        case .stale: "attention"
-        case .unavailable: "failed"
-        }
-    }
-
-    public var diagnosticText: String? {
-        switch self {
-        case .stale(_, let message), .unavailable(let message): message
-        case .loading, .current: nil
         }
     }
 

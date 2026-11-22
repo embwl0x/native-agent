@@ -104,12 +104,7 @@ public struct SwiftNativeBrowserClient: Sendable {
             "receiptCount": .int(Int64(receipts.count)),
             "receiptPath": .string(receiptsPath.path),
             "latestReceipt": latestReceipt,
-            "createdAt": .string(Self.nowISO(now())),
+            "createdAt": .string(NativeTimestampFormat.sixDigitUTCOffset(now())),
         ])
-    }
-
-    /// ISO-8601 UTC with six fractional digits and a `+00:00` suffix.
-    static func nowISO(_ date: Date) -> String {
-        NativeTimestampFormat.sixDigitUTCOffset(date)
     }
 }

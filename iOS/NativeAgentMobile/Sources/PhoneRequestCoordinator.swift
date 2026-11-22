@@ -153,7 +153,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
                let record = records.first(where: { $0.result == nil && $0.pairing == pairing }) {
                 if interrupted.contains(record.request.id) {
                     active = record.request
-                    errorMessage = "The app closed while handling request \(record.request.id). Its outcome is unknown; cancel it to retire the request."
+                    errorMessage = "The app closed while handling a request. Not sure it finished; cancel it to clear the request."
                     return
                 }
                 if record.request.expiresAt <= Date() {
@@ -441,7 +441,7 @@ struct PhoneRequestSheet: View {
                  : request.kind == .currentLocation ? "Share your current location?"
                  : request.kind == .capturePhoto ? "Take a photo to share." : "Choose a photo to share.")
             if coordinator.isInterrupted(request) {
-                Text("This request was executing when the app closed. Its outcome is unknown. Cancel retires it without repeating its action.")
+                Text("This request was running when the app closed, and it may not have finished. Cancel clears it without running it again.")
             } else if request.kind.isSettings {
                 Text("This changes the setting on this iPhone. Any iOS permission prompt is still yours to answer.")
                 Button("Allow change") {

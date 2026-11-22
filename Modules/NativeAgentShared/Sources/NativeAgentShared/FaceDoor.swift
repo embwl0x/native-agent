@@ -40,7 +40,7 @@ public struct FaceActOutcome: Codable, Sendable, Equatable {
         let failure: WireFailure
         if let known = error as? WireFailure { failure = known }
         else {
-            failure = WireFailure(code: "page_reply_unconfirmed", message: "The page action's reply is unavailable.",
+            failure = WireFailure(code: "page_reply_unconfirmed", message: "Not sure that went through.",
                                   cause: error.localizedDescription, effects: .unknown)
         }
         return Self(failure: failure, effects: failure.effects, committed: failure.committed)
@@ -52,7 +52,7 @@ public struct FaceActOutcome: Codable, Sendable, Equatable {
         case .result(let value): return try JSONDecoder().decode(Self.self, from: JSONEncoder().encode(value))
         case .failed(let failure), .refused(let failure): return .interrupted(failure)
         default:
-            throw WireFailure(code: "page_reply_unconfirmed", message: "The owner did not return this page action's outcome.",
+            throw WireFailure(code: "page_reply_unconfirmed", message: "Not sure that went through.",
                               cause: nil, effects: .unknown)
         }
     }
@@ -73,7 +73,6 @@ public struct FaceActSettlement: Codable, Sendable {
 
 /// The presentation asks its owner to act or navigate; drawing owns neither effect.
 @MainActor public protocol FaceDoor: Sendable {
-    var answersOnRow: Bool { get }
     var cancellationLabel: String { get }
     var waitingOn: String { get }
     func open(_ link: String)
@@ -94,7 +93,6 @@ extension FaceDoor {
 
 public struct ReadOnlyFaceDoor: FaceDoor {
     private let opening: (String) -> Void
-    public let answersOnRow = true
     public let cancellationLabel = "Cancel"
     public let waitingOn = "the page"
     public init(open: @escaping (String) -> Void = { _ in }) { opening = open }
@@ -108,7 +106,6 @@ public struct ReadOnlyFaceDoor: FaceDoor {
 }
 
 public struct ClosureFaceDoor: FaceDoor {
-    public let answersOnRow: Bool
     public let cancellationLabel: String
     public let waitingOn: String
     private let opening: (String) -> Void
@@ -129,32 +126,12 @@ public struct ClosureFaceDoor: FaceDoor {
                 perform: @escaping (FaceActSubmission) async -> FaceActOutcome) {
         opening = open
         acting = perform
-        answersOnRow = true
         self.cancellationLabel = cancellationLabel
         self.waitingOn = waitingOn
         reading = read
         pageReading = pageRead
         pageReleasing = releaseFace
         scoping = scope
-    }
-
-    public init(open: @escaping (String) -> Void, act: @escaping (String, String, String?) async -> Void) {
-        opening = open
-        answersOnRow = false
-        cancellationLabel = "Cancel waiting"
-        waitingOn = "the document"
-        reading = { _ in throw PartCallError(code: "read_unavailable", message: "This door has no document reader.") }
-        pageReading = { _ in throw PartCallError(code: "page_read_unavailable", message: "This door has no collection or item reader.") }
-        pageReleasing = { _ in }
-        scoping = nil
-        acting = { submission in
-            guard submission.values == nil else {
-                return .interrupted(WireFailure(code: "form_door_unavailable", message: "This page needs an answering form door.",
-                                                cause: nil, effects: .none))
-            }
-            await act(submission.row, submission.action, submission.value)
-            return FaceActOutcome(effects: .unknown)
-        }
     }
 
     public func open(_ link: String) { opening(link) }

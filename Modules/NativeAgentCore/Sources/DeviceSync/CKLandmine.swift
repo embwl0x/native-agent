@@ -11,18 +11,13 @@ import Security
 #endif
 
 public func nativeAgentCloudKitAccountProbeEnabled(
-    environment: [String: String] = ProcessInfo.processInfo.environment,
-    hasCloudKitEntitlement: @Sendable () -> Bool = nativeAgentHasCloudKitServiceEntitlement
+    environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> Bool {
     let raw = (environment["NATIVE_AGENT_ENABLE_CLOUDKIT"] ?? "")
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
     guard raw == "1" || raw == "true" || raw == "yes" else { return false }
-    return hasCloudKitEntitlement()
-}
-
-public func nativeAgentHasCloudKitServiceEntitlement() -> Bool {
-    DeviceCloudKitPreflight.hasCloudKitEntitlement()
+    return DeviceCloudKitPreflight.hasCloudKitEntitlement()
 }
 
 public func nativeAgentCloudKitAccountStatus() async -> String {

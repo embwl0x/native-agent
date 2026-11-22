@@ -5,16 +5,35 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `EngineBodyNerve.swift` | `BodyNerve`: each beat re-reads the body; a newly felt deviation becomes a somatic signal and a fault owes repair |
+// Blueprint: | `EngineBodyNerve.swift` | `BodyNerve`: each beat re-reads the body; a newly felt deviation becomes a somatic signal and a fault owes repair, kept with why it is owed (a failure settles only by a pass) |
 
 /// The body's integrator. Every beat re-reads the whole body, so an organ's silence is noticed as soon as any other organ beats. A deviation the nerve has
-/// not felt (new, changed, or doubled) becomes one `organDeviated` signal; a failed or stuck organ owes repair once, settled by its next completed pass
-/// (a stuck organ's also by a busy beat, which says it is not stuck).
+/// not felt (new, changed, or doubled) becomes one `organDeviated` signal; a failed or stuck organ owes repair once, kept with why it is owed and settled
+/// by its next completed pass (a stuck organ's also by a busy beat, which says it is not stuck; a failure only by a pass, however many beats follow it).
 /// What it has felt and what is owed live in `mind/body_nerve.json`, so a relaunch neither signals an ongoing deviation again nor forgets its debt.
 public actor BodyNerve {
     struct Memory: Codable, Equatable {
         var felt: [String: OrganBody.Mark] = [:]
-        var owed: Set<String> = []
+        /// Each organ that owes repair, with why: what may settle it follows from the fault it was owed for, never from beats read later.
+        var owed: [String: OrganRecord.Deviation.Kind] = [:]
+
+        init(felt: [String: OrganBody.Mark] = [:], owed: [String: OrganRecord.Deviation.Kind] = [:]) {
+            self.felt = felt
+            self.owed = owed
+        }
+
+        private enum CodingKeys: String, CodingKey { case felt, owed }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            felt = try container.decodeIfPresent([String: OrganBody.Mark].self, forKey: .felt) ?? [:]
+            // A memory written before the reason was kept names only the organs; each is held to a pass, the one settlement every fault takes.
+            if let organs = try? container.decode([String].self, forKey: .owed) {
+                owed = Dictionary(uniqueKeysWithValues: organs.map { ($0, .failed) })
+            } else {
+                owed = try container.decodeIfPresent([String: OrganRecord.Deviation.Kind].self, forKey: .owed) ?? [:]
+            }
+        }
     }
 
     private enum State {
@@ -62,18 +81,24 @@ public actor BodyNerve {
         guard let body = read else { return }
         await RepairOwed.settle(dataRoot, operation: Self.recordOperation, evidence: .init(source: "mind.body", id: "read")).value
         guard var memory = load() else { return }
-        // A completed pass settles what the organ owes. So does a busy beat for a repair owed for being stuck (no failure in its kept beats):
-        // busy is a slot held by other work, not a hold, so the organ is not stuck and that repair is no longer owed. A failure stays owed.
-        let unstuck = body.lines.filter { $0.latest.outcome == .busy && !$0.failedInRecord }.map(\.organ)
-        let settled = memory.owed.intersection(completed.union(unstuck))
+        // A completed pass settles what the organ owes. So does a busy beat for a repair owed for being stuck: busy is a slot held by other work,
+        // not a hold, so the organ is not stuck. A failure stays owed until the organ passes.
+        let busy = Set(body.lines.filter { $0.latest.outcome == .busy }.map(\.organ))
+        let settled = Set(memory.owed.compactMap { organ, kind in
+            completed.contains(organ) || (kind == .stuck && busy.contains(organ)) ? organ : nil
+        })
         completed = []
         let unfelt = body.unfelt(memory.felt)
+        // Settlement comes first, so a pass and then a fresh fault in one read settle the old repair and owe the new one.
+        var owed = memory.owed.filter { !settled.contains($0.key) }
         let owing = unfelt.filter { line in
             guard let kind = line.deviation?.kind, kind == .failed || kind == .stuck else { return false }
-            return !memory.owed.contains(line.organ)
+            return owed[line.organ] == nil
         }
-        let next = Memory(felt: body.marks(feeling: unfelt, over: memory.felt),
-                          owed: memory.owed.subtracting(settled).union(owing.map(\.organ)))
+        for line in owing { owed[line.organ] = line.deviation?.kind }
+        // A stuck organ that then fails owes the one repair it already owes, now for its failure.
+        for line in unfelt where line.deviation?.kind == .failed && owed[line.organ] == .stuck { owed[line.organ] = .failed }
+        let next = Memory(felt: body.marks(feeling: unfelt, over: memory.felt), owed: owed)
         guard next != memory else { return }
         do {
             let encoder = JSONEncoder()

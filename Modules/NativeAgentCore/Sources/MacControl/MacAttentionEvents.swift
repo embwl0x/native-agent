@@ -1,12 +1,8 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-#if canImport(AppKit) && os(macOS)
 import AppKit
-#endif
-#if canImport(CoreGraphics) && os(macOS)
 import CoreGraphics
-#endif
 // Blueprint: | `MacAttentionEvents.swift` | Passive input/scene events retain provenance; coalescing never delays synchronous takeover |
 
 public enum MacAttentionActivityKind: String, Sendable, Equatable, CaseIterable {
@@ -50,34 +46,14 @@ public protocol MacAttentionEventSource: Sendable {
     ) -> any MacAXEffectObservation
 }
 
-private final class UnavailableMacAttentionObservation: MacAXEffectObservation, @unchecked Sendable {
-    func stop() {}
-}
-
-public struct UnavailableMacAttentionEventSource: MacAttentionEventSource {
-    public init() {}
-    public var isAvailable: Bool { false }
-    public func start(
-        handler: @escaping @Sendable (MacAttentionActivity) -> Void
-    ) -> any MacAXEffectObservation {
-        _ = handler
-        return UnavailableMacAttentionObservation()
-    }
-}
-
-#if canImport(AppKit) && canImport(CoreGraphics) && os(macOS)
 
 private final class SystemMacAttentionObservation: MacAXEffectObservation, @unchecked Sendable {
-    let routingOwner: UUID
-    let routingOpen: Task<Void, Never>
     private let lock = NSLock()
     private var eventMonitors: [Any]
     private var workspaceObserver: NSObjectProtocol?
     private var stopped = false
 
-    init(eventMonitors: [Any], workspaceObserver: NSObjectProtocol?, routingOwner: UUID, routingOpen: Task<Void, Never>) {
-        self.routingOwner = routingOwner
-        self.routingOpen = routingOpen
+    init(eventMonitors: [Any], workspaceObserver: NSObjectProtocol?) {
         self.eventMonitors = eventMonitors
         self.workspaceObserver = workspaceObserver
     }
@@ -95,8 +71,6 @@ private final class SystemMacAttentionObservation: MacAXEffectObservation, @unch
         workspaceObserver = nil
         lock.unlock()
 
-        let opening = routingOpen, owner = routingOwner
-        Task { await opening.value; await MacInputRouting.close(owner) }
         for monitor in monitors { NSEvent.removeMonitor(monitor) }
         if let observer {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
@@ -142,8 +116,6 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
 
             func activity(from event: NSEvent) -> MacAttentionActivity? {
                 guard let input = event.cgEvent else { return nil }
-                let token = input.getIntegerValueField(.eventSourceUserData)
-                Task { await MacInputRouting.routed(token) }
                 guard NativePersonInput.isPerson(input) else { return nil }
                 let targetPID = Int32(clamping: input.getIntegerValueField(.eventTargetUnixProcessID))
                 if PersonOnlyWindows.isFaceProcess(targetPID) { return nil }
@@ -203,25 +175,14 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
             ) { _ in
                 handler(MacAttentionActivity(kind: .appChanged))
             }
-            let routingOwner = UUID()
-            let available = monitors.count == 2
-            let routingOpen = Task { await MacInputRouting.open(routingOwner, available: available) }
-            return SystemMacAttentionObservation(
-                eventMonitors: monitors,
-                workspaceObserver: workspace, routingOwner: routingOwner, routingOpen: routingOpen
-            )
+            return SystemMacAttentionObservation(eventMonitors: monitors, workspaceObserver: workspace)
         }
         if Thread.isMainThread { return install() }
         return DispatchQueue.main.sync(execute: install)
     }
 }
 
-#endif
 
 public func defaultMacAttentionEventSource() -> any MacAttentionEventSource {
-    #if canImport(AppKit) && canImport(CoreGraphics) && os(macOS)
     return SystemMacAttentionEventSource()
-    #else
-    return UnavailableMacAttentionEventSource()
-    #endif
 }

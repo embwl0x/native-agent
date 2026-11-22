@@ -1,3 +1,4 @@
+import NativeAgentShared
 // Bound suppressions and disposition undo; selectors honor source/context scope, and undo requires the exact value its update left.
 
 import Foundation
@@ -100,10 +101,6 @@ extension CognitiveSubstrate {
         return nil
     }
 
-    public func associationSuppressionSnapshot() -> [CognitiveAssociationSuppression] {
-        associationSuppressions
-    }
-
     // MARK: - Undo
 
     static func undoStamp(_ disposition: CognitiveDisposition) -> String {
@@ -113,7 +110,7 @@ extension CognitiveSubstrate {
     /// Retain only the newest undertone undo.
     func recordDispositionUndo(what: String, previous: JSONValue, stamp: String) async {
         dispositionUndo = .init(
-            key: "disposition", what: bounded(what, maxCharacters: 160), previous: previous,
+            key: "disposition", what: TextClipping.prefixOrWhole(what, maxCharacters: 160), previous: previous,
             stamp: stamp, at: dependencies.now())
         await notingPersistence("mind_ledger") { try await persistMindLedger() }
     }
@@ -148,7 +145,7 @@ extension CognitiveSubstrate {
         disposition = restored
         dispositionTransitions.append(CognitiveDispositionTransition(
             before: current.valence, afterDecay: current.valence, afterContribution: valence,
-            at: now, source: bounded("undo: \(entry.what)", maxCharacters: 60)))
+            at: now, source: TextClipping.prefixOrWhole("undo: \(entry.what)", maxCharacters: 60)))
         if dispositionTransitions.count > Self.maximumDispositionTransitions {
             dispositionTransitions.removeFirst(dispositionTransitions.count - Self.maximumDispositionTransitions)
         }

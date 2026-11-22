@@ -15,11 +15,10 @@ import ApprovalInbox
 import PersonaEngine
 import StandingBots
 import ProviderRouting
-import CryptoKit
 import MemoryV2
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `BuilderProcess.swift` | Checked workspace and required SwiftPM shim admission before process launch; environment and confinement |
+// Blueprint: | `BuilderProcess.swift` | Checked workspace and required SwiftPM shim admission before process launch; environment (the person's login PATH, as their terminal finds programs) and confinement |
 extension SwiftToolDispatcher {
     // Escape SBPL literals so paths cannot alter confinement or credential/Trust denials.
     static func sbplEscapeLiteral(_ s: String) -> String {
@@ -257,48 +256,91 @@ extension SwiftToolDispatcher {
         do { checkedLaunch = try await builderLaunch(turn: turn, executable: executable, args: args, cwd: cwd, dataRoot: dataRoot, readWords: readWords) }
         catch { return ChatToolOutcome.failure(error: error, tool: toolName, effects: ToolFailureError.Effects.none) }
         guard let launch = checkedLaunch else {
-            let auditEntry: [String: Any] = [
-                "toolName": toolName,
-                "runId": runId,
-                "createdAt": NativeTimestampFormat.plainZulu(started),
-                "completedAt": NativeTimestampFormat.plainZulu(Date()),
-                "status": "failed_pre_spawn",
-                "reason": "cwd_invalid_or_outside_workspace",
-                "cwd_requested": cwd,
-                "workspace_root": builderWorkspaceRoot(dataRoot: dataRoot).path,
-                "executable": executable,
-                "args": args,
-                "outer_sandbox_policy": "policy",
-            ]
-            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-            var env: [String: JSONValue] = [
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "tool": .string(toolName),
-                "reason": .string("cwd_invalid_or_outside_workspace"),
-                "execution": .string("not_run"),
-                "effect": .string("none"),
-                "detail": .string("cwd is not an existing folder this action may work in; use one inside workspace_root. Nothing ran."),
-                "cwd_requested": .string(cwd),
-                "workspace_root": .string(builderWorkspaceRoot(dataRoot: dataRoot).path),
-                "source_checkout_available": .bool(builderSourceRepoRoot(dataRoot: dataRoot) != nil),
-                "runId": .string(runId),
-                "audit_path": .string(auditURL.path),
-                "outer_sandbox_policy": .string("policy"),
-            ]
-            if let auditErr { env["audit_error"] = .string(auditErr) }
-            return .object(env)
+            return shellInvalidDirectoryReceipt(toolName: toolName, runId: runId, started: started, cwd: cwd,
+                executable: executable, args: args, dataRoot: dataRoot)
         }
         let clampedTimeout = builderEffectiveTimeoutSeconds(timeoutSeconds)
         let sandboxMode = launch.mode, resolvedCwd = launch.cwd
         let sandboxed = sandboxMode != .off
+        let (process, resolvedCompatRewrites) = await configureShellProcess(turn: turn, launch: launch, resolvedCwd: resolvedCwd,
+            environmentOverride: environmentOverride, closeStandardInput: closeStandardInput)
+        @Sendable func spawnFailure(_ error: any Error) -> JSONValue {
+            shellSpawnFailure(error, toolName: toolName, runId: runId, started: started, resolvedCwd: resolvedCwd,
+                executable: executable, args: args, sandboxed: sandboxed, dataRoot: dataRoot)
+        }
+        let outputCapture: InvokeOutputCapture
+        do {
+            outputCapture = try InvokeOutputCapture(process: process,
+                stdoutCap: 16 * 1024 * 1024, stderrCap: 16 * 1024 * 1024, onStdoutLine: onStdoutLine)
+        } catch {
+            return await settle { spawnFailure(error) }
+        }
+        return await SubprocessWork(process).run(
+            timeoutSeconds: clampedTimeout, reapDescendantsOnExit: reapDescendantsOnExit
+        ) { exit in
+            let (stdoutText, stderrText) = outputCapture.finish(appendTruncationNotes: false)
+            if let error = exit.launchError {
+                return spawnFailure(ToolFailureError(error, effects: .none, code: "spawn_failed"))
+            }
+            let pipeTruncated = outputCapture.truncated
+            return shellExitReceipt(exit, toolName: toolName, runId: runId, started: started, clampedTimeout: clampedTimeout,
+                resolvedCwd: resolvedCwd, executable: executable, args: args, stdoutText: stdoutText, stderrText: stderrText,
+                pipeTruncated: pipeTruncated, sandboxed: sandboxed, sandboxMode: sandboxMode, sourcePayloadForAudit: sourcePayloadForAudit,
+                resolvedCompatRewrites: resolvedCompatRewrites, dataRoot: dataRoot, exitIsAnswer: exitIsAnswer)
+        }
+    }
+
+    /// Record the refusal when the working directory is outside the admitted workspace.
+    private static func shellInvalidDirectoryReceipt(toolName: String, runId: String, started: Date, cwd: String,
+        executable: String, args: [String], dataRoot: URL) -> JSONValue {
+        let auditEntry: [String: Any] = [
+            "toolName": toolName,
+            "runId": runId,
+            "createdAt": NativeTimestampFormat.plainZulu(started),
+            "completedAt": NativeTimestampFormat.plainZulu(Date()),
+            "status": "failed_pre_spawn",
+            "reason": "cwd_invalid_or_outside_workspace",
+            "cwd_requested": cwd,
+            "workspace_root": builderWorkspaceRoot(dataRoot: dataRoot).path,
+            "executable": executable,
+            "args": args,
+            "outer_sandbox_policy": "policy",
+        ]
+        let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
+        var env: [String: JSONValue] = [
+            "status": .string("failed"),
+            "effects": .string("none"),
+            "tool": .string(toolName),
+            "reason": .string("cwd_invalid_or_outside_workspace"),
+            "execution": .string("not_run"),
+            "effect": .string("none"),
+            "detail": .string("cwd is not an existing folder this action may work in; use one inside workspace_root. Nothing ran."),
+            "cwd_requested": .string(cwd),
+            "workspace_root": .string(builderWorkspaceRoot(dataRoot: dataRoot).path),
+            "source_checkout_available": .bool(builderSourceRepoRoot(dataRoot: dataRoot) != nil),
+            "runId": .string(runId),
+            "audit_path": .string(auditURL.path),
+            "outer_sandbox_policy": .string("policy"),
+        ]
+        if let auditErr { env["audit_error"] = .string(auditErr) }
+        return .object(env)
+    }
+
+    /// Configure the admitted process and capture any environment rewrites.
+    private static func configureShellProcess(turn: Turn, launch: BuilderLaunch, resolvedCwd: String,
+        environmentOverride: [String: String]?, closeStandardInput: Bool) async -> (ManagedProcess, [String]) {
         let process = ManagedProcess()
         // The call waiting on this command watches it: its output and processor time are the call's life.
         process.life = turn.enclosingCall
         process.executableURL = URL(fileURLWithPath: launch.executable)
         process.arguments = launch.arguments
         // SwiftPM's manifest sandbox cannot nest. Put the --disable-sandbox shim first on PATH while the outer profile retains write confinement.
-        var env = launch.environment ?? environmentOverride ?? ManagedProcess.agentEnvironment()
+        // Her shell finds programs the way the person's own terminal does: the login PATH once it reads, else the app's own.
+        var env = launch.environment ?? environmentOverride ?? {
+            var own = ManagedProcess.agentEnvironment()
+            if case .success(let login) = AgentHostCommandLines.loginEnvironment, let path = login["PATH"] { own["PATH"] = path }
+            return own
+        }()
         var effectiveCompatRewrites: [String] = []
         let developerDirectory = await Self.builderSelectedDeveloperDirectory(environment: env)
         let developerPromptPolicy = Self.builderEnvironmentSuppressingDeveloperToolsPrompt(
@@ -320,142 +362,138 @@ extension SwiftToolDispatcher {
         process.currentDirectoryURL = URL(fileURLWithPath: resolvedCwd)
         if closeStandardInput { process.standardInput = FileHandle.nullDevice }
         process.qualityOfService = .utility
-        @Sendable func spawnFailure(_ error: any Error) -> JSONValue {
-            let spawnAudit: [String: Any] = [
-                "toolName": toolName,
-                "runId": runId,
-                "createdAt": NativeTimestampFormat.plainZulu(started),
-                "completedAt": NativeTimestampFormat.plainZulu(Date()),
-                "status": "failed_pre_spawn",
-                "reason": "spawn_failed",
-                "detail": ChatToolOutcome.errorMessage(error),
-                "cwd": resolvedCwd,
-                "executable": executable,
-                "args": args,
-                "sandboxed": sandboxed,
-                "outer_sandbox_policy": "policy",
-            ]
-            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: spawnAudit, dataRoot: dataRoot)
-            var env = Self.builderFailureFields(error,
-                tool: toolName, reason: "spawn_failed", effects: .none,
-                owner: "process launch for \(executable) in \(resolvedCwd)",
-                instruction: "Repair the reported executable, working-directory or pipe error before another command. Nothing ran.")
-            env.merge([
-                "execution": .string("not_run"),
-                "effect": .string("none"),
-                "runId": .string(runId),
-                "sandboxed": .bool(sandboxed),
-                "outer_sandbox_policy": .string("policy"),
-                "audit_path": .string(auditURL.path),
-            ], uniquingKeysWith: { _, receipt in receipt })
-            if let auditErr { env["audit_error"] = .string(auditErr) }
-            return .object(env)
+        return (process, resolvedCompatRewrites)
+    }
+
+    /// Record launch or pipe setup failure before the command runs.
+    private static func shellSpawnFailure(_ error: any Error, toolName: String, runId: String, started: Date, resolvedCwd: String,
+        executable: String, args: [String], sandboxed: Bool, dataRoot: URL) -> JSONValue {
+        let spawnAudit: [String: Any] = [
+            "toolName": toolName,
+            "runId": runId,
+            "createdAt": NativeTimestampFormat.plainZulu(started),
+            "completedAt": NativeTimestampFormat.plainZulu(Date()),
+            "status": "failed_pre_spawn",
+            "reason": "spawn_failed",
+            "detail": ChatToolOutcome.errorMessage(error),
+            "cwd": resolvedCwd,
+            "executable": executable,
+            "args": args,
+            "sandboxed": sandboxed,
+            "outer_sandbox_policy": "policy",
+        ]
+        let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: spawnAudit, dataRoot: dataRoot)
+        var env = Self.builderFailureFields(error,
+            tool: toolName, reason: "spawn_failed", effects: .none,
+            owner: "process launch for \(executable) in \(resolvedCwd)",
+            instruction: "Repair the reported executable, working-directory or pipe error before another command. Nothing ran.")
+        env.merge([
+            "execution": .string("not_run"),
+            "effect": .string("none"),
+            "runId": .string(runId),
+            "sandboxed": .bool(sandboxed),
+            "outer_sandbox_policy": .string("policy"),
+            "audit_path": .string(auditURL.path),
+        ], uniquingKeysWith: { _, receipt in receipt })
+        if let auditErr { env["audit_error"] = .string(auditErr) }
+        return .object(env)
+    }
+
+    /// Write the exit audit and present the bounded command receipt during settlement.
+    private static func shellExitReceipt(_ exit: SubprocessWork.Exit, toolName: String, runId: String, started: Date, clampedTimeout: Int,
+        resolvedCwd: String, executable: String, args: [String], stdoutText: String, stderrText: String, pipeTruncated: Bool,
+        sandboxed: Bool, sandboxMode: BuilderShellSandboxMode, sourcePayloadForAudit: String?, resolvedCompatRewrites: [String],
+        dataRoot: URL, exitIsAnswer: Bool) -> JSONValue {
+        let exitCode = exit.code
+        let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+        // A launched shell timeout is command data; an explicit Stop is cancellation.
+        let timeoutIsAnswer = exitIsAnswer && exit.launched && exit.timedOut
+        let status = exit.terminationError != nil ? "failed" : exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0
+            ? "completed" : "failed"
+        var auditEntry: [String: Any] = [
+            "toolName": toolName,
+            "runId": runId,
+            "createdAt": NativeTimestampFormat.plainZulu(started),
+            "completedAt": NativeTimestampFormat.plainZulu(Date()),
+            "status": status,
+            "durationMs": durationMs,
+            "timeoutSecondsEffective": clampedTimeout,
+            "timedOut": exit.timedOut,
+            "exitCode": Int(exitCode),
+            "processExitCode": Int(exitCode),
+            "cwd": resolvedCwd,
+            "executable": executable,
+            "args": args,
+            "stdout_len": stdoutText.count,
+            "stderr_len": stderrText.count,
+            "stdout": stdoutText,
+            "stderr": stderrText,
+            "pipe_truncated": pipeTruncated,
+            "sandboxed": sandboxed,
+            "sandbox_mode": sandboxMode.rawValue,
+            "outer_sandbox_policy": "policy",
+        ]
+        if let error = exit.terminationError { auditEntry["terminationError"] = error }
+        if let sourcePayloadForAudit { auditEntry["sourcePayload"] = sourcePayloadForAudit }
+        if exit.stopped { auditEntry["reason"] = exit.timedOut ? "watchdog_timeout" : "stopped" }
+        if !resolvedCompatRewrites.isEmpty {
+            auditEntry["compat_rewrites"] = resolvedCompatRewrites
         }
-        let outputCapture: InvokeOutputCapture
-        do {
-            outputCapture = try InvokeOutputCapture(process: process,
-                stdoutCap: 16 * 1024 * 1024, stderrCap: 16 * 1024 * 1024, onStdoutLine: onStdoutLine)
-        } catch {
-            return await settle { spawnFailure(error) }
+        let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
+        // Keep 8 KiB of head and 24 KiB of tail: command/root-cause context and final errors survive the 32 KiB envelope cap.
+        let (envStdout, envStdoutTruncated) = SwiftToolDispatcher.headTailPreserve(
+            stdoutText, headBudget: 8_192, tailBudget: 24_576)
+        let (envStderr, envStderrTruncated) = SwiftToolDispatcher.headTailPreserve(
+            stderrText, headBudget: 8_192, tailBudget: 24_576)
+        var envelope: [String: JSONValue] = [
+            "status": .string(status),
+            "tool": .string(toolName),
+            "runId": .string(runId),
+            "exit_code": .int(Int64(exitCode)),
+            "process_exit_code": .int(Int64(exitCode)),
+            "stdout": .string(envStdout),
+            "stderr": .string(envStderr),
+            "durationMs": .int(Int64(durationMs)),
+            "timeout_seconds_effective": .int(Int64(clampedTimeout)),
+            "timed_out": .bool(exit.timedOut),
+            "ran": .bool(exit.launched),
+            "execution": .string(exit.launched ? "executed" : "not_run"),
+            "cwd": .string(resolvedCwd),
+            "sandboxed": .bool(sandboxed),
+            "sandbox_mode": .string(sandboxMode.rawValue),
+            "outer_sandbox_policy": .string("policy"),
+            "audit_path": .string(auditURL.path),
+        ]
+        if exitIsAnswer {
+            envelope["summary"] = .string(exit.launched
+                ? "Ran · exit \(exitCode)" + (exit.timedOut ? " · timed out after \(clampedTimeout) s" : "")
+                : "Stopped before launch")
         }
-        return await SubprocessWork(process).run(
-            timeoutSeconds: clampedTimeout, reapDescendantsOnExit: reapDescendantsOnExit
-        ) { exit in
-            let (stdoutText, stderrText) = outputCapture.finish(appendTruncationNotes: false)
-            if let error = exit.launchError {
-                return spawnFailure(ToolFailureError(error, effects: .none, code: "spawn_failed"))
-            }
-            let pipeTruncated = outputCapture.truncated
-            let exitCode = exit.code
-            let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-            // A launched shell timeout is command data; an explicit Stop is cancellation.
-            let timeoutIsAnswer = exitIsAnswer && exit.launched && exit.timedOut
-            let status = exit.terminationError != nil ? "failed" : exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0
-                ? "completed" : "failed"
-            var auditEntry: [String: Any] = [
-                "toolName": toolName,
-                "runId": runId,
-                "createdAt": NativeTimestampFormat.plainZulu(started),
-                "completedAt": NativeTimestampFormat.plainZulu(Date()),
-                "status": status,
-                "durationMs": durationMs,
-                "timeoutSecondsEffective": clampedTimeout,
-                "timedOut": exit.timedOut,
-                "exitCode": Int(exitCode),
-                "processExitCode": Int(exitCode),
-                "cwd": resolvedCwd,
-                "executable": executable,
-                "args": args,
-                "stdout_len": stdoutText.count,
-                "stderr_len": stderrText.count,
-                "stdout": stdoutText,
-                "stderr": stderrText,
-                "pipe_truncated": pipeTruncated,
-                "sandboxed": sandboxed,
-                "sandbox_mode": sandboxMode.rawValue,
-                "outer_sandbox_policy": "policy",
-            ]
-            if let error = exit.terminationError { auditEntry["terminationError"] = error }
-            if let sourcePayloadForAudit { auditEntry["sourcePayload"] = sourcePayloadForAudit }
-            if exit.stopped { auditEntry["reason"] = exit.timedOut ? "watchdog_timeout" : "stopped" }
-            if !resolvedCompatRewrites.isEmpty {
-                auditEntry["compat_rewrites"] = resolvedCompatRewrites
-            }
-            let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-            // Keep 8 KiB of head and 24 KiB of tail: command/root-cause context and final errors survive the 32 KiB envelope cap.
-            let (envStdout, envStdoutTruncated) = SwiftToolDispatcher.headTailPreserve(
-                stdoutText, headBudget: 8_192, tailBudget: 24_576)
-            let (envStderr, envStderrTruncated) = SwiftToolDispatcher.headTailPreserve(
-                stderrText, headBudget: 8_192, tailBudget: 24_576)
-            var envelope: [String: JSONValue] = [
-                "status": .string(status),
-                "tool": .string(toolName),
-                "runId": .string(runId),
-                "exit_code": .int(Int64(exitCode)),
-                "process_exit_code": .int(Int64(exitCode)),
-                "stdout": .string(envStdout),
-                "stderr": .string(envStderr),
-                "durationMs": .int(Int64(durationMs)),
-                "timeout_seconds_effective": .int(Int64(clampedTimeout)),
-                "timed_out": .bool(exit.timedOut),
-                "ran": .bool(exit.launched),
-                "execution": .string(exit.launched ? "executed" : "not_run"),
-                "cwd": .string(resolvedCwd),
-                "sandboxed": .bool(sandboxed),
-                "sandbox_mode": .string(sandboxMode.rawValue),
-                "outer_sandbox_policy": .string("policy"),
-                "audit_path": .string(auditURL.path),
-            ]
-            if exitIsAnswer {
-                envelope["summary"] = .string(exit.launched
-                    ? "Ran · exit \(exitCode)" + (exit.timedOut ? " · timed out after \(clampedTimeout) s" : "")
-                    : "Stopped before launch")
-            }
-            if let error = exit.terminationError {
-                envelope["reason"] = .string("process_termination_incomplete")
-                envelope["effects"] = .string("unknown")
-                envelope["detail"] = .string(error)
-                envelope["remedy"] = Repair.reconcile(instruction: "Inspect the command's existing effects and repair its process group before repeating work.",
-                    nextCall: .object(["tool": .string("app"), "input": .object(["find": .string("shell")])]))
-            } else if exit.timedOut {
-                if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
-                envelope["detail"] = .string("""
-                    The process exceeded the effective \(clampedTimeout)-second builder timeout and its owned process group was terminated.
-                    """)
-            } else if exit.stopped {
-                envelope["reason"] = .string("stopped")
-                envelope["detail"] = .string(exit.launched
-                    ? "Stopped the owned process group. Captured output is saved in the audit; any changes already made remain."
-                    : "Stopped before launch. Nothing ran.")
-            }
-            if !resolvedCompatRewrites.isEmpty {
-                envelope["compat_rewrites"] = .array(resolvedCompatRewrites.map { .string($0) })
-            }
-            if envStdoutTruncated || envStderrTruncated || pipeTruncated {
-                envelope["_truncated"] = .bool(true)
-            }
-            if let auditErr { envelope["audit_error"] = .string(auditErr) }
-            return .object(envelope)
+        if let error = exit.terminationError {
+            envelope["reason"] = .string("process_termination_incomplete")
+            envelope["effects"] = .string("unknown")
+            envelope["detail"] = .string(error)
+            envelope["remedy"] = Repair.reconcile(instruction: "Inspect the command's existing effects and repair its process group before repeating work.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["find": .string("shell")])]))
+        } else if exit.timedOut {
+            if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
+            envelope["detail"] = .string("""
+                The process exceeded the effective \(clampedTimeout)-second builder timeout and its owned process group was terminated. \
+                Check what changed before retrying. If a native action handles the remaining work, use its receipt.
+                """)
+        } else if exit.stopped {
+            envelope["reason"] = .string("stopped")
+            envelope["detail"] = .string(exit.launched
+                ? "Stopped the owned process group. Captured output is saved in the audit; any changes already made remain."
+                : "Stopped before launch. Nothing ran.")
         }
+        if !resolvedCompatRewrites.isEmpty {
+            envelope["compat_rewrites"] = .array(resolvedCompatRewrites.map { .string($0) })
+        }
+        if envStdoutTruncated || envStderrTruncated || pipeTruncated {
+            envelope["_truncated"] = .bool(true)
+        }
+        if let auditErr { envelope["audit_error"] = .string(auditErr) }
+        return .object(envelope)
     }
 }

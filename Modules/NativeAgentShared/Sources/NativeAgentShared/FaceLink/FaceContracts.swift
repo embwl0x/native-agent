@@ -53,7 +53,8 @@ public struct WireFailure: Codable, Sendable, Equatable, LocalizedError {
     public var effects: FaceEffects
     public var committed: [FaceCommittedField]?
     public var fields: [String: String]?
-    public var errorDescription: String? { cause.map { message + "\n" + $0 } ?? message }
+    /// What a person reads: the message alone. `cause` stays on the value for logs and the agent.
+    public var errorDescription: String? { message }
     public init(code: String, message: String, cause: String?, effects: FaceEffects,
                 committed: [FaceCommittedField]? = nil, fields: [String: String]? = nil) {
         self.code = code
@@ -216,13 +217,17 @@ public struct FaceAttachment: Codable, Sendable, Equatable {
     public var byteCount: Int
     public var resource: ResourceGrant?
     public var bytes: Data?
-    public init(id: String, name: String, mimeType: String, byteCount: Int, resource: ResourceGrant?, bytes: Data?) {
+    /// A dictation's recognition record rides with its audio, so the turn still has its speech evidence after the composer.
+    public var utterance: SpeechUtterance?
+    public init(id: String, name: String, mimeType: String, byteCount: Int, resource: ResourceGrant?, bytes: Data?,
+                utterance: SpeechUtterance? = nil) {
         self.id = id
         self.name = name
         self.mimeType = mimeType
         self.byteCount = byteCount
         self.resource = resource
         self.bytes = bytes
+        self.utterance = utterance
     }
 }
 

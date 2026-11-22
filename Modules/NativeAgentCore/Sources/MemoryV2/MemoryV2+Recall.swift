@@ -51,22 +51,39 @@ extension SwiftNativeMemoryV2 {
     ) async throws -> MemoryV2RecallResponse {
         guard !query.text.isEmpty else { throw MemoryV2Error.invalidQuery }
         let recallStarted = ProcessInfo.processInfo.systemUptime
-        var timings: [String: Double] = [:]
-        func milliseconds(since start: Double) -> Double {
-            (ProcessInfo.processInfo.systemUptime - start) * 1_000
-        }
+        let metrics = RecallTimings()
         defer {
             if query.requiresRelevance == true {
-                timings["total_ms"] = milliseconds(since: recallStarted)
-                let detail = timings.sorted { $0.key < $1.key }
+                metrics.timings["total_ms"] = metrics.milliseconds(since: recallStarted)
+                let detail = metrics.timings.sorted { $0.key < $1.key }
                     .map { "\($0.key)=\(Int($0.value))" }.joined(separator: " ")
                 nativeLog("MemoryV2 recall: \(detail)")
             }
         }
         try await ensureCanonicalAttachment()
-        timings["attachment_ms"] = milliseconds(since: recallStarted)
+        metrics.timings["attachment_ms"] = metrics.milliseconds(since: recallStarted)
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try Task.checkCancellation()
+        let vectors = try await embedRecallQuery(query, storage: storage, metrics: metrics)
+        let selection = try await selectRecallRows(query, storage: storage, vectors: vectors, metrics: metrics, turn: turn)
+        return try makeRecallResponse(query, storage: storage, selection: selection, topK: vectors.topK,
+            storageTopK: vectors.storageTopK, metrics: metrics, recallStarted: recallStarted, recordingUsage: recordingUsage)
+    }
+
+    private final class RecallTimings {
+        var timings: [String: Double] = [:]
+
+        func milliseconds(since start: Double) -> Double {
+            (ProcessInfo.processInfo.systemUptime - start) * 1_000
+        }
+    }
+
+    private typealias RecallVectors = (qvec: [Float], rewritten: String?, rewrittenEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?,
+        embedded: MemoryEmbeddingBatch, topK: Int, storageTopK: Int, hasUsableVector: Bool)
+    private typealias RecallSelection = (disclosed: [ScoredMemoryRecord], rankedCandidates: [ScoredMemoryRecord],
+        scored: [ScoredMemoryRecord], disclosureFilteredCount: Int, candidateCount: Int, offset: Int, examinedCount: Int)
+
+    private func embedRecallQuery(_ query: MemoryV2RecallRequest, storage: MemoryStorage, metrics: RecallTimings) async throws -> RecallVectors {
         // Recall reads the published vector space and never builds one: what is missing is named, and its housekeeping flight requested.
         let epochStarted = ProcessInfo.processInfo.systemUptime
         guard let residentEpoch = try residentEmbeddingEpoch() else {
@@ -81,7 +98,7 @@ extension SwiftNativeMemoryV2 {
             requestEmbeddingEpochReconcile()
             throw Self.recallCorpusConverging
         }
-        timings["epoch_ms"] = milliseconds(since: epochStarted)
+        metrics.timings["epoch_ms"] = metrics.milliseconds(since: epochStarted)
         let embeddingStarted = ProcessInfo.processInfo.systemUptime
         // Embed both conversational voices together and keep each row's better score so neither reading can disappear silently.
         let storeDirectory = await storage.path.deletingLastPathComponent()
@@ -112,8 +129,14 @@ extension SwiftNativeMemoryV2 {
         let hasUsableVector = !qvec.isEmpty && qvec.contains { $0 != 0 && $0.isFinite }
         let rewrittenEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)? = rewritten != nil
             && embedded.vectors.count > 1 ? (embedded.vectors[1], embedded.epoch) : nil
-        timings["embedding_ms"] = milliseconds(since: embeddingStarted)
+        metrics.timings["embedding_ms"] = metrics.milliseconds(since: embeddingStarted)
         try Task.checkCancellation()
+        return (qvec, rewritten, rewrittenEmbedding, embedded, topK, storageTopK, hasUsableVector)
+    }
+
+    private func selectRecallRows(_ query: MemoryV2RecallRequest, storage: MemoryStorage, vectors: RecallVectors,
+                                  metrics: RecallTimings, turn: Turn?) async throws -> RecallSelection {
+        let (qvec, rewritten, rewrittenEmbedding, embedded, topK, storageTopK, hasUsableVector) = vectors
         let canonicalStorage = storage
         func disclosedRows(_ rows: [ScoredMemoryRecord]) -> [ScoredMemoryRecord] {
             var seen: Set<String> = []
@@ -136,7 +159,7 @@ extension SwiftNativeMemoryV2 {
         } else {
             generation = nil
         }
-        timings["generation_ms"] = milliseconds(since: generationStarted)
+        metrics.timings["generation_ms"] = metrics.milliseconds(since: generationStarted)
         var retrievalStarted = ProcessInfo.processInfo.systemUptime
         guard hasUsableVector else {
             throw MemoryStorageError.searchFailure("The memory search model returned no usable query vector.",
@@ -179,18 +202,18 @@ extension SwiftNativeMemoryV2 {
             return Array(best.values)
         }
         var scored = retrieve(storageTopK)
-        timings["retrieval_ms"] = milliseconds(since: retrievalStarted)
-        timings["retrieval_passes"] = 1
+        metrics.timings["retrieval_ms"] = metrics.milliseconds(since: retrievalStarted)
+        metrics.timings["retrieval_passes"] = 1
         try Task.checkCancellation()
         let disclosureStarted = ProcessInfo.processInfo.systemUptime
         var disclosed = disclosedRows(scored)
         var disclosureFilteredCount = scored.count - disclosed.count
-        timings["disclosure_ms"] = milliseconds(since: disclosureStarted)
-        timings["candidates"] = Double(disclosed.count)
+        metrics.timings["disclosure_ms"] = metrics.milliseconds(since: disclosureStarted)
+        metrics.timings["candidates"] = Double(disclosed.count)
         let candidateCount = disclosed.count
         let offset = min(max(0, query.offset ?? 0), candidateCount)
         disclosed = Array(disclosed.dropFirst(offset))
-        var examinedCount = MemoryRecallScoring.relevanceCandidateLimit(topK: topK, count: disclosed.count)
+        let examinedCount = MemoryRecallScoring.relevanceCandidateLimit(topK: topK, count: disclosed.count)
         let rankedCandidates = disclosed
         if query.requiresRelevance == true, !disclosed.isEmpty {
             let relevanceStarted = ProcessInfo.processInfo.systemUptime
@@ -199,19 +222,27 @@ extension SwiftNativeMemoryV2 {
                     MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
                         kind: $0.record.memoryKind ?? MemoryRecallScoring.kind(of: $0.record.extras))
                 }, generation: generation, topK: topK, turn: turn)
-            timings["relevance_ms", default: 0] += milliseconds(since: relevanceStarted)
+            metrics.timings["relevance_ms", default: 0] += metrics.milliseconds(since: relevanceStarted)
             disclosed = disclosed.filter { admitted.contains($0.record.id) }
         }
         // Non-judged callers retain the disclosure refill. Explicit recall already fetched the row cap and never repeats retrieval or judgment.
         if query.requiresRelevance != true, disclosed.count < topK, scored.count >= storageTopK, storageTopK < memoryStoredRowCap {
             retrievalStarted = ProcessInfo.processInfo.systemUptime
             scored = retrieve(memoryStoredRowCap)
-            timings["retrieval_ms", default: 0] += milliseconds(since: retrievalStarted)
+            metrics.timings["retrieval_ms", default: 0] += metrics.milliseconds(since: retrievalStarted)
             try Task.checkCancellation()
             let allDisclosed = disclosedRows(scored)
             disclosureFilteredCount = scored.count - allDisclosed.count
             disclosed = Array(allDisclosed.dropFirst(offset))
         }
+        return (disclosed, rankedCandidates, scored, disclosureFilteredCount, candidateCount, offset, examinedCount)
+    }
+
+    private func makeRecallResponse(_ query: MemoryV2RecallRequest, storage: MemoryStorage, selection: RecallSelection,
+                                    topK: Int, storageTopK: Int, metrics: RecallTimings, recallStarted: Double,
+                                    recordingUsage: Bool) throws -> MemoryV2RecallResponse {
+        let (disclosed, rankedCandidates, scored, disclosureFilteredCount, candidateCount, offset, examined) = selection
+        var examinedCount = examined
         // storageTopK is a wider disclosure candidate window, not the result budget: cut AFTER disclosure at the actual requested size.
         let selectionStarted = ProcessInfo.processInfo.systemUptime
         let sorted = Array(disclosed.sorted { $0.score == $1.score ? $0.record.id < $1.record.id : $0.score > $1.score }.prefix(max(0, topK)))
@@ -233,8 +264,8 @@ extension SwiftNativeMemoryV2 {
             hasMore = sorted.count < disclosed.count || scored.count >= storageTopK && storageTopK < memoryStoredRowCap
             capped = offset > 0 || hasMore
         }
-        timings["selection_ms"] = milliseconds(since: selectionStarted)
-        timings["results"] = Double(sorted.count)
+        metrics.timings["selection_ms"] = metrics.milliseconds(since: selectionStarted)
+        metrics.timings["results"] = Double(sorted.count)
         // Record access after computing recall without awaiting; scoring and capacity retention use it, but disuse never archives rows.
         try Task.checkCancellation()
         let usedIds = recordingUsage ? sorted.map { $0.record.id } : []
@@ -298,13 +329,13 @@ extension SwiftNativeMemoryV2 {
                 extras: .object(extras)
             )
         }
-        timings["total_ms"] = milliseconds(since: recallStarted)
+        metrics.timings["total_ms"] = metrics.milliseconds(since: recallStarted)
         return MemoryV2RecallResponse(
             hits: hits,
             scored: sorted,
             total: sorted.count,
             disclosureFilteredCount: disclosureFilteredCount,
-            timings: timings,
+            timings: metrics.timings,
             capped: capped,
             hasMore: hasMore,
             nextOffset: hasMore ? next : nil
@@ -329,9 +360,7 @@ extension SwiftNativeMemoryV2 {
               persona == nil || record.personaId == persona,
               let disclosure = MemoryRecordDisclosurePolicy.classify(record),
               disclosure.permits(surface: surface, personaID: persona),
-              MemoryCandidateQuality.isDurableCandidate(
-                text: record.text, source: record.sourceRunId, kind: record.memoryKind
-              ) else { return nil }
+              MemoryCandidateQuality.isDurableCandidate(text: record.text) else { return nil }
         let tombstoned = try await storage.isTombstoned(content: record.text)
         guard !tombstoned else { return nil }
         guard !MemoryStorage.metadataFlag(record.extras, MemoryStorage.pendingAdmissionKey) else {

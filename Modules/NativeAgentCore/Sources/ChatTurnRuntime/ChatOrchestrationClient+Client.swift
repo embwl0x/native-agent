@@ -1,6 +1,5 @@
 import AuthoredCapabilities
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -52,12 +51,12 @@ public actor SwiftNativeChatOrchestrationClient {
         let wake = turn.with(\.client, llm).with(\.admission, nil).with(\.providerChoice, nil)
         let admit: @Sendable (Turn) async throws -> Turn = { [self] turn in
             let admission = try await self.engine.router.checkedRouteAdmission(for: "chat")
-            return try await self.withModelContext(admission, surface: "chat", turn: turn) { $0 }
+            return try await self.withModelContext(admission, turn: turn) { $0 }
         }
         return try await body(wake, admit)
     }
 
-    func withModelContext<T: Sendable>(_ admission: TurnRouteAdmission, surface: String,
+    func withModelContext<T: Sendable>(_ admission: TurnRouteAdmission,
         turn: Turn, _ body: (Turn) async throws -> T
     ) async throws -> T {
         guard let provider = admission.providerId else {
@@ -167,7 +166,7 @@ public actor SwiftNativeChatOrchestrationClient {
             }
             var work = work
             work.prefixTelemetry = ConversationPrefixTelemetrySink()
-            return try await withModelContext(admission, surface: surface, turn: turn) { turn in
+            return try await withModelContext(admission, turn: turn) { turn in
                 var execution = try await executeStructuredChatStreaming(
                     message: message, sessionId: sessionId, model: admission.modelId,
                     reasoningEffort: admittedReasoningEffort, fileAccess: fileAccess,

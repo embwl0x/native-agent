@@ -61,23 +61,30 @@ Its on-device recognition, voice and audio lifetime are described in
 Ask/Remember wait on the original correlation's reply or terminal event, intent
 cancellation or owner shutdown. Silence leaves that request pending; invoking
 the shortcut again creates a separate message.
+Ask and Remember carry the validated agent's pairing identity through to
+message signing. A pairing change before signing stops the send.
 Chat and the intent share terminal classification. Explicit `reply`/`final`
 completes the intent; `error`, `cancelled` and signed rejection report failure.
 `incomplete` or a missing kind ends the wait with the received words and
 unconfirmed status, never success inferred from silence.
 
-Notification Reply retains the text in its conversation's durable chat queue
-before delivery. A failed send stays queued for recovery in Chat.
+On iPhone and iPad, Notification Reply verifies the retained envelope with the
+current pairing key and uses the conversation carried in its signed metadata.
+Older notifications can still open their conversation on a tap. Reply requires
+the signed envelope and a matching pairing fingerprint. A verified Reply opens
+Chat before attempting to queue text, so the conversation is available if the
+queue is full. A queued send stays bound to that pairing and a failed send stays
+queued for recovery in Chat.
 
 ## Mac notification actions
 
-Approve, Deny and Reply require foreground activation and authentication.
-Approve/Deny reread the canonical inbox, require a pending request with
+Approve, Decline and Reply require foreground activation and authentication.
+Approve/Decline reread the canonical inbox, require a pending request with
 reviewable details, and use `ApprovalDecisionAction`, as the in-app buttons do.
 A normal notification click navigates without deciding the request.
 Approval and Desk destinations show in place in Simple and enter Advanced view
 from Agent view, independently of any chat shortcut overlay. A chat destination
-preserves the person's current view mode.
+keeps Simple or Advanced; from Agent view, which has no chat pane, it opens Simple.
 
 The approval observer establishes a startup baseline for Mac banners. New
 pending requests retain their Mac and phone intents on the canonical card.
@@ -98,11 +105,15 @@ admission and busy-session queueing.
    the reply and the conversation it continued.
    With the Mac locked and no authenticated remote origin, invoke Ask from
    Shortcuts: it must request unlock before running. Cancel and confirm no message was submitted.
-   On an unlocked Mac, run an Ask shortcut requesting a setting raise: it must
-   raise a card without changing the setting. A question must return its normal reply.
-   Repeat the raise while a person-started turn is running: the intent must wait
-   for its own turn and raise its card, returning that turn's reply.
-2. For an existing benign pending approval, use its banner's Approve or Deny
+   On an unlocked Mac in Work mode, use Ask to request a raise to a
+   person-controlled setting. Check that a card appears and the setting stays
+   unchanged pending approval. In Full Mac the agent can make that raise directly
+   unless an untrusted voice steers the turn. Mind-owned settings are theirs to
+   change in either mode. See [setting authority](ONE_DOOR.md#authority-and-receipts).
+   Check that a question returns its normal reply. Repeat the Work mode raise
+   during a person-started turn and check that Ask waits for its own turn,
+   raises its card, and returns that turn's reply.
+2. For an existing benign pending approval, use its banner's Approve or Decline
    action and inspect the decision in Approvals. Do not change Trust solely to
    manufacture a banner.
 3. Ask for a benign Mac notification through `app` action `notify.mac`, switch

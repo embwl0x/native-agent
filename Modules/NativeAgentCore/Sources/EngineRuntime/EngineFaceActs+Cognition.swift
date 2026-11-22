@@ -20,9 +20,8 @@ extension EngineFaceActs {
             case .cleared: (status, message) = ("completed", "Thinking and body state cleared.")
             case .persistenceFailed(let cause):
                 throw Self.failure("cognition_clear_failed", "Nothing was cleared; the state was kept: " + cause)
-            case .bodyPersistenceFailed:
-                throw Self.failure("cognition_clear_partial",
-                    "Thinking state cleared. Body state cleared in memory, but could not be saved.", effects: .known)
+            case .partiallyCleared(let detail):
+                throw Self.failure("cognition_clear_partial", detail, effects: .known)
             }
         case .settleContinuity, .resetContinuity:
             let outcome: OrganismContinuityApplyOutcome

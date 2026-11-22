@@ -1,6 +1,5 @@
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -13,7 +12,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import AgentWorkspace
-// Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`,`chatStream`,`chatStreamExecution`,`ChatStreamExecution` |
+// Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`,`chatStreamExecution`,`ChatStreamExecution` |
 
 /// Join the producer before declaring settlement: terminal events can precede its cancellation/failure transcript write.
 public struct ChatStreamExecution: Sendable {
@@ -34,48 +33,6 @@ public struct ChatStreamExecution: Sendable {
 }
 
 extension SwiftNativeChatOrchestrationClient {
-    // MARK: chatStream
-
-    /// The producer captures the accepted turn and its exact transcript choices.
-    public nonisolated func chatStream(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String? = nil,
-        surface: String = "chat",
-        suppressUserAppend: Bool,
-        replacementAssistantMessageID: String? = nil,
-        /// The producer holds the helper's saved provider choice.
-        choice: ProviderTurnChoice? = nil,
-        /// Bind the immutable return route inside the producer for its full lifetime.
-        replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
-        /// Bind the service tier inside the producer for its full lifetime.
-        serviceTier: String? = nil,
-        /// Stream consumption alone does not prove card rendering, so the default stays text-only.
-        consumerRendersInlineCards: Bool = false,
-        turn: Turn
-    ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
-        chatStreamExecution(
-            message: message,
-            sessionId: sessionId,
-            model: model,
-            reasoningEffort: reasoningEffort,
-            fileAccess: fileAccess,
-            attachments: attachments,
-            persona: persona,
-            surface: surface,
-            suppressUserAppend: suppressUserAppend,
-            replacementAssistantMessageID: replacementAssistantMessageID,
-            choice: choice,
-            replyRoute: replyRoute,
-            serviceTier: serviceTier,
-            consumerRendersInlineCards: consumerRendersInlineCards, turn: turn
-        ).events
-    }
-
     /// Lifecycle owners join producer persistence before claiming terminal truth; stream-only consumers retain ordinary cancellation.
     public nonisolated func chatStreamExecution(
         message: String,

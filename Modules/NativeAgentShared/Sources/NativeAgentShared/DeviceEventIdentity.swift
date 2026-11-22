@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import UserNotifications
 
@@ -12,7 +11,7 @@ public func nativeAgentNotificationCategories(approvalCategory: String, messageC
     return [
         UNNotificationCategory(identifier: approvalCategory, actions: [
             UNNotificationAction(identifier: approve, title: "Approve", options: authenticated),
-            UNNotificationAction(identifier: deny, title: "Deny", options: authenticated.union(.destructive)),
+            UNNotificationAction(identifier: deny, title: "Decline", options: authenticated.union(.destructive)),
         ], intentIdentifiers: [], options: []),
         UNNotificationCategory(identifier: messageCategory, actions: [replyAction], intentIdentifiers: [], options: []),
     ]
@@ -27,16 +26,16 @@ public enum NativeAgentDeviceEventIdentity {
         userInfo: [String: String],
         fallback: @autoclosure () -> String = UUID().uuidString
     ) -> String {
-        if let explicit = clean(userInfo["eventId"]), isCanonical(explicit) {
+        if let explicit = userInfo["eventId"].trimmedNonEmpty, isCanonical(explicit) {
             return explicit.lowercased()
         }
         let keys = ["eventId", "dedupKey", "itemId", "approvalId", "taskId", "trigger"]
         for key in keys {
-            if let value = clean(userInfo[key]) {
-                return digest("notification:\(key):\(value)")
+            if let value = userInfo[key].trimmedNonEmpty {
+                return SHA256Hex.of(utf8: "notification:\(key):\(value)")
             }
         }
-        return digest("notification:fallback:\(fallback())")
+        return SHA256Hex.of(utf8: "notification:fallback:\(fallback())")
     }
 
     public static func isCanonical(_ value: String) -> Bool {
@@ -44,16 +43,5 @@ public enum NativeAgentDeviceEventIdentity {
             && value.utf8.allSatisfy { byte in
                 (48...57).contains(byte) || (65...70).contains(byte) || (97...102).contains(byte)
             }
-    }
-
-    private static func clean(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
-    }
-
-    private static func digest(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
     }
 }

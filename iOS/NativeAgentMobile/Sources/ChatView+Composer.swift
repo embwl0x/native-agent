@@ -71,8 +71,9 @@ extension ChatView {
                 .accessibilityLabel("Talk to \(agentDisplayName)")
                 .accessibilityHint("Start a hands-free conversation in this chat")
 
-                if !voiceInput.isListening && !voiceInput.isStarting
-                    && (!store.activeTurnRunIDs.isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true)) {
+                let replying = !voiceInput.isListening && !voiceInput.isStarting
+                    && (!store.stoppableRunIDs(client: bridgeClient).isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true))
+                if replying {
                     Button {
                         guard !isChatSample else { return }
                         store.stop(client: bridgeClient)
@@ -85,7 +86,9 @@ extension ChatView {
                             .frame(width: 44, height: 44)
                     }
                     .accessibilityLabel("Stop generation")
-                } else {
+                }
+                // While she replies, a draft still sends: it reaches her in the turn she is in.
+                if !replying || canSend {
 
                 Button {
                     if voiceInput.isListening || voiceInput.isStarting {
@@ -182,6 +185,7 @@ extension ChatView {
                     } label: {
                         Label("Remove", systemImage: "xmark")
                     }
+                    .disabled(!store.canRemoveQueuedSend(next))
                     if turns.count > 1 {
                         Section(AliveWords.count(turns.count, "message") + " waiting") {
                             ForEach(Array(turns.enumerated().dropFirst()), id: \.element.id) { index, queued in
@@ -206,6 +210,7 @@ extension ChatView {
                                 } label: {
                                     Label("Remove \(index + 1): \(queued.preview)", systemImage: "xmark")
                                 }
+                                .disabled(!store.canRemoveQueuedSend(queued))
                             }
                         }
                     }
@@ -323,7 +328,7 @@ extension ChatView {
                 .foregroundStyle(AlivePalette.secondary)
                 .frame(width: 44, height: 44)
         }
-        .disabled(store.isLoading || store.isSwitchingSession || fileLoadID != nil || pendingFiles.count + pendingPhotos.count >= maxPendingPhotos)
+        .disabled(store.isLoading || store.isSwitchingSession || loading || fileLoadID != nil || pendingFiles.count + pendingPhotos.count >= maxPendingPhotos)
         .accessibilityLabel("Add PDF or text files")
         }
     }
@@ -524,7 +529,8 @@ extension ChatView {
             guard generation == photoLoadGeneration, !Task.isCancelled,
                   sessionGeneration == store.sessionSwitchGeneration,
                   sessionKey == store.queueSessionKey(store.selectedSessionID) else { return }
-            pendingPhotos.append(contentsOf: loaded)
+            // Four attachments in all, whichever picker finished first.
+            pendingPhotos.append(contentsOf: loaded.prefix(max(0, maxPendingPhotos - pendingPhotos.count - pendingFiles.count)))
             isLoadingPhotos = false
             if let message = PhotosPickerLoadPresentation.message(
                 loadedCount: loaded.count,

@@ -80,8 +80,6 @@
 	<string>NativeAgent uses reminders access for assistant briefings and user-approved watch jobs.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>NativeAgent uses speech recognition to transcribe your voice.</string>
-	<key>NativeAgentBackgroundTaskIDPrefix</key>
-	<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX)</string>
 	<key>NativeAgentDeviceSync</key>
 	<string>$(NATIVEAGENT_DEVICE_SYNC)</string>
 	<key>NativeAgentICloudContainerID</key>

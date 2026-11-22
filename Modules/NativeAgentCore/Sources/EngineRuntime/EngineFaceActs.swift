@@ -145,82 +145,8 @@ public actor EngineFaceActs: FaceActHandler {
             guard epoch == sink else { throw FaceWireError.invalidFeedOrder }
             try await engine.face.applied(epoch: epoch, sequence: sequence, barriers: barriers)
             return .acknowledged
-        case .observe(let id, let demand):
-            guard !disconnecting else { throw FaceWireError.disconnected }
-            let connection = sink
-            guard observationKeys[id] == nil, platformObservations[id] == nil else {
-                throw Self.failure("observation_exists", "That observation is already open.")
-            }
-            if demand == .key(.page("connectors")) {
-                await AgentContactHealth.shared.refresh(dataRoot: engine.dataRoot)
-            }
-            if !EngineFaceProjection.owns(demand) {
-                guard let platform else { throw Self.failure("body_adapter_unavailable", "The body presentation adapter has not been installed.") }
-                let task = Task { try await platform.handle(act) }
-                platformObservations[id] = task
-                let reply = try await task.value
-                guard !disconnecting, platformObservations[id] == task else { throw FaceWireError.disconnected }
-                return reply
-            }
-            let key: FaceKey
-            switch demand {
-            case .key(let value): key = value
-            case .dreamDiary(let limit):
-                guard limit > 0 else { throw Self.failure("invalid_diary_limit", "The diary view requires a positive entry count.") }
-                _ = try await engine.cognitionView.dreamDiary(limit: limit)
-                key = .dreamDiary
-            case .deskPalette(let view, _): key = .deskPalette(view)
-            case .sessionSearch(let view, _): key = .sessionSearch(view)
-            case .agentScreen(let room, let scope): key = .agentScreen(room: room, scope: scope)
-            case .graphNeighborhood(let entity): key = .graphNeighborhood(entity: entity)
-            default: throw Self.failure("invalid_observation", "This body observation requires a feed key.")
-            }
-            let source: FaceDemand
-            switch demand {
-            case .deskPalette, .agentScreen, .sessionSearch: source = demand
-            default: source = .key(key)
-            }
-            while let observation = observations[key], observation.readers.isEmpty {
-                try Task.checkCancellation()
-                await observation.task.value
-                if observations[key]?.task == observation.task { observations.removeValue(forKey: key) }
-            }
-            try Task.checkCancellation()
-            guard !disconnecting, sink == connection else { throw FaceWireError.disconnected }
-            guard observationKeys[id] == nil, platformObservations[id] == nil else {
-                throw Self.failure("observation_exists", "That observation is already open.")
-            }
-            if var observation = observations[key] {
-                guard observation.demand == source else {
-                    throw Self.failure("observation_query_changed", "Close the previous search before changing its query.")
-                }
-                observation.readers.insert(id)
-                observations[key] = observation
-            } else {
-                let task = Task { [engine] in await EngineFaceProjection.observe(source, engine: engine) }
-                observations[key] = Observation(demand: source, task: task, readers: [id])
-            }
-            observationKeys[id] = key
-            return .observation(id: id)
-        case .unobserve(let id):
-            if let key = observationKeys.removeValue(forKey: id), var observation = observations[key] {
-                observation.readers.remove(id)
-                observations[key] = observation
-                if observation.readers.isEmpty {
-                    observation.task.cancel()
-                    await observation.task.value
-                    if observations[key]?.task == observation.task { observations.removeValue(forKey: key) }
-                }
-            }
-            if let task = platformObservations[id] {
-                guard let platform else { throw Self.failure("body_adapter_unavailable", "The body presentation adapter is unavailable.") }
-                task.cancel()
-                _ = await task.result
-                let reply = try await platform.handle(act)
-                if platformObservations[id] == task { platformObservations.removeValue(forKey: id) }
-                return reply
-            }
-            return .acknowledged
+        case .observe(let id, let demand): return try await openObservation(act, id: id, demand: demand)
+        case .unobserve(let id): return try await closeObservation(act, id: id)
         case .refresh(let scope):
             switch scope {
             case .page, .session:
@@ -235,23 +161,14 @@ public actor EngineFaceActs: FaceActHandler {
             return try await platform.handle(act)
         case .createConversation, .selectConversation, .markConversationRead, .renameConversation,
              .archiveConversation, .clearConversation, .pinConversation, .unpinConversation, .send, .stop,
-             .regenerate, .prepareRetryDraft, .appendSlashHelp:
+             .regenerate, .revise, .prepareRetryDraft, .appendSlashHelp:
             return try await chat.handle(act, renderer: sink)
         case .setSurfaceExpanded(let surface, let block, let open):
             let saved = try await engine.setSurfaceExpanded(open, surface: surface, block: block).get()
             await EngineFaceProjection.layout(engine)
             ModuleLog.app("[face-act] layout fold committed surface=\(surface) block=\(block) version=\(saved.layoutVersion)")
             return try Self.committed(saved)
-        case .savePageSecret(let request, let secret):
-            guard let expected = request.expectedCall, let text = try Self.secret(secret), !text.isEmpty else {
-                throw Self.failure("secret_required", "Enter a secret in this form's protected Mac entry.")
-            }
-            let outcome: FaceActOutcome
-            do {
-                outcome = try await engine.pages.saveKeyringForm(page: request.page, row: request.row, action: request.action,
-                    revision: request.expectedRevision, expecting: expected, secret: text)
-            } catch let error as PartCallError { throw Self.failure(error.code, error.message) }
-            return .result(try outcome.wireValue())
+        case .savePageSecret(let request, let secret): return try await savePageSecret(request, secret: secret)
         case .readCredential(let request):
             return .result(try await readCredential(request).wireValue())
         case .readProviderAccount(let id):
@@ -260,60 +177,7 @@ public actor EngineFaceActs: FaceActHandler {
                 throw Self.failure("provider_unavailable", "This account is absent from the checked provider list.")
             }
             return .provider(saved)
-        case .pageAct(let request):
-            if request.page == "providers", request.action == "read_chat_choice" {
-                guard request.value == nil, request.expectedRevision == nil, request.expectedCall == nil else {
-                    throw Self.failure("provider_read_invalid", "Reading the current Chat choice takes only its conversation identity.")
-                }
-                return try await readChatChoice(session: request.row)
-            }
-            if request.page == "trust", request.row == "policy", request.action == "read_revision" {
-                guard request.value == nil, request.expectedRevision == nil, request.expectedCall == nil else {
-                    throw Self.failure("trust_read_invalid", "Reading the Trust revision takes no edited values.")
-                }
-                return try await readTrustRevision()
-            }
-            let values: [String: PartFace.Value]?
-            if case .object(let fields)? = request.value { values = fields }
-            else { values = nil }
-            guard request.expectedRevision == nil || values != nil else {
-                throw Self.failure("page_revision_unavailable", "Page revision admission requires its body adapter. No page action ran.")
-            }
-            let value: String?
-            switch request.value {
-            case nil: value = nil
-            case .string(let text)?: value = text
-            case .bool(let enabled)?: value = enabled ? "true" : "false"
-            case .int(let number)?: value = String(number)
-            case .double(let number)?: value = String(number)
-            case .object?: value = nil
-            case .null?, .array?:
-                throw Self.failure("invalid_control_value", "This page control takes a scalar value.")
-            }
-            if request.answers == true {
-                guard let expected = request.expectedCall else { throw Self.failure("drawn_call_missing", "Read the page before acting.") }
-                let renderer = sink
-                let outcome: FaceActOutcome
-                do {
-                    if request.checking == true {
-                        outcome = await engine.pages.reconcile(page: request.page, row: request.row, value: value, values: values, expecting: expected)
-                    } else {
-                        outcome = try await engine.pages.actOutcome(page: request.page, row: request.row, action: request.action, value: value,
-                            values: values, formRevision: request.expectedRevision,
-                            door: "mac", expecting: expected, renderer: renderer, operation: request.operation, undoOf: request.undoOf)
-                    }
-                } catch let error as PartCallError {
-                    outcome = .interrupted(Self.failure(error.code, error.message))
-                }
-                if let renderer, renderer != sink { await engine.pages.releaseRenderer(renderer) }
-                var clean = outcome
-                clean.failure = outcome.failure.map { Self.redacted($0, act: act) }
-                return .result(try clean.wireValue())
-            }
-            let words = try await engine.pages.act(page: request.page, row: request.row, action: request.action, value: value,
-                values: values, formRevision: request.expectedRevision,
-                door: "mac", expecting: request.expectedCall, renderer: sink)
-            return .result(words.map(PartFace.Value.string) ?? .null)
+        case .pageAct(let request): return try await actOnPage(act, request: request)
         case .requestDocument(let request):
             return try await EngineFaceProjection.document(request, engine: engine)
         case .remember(let text):
@@ -338,30 +202,9 @@ public actor EngineFaceActs: FaceActHandler {
             case .reject: try await engine.memory.reject(proposalID: id, reason: "")
             }
             return .acknowledged
-        case .searchMemories(let query):
-            let reading = await engine.memory.search(query: query)
-            if let issue = reading.issue { throw Self.failure("memory_search_unavailable", issue) }
-            return .result(.object(["query": .string(reading.query), "records": try reading.records.map {
-                PartFace.Value(try JSONValue.fromEncodable($0))
-            } ?? .null]))
-        case .readPersona(let documents):
-            var reading = PersonaSettingsFace()
-            if documents {
-                reading.documents = try await engine.persona.loadDocuments()
-            } else {
-                let profile = try await engine.persona.loadProfile()
-                reading.profile = profile
-                reading.displayName = profile.name
-            }
-            return .persona(reading)
-        case .savePersonaProfile(let profile):
-            let saved = try await engine.persona.saveProfile(profile)
-            await engine.memory.teachAssistantName(saved.profile)
-            return .committed(.init(identities: [], value: PartFace.Value(try JSONValue.fromEncodable(saved.profile)), revision: nil, effects: .known,
-                publicationFailure: saved.documentsIssue.map {
-                    WireFailure(code: "persona_documents_unavailable", message: "The profile was saved, but its documents could not be refreshed.",
-                        cause: $0, effects: .known)
-                }))
+        case .searchMemories(let query): return try await searchMemories(query)
+        case .readPersona(let documents): return try await readPersona(documents: documents)
+        case .savePersonaProfile(let profile): return try await savePersonaProfile(profile)
         case .savePersonaName(let name):
             let saved = try await engine.persona.saveName(name)
             await engine.memory.teachAssistantName(saved)
@@ -381,24 +224,8 @@ public actor EngineFaceActs: FaceActHandler {
             guard let runtime = engine.cognition else { throw Self.failure("body_unavailable", "There is no running mind: it starts when setup finishes.") }
             let result = await engine.cognitionView.setInnerLifeEnabled(enabled, runtime: runtime, contextFlow: engine.contextFlow)
             return .result(.object(["enabled": .bool(result.state.enabled), "contextFlowReady": .bool(result.contextFlowReady)]))
-        case .setContextFlowMode(let name):
-            guard let mode = ContextFlowMode(rawValue: name) else { throw Self.failure("invalid_mode", "Choose an offered context mode.") }
-            let status = await engine.contextFlow.setMode(mode)
-            guard let saved = status.effectiveMode, status.unavailableReason == nil else {
-                throw Self.failure("context_unavailable", status.unavailableReason ?? "The context owner returned no effective mode.")
-            }
-            await engine.cognitionView.refreshContextFlowHealth { @Sendable [engine] in
-                await engine.contextFlow.observatoryHealthState()
-            }
-            return .result(.string(saved.rawValue))
-        case .setEmbeddingsEnabled(let enabled):
-            try await engine.memory.toggleEmbeddings(enabled)
-            guard let saved = await engine.memory.readEmbeddingSnapshot() else {
-                throw Self.failure("embedding_readback_unavailable", "The embedding choice was saved, but its runtime could not be read.", effects: .known)
-            }
-            return .result(.object(["requestedBackend": .string(saved.requestedBackend), "effectiveBackend": .string(saved.effectiveBackend),
-                "model": .string(saved.modelId), "dimensions": .int(Int64(saved.dimensions)),
-                "loadError": saved.lastLoadError.map(PartFace.Value.string) ?? .null]))
+        case .setContextFlowMode(let name): return try await setContextFlowMode(name)
+        case .setEmbeddingsEnabled(let enabled): return try await setEmbeddingsEnabled(enabled)
         case .testProvider(let request):
             return try await testProvider(request)
         case .disconnectProvider(let id):
@@ -465,21 +292,7 @@ public actor EngineFaceActs: FaceActHandler {
             let result = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective, dataRoot: engine.dataRoot)
             return .committed(.init(identities: [result.deskItem.handle, result.job], value: .string(result.deskItem.handle),
                 revision: nil, effects: .known, publicationFailure: nil))
-        case .runMacControl(let request) where request.checking == true:
-            guard let id = request.arguments["operationId"]?.stringValue,
-                  let record = try await MacControlOperationStore(dataRoot: engine.dataRoot).record(operationId: id),
-                  record.action == request.action else {
-                throw WireFailure(code: "workbench_operation_unavailable", message: "The original Mac control operation could not be read.",
-                    cause: nil, effects: .unknown)
-            }
-            var receipt: [String: PartFace.Value] = [
-                "ok": .bool(record.state == .completed), "status": .string(record.state == .completed ? "completed" : "failed"),
-                "operationId": .string(id), "operationState": .string(record.state.rawValue),
-                "verification": .string(record.verification.rawValue),
-                "error": record.outcomeCode.map(PartFace.Value.string) ?? .null,
-            ]
-            if record.terminalAt == nil { receipt["effects"] = .string("unknown") }
-            return .committed(.init(identities: [id], value: .object(receipt), revision: nil, effects: .none, publicationFailure: nil))
+        case .runMacControl(let request) where request.checking == true: return try await readMacControlOperation(request)
         case .handBackMacControl(let generation):
             guard await MacAttentionSessionStore.shared.giveAgentControl(userGeneration: generation) else {
                 throw Self.failure("mac_handoff_unconfirmed", "Mac control changed or its input observer is unavailable. Control was not handed back.")
@@ -500,6 +313,231 @@ public actor EngineFaceActs: FaceActHandler {
             guard let platform else { throw Self.failure("body_adapter_unavailable", "The body act adapter has not been installed.") }
             return try await platform.handle(act)
         }
+    }
+
+    // MARK: - Observations
+
+    /// Opens a feed observation: the platform's own, or one shared engine projection per key with this id as a reader.
+    private func openObservation(_ act: FaceAct, id: UUID, demand: FaceDemand) async throws -> FaceActReply {
+        guard !disconnecting else { throw FaceWireError.disconnected }
+        let connection = sink
+        guard observationKeys[id] == nil, platformObservations[id] == nil else {
+            throw Self.failure("observation_exists", "That observation is already open.")
+        }
+        if demand == .key(.page("connectors")) {
+            await AgentContactHealth.shared.refresh(dataRoot: engine.dataRoot)
+        }
+        if !EngineFaceProjection.owns(demand) {
+            guard let platform else { throw Self.failure("body_adapter_unavailable", "The body presentation adapter has not been installed.") }
+            let task = Task { try await platform.handle(act) }
+            platformObservations[id] = task
+            let reply = try await task.value
+            guard !disconnecting, platformObservations[id] == task else { throw FaceWireError.disconnected }
+            return reply
+        }
+        let key: FaceKey
+        switch demand {
+        case .key(let value): key = value
+        case .dreamDiary(let limit):
+            guard limit > 0 else { throw Self.failure("invalid_diary_limit", "The diary view requires a positive entry count.") }
+            _ = try await engine.cognitionView.dreamDiary(limit: limit)
+            key = .dreamDiary
+        case .deskPalette(let view, _): key = .deskPalette(view)
+        case .sessionSearch(let view, _): key = .sessionSearch(view)
+        case .agentScreen(let room, let scope): key = .agentScreen(room: room, scope: scope)
+        case .graphNeighborhood(let entity): key = .graphNeighborhood(entity: entity)
+        default: throw Self.failure("invalid_observation", "This body observation requires a feed key.")
+        }
+        let source: FaceDemand
+        switch demand {
+        case .deskPalette, .agentScreen, .sessionSearch: source = demand
+        default: source = .key(key)
+        }
+        while let observation = observations[key], observation.readers.isEmpty {
+            try Task.checkCancellation()
+            await observation.task.value
+            if observations[key]?.task == observation.task { observations.removeValue(forKey: key) }
+        }
+        try Task.checkCancellation()
+        guard !disconnecting, sink == connection else { throw FaceWireError.disconnected }
+        guard observationKeys[id] == nil, platformObservations[id] == nil else {
+            throw Self.failure("observation_exists", "That observation is already open.")
+        }
+        if var observation = observations[key] {
+            guard observation.demand == source else {
+                throw Self.failure("observation_query_changed", "Close the previous search before changing its query.")
+            }
+            observation.readers.insert(id)
+            observations[key] = observation
+        } else {
+            let task = Task { [engine] in await EngineFaceProjection.observe(source, engine: engine) }
+            observations[key] = Observation(demand: source, task: task, readers: [id])
+        }
+        observationKeys[id] = key
+        return .observation(id: id)
+    }
+
+    /// Releases a reader; the last reader ends the shared projection, and a platform observation is closed by its owner.
+    private func closeObservation(_ act: FaceAct, id: UUID) async throws -> FaceActReply {
+        if let key = observationKeys.removeValue(forKey: id), var observation = observations[key] {
+            observation.readers.remove(id)
+            observations[key] = observation
+            if observation.readers.isEmpty {
+                observation.task.cancel()
+                await observation.task.value
+                if observations[key]?.task == observation.task { observations.removeValue(forKey: key) }
+            }
+        }
+        if let task = platformObservations[id] {
+            guard let platform else { throw Self.failure("body_adapter_unavailable", "The body presentation adapter is unavailable.") }
+            task.cancel()
+            _ = await task.result
+            let reply = try await platform.handle(act)
+            if platformObservations[id] == task { platformObservations.removeValue(forKey: id) }
+            return reply
+        }
+        return .acknowledged
+    }
+
+    // MARK: - Domain acts
+
+    private func savePageSecret(_ request: PageActRequest, secret: Data) async throws -> FaceActReply {
+        guard let expected = request.expectedCall, let text = try Self.secret(secret), !text.isEmpty else {
+            throw Self.failure("secret_required", "Enter a secret in this form's protected Mac entry.")
+        }
+        let outcome: FaceActOutcome
+        do {
+            outcome = try await engine.pages.saveKeyringForm(page: request.page, row: request.row, action: request.action,
+                revision: request.expectedRevision, expecting: expected, secret: text)
+        } catch let error as PartCallError { throw Self.failure(error.code, error.message) }
+        return .result(try outcome.wireValue())
+    }
+
+    /// Page reads that answer here, then a drawn call's checked outcome or a plain page act.
+    private func actOnPage(_ act: FaceAct, request: PageActRequest) async throws -> FaceActReply {
+        if request.page == "providers", request.action == "read_chat_choice" {
+            guard request.value == nil, request.expectedRevision == nil, request.expectedCall == nil else {
+                throw Self.failure("provider_read_invalid", "Reading the current Chat choice takes only its conversation identity.")
+            }
+            return try await readChatChoice(session: request.row)
+        }
+        if request.page == "trust", request.row == "policy", request.action == "read_revision" {
+            guard request.value == nil, request.expectedRevision == nil, request.expectedCall == nil else {
+                throw Self.failure("trust_read_invalid", "Reading the Trust revision takes no edited values.")
+            }
+            return try await readTrustRevision()
+        }
+        let values: [String: PartFace.Value]?
+        if case .object(let fields)? = request.value { values = fields }
+        else { values = nil }
+        guard request.expectedRevision == nil || values != nil else {
+            throw Self.failure("page_revision_unavailable", "Page revision admission requires its body adapter. No page action ran.")
+        }
+        let value: String?
+        switch request.value {
+        case nil: value = nil
+        case .string(let text)?: value = text
+        case .bool(let enabled)?: value = enabled ? "true" : "false"
+        case .int(let number)?: value = String(number)
+        case .double(let number)?: value = String(number)
+        case .object?: value = nil
+        case .null?, .array?:
+            throw Self.failure("invalid_control_value", "This page control takes a scalar value.")
+        }
+        if request.answers == true {
+            guard let expected = request.expectedCall else { throw Self.failure("drawn_call_missing", "Read the page before acting.") }
+            let renderer = sink
+            let outcome: FaceActOutcome
+            do {
+                if request.checking == true {
+                    outcome = await engine.pages.reconcile(page: request.page, row: request.row, value: value, values: values, expecting: expected)
+                } else {
+                    outcome = try await engine.pages.actOutcome(page: request.page, row: request.row, action: request.action, value: value,
+                        values: values, formRevision: request.expectedRevision,
+                        door: "mac", expecting: expected, renderer: renderer, operation: request.operation, undoOf: request.undoOf)
+                }
+            } catch let error as PartCallError {
+                outcome = .interrupted(Self.failure(error.code, error.message))
+            }
+            if let renderer, renderer != sink { await engine.pages.releaseRenderer(renderer) }
+            var clean = outcome
+            clean.failure = outcome.failure.map { Self.redacted($0, act: act) }
+            return .result(try clean.wireValue())
+        }
+        let words = try await engine.pages.act(page: request.page, row: request.row, action: request.action, value: value,
+            values: values, formRevision: request.expectedRevision,
+            door: "mac", expecting: request.expectedCall, renderer: sink)
+        return .result(words.map(PartFace.Value.string) ?? .null)
+    }
+
+    private func searchMemories(_ query: String) async throws -> FaceActReply {
+        let reading = await engine.memory.search(query: query)
+        if let issue = reading.issue { throw Self.failure("memory_search_unavailable", issue) }
+        return .result(.object(["query": .string(reading.query), "records": try reading.records.map {
+            PartFace.Value(try JSONValue.fromEncodable($0))
+        } ?? .null]))
+    }
+
+    private func readPersona(documents: Bool) async throws -> FaceActReply {
+        var reading = PersonaSettingsFace()
+        if documents {
+            reading.documents = try await engine.persona.loadDocuments()
+        } else {
+            let profile = try await engine.persona.loadProfile()
+            reading.profile = profile
+            reading.displayName = profile.name
+        }
+        return .persona(reading)
+    }
+
+    private func savePersonaProfile(_ profile: PersonalityProfile) async throws -> FaceActReply {
+        let saved = try await engine.persona.saveProfile(profile)
+        await engine.memory.teachAssistantName(saved.profile)
+        return .committed(.init(identities: [], value: PartFace.Value(try JSONValue.fromEncodable(saved.profile)), revision: nil, effects: .known,
+            publicationFailure: saved.documentsIssue.map {
+                WireFailure(code: "persona_documents_unavailable", message: "The profile was saved, but its documents could not be refreshed.",
+                    cause: $0, effects: .known)
+            }))
+    }
+
+    private func setContextFlowMode(_ name: String) async throws -> FaceActReply {
+        guard let mode = ContextFlowMode(rawValue: name) else { throw Self.failure("invalid_mode", "Choose an offered context mode.") }
+        let status = await engine.contextFlow.setMode(mode)
+        guard let saved = status.effectiveMode, status.unavailableReason == nil else {
+            throw Self.failure("context_unavailable", status.unavailableReason ?? "The context owner returned no effective mode.")
+        }
+        await engine.cognitionView.refreshContextFlowHealth { @Sendable [engine] in
+            await engine.contextFlow.observatoryHealthState()
+        }
+        return .result(.string(saved.rawValue))
+    }
+
+    private func setEmbeddingsEnabled(_ enabled: Bool) async throws -> FaceActReply {
+        try await engine.memory.toggleEmbeddings(enabled)
+        guard let saved = await engine.memory.readEmbeddingSnapshot() else {
+            throw Self.failure("embedding_readback_unavailable", "The embedding choice was saved, but its runtime could not be read.", effects: .known)
+        }
+        return .result(.object(["requestedBackend": .string(saved.requestedBackend), "effectiveBackend": .string(saved.effectiveBackend),
+            "model": .string(saved.modelId), "dimensions": .int(Int64(saved.dimensions)),
+            "loadError": saved.lastLoadError.map(PartFace.Value.string) ?? .null]))
+    }
+
+    /// A checking Mac control act reads its original operation's record; nothing runs again.
+    private func readMacControlOperation(_ request: MacControlRequest) async throws -> FaceActReply {
+        guard let id = request.arguments["operationId"]?.stringValue,
+              let record = try await MacControlOperationStore(dataRoot: engine.dataRoot).record(operationId: id),
+              record.action == request.action else {
+            throw WireFailure(code: "workbench_operation_unavailable", message: "The original Mac control operation could not be read.",
+                cause: nil, effects: .unknown)
+        }
+        var receipt: [String: PartFace.Value] = [
+            "ok": .bool(record.state == .completed), "status": .string(record.state == .completed ? "completed" : "failed"),
+            "operationId": .string(id), "operationState": .string(record.state.rawValue),
+            "verification": .string(record.verification.rawValue),
+            "error": record.outcomeCode.map(PartFace.Value.string) ?? .null,
+        ]
+        if record.terminalAt == nil { receipt["effects"] = .string("unknown") }
+        return .committed(.init(identities: [id], value: .object(receipt), revision: nil, effects: .none, publicationFailure: nil))
     }
 
     func refresh(_ scope: FaceRefreshScope) async throws {

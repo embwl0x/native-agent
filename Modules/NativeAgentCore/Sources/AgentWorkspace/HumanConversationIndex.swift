@@ -21,11 +21,10 @@ package enum HumanConversationIndex {
     }
 
     /// Bound conversation lists to 8 rows per page, at most 16; opening reads the selected canonical owner.
-    package static func list(workspace: WorkspaceOperation, _ input: [String: JSONValue], dataRoot: URL) throws -> JSONValue {
-        func number(_ key: String) -> Int? { if case .int(let value)? = input[key] { Int(value) } else { nil } }
-        let limit = min(16, max(1, number("limit") ?? 8))
+    package static func list(_ input: [String: JSONValue], dataRoot: URL) throws -> JSONValue {
+        let limit = min(16, max(1, input["limit"]?.strictInt ?? 8))
         let rows = try rows(dataRoot: dataRoot)
-        let offset = min(rows.count, max(0, number("offset") ?? 0))
+        let offset = min(rows.count, max(0, input["offset"]?.strictInt ?? 0))
         let selected = rows.dropFirst(offset).prefix(limit)
         let conversations = selected.map { row -> JSONValue in
             .object(["conversation_session_id": row["id"] ?? .null, "title": row["title"] ?? .string("Conversation"),
@@ -33,7 +32,7 @@ package enum HumanConversationIndex {
                 "updated_at": row["updatedAt"] ?? .null,
                 "revision": ChatSessionIndexFile.transcriptGeneration(in: row).map { .string(String($0)) } ?? .null,
                 "source_revision": ChatSessionIndexFile.transcriptGeneration(in: row).map { .string(String($0)) } ?? .null,
-                "preview": .string(String((shownPreview(workspace: workspace, row) ?? "").prefix(400)))])
+                "preview": .string(String((shownPreview(row) ?? "").prefix(400)))])
         }
         let next = offset + selected.count
         return .object(["status": .string("ok"), "conversations": .array(conversations),
@@ -47,12 +46,9 @@ package enum HumanConversationIndex {
         TranscriptRowStamp(json: row[TranscriptRowStamp.previewKey])
     }
 
-    /// A preview as it is shown now: read under its stored stamp through the one per-line path first; a preview with no stamp is not shown at all.
-    package static func shownPreview(workspace: WorkspaceOperation, _ row: [String: JSONValue]) -> String? {
-        guard let text = row["lastMessagePreview"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), let stamp = previewStamp(row) else { return nil }
-        ContactThread.consume(.init(text: text, stamp: stamp), mark: { peer, _ in
-            workspace.ports.tools.markConsumed(peer: peer)
-        })
+    /// Only show previews with a valid saved stamp.
+    package static func shownPreview(_ row: [String: JSONValue]) -> String? {
+        guard let text = row["lastMessagePreview"]?.stringValue, !text.isEmpty, previewStamp(row) != nil else { return nil }
         return text
     }
 

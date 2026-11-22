@@ -5,10 +5,7 @@ import NativeAgentCore
 import MacControl
 import PersistenceCore
 import TrustCenter
-#if canImport(Darwin)
 import Darwin
-import Darwin
-#endif
 // Blueprint: | `FileReading.swift` | Descriptor-bound UTF-8 windows and exact bytes; only ENOENT proves absence; metadata-only watches |
 extension FileSystemActions {
     /// Only ENOENT proves absence; permission and I/O errors cannot become missing-file verdicts.
@@ -28,7 +25,6 @@ extension FileSystemActions {
         var errorDescription: String? { message }
     }
     static func openRegularReadHandle(_ path: URL) throws -> FileHandle {
-        #if canImport(Darwin)
         // Walk O_DIRECTORY|O_NOFOLLOW parents and an O_NOFOLLOW final component; read only the resulting descriptor. A pathname swap after authorization must
         // never redirect the bytes.
         let descriptor: Int32
@@ -47,9 +43,6 @@ extension FileSystemActions {
                 message: "File reads support regular files only; pipes, devices and sockets cannot provide file windows.", code: "unsupported_file_type")
         }
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        #else
-        throw FileReadFailure(message: "Bounded regular-file reads are unavailable on this platform.", code: "unsupported_file_type")
-        #endif
     }
     static func readFileWindow(
         handle: FileHandle,
@@ -324,7 +317,7 @@ extension FileSystemActions {
         return .object(result)
     }
     /// Explicit byte requests bypass interpretation so the result preserves exact source bytes.
-    static func rawBytes(_ input: [String: JSONValue], _ path: String) -> Bool {
+    static func rawBytes(_ input: [String: JSONValue]) -> Bool {
         input["raw"] == .bool(true)
     }
     /// Folder matches use ordinary single-file gates, including image delivery, rather than a separate read path.
@@ -355,7 +348,7 @@ extension FileSystemActions {
         for name in names.prefix(folderReadLimit) {
             let path = folder.appendingPathComponent(name)
             // Only a pixel read spends the budget; raw and metadata-only reads never wait.
-            if VerifiedImageRead.isImagePath(path), !rawBytes(single, path.path), !ctx.readOptions.metadataOnly,
+            if VerifiedImageRead.isImagePath(path), !rawBytes(single), !ctx.readOptions.metadataOnly,
                ctx.readOptions.imageSink?.round.hasRoom == false {
                 later.append(.string(path.path)); continue
             }

@@ -1,16 +1,9 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `AppModel+TrustActions.swift` | Trust, approval, backup and Mac control requests through the body dispatcher |
+// Blueprint: | `AppModel+TrustActions.swift` | Trust, backup and Mac control requests through the body dispatcher |
 
 @MainActor
 extension AppModel {
-    func resolveApproval(id: String, decision: String) async throws -> CommittedResult {
-        guard let decision = FaceApprovalDecision(rawValue: decision) else {
-            throw PartCallError(code: "invalid_decision", message: "Choose approve, deny or cancel for this approval.")
-        }
-        return try await committedFaceAct(.resolveApproval(id: id, decision: decision))
-    }
-
     func createBackup(reason: String) async throws -> CommittedResult {
         try await committedFaceAct(.createBackup(reason: reason))
     }

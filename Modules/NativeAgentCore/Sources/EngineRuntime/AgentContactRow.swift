@@ -211,9 +211,16 @@ public struct AgentContactRow: Identifiable, Sendable {
     public enum Action { case connect, disconnect, test }
     public func prompt(_ action: Action) -> String {
         switch action {
-        case .connect: return "Connect to \(name)."
-        case .disconnect: return "Disconnect the \(name) agent contact."
-        case .test: return "Send \(name) a short test message and tell me what it answers."
+        case .connect:
+            if let contact { return "Reconnect the existing \(name) contact using agent.connect with name peer:\(contact.id). Keep its conversations. Do not resend an earlier message." }
+            return "Connect to \(name)."
+        // The contact the person picked, by its id: two contacts may share a display name.
+        case .disconnect:
+            if let contact { return "Disconnect the \(name) agent contact (peer:\(contact.id))." }
+            return "Disconnect the \(name) agent contact."
+        case .test:
+            if let contact { return "Send \(name) (peer:\(contact.id)) a short test message and tell me what it answers." }
+            return "Send \(name) a short test message and tell me what it answers."
         }
     }
 }

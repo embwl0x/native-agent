@@ -7,6 +7,26 @@ import PersistenceCore
 /// the model, the transcript and the trace (the edges); every decision reads
 /// these fields, parsed here once, never the payload's keys.
 public struct ToolResult: Sendable {
+    package static let formEnvelope: Set<String> = ["action", "result", "status", "execution", "argument_form", "understood", "effect", "read_only", "irreversible"]
+
+    /// What came back from a call: object results unwrapped, model guidance, remedies, provenance and her own echoed arguments kept out.
+    /// A script receives this; a batch's expect and found read it.
+    package static func stepAnswer(_ receipt: JSONValue) -> JSONValue {
+        guard case .object(var fields) = receipt else { return receipt }
+        if fields["action"] != nil, fields["argument_form"] != nil, fields.keys.allSatisfy(formEnvelope.contains),
+           let result = fields["result"], result.objectValue == nil {
+            return result
+        }
+        fields.removeValue(forKey: "argument_form")
+        fields.removeValue(forKey: "understood")
+        if fields["action"] != nil, case .object(let result)? = fields["result"] {
+            fields.removeValue(forKey: "result")
+            fields.merge(result) { _, own in own }
+        }
+        for key in ["guide", "remedy", "next_call", "sense_provenance"] { fields.removeValue(forKey: key) }
+        return .object(fields)
+    }
+
     /// The action's own reply, for the edges.
     public let payload: JSONValue
     /// The shared exact classification from the owner's outcome and failure evidence; effects alone do not establish failure.

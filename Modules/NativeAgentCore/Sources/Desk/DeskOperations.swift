@@ -21,7 +21,7 @@ public enum DeskOpBody: Sendable, Equatable {
     )
     case updateTitle(title: String?, summary: String?, refs: [DeskRef]? = nil)
     case addRef(ref: DeskRef)
-    case appendNote(text: String, author: String? = "system", releaseCondition: String? = nil)
+    case appendNote(text: String, author: String? = "system", releaseCondition: String? = nil, carriedOccurrence: String? = nil)
     /// Record veto and cancellation atomically so the rationale survives replay.
     case vetoPursuit(note: String)
     case setCadence(cadence: Cadence)
@@ -121,10 +121,11 @@ public struct DeskOp: Sendable, Equatable {
             if let refs { obj["refs"] = .array(refs.map { $0.toJSON() }) }
         case let .addRef(ref):
             obj["ref"] = ref.toJSON()
-        case let .appendNote(text, author, releaseCondition):
+        case let .appendNote(text, author, releaseCondition, carriedOccurrence):
             obj["text"] = .string(text)
             put("author", author)
             if let releaseCondition { obj["releaseCondition"] = .string(releaseCondition) }
+            if let carriedOccurrence { obj["carriedOccurrence"] = .string(carriedOccurrence) }
         case let .vetoPursuit(note):
             obj["note"] = .string(note)
         case let .setCadence(cadence):
@@ -236,8 +237,9 @@ public struct DeskOp: Sendable, Equatable {
             guard let refVal = obj["ref"], let ref = DeskRef.fromJSON(refVal) else { return nil }
             body = .addRef(ref: ref)
         case "append_note":
-            guard let text = obj["text"]?.stringValue, DeskNote.fromJSON(value) != nil else { return nil }
-            body = .appendNote(text: text, author: obj["author"]?.stringValue, releaseCondition: obj["releaseCondition"]?.stringValue)
+            guard let note = DeskNote.fromJSON(value) else { return nil }
+            body = .appendNote(text: note.text, author: note.author, releaseCondition: note.releaseCondition,
+                               carriedOccurrence: note.carriedOccurrence)
         case "veto_pursuit":
             guard let note = obj["note"]?.stringValue, !note.isEmpty else { return nil }
             body = .vetoPursuit(note: note)

@@ -18,6 +18,7 @@ public struct ArchiveRecord: Sendable, Equatable {
     public var refs: [DeskRef]
     public var decisions: [String]
     public var artifacts: [String]
+    public var carriedNotes: [DeskNote]
     public var supersededBy: String?
     public var findingKey: String?
 
@@ -25,7 +26,7 @@ public struct ArchiveRecord: Sendable, Equatable {
         handle: String, title: String, project: String,
         finalStatus: ArchiveFinalStatus, openedAt: String, closedAt: String,
         summary: String, refs: [DeskRef] = [], decisions: [String] = [],
-        artifacts: [String] = [], supersededBy: String? = nil, findingKey: String? = nil
+        artifacts: [String] = [], supersededBy: String? = nil, findingKey: String? = nil, carriedNotes: [DeskNote] = []
     ) {
         self.handle = handle
         self.title = title
@@ -37,6 +38,7 @@ public struct ArchiveRecord: Sendable, Equatable {
         self.refs = refs
         self.decisions = decisions
         self.artifacts = artifacts
+        self.carriedNotes = carriedNotes
         self.supersededBy = supersededBy
         self.findingKey = findingKey
     }
@@ -54,6 +56,7 @@ public struct ArchiveRecord: Sendable, Equatable {
         if !refs.isEmpty { obj["refs"] = .array(refs.map { $0.toJSON() }) }
         if !decisions.isEmpty { obj["decisions"] = .array(decisions.map { .string($0) }) }
         if !artifacts.isEmpty { obj["artifacts"] = .array(artifacts.map { .string($0) }) }
+        if !carriedNotes.isEmpty { obj["carriedNotes"] = .array(carriedNotes.map { $0.toJSON() }) }
         if let supersededBy, !supersededBy.isEmpty { obj["supersededBy"] = .string(supersededBy) }
         if let findingKey { obj["findingKey"] = .string(findingKey) }
         return .object(obj)
@@ -72,13 +75,14 @@ public struct ArchiveRecord: Sendable, Equatable {
         guard let refs = deskStoredCollection(obj["refs"], decode: DeskRef.fromJSON),
               let decisions = DeskJSON.strings(obj["decisions"]),
               let artifacts = DeskJSON.strings(obj["artifacts"]),
+              let carriedNotes = deskStoredCollection(obj["carriedNotes"], decode: DeskNote.fromJSON),
               DeskJSON.optionalStringsAreValid(obj, keys: ["supersededBy", "findingKey"]) else { return nil }
         return ArchiveRecord(
             handle: handle, title: title, project: project, finalStatus: finalStatus,
             openedAt: openedAt, closedAt: closedAt, summary: summary, refs: refs,
             decisions: decisions,
             artifacts: artifacts,
-            supersededBy: obj["supersededBy"]?.stringValue, findingKey: obj["findingKey"]?.stringValue
+            supersededBy: obj["supersededBy"]?.stringValue, findingKey: obj["findingKey"]?.stringValue, carriedNotes: carriedNotes
         )
     }
 }
@@ -221,14 +225,11 @@ public struct DeskState: Sendable, Equatable {
 }
 
 extension DeskState {
-    /// The one reading of a Desk item's name, for every Desk call and the window alike: its stable handle, its visible number (`4`, `2.1`), `desk.4`,
-    /// `#4`, the number with its title after it, or its exact title.
+    /// Strip the optional prefix of a Desk address while preserving any title.
     public static func reference(_ raw: String) -> String {
         var r = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if r.lowercased().hasPrefix("desk.") { r = String(r.dropFirst(5)) }
         if r.hasPrefix("#") { r = String(r.dropFirst()) }
-        if let first = r.split(separator: " ").first, first.count < r.count,
-           first.allSatisfy({ $0.isNumber || $0 == "." }) { r = String(first) }
         return r
     }
 
@@ -236,9 +237,16 @@ extension DeskState {
     public func matching(_ raw: String, field: String = "handle") throws -> [DeskItem] {
         let reference = Self.reference(raw)
         let exact = items.filter { $0.alias == reference || $0.handle == reference }
-        let matches = exact.isEmpty ? items.filter {
-            $0.title.caseInsensitiveCompare(raw.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
-        } : exact
+        let title = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var matches = exact.isEmpty ? items.filter { $0.title.caseInsensitiveCompare(title) == .orderedSame } : exact
+        if matches.isEmpty {
+            let label = reference.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+            if label.count == 2 {
+                let number = String(label[0])
+                let labelTitle = label[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                matches = items.filter { $0.alias == number && $0.title.caseInsensitiveCompare(labelTitle) == .orderedSame }
+            }
+        }
         guard matches.count <= 1 else {
             throw ToolFailureError("Several items share that title; use query in desk.read to find their handles.", argumentPath: "$." + field,
                 effects: .none, code: "invalid_input")

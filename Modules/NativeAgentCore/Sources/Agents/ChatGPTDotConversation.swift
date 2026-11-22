@@ -164,7 +164,7 @@ actor ChatGPTDotConversation {
         for message in messages {
             guard case .object(let fields) = message, case .string? = fields["id"],
                   case .string? = fields["text"], case .string(let at)? = fields["at"],
-                  roomDate(at) != nil else {
+                  NativeTimestampFormat.parseISO8601FractionalFirst(at) != nil else {
                 throw AgentConversationStore.Failure(message: "Dot returned an unreadable room message.")
             }
             // Kept until appended; a newer copy of a kept one rides beside it (ingestion offers each id once).
@@ -221,7 +221,6 @@ actor ChatGPTDotConversation {
             row["text_offset"] = .int(Int64(textOffset))
             row["text_has_more"] = .bool(textOffset + part.count < text.count)
             selected.append(.object(row))
-            ContactThread.consume(saved[index], mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
             remaining -= part.count
             textOffset += part.count
             if textOffset < text.count { break }
@@ -291,7 +290,7 @@ actor ChatGPTDotConversation {
         let pending = try admissions(peer: peer.id)
         let recovered = try pending.values.filter { !$0.started && $0.failed == nil }.map { admission -> (JSONValue, Date) in
             guard case .object(let fields) = admission.message, case .string(let at)? = fields["at"],
-                  let date = roomDate(at) else {
+                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(at) else {
                 throw AgentConversationStore.Failure(message: "Dot returned an unreadable room message.")
             }
             return (admission.message, date)
@@ -377,8 +376,7 @@ actor ChatGPTDotConversation {
                                   row["role"] == .string("user") || row["role"] == .string("assistant"),
                                   case .string? = row["content"] else { return nil }
                             return ContactThread.Line(row)
-                        }, own: PersonaCompiler.agentDisplayName(dataRoot: dataRoot), names: ["peer:" + peer.id: peer.name],
-                            mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) }).map { line in
+                        }, own: PersonaCompiler.agentDisplayName(dataRoot: dataRoot), names: ["peer:" + peer.id: peer.name]).map { line in
                             .object(["id": line.id.isEmpty ? .null : .string(line.id), "at": line.timestamp.map(JSONValue.string) ?? .null,
                                      "from": .string(line.speaker), "own": .bool(line.mine), "text": .string(line.text)])
                         })])
@@ -389,10 +387,6 @@ actor ChatGPTDotConversation {
               case .object(let metadata)? = row["metadata"], case .object(let origin)? = metadata["origin"],
               case .string(let id)? = origin["replyTo"], id.hasPrefix("dot-room:") else { return nil }
         return id
-    }
-
-    private func roomDate(_ text: String) -> Date? {
-        NativeTimestampFormat.parseISO8601FractionalFirst(text)
     }
 
     private func replies(_ messages: [JSONValue], rows: [JSONValue]) throws -> [JSONValue] {
@@ -406,7 +400,7 @@ actor ChatGPTDotConversation {
         }
         let timeline = try messages.map { message -> (JSONValue, [String: JSONValue], Date) in
             guard case .object(let fields) = message, case .string(let at)? = fields["at"],
-                  let date = roomDate(at) else {
+                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(at) else {
                 throw AgentConversationStore.Failure(message: "Dot returned an unreadable room message.")
             }
             return (message, fields, date)

@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -40,7 +39,7 @@ public enum CodexCompletionTranscriptEvidence {
             "sessionId": .string(sessionId),
         ])
         let bytes = (try? payload.serializedData(pretty: false)) ?? Data()
-        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        return SHA256Hex.of(bytes)
     }
 
     public static func recoverRunId(

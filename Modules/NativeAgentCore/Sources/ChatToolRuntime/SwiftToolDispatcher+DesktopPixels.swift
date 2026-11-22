@@ -45,7 +45,7 @@ extension SwiftToolDispatcher {
                 throw invalid("invalid_window_id", "window_id must be a positive window number.", field: "window_id", accepted: "integer 1...4294967295")
             }
             args += ["-l", String(id)]
-        } else if let app = optionalString(input, "app") {
+        } else if let app = input["app"]?.nonblankString {
             let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
             let matches = windows.filter {
                 ($0[kCGWindowOwnerName as String] as? String)?.caseInsensitiveCompare(app) == .orderedSame
@@ -57,7 +57,7 @@ extension SwiftToolDispatcher {
                     field: "app", accepted: "one visible app, or an exact window_id instead")
             }
             args += ["-l", String(id)]
-        } else if let region = optionalString(input, "region") {
+        } else if let region = input["region"]?.nonblankString {
             let parts = region.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             let values = parts.compactMap(Int.init)
             guard parts.count == 4, values.count == 4, values[2] > 0, values[3] > 0 else {
@@ -69,7 +69,7 @@ extension SwiftToolDispatcher {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd 'at' h.mm.ss a"
-        let requested = optionalString(input, "path") ?? FileManager.default.homeDirectoryForCurrentUser
+        let requested = input["path"]?.nonblankString ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Desktop/Screenshot \(formatter.string(from: Date())).png").path
         let path = URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(requested)).standardizedFileURL.resolvingSymlinksInPath()
         guard path.pathExtension.lowercased() == "png", !connectorPathIsSensitiveData(path, dataRoot: dataRoot, turn: turn) else {

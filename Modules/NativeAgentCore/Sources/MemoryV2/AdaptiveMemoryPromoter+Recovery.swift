@@ -9,7 +9,6 @@ import Transcripts
 import GRDB
 import NativeAgentShared
 import Experiences
-import CryptoKit
 import Desk
 // Blueprint: | `AdaptiveMemoryPromoter+Recovery.swift` | `AdaptiveMemoryPromoter`: event-owned owed-turn recovery with recorded provenance |
 
@@ -155,7 +154,7 @@ extension AdaptiveMemoryPromoter {
             let encoder = JSONEncoder()
             encoder.outputFormatting = .sortedKeys
             let bytes = try encoder.encode([try JSONDecoder().decode(JSONValue.self, from: encoder.encode(moment.input)), moment.meaning])
-            basis.record = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            basis.record = SHA256Hex.of(bytes)
         }
         return basis
     }

@@ -7,13 +7,7 @@ import ChatTurnContracts
 /// Shared session input handling; explicit caller fields confer no verified identity.
 package enum ChatToolSessionInjection {
     package static func explicitSessionId(in input: [String: JSONValue]) -> String {
-        for key in ["__session_id", "session_id"] {
-            if case .string(let raw)? = input[key] {
-                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        return ""
+        JSONValue.firstTrimmedString(input, keys: ["__session_id", "session_id"]) ?? ""
     }
 
     /// Transport-verified session first, then the direct tool loop's session. Without either, leave the caller's explicit input intact.

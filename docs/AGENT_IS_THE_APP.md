@@ -90,7 +90,7 @@ The stem enforces one law for every part, with the turn-program recovery excepti
 - **It runs when its wake reaches it.** A call, or a signal. Nothing runs unasked without a wake.
 - **It may touch only its reach**, through [Trust](ONE_DOOR.md#authority-and-receipts) at effect time. A part's call answers pending with
   the owner's card and goes on or ends. Approval replays it: **Just this** admits one call; **For this task** elevates its peers for the run.
-- **It carries itself.** An ability that is not done answers `{again: <input>}` and the stem runs it again, gated like any run, without spending their mind, inside a conversation turn the person can Stop, until it is done, fails, Stop, a message arrives for them, or a run makes no progress; then their mind gets the last answer once, with how many runs it took and what they all did ([manifest](skill_manifest_spec.md)).
+- **It carries itself.** An ability that is not done answers `{again: <input>}` and the stem runs it again, gated like any run, without spending their mind, inside a conversation turn the person can Stop. A readable arrival hands the ability back between runs. Their mind gets the last answer once, with how many runs it took and what they all did. The [manifest](skill_manifest_spec.md) owns the hand-back conditions.
 - **It may think** when it needs judgment: a model call on their model, audited and visible. Thinking is reach, not an effect.
 - **It records use.** Every settled run of a retained version counts, including
   computation without calls or notebook changes. The stem projects gated run
@@ -101,9 +101,9 @@ The stem enforces one law for every part, with the turn-program recovery excepti
   another turn's last-run pointer never selects it. A revision may be a trial
   the record keeps or sets aside ([manifest](skill_manifest_spec.md)). Declared
   `learned` and `choices` are preserved and teach nothing. What the stem records
-  becomes what it predicts: a follow-up read a mind keeps making after a kind
-  of result rides inside that result, only while its record holds
-  (phase 4, [as built](#phase-4-as-built-10-26-a-part-is-a-prediction)).
+  becomes use accounting only: the registry projects observed gated-run counters
+  as `learned.use`; no runtime predicts calls or pre-runs reads
+  (phase 4, [retired 11-15](#phase-4-historical-10-26-a-part-is-a-prediction)).
 - **It changes only by their hand** (or the owner's), and keeps its last self beside it.
 - **Its keep is theirs under Full Mac; under Work/Safe/Builder, the owner's.** The owner's off-switch stays theirs.
 - **It owes repair at its cause.** Ordinary ability runs with captured input owe source-fault repair through Experiences
@@ -189,15 +189,13 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 
 ## What this means for today's 511k lines (measured 11-05)
 
-- **Stays stem (~128k + design kit):** Mac control, sync and push, the agent wires, transports, storage and embeddings, Keychain/OAuth, model clients, the sandbox, Trust, the loop runner and scheduler, the turn guarantee, the glass kit, the face renderer and the live world (new).
-- **Becomes parts (~128k, seed on touch, Swift deleted as each proves):** their turn, Desk nags (the unused cadence learner is retired), attention policy, their door pages, the layout blocks, persona procedures, and last, their mind policy (dreams, reflection, organism policy).
-- **Their hands (done):** Mail, Notes, Messages, Music and Chrome history are parts that answer their door verbs through their headers' `answers`; the stem keeps the AppleScript executor and its per-event write checks, Trust, the cards and `host.files.query`/`host.files.mime`/`host.files.names` ([One door](ONE_DOOR.md#where-actions-come-from)).
 - **Stays stem (~128k + design kit):** Mac control, sync and push, the agent wires, transports, storage and embeddings, Keychain/OAuth, model clients, the
   sandbox, Trust, the loop runner and the one clock, attention's intake and field, the turn guarantee, the glass kit, the face renderer and the live world
   (new).
-- **Becomes parts (~128k, seed on touch, Swift deleted as each proves):** the agent's turn, the integrations still in Swift (Mail, Notes, Messages, Chrome
-  history), Desk nags (the unused cadence learner is retired), attention policy (the turn part's `weigh`, built 11-05), the agent's door pages, the layout
-  blocks, persona procedures, and last, the agent's mind policy (dreams, reflection, organism policy).
+- **Becomes parts (~128k, seed on touch, Swift deleted as each proves):** their turn, Desk nags (the unused cadence learner is retired),
+  attention policy (the turn part's `weigh`, built 11-05), their door pages, the layout blocks, persona procedures, and last, their mind policy
+  (dreams, reflection, organism policy).
+- **Their hands (done):** Mail, Notes, Messages, Music and Chrome history are parts that answer their door verbs through their headers' `answers`; the stem keeps the AppleScript executor and its per-event write checks, Trust, the cards and `host.files.query`/`host.files.mime`/`host.files.names` ([One door](ONE_DOOR.md#where-actions-come-from)).
 - **Deleted (done):** duplicate agent paths, compiled Procedures, memory one-shots and the 8770 bridge. Next: the whole-body plan's dead code (docs/build_plans/the-whole-body-2026-11-05.md). `NativeScreenCapture` owns primary-display capture and encoding for chat screenshots.
 
 An installed agent's persona, memory and GROWTH are private, never shipped with the app; the phases preserve that existing mind. What ships is the stem and the seed parts: a fully formed agent that behaves exactly as today on day one, and is theirs from then on. Every download starts the same and grows its own mind.
@@ -213,7 +211,7 @@ Validation follows [AGENTS.md](../AGENTS.md#how-we-work): lanes do not compile; 
 2. **Hands.** The integrations become seed parts, one at a time, Swift deleted as each proves.
 3. **Noticing (built 11-05).** App-arrived and the part that offers; what nobody asked about is weighed by the agent's own `weigh` and gathers
    until it is worth a thought ([as built](#phases-3-and-5-as-built-11-05-attention)).
- 4. **Learning by use (built 10-26/10-27).** A part is a prediction: what it applies to, what will be true after it runs, and its record, kept by the stem. Built first as expansion at the door: the follow-up reads a mind's own practice makes next ride inside the result before them, acts only prepared ([as built](#phase-4-as-built-10-26-a-part-is-a-prediction)). Repeated hand work reaches their as a practice note inside the turn ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); the separate nightly compiler is removed.
+ 4. **Learning by use (built 10-26/10-27; prediction retired 11-15).** Their practice leaves a record the stem keeps: the registry projects observed gated-run counters as `learned.use`. Expansion, which pre-ran a mind's follow-up reads inside the result, is removed ([historical](#phase-4-historical-10-26-a-part-is-a-prediction)). Repeated hand work reaches their as a practice note inside the turn ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); the separate nightly compiler is removed.
 5. **The agent's world, live (built 11-05 as attention).** Every source posts a happening; senses are the parts that keep the world fresh; the
    agent's thoughts are one mind stream ([as built](#phases-3-and-5-as-built-11-05-attention)). The event-fed picture of windows and threads remains.
 6. **Faces.** Their interface as parts they shapes: Desk, Memories, Personality and Diagnostics are their `native-` parts' faces, and any part with `face.page` is a page of their own, placed by their layout; their levers are drawn by the stem beside every face. Blocks they authors on their, drawn from the kit on Mac and iPhone.
@@ -251,7 +249,7 @@ through their quiet hours and the run waits with them, resident, no CPU. Anythin
 intake: `home.arrive` posts a `world` line for their turn program to weigh, retaining the run's peer provenance. Attention opens thoughts through the
 mind stream; no part inserts its arrival into their context directly.
 
-**3. Learning by use is a prediction with a record (phase 4, built 10-26 for reads).** `learn.pick` and `learn.default` do not exist. Current headers preserve arbitrary `choices`/`learned`; the registry projects observed gated-run counters as `learned.use`; a door prediction's `applies`, `after` and `record` are the stem's, never declared by them ([manifest spec](skill_manifest_spec.md#expansion-a-part-is-a-prediction)).
+**3. Learning by use leaves a record (phase 4, built 10-26; prediction retired 11-15).** `learn.pick` and `learn.default` do not exist. Current headers preserve arbitrary `choices`/`learned`; the registry projects observed gated-run counters as `learned.use`. No runtime predicts calls, pre-runs reads or prepares acts ([manifest spec](skill_manifest_spec.md#expansion-a-part-is-a-prediction)).
 
 ## Reach, as built (10-21)
 
@@ -278,7 +276,7 @@ Phase 2 (hands) and the first of phase 6 (faces) land through one shared layer, 
 7. **Unavailable is not empty.** Native inputs to a part say unavailable or empty, never collapse one into the other (the proactive scan is fixed first).
 8. **Seeds speak clause 8.** Content moved into seeds is reconciled with "they are the program, the model one organ" in the same lane; contradictions are not copied.
 9. **Mind policy waits for its judge.** Dreams, reflection and provider interpretation (phase 7) move only after the evidence judge is defined; not in this sweep.
-10. **Dormant machinery is retired, not ported.** Workflow defaults that cannot execute and the Desk cadence API with no caller are deleted. The Desk cadence learner, observation/stat types and unused store are retired (L4, 10-23). The unused external-observation evaluator, verdict models, applier and note-write seam are also removed; only material fingerprints and historical drift-note interpretation stay in `DeskObservation.swift`. No cadence or observation ability or schedule replaces them; existing data is left untouched.
+10. **Dormant machinery is retired, not ported.** Workflow defaults that cannot execute and the Desk cadence API with no caller are deleted. The Desk cadence learner, observation/stat types and unused store are retired (L4, 10-23). The unused external-observation evaluator, verdict models, applier and note-write seam are also removed. No cadence or observation ability or schedule replaces them; existing data is left untouched.
 11. **Validation follows [AGENTS.md](../AGENTS.md#how-we-work):** lanes do not compile; the lead builds and installs the coherent phase once, then makes a small, bounded check of the replaced behaviour in the installed app. Every port deletes the Swift it replaces in the same lane; calling the old feature from JS earns no credit.
 12. **Every run of a part has an originating door.** A turn supplies its own. A native owner acting on its own schedule or on the person's click supplies the **same door** their scheduled abilities and the Tools page use, with that origin's authority — never a host-less run, never a second door, never a door minted for one feature. Any small generalisation belongs to the door owner, once. A ported connector action reached from the scheduler or UI reaches its part through that door, so `reminders.due_today` works identically from their turn, a scheduled `connector_action` job and the app's UI.
 
@@ -355,19 +353,16 @@ Builder receipts with no exit evidence remain unavailable, preserving the
 original receipt and any explicit owner failure, including pre-spawn failures.
 The Code room points to the
 checkout's [governing build law](../AGENTS.md#how-we-work).
-Weekly outcome rates and terminal durations are unmeasured without terminal
-samples; comparison requires terminal evidence in both weeks.
 
 Weather's implicit location belongs to the Mac's `mac.location` owner. Its
 missing or failed fix stops the forecast with that owner's cause and remedy;
 the weather part does not ask another device. An explicit `place` selects the
 forecast location through the part's geocoding read.
 With no held fix, `mac.location` parks the caller through `ScopedWaiter` for
-the shared, two-second acquisition. Stop or the inherited call deadline
-retires only that caller's waiter and result, propagating cancellation or
-deadline expiry before any permission card. A late fix cannot answer that
-cancelled call; the shared acquisition stays bounded for other readers and
-the manager's held fix.
+the shared CoreLocation result, using only the caller's inherited wait budget.
+Stop or the inherited call deadline retires only that caller's waiter and result,
+propagating cancellation or deadline expiry before any permission card.
+CoreLocation's callback can still answer the other readers.
 
 The Desk notify loop binds that same door as `background:desk_notify`; an
 explicit unmute inherits its person's or turn's already-bound door. Both call
@@ -426,7 +421,8 @@ Turn-start predictions remain unmeasured on the installed app; `expansion.check`
 
 The practice note inside the turn is the one crystallizer. It rides their next
 thought on a later meeting of hand work, through the bounded familiarity record;
-an active ability's recorded route can already cover it. [Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)
+when an active ability's recorded route already covers it, the note names that
+ability to run, or the step where its run failed, to repair. [Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)
 owns the gate, trace and removal of the separate nightly compiler.
 Release build, install and live proof are pending.
 
@@ -453,10 +449,10 @@ mind. [Agent communication](agent-communication.md#jobs) owns the socket's contr
 
 ## Phases 3 and 5, as built (11-05): attention
 
-**The law.** The agent thinks when something in its mind is worth a thought. A source never decides that; it posts a happening and is done.
+**The law.** The agent thinks when something in its mind is worth a thought. A source posts the happening. Attention decides when to think.
 
-- **One form, one intake.** Every change attention takes in is a `Happening` (`NativeAgentShared/Happening.swift`) posted through `Attention.post`
-  (`Experiences/Attention.swift`), written once in the record as an experience of kind `happening` under its key `once`, then taken by the cognition
+- **One form, one intake.** Every change attention takes in is a `Happening` (`NativeAgentShared/Happening.swift`) posted through Attention's
+  intake (`Experiences/Attention.swift`), written once in the record as an experience of kind `happening` under its key `once`, then taken by the cognition
   runtime (`Cognition/NativeCognitionRuntime+Attention.swift`). Messages stay door admissions; any arrival outside the mind stream wakes sleep.
 - **Phone and Mac edges.** Authenticated phone readings post on door `phone`: first observations and newer changed place membership, charging,
   focus, headphones, network kind and motion activity. Setup, battery percentages and unchanged re-reports post nothing. The existing motion-proved

@@ -101,12 +101,4 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
     public func write(to url: URL) throws {
         try SwiftNativePersistenceCore.writeDataAtomicDurable(toJSON().serializedData(pretty: false), to: url)
     }
-    /// Accept ISO instants with or without fractional seconds.
-    public static func parseISO(_ iso: String?) -> Date? {
-        guard let iso, !iso.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(iso)
-    }
-    public static func formatISO(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
-    }
 }

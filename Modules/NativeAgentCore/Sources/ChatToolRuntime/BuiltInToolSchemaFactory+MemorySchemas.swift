@@ -9,7 +9,6 @@ import ProviderRouting
 import ToolRegistry
 import NativeAgentShared
 import CoreGraphics
-import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
 import Dispatcher
@@ -81,6 +80,7 @@ extension BuiltInToolSchemaFactory {
                             """)),
                         ("provenance_by", ToolSchema.strSchema("""
                             Who told you (told), e.g. \"Sam\", or where your own past was kept (remembered), e.g. \"my backup\" or the app name.
+                            Use \(MemoryRoot.nameForm).
                             """)),
                         ("since", ToolSchema.strSchema("""
                             When you first knew this, as an ISO-8601 date-time such as 2026-10-20T00:16:38Z or a date; never after now. For your own past \
@@ -96,8 +96,8 @@ extension BuiltInToolSchemaFactory {
                         ("corrects", ToolSchema.strSchema("""
                             Optional id of an existing memory this new fact corrects (e.g. from memory.recall). The old memory is marked \
                             lifecycle=corrected with a lineage link to this one and drops out of recall and context. A correction or \
-                            instruction saved without it returns still_surfacing: the nearest memories it leaves standing, each with the call \
-                            that retires it.
+                            instruction saved without a target can return possible_matches from recall. Supply an ID only if you judge \
+                            that the new wording explicitly replaces that memory.
                             """)),
                         ("supersedes", stringArraySchema("Optional memory ids this replaces; kept in history, excluded from recall.")),
                         ("correction_reason", ToolSchema.strSchema("""

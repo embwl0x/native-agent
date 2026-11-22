@@ -54,9 +54,6 @@ extension AppConnectorStatusPlatform {
             case .failed(let failure), .refused(let failure): throw failure
             default: throw FaceWireError.invalidFeedOrder
             }
-        }, showGrokSecureSetup: { peer in
-            guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
-            try await BodyFacePresentation.current(model: model).present(.showGrokSetup(contact: peer, operation: UUID()))
         }, closeGrokSecureSetup: { peer in
             guard let model = ApplicationLifetime.shared.appModel else { throw FaceWireError.disconnected }
             try await BodyFacePresentation.current(model: model).present(.closeGrokSetup(contact: peer))

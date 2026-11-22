@@ -1,9 +1,11 @@
 import SwiftUI
 #if canImport(AppKit)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
 #endif
 
-// Blueprint: | `ColorHex.swift` | `NativeAgentSpacing`, `NativeAgentRadius`, `HazeColor`, `HazeMood`, `Color.init(hex:)`: shared values |
+// Blueprint: | `ColorHex.swift` | `NativeAgentSpacing`, `NativeAgentRadius`, `HazeColor`, `HazeMood`, and `Color` fixed and appearance-aware hex colors |
 
 public enum NativeAgentSpacing {
     public static let xs: CGFloat = 4
@@ -26,6 +28,19 @@ public enum NativeAgentRadius {
 }
 
 public extension Color {
+    #if canImport(AppKit) || canImport(UIKit)
+    static func adaptive(dark: UInt, light: UInt) -> Color {
+        #if canImport(AppKit)
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            return NSColor(Color(hex: isDark ? dark : light))
+        })
+        #else
+        Color(uiColor: UIColor { UIColor(Color(hex: $0.userInterfaceStyle == .dark ? dark : light)) })
+        #endif
+    }
+    #endif
+
     init(hex: UInt, opacity: Double = 1) {
         self.init(.sRGB, red: Double((hex >> 16) & 0xFF) / 255,
                   green: Double((hex >> 8) & 0xFF) / 255,

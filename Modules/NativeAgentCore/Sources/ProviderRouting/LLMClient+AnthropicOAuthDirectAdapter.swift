@@ -24,7 +24,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
     private let authPathOverride: URL?
     private let maxTokensOverride: Int?
     private let clientID: String
-    private let telemetry: LLMCallTraceRecorder
+    public let telemetry: LLMCallTraceRecorder
 
     public init(
         session: URLSession = AnthropicOAuthTransport.productionSession,
@@ -110,13 +110,6 @@ public final class AnthropicOAuthTransport: LLMTransport {
         )
     }
 
-    private func transientNetworkError(_ error: Error, endpoint: URL, operation: String) -> LLMError {
-        .transient(message: """
-            \(providerId) \(operation) failed for \(endpoint.host ?? "api.anthropic.com"): \
-            \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))
-            """)
-    }
-
     // MARK: - Shared refresh-actor registry
     // Share the refresh queue by credential path across instances so concurrent adapters cannot spend one refresh token twice.
 
@@ -143,14 +136,6 @@ public final class AnthropicOAuthTransport: LLMTransport {
         throw LLMError.modelUnavailable(provider: "anthropic_oauth_direct", model: r)
     }
 
-    /// Record actual ID rewrites in substitutedFrom so substitutions remain visible.
-    static func substitutionTrace(requested: String?, coerced: String) -> String? {
-        guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
-            return nil
-        }
-        return r == coerced ? nil : r
-    }
-
     /// The subscription connection must never carry a native `tools` array (ProviderToolCapability); tools reach Claude here only as prompt text.
     private static func refuseNativeTools(_ tools: [LLMToolSchema]?) throws {
         guard let tools, !tools.isEmpty else { return }
@@ -159,23 +144,6 @@ public final class AnthropicOAuthTransport: LLMTransport {
     }
 
     // MARK: - LLMTransport conformance
-
-    /// Structured conversation blocks keep prior calls paired with results so the tool loop can converge.
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
-    }
-
-    public func complete(
-        prompt: String, system: String?, model: String, tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
-    }
 
     /// Text-tool streams must refuse native schemas.
     public func streamMessages(
@@ -194,7 +162,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
                         messages: messages,
                         system: system,
                         model: coercedModel,
-                        substitutedFrom: Self.substitutionTrace(
+                        substitutedFrom: substitutionTrace(
                             requested: model,
                             coerced: coercedModel
                         ),
@@ -296,7 +264,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         do {
             (bytes, response) = try await ProviderWire.open(session, req, call: call)
         } catch {
-            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
+            throw mapTransportError(error, fallback: transientNetworkError(error, provider: providerId, host: endpoint.host ?? "api.anthropic.com", operation: "streamMessages"))
         }
         defer { bytes.cancel() }
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
@@ -331,7 +299,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
+            throw mapTransportError(error, fallback: transientNetworkError(error, provider: providerId, host: endpoint.host ?? "api.anthropic.com", operation: "streamMessages"))
         }
         throw LLMError.streamTruncated(
             message: "Anthropic OAuth streamMessages ended without message_stop"
@@ -444,16 +412,14 @@ public final class AnthropicOAuthTransport: LLMTransport {
         do {
             (rdata, response) = try await OAuthGrantOperations.post(refreshEndpoint, body, json: true, session: session)
         } catch {
-            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: refreshEndpoint, operation: "refresh"))
+            throw mapTransportError(error, fallback: transientNetworkError(error, provider: providerId, host: refreshEndpoint.host ?? "api.anthropic.com", operation: "refresh"))
         }
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         let status = http.statusCode
         if !(200..<300).contains(status) {
             // Refresh 429 preserves Retry-After; 5xx is transient and neither revokes the credential.
             if status == 429 {
-                throw LLMError.rateLimited(
-                    message: "anthropic_oauth_direct refresh HTTP 429 (temporary)",
-                    retryAfterSeconds: parseRetryAfterSeconds(from: response))
+                throw LLMError.rateLimited(retryAfterSeconds: parseRetryAfterSeconds(from: response))
             }
             if (500..<600).contains(status) {
                 throw LLMError.transient(

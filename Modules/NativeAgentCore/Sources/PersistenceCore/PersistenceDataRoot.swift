@@ -1,9 +1,23 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `PersistenceDataRoot.swift` | `DataRootLife.life(of:)`; Stable process root; explicit roots retain literal spelling. |
+// Blueprint: | `PersistenceDataRoot.swift` | `DataRootLife.life(of:)`, stable process root, and `DataRootPaths` for chat and memory beneath explicit roots |
 
 // MARK: - Data root resolution
+
+package enum DataRootPaths {
+    package static func chatDirectory(in dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent("chat", isDirectory: true)
+    }
+
+    package static func chatSessionIndex(in dataRoot: URL) -> URL {
+        chatDirectory(in: dataRoot).appendingPathComponent("sessions.json")
+    }
+
+    package static func memoryDatabase(in dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent("memory", isDirectory: true).appendingPathComponent("memory.sqlite")
+    }
+}
 
 private let repoMarkerFiles: [String] = [
     "persona/SOUL.template.md",

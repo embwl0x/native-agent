@@ -136,7 +136,7 @@ extension SwiftToolDispatcher {
     /// A consult is material for live judgment; filing it must neither retrieve nor append journal entries or suggest a verdict.
     func impl_studio_consult(input: [String: JSONValue]) async throws -> JSONValue {
         let refs = try studioStringArray(input, "artifact_refs", tool: "studio_consult")
-        let question = optionalString(input, "question")?
+        let question = input["question"]?.nonblankString?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !question.isEmpty else {
             return studioRefusal(.consultQuestionMissing)
@@ -144,13 +144,13 @@ extension SwiftToolDispatcher {
         do {
             let consult = try await studioStore().fileConsult(
                 artifactRefs: refs,
-                description: optionalString(input, "description"),
-                portionAvailable: optionalString(input, "portion_available"),
+                description: input["description"]?.nonblankString,
+                portionAvailable: input["portion_available"]?.nonblankString,
                 question: question,
-                projectContext: optionalString(input, "project_context"),
-                stage: optionalString(input, "stage"),
-                constraints: optionalString(input, "constraints"),
-                priorDiscussion: optionalString(input, "prior_discussion"),
+                projectContext: input["project_context"]?.nonblankString,
+                stage: input["stage"]?.nonblankString,
+                constraints: input["constraints"]?.nonblankString,
+                priorDiscussion: input["prior_discussion"]?.nonblankString,
                 descriptionOnly: flag(input, "description_only")
             )
             return .object([
@@ -280,12 +280,12 @@ extension SwiftToolDispatcher {
 
         do {
             let entry = try await studioStore().appendJournalEntry(
-                encounteredAt: optionalString(input, "encountered_at"),
+                encounteredAt: input["encountered_at"]?.nonblankString,
                 work: work,
                 reception: reception,
                 artifactRefs: try studioStringArray(input, "artifact_refs", tool: "studio_journal"),
                 origin: origin,
-                response: optionalString(input, "response"),
+                response: input["response"]?.nonblankString,
                 stance: stance,
                 relations: relations,
                 tags: try studioStringArray(input, "tags", tool: "studio_journal")
@@ -344,9 +344,9 @@ extension SwiftToolDispatcher {
         do {
             let (amendment, entry) = try await studioStore().appendJournalAmendment(
                 entryId: entryId,
-                reason: optionalString(input, "reason") ?? "",
-                supersedes: optionalString(input, "supersedes"),
-                correction: optionalString(input, "correction") ?? ""
+                reason: input["reason"]?.nonblankString ?? "",
+                supersedes: input["supersedes"]?.nonblankString,
+                correction: input["correction"]?.nonblankString ?? ""
             )
             // Wake context for the corrected pointer; a factual amendment is neither a new felt encounter nor a graph relation.
             await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
@@ -447,7 +447,7 @@ extension SwiftToolDispatcher {
     /// Return journal words verbatim, newest first, with explicit pagination and no invented relevance score.
     func impl_studio_recall(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
         var relationKind: StudioRelationKind?
-        if let raw = optionalString(input, "relation_kind") {
+        if let raw = input["relation_kind"]?.nonblankString {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             // Strict caller schemas may send empty optional filters; an empty relation_kind is omitted.
             if !trimmed.isEmpty {
@@ -458,13 +458,13 @@ extension SwiftToolDispatcher {
             }
         }
         let query = StudioRecallQuery(
-            text: optionalString(input, "query"),
-            title: optionalString(input, "title"),
-            creator: optionalString(input, "creator"),
-            medium: optionalString(input, "medium"),
-            tag: optionalString(input, "tag"),
+            text: input["query"]?.nonblankString,
+            title: input["title"]?.nonblankString,
+            creator: input["creator"]?.nonblankString,
+            medium: input["medium"]?.nonblankString,
+            tag: input["tag"]?.nonblankString,
             relationKind: relationKind,
-            relatedTo: optionalString(input, "related_to"),
+            relatedTo: input["related_to"]?.nonblankString,
             limit: Self.jsonInt(input["limit"]) ?? StudioRecallQuery.defaultLimit
         )
         let result = try await studioStore().recall(query)

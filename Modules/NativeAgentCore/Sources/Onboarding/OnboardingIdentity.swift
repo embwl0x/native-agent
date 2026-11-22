@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentShared
 import MemoryV2
 import Observation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -24,9 +23,6 @@ extension SwiftNativeOnboardingClient {
         // directory creation and falsely orphan a valid manifest.
         url.standardizedFileURL.path
     }
-    static func sha256(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
     static func identityHash(
         agentName: String,
         personaType: String,
@@ -42,7 +38,7 @@ extension SwiftNativeOnboardingClient {
             canonicalPath(personaRoot),
             canonicalPath(profilePath),
         ]
-        return sha256(Data(components.joined(separator: "\u{0}").utf8))
+        return SHA256Hex.of(Data(components.joined(separator: "\u{0}").utf8))
     }
     /// USER.md is either the onboarding template or a bounded memory projection with an optional preamble. Its content identifies the writer, never completion.
     enum UserDocShape: Equatable {
@@ -77,7 +73,7 @@ extension SwiftNativeOnboardingClient {
             else { return .authored }
             remainder.removeSubrange(start.lowerBound..<end.upperBound)
         }
-        return remainder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .replaceable(baseSHA256: sha256(data)) : .authored
+        return remainder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .replaceable(baseSHA256: SHA256Hex.of(data)) : .authored
     }
     static func expectedTargetURLs(
         personaRoot: URL,
@@ -122,7 +118,7 @@ extension SwiftNativeOnboardingClient {
             } catch {
                 throw OnboardingError.ioFailure("read \(path.lastPathComponent) during onboarding recovery failed")
             }
-            let currentHash = sha256(current)
+            let currentHash = SHA256Hex.of(current)
             if currentHash == intent.sha256 {
                 try SwiftNativePersistenceCore.syncDirectory(path.deletingLastPathComponent())
                 return
@@ -146,7 +142,7 @@ extension SwiftNativeOnboardingClient {
             try atomicWriteText(intent.content, to: path)
         }
         let committed = try Data(contentsOf: path)
-        guard sha256(committed) == intent.sha256 else {
+        guard SHA256Hex.of(committed) == intent.sha256 else {
             throw OnboardingError.ioFailure("\(path.lastPathComponent) failed post-write verification")
         }
     }

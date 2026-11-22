@@ -4,23 +4,14 @@ import NativeAgentShared
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(CoreText)
 import CoreText
-#endif
-#if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import ApplicationServices
 import UserNotifications
 import Experiences
-import CryptoKit
 import os
-#endif
 // Blueprint: | `MacScreenViewResultRedaction.swift` | Persisted result previews omit image payloads |
 /// Screenshots belong in the live model call but not trace, persistence or sync; those sinks retain only size, hash and pixel dimensions.
 public enum MacScreenViewResultRedaction {

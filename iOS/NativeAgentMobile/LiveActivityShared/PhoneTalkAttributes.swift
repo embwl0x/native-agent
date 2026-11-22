@@ -15,7 +15,7 @@ struct PhoneTalkAttributes: ActivityAttributes, Sendable {
 
 /// LiveActivityIntent executes in the app; the extension has neither microphone access nor copied call state.
 @MainActor enum PhoneTalkCommands {
-    enum Command { case mute, end }
+    enum Command { case setMuted(Bool), end }
     static var handle: ((String, Command) -> Bool)?
     static func perform(_ command: Command, callID: String) throws {
         guard handle?(callID, command) == true else {
@@ -28,10 +28,14 @@ struct PhoneTalkAttributes: ActivityAttributes, Sendable {
 struct PhoneTalkMuteIntent: LiveActivityIntent {
     static let title: LocalizedStringResource = "Mute or Unmute Talk"
     @Parameter(title: "Call") var callID: String
+    @Parameter(title: "Muted") var muted: Bool
     init() {}
-    init(callID: String) { self.callID = callID }
+    init(callID: String, muted: Bool) {
+        self.callID = callID
+        self.muted = muted
+    }
     @MainActor func perform() async throws -> some IntentResult {
-        try PhoneTalkCommands.perform(.mute, callID: callID)
+        try PhoneTalkCommands.perform(.setMuted(muted), callID: callID)
         return .result()
     }
 }

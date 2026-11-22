@@ -17,6 +17,8 @@ public extension MacChatTurnPresentationPort {
     ) async -> (persisted: Bool, isCurrent: Bool) {
         let sessionId = identity.sessionId
         guard !sessionId.isEmpty, !identity.turnId.isEmpty else { return (false, false) }
+        // A send Stop revoked while it was saving no longer owns the session: it must not replace its successor's lifecycle.
+        guard macChatTurns.taskGenerations[sessionId] == generation else { return (false, false) }
         macChatTurns.activeTurnIDsBySession[sessionId] = identity.turnId
         // A new turn must not inherit the previous turn's screen evidence or its attention.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)

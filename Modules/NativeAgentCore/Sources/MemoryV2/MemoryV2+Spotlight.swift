@@ -58,7 +58,8 @@ public final class SystemSpotlightIndexClient: SpotlightIndexClient, @unchecked 
                 domainIdentifier: item.domainIdentifier,
                 attributeSet: attrs
             )
-            if let expiry = item.expirationDate { searchable.expirationDate = expiry }
+            // Core Spotlight drops an item after a month unless told otherwise; a memory without its own expiry stays until it changes.
+            searchable.expirationDate = item.expirationDate ?? .distantFuture
             return searchable
         }
         try await CSSearchableIndex.default().indexSearchableItems(mapped)
@@ -138,7 +139,7 @@ extension SwiftNativeMemoryIndexer {
             let generation = try await storage.spotlightSnapshot().fingerprint
             if let markerData = try? Data(contentsOf: markerURL(dataRoot: dataRoot)),
                String(data: markerData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) == generation { return }
+                .trimmingCharacters(in: .whitespacesAndNewlines) == Self.markerPrefix + generation { return }
         } catch {
             await recordProjectionFailure(
                 "Spotlight launch fingerprint failed: \(error)", dataRoot: dataRoot, storage: storage)
@@ -150,6 +151,9 @@ extension SwiftNativeMemoryIndexer {
             nativeLog("MemoryV2 Spotlight launch failed: %@", String(describing: error))
         }
     }
+
+    /// The marker names how items were indexed as well as what: items indexed before explicit expiry are rebuilt once.
+    static let markerPrefix = "expiry-v2:"
 
     public static func reindex(dataRoot: URL, client: any SpotlightIndexClient) async throws -> ReindexOutcome {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
@@ -181,7 +185,7 @@ extension SwiftNativeMemoryIndexer {
             return .changedDuringReindex
         }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(
-            Data((snapshot.fingerprint + "\n").utf8),
+            Data((Self.markerPrefix + snapshot.fingerprint + "\n").utf8),
             to: marker
         )
         await storage.recordSpotlightProjectionFailure(nil)

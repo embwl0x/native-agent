@@ -21,7 +21,14 @@ public struct AgentConversationStore: Sendable {
     public struct Failure: Error, LocalizedError, Sendable {
         public let message: String
         public var effects: ToolFailureError.Effects = .none
+        /// The conversation moved on, so an older result was correctly not applied: an outcome, not a failure to repair.
+        public var isMovedOn = false
         package init(message: String) { self.message = message }
+        package static var movedOn: Failure {
+            var failure = Failure(message: "This conversation has moved on; the older result was not applied.")
+            failure.isMovedOn = true
+            return failure
+        }
         public var errorDescription: String? { message }
     }
 
@@ -111,7 +118,7 @@ public struct AgentConversationStore: Sendable {
             throw ToolFailureError("message_id must be a non-empty protocol message string.",
                 argumentPath: "message_id", effects: .none)
         }
-        // Every record names its contact; replies are attributed by it (BridgeLane.bridgeSurfaceName).
+        // Every record names its contact; replies are attributed by it.
         guard !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw Failure(message: "Name the contact this conversation is with. Nothing was sent.")
         }
@@ -312,7 +319,7 @@ public struct AgentConversationStore: Sendable {
 
     /// Late replies settle their own exchange, never the current send. Only committed reply storage can settle its repair debt.
     public func settleExchange(id: String, exchange: String, reply: String?, receipt: JSONValue? = nil,
-                               firstActivity: Date? = nil, stopDetail: String? = nil) throws {
+                               firstActivity: Date? = nil) throws {
         try locked {
             var rows = try load()
             guard let i = rows.firstIndex(where: { $0.id == id }), var history = rows[i].exchanges,
@@ -324,10 +331,6 @@ public struct AgentConversationStore: Sendable {
             if rows[i].operationID == exchange, let receipt {
                 rows[i].receipt = Self.cacheReceipt(receipt)
                 rows[i].phase = reply == nil ? "attention" : "ready"
-                if let stopDetail {
-                    rows[i].stop = AgentConversationStop(state: "released", operationID: exchange, at: Date(), detail: stopDetail)
-                    rows[i].phase = "ready"
-                }
                 rows[i].automaticRead = false; rows[i].nextReadAt = nil
                 rows[i].exchanges = history
                 try Self.absorbExchange(into: &rows[i], file: fileURL)
@@ -345,7 +348,7 @@ public struct AgentConversationStore: Sendable {
                     }
                     if case .string(let status)? = fields["status"] { history[j].status = status }
                 } else { history[j].status = "answered" }
-                history[j].phase = stopDetail != nil || reply != nil ? "ready" : "attention"
+                history[j].phase = reply != nil ? "ready" : "attention"
                 history[j].settledAt = Date()
                 rows[i].exchanges = try AgentConversationExchange.bounded(history, file: fileURL)
             }
@@ -422,7 +425,7 @@ public struct AgentConversationStore: Sendable {
             var rows = try load()
             let original = rows
             guard let i = rows.firstIndex(where: { $0.id == id && $0.operationID == operationID }) else {
-                throw Failure(message: "This conversation has moved on; the older result was not applied.")
+                throw Failure.movedOn
             }
             let identity = rows[i]
             try edit(&rows[i])

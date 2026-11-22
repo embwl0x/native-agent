@@ -40,37 +40,11 @@ final class JSONLCapCheckCounter: @unchecked Sendable {
     }
 }
 
-/// Select line retention, then byte retention, and durably publish once. The caller holds the feed's lock. Checked append bytes may be carried in to avoid
-/// rereading a diagnostic feed admitted before its append.
-@discardableResult
-public func enforceJSONLRetention(
-    at path: URL,
-    maxLines: Int? = nil,
-    minimumRowsPerKind: Int? = nil,
-    trimWhenBytesExceed: Int? = nil,
-    trimToLines: Int? = nil,
-    maxBytes: Int? = nil,
-    trimToBytes: Int? = nil,
-    preserveOversizedNewestRow: Bool = true,
-    data checkedData: Data? = nil
-) throws -> Int {
-    let selection = try selectJSONLRetention(
-        at: path, maxLines: maxLines, minimumRowsPerKind: minimumRowsPerKind,
-        trimWhenBytesExceed: trimWhenBytesExceed, trimToLines: trimToLines,
-        maxBytes: maxBytes, trimToBytes: trimToBytes,
-        preserveOversizedNewestRow: preserveOversizedNewestRow, data: checkedData)
-    if let retained = selection.retained {
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(retained, to: path)
-    }
-    return selection.dropped?.count ?? 0
-}
-
 /// One selection of original rows; nil dropped rows mean unreadable UTF-8.
 private func selectJSONLRetention(
     at path: URL,
     maxLines: Int? = nil,
     minimumRowsPerKind: Int? = nil,
-    trimWhenBytesExceed: Int? = nil,
     trimToLines: Int? = nil,
     maxBytes: Int? = nil,
     trimToBytes: Int? = nil,
@@ -83,7 +57,7 @@ private func selectJSONLRetention(
         atPath: path.path
     ))?[.size] as? NSNumber)?.intValue
     let checkLines = maxLines.map { limit in
-        limit > 0 && size.map { $0 >= limit && $0 >= (trimWhenBytesExceed ?? 0) } != false
+        limit > 0 && size.map { $0 >= limit } != false
     } ?? false
     let byteTarget = trimToBytes ?? maxBytes ?? 0
     let checkBytes = maxBytes.map { limit in

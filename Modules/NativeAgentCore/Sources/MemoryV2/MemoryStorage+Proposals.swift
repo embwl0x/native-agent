@@ -1,8 +1,9 @@
 import Foundation
+import NativeAgentShared
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Proposals.swift` | `MemoryStorage`: `repairSupersededTombstones`, `stagePendingProposal`, `updateProposalMetadata` |
+// Blueprint: | `MemoryStorage+Proposals.swift` | `MemoryStorage`: `repairSupersededTombstones`, `stagePendingProposal` |
 
 extension MemoryStorage {
     // Repair and cursor commit together; every row is visited without advancing past failed repairs.
@@ -47,7 +48,7 @@ extension MemoryStorage {
                     UPDATE proposals SET status = 'superseded', rejection_reason = ?, metadata_json = ?,
                         resolved_at = CASE WHEN status = 'superseded' THEN resolved_at ELSE ? END WHERE id = ?
                     """, arguments: [marker.map { prefix + $0 } ?? row.rejectionReason,
-                                     Self.encodeMetadata(.object(metadata)), Self.nowISO8601(), row.id])
+                                     Self.encodeMetadata(.object(metadata)), NativeTimestampFormat.fractionalZulu(Date()), row.id])
             }
             if let last = rows.last {
                 let stamp: String = last["repair_stamp"]
@@ -65,7 +66,7 @@ extension MemoryStorage {
             SELECT COUNT(*) FROM proposals WHERE status IN ('accepted', 'rejected', 'merged', 'superseded')
             """) ?? 0
         guard terminalCount > 512 else { return }
-        let dayStart = MemoryDueDateStamp.iso8601(Calendar.current.startOfDay(for: now))
+        let dayStart = NativeTimestampFormat.plainZulu(Calendar.current.startOfDay(for: now))
         try db.execute(sql: """
             WITH RECURSIVE retained(id) AS (
                 SELECT id FROM proposals WHERE status NOT IN ('accepted', 'rejected', 'merged', 'superseded')
@@ -112,7 +113,7 @@ extension MemoryStorage {
             guard proposal.status == "pending", successor == nil || successor == successorId else { return false }
             var metadata: [String: JSONValue] = [:]
             if case .object(let existing)? = proposal.metadata { metadata = existing }
-            let now = Self.nowISO8601()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             metadata["supersededBy"] = .string(successorId)
             metadata["supersededAt"] = .string(now)
             try db.execute(sql: """
@@ -209,6 +210,13 @@ extension MemoryStorage {
             guard proposal.status == "pending" else {
                 throw MemoryStorageError.alreadyResolved(id)
             }
+            // The target retired must be the one this proposal names now: a same-text proposal merged meanwhile may have changed it.
+            if let superseding {
+                let current = SwiftNativeMemoryV2.supersedingAcceptance(from: proposal.metadata)
+                guard current?.targetId == superseding.targetId, current?.expectedContentHash == superseding.expectedContentHash else {
+                    throw MemoryV2Error.staleSupersession("The proposal's replacement target changed after it was read; review it again.")
+                }
+            }
             let stampedConfidence = try MemoryProposalEvidence.confidence(in: proposal.metadata)
             let provenance = MemorySenseProvenance.merging(existing: proposal.metadata, incoming: turnProvenance)
             if !provenance.isEmpty {
@@ -226,7 +234,7 @@ extension MemoryStorage {
                 try db.execute(sql: """
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
-                """, arguments: [Self.nowISO8601(), "tombstoned: exact match to a rejected claim", id])
+                """, arguments: [NativeTimestampFormat.fractionalZulu(Date()), "tombstoned: exact match to a rejected claim", id])
                 try Self.pruneTerminalProposals(in: db)
                 return .tombstoned
             }
@@ -241,11 +249,11 @@ extension MemoryStorage {
                 try db.execute(sql: """
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
-                """, arguments: [Self.nowISO8601(), "tombstoned: semantic match to a rejected claim", id])
+                """, arguments: [NativeTimestampFormat.fractionalZulu(Date()), "tombstoned: semantic match to a rejected claim", id])
                 try Self.pruneTerminalProposals(in: db)
                 return .tombstoned
             }
-            let now = Self.nowISO8601()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             // Preserve the checked proposal confidence and its recorded kind.
             let proposalMeta: [String: JSONValue] = {
                 if case .object(let o)? = proposal.metadata { return o }
@@ -322,7 +330,7 @@ extension MemoryStorage {
             }
             for predecessor in subjectPredecessors where predecessor.id != superseding?.targetId {
                 demoted.append(try Self.demoteSuperseded(SupersedingAcceptance(
-                    targetId: predecessor.id, expectedContentHash: Self.contentHash(predecessor.content),
+                    targetId: predecessor.id, expectedContentHash: Self.contentFingerprint(predecessor.content),
                     reason: "superseded by explicit standing correction on the same subject"
                 ), by: &mem, in: db))
             }
@@ -373,7 +381,7 @@ extension MemoryStorage {
                 "memory this update replaces (\(superseding.targetId)) is gone or already superseded"
             )
         }
-        if Self.contentHash(row.content) != superseding.expectedContentHash {
+        if Self.contentFingerprint(row.content) != superseding.expectedContentHash {
             throw MemoryV2Error.staleSupersession(
                 "memory this update replaces (\(superseding.targetId)) changed since the update was staged"
             )
@@ -390,7 +398,7 @@ extension MemoryStorage {
                     // A direct save without a turn has its own admission event.
                     raw = memory.createdAt
                 }
-                guard var date = MemoryDataProvenance.parseTimestamp(raw) else {
+                guard var date = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(raw) else {
                     throw MemoryStorageError.invalidTemporalEvidence("Pinned belief ruling time is not ISO-8601")
                 }
                 if let supplied = memory.metadata?.objectValue?["duplicate_occurrences"] {
@@ -402,7 +410,7 @@ extension MemoryStorage {
                             throw MemoryStorageError.invalidTemporalEvidence("Pinned belief occurrence is not an object")
                         }
                         if let supplied = fields["turn_at"] {
-                            guard case .string(let raw) = supplied, let at = MemoryDataProvenance.parseTimestamp(raw) else {
+                            guard case .string(let raw) = supplied, let at = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(raw) else {
                                 throw MemoryStorageError.invalidTemporalEvidence("Pinned belief occurrence time is not ISO-8601")
                             }
                             date = max(date, at)
@@ -422,7 +430,7 @@ extension MemoryStorage {
                 throw MemoryV2Error.staleSupersession("A newer ruling owns this pin; the older replacement was not admitted.")
             }
         }
-        let now = Self.nowISO8601()
+        let now = NativeTimestampFormat.fractionalZulu(Date())
         // The target's roots are read under the same transaction that retires it. A metadata-only change while the writer embedded must reach
         // the surviving memory too; a pre-insertion read cannot attest the roots present at this landing.
         let heldRoots = try MemoryRoot.roots(in: replacement.metadata)
@@ -498,7 +506,7 @@ extension MemoryStorage {
             guard proposal.status == "pending" else {
                 throw MemoryStorageError.alreadyResolved(id)
             }
-            let now = Self.nowISO8601()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             // Preserve the rejected proposal's embedding so the semantic gate blocks paraphrases.
             try Self.upsertTombstone(
                 db: db, content: proposal.content, reason: reason,
@@ -520,25 +528,6 @@ extension MemoryStorage {
                 sql: "SELECT * FROM proposals WHERE id = ?",
                 arguments: [id]
             ).map(Self.decodeProposal)
-        }
-    }
-
-    /// Only pending or superseded rows permit metadata repair; preserve successor audit links without mutating terminal rows. The proposal keeps the
-    /// roots it holds: a repair never writes them.
-    @discardableResult
-    public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> StoredProposal? {
-        try await dbPool.write { db in
-            guard let current = try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]).map(Self.decodeProposal) else {
-                return nil
-            }
-            let repaired = MemoryRoot.setting(try MemoryRoot.roots(in: current.metadata), in: metadata)
-            try db.execute(sql: """
-                UPDATE proposals SET metadata_json = ?
-                WHERE id = ? AND status IN ('pending', 'superseded')
-            """, arguments: [Self.encodeMetadata(repaired), id])
-            guard db.changesCount > 0 else { return nil }
-            return try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id])
-                .map(Self.decodeProposal)
         }
     }
 

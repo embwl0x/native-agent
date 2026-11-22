@@ -17,6 +17,8 @@ final class BodyFaceVoice {
         var watch: Task<Void, Never>?
     }
     private var captures: [UUID: Capture] = [:]
+    /// Dictations waiting on the permission prompt: a discard removes one, and its start then never turns the microphone on.
+    private var startingDictations: Set<UUID> = []
     private var speech: [UUID: Task<Void, Never>] = [:]
 
     init(engine: NativeAgentEngine) { self.engine = engine }
@@ -49,10 +51,18 @@ final class BodyFaceVoice {
     private func voice(_ command: VoiceAct) async throws -> FaceActReply {
         switch command {
         case .beginDictation(let id, let session, let revision):
-            guard captures[id] == nil else { throw BodyFaceServices.failure("voice_operation_exists", "This dictation operation is already open.") }
+            guard captures[id] == nil, !startingDictations.contains(id) else {
+                throw BodyFaceServices.failure("voice_operation_exists", "This dictation operation is already open.")
+            }
             VoiceOutputController.sharedMessagePlayback.stop()
             let input = VoiceInputCapture.forChat()
-            if let cause = await input.requestPermission().errorMessage {
+            // Registered before the permission prompt, so a discard during the prompt cancels it and the microphone never starts.
+            startingDictations.insert(id)
+            let permission = await input.requestPermission()
+            guard startingDictations.remove(id) != nil else {
+                throw BodyFaceServices.failure("voice_cancelled", "Dictation was cancelled before it started.")
+            }
+            if let cause = permission.errorMessage {
                 throw BodyFaceServices.failure("voice_permission_required", cause)
             }
             try Task.checkCancellation()
@@ -87,6 +97,12 @@ final class BodyFaceVoice {
             await engine.face.post(value, at: .voice(id))
             return .voice(value)
         case .discardDictation(let id):
+            if startingDictations.remove(id) != nil {
+                let cancelled = VoiceFace(operation: id, session: nil, message: nil, composerRevision: nil,
+                    phase: .cancelled, text: nil, attachment: nil, state: .ready)
+                await engine.face.post(cancelled, at: .voice(id))
+                return .voice(cancelled)
+            }
             guard var capture = captures.removeValue(forKey: id) else {
                 throw BodyFaceServices.failure("voice_operation_missing", "This dictation operation is not open.")
             }
@@ -181,7 +197,7 @@ final class BodyFaceVoice {
         else if let path = attachment.path { bytes = try Data(contentsOf: URL(fileURLWithPath: path)) }
         else { throw BodyFaceServices.failure("voice_attachment_missing", "The recorded audio has no readable bytes.") }
         return .init(id: attachment.id, name: attachment.name ?? attachment.id, mimeType: attachment.mime,
-            byteCount: bytes.count, resource: nil, bytes: bytes)
+            byteCount: bytes.count, resource: nil, bytes: bytes, utterance: attachment.utterance)
     }
 
     @concurrent private static func attachment(_ attachment: FaceAttachment) async throws -> ArtifactGrant {

@@ -12,7 +12,7 @@ import TrustCenter
 
 extension AppToolExecutor {
     @MainActor
-    func runSenseLifecycle(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+    func runSenseLifecycle(input: [String: JSONValue], turn: Turn) async throws -> JSONValue {
         guard let registry = SensesHub.shared.registry,
               let id = input["sense_id"]?.scalarText, let verb = input["verb"]?.scalarText else {
             return Self.failure("sense_unavailable", "Read Senses for the sense's current identity.")
@@ -29,7 +29,7 @@ extension AppToolExecutor {
         if verb == "versions" {
             return try await registry.lifecycleRead(id: id)
         }
-        if verb == "quarantine", Int(Self.doorText(input["version"])) != current.version {
+        if verb == "quarantine", Int(JSONValue.trimmedScalarTextOrEmpty(input["version"])) != current.version {
             return Self.doorRefusal("stale_version", "Sense \(id) changed; the requested version is stale.",
                 remedy: "read_version", "Read this sense's retained versions and use the exact current version.",
                 next: ["action": .string("sense.versions"), "args": .object(["sense_id": .string(id)])],

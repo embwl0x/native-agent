@@ -314,7 +314,7 @@ final class BodyFaceTranscripts {
         let live = liveID.flatMap { engine.transcripts.streamingTailBox(forMessage: $0).content }
         let transcripts = engine.transcripts
         let cards = TranscriptReadout(messages: messages).cardsByRow.mapValues { $0.map(\.model.id) }
-        let trailing = ChatTurnFailure.read(all) == nil ? [] : [TranscriptBlock(id: "trouble", messageID: "trouble", role: "system",
+        let trailing = ChatTurnFailure.read(all) == nil ? [] : [TranscriptBlock(id: TranscriptBlockID.trouble, messageID: TranscriptBlockID.trouble, role: "system",
             kind: .attachment(.trouble), source: "", lead: .message, foldGroup: nil)]
         let input = TranscriptPressInput(session: request.session, presentation: request.presentation, groups: Array(groups),
             exchanges: engine.contactThreads.otherRooms.filter { $0.sessionID != request.session }, cards: cards,
@@ -404,13 +404,9 @@ final class BodyFaceTranscripts {
         for message in messages {
             try Task.checkCancellation()
             for (index, attachment) in (message.metadata?.attachments ?? []).enumerated() {
-                let kind: String
-                switch attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-                case "image": kind = "image"
-                case "audio": kind = "voice"
-                default: kind = "file"
-                }
-                let id = message.id + "@" + kind + "-" + String(index)
+                let drawn = TranscriptAttachmentKind(type: attachment.type)
+                let kind = drawn.rawValue
+                let id = drawn.blockID(messageID: message.id, index: index)
                 do {
                     let resource = try await Self.resource(attachment)
                     let preview = kind == "image" ? await TranscriptAttachmentPreviews.shared.read(attachment.path) : nil
@@ -427,25 +423,25 @@ final class BodyFaceTranscripts {
                 let answers = inbox?.sections.flatMap(\.rows).first { $0.id == "interaction:" + card.interaction.id }
                 let face = card.face(answers: answers)
                 let unanswerable = card.model.needsAttention && answers == nil && snapshot?.error != nil
-                attachments.append(.init(id: "card-" + card.interaction.id, message: message.id, kind: "card", title: card.model.title,
+                attachments.append(.init(id: TranscriptBlockID.card(card.interaction.id), message: message.id, kind: "card", title: card.model.title,
                     text: nil, resource: nil, card: PartFace(sections: [.init(id: face.id, style: .list, rows: [face])]),
                     failure: unanswerable ? .init(code: "card_answers_unavailable", message: "This request's answers could not be read from Inbox.",
                         cause: snapshot?.error?.message, effects: .none) : nil, secureCard: card.secureFace))
             }
             if let approval = message.metadata?.approvalId, message.metadata?.isPendingApproval == true {
                 let row = inbox?.sections.flatMap(\.rows).first { $0.id == approval }
-                attachments.append(.init(id: "approval-" + message.id, message: message.id, kind: "approval", title: "Approval request",
+                attachments.append(.init(id: TranscriptBlockID.approval(message.id), message: message.id, kind: "approval", title: "Approval request",
                     text: nil, resource: nil, card: row.map { PartFace(sections: [.init(id: $0.id, style: .list, rows: [$0])]) },
                     failure: row == nil ? .init(code: "approval_presentation_unavailable", message: "This approval could not be read from Inbox.",
                         cause: snapshot?.error?.message, effects: .none) : nil))
             }
             if TranscriptRowFace.read(message, receiptTitle: nil).seat == .envelope {
-                attachments.append(.init(id: message.id + "#0", message: message.id, kind: "envelope", title: "Message",
+                attachments.append(.init(id: TranscriptBlockID.words(message.id, 0), message: message.id, kind: "envelope", title: "Message",
                     text: message.content, resource: nil, card: nil, failure: nil))
             }
         }
         if let trouble = ChatTurnFailure.read(messages) {
-            attachments.append(.init(id: "trouble", message: trouble.message.id, kind: "trouble", title: "Reply failed",
+            attachments.append(.init(id: TranscriptBlockID.trouble, message: trouble.message.id, kind: "trouble", title: "Reply failed",
                 text: trouble.failure.line(model: nil), resource: nil, card: nil, failure: nil))
         }
         let actions = messages.map { message in

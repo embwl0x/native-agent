@@ -27,7 +27,7 @@ extension Parts {
         try await checkDependencies(candidate, invocation: invocation)
         let key = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
         let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), abilityID: candidate.id, dataRoot: root,
-            readPaths: Self.strings(Self.fields(Self.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([])))
+            readPaths: JSONValue.stringArray(Self.fields(Self.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([])))
         let host = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: invocation.openScreenWatch, admission: {})
         let face = Self.fields(Self.fields(candidate.manifest)["face"] ?? .null)["projection"] == .bool(true)
         let schema = face ? Self.faceNeeds(candidate.program.schema) : candidate.program.schema
@@ -85,7 +85,7 @@ struct ToolHost: OwnedProgramHostProfile {
         }
         return targets
     }
-    private var readPaths: [String] { Parts.strings(Parts.fields(Parts.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([])) }
+    private var readPaths: [String] { JSONValue.stringArray(Parts.fields(Parts.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([])) }
     /// A read verb's run refuses anything that can change something, before it is admitted or sent.
     private func readRefusal(_ operation: String, _ arguments: JSONValue) -> JSONValue? {
         guard readOnly else { return nil }
@@ -117,7 +117,7 @@ struct ToolHost: OwnedProgramHostProfile {
                     may need to be kept or enabled. It was not called.
                     """))
             }
-            let declared = Parts.fields(candidate.manifest)["declaredActions"].map { Parts.strings($0) } ?? candidate.program.dependencies
+            let declared = Parts.fields(candidate.manifest)["declaredActions"].map { JSONValue.stringArray($0) } ?? candidate.program.dependencies
             let actions = Set(declared + [id]).sorted().map { "\"" + $0 + "\"" }.joined(separator: ", ")
             return .failure(.init(reason: "undeclared_dependency",
                 detail: "\(id) is not among the actions ability \(candidate.id) declares, so it was not called. "
@@ -171,13 +171,13 @@ struct ToolHost: OwnedProgramHostProfile {
         if opensHomeItem(call) {
             return Self.failure("home_item_in_script", "A part cannot open a home arrival from inside its own run.", effects: "none")
         }
-        if let id = Parts.string(call, "action"),
+        if let id = call["action"]?.stringValue,
            case .failure(let error) = doorInput(id: id, given: [call["args"] ?? .object([:])]) {
             return Self.failure(error.reason, error.detail, effects: "none")
         }
         // A named action read must pass its declaration and read classification so preview/live reads cannot become writes.
         do {
-        if reads(call), let page = Parts.string(call, "page"), page.contains("."), let named = try base.action(page) {
+        if reads(call), let page = call["page"]?.stringValue, page.contains("."), let named = try base.action(page) {
             guard named.read else {
                 return Self.failure("not_a_read", "app.read(\"\(page)\") names an action that changes something; a read never runs it. "
                     + "Call it as its own action, declared, if the ability means to.", effects: "none")
@@ -185,10 +185,10 @@ struct ToolHost: OwnedProgramHostProfile {
             call = call.filter { $0.key.hasPrefix("__") }.merging(["action": .string(page), "args": .object([:])]) { $1 }
         }
         // A read goes through the same selection check and gates as any call.
-        guard try reads(call) || Parts.string(call, "action").map({ try action($0) != nil }) == true else {
+        guard try reads(call) || call["action"]?.stringValue.map({ try action($0) != nil }) == true else {
             return Self.failure("undeclared_dependency", "An ability calls only its declared app actions.", effects: "none")
         }
-        if readOnly, let id = Parts.string(call, "action"), let named = try base.action(id),
+        if readOnly, let id = call["action"]?.stringValue, let named = try base.action(id),
            !(named.read || named.readOnly(Parts.fields(call["args"] ?? .null))) {
             return Self.failure("read_verb", "\(id) changes something, and this verb is declared read, so it only reads. Nothing ran.", effects: "none")
         }
@@ -250,7 +250,7 @@ struct ToolHost: OwnedProgramHostProfile {
     private func partRequest(_ arguments: JSONValue) throws -> (id: String, input: JSONValue) {
         try Task.checkCancellation()
         let args = Parts.fields(arguments)
-        guard !projection, let id = Parts.string(args, "id"), AbilityStore.isAbilityID(id),
+        guard !projection, let id = args["id"]?.stringValue, AbilityStore.isAbilityID(id),
               let input = args["input"], case .object = input,
               try input.serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
             throw SenseFailure(code: "bad_input", message: "part.call takes an exact id and a JSON object input of at most 4 MiB.")
@@ -275,7 +275,7 @@ struct ToolHost: OwnedProgramHostProfile {
                 let receipt = await perform(["action": .string("authored." + id), "args": input, "preview": .bool(preview)], execution: execution)
                 let result = Parts.callResult(receipt, as: JSONValue.self)
                 let fields = Parts.fields(receipt)
-                let effects = Parts.string(fields, "effects") ?? Parts.string(Parts.fields(fields["result"] ?? .null), "effects") ?? "unknown"
+                let effects = fields["effects"]?.stringValue ?? Parts.fields(fields["result"] ?? .null)["effects"]?.stringValue ?? "unknown"
                 return Self.receipt(try .fromEncodable(result), effects: effects)
             } catch {
                 let failure = PartCallResult<JSONValue>.failure(.init(code: error is CancellationError ? "cancelled"

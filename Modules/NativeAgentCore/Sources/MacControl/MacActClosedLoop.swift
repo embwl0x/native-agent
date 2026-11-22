@@ -1,10 +1,9 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
 
 // Blueprint: | `MacActClosedLoop.swift` | Closed-loop grammar, live identity, geometry guards, declared effects and bounded waits |
 
@@ -74,9 +73,10 @@ public enum MacActVerb: String, Sendable, Equatable, CaseIterable {
     case scroll
 }
 
-public enum MacActScrollDirection: String, Sendable, Equatable {
-    case up
-    case down
+public enum MacActScrollDirection: String, Sendable, Equatable, CaseIterable {
+    case up, down, left, right
+
+    var isHorizontal: Bool { self == .left || self == .right }
 }
 
 // MARK: - The loop's constants and pure logic
@@ -381,9 +381,7 @@ public enum MacActClosedLoop {
     }
 
     static func normalizedLabel(_ text: String?) -> String? {
-        guard let text else { return nil }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        text.trimmedNonEmpty
     }
 
     // MARK: the wait
@@ -435,10 +433,8 @@ public enum MacActClosedLoop {
         intendedTarget: String?
     ) -> Bool? {
         guard let intendedTarget, let title else { return nil }
-        func norm(_ text: String) -> String {
-            text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
-        let want = norm(intendedTarget), got = norm(title)
+        let want = TextNormalization.trimmedLowercased(intendedTarget)
+        let got = TextNormalization.trimmedLowercased(title)
         guard !want.isEmpty, !got.isEmpty else { return nil }
         // Navigation labels match exactly; a substring such as Doc in Documents cannot prove the destination.
         return got == want
@@ -642,10 +638,16 @@ public enum MacActClosedLoop {
                 ? true : dismissed
         case .scroll:
             readback = "The target's accessibility scroll state changed."
-            mismatch = "AXScrollBar reads the same value; a scroll position change was expected."
-            matches = diff?.changed.first { $0.role == "AXScrollBar" }.flatMap { row in
+            mismatch = "The scroll bar reads the same position; a scroll position change was expected."
+            // Apps report the position on the bar or on its thumb, as a control or as a readout: any of them moving is the scroll.
+            let scrollRoles: Set<String> = ["AXScrollBar", "AXValueIndicator"]
+            let control = diff?.changed.first { scrollRoles.contains($0.role) }.flatMap { row in
                 row.beforeValue.flatMap { before in row.afterValue.map { $0 != before } }
             }
+            let readout = diff?.readoutsChanged.first { scrollRoles.contains($0.role) }.flatMap { row in
+                row.beforeText.flatMap { before in row.afterText.map { $0 != before } }
+            }
+            matches = control == true || readout == true ? true : control ?? readout
         case .pointer:
             readback = "The system pointer is inside the target's freshly observed bounds."
             mismatch = "The system pointer is outside the target's freshly observed bounds."

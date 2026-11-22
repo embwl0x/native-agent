@@ -2,7 +2,6 @@ import AuthoredCapabilities
 import AgentWorkspace
 import ChatToolParsing
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -82,220 +81,33 @@ extension SwiftToolDispatcher {
         }
         // A contributed tool runs in its owner's executor.
         if let appTools, executorOwnedToolNames.contains(tool) {
-            if tool == "app" {
-                guard var door = invocation.appDoor else {
-                    throw ToolFailureError("The app door has no dispatcher. Nothing ran.", effects: .none, owner: "App dispatch")
-                }
-                door.validate = { name, arguments, turn, invocation in
-                    if let refusal = await self.preApprovalRefusal(turn: turn, invocation: invocation, tool: name, input: arguments,
-                        surface: surface) { return refusal }
-                    return await self.fileReadPreviewRefusal(turn: turn, invocation: invocation, tool: name, input: arguments, surface: surface)
-                }
-                return try await appTools.execute(tool: tool, input: input, surface: surface,
-                    turn: turn, invocation: invocation.with(\.appDoor, door))
-            }
-            return try await appTools.execute(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+            return try await dispatchContributedTool(appTools, turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         }
         if Self.fileAccessGatedToolNames.contains(tool), try await !fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
             return builderFullMacRequired(invocation: invocation, tool: tool, input: input)
         }
+        return try await routeNormalizedTool(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface, deskState: deskState)
+    }
+
+    /// Route admitted tools in the established switch order.
+    private func routeNormalizedTool(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String, deskState: DeskState?) async throws -> JSONValue {
         switch tool {
         case "maps_search":
             return try await impl_maps_search(input: input)
         case "maps_route":
             return try await impl_maps_route(input: input)
         case "web_search":
-            func text(_ key: String) -> String {
-                guard case .string(let value)? = input[key] else { return "" }
-                return value.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            let query = text("query"), categories = text("categories"), timeRange = text("time_range")
-            guard !query.isEmpty else {
-                throw ToolFailureError("search needs query: the words to search for.", argumentPath: "query", effects: .none)
-            }
-            let reader = pageReader
-            var result = await WebSearchRoutes.search(query: query, categories: categories, timeRange: timeRange) {
-                try await reader.search(query: query, categories: categories.isEmpty ? nil : categories,
-                                        timeRange: timeRange.isEmpty ? nil : timeRange)
-            }
-            let reply = ToolResult(result)
-            // A search only reads: a failed one changed nothing.
-            if case .object(var fields) = result,
-               !(reply.said("ok") && reply.status == fields["status"]?.stringValue) {
-                fields["effects"] = .string("none")
-                result = .object(fields)
-            }
-            return result
+            return try await dispatchWebSearch(input: input)
         case "read_page":
-            guard case .string(let raw)? = input["url"], case let url = Self.withWebScheme(raw),
-                  let parsed = URL(string: url),
-                  ["http", "https"].contains(parsed.scheme?.lowercased() ?? ""),
-                  parsed.host?.isEmpty == false, parsed.user == nil, parsed.password == nil else {
-                throw AutonomyGateError.toolDenied(reason: "read_page requires a public http(s) URL.")
-            }
-            let find: String?
-            switch input["find"] {
-            case nil, .null?: find = nil
-            case .string(let words)? where !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
-                find = words.trimmingCharacters(in: .whitespacesAndNewlines)
-            default: throw AutonomyGateError.toolDenied(reason: "find must contain the words to locate in the page.")
-            }
-            let around: Int
-            switch input["around"] {
-            case nil, .null?: around = 1
-            case .int(let value)? where (0...3).contains(value): around = Int(value)
-            default: throw AutonomyGateError.toolDenied(reason: "around must be an integer from 0 through 3 surrounding paragraphs.")
-            }
-            let full: Bool
-            switch input["full"] {
-            case nil, .null?: full = false
-            case .bool(let value)?: full = value
-            default: throw AutonomyGateError.toolDenied(reason: "full must be true or false.")
-            }
-            let fetched: JSONValue
-            do { fetched = try await self.pageReader.fetchURL(url).readJSON(find: find, around: around, full: full) }
-            catch ResearchClientError.httpStatus(let status) {
-                var failure: [String: JSONValue] = ["status": .string("failed"), "reason": .string("http_status"),
-                    "http_status": .int(Int64(status)),
-                    "url": .string(url), "effects": .string("none"),
-                    "message": .string(ResearchClientError.httpStatus(status).localizedDescription)]
-                if [404, 410].contains(status) {
-                    failure["remedy"] = .object(["kind": .string("inspect"),
-                        "instruction": .string("Use a different address or search for the page."), "next_call": .null])
-                }
-                return .object(failure)
-            }
-            catch let error as ResearchClientError where error.failureReason != nil {
-                return .object(["status": .string("failed"), "reason": .string(error.failureReason!),
-                    "url": .string(url), "effects": .string("none"), "message": .string(error.localizedDescription)])
-            }
-            let observedURL: String = if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
-                case .string(let finalURL)? = coverage["final_url"] { finalURL } else { url }
-            if case .object(let httpFields) = fetched, httpFields["coverage"]?.objectValue?["thin_page"] == .bool(true) {
-                // A successfully read script shell requires rendering. This is
-                // reader selection, never recovery from an HTTP failure.
-                func retainingHTTP(reason: String, attempted: Bool, browser: JSONValue? = nil, note: String) -> JSONValue {
-                    var fields = httpFields
-                    fields["status"] = .string("partial")
-                    fields["reason"] = .string(reason)
-                    fields["text_reader"] = .string("http")
-                    fields["used_browser"] = .bool(attempted)
-                    fields["http_read"] = fetched
-                    fields["browser_read"] = browser
-                    fields["reader_note"] = .string(note)
-                    return .object(fields)
-                }
-                guard let door = invocation.appDoor else {
-                    return retainingHTTP(reason: "browser_door_unavailable", attempted: false,
-                        note: "This call has no Chrome app door. The HTTP text is retained; rendered content remains unknown.")
-                }
-                var arguments: [String: JSONValue] = ["url": .string(observedURL), "new_tab": .bool(true)]
-                if let find, !full { arguments["find"] = .string(find) }
-                for key in ["raw", "wrong", "why"] where input[key] != nil { arguments[key] = input[key] }
-                let browser: JSONValue
-                do {
-                    // This nested navigation owns the rendered read. The enclosing
-                    // workspace sees web.read, so it cannot attach Chrome's page.
-                    browser = CanonicalToolNameDispatcher.actionResult(try await door.perform("app",
-                        ["action": .string("chrome.navigate"), "args": .object(arguments)], turn,
-                        invocation.with(\.frameSource, "direct")), action: "chrome.navigate")
-                } catch is CancellationError { throw CancellationError() }
-                catch {
-                    try Task.checkCancellation()
-                    return retainingHTTP(reason: "browser_read_unavailable", attempted: true,
-                        browser: ChatToolOutcome.failure(error: error, tool: "chrome.navigate"),
-                        note: "Chrome did not return a readable page; its actual failure is attached. The HTTP text is retained.")
-                }
-                guard case .object(var fields) = browser else {
-                    return retainingHTTP(reason: "browser_read_unavailable", attempted: true, browser: browser,
-                        note: "Chrome returned no page envelope. The HTTP text is retained; rendered content remains unknown.")
-                }
-                let page = fields["page"]?.objectValue
-                guard case .string(let httpText)? = httpFields["text"],
-                      let browserText = page?["text"]?.stringValue ?? page?["sense_page"]?.stringValue else {
-                    return retainingHTTP(reason: "browser_content_unmeasured", attempted: true, browser: browser,
-                        note: "Chrome supplied no measured readable text. The HTTP text is retained; Chrome's actual page or blocker is attached.")
-                }
-                // Measure the exact text each reader would serve, including an authored sense.
-                let browserCharacters = browserText.filter { !$0.isWhitespace }.count
-                let httpCharacters = httpText.filter { !$0.isWhitespace }.count
-                let browserIsEmpty = browserCharacters == 0
-                    || ["read_window_empty", "find_not_observed"].contains(page?["reason"]?.stringValue ?? "")
-                guard !browserIsEmpty, browserCharacters > httpCharacters else {
-                    let reason = browserIsEmpty ? "browser_read_empty" : "browser_read_not_richer"
-                    let detail = page?["reason"]?.stringValue ?? "No additional readable content was observed in this window."
-                    return retainingHTTP(reason: reason, attempted: true, browser: browser,
-                        note: "Chrome's background read did not contain more readable content "
-                            + "(\(browserCharacters) non-whitespace characters in served text; HTTP \(httpCharacters)). "
-                            + "The HTTP text is retained. Chrome: " + detail)
-                }
-                fields["text"] = .string(browserText)
-                if let status = page?["status"] { fields["status"] = status }
-                if fields["status"] == nil { fields["status"] = .string("partial") }
-                fields["used_browser"] = .bool(true)
-                fields["text_reader"] = .string("browser")
-                fields["http_read"] = fetched
-                if fields["url"] == nil { fields["url"] = .string(observedURL) }
-                fields["reader_note"] = .string("""
-                    Chrome supplied more readable content than the thin HTTP text, so its background-tab read supplies text. The HTTP extraction and its \
-                    source receipt remain in http_read. Chrome's receipt and page describe what actually happened. Consent was not accepted or dismissed.
-                    """)
-                return .object(fields)
-            }
-            let corner = SenseCorner.site(host: URL(string: observedURL)?.host?.lowercased() ?? parsed.host!.lowercased())
-            var senseInput = input
-            senseInput["__sense_action"] = .string("web.read")
-            let result = try await SenseDoor.read(corner: corner, address: observedURL, input: senseInput,
-                scope: turn.verifiedSessionID ?? "",
-                nativeCorner: .stream(id: "web"),
-                operation: invocation.senseOperation(turn: turn),
-                raw: { _ in fetched },
-                material: { document, _ in
-                    let reply = ToolResult(document)
-                    guard case .object(let fields) = document,
-                          !(reply.said("failed") && reply.status == fields["status"]?.stringValue) else {
-                        throw SenseFailure(code: "source_unavailable", message: "The original reader refused this read.")
-                    }
-                    return .pageSnapshot(document)
-                })
-            return result
+            return try await dispatchReadPage(turn: turn, invocation: invocation, input: input)
         // Ask for the missing file-access switch; prose alone cannot resolve a workspace boundary.
         case "read_file":
-            do {
-                return try await impl_read_file(turn: turn, invocation: invocation, input: input, surface: surface)
-            } catch {
-                guard let need = fileOpsNeedEnvelope(invocation: invocation,
-                    tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
-                ) else { throw error }
-                return need
-            }
+            return try await dispatchNormalizedFileRead(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         case "list_dir", "file_info":
-            if tool == "list_dir" { input = Self.listDirInput(input) }
-            if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
-                return tool == "list_dir" ? try await impl_full_mac_list_dir(turn: turn, invocation: invocation, input: input, surface: surface)
-                    : try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
-            }
-            do {
-                return try await impl_file_metadata(turn: turn, invocation: invocation, tool: tool, input: input)
-            } catch {
-                guard let need = fileOpsNeedEnvelope(invocation: invocation,
-                    tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
-                ) else { throw error }
-                return need
-            }
+            return try await dispatchNormalizedFileMetadata(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         case "write_file", "move_file", "copy_file", "trash_file":
-            if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
-                return partWrote(invocation: invocation, try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: input,
-                    surface: surface))
-            }
-            do {
-                return partWrote(invocation: invocation, try await impl_trusted_file_mutation(turn: turn, invocation: invocation, tool: tool, input: input))
-            } catch {
-                guard let need = fileOpsNeedEnvelope(invocation: invocation,
-                    tool: tool, mode: .write, path: input["path"]?.stringValue, error: error
-                ) else { throw error }
-                return need
-            }
+            return try await dispatchNormalizedFileMutation(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete":
             return try await impl_standingBots(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         case "recall_memory":   return try await impl_recall_memory(turn: turn, input: input, surface: surface)
@@ -346,7 +158,7 @@ extension SwiftToolDispatcher {
             return try await impl_studio_canon_resolve(turn: turn, input: input, surface: surface)
         case "search_kg":       return try await impl_search_kg(input: input, surface: surface)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
-        case "work_context": return try await impl_work_context(turn: turn, invocation: invocation, input: input, surface: surface)
+        case "work_context": return try await impl_work_context(turn: turn, invocation: invocation, input: input)
         case "artifact_find": return try await impl_artifact_find(turn: turn, input: input)
         case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)
         case "get_persona_doc": return try await impl_get_persona_doc(turn: turn, input: input)
@@ -357,7 +169,7 @@ extension SwiftToolDispatcher {
         case "tool_result_page": return await impl_tool_result_page(turn: turn, input: input)
         case "request_interaction": return await impl_request_interaction(invocation: invocation, input: input)
         case "context_lookup": return try await impl_context_lookup(input: input)
-        case "context_expand": return try await impl_context_expand(turn: turn, invocation: invocation, input: input, surface: surface)
+        case "context_expand": return try await impl_context_expand(turn: turn, invocation: invocation, input: input)
         case "scratchpad_read": return try await impl_scratchpad_read(input: input)
         case "recent_trace_summary": return try await impl_recent_trace_summary(turn: turn, invocation: invocation, input: input)
         case "time_now": return ClockReply.read(input) { $0.chat }
@@ -391,47 +203,11 @@ extension SwiftToolDispatcher {
                 source: "chat:\(surface)"
             )
         case "image_generate":
-            let generated = await impl_image_generate(turn: turn, invocation: invocation, input: input, surface: surface)
-            let reply = ToolResult(generated)
-            guard case .object(let generation) = generated, reply.said("ok"), reply.status == generation["status"]?.stringValue else { return reply.payload }
-            let paths = (generation["images"]?.arrayValue ?? []).compactMap { image -> String? in
-                guard let path = (image.objectValue?["path"])?.stringValue else { return nil }
-                return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
-            }
-            // Provider execution stays native; the part composes its raw artifact result with make.add. Only this native receipt grants output provenance, not
-            // the part's returned or supplied JSON.
-            let registration = await Parts(root: dataRoot).call(id: "make-generated", input: .object([
-                    "generated": generated, "prompt": .string(input["prompt"]?.stringValue ?? input["description"]?.stringValue ?? ""),
-                    "ref": input["__make_ref"]?.stringValue.map(JSONValue.string) ?? .null]),
-                    within: .init(actions: ["make.add"], capabilities: []),
-                    invocation: invocation.partInvocation(turn: turn.with(\.makeRegistration, .init(generatedImagePaths: Set(paths))), surface: surface),
-                    as: JSONValue.self)
-            switch registration {
-            case .success(let result): return Self.studioImageInvitation(result)
-            case .failure(let error):
-                // Registration failed after generation completed. Keep the artifacts top-level for every reply surface and persistence.
-                var response = generation
-                response["status"] = .string("failed")
-                response["reason"] = .string("make_registration_failed")
-                response["detail"] = .string(error.message)
-                response["effects"] = .string("unknown")
-                return .object(response)
-            }
+            return await dispatchImageGenerate(turn: turn, invocation: invocation, input: input, surface: surface)
         case let name where Self.macIntegrationAccess(forTool: name) != nil:
             return try await dispatchMacIntegrationTool(turn: turn, invocation: invocation, tool: name, surface: surface, input: input)
         case "mac_location":
-            // The fix the Mac holds answers first, whatever the permission now. Not yet asked: the reader's refusal carries the permission card's
-            // remedy; this Settings-row card is for a denial with nothing held.
-            let held = try await MacLocationReader.read(context: invocation.macContext(dataRoot: dataRoot))
-            let reply = ToolResult(held)
-            guard !Task.isCancelled, !invocation.expired else { throw invocation.cancellationError }
-            guard case .object(let fields) = held, !(reply.said("ok") && reply.status == fields["status"]?.stringValue),
-                  [.denied, .restricted].contains(SystemPermissionPreflight.status(.location)) else { return held }
-            return await Self.requestedInteraction(invocation: invocation, input: [
-                "kind": .string("permission"), "target": .string("location"), "mode": .string("read"),
-                "why": .string("I need Location Services to read where this Mac is."),
-                "decline_consequence": .string("I can ask the paired iPhone for location or use a place you give me.")
-            ], dataRoot: dataRoot)
+            return try await dispatchMacLocation(invocation: invocation)
         case "mac_screenshot_save":
             return try await impl_mac_screenshot_save(turn: turn, invocation: invocation, input: input, surface: surface)
         case let name where Self.fullMacFileToolNames.contains(name):
@@ -452,53 +228,340 @@ extension SwiftToolDispatcher {
         case let name where Self.activityQueryToolNames.contains(name):
             return try await impl_activity_query_tool(turn: turn, tool: name, input: input, surface: surface)
         default:
-            // Authored calls use Parts.run with the selected fingerprint. Parts verifies admission on every run; keeping follows its Full Mac/owner authority
-            // rule. Built-ins matched above.
-            if let record = try registryToolRecord(tool) {
-                guard case .string(let fingerprint)? = record["codeFingerprint"], !fingerprint.isEmpty else {
-                    return .object([
-                        "status": .string("failed"),
-                        "effects": .string("none"),
-                        "reason": .string("unsigned_tool"),
-                        "tool": .string(tool),
-                        "fix": .string("""
-                            Part '\(tool)' has no codeFingerprint in its selected abilities/<id>.js file. Read it with ability.read, then keep \
-                            it with ability.enable.
-                            """),
-                    ])
-                }
-                // A verb the part answers passes its integration switch as the native verb did: granted, or the person's inline grant request.
-                if let gate = try Self.integrationGate(tool: tool, input: input, turn: turn) {
-                    let allowed = try await macIntegrationPermissionStore.allows(gate.integration, mode: gate.mode)
-                    if !allowed {
-                        return try await Self.macIntegrationDeniedEnvelope(invocation: invocation, integration: gate.integration, mode: gate.mode,
-                            store: macIntegrationPermissionStore)
-                    }
-                } else if case .string(let verb)? = input["verb"], case .object(let reach)? = record["reach"],
-                          case .array(let paths)? = reach["readPaths"], !paths.isEmpty, !(await fullMacYoloAdmitted(turn: turn, surface: surface)) {
-                    // The person's files with no app switch over them are Full Mac's to read, refused without a card as a native reader was.
-                    return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("failed"), "reason": .string("full_mac_required"),
-                        "effects": .string("none"), "detail": .string("""
-                            \(verb) reads files outside any app's switch, which needs admitted Full Mac and file-read permission. Check Trust and file \
-                            access at the Mac; nothing was read and no card was raised.
-                            """)]))
-                }
-                // Pin the selected fingerprint so a registry or manifest swap fails with fingerprintMismatch.
-                var partInvocation = invocation.partInvocation(turn: turn, surface: surface)
-                partInvocation = Parts.Invocation(host: partInvocation.host, execution: partInvocation.execution,
-                    arrived: partInvocation.arrived, progressed: partInvocation.progressed,
-                    openScreenWatch: { request, hands in
-                        try await self.openScreenWatch(turn: turn, invocation: invocation, request, hands: hands, surface: surface)
-                    })
-                return try await Parts(root: dataRoot)
-                    .run(id: tool, input: .object(input.filter { $0.key != "__session_id" }),
-                         requiredFingerprint: invocation.valueCall.flatMap { $0.id == tool ? $0.version : nil } ?? fingerprint,
-                         invocation: partInvocation)
-            }
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: '\(tool)' is not in the dispatch table"
-            )
+            return try await dispatchAuthoredPart(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         }
+    }
+
+    /// Read a file or return its file-access interaction.
+    private func dispatchNormalizedFileRead(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
+        do {
+            return try await impl_read_file(turn: turn, invocation: invocation, input: input, surface: surface)
+        } catch {
+            guard let need = fileOpsNeedEnvelope(invocation: invocation,
+                tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
+            ) else { throw error }
+            return need
+        }
+    }
+
+    /// Select the metadata path and supply its file-access interaction when needed.
+    private func dispatchNormalizedFileMetadata(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
+        var input = input
+        if tool == "list_dir" { input = Self.listDirInput(input) }
+        if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+            return tool == "list_dir" ? try await impl_full_mac_list_dir(turn: turn, invocation: invocation, input: input, surface: surface)
+                : try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
+        }
+        do {
+            return try await impl_file_metadata(turn: turn, invocation: invocation, tool: tool, input: input)
+        } catch {
+            guard let need = fileOpsNeedEnvelope(invocation: invocation,
+                tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
+            ) else { throw error }
+            return need
+        }
+    }
+
+    /// Select the file mutation path and record successful part writes.
+    private func dispatchNormalizedFileMutation(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
+        if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+            return partWrote(invocation: invocation, try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: input,
+                surface: surface))
+        }
+        do {
+            return partWrote(invocation: invocation, try await impl_trusted_file_mutation(turn: turn, invocation: invocation, tool: tool, input: input))
+        } catch {
+            guard let need = fileOpsNeedEnvelope(invocation: invocation,
+                tool: tool, mode: .write, path: input["path"]?.stringValue, error: error
+            ) else { throw error }
+            return need
+        }
+    }
+
+    /// A contributed tool runs in its owner's executor; each call the app door carries is checked by the pre-approval and file-read preview
+    /// refusals.
+    private func dispatchContributedTool(_ appTools: any ChatToolExecuting, turn: Turn, invocation: ChatToolInvocation, tool: String,
+        input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if tool == "app" {
+            guard var door = invocation.appDoor else {
+                throw ToolFailureError("The app door has no dispatcher. Nothing ran.", effects: .none, owner: "App dispatch")
+            }
+            door.validate = { name, arguments, turn, invocation in
+                if let refusal = await self.preApprovalRefusal(turn: turn, invocation: invocation, tool: name, input: arguments,
+                    surface: surface) { return refusal }
+                return await self.fileReadPreviewRefusal(turn: turn, invocation: invocation, tool: name, input: arguments, surface: surface)
+            }
+            return try await appTools.execute(tool: tool, input: input, surface: surface,
+                turn: turn, invocation: invocation.with(\.appDoor, door))
+        }
+        return try await appTools.execute(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+    }
+
+    /// A web search with its query, categories and time range; a failed search reports that it changed nothing.
+    private func dispatchWebSearch(input: [String: JSONValue]) async throws -> JSONValue {
+        let query = JSONValue.trimmedStringOrEmpty(input["query"])
+        let categories = JSONValue.trimmedStringOrEmpty(input["categories"])
+        let timeRange = JSONValue.trimmedStringOrEmpty(input["time_range"])
+        guard !query.isEmpty else {
+            throw ToolFailureError("search needs query: the words to search for.", argumentPath: "query", effects: .none)
+        }
+        let reader = pageReader
+        var result = await WebSearchRoutes.search {
+            try await reader.search(query: query, categories: categories.isEmpty ? nil : categories,
+                                    timeRange: timeRange.isEmpty ? nil : timeRange)
+        }
+        let reply = ToolResult(result)
+        // A search only reads: a failed one changed nothing.
+        if case .object(var fields) = result,
+           !(reply.said("ok") && reply.status == fields["status"]?.stringValue) {
+            fields["effects"] = .string("none")
+            result = .object(fields)
+        }
+        return result
+    }
+
+    /// A public page read over HTTP, located by `find` when asked, answered through the sense door; a thin script shell is read again in Chrome.
+    private func dispatchReadPage(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
+        guard case .string(let raw)? = input["url"], case let url = Self.withWebScheme(raw),
+              let parsed = URL(string: url),
+              ["http", "https"].contains(parsed.scheme?.lowercased() ?? ""),
+              parsed.host?.isEmpty == false, parsed.user == nil, parsed.password == nil else {
+            throw AutonomyGateError.toolDenied(reason: "read_page requires a public http(s) URL.")
+        }
+        let find: String?
+        switch input["find"] {
+        case nil, .null?: find = nil
+        case .string(let words)? where !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+            find = words.trimmingCharacters(in: .whitespacesAndNewlines)
+        default: throw AutonomyGateError.toolDenied(reason: "find must contain the words to locate in the page.")
+        }
+        let around: Int
+        switch input["around"] {
+        case nil, .null?: around = 1
+        case .int(let value)? where (0...3).contains(value): around = Int(value)
+        default: throw AutonomyGateError.toolDenied(reason: "around must be an integer from 0 through 3 surrounding paragraphs.")
+        }
+        let full: Bool
+        switch input["full"] {
+        case nil, .null?: full = false
+        case .bool(let value)?: full = value
+        default: throw AutonomyGateError.toolDenied(reason: "full must be true or false.")
+        }
+        let fetched: JSONValue
+        do { fetched = try await self.pageReader.fetchURL(url).readJSON(find: find, around: around, full: full) }
+        catch ResearchClientError.httpStatus(let status) {
+            var failure: [String: JSONValue] = ["status": .string("failed"), "reason": .string("http_status"),
+                "http_status": .int(Int64(status)),
+                "url": .string(url), "effects": .string("none"),
+                "message": .string(ResearchClientError.httpStatus(status).localizedDescription)]
+            if [404, 410].contains(status) {
+                failure["remedy"] = .object(["kind": .string("inspect"),
+                    "instruction": .string("Use a different address or search for the page."), "next_call": .null])
+            }
+            return .object(failure)
+        }
+        catch let error as ResearchClientError where error.failureReason != nil {
+            return .object(["status": .string("failed"), "reason": .string(error.failureReason!),
+                "url": .string(url), "effects": .string("none"), "message": .string(error.localizedDescription)])
+        }
+        let observedURL: String = if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
+            case .string(let finalURL)? = coverage["final_url"] { finalURL } else { url }
+        if case .object(let httpFields) = fetched, httpFields["coverage"]?.objectValue?["thin_page"] == .bool(true) {
+            return try await readPageThroughBrowser(httpFields: httpFields, fetched: fetched, find: find, full: full, observedURL: observedURL,
+                turn: turn, invocation: invocation, input: input)
+        }
+        let corner = SenseCorner.site(host: URL(string: observedURL)?.host?.lowercased() ?? parsed.host!.lowercased())
+        var senseInput = input
+        senseInput["__sense_action"] = .string("web.read")
+        let result = try await SenseDoor.read(corner: corner, address: observedURL, input: senseInput,
+            scope: turn.verifiedSessionID ?? "",
+            nativeCorner: .stream(id: "web"),
+            operation: invocation.senseOperation(turn: turn),
+            raw: { _ in fetched },
+            material: { document, _ in
+                let reply = ToolResult(document)
+                guard case .object(let fields) = document,
+                      !(reply.said("failed") && reply.status == fields["status"]?.stringValue) else {
+                    throw SenseFailure(code: "source_unavailable", message: "The original reader refused this read.")
+                }
+                return .pageSnapshot(document)
+            })
+        return result
+    }
+
+    /// A thin HTTP page is read in a background Chrome tab; Chrome's text serves only when it measures richer, and the HTTP read is kept either way.
+    private func readPageThroughBrowser(httpFields: [String: JSONValue], fetched: JSONValue, find: String?, full: Bool, observedURL: String,
+        turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
+        // A successfully read script shell requires rendering. This is
+        // reader selection, never recovery from an HTTP failure.
+        func retainingHTTP(reason: String, attempted: Bool, browser: JSONValue? = nil, note: String) -> JSONValue {
+            var fields = httpFields
+            fields["status"] = .string("partial")
+            fields["reason"] = .string(reason)
+            fields["text_reader"] = .string("http")
+            fields["used_browser"] = .bool(attempted)
+            fields["http_read"] = fetched
+            fields["browser_read"] = browser
+            fields["reader_note"] = .string(note)
+            return .object(fields)
+        }
+        guard let door = invocation.appDoor else {
+            return retainingHTTP(reason: "browser_door_unavailable", attempted: false,
+                note: "This call has no Chrome app door. The HTTP text is retained; rendered content remains unknown.")
+        }
+        var arguments: [String: JSONValue] = ["url": .string(observedURL), "new_tab": .bool(true)]
+        if let find, !full { arguments["find"] = .string(find) }
+        for key in ["raw", "wrong", "why"] where input[key] != nil { arguments[key] = input[key] }
+        let browser: JSONValue
+        do {
+            // This nested navigation owns the rendered read. The enclosing
+            // workspace sees web.read, so it cannot attach Chrome's page.
+            browser = CanonicalToolNameDispatcher.actionResult(try await door.perform("app",
+                ["action": .string("chrome.navigate"), "args": .object(arguments)], turn,
+                invocation.with(\.frameSource, "direct")), action: "chrome.navigate")
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            try Task.checkCancellation()
+            return retainingHTTP(reason: "browser_read_unavailable", attempted: true,
+                browser: ChatToolOutcome.failure(error: error, tool: "chrome.navigate"),
+                note: "Chrome did not return a readable page; its actual failure is attached. The HTTP text is retained.")
+        }
+        guard case .object(var fields) = browser else {
+            return retainingHTTP(reason: "browser_read_unavailable", attempted: true, browser: browser,
+                note: "Chrome returned no page envelope. The HTTP text is retained; rendered content remains unknown.")
+        }
+        let page = fields["page"]?.objectValue
+        guard case .string(let httpText)? = httpFields["text"],
+              let browserText = page?["text"]?.stringValue ?? page?["sense_page"]?.stringValue else {
+            return retainingHTTP(reason: "browser_content_unmeasured", attempted: true, browser: browser,
+                note: "Chrome supplied no measured readable text. The HTTP text is retained; Chrome's actual page or blocker is attached.")
+        }
+        // Measure the exact text each reader would serve, including an authored sense.
+        let browserCharacters = browserText.filter { !$0.isWhitespace }.count
+        let httpCharacters = httpText.filter { !$0.isWhitespace }.count
+        let browserIsEmpty = browserCharacters == 0
+            || ["read_window_empty", "find_not_observed"].contains(page?["reason"]?.stringValue ?? "")
+        guard !browserIsEmpty, browserCharacters > httpCharacters else {
+            let reason = browserIsEmpty ? "browser_read_empty" : "browser_read_not_richer"
+            let detail = page?["reason"]?.stringValue ?? "No additional readable content was observed in this window."
+            return retainingHTTP(reason: reason, attempted: true, browser: browser,
+                note: "Chrome's background read did not contain more readable content "
+                    + "(\(browserCharacters) non-whitespace characters in served text; HTTP \(httpCharacters)). "
+                    + "The HTTP text is retained. Chrome: " + detail)
+        }
+        fields["text"] = .string(browserText)
+        if let status = page?["status"] { fields["status"] = status }
+        if fields["status"] == nil { fields["status"] = .string("partial") }
+        fields["used_browser"] = .bool(true)
+        fields["text_reader"] = .string("browser")
+        fields["http_read"] = fetched
+        if fields["url"] == nil { fields["url"] = .string(observedURL) }
+        fields["reader_note"] = .string("""
+            Chrome supplied more readable content than the thin HTTP text, so its background-tab read supplies text. The HTTP extraction and its \
+            source receipt remain in http_read. Chrome's receipt and page describe what actually happened. Consent was not accepted or dismissed.
+            """)
+        return .object(fields)
+    }
+
+    /// A generated image is registered as a made artifact through its part; a failed registration keeps the images and says so.
+    private func dispatchImageGenerate(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async -> JSONValue {
+        let generated = await impl_image_generate(turn: turn, invocation: invocation, input: input, surface: surface)
+        let reply = ToolResult(generated)
+        guard case .object(let generation) = generated, reply.said("ok"), reply.status == generation["status"]?.stringValue else { return reply.payload }
+        let paths = (generation["images"]?.arrayValue ?? []).compactMap { image -> String? in
+            guard let path = (image.objectValue?["path"])?.stringValue else { return nil }
+            return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+        }
+        // Provider execution stays native; the part composes its raw artifact result with make.add. Only this native receipt grants output provenance, not
+        // the part's returned or supplied JSON.
+        let registration = await Parts(root: dataRoot).call(id: "make-generated", input: .object([
+                "generated": generated, "prompt": .string(input["prompt"]?.stringValue ?? input["description"]?.stringValue ?? ""),
+                "ref": input["__make_ref"]?.stringValue.map(JSONValue.string) ?? .null]),
+                within: .init(actions: ["make.add"], capabilities: []),
+                invocation: invocation.partInvocation(turn: turn.with(\.makeRegistration, .init(generatedImagePaths: Set(paths))), surface: surface),
+                as: JSONValue.self)
+        switch registration {
+        case .success(let result): return Self.studioImageInvitation(result)
+        case .failure(let error):
+            // Registration failed after generation completed. Keep the artifacts top-level for every reply surface and persistence.
+            var response = generation
+            response["status"] = .string("failed")
+            response["reason"] = .string("make_registration_failed")
+            response["detail"] = .string(error.message)
+            response["effects"] = .string("unknown")
+            return .object(response)
+        }
+    }
+
+    /// The Mac's held location fix answers first; a denial with nothing held raises the Location permission card.
+    private func dispatchMacLocation(invocation: ChatToolInvocation) async throws -> JSONValue {
+        // The fix the Mac holds answers first, whatever the permission now. Not yet asked: the reader's refusal carries the permission card's
+        // remedy; this Settings-row card is for a denial with nothing held.
+        let held = try await MacLocationReader.read(context: invocation.macContext(dataRoot: dataRoot))
+        let reply = ToolResult(held)
+        guard !Task.isCancelled, !invocation.expired else { throw invocation.cancellationError }
+        guard case .object(let fields) = held, !(reply.said("ok") && reply.status == fields["status"]?.stringValue),
+              [.denied, .restricted].contains(SystemPermissionPreflight.status(.location)) else { return held }
+        return await Self.requestedInteraction(invocation: invocation, input: [
+            "kind": .string("permission"), "target": .string("location"), "mode": .string("read"),
+            "why": .string("I need Location Services to read where this Mac is."),
+            "decline_consequence": .string("I can ask the paired iPhone for location or use a place you give me.")
+        ], dataRoot: dataRoot)
+    }
+
+    /// A tool the built-ins do not name runs as an authored part pinned to its selected fingerprint, behind its integration switch or Full Mac
+    /// file reach.
+    private func dispatchAuthoredPart(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue], surface: String)
+        async throws -> JSONValue {
+        // Authored calls use Parts.run with the selected fingerprint. Parts verifies admission on every run; keeping follows its Full Mac/owner authority
+        // rule. Built-ins matched above.
+        if let record = try registryToolRecord(tool) {
+            guard case .string(let fingerprint)? = record["codeFingerprint"], !fingerprint.isEmpty else {
+                return .object([
+                    "status": .string("failed"),
+                    "effects": .string("none"),
+                    "reason": .string("unsigned_tool"),
+                    "tool": .string(tool),
+                    "fix": .string("""
+                        Part '\(tool)' has no codeFingerprint in its selected abilities/<id>.js file. Read it with ability.read, then keep \
+                        it with ability.enable.
+                        """),
+                ])
+            }
+            // A verb the part answers passes its integration switch as the native verb did: granted, or the person's inline grant request.
+            if let gate = try Self.integrationGate(tool: tool, input: input, turn: turn) {
+                let allowed = try await macIntegrationPermissionStore.allows(gate.integration, mode: gate.mode)
+                if !allowed {
+                    return try await Self.macIntegrationDeniedEnvelope(invocation: invocation, integration: gate.integration, mode: gate.mode,
+                        store: macIntegrationPermissionStore)
+                }
+            } else if case .string(let verb)? = input["verb"], case .object(let reach)? = record["reach"],
+                      case .array(let paths)? = reach["readPaths"], !paths.isEmpty, !(await fullMacYoloAdmitted(turn: turn, surface: surface)) {
+                // The person's files with no app switch over them are Full Mac's to read, refused without a card as a native reader was.
+                return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("failed"), "reason": .string("full_mac_required"),
+                    "effects": .string("none"), "detail": .string("""
+                        \(verb) reads files outside any app's switch, which needs admitted Full Mac and file-read permission. Check Trust and file \
+                        access at the Mac; nothing was read and no card was raised.
+                        """)]))
+            }
+            // Pin the selected fingerprint so a registry or manifest swap fails with fingerprintMismatch.
+            var partInvocation = invocation.partInvocation(turn: turn, surface: surface)
+            partInvocation = Parts.Invocation(host: partInvocation.host, execution: partInvocation.execution,
+                arrived: partInvocation.arrived, progressed: partInvocation.progressed,
+                openScreenWatch: { request, hands in
+                    try await self.openScreenWatch(turn: turn, invocation: invocation, request, hands: hands, surface: surface)
+                })
+            return try await Parts(root: dataRoot)
+                .run(id: tool, input: .object(input.filter { $0.key != "__session_id" }),
+                     requiredFingerprint: invocation.valueCall.flatMap { $0.id == tool ? $0.version : nil } ?? fingerprint,
+                     invocation: partInvocation)
+        }
+        throw AutonomyGateError.toolDenied(
+            reason: "SwiftToolDispatcher: '\(tool)' is not in the dispatch table"
+        )
     }
 }
 extension SwiftToolDispatcher: PureToolArgumentValidating {

@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -43,7 +42,7 @@ struct WorkActivityPushRegistration: Codable, Equatable, Sendable {
         }
     }
     static func fingerprint(_ pairing: String) -> String {
-        SHA256.hash(data: Data(pairing.utf8)).map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(utf8: pairing)
     }
     static func read(_ value: JSONValue?) throws -> Self? {
         guard let value else { return nil }

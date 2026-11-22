@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 import Desk
 // Blueprint: | `AgentScreenRooms+Agents.swift` | `AgentScreen`, `agentsTarget`, `delegationsRoom`: exact owner liveness; crews are the agent's lines |
@@ -15,7 +16,7 @@ extension AgentScreen {
             default: break
             }
             if name.hasPrefix("job."), let n = Int(name.dropFirst(4)), let id = try withNames(workspace: workspace, dataRoot, { $0.id("job", n) }) {
-                return .page(await jobRoom(workspace: workspace, id: id, name: name, dataRoot: dataRoot)
+                return .page(await jobRoom(id: id, name: name, dataRoot: dataRoot)
                     ?? "\(name) has no matching record in the available delegation sources; this does not establish removal.\nBack: home · delegations.")
             }
             for (verb, paused) in [(".pause", true), (".resume", false)] where name.hasSuffix(verb) {
@@ -30,9 +31,9 @@ extension AgentScreen {
 
     // MARK: Delegations
 
-    private static func jobs(dataRoot: URL, now: Date, jobID: String? = nil) -> DelegationStatusReadSnapshot {
+    private static func jobs(dataRoot: URL, jobID: String? = nil) -> DelegationStatusReadSnapshot {
         DelegationStatusProjector(configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
-            .readSnapshot(now: now, limit: jobID == nil ? 12 : nil, jobID: jobID)
+            .readSnapshot(limit: jobID == nil ? 12 : nil, jobID: jobID)
     }
 
     private static func sourceRows(_ snapshot: DelegationStatusReadSnapshot) -> [String] {
@@ -49,20 +50,20 @@ extension AgentScreen {
         }
         if let delivery = job.deliveryOutcome { parts.append("delivery: " + delivery) }
         if job.completedAt == nil { parts.append("completion time not recorded") }
-        if let at = (job.completedAt ?? job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(date) {
+        if let at = (job.completedAt ?? job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) {
             parts.append(age(now.timeIntervalSince(at)))
         }
         return parts.joined(separator: " · ")
     }
 
     private static func jobTitle(_ job: DelegationReadout) -> String {
-        nonEmpty(job.requestTextHead).map(firstLine) ?? nonEmpty(job.topicSlug) ?? "work for \(job.agent)"
+        job.requestTextHead.trimmedNonEmpty.map(firstLine) ?? job.topicSlug.trimmedNonEmpty ?? "work for \(job.agent)"
     }
 
     /// Keep job state in the delegation view and conversation in its owning room.
     static func delegationsRoom(workspace: WorkspaceOperation, dataRoot: URL, now: Date = Date()) -> String {
         do {
-            let snapshot = jobs(dataRoot: dataRoot, now: now)
+            let snapshot = jobs(dataRoot: dataRoot)
             let all = snapshot.jobs
             let list = all.prefix(12)
             let lines: [String] = try withNames(workspace: workspace, dataRoot) { book in
@@ -84,9 +85,9 @@ extension AgentScreen {
         } catch { return nameFailure(error) }
     }
 
-    static func jobRoom(workspace: WorkspaceOperation, id: String, name: String, dataRoot: URL, now: Date = Date()) async -> String? {
+    static func jobRoom(id: String, name: String, dataRoot: URL, now: Date = Date()) async -> String? {
         do {
-            let snapshot = jobs(dataRoot: dataRoot, now: now, jobID: id)
+            let snapshot = jobs(dataRoot: dataRoot, jobID: id)
             guard let job = snapshot.jobs.first(where: { $0.id == id }) else {
                 return screen([name,
                     "record not observed"], [["""
@@ -95,17 +96,13 @@ extension AgentScreen {
                         """],
                     section("SOURCES", sourceRows(snapshot))], verbs: [("delegations", "newest observed jobs")])
             }
-            let asked = nonEmpty(job.requestTextHead).map { plainLines($0).prefix(3).map { clip($0, 100) } } ?? [clip(jobTitle(job), 100)]
-            let replyText = nonEmpty(job.agentReplyText) ?? nonEmpty(job.agentReplyTextHead) ?? nonEmpty(job.completionTextHead)
-            if let replyText {
-                ContactThread.consume(.init(text: replyText, stamp: .init(source: job.agent.isEmpty ? nil : job.agent, steeredBy: [], contact: true)),
-                    mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) })
-            }
+            let asked = job.requestTextHead.trimmedNonEmpty.map { plainLines($0).prefix(3).map { clip($0, 100) } } ?? [clip(jobTitle(job), 100)]
+            let replyText = job.agentReplyText.trimmedNonEmpty ?? job.agentReplyTextHead.trimmedNonEmpty ?? job.completionTextHead.trimmedNonEmpty
             var reply = replyText.map { plainLines($0).prefix(5).map { clip($0, 100) } }
                 ?? ["no reply text retained; read the recorded execution and delivery state"]
             if job.agentReplyTruncated { reply.append("(reply cut; the full text: app agent.read agent \(job.agent))") }
             var about: [String] = []
-            if let error = nonEmpty(job.executionError) { about.append(jobFailure(job, error: error)) }
+            if let error = job.executionError.trimmedNonEmpty { about.append(jobFailure(job, error: error)) }
             if let handle = job.deskHandle, let desk = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState(),
                let item = desk.items.first(where: { $0.handle == handle }) {
                 about.append("desk." + item.alias + " " + clip(item.title, 60))

@@ -42,17 +42,17 @@ public enum TelegramVoiceTranscriptionError: Error, Equatable, LocalizedError, S
     public var errorDescription: String? {
         switch self {
         case .missingAudioBytes:
-            return "voice transcription: missing audio bytes"
+            return "The voice note had no audio in it"
         case .malformedResponse:
-            return "voice transcription: malformed response"
+            return "No words could be made out in the voice note"
         case .conversionFailed(let message):
-            return "voice transcription: audio conversion failed: \(message)"
+            return message
         case .speechPermissionDenied(let message):
-            return "voice transcription: speech recognition permission denied: \(message)"
+            return "Speech Recognition is not allowed (\(message))"
         case .speechUnavailable(let message):
-            return "voice transcription: Apple Speech unavailable: \(message)"
+            return "Speech recognition is unavailable: \(message)"
         case .speechRecognitionFailed(let message):
-            return "voice transcription: Apple Speech recognition failed: \(message)"
+            return "Apple Speech recognition failed: \(message)"
         }
     }
 }
@@ -144,7 +144,7 @@ enum TelegramVoiceAudioPreparer {
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         let id = UUID().uuidString
         guard let inputExt = fileExtension(for: attachment.captureFilename) ?? fileExtension(forMIMEType: attachment.mimeType) else {
-            throw TelegramVoiceTranscriptionError.conversionFailed("Audio has no declared filename format or supported MIME type")
+            throw TelegramVoiceTranscriptionError.conversionFailed("This voice note's audio format could not be identified.")
         }
         let input = tempRoot.appendingPathComponent("\(id).\(inputExt)")
         let output = tempRoot.appendingPathComponent("\(id).wav")

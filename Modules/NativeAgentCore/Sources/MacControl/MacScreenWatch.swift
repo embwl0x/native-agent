@@ -27,11 +27,13 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             guard case .string(let app)? = args["app"], !app.trimmingCharacters(in: .whitespaces).isEmpty else {
                 throw bad("app names the app whose front window to watch.")
             }
-            let fps = args["fps"].map(MacScreenWatch.number) ?? 10, seconds = args["seconds"].map(MacScreenWatch.number) ?? 60
+            // Only missing settings take defaults. Supplied values still have to pass the guards below.
+            let fps = args["fps"].map { $0.finiteDoubleValue } ?? 10
+            let seconds = args["seconds"].map { $0.finiteDoubleValue } ?? 60
             guard let fps, (1...30).contains(fps), fps.rounded() == fps else { throw bad("fps is a whole number from 1 to 30.") }
             guard let seconds, seconds > 0, seconds <= 600 else { throw bad("seconds is more than 0 and at most 600.") }
             if let raw = args["region"] {
-                guard case .array(let values) = raw, values.count == 4, case let n = values.compactMap(MacScreenWatch.number),
+                guard case .array(let values) = raw, values.count == 4, case let n = values.compactMap(\.finiteDoubleValue),
                       n.count == 4, n[0] >= 0, n[1] >= 0, n[2] > 0, n[3] > 0 else {
                     throw bad("region is [x, y, w, h] in the window's points, from its top-left corner.")
                 }
@@ -40,8 +42,6 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             self.app = app; self.fps = Int(fps); self.seconds = seconds
         }
     }
-
-    public typealias Opener = @Sendable (Request, Bool) async throws -> MacScreenWatch
 
     /// Retain Screen control’s refusal card as the receipt.
     public struct Refusal: Error, Sendable {
@@ -426,14 +426,6 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
                 "failure": failure.map { .string($0.message) } ?? .null,
                 "remedy": failure?.remedy ?? .null,
                 "seconds": .double(((ProcessInfo.processInfo.systemUptime - started) * 10).rounded() / 10)])
-        }
-    }
-
-    static func number(_ value: JSONValue) -> Double? {
-        switch value {
-        case .int(let n): Double(n)
-        case .double(let n) where n.isFinite: n
-        default: nil
         }
     }
 }

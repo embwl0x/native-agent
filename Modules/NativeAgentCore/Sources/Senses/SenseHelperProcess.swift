@@ -1,6 +1,5 @@
 import AuthoredCapabilities
 import Foundation
-import CryptoKit
 import Darwin
 import PersistenceCore
 import NativeAgentCore
@@ -20,7 +19,8 @@ actor SenseHelperProcess {
     private let dataRoot: URL
     private let script: String
     private let notebook: URL
-    private let scratch: URL
+    private let selection: String
+    private let slot: String
     private let limits: HelperSenseRunner.Limits
     private let apps: (@Sendable (JSONValue, [String: String], SenseReadOperation) async throws -> JSONValue)?
     private let transport: OwnedProgramProcess
@@ -51,12 +51,14 @@ actor SenseHelperProcess {
     private var idleHolds = 0
 
     init(record: SenseRecord, dataRoot: URL, script: String, notebook: URL, scratch: URL, helper: URL,
-         profile: String, limits: HelperSenseRunner.Limits, initialAddress: String?, apps: (@Sendable (JSONValue, [String: String],
+         profile: String, limits: HelperSenseRunner.Limits, selection: String, slot: String, initialAddress: String?,
+         apps: (@Sendable (JSONValue, [String: String],
              SenseReadOperation) async throws -> JSONValue)?,
          onSourceChange: @escaping @Sendable () -> Void,
          onSettled: @escaping @Sendable () async -> Void,
          onExit: @escaping @Sendable (SenseFailure?) async -> Void) throws {
-        self.record = record; self.dataRoot = dataRoot; self.script = script; self.notebook = notebook; self.scratch = scratch
+        self.record = record; self.dataRoot = dataRoot; self.script = script; self.notebook = notebook
+        self.selection = selection; self.slot = slot
         self.limits = limits; self.onExit = onExit; self.onSettled = onSettled
         self.onSourceChange = onSourceChange
         self.sourceAddress = initialAddress
@@ -88,7 +90,7 @@ actor SenseHelperProcess {
 
     func request(_ request: SenseRequest, source: any SenseSourceProvider,
                  operation: SenseReadOperation,
-                 changed: SenseMaterial? = nil) async -> SenseOutcome {
+                 changed: SenseMaterial? = nil, eventRoute: SenseNewsBoard.ViewRoute? = nil) async -> SenseOutcome {
         let isEvent = if case .event = request { true } else { false }
         let operation = request == .watch || isEvent ? operation.observing() : operation
         let perform = operation.perform
@@ -118,180 +120,8 @@ actor SenseHelperProcess {
                 pending = Pending(id: id, events: events, stallWindow: limits.requestSeconds)
                 // The worker holds this operation's turn, action dependency and read captures through settlement.
                 let worker = Task<SenseOutcome, Never> {
-                    do {
-                        let address: String?
-                        switch request {
-                        case .read(let a): address = a
-                        case .act(_, let a, _): address = a
-                        case .watch, .event: address = sourceAddress
-                        }
-                        var wire: JSONValue = .null
-                        if !isEvent {
-                            let material: SenseMaterial
-                            if let changed { material = changed }
-                            else { material = try await source.material(for: record.corner, address: address, operation: operation) }
-                            try Task.checkCancellation()
-                            if !isSite || request == .watch {
-                                sourceAddress = address
-                            } else if case .read = request { sourceAddress = address }
-                            if case .file(let path, _, _) = material {
-                                sourceFile = path
-                                if sourceAddress == nil { sourceAddress = path }
-                            }
-                            if case .pageSnapshot(.object(let fields)) = material,
-                               case .int(let tab)? = fields["tabId"] { sourceTab = String(tab) }
-                            wire = try await Self.materialWire(material, dataRoot: dataRoot, source: source)
-                            if case .read = request, case .fileKind = record.corner, let address,
-                               !address.hasPrefix("/"), !address.hasPrefix("~"),
-                               let query = address.split(separator: "?", maxSplits: 1).dropFirst().first,
-                               let items = URLComponents(string: "?" + String(query))?.queryItems,
-                               case .object(let fields) = wire,
-                               items.first(where: { $0.name == "version" })?.value.map(JSONValue.string) != fields["version"] {
-                                throw SenseFailure(code: "file_changed", message: "The file changed; read from the start.")
-                            }
-                        }
-                        try Task.checkCancellation()
-                        if changed != nil {
-                            try send(.object(["id": .int(Int64(id)), "type": .string("changed"),
-                                "timeoutSeconds": .double(pending?.stallWindow ?? limits.requestSeconds), "material": wire]))
-                        } else {
-                            var run: [String: JSONValue] = ["id": .int(Int64(id)), "type": .string("run"),
-                                "sense": try JSONValue.fromEncodable(record),
-                                "request": Self.requestWire(request),
-                                "timeoutSeconds": .double(pending?.stallWindow ?? limits.requestSeconds), "material": wire]
-                            run["program"] = try .fromEncodable(OwnedProgram(kind: .sense, id: record.id,
-                                version: String(record.version), source: script, entry: .sense,
-                                reach: record.reach, seconds: limits.requestSeconds))
-                            try send(.object(run))
-                        }
-                        transport.begin(id: id, kind: .sense, seconds: pending?.stallWindow ?? limits.requestSeconds)
-                        var progress = SenseEntryProgress()
-                        let entryAddress = changed != nil || isEvent || request == .watch ? nil : address
-                        var page: NativePage?
-                        var acted: JSONValue?
-                        var actFailure: SenseFailure?
-                        var lastCallID: Int64 = 0
-                        var logBytes = 0
-                        var view: SenseInteractiveView?
-                        var presented = false
-                        for try await message in stream {
-                            try Task.checkCancellation()
-                            guard case .object(let fields) = message, case .string(let type)? = fields["type"] else {
-                                throw SenseFailure(code: "bad_output", message: "Sense helper sent an invalid message.")
-                            }
-                            if type != "done", type != "failed", type != "progress" {
-                                guard case .int(let callID)? = fields["callID"], callID > lastCallID else {
-                                    throw SenseFailure(code: "bad_output", message: "Sense API requires increasing callIDs.")
-                                }
-                                lastCallID = callID
-                            }
-                            switch type {
-                            case "progress":
-                                let accepted: Bool
-                                if let readAddress = fields["readAddress"] {
-                                    // Only supplied snapshots permit local reads without a source round trip.
-                                    let expected = entryAddress.map(JSONValue.string) ?? .null
-                                    guard wire != .null,
-                                          readAddress == expected, fields["n"] == nil else {
-                                        throw SenseFailure(code: "bad_output", message: "Sense progress must identify its supplied source read.")
-                                    }
-                                    accepted = progress.read(address: entryAddress)
-                                } else {
-                                    let value: Double
-                                    switch fields["n"] {
-                                    case .int(let n): value = Double(n)
-                                    case .double(let n): value = n
-                                    default: throw SenseFailure(code: "bad_output", message: "Sense progress requires a finite number.")
-                                    }
-                                    accepted = try progress.advance(to: value) != nil
-                                }
-                                if accepted { try transport.renewProgress(id) }
-                            case "publish":
-                                page = try decodePage(fields["page"], material: wire)
-                                try transport.renewProgress(id)
-                            case "present":
-                                presented = true
-                                view = try SenseWire.view(fields["view"], senseID: record.id, version: record.version)
-                            case "notify":
-                                let news = try decodeNews(fields["news"])
-                                try transport.renewProgress(id)
-                                try await postNews(news)
-                            case "source_read", "source_watch", "state_get", "state_set", "app_read":
-                                let waitStarted = try transport.suspend(id)
-                                do {
-                                    try await service(fields, source: source, operation: operation)
-                                    if type == "source_read" {
-                                        let readAddress = if case .string(let a)? = fields["address"] { a } else { entryAddress }
-                                        if progress.read(address: readAddress) {
-                                            try transport.renewProgress(id)
-                                        }
-                                    }
-                                }
-                                catch {
-                                    let failure = HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))
-                                    let replyType = type == "app_read" ? "app_reply" : type.hasPrefix("state_") ? "state_reply" : "source_reply"
-                                    try send(.object(["type": .string(replyType), "id": fields["id"] ?? .null,
-                                        "callID": fields["callID"] ?? .null, "failure": try JSONValue.fromEncodable(failure)]))
-                                }
-                                try transport.resume(id, since: waitStarted)
-                            case "log":
-                                guard case .string(let text)? = fields["text"], logBytes + text.utf8.count <= 2_048 else {
-                                    throw SenseFailure(code: "bad_output", message: "Sense logs exceed 2 KiB or are malformed.")
-                                }
-                                logBytes += text.utf8.count
-                            case "act":
-                                guard case .act = request, record.verbsEnabled, let perform,
-                                      case .string(let verb)? = fields["verb"], case .string(let address)? = fields["address"] else {
-                                    throw SenseFailure(code: "act_denied", message: "Sense actions require an active act request and the app door.")
-                                }
-                                let waitStarted = try transport.suspend(id)
-                                do {
-                                    acted = try await perform(verb, address, fields["args"] ?? .object([:]))
-                                    // Save returned effects before observing cancellation or writing to a stopped helper.
-                                    if let acted { pending?.returnedActions.append(acted) }
-                                    try Task.checkCancellation()
-                                    try reply(fields, type: "act_reply", value: acted ?? .null, field: "result")
-                                } catch {
-                                    let failure = HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))
-                                    actFailure = failure
-                                    try send(.object(["type": .string("act_reply"), "id": fields["id"] ?? .null,
-                                        "callID": fields["callID"] ?? .null, "failure": try JSONValue.fromEncodable(failure)]))
-                                }
-                                try transport.resume(id, since: waitStarted)
-                            case "done":
-                                try transport.claimCompletion(id)
-                                if case .read = request, page == nil {
-                                    throw SenseFailure(code: "bad_output", message: "Sense read finished without a page.")
-                                }
-                                if presented, record.status == .on, let registry = SensesHub.shared.registry,
-                                   let current = try await registry.sense(for: record.corner), current.status == .on,
-                                   current.id == record.id, current.version == record.version {
-                                    await SenseNewsBoard.shared.present(view)
-                                }
-                                if case .read = request {
-                                    guard let page else { throw SenseFailure(code: "bad_output", message: "Sense read finished without a page.") }
-                                    return .page(page, SenseProvenance(record: record))
-                                } else {
-                                    if changed == nil, case .act = request {
-                                        if let actFailure { throw actFailure }
-                                        guard let acted else {
-                                            throw SenseFailure(code: "no_action", message: "The sense performed no door action; no success receipt exists.")
-                                        }
-                                        return .acted(acted, SenseProvenance(record: record))
-                                    }
-                                    if request == .watch, changed == nil {
-                                        watching = !isSite || observation != nil
-                                    }
-                                    return .acted(.null, SenseProvenance(record: record))
-                                }
-                            default: throw SenseFailure(code: "bad_output", message: "Unknown sense helper message: \(type)")
-                            }
-                        }
-                        throw CancellationError()
-                    } catch {
-                        let failure = HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))
-                        return .failed(failure)
-                    }
+                    await runRequestWorker(request, source: source, operation: operation, changed: changed, isEvent: isEvent, eventRoute: eventRoute,
+                                           perform: perform, id: id, stream: stream)
                 }
                 pending?.worker = worker
                 // Join the worker before terminal recording, release and response; this retained owner must never join itself.
@@ -312,6 +142,220 @@ actor SenseHelperProcess {
         } onCancel: {
             Task { await self.cancel(id) }
         }
+    }
+
+    /// Prepare the request, then read its replies through completion.
+    private func runRequestWorker(_ request: SenseRequest, source: any SenseSourceProvider, operation: SenseReadOperation,
+                                  changed: SenseMaterial?, isEvent: Bool, eventRoute: SenseNewsBoard.ViewRoute?, perform: SenseActionContext.Perform?, id: Int,
+                                  stream: AsyncThrowingStream<JSONValue, Error>) async -> SenseOutcome {
+        do {
+            let (wire, address) = try await sendRequest(request, source: source, operation: operation, changed: changed,
+                                                        isEvent: isEvent, eventRoute: eventRoute, id: id)
+            return try await receiveRequest(request, source: source, operation: operation, changed: changed, isEvent: isEvent,
+                                            perform: perform, id: id, stream: stream, wire: wire, address: address)
+        } catch {
+            let failure = HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))
+            return .failed(failure)
+        }
+    }
+
+    /// Capture source material, send the request and start its stall window.
+    private func sendRequest(_ request: SenseRequest, source: any SenseSourceProvider, operation: SenseReadOperation,
+                             changed: SenseMaterial?, isEvent: Bool, eventRoute: SenseNewsBoard.ViewRoute?, id: Int) async throws -> (JSONValue, String?) {
+        let address: String?
+        switch request {
+        case .read(let a): address = a
+        case .act(_, let a, _): address = a
+        case .watch: address = sourceAddress
+        case .event: address = if let eventRoute { eventRoute.address } else { sourceFile ?? sourceAddress }
+        }
+        var wire: JSONValue = .null
+        if !isEvent {
+            let material: SenseMaterial
+            if let changed { material = changed }
+            else { material = try await source.material(for: record.corner, address: address, operation: operation) }
+            try Task.checkCancellation()
+            if !isSite || request == .watch {
+                sourceAddress = address
+            } else if case .read = request { sourceAddress = address }
+            if case .file(let path, _, _) = material {
+                sourceFile = path
+                if sourceAddress == nil { sourceAddress = path }
+            }
+            if case .pageSnapshot(.object(let fields)) = material,
+               case .int(let tab)? = fields["tabId"] { sourceTab = String(tab) }
+            wire = try await Self.materialWire(material, dataRoot: dataRoot, source: source)
+            if case .read = request, case .fileKind = record.corner, let address,
+               !address.hasPrefix("/"), !address.hasPrefix("~"),
+               let query = address.split(separator: "?", maxSplits: 1).dropFirst().first,
+               let items = URLComponents(string: "?" + String(query))?.queryItems,
+               case .object(let fields) = wire,
+               items.first(where: { $0.name == "version" })?.value.map(JSONValue.string) != fields["version"] {
+                throw SenseFailure(code: "file_changed", message: "The file changed; read from the start.")
+            }
+        }
+        try Task.checkCancellation()
+        if changed != nil {
+            try send(.object(["id": .int(Int64(id)), "type": .string("changed"),
+                "timeoutSeconds": .double(pending?.stallWindow ?? limits.requestSeconds), "material": wire]))
+        } else {
+            var run: [String: JSONValue] = ["id": .int(Int64(id)), "type": .string("run"),
+                "sense": try JSONValue.fromEncodable(record),
+                "request": Self.requestWire(request),
+                "timeoutSeconds": .double(pending?.stallWindow ?? limits.requestSeconds), "material": wire]
+            run["program"] = try .fromEncodable(OwnedProgram(kind: .sense, id: record.id,
+                version: String(record.version), source: script, entry: .sense,
+                reach: record.reach, seconds: limits.requestSeconds))
+            try send(.object(run))
+        }
+        transport.begin(id: id, kind: .sense, seconds: pending?.stallWindow ?? limits.requestSeconds)
+        return (wire, address)
+    }
+
+    /// Service helper messages until the request has an outcome.
+    private func receiveRequest(_ request: SenseRequest, source: any SenseSourceProvider, operation: SenseReadOperation,
+                                changed: SenseMaterial?, isEvent: Bool, perform: SenseActionContext.Perform?, id: Int,
+                                stream: AsyncThrowingStream<JSONValue, Error>, wire: JSONValue, address: String?) async throws -> SenseOutcome {
+        var progress = SenseEntryProgress()
+        let entryAddress = changed != nil || isEvent || request == .watch ? nil : address
+        let siteViewEvent = if case .event(_, let revision) = request { isSite && revision != nil } else { false }
+        var page: NativePage?
+        var acted: JSONValue?
+        var actFailure: SenseFailure?
+        var lastCallID: Int64 = 0
+        var logBytes = 0
+        var view: SenseInteractiveView?
+        var presented = false
+        for try await message in stream {
+            try Task.checkCancellation()
+            guard case .object(let fields) = message, case .string(let type)? = fields["type"] else {
+                throw SenseFailure(code: "bad_output", message: "Sense helper sent an invalid message.")
+            }
+            if type != "done", type != "failed", type != "progress" {
+                guard case .int(let callID)? = fields["callID"], callID > lastCallID else {
+                    throw SenseFailure(code: "bad_output", message: "Sense API requires increasing callIDs.")
+                }
+                lastCallID = callID
+            }
+            switch type {
+            case "progress":
+                let accepted: Bool
+                if let readAddress = fields["readAddress"] {
+                    // Only supplied snapshots permit local reads without a source round trip.
+                    let expected = entryAddress.map(JSONValue.string) ?? .null
+                    guard wire != .null,
+                          readAddress == expected, fields["n"] == nil else {
+                        throw SenseFailure(code: "bad_output", message: "Sense progress must identify its supplied source read.")
+                    }
+                    accepted = progress.read(address: entryAddress)
+                } else {
+                    let value: Double
+                    switch fields["n"] {
+                    case .int(let n): value = Double(n)
+                    case .double(let n): value = n
+                    default: throw SenseFailure(code: "bad_output", message: "Sense progress requires a finite number.")
+                    }
+                    accepted = try progress.advance(to: value) != nil
+                }
+                if accepted { try transport.renewProgress(id) }
+            case "publish":
+                page = try decodePage(fields["page"], material: wire)
+                try transport.renewProgress(id)
+            case "present":
+                presented = true
+                view = try SenseWire.view(fields["view"], senseID: record.id, version: record.version)
+            case "notify":
+                let news = try decodeNews(fields["news"])
+                try transport.renewProgress(id)
+                try await postNews(news)
+            case "source_read", "source_watch", "state_get", "state_set", "app_read":
+                let waitStarted = try transport.suspend(id)
+                do {
+                    try await service(fields, source: source, operation: operation, address: isEvent ? address : sourceAddress,
+                                      siteViewEvent: siteViewEvent)
+                    if type == "source_read" {
+                        let readAddress = if case .string(let a)? = fields["address"] { a } else { entryAddress }
+                        if progress.read(address: readAddress) {
+                            try transport.renewProgress(id)
+                        }
+                    }
+                }
+                catch {
+                    let failure = HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))
+                    let replyType = type == "app_read" ? "app_reply" : type.hasPrefix("state_") ? "state_reply" : "source_reply"
+                    try send(.object(["type": .string(replyType), "id": fields["id"] ?? .null,
+                        "callID": fields["callID"] ?? .null, "failure": try JSONValue.fromEncodable(failure)]))
+                }
+                try transport.resume(id, since: waitStarted)
+            case "log":
+                guard case .string(let text)? = fields["text"], logBytes + text.utf8.count <= 2_048 else {
+                    throw SenseFailure(code: "bad_output", message: "Sense logs exceed 2 KiB or are malformed.")
+                }
+                logBytes += text.utf8.count
+            case "act":
+                guard case .act = request, record.verbsEnabled, let perform,
+                      case .string(let verb)? = fields["verb"], case .string(let address)? = fields["address"] else {
+                    throw SenseFailure(code: "act_denied", message: "Sense actions require an active act request and the app door.")
+                }
+                let waitStarted = try transport.suspend(id)
+                do {
+                    acted = try await perform(verb, address, fields["args"] ?? .object([:]))
+                    // Save returned effects before observing cancellation or writing to a stopped helper.
+                    if let acted { pending?.returnedActions.append(acted) }
+                    try Task.checkCancellation()
+                    try reply(fields, type: "act_reply", value: acted ?? .null, field: "result")
+                } catch {
+                    let failure = HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))
+                    actFailure = failure
+                    try send(.object(["type": .string("act_reply"), "id": fields["id"] ?? .null,
+                        "callID": fields["callID"] ?? .null, "failure": try JSONValue.fromEncodable(failure)]))
+                }
+                try transport.resume(id, since: waitStarted)
+            case "done":
+                try transport.claimCompletion(id)
+                if case .read = request, page == nil {
+                    throw SenseFailure(code: "bad_output", message: "Sense read finished without a page.")
+                }
+                if presented, record.status == .on, let registry = SensesHub.shared.registry,
+                   let current = try await registry.sense(for: record.corner), current.status == .on,
+                   current.id == record.id, current.version == record.version,
+                   try registry.helperSelection(current) == selection {
+                    try Task.checkCancellation()
+                    var siteSource = isSite ? source as? DoorSource : nil
+                    var place = isEvent ? address : sourceFile ?? sourceAddress
+                    if isSite, let tab = wire.objectValue?["snapshot"]?.objectValue?["tabId"]?.strictInt64 {
+                        // An observed Chrome tab can be read again through its passive source gates.
+                        var input: [String: JSONValue] = [:]
+                        if let place, place.hasPrefix("{"), case .object(let retained)? = try? JSONValue.parse(Data(place.utf8)) {
+                            input = retained
+                        }
+                        input["tab_id"] = .int(tab)
+                        place = try JSONValue.object(input).serialize(pretty: false)
+                        siteSource = nil
+                    }
+                    await SenseNewsBoard.shared.present(view,
+                        route: .init(selection: selection, slot: slot, address: place, siteSource: siteSource))
+                }
+                if case .read = request {
+                    guard let page else { throw SenseFailure(code: "bad_output", message: "Sense read finished without a page.") }
+                    return .page(page, SenseProvenance(record: record))
+                } else {
+                    if changed == nil, case .act = request {
+                        if let actFailure { throw actFailure }
+                        guard let acted else {
+                            throw SenseFailure(code: "no_action", message: "The sense performed no door action; no success receipt exists.")
+                        }
+                        return .acted(acted, SenseProvenance(record: record))
+                    }
+                    if request == .watch, changed == nil {
+                        watching = !isSite || observation != nil
+                    }
+                    return .acted(.null, SenseProvenance(record: record))
+                }
+            default: throw SenseFailure(code: "bad_output", message: "Unknown sense helper message: \(type)")
+            }
+        }
+        throw CancellationError()
     }
 
     private func cancel(_ id: Int) async {
@@ -456,7 +500,8 @@ actor SenseHelperProcess {
         else { await terminate(failure: failure) }
     }
 
-    private func service(_ fields: [String: JSONValue], source: any SenseSourceProvider, operation: SenseReadOperation) async throws {
+    private func service(_ fields: [String: JSONValue], source: any SenseSourceProvider, operation: SenseReadOperation,
+                         address boundAddress: String?, siteViewEvent: Bool) async throws {
         switch fields["type"] {
         case .string("app_read"):
             guard let apps else { throw SenseFailure(code: "unavailable", message: "App reading is not connected.") }
@@ -472,9 +517,10 @@ actor SenseHelperProcess {
             case nil, .null, .string: break
             default: throw SenseFailure(code: "bad_output", message: "Sense source address must be a string or null.")
             }
-            let address: String? = if case .string(let value)? = fields["address"] { value } else { sourceAddress }
+            // A site view's event reads the reader or tab that produced that view.
+            let address: String? = if !siteViewEvent, case .string(let value)? = fields["address"] { value } else { boundAddress }
             if case .fileKind = record.corner, let address,
-               address != sourceAddress, address != sourceFile,
+               address != boundAddress, address != sourceFile,
                address != sourceFile.map({ URL(fileURLWithPath: $0).absoluteString }) {
                 let path = URL(string: address).flatMap { $0.isFileURL ? $0.path : nil } ?? address
                 let candidate = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
@@ -505,7 +551,7 @@ actor SenseHelperProcess {
                 guard let provider = source as? any SenseSourceWatchingProvider else {
                     throw SenseFailure(code: "unsupported", message: "Sense source does not provide live change events.")
                 }
-                let changes = try await provider.changes(for: record.corner, address: sourceAddress, operation: operation.observing())
+                let changes = try await provider.changes(for: record.corner, address: boundAddress, operation: operation.observing())
                 try Task.checkCancellation()
                 guard !stopped else { throw CancellationError() }
                 let appObservation: JSONValue?
@@ -705,7 +751,7 @@ actor SenseHelperProcess {
         case .read(let address): .object(["type": .string("read"), "address": address.map(JSONValue.string) ?? .null])
         case .act(let verb, let address, let args): .object(["type": .string("act"), "verb": .string(verb), "address": .string(address), "args": args])
         case .watch: .object(["type": .string("watch")])
-        case .event(let event): .object(["type": .string("event"), "event": event])
+        case .event(let event, _): .object(["type": .string("event"), "event": event])
         }
     }
 }

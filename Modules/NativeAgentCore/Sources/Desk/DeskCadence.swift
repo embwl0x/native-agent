@@ -19,6 +19,8 @@ public struct DeskStep: Sendable, Equatable {
     public var say: String?
     public var card: String?
     public var action: JSONValue?
+    /// Rebinding a habit gives its next run a new identity even at the same scheduled instant.
+    public private(set) var habitRevision: String?
     public var source: String?
     /// Original moment/candidate identities survive refiling and closure so replay cannot recreate landed promises.
     public var promiseCaptures: [String]
@@ -52,7 +54,7 @@ public struct DeskStep: Sendable, Equatable {
               !when.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               MyQueue.When(when, card: obj["card"]?.stringValue) != nil,
               DeskJSON.optionalStringsAreValid(obj, keys: ["card", "source", "session", "origin", "filedAt", "lifeID", "status", "reason", "until", "say",
-                  "clockStart", "scheduledJobID"]),
+                  "clockStart", "scheduledJobID", "habitRevision"]),
               let peers = DeskJSON.strings(obj["peers"]),
               let promiseCaptures = DeskJSON.strings(obj["promiseCaptures"]),
               let elevated = DeskJSON.strings(obj["elevated"]) else { return nil }
@@ -77,13 +79,14 @@ public struct DeskStep: Sendable, Equatable {
         lifeID = obj["lifeID"]?.stringValue
         status = obj["status"]?.stringValue
         reason = obj["reason"]?.stringValue
+        habitRevision = obj["habitRevision"]?.stringValue
     }
 
     var fields: [String: JSONValue] {
         var obj: [String: JSONValue] = ["words": .string(words), "when": .string(when)]
         for (key, value) in [("card", card), ("source", source), ("session", session), ("origin", origin), ("filedAt",
             filedAt), ("lifeID", lifeID), ("status", status), ("reason", reason), ("until", until), ("say",
-            say), ("clockStart", clockStart), ("scheduledJobID", scheduledJobID)] {
+            say), ("clockStart", clockStart), ("scheduledJobID", scheduledJobID), ("habitRevision", habitRevision)] {
             if let value, !value.isEmpty { obj[key] = .string(value) }
         }
         if !peers.isEmpty { obj["peers"] = .array(peers.map(JSONValue.string)) }
@@ -122,6 +125,8 @@ public struct DeskStep: Sendable, Equatable {
         filedAt = previous.filedAt
         replyRoute = previous.replyRoute
         scheduledJobID = previous.scheduledJobID
+        // Only a new action is a new habit; dropping the action keeps the occurrence its words were already said for.
+        habitRevision = action == previous.action || action == nil ? previous.habitRevision : DeskClock.newRefId()
     }
 
     /// Every writer records who the step came from; the person's steps are the ones owed to them.

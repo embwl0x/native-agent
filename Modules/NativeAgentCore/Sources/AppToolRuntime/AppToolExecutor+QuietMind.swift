@@ -190,8 +190,8 @@ extension AppToolExecutor {
                 return (true, "Thinking and body state cleared.", [:])
             case .persistenceFailed(let why):
                 return (false, "Nothing was cleared; the state was kept: \(why)." + Self.quietMindRetry, [:])
-            case .bodyPersistenceFailed:
-                return (false, "Thinking state cleared. Body state cleared in memory, but was not saved; its previous state may return after a restart.", [:])
+            case .partiallyCleared(let detail):
+                return (false, detail, ["status": .string("failed"), "reason": .string("cognition_clear_partial"), "effects": .string("partial")])
             }
         default:
             return (false, "No mind_run button is called \(verb).", [:])

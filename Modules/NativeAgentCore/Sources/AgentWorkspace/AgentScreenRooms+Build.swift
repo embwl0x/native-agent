@@ -3,6 +3,7 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import Dispatcher
+import NativeAgentShared
 // Blueprint: | `AgentScreenRooms+Build.swift` | `AgentScreen`: source/file rooms, named reads and existing app file actions |
 
 enum AgentWorkspaceBuild {
@@ -75,10 +76,6 @@ extension AgentScreen {
                 default: return nil
                 }
             }
-            func rowsOf(_ value: JSONValue?) -> [[String: JSONValue]] {
-                guard case .array(let list)? = value else { return [] }
-                return list.compactMap { if case .object(let row) = $0 { row } else { nil } }
-            }
             var body: String?
             if case .string(let whole) = value { body = whole }
             for key in ["text", "content", "body", "answer"] where body == nil { body = text(object[key]) }
@@ -86,14 +83,15 @@ extension AgentScreen {
             var rows: [String] = [], label = "TEXT"
             switch tool {
             case "git_log":
-                let commits = rowsOf(object["commits"])
+                let commits = JSONValue.objectArray(object["commits"])
                 rows = commits.map { pad(text($0["hash"]) ?? "", 11) + pad(String((text($0["date"]) ?? "").prefix(16)), 18) + clip(text($0["subject"]) ?? "",
                     80) }
                 header = ["COMMITS", "\(commits.count) newest"]; label = "LOG"
             case "activity_query":
+                // The source's full-range per-app totals, not a sum of the buckets it capped for detail.
                 var seconds: [String: Double] = [:]
-                for bucket in rowsOf(object["buckets"]) {
-                    if case .double(let s)? = bucket["seconds"], let app = text(bucket["app_name"]) { seconds[app, default: 0] += s }
+                for app in JSONValue.objectArray(object["top_apps"]) {
+                    if case .double(let s)? = app["seconds"], let name = text(app["app_name"]) { seconds[name, default: 0] += s }
                 }
                 let apps = seconds.sorted { $0.value > $1.value }
                 rows = apps.prefix(10).map { pad(clip($0.key, 28), 30) + age($0.value) }
@@ -102,7 +100,7 @@ extension AgentScreen {
             case "app" where input["item"] == .string("status"):
                 let object: [String: JSONValue] = if case .object(let row)? = object["item"] { row } else { [:] }
                 let now = Date()
-                func when(_ key: String) -> String? { text(object[key]).flatMap(date).map { friendly($0, now: now) } }
+                func when(_ key: String) -> String? { text(object[key]).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst).map { friendly($0, now: now) } }
                 let on = object["enabled"] == .bool(true), polling = object["poller_running"] == .bool(true)
                 let broken = object["active_error"] == .bool(true)
                 rows = [

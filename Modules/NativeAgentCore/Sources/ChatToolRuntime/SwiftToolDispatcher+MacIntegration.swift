@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -121,7 +120,7 @@ extension SwiftToolDispatcher {
     func impl_maps_route(input: [String: JSONValue]) async throws -> JSONValue {
         let origin = try requireString(input, "origin").trimmingCharacters(in: .whitespacesAndNewlines)
         let destination = try requireString(input, "destination").trimmingCharacters(in: .whitespacesAndNewlines)
-        let transport = optionalString(input, "transport") ?? "automobile"
+        let transport = input["transport"]?.nonblankString ?? "automobile"
         guard !origin.isEmpty, !destination.isEmpty, ["automobile", "walking"].contains(transport) else {
             throw AutonomyGateError.toolDenied(reason: "Route needs origin and destination text, and transport automobile or walking.")
         }

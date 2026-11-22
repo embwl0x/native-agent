@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import AgentLinkTransport
 import ToolRegistry
 import Network
@@ -67,7 +68,7 @@ public struct AgentContactA2AEndpoint: Sendable {
                 // Method and params, not the envelope: a client retrying the same messageId mints a new JSON-RPC id.
                 let replayBytes = try JSONSerialization.data(withJSONObject: ["method": method, "params": envelope?["params"] ?? NSNull()],
                     options: .sortedKeys)
-                let task = try await tasks.send(send, principal: principal, digest: AgentPeerReplayClaimStore.digest(replayBytes))
+                let task = try await tasks.send(send, principal: principal, digest: SHA256Hex.of(replayBytes))
                 if send.streaming {
                     return try await streamResponse(id: id, task: task.id, principal: principal, version: wireVersion)
                 }
@@ -123,15 +124,33 @@ public struct AgentContactA2AEndpoint: Sendable {
     /// Settle transport delivery only after the selected reply is written.
     private func replyAcknowledgement(_ task: AgentContactTask) -> (@Sendable () async -> Void)? {
         guard !task.text.isEmpty || !task.parts.isEmpty || task.delegatedCompletions?.isEmpty == false else { return nil }
-        return { await tasks.recordReplyFetch(task) }
+        let prose = task.parts.isEmpty ? task.text : Self.prose(task.parts)
+        let files = task.parts.contains(where: \.isAttachment) || task.delegatedCompletions?.isEmpty == false
+        return { await tasks.recordReplyFetch(task, prose: prose, files: files) }
     }
 
     private func eventAcknowledgement(_ event: AgentContactEvent) async {
-        let task: AgentContactTask
         switch event {
-        case .snapshot(let value), .status(let value, _), .artifact(let value, _, _, _, _): task = value
+        case .snapshot(let task):
+            await replyAcknowledgement(task)?()
+        case .artifact(let task, let artifactID, let parts, let append, let last):
+            guard !parts.isEmpty else { return }
+            let prose = artifactID == task.id + "-reply" ? Self.prose(parts) : ""
+            let start = !last && append ? task.text.utf8.count - prose.utf8.count : 0
+            // The stream writes the primary artifacts in order. last is local to each artifact.
+            let files = last && !append && task.text.isEmpty && parts.contains(where: \.isAttachment)
+                && task.replyArtifacts(task.parts).last?.id == artifactID
+            await tasks.recordReplyFetch(task, prose: prose, byteOffset: start, files: files)
+        case .status:
+            break
         }
-        await replyAcknowledgement(task)?()
+    }
+
+    private static func prose(_ parts: [AgentContactPart]) -> String {
+        parts.compactMap { part in
+            if case .text(let text) = part { return text }
+            return nil
+        }.joined(separator: "\n")
     }
 }
 
@@ -188,12 +207,13 @@ enum AgentContactRuntime {
         let runID = acceptedMessage?.runId ?? UUID().uuidString
         let enqueued: EnqueuedUserMessage
         if let acceptedMessage { enqueued = acceptedMessage } else {
-            // Persist the task binding before session admission waits so restart can resume queued input from its row.
             var request = try revalidated(principal, dataRoot: dataRoot).turnRequest(context: turn.context, plain: plain,
                 attachments: attachments, messageID: turn.requestID, jobLines: jobLines)
             request.pinnedRunID = .some(runID)
+            let pinnedSession = try SwiftNativeChatOrchestrationClient.resolveSessionId(request.sessionID)
+            try await turn.bindRun(pinnedSession, runID)
             enqueued = try await request.enqueue(on: client)
-            try await turn.bindRun(session, enqueued.runId)
+            await turn.inputCommitted()
         }
         // One turn at a time in this conversation: a second message waits for the first reply to finish instead of interleaving with it. Admission registers
         // the run for Stop before it waits.
@@ -333,18 +353,23 @@ enum AgentContactRuntime {
         }
     }
 
-    static func outputParts(_ result: TurnEngineResult, taskID: String, dataRoot: URL,
-                            job: AgentContactJob? = nil) throws -> (parts: [AgentContactPart], recovery: AgentContactReplyRecovery?) {
-        var parts: [AgentContactPart] = result.reply.isEmpty ? [] : [.text(result.reply)]
-        if let bytes = result.reply.data(using: .utf8), bytes.count <= 64000,
+    static func reportParts(_ reply: String, taskID: String) -> [AgentContactPart] {
+        var parts: [AgentContactPart] = reply.isEmpty ? [] : [.text(reply)]
+        if let bytes = reply.data(using: .utf8), bytes.count <= 64000,
            let value = try? JSONDecoder().decode(JSONValue.self, from: bytes), case .object = value {
             parts.append(.data(value, metadata: .object(["source": .string("agent"), "taskId": .string(taskID)])))
         }
+        return parts
+    }
+
+    static func outputParts(_ result: TurnEngineResult, taskID: String, dataRoot: URL,
+                            job: AgentContactJob? = nil) throws -> (parts: [AgentContactPart], recovery: AgentContactReplyRecovery?) {
+        var parts = reportParts(result.reply, taskID: taskID)
         var failures: [String] = []
         if job != nil {
             // A job's artifacts are the files in its folder, whichever tool made them.
-            let made = try AgentContactJob.fileParts(taskID: taskID, dataRoot: dataRoot)
-            parts += made.parts
+            let made = try AgentContactJob.fileParts(taskID: taskID, dataRoot: dataRoot, following: parts)
+            parts = made.parts
             failures += made.failures
         } else {
             for attachment in ChatGeneratedImageArtifacts.attachments(from: result.toolDispatches, dataRoot: dataRoot) {

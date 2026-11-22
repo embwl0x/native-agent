@@ -5,7 +5,7 @@ import PersistenceCore
 import TurnTrace
 import Transcripts
 import Synchronization
-// Blueprint: | `SessionHistoryReader.swift` | `SessionHistoryReader`, `messages`, `messagesWithStats`. |
+// Blueprint: | `SessionHistoryReader.swift` | `SessionHistoryReader`, `messagesWithStats`. |
 
 // MARK: - ChatMessage
 
@@ -181,18 +181,6 @@ public actor SessionHistoryReader {
     }
 
     /// Read oldest-first, tail-bounded when requested; exclude the already-persisted current run so it cannot replay as prior history.
-    public func messages(
-        forSessionId id: String,
-        limit: Int? = nil,
-        excludingRunId: String? = nil
-    ) async throws -> [ChatMessage] {
-        try await messagesWithStats(
-            forSessionId: id,
-            limit: limit,
-            excludingRunId: excludingRunId
-        ).checkedMessages()
-    }
-
     public func messagesWithStats(
         forSessionId id: String,
         limit: Int? = nil,
@@ -270,8 +258,9 @@ public actor SessionHistoryReader {
                 }
                 text = decoded
             }
+            // Rows end in LF or CRLF (one Character in Swift); nothing else ends a row.
             lines = text
-                .split(separator: "\n", omittingEmptySubsequences: true)
+                .split(omittingEmptySubsequences: true, whereSeparator: { $0 == "\n" || $0 == "\r\n" })
                 .map(String.init)
             sourceBytes = Int64(data.count)
             bytesRead = Int64(data.count)
@@ -392,14 +381,13 @@ public actor SessionHistoryReader {
     /// Replay reads preserve every retained transcript row.
     public nonisolated func promptMessagesWithStats(
         transcript: Data?,
-        excludingRunId: String? = nil,
-        relevanceWhen: (SessionHistoryReadResult) -> Bool = { _ in false }
-    ) -> (prompt: SessionHistoryReadResult, relevance: SessionHistoryReadResult?) {
+        excludingRunId: String? = nil
+    ) -> SessionHistoryReadResult {
         guard let transcript else {
-            return (SessionHistoryReadResult(
+            return SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(mode: "missing")
-            ), nil)
+            )
         }
         let excludedRunId = excludingRunId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -424,16 +412,17 @@ public actor SessionHistoryReader {
         // Split JSONL on byte LF without walking every grapheme; preserve String's CR/CRLF segmentation when CR is present.
         let splitStart = DispatchTime.now().uptimeNanoseconds
         guard let decodedTranscript = String(data: transcript, encoding: .utf8) else {
-            return (SessionHistoryReadResult(
+            return SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(
                     mode: "invalid_encoding",
                     sourceBytes: Int64(transcript.count),
                     bytesRead: Int64(transcript.count)
                 )
-            ), nil)
+            )
         }
-        let lines = decodedTranscript.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let lines = decodedTranscript.split(omittingEmptySubsequences: true, whereSeparator: { $0 == "\n" || $0 == "\r\n" })
+            .map(String.init)
         let selectStart = DispatchTime.now().uptimeNanoseconds
         let memoBeforeSelect = rowMemoNs
         let prompt = Self.selectionResult(
@@ -443,9 +432,6 @@ public actor SessionHistoryReader {
         // Selection calls the memo per line; its time stays with the memo so the two steps never overlap.
         let promptRowMemoNs = rowMemoNs
         let selectNs = (DispatchTime.now().uptimeNanoseconds &- selectStart) &- (promptRowMemoNs &- memoBeforeSelect)
-        let relevance = relevanceWhen(prompt) ? relevanceMessagesWithStats(
-            size: transcript.count, excludingRunId: excludingRunId, decode: decode
-        ) { transcript.subdata(in: (transcript.startIndex + $0)..<(transcript.startIndex + $0 + $1)) } : nil
         // Late memo updates affect only cache misses; they cannot publish stale transcript state.
         // A read adds every line it used as the most recent; past the cap the least recently read lines go first.
         let memoWriteStart = DispatchTime.now().uptimeNanoseconds
@@ -473,7 +459,7 @@ public actor SessionHistoryReader {
             splitNanoseconds: selectStart &- splitStart, rowMemoNanoseconds: promptRowMemoNs,
             selectNanoseconds: selectNs, memoWriteNanoseconds: memoWriteNs),
             contextStatistics: prompt.contextStatistics)
-        return (measured, relevance)
+        return measured
     }
 
     /// Bound semantic candidates with interior windows for large transcripts; explicit search still reaches exact older wording.
@@ -559,7 +545,6 @@ public actor SessionHistoryReader {
     private nonisolated func relevanceMessagesWithStats(
         size: Int,
         excludingRunId: String?,
-        decode: (String) -> DecodedRow = SessionHistoryReader.decodeRow,
         bytes: (_ offset: Int, _ count: Int) -> Data?
     ) -> SessionHistoryReadResult {
         let excludedRunId = excludingRunId?
@@ -583,7 +568,7 @@ public actor SessionHistoryReader {
             mode = "relevance_sampled"
         }
         return Self.selectionResult(lineRead, mode: mode,
-            excludingRunId: shouldExcludeRun ? excludedRunId : nil, decode: decode)
+            excludingRunId: shouldExcludeRun ? excludedRunId : nil, decode: SessionHistoryReader.decodeRow)
     }
 
     private nonisolated static func selectionResult(
@@ -762,12 +747,11 @@ public actor SessionHistoryReader {
             return row.map(JSONValue.object)
         }
         guard case .object(let row)? = parsed else { return DecodedRow(parsed, nil, nil, nil, statistics) }
-        func string(_ key: String) -> String? { if case .string(let text)? = row[key] { return text }; return nil }
-        guard let id = string("id"), !id.isEmpty,
+        guard let id = row["id"]?.stringValue, !id.isEmpty,
               ContactThread.Line(row).provenanceFailure == nil else {
             return DecodedRow(parsed, nil, nil, nil, statistics)
         }
-        return DecodedRow(parsed, string("role"), string("content"), string("createdAt"), statistics)
+        return DecodedRow(parsed, row["role"]?.stringValue, row["content"]?.stringValue, row["createdAt"]?.stringValue, statistics)
     }
 
     private nonisolated static func decodeMessages(

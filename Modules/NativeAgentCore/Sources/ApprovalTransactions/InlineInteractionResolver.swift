@@ -148,7 +148,6 @@ public enum InlineInteractionResolver {
     static var waitingHosts: Set<String> = []
     /// Fence the call-to-checkpoint window within this process; the durable row owns cross-launch authority.
     static var replayedResumeRunIds: Set<String> = []
-    static var reclaimedSessions: Set<String> = []
     /// Cards this process began running: their owner is alive here, so the launch settlement never takes them for interrupted.
     static var begunHere: Set<String> = []
     /// Retain continuation results until the running turn takes them; that turn owns continuation, without starting another.
@@ -316,10 +315,10 @@ public enum InlineInteractionResolver {
                 ?? .object(["status": .string("failed"), "reason": .string("continuation_refused"),
                     "detail": .string("The blocked call could not resume; check its card before continuing.")])
         }
-        await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot)
         // The waiting turn is this card's continuation: it takes the card's after_card steps.
         let queued = await AgentScreen.resume(card: current.id, decision: current.state.outcome != nil ? "approved" : "declined",
             completed: current.state.outcome != nil, handOff: true, dataRoot: dataRoot)
+        await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot)
         queued.sources.forEach { turn.peerSteering?.mark(peer: $0) }
         queued.elevated.forEach { turn.peerSteering?.elevate(peer: $0) }
         guard case .object(var receipt) = receiptEnvelope(current) else { return receiptEnvelope(current) }
@@ -567,8 +566,9 @@ public enum InlineInteractionResolver {
 
     /// A settled card with no turn to continue (non-blocking, or its continuation retired) releases its after_card steps to MY QUEUE, or drops
     /// them when it was declined. A card that continues a turn leaves them to that turn (`continueRequest`, or its waiting host).
-    private static func releaseAfterCardWithoutContinuation(_ card: InlineInteraction, dataRoot: URL) async {
-        guard card.continuation?.state != .waiting else { return }
+    static func releaseAfterCardWithoutContinuation(_ card: InlineInteraction, dataRoot: URL) async {
+        if let state = card.continuation?.state, [.waiting, .claimed, .replaying].contains(state) { return }
+        guard card.state.outcome != nil || card.state == .declined else { return }
         _ = await AgentScreen.resume(card: card.id, decision: card.state.outcome != nil ? "approved" : "declined",
             completed: card.state.outcome != nil, handOff: false, dataRoot: dataRoot)
     }
@@ -670,6 +670,7 @@ public enum InlineInteractionResolver {
                     try await persist(current, sessionID: sessionID, dataRoot: dataRoot, expecting: {
                         $0.revision == revision && $0.continuation?.state == state
                     })
+                    if retired == .invalidated { await releaseAfterCardWithoutContinuation(current, dataRoot: dataRoot) }
                 } catch { nativeLog("[interaction] stop settlement failed for \(id): \(error)") }
                 return nil
             }

@@ -3,23 +3,16 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-#if canImport(Darwin)
 import Darwin
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 import os
 import CoreGraphics
 import UserNotifications
 import Senses
 import Experiences
-import CryptoKit
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacChromiumAccessibility.swift` | Renderer identity and activation; descendant events wake async content judging; synchronous reads never sleep |
 /// Classification serves page presentation, never activation admission.
 public enum MacChromiumAccessibility {
@@ -30,7 +23,7 @@ public enum MacChromiumAccessibility {
         case manualAccessibility = "AXManualAccessibility"
     }
     /// Classify from the running bundle; a thin native tree alone cannot establish a renderer.
-    public static func looksChromium(bundleId: String?, pid: Int32? = nil, snapshot: MacAXTreeSnapshot?) throws -> Bool {
+    public static func looksChromium(bundleId: String?, pid: Int32? = nil) throws -> Bool {
         // Browser identity is available before Chromium builds any AXWebArea. Do not make renderer activation depend on the tree it activates or on browser
         // helper layout (which changes between distributions).
         if let bundleId, chromiumBrowserBundles.contains(bundleId) { return true }
@@ -121,7 +114,6 @@ public final class MacChromiumAccessibilityState: Sendable {
         }
     }
 }
-#if canImport(ApplicationServices) && os(macOS)
 /// A process's identity across relaunches. Launch Services gives some apps no launchDate, so this reads the kernel's start time, which every process has.
 func macProcessStart(_ pid: Int32) throws -> Date {
     var info = kinfo_proc()
@@ -482,7 +474,8 @@ extension SystemMacAXElementSource {
         var json: JSONValue { .object([
             "elements": .int(Int64(nodes)), "roles": .array(roles.sorted().map(JSONValue.string)),
             "empty": empty.map(JSONValue.bool) ?? .null,
-            "complete": .bool(complete),
+            // The readiness probe's own walk (160 elements at most), never the look's completeness: that is the look's partial.
+            "probe_complete": .bool(complete),
         ]) }
     }
     private static func rendererTopology(app: AXUIElement, deadline: Date) throws -> RendererTopology {
@@ -525,4 +518,3 @@ extension SystemMacAXElementSource {
         return result
     }
 }
-#endif

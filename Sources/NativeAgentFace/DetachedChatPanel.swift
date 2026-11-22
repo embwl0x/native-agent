@@ -184,17 +184,28 @@ final class DetachedChatWindowController: NSObject, NSWindowDelegate {
         panels[sessionId]?.close()
     }
 
+    /// The renderer's disconnect closes every panel but keeps the list to reopen: only the person's own close forgets a panel.
+    private var closingForTeardown = false
+    func closeAllKeepingPersisted() {
+        closingForTeardown = true
+        defer { closingForTeardown = false }
+        for session in detachedSessionIDs { close(sessionId: session) }
+    }
+
     func focus(sessionId: String) {
         panels[sessionId]?.makeKeyAndOrderFront(nil)
     }
 
     func restoreFromPersist() {
         let saved = persistedSet()
-        guard !saved.isEmpty else { return }
-        Task { @MainActor in
-            guard let appModel else { return }
-            await appModel.loadChatState()
-            for sid in saved { await open(sessionId: sid, origin: nil) }
+        guard !saved.isEmpty, let appModel else { return }
+        // Reopening needs the body: it waits for the link instead of spending its only attempt before it exists.
+        appModel.client.whenConnected { [weak self] in
+            Task { @MainActor in
+                guard let self, let appModel = self.appModel else { return }
+                await appModel.loadChatState()
+                for sid in saved { await self.open(sessionId: sid, origin: nil) }
+            }
         }
     }
 
@@ -233,7 +244,7 @@ final class DetachedChatWindowController: NSObject, NSWindowDelegate {
         let sessionId = panel.sessionId
         panels.removeValue(forKey: sessionId)
         frames.removeValue(forKey: sessionId)?.end()
-        removeFromPersist(sessionId)
+        if !closingForTeardown { removeFromPersist(sessionId) }
         // Keep the pin after closing so the session remains reachable from the strip.
     }
 }

@@ -116,15 +116,6 @@ public enum ChromeControlEffect: String, Sendable, CaseIterable {
 
 public enum ChromeControlConnectionState: Sendable, Equatable {
     case extensionNotLoaded, disconnected, connected
-
-    public func status(enabled: Bool) -> String {
-        guard enabled else { return "Chrome control is off" }
-        switch self {
-        case .extensionNotLoaded: return "On, but no Chrome extension connection has been confirmed yet — press Set up Chrome"
-        case .disconnected: return "On, previously connected; Chrome is not connected right now"
-        case .connected: return "Connected"
-        }
-    }
 }
 
 public actor ChromeControlRuntime {

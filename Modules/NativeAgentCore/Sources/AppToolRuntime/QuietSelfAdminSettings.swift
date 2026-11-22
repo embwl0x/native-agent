@@ -1004,7 +1004,9 @@ public enum QuietSettings {
     public static func settings(forPage page: String, host: (any QuietSettingsHost)?) throws -> [QuietSetting] {
         // Page settings include the page's own rows, its app's access switch (a Trust row) and the memories page's model.
         let belongs: (QuietSetting) -> Bool = { setting in
-            setting.page == page || (setting.page == "trust" && setting.id == "trust.mac_integration_\(page)")
+            // The reconstruction input contains preserved bytes. It is available by explicit setting.get.
+            guard setting.id != "providers.routing_repair" else { return false }
+            return setting.page == page || (setting.page == "trust" && setting.id == "trust.mac_integration_\(page)")
                 || (page == "memories" && setting.id == "providers.memory_and_mind_model")
         }
         return try staticRows.filter(belongs)

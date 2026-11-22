@@ -106,14 +106,13 @@ final class AppModel: Sendable {
         chatStateLoadFailed = false
     }
 
-    var supportDiagnostics: SupportDiagnostics?
     /// Support Snapshot must not share Doctor's read state.
     var supportDiagnosticsLoading = false
     /// Observe engine.memory because the live engine owns canonical memory state.
     @ObservationIgnored let engine: NativeAgentEngine
     /// The only agent state the window's views read as stage one moves them over: finished values her owners post, applied per frame.
     @ObservationIgnored let face: FaceFeed
-    @ObservationIgnored private let displayFrame = DisplayFrame()
+    @ObservationIgnored private let displayFrame = DisplayFrame(followsScreenChanges: false)
     @ObservationIgnored private let workStatusPublication = WorkStatusPublication()
     /// Share engine owners and per-turn effect gates through the immutable Mac client.
     @ObservationIgnored lazy var macChatClient = engine.chatClient(profile: .mac)
@@ -125,8 +124,6 @@ final class AppModel: Sendable {
         let name = engine.persona.displayName
         if !name.isEmpty { AgentVoice.live = AgentVoice.current(name: name) }
     }
-    /// Keep Trust feedback separate so another surface or refresh cannot overwrite it.
-    var trustCenterActionOutcome: TrustCenterActionOutcome?
     var isSavingChatBrain: Bool { engine.providers.isSavingChatBrain }
     var chatProvider: String { currentChatBrainSelection?.provider ?? "" }
     /// A new status retires the previous raw cause.

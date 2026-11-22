@@ -4,18 +4,11 @@ import NativeAgentCore
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(Darwin)
 import Darwin
-#endif
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import Carbon
 import OSAKit
 import os
-#endif
 
 // Blueprint: | `MacProcessExecution.swift` | `ProcessExecution`, `ProcessRunResult`, `ProcessRunCancellation`, `ProcessRunIOFailure`: Process lifecycle |
 

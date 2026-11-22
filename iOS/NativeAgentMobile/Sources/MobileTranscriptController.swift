@@ -4,62 +4,25 @@ import QuartzCore
 import SwiftUI
 import UIKit
 
-// Blueprint: | `MobileTranscriptController.swift` | Applies Shared press scripts; phone viewport, reader place and prepared-glyph reveal |
+// Blueprint: | `MobileTranscriptController.swift` | The phone's glass on the Shared reader core: text view and scroll, press calls, action links, edit menu and copy |
 
-/// Owns the text view's document. Every change is one edit inside one editing transaction, and after every edit the reader's place
-/// is put back: the first visible paragraph at the offset it had, or the end when the reader follows it.
+/// The phone's reader: the Shared core owns the document, its edits, the reader's place and the paced reveal; this owns the text view
+/// and its scroll, the in-process press calls, action links, the edit menu and copy. The reader's place after an edit is the first
+/// visible paragraph at the offset it had, or the end when the reader follows it.
 /// Nothing here reads `.layoutManager`: that silently drops the view to TextKit 1.
 @MainActor
-final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
-    /// The reader's place: the first visible paragraph (by block) and how far its top sits below the reading top.
-    struct Place {
-        var block: Int
-        var id: String
-        var offset: CGFloat
-    }
-
-    /// The pacer reveals glyphs from paragraphs already rendered by the press.
-    @MainActor
-    struct Live {
-        let messageID: String
-        var pacer = ChatStreamPacer()
-        var target: String
-        var glyphs: String
-        var cuts: [String: [TranscriptRevealCut]]
-        var revealed = 0
-        /// Once the turn stops streaming, the reveal finishes and the reply is the built document's own blocks again.
-        var streaming: Bool
-    }
-
+final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate, UIGestureRecognizerDelegate {
     /// The phone's ~1 s batches run up to ~1,200 characters, so the reveal jumps only past four bytes a character of that.
     static let maxLagBytes = 4_800
 
     let textView: MobileTranscriptTextView
-    let layout: NSTextLayoutManager
-    let content: NSTextContentStorage
-    let storage: NSTextStorage
-    let folds = TranscriptLayoutDelegate()
     let attachments = TranscriptAttachments()
     private weak var handle: MobileTranscriptHandle?
     private var actions = MobileTranscriptActions()
     private var environment: EnvironmentValues?
 
     private var sessionKey: String?
-    private var shown = TranscriptDocument.empty
-    /// Each block's paragraph length without its separator; every block but the last is followed by one "\n".
-    private var lengths: [Int] = []
-    private var startsCache: [Int]?
-    private var index: [String: Int] = [:]
-    private struct NativeParagraph {
-        var body: NSAttributedString
-        var separator: NSAttributedString
-        var hidden: NSAttributedString
-    }
-    private var native: [String: NativeParagraph] = [:]
-    private var hiddenLive: Set<String> = []
     private let owner = MobileTranscriptPress.shared
-    private var readerID = UUID()
-    private var appliedScript: UUID?
     private var paintedScript: UUID?
     private var mounted = true
     private struct Pending: Equatable {
@@ -75,22 +38,16 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
     private var lastAssistantID: String?
     private var data = TranscriptAttachmentData(messages: [:], asked: [:], inbox: [:])
 
-    private var live: Live?
-    private var link: CADisplayLink?
-
     /// The column the text lays out in; zero until the host gives a width.
     private var containerWidth: CGFloat = 0
     private var reduceMotion = false
-    private var pendingOpen = true
-    /// Reader scroll, Latest, sending and opening own following; estimated document height cannot decide it.
-    private var following = true
     private var viewportSize = CGSize.zero
     private var scrollingToEnd = false
     private var openingStarted = CACurrentMediaTime()
     private var firstPaintOwed = true
     private let log = ModuleLog(category: "MobileTranscriptDocument")
 
-    override init() {
+    init() {
         let content = NSTextContentStorage()
         let layout = NSTextLayoutManager()
         content.addTextLayoutManager(layout)
@@ -98,10 +55,13 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         layout.textContainer = container
         let text = MobileTranscriptTextView(frame: .zero, textContainer: container)
         textView = text
-        self.layout = layout
-        self.content = content
-        storage = text.textStorage
-        super.init()
+        // Reader scroll, Latest, sending and opening own following; estimated document height cannot decide it. A fold the reader
+        // opens holds its row, and copy leaves out a paragraph that reads as nothing.
+        super.init(content: content, layout: layout, storage: text.textStorage,
+                   folds: TranscriptLayoutDelegate(user: TranscriptUserFragment.init(textElement:range:),
+                                                   code: TranscriptCodeFragment.init(textElement:range:)),
+                   rules: TranscriptReaderRules(maxLagBytes: MobileTranscriptController.maxLagBytes, layoutAboveOnlyWhenBlocksChange: false,
+                                                foldFollowsEnd: false, copySkipsEmptyParagraphs: true))
         configureView()
         attachments.heightChanged = { [weak self] blockID in self?.relayoutAttachment(blockID) }
     }
@@ -225,18 +185,7 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         sessionKey = key
         openingStarted = CACurrentMediaTime()
         firstPaintOwed = true
-        stopLink()
-        live = nil
-        let gone = Set(shown.blocks.map(\.id))
-        content.performEditingTransaction { storage.setAttributedString(NSAttributedString()) }
-        if !gone.isEmpty { attachments.forget(gone) }
-        shown = .empty
-        lengths = []
-        startsCache = nil
-        index = [:]
-        native = [:]
-        hiddenLive = []
-        folds.openFolds = []
+        clearDocument()
         pendingOpen = true
         following = true
         handle?.issue = nil
@@ -244,28 +193,9 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         observeFeed()
     }
 
-    private func observeFeed() {
-        guard let sessionKey else { return }
-        let id = readerID
-        let packet = withObservationTracking {
-            owner.face.slot(.transcript(session: sessionKey)).select("press:" + id.uuidString, as: TranscriptFace.self) { $0?.readers[id] }
-        } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.mounted, self.readerID == id else { return }
-                self.observeFeed()
-            }
-        }
-        if let packet { receive(packet) }
-    }
-
-    private func viewportBlocks() -> Set<String> {
-        guard let range = layout.textViewportLayoutController.viewportRange else { return [] }
-        let from = content.offset(from: content.documentRange.location, to: range.location)
-        let to = content.offset(from: content.documentRange.location, to: range.endLocation)
-        guard let first = block(atCharacter: from), let last = block(atCharacter: to),
-              shown.blocks.indices.contains(first), shown.blocks.indices.contains(last) else { return [] }
-        return Set(shown.blocks[first...last].map(\.id))
-    }
+    override var feed: FaceFeed? { owner.face }
+    override var feedSession: String? { sessionKey }
+    override var isCurrentReader: Bool { mounted }
 
     /// The column stays inside the page inset, centred in the room the host gives it.
     private func setWidth(_ width: CGFloat) {
@@ -283,7 +213,7 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
 
     // MARK: Geometry
 
-    private var readingTop: CGFloat { textView.contentOffset.y + textView.contentInset.top }
+    override var readingTop: CGFloat { textView.contentOffset.y + textView.contentInset.top }
     private var readingBottom: CGFloat { textView.contentOffset.y + textView.bounds.height - textView.contentInset.bottom }
     private var maxOffsetY: CGFloat {
         max(-textView.contentInset.top, textView.contentSize.height + textView.contentInset.bottom - textView.bounds.height)
@@ -291,7 +221,7 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
     /// The reader holds the scroll: a drag or its glide is under way, and nothing moves the document under the finger.
     private var readerHolds: Bool { textView.isDragging || textView.isDecelerating }
     /// The laid-out end is within the reading area: the reader's scroll came to rest at the end.
-    private var reachesEnd: Bool? {
+    override var reachesEnd: Bool? {
         guard let last = lastFragmentFrame(ensuringLayout: false) else { return shown.blocks.isEmpty ? true : nil }
         return documentEnd(last) - readingBottom <= 1
     }
@@ -300,46 +230,6 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         let clamped = min(max(y, -textView.contentInset.top), maxOffsetY)
         guard textView.contentOffset.y != clamped else { return }
         textView.contentOffset = CGPoint(x: textView.contentOffset.x, y: clamped)
-    }
-
-    private func starts() -> [Int] {
-        if let startsCache { return startsCache }
-        var out: [Int] = []
-        out.reserveCapacity(lengths.count)
-        var at = 0
-        for length in lengths {
-            out.append(at)
-            at += length + 1
-        }
-        startsCache = out
-        return out
-    }
-
-    private func start(_ block: Int) -> Int { starts()[block] }
-
-    private func block(atCharacter character: Int) -> Int? {
-        let starts = starts()
-        guard !starts.isEmpty, character >= 0 else { return nil }
-        var low = 0, high = starts.count - 1
-        while low < high {
-            let mid = (low + high + 1) / 2
-            if starts[mid] <= character { low = mid } else { high = mid - 1 }
-        }
-        return low
-    }
-
-    private func location(at character: Int) -> (any NSTextLocation)? {
-        content.location(content.documentRange.location, offsetBy: character)
-    }
-
-    private func lastFragmentFrame(ensuringLayout: Bool) -> CGRect? {
-        var frame: CGRect?
-        let options: NSTextLayoutFragment.EnumerationOptions = ensuringLayout ? [.reverse, .ensuresLayout] : [.reverse]
-        _ = layout.enumerateTextLayoutFragments(from: content.documentRange.endLocation, options: options) { fragment in
-            frame = fragment.layoutFragmentFrame
-            return false
-        }
-        return frame
     }
 
     private func documentEnd(_ last: CGRect) -> CGFloat {
@@ -368,67 +258,13 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         }
     }
 
-    private func recordPlace() -> Place? {
-        guard let viewport = layout.textViewportLayoutController.viewportRange else { return nil }
-        let top = readingTop
-        let originY = textView.textContainerInset.top
-        var place: Place?
-        _ = layout.enumerateTextLayoutFragments(from: viewport.location, options: []) { fragment in
-            let frame = fragment.layoutFragmentFrame
-            guard frame.maxY + originY > top else { return true }
-            let character = self.content.offset(from: self.content.documentRange.location, to: fragment.rangeInElement.location)
-            if let block = self.block(atCharacter: character), self.shown.blocks.indices.contains(block) {
-                place = Place(block: block, id: self.shown.blocks[block].id, offset: frame.minY + originY - top)
-            }
-            return false
-        }
-        return place
-    }
-
-    /// Puts the place's paragraph back at its recorded offset. When the edit began above it, the paragraphs between are laid out first,
-    /// so the paragraph's position is real and not an estimate.
-    private func restore(_ place: Place, editStart: Int, layoutAbove: Bool) {
-        guard lengths.indices.contains(place.block), let location = location(at: start(place.block)) else { return }
-        if layoutAbove, editStart < place.block, let from = self.location(at: start(editStart)),
-           let between = NSTextRange(location: from, end: location) {
-            layout.ensureLayout(for: between)
-        }
-        guard let fragment = layout.textLayoutFragment(for: location) else { return }
-        let now = fragment.layoutFragmentFrame.minY + textView.textContainerInset.top - readingTop
-        let shift = now - place.offset
-        if abs(shift) > 0.01 { scroll(toOffsetY: textView.contentOffset.y + shift) }
-    }
-
-    /// The place law around one change of `removed` blocks at `editStart` into `inserted` blocks. Following means "followed the end
-    /// before this change"; a fold the reader opens never follows, it holds the row; a reader holding the scroll keeps what is under
-    /// the finger.
-    private func keepingPlace(editStart: Int, removed: Int, inserted: Int, follows: Bool = true, layoutAbove: Bool = true,
-                              _ change: () -> Void) {
-        let wasAtEnd = follows && !pendingOpen && following && !readerHolds
-        let place = wasAtEnd || pendingOpen ? nil : recordPlace()
-        change()
-        if pendingOpen {
-            open()
-            return
-        }
-        if wasAtEnd {
-            scrollToEnd()
-        } else if var place {
-            if let position = index[place.id] {
-                place.block = position
-            } else if place.block >= editStart + removed {
-                place.block += inserted - removed
-            } else if place.block >= editStart {
-                place.block = min(editStart, lengths.count - 1)
-            }
-            if place.block >= 0 { restore(place, editStart: editStart, layoutAbove: layoutAbove) }
-            if !follows, let reached = reachesEnd { following = reached }
-        }
-        didMove()
-    }
+    override var textOrigin: CGPoint { CGPoint(x: textView.textContainerInset.left, y: textView.textContainerInset.top) }
+    override var holdsScroll: Bool { readerHolds }
+    override func shiftScroll(by shift: CGFloat) { scroll(toOffsetY: textView.contentOffset.y + shift) }
+    override func landAtEnd() { scrollToEnd() }
 
     /// Opening lands at the end once there is something to show and a viewport to show it in.
-    private func open() {
+    override func open() {
         guard pendingOpen, !shown.blocks.isEmpty, textView.bounds.height > 0, containerWidth > 0 else { return }
         pendingOpen = false
         scrollToEnd()
@@ -473,7 +309,7 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         didMove()
     }
 
-    private func didMove() {
+    override func didMove() {
         if let handle, handle.isAtEnd != following { handle.isAtEnd = following }
     }
 
@@ -500,174 +336,40 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
 
     // MARK: The one edit
 
-    /// The face applies an acknowledged press script in one TextKit transaction.
-    private func receive(_ packet: TranscriptPressEdits) {
-        guard packet.id != appliedScript else { return }
+    override func attachment(blockID: String, ref: TranscriptAttachmentRef, role: String) -> NSTextAttachment {
+        attachments.attachment(blockID: blockID, ref: ref, role: role)
+    }
+
+    override func forgetAttachments(_ blockIDs: Set<String>) { attachments.forget(blockIDs) }
+    override func placeHosted(_ frames: [String: CGRect]) { attachments.place(frames, in: textView) }
+
+    /// Receipts go straight to the in-process press.
+    override func acknowledge(_ receipt: TranscriptReaderReceipt) {
         let id = readerID, press = owner.press
-        guard packet.base == appliedScript else {
-            Task { await press.rebase(reader: id) }
-            return
-        }
-        do {
-            var end = 0
-            for edit in packet.edits {
-                guard edit.start >= end, edit.start <= shown.blocks.count, edit.removed >= 0,
-                      edit.removed <= shown.blocks.count - edit.start else {
-                    throw CocoaError(.coderReadCorrupt,
-                        userInfo: [NSLocalizedDescriptionKey: "The transcript script has an invalid paragraph range."])
-                }
-                end = edit.start + edit.removed
+        Task {
+            switch receipt {
+            case .applied(let script): _ = await press.applied(reader: id, script: script)
+            case .rejected(let script, _): await press.rejected(reader: id, script: script)
+            case .rebase: await press.rebase(reader: id)
+            case .revealed(let row): await press.revealed(reader: id, rowID: row)
             }
-            var replacements: [String: NativeParagraph] = [:]
-            for paragraph in packet.edits.flatMap(\.inserted) {
-                let body = NSMutableAttributedString(attributedString:
-                    try NSAttributedString(paragraph.body, including: TranscriptAttributes.self))
-                if case .attachment(let ref) = paragraph.block.kind, body.length > 0 {
-                    body.addAttribute(.attachment, value: attachments.attachment(blockID: paragraph.block.id, ref: ref),
-                                      range: NSRange(location: 0, length: body.length))
-                }
-                replacements[paragraph.block.id] = try NativeParagraph(body: body,
-                    separator: NSAttributedString(paragraph.separator, including: TranscriptAttributes.self),
-                    hidden: NSAttributedString(paragraph.hidden, including: TranscriptAttributes.self))
-            }
-            let previousReveal = live?.cuts.keys.map { $0 } ?? []
-            if let line = packet.live {
-                if live?.messageID != line.rowID {
-                    live = Live(messageID: line.rowID, target: line.text, glyphs: line.glyphs, cuts: line.cuts, streaming: line.streaming)
-                } else if var live {
-                    retarget(&live, line)
-                    live.cuts = line.cuts
-                    live.streaming = line.streaming
-                    self.live = live
-                }
-            } else { live = nil; stopLink() }
-            if revealsAtOnce, var live { live.revealed = live.glyphs.utf8.count; self.live = live }
-            handle?.issue = packet.issue
-            let changed = packet.edits
-            if let first = changed.first {
-                let single = changed.count == 1
-                let gone = Set(changed.flatMap { edit in
-                    shown.blocks.dropFirst(edit.start).prefix(edit.removed).map(\.id)
-                }).subtracting(changed.flatMap { $0.inserted.map { $0.block.id } })
-                let nextNative = native.merging(replacements) { _, next in next }
-                let resolved = try changed.map { try resolve($0, paragraphs: nextNative) }
-                native = nextNative
-                keepingPlace(editStart: first.start, removed: single ? first.removed : 0,
-                             inserted: single ? first.inserted.count : 0) {
-                    content.performEditingTransaction {
-                        for edit in resolved.reversed() {
-                            storage.replaceCharacters(in: edit.characters, with: edit.replacement)
-                            lengths.replaceSubrange(edit.paragraphs, with: edit.bodies.map { $0.1.length })
-                            shown.blocks.replaceSubrange(edit.paragraphs, with: edit.bodies.map { $0.0 })
-                            for (block, body) in edit.bodies { rememberVisibility(block.id, body) }
-                        }
-                    }
-                    startsCache = nil
-                    reindex()
-                }
-                for key in gone { native[key] = nil; hiddenLive.remove(key) }
-                attachments.forget(gone)
-            }
-            appliedScript = packet.id
-            handle?.isPreparing = false
-            log("press.apply reader=%@ script=%@ edits=%ld blocks=%ld", id.uuidString, packet.id.uuidString,
-                changed.count, shown.blocks.count)
-            Task { await press.applied(reader: id, script: packet.id) }
-            applyReveal(including: previousReveal)
-            paceLive()
-            if pendingOpen { open() }
-            placeHostedViews()
-            textView.setNeedsDisplay()
-        } catch {
-            handle?.issue = "Transcript could not be applied: " + error.localizedDescription
-            handle?.isPreparing = false
-            log("press.rejected reader=%@ cause=%@", id.uuidString, error.localizedDescription, level: .error)
-            Task { await press.rejected(reader: id, script: packet.id) }
         }
     }
 
-    private struct ResolvedEdit {
-        var paragraphs: Range<Int>
-        var characters: NSRange
-        var replacement: NSAttributedString
-        var bodies: [(TranscriptBlock, NSAttributedString)]
+    override func pressIssue(_ issue: String?) { handle?.issue = issue }
+
+    override func didAcceptScript(_ packet: TranscriptPressEdits) {
+        handle?.isPreparing = false
+        log("press.apply reader=%@ script=%@ edits=%ld blocks=%ld", readerID.uuidString, packet.id.uuidString,
+            packet.edits.count, shown.blocks.count)
     }
 
-    private func resolve(_ edit: TranscriptParagraphEdit, paragraphs: [String: NativeParagraph]) throws -> ResolvedEdit {
-        let count = shown.blocks.count, at = edit.start, removed = edit.removed
-        let replacement = NSMutableAttributedString()
-        let from: Int, to: Int
-        let inserted = try edit.inserted.map { paragraph -> (TranscriptBlock, NSAttributedString, NSAttributedString) in
-            guard let value = paragraphs[paragraph.block.id] else {
-                throw CocoaError(.coderReadCorrupt, userInfo: [NSLocalizedDescriptionKey: "A prepared transcript paragraph is missing."])
-            }
-            return (paragraph.block, visible(paragraph.block.id, value), value.separator)
-        }
-        if at + removed < count {
-            from = start(at)
-            to = start(at + removed)
-            for (_, body, separator) in inserted { replacement.append(body); replacement.append(separator) }
-        } else if inserted.isEmpty {
-            from = at > 0 ? start(at) - 1 : 0
-            to = storage.length
-        } else {
-            from = removed > 0 ? start(at) : storage.length
-            to = storage.length
-            if removed == 0, let last = shown.blocks.last {
-                guard let separator = paragraphs[last.id]?.separator else {
-                    throw CocoaError(.coderReadCorrupt, userInfo: [NSLocalizedDescriptionKey: "The transcript separator is missing."])
-                }
-                replacement.append(separator)
-            }
-            for (offset, value) in inserted.enumerated() {
-                if offset > 0 { replacement.append(inserted[offset - 1].2) }
-                replacement.append(value.1)
-            }
-        }
-        return ResolvedEdit(paragraphs: at..<(at + removed), characters: NSRange(location: from, length: to - from),
-                            replacement: replacement, bodies: inserted.map { ($0.0, $0.1) })
-    }
+    override func didApplyScript(_ packet: TranscriptPressEdits) { textView.setNeedsDisplay() }
 
-    private func rememberVisibility(_ key: String, _ body: NSAttributedString) {
-        if body.length > 0, body.attribute(TranscriptKey.liveHidden, at: 0, effectiveRange: nil) as? Bool == true {
-            hiddenLive.insert(key)
-        } else { hiddenLive.remove(key) }
-    }
-
-    private func visible(_ blockID: String, _ paragraph: NativeParagraph) -> NSAttributedString {
-        guard let live, let cuts = live.cuts[blockID] else { return paragraph.body }
-        if live.revealed >= live.glyphs.utf8.count { return paragraph.body }
-        var low = 0, high = cuts.count
-        while low < high {
-            let mid = low + (high - low) / 2
-            if cuts[mid].utf8End <= live.revealed { low = mid + 1 } else { high = mid }
-        }
-        guard low > 0 else { return paragraph.hidden }
-        let length = min(paragraph.body.length, cuts[low - 1].utf16End)
-        return paragraph.body.attributedSubstring(from: NSRange(location: 0, length: length))
-    }
-
-    private func reindex() {
-        index = Dictionary(shown.blocks.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { _, last in last })
-    }
-
-    /// TextKit places the existing attachment hosts over the visible attachment paragraphs.
-    func placeHostedViews() {
-        guard let viewport = layout.textViewportLayoutController.viewportRange else { return }
-        let inset = textView.textContainerInset
-        var frames: [String: CGRect] = [:]
-        _ = layout.enumerateTextLayoutFragments(from: viewport.location, options: []) { fragment in
-            guard fragment.rangeInElement.location.compare(viewport.endLocation) == .orderedAscending else { return false }
-            guard let paragraph = fragment.textElement as? NSTextParagraph, paragraph.attributedString.length > 0,
-                  let attachment = paragraph.attributedString.attribute(.attachment, at: 0, effectiveRange: nil) as? TranscriptAttachment
-            else { return true }
-            let local = fragment.frameForTextAttachment(at: fragment.rangeInElement.location)
-            guard local.width > 0, local.height > 0 else { return true }
-            let frame = fragment.layoutFragmentFrame
-            frames[attachment.blockID] = local.offsetBy(dx: frame.minX + inset.left, dy: frame.minY + inset.top)
-            return true
-        }
-        attachments.place(frames, in: textView)
+    override func scriptFailed(issue: String, cause: String) {
+        handle?.issue = issue
+        handle?.isPreparing = false
+        log("press.rejected reader=%@ cause=%@", readerID.uuidString, cause, level: .error)
     }
 
     // MARK: Insets
@@ -683,83 +385,17 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
 
     // MARK: The live reply
 
-    private func retarget(_ live: inout Live, _ line: TranscriptLiveLine) {
-        if !line.glyphs.hasPrefix(live.glyphs) {
-            live.pacer = ChatStreamPacer()
-            live.revealed = line.glyphs.utf8.count
-        }
-        live.target = line.text
-        live.glyphs = line.glyphs
-    }
-
     /// Reduce Motion and a view off screen show the current words at once; otherwise the display link paces them in.
-    private var revealsAtOnce: Bool { reduceMotion || textView.window == nil }
+    override var revealsAtOnce: Bool { reduceMotion || textView.window == nil }
 
-    private func paceLive() {
-        guard live != nil else { return }
-        if revealsAtOnce {
-            step(now: nil)
-        } else if link == nil {
-            let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-            link.add(to: .main, forMode: .common)
-            self.link = link
-        }
-    }
+    override func displayLink(target: Any, selector: Selector) -> CADisplayLink? { CADisplayLink(target: target, selector: selector) }
 
-    @objc private func tick(_ link: CADisplayLink) {
-        step(now: revealsAtOnce ? nil : CACurrentMediaTime())
-    }
-
-    /// A frame slices prepared glyphs; the press owns Markdown and block building.
-    private func step(now: CFTimeInterval?) {
-        guard var live else { stopLink(); return }
-        let total = live.glyphs.utf8.count
-        if let now {
-            live.revealed = live.pacer.advance(live.glyphs, now: now, maxLagBytes: Self.maxLagBytes)
-        } else { live.revealed = total }
-        let caughtUp = live.revealed >= total
-        self.live = live
-        applyReveal()
-        if caughtUp && !live.streaming {
-            self.live = nil
-            let id = readerID, row = live.messageID, press = owner.press
-            Task { await press.revealed(reader: id, rowID: row) }
-        }
-        if caughtUp { stopLink() }
-    }
-
-    private func stopLink() {
-        link?.invalidate()
-        link = nil
-    }
-
-    private func applyReveal(including previousReveal: [String] = []) {
-        var edits: [(Int, NSAttributedString)] = []
-        // Paragraphs leaving the live line regain their complete prepared body, including a partly revealed paragraph.
-        for key in Set(live?.cuts.keys.map { $0 } ?? []).union(previousReveal).union(hiddenLive) {
-            guard let position = index[key], let paragraph = native[key] else { continue }
-            let body = visible(key, paragraph)
-            let hidden = body.length > 0 && body.attribute(TranscriptKey.liveHidden, at: 0, effectiveRange: nil) as? Bool == true
-            if body.length != lengths[position] || hiddenLive.contains(key) != hidden { edits.append((position, body)) }
-        }
-        edits.sort { $0.0 < $1.0 }
-        guard let first = edits.first else { return }
-        keepingPlace(editStart: first.0, removed: 0, inserted: 0, layoutAbove: false) {
-            content.performEditingTransaction {
-                for (position, body) in edits.reversed() {
-                    let key = shown.blocks[position].id
-                    let oldLength = lengths[position]
-                    if !hiddenLive.contains(key), body.length > oldLength {
-                        let tail = body.attributedSubstring(from: NSRange(location: oldLength, length: body.length - oldLength))
-                        storage.replaceCharacters(in: NSRange(location: start(position) + oldLength, length: 0), with: tail)
-                    } else {
-                        storage.replaceCharacters(in: NSRange(location: start(position), length: oldLength), with: body)
-                    }
-                    lengths[position] = body.length
-                    rememberVisibility(key, body)
-                }
-            }
-            startsCache = nil
+    /// Paragraph by paragraph inside the place law; paragraphs leaving the live line regain their complete prepared body.
+    override func applyReveal(including previousReveal: [String] = []) {
+        let changes = revealChanges(including: previousReveal)
+        guard let first = changes.first else { return }
+        keepingPlace(editStart: first.position, removed: 0, inserted: 0, layoutAbove: false) {
+            splice(changes, coalesced: false)
         }
     }
 
@@ -788,36 +424,6 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         case .wholeMessage(let id): actions.loadWholeMessage(id)
         case .retrySend(let id): actions.retrySend(id)
         }
-    }
-
-    /// A toggle is an attribute edit over the run's range, so TextKit enumerates it again and asks `shouldEnumerate` afresh.
-    private func setFold(_ group: String, open: Bool) {
-        let members = shown.blocks.indices.filter { position in
-            let block = shown.blocks[position]
-            if case .foldHeadline = block.kind, block.messageID == group { return true }
-            return block.foldGroup == group
-        }
-        guard let first = members.first, let last = members.last else { return }
-        let range = NSRange(location: start(first), length: start(last) + lengths[last] - start(first))
-        keepingPlace(editStart: first, removed: 0, inserted: 0, follows: false) {
-            if open { folds.openFolds.insert(group) } else { folds.openFolds.remove(group) }
-            content.performEditingTransaction {
-                storage.beginEditing()
-                storage.edited(.editedAttributes, range: range, changeInLength: 0)
-                storage.endEditing()
-            }
-        }
-    }
-
-    /// A hosted view changed height: lay its paragraph out again where it is.
-    private func relayoutAttachment(_ blockID: String) {
-        guard let position = index[blockID], let from = location(at: start(position)),
-              let to = location(at: start(position) + lengths[position]), let range = NSTextRange(location: from, end: to) else { return }
-        keepingPlace(editStart: position, removed: 0, inserted: 0) {
-            layout.invalidateLayout(for: range)
-            layout.textViewportLayoutController.layoutViewport()
-        }
-        placeHostedViews()
     }
 
     // MARK: Requests from the host
@@ -894,9 +500,9 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
                     })
                 }
             }
-            if message.id.uuidString == lastAssistantID, actions.canRegenerate {
+            if let sessionKey, message.id.uuidString == lastAssistantID, actions.canRegenerate {
                 ours.append(UIAction(title: "Answer again", image: UIImage(systemName: "arrow.clockwise")) { [weak self] _ in
-                    self?.actions.regenerate()
+                    self?.actions.regenerate(message.id, sessionKey)
                 })
             }
         } else if spansBlocks {
@@ -909,66 +515,24 @@ final class MobileTranscriptController: NSObject, UITextViewDelegate, UIGestureR
         return UIMenu(children: [UIMenu(options: .displayInline, children: ours)] + suggestedActions)
     }
 
+    /// Every paragraph of the message as it stands on screen.
+    private func messageRange(_ id: String) -> NSRange? {
+        guard let first = shown.blocks.firstIndex(where: { $0.messageID == id && actionable($0) != nil }),
+              let last = shown.blocks.lastIndex(where: { $0.messageID == id && actionable($0) != nil }) else { return nil }
+        return NSRange(location: start(first), length: start(last) + lengths[last] - start(first))
+    }
+
     /// The message's words as they read on screen, every paragraph of it.
     private func copyMessage(_ id: String) {
-        guard let first = shown.blocks.firstIndex(where: { $0.messageID == id && actionable($0) != nil }),
-              let last = shown.blocks.lastIndex(where: { $0.messageID == id && actionable($0) != nil }),
-              let text = text(for: [NSRange(location: start(first), length: start(last) + lengths[last] - start(first))], markdown: false)
-        else { return }
+        guard let range = messageRange(id), let text = text(for: [range], markdown: false) else { return }
         UIPasteboard.general.string = text
         SystemToastCenter.shared.push(success: "Copied")
     }
 
-    /// A selection across paragraphs gives their markdown sources; otherwise the whole message's markdown.
+    /// A selection across paragraphs gives their markdown sources; otherwise the shown message's, cut where its words have revealed (as on the Mac).
     private func copyMarkdown(_ range: NSRange?, message: ChatMessage) {
-        let markdown = range.flatMap { text(for: [$0], markdown: true) } ?? message.text
+        guard let markdown = (range ?? messageRange(message.id.uuidString)).flatMap({ text(for: [$0], markdown: true) }) else { return }
         UIPasteboard.general.string = markdown
         SystemToastCenter.shared.push(success: "Copied as Markdown")
-    }
-
-    // MARK: Copy
-
-    private func source(for block: TranscriptBlock, visibleLength: Int) -> String {
-        guard let live, let cuts = live.cuts[block.id], let last = cuts.last,
-              visibleLength < last.utf16End else { return block.source }
-        guard let cut = cuts.last(where: { $0.utf16End <= visibleLength }) else { return "" }
-        return String(decoding: block.source.utf8.prefix(cut.markdownEnd), as: UTF8.self)
-    }
-
-    /// Paragraph by paragraph: a wholly selected paragraph gives its markdown source (with `markdown`), a partly selected one its
-    /// selected text. Closed folds are skipped, as they are on screen; line separators read as newlines and attachments as their source.
-    func text(for ranges: [NSRange], markdown: Bool) -> String? {
-        let string = storage.string as NSString
-        let separators: Set<unichar> = [0x0A, 0x0D, 0x2029]
-        var parts: [String] = []
-        var lastMessage: String?
-        for range in ranges where range.length > 0 {
-            var location = range.location
-            let end = min(NSMaxRange(range), string.length)
-            while location < end {
-                let paragraph = string.paragraphRange(for: NSRange(location: location, length: 0))
-                location = NSMaxRange(paragraph)
-                var body = paragraph
-                while body.length > 0, separators.contains(string.character(at: NSMaxRange(body) - 1)) { body.length -= 1 }
-                let selected = NSIntersectionRange(body, range)
-                guard selected.length > 0,
-                      let id = storage.attribute(TranscriptKey.blockID, at: paragraph.location, effectiveRange: nil) as? String,
-                      let position = index[id] else { continue }
-                if hiddenLive.contains(id) { continue }
-                let block = shown.blocks[position]
-                if let group = block.foldGroup, !folds.openFolds.contains(group) { continue }
-                var isAttachment = false
-                if case .attachment = block.kind { isAttachment = true }
-                let whole = selected.length == body.length
-                let text = isAttachment || (markdown && whole) ? source(for: block, visibleLength: body.length) : string.substring(with: selected)
-                    .replacingOccurrences(of: "\u{2028}", with: "\n")
-                    .replacingOccurrences(of: "\u{FFFC}", with: "")
-                guard !text.isEmpty else { continue }
-                let tight = block.messageID == lastMessage && (block.lead == .listItem || block.lead == .detail)
-                parts.append((parts.isEmpty ? "" : (tight ? "\n" : "\n\n")) + text)
-                lastMessage = block.messageID
-            }
-        }
-        return parts.isEmpty ? nil : parts.joined()
     }
 }

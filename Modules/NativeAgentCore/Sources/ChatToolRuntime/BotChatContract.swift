@@ -16,7 +16,6 @@ public struct BotChatContract: Sendable, Equatable {
     /// Nil only when the choice is unavailable and the turn must be refused.
     public var choice: ProviderTurnChoice?
     public var modelChoiceProblem: String? = nil
-    public var outputBudgetTokens: Int? = nil
 
     public struct FollowingSettingsRefusal: Error, LocalizedError, Sendable {
         public let problems: [(field: String, message: String)]
@@ -86,8 +85,7 @@ public struct BotChatContract: Sendable, Equatable {
         do {
             instructions = try Self.instructions(for: bot)
             let choice = try await choice(for: bot, dataRoot: dataRoot)
-            return BotChatContract(name: bot.name, instructions: instructions, choice: choice,
-                outputBudgetTokens: bot.budget.tokens)
+            return BotChatContract(name: bot.name, instructions: instructions, choice: choice)
         } catch {
             return BotChatContract(name: bot.name, instructions: instructions, choice: nil, modelChoiceProblem: String(describing: error))
         }

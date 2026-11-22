@@ -39,13 +39,7 @@ extension ChatView {
     }
 
     func pinSessionFromDroppedPayload(_ payload: String) {
-        guard let sessionId = sessionIdFromDroppedPayload(payload) else { return }
+        guard let sessionId = payload.trimmedNonEmpty else { return }
         pinSession(sessionId, selectAfterPin: true)
-    }
-
-    func sessionIdFromDroppedPayload(_ payload: String) -> String? {
-        let sessionId = payload.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sessionId.isEmpty else { return nil }
-        return sessionId
     }
 }

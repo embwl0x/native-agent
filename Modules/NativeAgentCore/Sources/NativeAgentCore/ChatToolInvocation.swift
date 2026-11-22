@@ -9,10 +9,20 @@ public struct ChatToolInvocation: Sendable {
 
     public init() {}
 
+    /// Report the durable ID to this dispatch's response owner before beginning follow-up work.
+    package var reportCommittedID: (@Sendable (_ tool: String, _ id: String) -> Void)? {
+        get { self[CommittedIDPart.self] }
+        set { self[CommittedIDPart.self] = newValue }
+    }
+
     package subscript<Part: ToolInvocationPart>(_ part: Part.Type) -> Part.Value {
         get { parts[ObjectIdentifier(part)] as? Part.Value ?? Part.unset }
         set { parts[ObjectIdentifier(part)] = newValue }
     }
+}
+
+private enum CommittedIDPart: ToolInvocationPart {
+    static let unset: (@Sendable (String, String) -> Void)? = nil
 }
 
 /// An owner's state on one tool operation, distinct from state on its turn.

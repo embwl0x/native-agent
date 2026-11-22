@@ -121,7 +121,7 @@ struct ContentView: View {
             } detail: {
                 ZStack {
                 ChatView()
-                    .environment(\.chatPageIsVisible, isShowingChat)
+                    .environment(\.chatPageIsVisible, isShowingChat && !showFirstRunOnboarding)
                     // Keep glass in the shared composition; a separate native host changes its backdrop boundary.
                     .animation(isShowingChat ? NativeAgentMotion.crossfade : nil) {
                         $0.opacity(isShowingChat ? 1 : 0)
@@ -325,7 +325,7 @@ struct ContentView: View {
         do {
             let reply = try FaceWindowReply.value(await appModel.client.act(.onboarding(.start)))
             guard case .object(let value) = reply, case .bool(let requiresPresentation)? = value["requiresPresentation"] else {
-                throw PartCallError(code: "onboarding_reply_invalid", message: "The body did not return the setup disposition.")
+                throw PartCallError(code: "onboarding_reply_invalid", message: "NativeAgent didn't answer. Try again.")
             }
             guard !Task.isCancelled, requiresPresentation else { return }
         } catch {
@@ -353,6 +353,8 @@ struct ContentView: View {
         if destination != .sidebar(.chat), viewModeRaw != ShellViewMode.simple {
             viewModeRaw = ShellViewMode.advanced
         }
+        // Agent view has no chat pane: a conversation it opens shows in Simple, and Choose Agent returns.
+        if destination == .sidebar(.chat), viewModeRaw == ShellViewMode.agent { viewModeRaw = ShellViewMode.simple }
         switch destination {
         case .chatShortcut: break
         case .ownPage(let page):
@@ -423,7 +425,6 @@ struct ContentView: View {
             selectionRaw = home.parent.rawValue
             return
         }
-        if target == .desk { appModel.pendingDeskHandle = nil }
         selectionRaw = target.rawValue
     }
 

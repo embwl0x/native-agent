@@ -4,7 +4,7 @@ import Experiences
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | `growthWeek`/`growthWeekLines`: frozen evidence for `growth-week.js` |
+// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | `growthWeek`: frozen evidence for `growth-week.js` |
 
 public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     /// An unanswered proposal is not a change.
@@ -167,9 +167,5 @@ extension CognitiveSubstrate {
             }),
         ])
         return CognitiveGrowthWeek(projection: await dependencies.growthProjection(input))
-    }
-
-    public func growthWeekLines(at now: Date? = nil) async -> [String] {
-        await growthWeek(at: now).lines
     }
 }

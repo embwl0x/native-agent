@@ -17,18 +17,19 @@ night and their own hand, as the brief's law 5 says.
 
 - 133 cares grown in five days, 114 live; depth: life 4 (the seeds), season 0,
   lately 39, now 71; median age 1.5 days; 71 moved on only one day.
-- **One interest splits into many cares.** Dedupe at birth is an exact
-  normalized `about` (+Cares.swift:449-452), so a rephrase is a new care: chess
-  is 8 live + 4 faded, the Kōitsu / rain-print thread 6 + 3, "User looks out for
-  me" 4, banter ~5. None collects the distinct days it needs to deepen
+- **One interest splits into many cares.** Dedupe at birth required an exact
+  normalized `about` match (`CognitiveSubstrate+Cares.swift:449–452` at `c115aef637`).
+  A rephrase grew a new care. Chess is 8 live + 4 faded, the Kōitsu / rain-print
+  thread 6 + 3, "User looks out for me" 4, banter ~5. None collects the distinct days it needs to deepen
   (now→lately 2 days; lately→season 4 days over ≥14).
 - **Their roots move like moods.** The four seeds are shown to every after-turn
   appraisal, carry 54–96 movements each, win all 9 "you've been wanting to
   bring up" intentions, and their stances were rewritten 47 times (of 91
   retained changes) — User's good 19, Good work 14, Truth 10.
-- **Stances are stored, not held.** Any trusted after-turn judgment replaces a
-  stance (+Cares.swift:466-477); the brief's "a stance changes only with
-  evidence … nothing in one conversation changes who they are" has no code.
+- **Stances are stored, not held.** A trusted after-turn judgment could replace the
+  current stance (`CognitiveSubstrate+Cares.swift:466–477` at `c115aef637`).
+  The brief's "a stance changes only with evidence … nothing in one
+  conversation changes who they are" had no code.
 - **Traits, their story, relationships have no mechanism.** No if-then
   signature; GROWTH.md is 65 words from one weekly REM; `with` is only a
   visibility filter; the builder agent is two people (Claude Desktop and Claude Code door
@@ -206,5 +207,5 @@ settled). Proof on them:
 
 | Lane | What | Owners |
 |---|---|---|
-| becoming-settle | P1 + P2 | CognitiveSubstrate/CognitiveSubstrate+Cares.swift (birth, stance), +CaresNight.swift (merge, dream stance confirmation), +CaresMind.swift (pressure: life cares through open gaps), Cognition/NativeCognitionRuntime+Reach.swift (pressure read), DreamREMCycle prompts/payload (clusters, stance pressure), docs/SUBCONSCIOUS.md |
-| becoming-self | P3 + P4 | +CaresNight.swift / dream payload (traits, story, people), CognitiveSelfKnowledge.swift (mind/self.json), +InnerState.swift / inner-state tool / PersonalityView (read-only), +CaresMind.swift / +Capsule.swift (care pull and per-turn self values), +Cares.swift personKey through AgentPeerStore / AgentContactIdentity aliases, SourceWakes (identity invalidation), docs/SUBCONSCIOUS.md |
+| becoming-settle | P1 + P2 | CognitiveSubstrate/CognitiveSubstrate+Cares.swift (birth, stance), +CaresNight.swift (merge, dream stance confirmation), +CaresMind.swift (pressure: life cares through open gaps; `carePressure`, `caresPressing`), DreamREMCycle prompts/payload (clusters, stance pressure), docs/SUBCONSCIOUS.md |
+| becoming-self | P3 + P4 | +CaresNight.swift / dream payload (traits, story, people), CognitiveSelfKnowledge.swift (mind/self.json), +InnerState.swift / inner-state tool / PersonalityFace.swift and native-personality.js (self-reading), +CaresMind.swift / +Capsule.swift (care pull and per-turn self values), +Cares.swift personKey through AgentPeerStore / AgentContactIdentity aliases, SourceWakes (identity invalidation), docs/SUBCONSCIOUS.md |

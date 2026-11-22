@@ -110,7 +110,7 @@ final class RemoteActionLedger: ObservableObject {
     func read(operation: UUID) async -> FaceActOutcome {
         await iCloudSyncEngine.shared.refreshApprovalsSnapshot()
         guard let card = actions.first(where: { $0.operationID == operation }) else {
-            return .init(words: "The original receipt is unavailable; its effect remains unconfirmed.", effects: .unknown)
+            return .init(words: "Not sure that went through.", effects: .unknown)
         }
         if let id = card.approvalID, let approval = iCloudSyncEngine.shared.approvals.first(where: { $0.id == id }) {
             var outcome = approvalOutcome(approval, card: card)

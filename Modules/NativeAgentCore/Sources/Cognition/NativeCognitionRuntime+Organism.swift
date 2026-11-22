@@ -69,7 +69,6 @@ extension NativeCognitionRuntime {
             if existing?.status == .pending { continue }
             await ingestApprovalLifecycleEvent(
                 ApprovalLifecycleEvent(phase: .requested, record: record),
-                persistSynchronously: false,
                 occurredAtOverride: now(),
                 bootstrapIfNeeded: false
             )
@@ -78,13 +77,12 @@ extension NativeCognitionRuntime {
 
     private func ingestApprovalLifecycleEvent(
         _ event: ApprovalLifecycleEvent,
-        persistSynchronously: Bool = false,
         occurredAtOverride: Date? = nil,
         bootstrapIfNeeded: Bool = true
     ) async {
         guard !isFlushedForTermination else { return }
         let record = event.record
-        let timestamp = occurredAtOverride ?? Self.approvalLifecycleDate(
+        let timestamp = occurredAtOverride ?? NativeTimestampFormat.parseOptionalISO8601FractionalFirst(
             event.phase == .resolved ? record.resolvedAt : record.createdAt
         ) ?? now()
         let source = Self.approvalLifecycleSource(for: record)
@@ -105,19 +103,14 @@ extension NativeCognitionRuntime {
         if bootstrapIfNeeded {
             await ingestPreparedOrganismSignal(
                 signal,
-                persistSynchronously: persistSynchronously
+                persistSynchronously: false
             )
         } else {
             await ingestPreparedOrganismSignalAfterBootstrap(
                 signal,
-                persistSynchronously: persistSynchronously
+                persistSynchronously: false
             )
         }
-    }
-
-    private nonisolated static func approvalLifecycleDate(_ raw: String?) -> Date? {
-        guard let raw, !raw.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     private nonisolated static func approvalLifecycleSource(for record: ApprovalRecord) -> String {
@@ -204,7 +197,7 @@ extension NativeCognitionRuntime {
     private func settleDreamSignal(_ signal: SomaticSignal) async -> Result<Void, PersistenceCoreError> {
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(.dreamCompleted))
         await drainFeltResolutionsIntoSubstrate()
-        cachedBodyRead = nil
+        bodyReadOrder.write { cachedBodyRead = nil }
         guard await organismKernel.hasCompletedDream(signal.id),
               await persistOrganismContinuity(reason: "dream:\(signal.id.uuidString)") else {
             return .failure(.ioFailure("dream completion remains owed; body did not persist it"))
@@ -220,8 +213,7 @@ extension NativeCognitionRuntime {
         arousal: Double? = nil,
         metadata: [String: JSONValue] = [:],
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
-        persistSynchronously: Bool = true,
-        reflectAfterReplay: Bool = true
+        persistSynchronously: Bool = true
     ) async {
         let signal = SomaticSignal(
             id: UUID(),
@@ -236,8 +228,7 @@ extension NativeCognitionRuntime {
         await ingestPreparedOrganismSignal(
             signal,
             reflectionMaterial: reflectionMaterial,
-            persistSynchronously: persistSynchronously,
-            reflectAfterReplay: reflectAfterReplay
+            persistSynchronously: persistSynchronously
         )
     }
 
@@ -245,28 +236,25 @@ extension NativeCognitionRuntime {
     func ingestPreparedOrganismSignal(
         _ signal: SomaticSignal,
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
-        persistSynchronously: Bool = true,
-        reflectAfterReplay: Bool = true
+        persistSynchronously: Bool = true
     ) async {
         await bootstrap()
         await ingestPreparedOrganismSignalAfterBootstrap(
             signal,
             reflectionMaterial: reflectionMaterial,
-            persistSynchronously: persistSynchronously,
-            reflectAfterReplay: reflectAfterReplay
+            persistSynchronously: persistSynchronously
         )
     }
 
     private func ingestPreparedOrganismSignalAfterBootstrap(
         _ signal: SomaticSignal,
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
-        persistSynchronously: Bool,
-        reflectAfterReplay: Bool = true
+        persistSynchronously: Bool
     ) async {
         let kind = signal.kind
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(kind))
         await drainFeltResolutionsIntoSubstrate()
-        cachedBodyRead = nil
+        bodyReadOrder.write { cachedBodyRead = nil }
         if persistSynchronously {
             await persistOrganismContinuity(reason: "somatic:\(kind.rawValue)")
         } else {
@@ -280,7 +268,7 @@ extension NativeCognitionRuntime {
             let reason = "replay_event:\(kind.rawValue)"
             // Replay owns flight and terminal accounting; journal acknowledgement prevents duplicate dream reflection.
             _ = await runEventDrivenReplay(reason: reason,
-                material: reflectAfterReplay ? reflectionMaterial : nil)
+                material: reflectionMaterial)
         }
     }
 
@@ -407,7 +395,7 @@ extension NativeCognitionRuntime {
     }
 
     /// Push quiet-hours invalidation into the body clock; unavailable preferences supply no diurnal input.
-    private func refreshOrganismDiurnalClockIfInvalidated(at fixedAt: Date) async {
+    private func refreshOrganismDiurnalClockIfInvalidated() async {
         guard !isFlushedForTermination, sourceWakes.clockDirty else { return }
         sourceWakes.clockDirty = false
         let window: TurnQuietHoursWindow?
@@ -435,20 +423,21 @@ extension NativeCognitionRuntime {
 
     func organismBodySample(at fixedAt: Date) async -> OrganismBodyRead {
         // Refresh the clock for frozen turn reads as well as background projection.
-        await refreshOrganismDiurnalClockIfInvalidated(at: fixedAt)
+        await refreshOrganismDiurnalClockIfInvalidated()
         var liveRead: OrganismBodyRead
         // Retain the two-second cache only for the composite host/transport gauge, which has no complete push owner.
         if let cached = cachedBodyRead, fixedAt.timeIntervalSince(cached.at) < 2.0 {
             liveRead = cached.read
         } else {
-            let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
-            liveRead = await Self.makeOrganismBodyRead(
-                dataRoot: dataRoot,
-                mobileConfigured: await checkedPhoneNotificationConfiguration(),
-                now: fixedAt,
-                phoneDeliveryPrediction: phoneDelivery
-            )
-            cachedBodyRead = (liveRead, fixedAt)
+            liveRead = await bodyReadOrder.read({
+                let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
+                return await Self.makeOrganismBodyRead(
+                    dataRoot: dataRoot,
+                    mobileConfigured: await checkedPhoneNotificationConfiguration(),
+                    now: fixedAt,
+                    phoneDeliveryPrediction: phoneDelivery
+                )
+            }, publish: { cachedBodyRead = ($0, fixedAt) })
         }
         if liveRead.providersAvailable == true {
             let providerEvidence = providerPathEvidence(at: fixedAt)

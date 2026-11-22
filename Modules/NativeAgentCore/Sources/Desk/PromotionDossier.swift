@@ -10,18 +10,22 @@ public struct DeskNote: Sendable, Equatable {
     public var author: String?
     /// Typed release identity belongs only to system-release notes.
     public var releaseCondition: String?
+    /// A carried deed handles the occurrence that admitted it.
+    public var carriedOccurrence: String?
 
-    public init(ts: String, text: String, author: String? = nil, releaseCondition: String? = nil) {
+    public init(ts: String, text: String, author: String? = nil, releaseCondition: String? = nil, carriedOccurrence: String? = nil) {
         self.ts = ts
         self.text = text
         self.author = author
         self.releaseCondition = releaseCondition
+        self.carriedOccurrence = carriedOccurrence
     }
 
     public func toJSON() -> JSONValue {
         var fields: [String: JSONValue] = ["ts": .string(ts), "text": .string(text)]
         if let author { fields["author"] = .string(author) }
         if let releaseCondition { fields["releaseCondition"] = .string(releaseCondition) }
+        if let carriedOccurrence { fields["carriedOccurrence"] = .string(carriedOccurrence) }
         return .object(fields)
     }
 
@@ -30,11 +34,15 @@ public struct DeskNote: Sendable, Equatable {
               let ts = obj["ts"]?.stringValue,
               DeskClock.parseISO(ts) != nil,
               let text = obj["text"]?.stringValue,
-              DeskJSON.optionalStringsAreValid(obj, keys: ["author", "releaseCondition"]) else { return nil }
+              DeskJSON.optionalStringsAreValid(obj, keys: ["author", "releaseCondition", "carriedOccurrence"]) else { return nil }
         if let condition = obj["releaseCondition"]?.stringValue {
             guard obj["author"] == .string("system"), MyQueue.When(condition) != nil else { return nil }
         }
-        return DeskNote(ts: ts, text: text, author: obj["author"]?.stringValue, releaseCondition: obj["releaseCondition"]?.stringValue)
+        if let occurrence = obj["carriedOccurrence"]?.stringValue {
+            guard obj["author"] == .string("agent"), MyQueueCarried.occurrenceDate(occurrence) != nil else { return nil }
+        }
+        return DeskNote(ts: ts, text: text, author: obj["author"]?.stringValue,
+                        releaseCondition: obj["releaseCondition"]?.stringValue, carriedOccurrence: obj["carriedOccurrence"]?.stringValue)
     }
 }
 

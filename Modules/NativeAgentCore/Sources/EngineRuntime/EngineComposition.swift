@@ -195,9 +195,6 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
     func stopAgentConversations() async {
         await NativeAgentEngine.live.agents.continuation.stop()
     }
-
-    /// Conversation-owner changes and the one clock wake reconciliation.
-    func nextConversationDeadline(after _: Date) -> Date? { nil }
 }
 
 // MARK: - Desk notifications

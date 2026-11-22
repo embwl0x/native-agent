@@ -70,7 +70,7 @@ extension AgentScreen {
     package static func names(_ dataRoot: URL) -> (agent: String, person: String) {
         let profile = (try? Data(contentsOf: dataRoot.appendingPathComponent("memory/profile.json")))
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
-        return (clip(nonEmpty(profile["name"] as? String) ?? "Agent", 40), clip(nonEmpty(profile["userName"] as? String) ?? "Your person", 40))
+        return (clip((profile["name"] as? String).trimmedNonEmpty ?? "Agent", 40), clip((profile["userName"] as? String).trimmedNonEmpty ?? "Your person", 40))
     }
 
     static func screen(_ header: [String], _ sections: [[String]], verbs: [(String, String)], back: String = "Back: home.",
@@ -163,10 +163,9 @@ extension AgentScreen {
                 return screen([contact.name, "History unavailable"], [[readFailure(error, reason: "contact_history_unavailable",
                     remedy: Repair.remedy(owner: "Contact history for " + owner, nextCall: nil, tap: repair, instruction: repair))]], verbs: [])
             }
-            var shown = Array(thread.suffix(6))
             var labels = Dictionary(everyone.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
             for member in members { labels[member] = slug }
-            shown = ContactThread.project(shown, person: person, own: "me", names: labels)
+            let shown = ContactThread.project(thread.suffix(6), person: person, own: "me", names: labels)
             var talk = shown.map {
                 line($0.at, $0.speaker + ($0.door.map { " · " + $0 } ?? ""), $0.text, now: now)
             }
@@ -176,30 +175,25 @@ extension AgentScreen {
                chat.at > max(thread.last?.at ?? .distantPast, record?.exchanges?.last?.sentAt ?? .distantPast) {
                 let tail = try chatTail(chat.id, dataRoot: dataRoot).suffix(6)
                 let projected = ContactThread.project(tail, person: person, own: "me",
-                    names: identity.doors, contactPrefix: slug + " · ",
-                    mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) })
+                    names: identity.doors, contactPrefix: slug + " · ")
                 talk = projected.map { line($0.date, $0.speaker, $0.text, now: now) }
                 answers = [:]
-                shown = []
                 for older in theirs.filter({ $0.id != scope && $0.id != chat.id }).prefix(3) {
                     if let last = try chatTail(older.id, dataRoot: dataRoot, bytes: 16_384).last(where: { !$0.mine }) {
                         let projected = ContactThread.project([last], person: person,
-                            names: identity.doors, contactPrefix: slug + " · ",
-                            mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) })[0]
+                            names: identity.doors, contactPrefix: slug + " · ")[0]
                         talk.insert(line(last.date, projected.speaker, "session " + older.id + " · " + last.text, now: now), at: 0)
                     }
                 }
             }
             if talk.isEmpty, contact.kind == "routine" {
                 let replies = try await ContactThread.project(routineReplies(workspace: workspace, dataRoot: dataRoot).suffix(6), names: labels,
-                    unattested: contact.name,
-                    mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) })
+                    unattested: contact.name)
                 talk = replies.map { line($0.date, $0.speaker, $0.text, now: now) }
             }
             if talk.isEmpty, let record, record.retainedReply != nil {
                 let replyLine = try ContactThread.project(ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity),
-                    names: labels, answering: record.operationID,
-                    mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) })
+                    names: labels, answering: record.operationID)
                 if let reply = replyLine.first {
                     talk.append(line(reply.date, reply.speaker, reply.text, now: now))
                 } else {
@@ -207,7 +201,6 @@ extension AgentScreen {
                 }
             }
             if talk.isEmpty { talk = [record == nil ? "no messages yet" : "sent; no reply is recorded yet"] }
-            for row in shown { ContactThread.consume(row, mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) }) }
             var outcome: [String] = []
             if let problem = health?.problem { outcome.append(problem) }
             if let record, record.sendFailed || health?.resolves(record) != true && record.phase == "attention" {
@@ -278,7 +271,7 @@ extension AgentScreen {
             } else {
                 talk = messages.suffix(6).compactMap { message in
                     guard case .object(let row) = message, case .string(let text)? = row["text"] else { return nil }
-                    let at = if case .string(let timestamp)? = row["timestamp"] { date(timestamp) } else { Optional<Date>.none }
+                    let at = if case .string(let timestamp)? = row["timestamp"] { NativeTimestampFormat.parseISO8601FractionalFirst(timestamp) } else { Optional<Date>.none }
                     let speaker: String = if row["role"] == .string("assistant") { "me" }
                         else if case .string(let principal)? = row["agent_id"] { world.contacts.first { $0.id == principal }?.name ?? principal }
                         else { person }
@@ -360,7 +353,7 @@ extension AgentScreen {
 
     private static func deskRow(_ item: DeskItem, now: Date) -> String {
         pad("desk." + item.alias, 11) + clip(item.title, 50) + " · " + deskState(item)
-            + (date(item.updatedAt).map { " " + age(now.timeIntervalSince($0)) } ?? "")
+            + (NativeTimestampFormat.parseISO8601FractionalFirst(item.updatedAt).map { " " + age(now.timeIntervalSince($0)) } ?? "")
     }
 
     package static func deskState(_ item: DeskItem) -> String {
@@ -377,9 +370,7 @@ extension AgentScreen {
         guard case .object(let owner) = value, case .object(let item)? = owner["record"], let alias = item["alias"]?.stringValue,
               let handle = item["handle"]?.stringValue, case .bool(let isOpen)? = item["is_open"],
               case .array(let replies)? = item["reply_deliveries"] else { return nil }
-        func rows(_ value: JSONValue?) -> [[String: JSONValue]] { guard case .array(let rows)? = value else { return [] }; return rows.compactMap {
-            if case .object(let row) = $0 { row } else { nil } } }
-        let name = "desk." + alias, children = rows(owner["items"])
+        let name = "desk." + alias, children = JSONValue.objectArray(owner["items"])
         var header = [name] + (item["display_status"]?.stringValue ?? "").components(separatedBy: " · "), gaps: [String] = []
         if !isOpen {
             do {
@@ -400,7 +391,7 @@ extension AgentScreen {
                         shape: "The obligation ledger could not be read: \(error.localizedDescription). Preserve its records and SQLite journals.")))]
             }
         }
-        var notes = rows(owner["notes"]).prefix(3).reversed().map { line(date($0["timestamp"]?.stringValue ?? ""), "", $0["text"]?.stringValue ?? "", now: now,
+        var notes = JSONValue.objectArray(owner["notes"]).prefix(3).reversed().map { line(NativeTimestampFormat.parseISO8601FractionalFirst($0["timestamp"]?.stringValue ?? ""), "", $0["text"]?.stringValue ?? "", now: now,
             talk: false) }
         if case .int(let count)? = owner["note_count"], count > 3 { notes.insert("+\(count - 3) earlier notes · \(name).more", at: 0) }
         var parts = children.prefix(6).map { pad("desk." + ($0["alias"]?.stringValue ?? ""), 11) + clip($0["title"]?.stringValue ?? "", 50) + " · " + (
@@ -733,7 +724,7 @@ extension AgentScreen {
             let projection = AgentWorkspaceReadiness.filter(workspace: workspace, projection)
             func text(_ value: JSONValue?) -> String? {
                 switch value {
-                case .string(let text)?: return nonEmpty(text)
+                case .string(let text)?: return text.trimmedNonEmpty
                 case .int(let n)?: return String(n)
                 case .double(let n)?: return String(n)
                 case .bool(let b)?: return b ? "yes" : nil
@@ -750,7 +741,7 @@ extension AgentScreen {
                     guard var value = text(row[field.key]).map(firstLine), !value.isEmpty, value != title else { return nil }
                     let bare = title.hasSuffix("…") ? String(title.dropLast()) : title
                     if !bare.isEmpty, value.hasPrefix(bare) || (value.count >= 20 && bare.hasPrefix(value)) { return nil }
-                    if let at = date(value) { value = friendly(at, now: now) }
+                    if let at = NativeTimestampFormat.parseISO8601FractionalFirst(value) { value = friendly(at, now: now) }
                     else if field.key == "sender", let angle = value.firstIndex(of: "<"), angle > value.startIndex {
                         value = value[..<angle].trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
                     }
@@ -762,12 +753,11 @@ extension AgentScreen {
             let status = text(status) ?? "ok"
             let reply = ToolResult(projection.content)
             let fine = reply.hasReadEvidence()
-            let content: [String: JSONValue] = if case .object(let row) = projection.content { row } else { [:] }
-            func fieldsOf(_ item: AgentWorkspaceItem) -> [String: JSONValue] { if case .object(let row) = item.content { row } else { [:] } }
+            let content = JSONValue.objectOrEmpty(projection.content)
 
             var items: [(item: AgentWorkspaceItem, times: Int)] = []
             for item in projection.items.dropFirst(projection.page * 8).prefix(8) {
-                let row = fieldsOf(item)
+                let row = JSONValue.objectOrEmpty(item.content)
                 let showCompletedReminder = room == "reminders" && (content["includeCompleted"] == .bool(true) || content["reminder"] != nil)
                 if row["completed"] == .bool(true) && !showCompletedReminder { continue }
                 if let last = items.last, let first = item.actions.first, let prior = last.item.actions.first,
@@ -818,11 +808,11 @@ extension AgentScreen {
                     if !opens {
                         pages[name] = screen([name, clip(item.title, 60)], [about.isEmpty ? [] : [clip(about, 110)]], verbs: own, back: "Back: \(room).")
                     }
-                    if room == "notes", fieldsOf(item)["status"] == .string("unavailable") {
+                    if room == "notes", JSONValue.objectOrEmpty(item.content)["status"] == .string("unavailable") {
                         return (name, clip(item.title, 60) + "\n"
                             + wrap(failureFace(item.content), width: 100).map { "      " + $0 }.joined(separator: "\n"))
                     }
-                    if room == "status", !item.title.hasSuffix(" · ok"), case .string(let detail)? = fieldsOf(item)["summary"], !detail.isEmpty {
+                    if room == "status", !item.title.hasSuffix(" · ok"), case .string(let detail)? = JSONValue.objectOrEmpty(item.content)["summary"], !detail.isEmpty {
                         return (name, clip(item.title, 60) + more + "\n" + wrap(detail, width: 100).map { "      " + $0 }.joined(separator: "\n"))
                     }
                     return (name, clip(item.title, 60) + (entry.times > 1 ? " ×\(entry.times)" : "") + (about.isEmpty ? "" : " · " + about) + more)
@@ -835,8 +825,8 @@ extension AgentScreen {
             if items.contains(where: { !$0.item.actions.isEmpty }) { verbs.append((room + ".N", "open one")) }
             if let rowVerb { verbs.append(rowVerb) }
             if room != "mail" || (!items.isEmpty && items.allSatisfy({
-                guard (fieldsOf($0.item)["scope"] ?? content["scope"] ?? .string("inbox")) == .string("inbox") else { return false }
-                if case .string(let expectedID)? = fieldsOf($0.item)["expected_message_id"] { return !expectedID.isEmpty } else { return false }
+                guard (JSONValue.objectOrEmpty($0.item.content)["scope"] ?? content["scope"] ?? .string("inbox")) == .string("inbox") else { return false }
+                if case .string(let expectedID)? = JSONValue.objectOrEmpty($0.item.content)["expected_message_id"] { return !expectedID.isEmpty } else { return false }
             })) { verbs += (commsItemVerbs[room] ?? []).filter { AgentWorkspaceReadiness.allows(workspace: workspace, tool: $0.tool) }.map { ($0.name,
                 $0.about) } }
             if room == "mail", !items.isEmpty {
@@ -872,7 +862,7 @@ extension AgentScreen {
 
             let width = min(22, (lines.map(\.0.count).max() ?? 0) + 2)
             let count = projection.items.count
-            let unread = projection.items.filter { fieldsOf($0)["unread"] == .bool(true) }.count
+            let unread = projection.items.filter { JSONValue.objectOrEmpty($0.content)["unread"] == .bool(true) }.count
             var header = [room.uppercased()] + roomCounts(content, fine: fine, status: status, listed: count, unreadRows: unread, page: projection.page)
             if fine, content["status"] == .string("partial") { header.append("partial") }
             if lines.contains(where: { $0.0 != "·" }) { header.append(numbersNote) }

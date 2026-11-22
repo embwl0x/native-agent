@@ -8,7 +8,6 @@ import ToolExecution
 import AuthoredCapabilities
 import StandingBots
 import Research
-import CryptoKit
 import PersonaEngine
 import MemoryV2
 import ProviderRouting
@@ -24,14 +23,21 @@ extension SwiftToolDispatcher {
     /// Bare blocked_on integers are batch positions; wire top-level numbers afterward with desk_blocked_on. Mid-batch refusals must retain partial-write
     /// evidence.
     func impl_desk_breakdown(input: [String: JSONValue]) async throws -> JSONValue {
+        let specs = try breakdownChildren(input)
+        return try await writeDeskBreakdown(input, specs: specs)
+    }
+
+    private struct ChildSpec {
+        var title: String
+        var summary: String?
+        var blockedOn: [String]
+        var deferUntil: String?
+    }
+
+    /// Parse children and validate positions before writing the plan.
+    private func breakdownChildren(_ input: [String: JSONValue]) throws -> [ChildSpec] {
         guard case .array(let rawChildren)? = input["children"], !rawChildren.isEmpty else {
             throw deskInvalid("children", reason: "desk_breakdown: children must be a non-empty array")
-        }
-        struct ChildSpec {
-            var title: String
-            var summary: String?
-            var blockedOn: [String]
-            var deferUntil: String?
         }
         var specs: [ChildSpec] = []
         // Unknown child fields are refused before any write.
@@ -100,7 +106,11 @@ extension SwiftToolDispatcher {
                 }
             }
         }
+        return specs
+    }
 
+    /// Write the parent, children and their setup while retaining partial receipts.
+    private func writeDeskBreakdown(_ input: [String: JSONValue], specs: [ChildSpec]) async throws -> JSONValue {
         let store = deskStore()
         let parentHandle: String
         let parentAlias: String
@@ -109,7 +119,7 @@ extension SwiftToolDispatcher {
         // Receipts retain identities returned by writes, independent of readback.
         var committed: [JSONValue] = []
         var committedOperations: [JSONValue] = []
-        let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parentRaw = input["parent"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let parentRaw, !parentRaw.isEmpty {
             let state = try await store.liveState()
             parentHandle = try resolveDeskRef(parentRaw, in: state, field: "parent")
@@ -121,13 +131,13 @@ extension SwiftToolDispatcher {
         } else {
             let proj = try deskProject(input, absent: DeskItem.tasksProject)
             let title = try deskString(input, "title").trimmingCharacters(in: .whitespacesAndNewlines)
-            let kindRaw = optionalString(input, "kind")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let kindRaw = input["kind"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
             let kind = (kindRaw?.isEmpty == false) ? DeskKind(rawValue: kindRaw!) : .plan
             guard let kind else {
                 throw deskInvalid("kind",
                     reason: "desk_breakdown: unknown kind '\(kindRaw ?? "")' — one of \(DeskKind.allCases.map(\.rawValue).joined(separator: ", "))")
             }
-            let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let summary = input["summary"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
             let result = try await store.createOrReuseEquivalentItem(
                 kind: kind, project: proj, title: title,
                 parent: nil, summary: (summary?.isEmpty == false) ? summary : nil
@@ -217,6 +227,13 @@ extension SwiftToolDispatcher {
             final plan readback unavailable: \(error.localizedDescription). The committed identities are retained; read them before repeating \
             this call.
             """) }
+        return deskBreakdownReceipt(state, parentHandle: parentHandle, parentAlias: parentAlias, reusedParent: reusedParent,
+            createdHandles: createdHandles, reusedSteps: reusedSteps, committed: committed, committedOperations: committedOperations)
+    }
+
+    /// Render the completed plan from its final readback and committed identities.
+    private func deskBreakdownReceipt(_ state: DeskState, parentHandle: String, parentAlias: String, reusedParent: Bool,
+        createdHandles: [String], reusedSteps: Set<Int>, committed: [JSONValue], committedOperations: [JSONValue]) -> JSONValue {
         let plan = DeskSequencing.compute(state)
         let byHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
         var lines: [String] = []

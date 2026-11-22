@@ -1,3 +1,4 @@
+import NativeAgentShared
 // Derive mood at read time; only the slower disposition undertone persists.
 
 import Foundation
@@ -198,7 +199,7 @@ extension CognitiveSubstrate {
             afterDecay: relaxed,
             afterContribution: next,
             at: now,
-            source: bounded(source, maxCharacters: 60)))
+            source: TextClipping.prefixOrWhole(source, maxCharacters: 60)))
         if dispositionTransitions.count > Self.maximumDispositionTransitions {
             dispositionTransitions.removeFirst(
                 dispositionTransitions.count - Self.maximumDispositionTransitions)
@@ -386,7 +387,7 @@ extension CognitiveSubstrate {
     /// A title-less studio entry cites its id alone; source content is not a substitute name.
     private func feltStudioEntryLine(word: String, node: CognitiveNode, entryID: String) -> String {
         let citation = "(studio entry "
-            + bounded(entryID, maxCharacters: Self.feltDaySummaryStudioEntryIDCharacters) + ")"
+            + TextClipping.prefixOrWhole(entryID, maxCharacters: Self.feltDaySummaryStudioEntryIDCharacters) + ")"
         let title = capsuleSignalText(
             node.subjectReference.label ?? "",
             maxCharacters: Self.feltDaySummaryNodeSignalCharacters)

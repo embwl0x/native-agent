@@ -78,6 +78,19 @@ struct ICloudChatReplacementIntent: Equatable, Sendable {
     }
 }
 
+/// One signed phone message: the message, its admitted route, and the reply target every answer to it names.
+final class ICloudPhoneCall: Sendable {
+    let msg: BridgeMessage
+    let route: ICloudPhoneRoute
+    let routeKey: String
+
+    init(msg: BridgeMessage, route: ICloudPhoneRoute, routeKey: String) {
+        self.msg = msg
+        self.route = route
+        self.routeKey = routeKey
+    }
+}
+
 /// Terminal turns consume their signed input even if reply publication fails, preventing duplicate execution.
 enum ICloudIncomingTurnConsumptionPolicy {
     static func shouldConsume(
@@ -132,51 +145,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let receivedAt = Date()
         let remoteMetadata = msg.metadata ?? [:]
         let routeKey = route.routeKey
-        func writeErrorReply(
-            _ text: String,
-            detail: String? = nil,
-            partialReply: String? = nil,
-            sessionID: String?,
-            turnReachedTerminalState: Bool = false,
-            needs: String? = nil
-        ) async -> Bool {
-            do {
-                var metadata = [
-                    "kind": "error",
-                    "errorDetail": String((detail ?? text).prefix(400)),
-                    "transport": "icloud",
-                    "source": "mac",
-                    "replyTo": route.replyTo,
-                    "targetSourceKey": routeKey
-                ]
-                if let needs { metadata["needs"] = needs }
-                let body = partialReply.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
-                if body != nil { metadata["partialReply"] = "true" }
-                _ = try await sync.bridge.sendChatMessage(
-                    text: body ?? text,
-                    sessionID: sessionID,
-                    correlationID: msg.id,
-                    metadata: metadata
-                )
-                await sync.relay.sendICloudReplyPushNotification(
-                    text: body ?? text,
-                    sessionID: sessionID,
-                    correlationID: msg.id,
-                    kind: "error"
-                )
-                port.completed(sessionID: sessionID)
-                return true
-            } catch {
-                nativeLog("[iCloudBridge] failed to write error reply for msg %@: %@", msg.id, "\(error)")
-                if turnReachedTerminalState {
-                    port.completed(sessionID: sessionID)
-                }
-                return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
-                    turnReachedTerminalState: turnReachedTerminalState,
-                    replyPublished: false
-                )
-            }
-        }
+        let phone = ICloudPhoneCall(msg: msg, route: route, routeKey: routeKey)
         // Resolve one session id before execution so transcripts and every reply identify the same conversation.
         let trimmedSessionID = msg.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedSessionID: String
@@ -185,12 +154,20 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 nativeLog("[iCloudBridge] dropping iOS msg %@: invalid sessionID %@", msg.id, trimmedSessionID)
                 return await writeErrorReply(
                     "iPhone message rejected: invalid chat session id.",
-                    sessionID: nil
+                    sessionID: nil, to: phone
                 )
             }
             resolvedSessionID = safeSessionID
         } else {
-            resolvedSessionID = UUID().uuidString
+            do {
+                let root = sync.dataRoot
+                resolvedSessionID = try await sync.storage.perform {
+                    try iCloudBridge.readChat(msg.id, dataRoot: root).assistantSessionId ?? UUID().uuidString
+                }
+            } catch {
+                nativeLog("[iCloudBridge] reply session could not be read: %@", error.localizedDescription)
+                return false
+            }
         }
         let incomingAttachments = (msg.attachments ?? []).map { attachment in
             var attachment = attachment
@@ -198,11 +175,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             return attachment
         }
         guard incomingAttachments.allSatisfy({ !$0.base64.isEmpty }) else {
-            return await writeErrorReply("iPhone attachment rejected: no file bytes were sent. Attach the file again.", sessionID: resolvedSessionID)
+            return await writeErrorReply("iPhone attachment rejected: no file bytes were sent. Attach the file again.", sessionID: resolvedSessionID, to: phone)
         }
         let chatFileAccess: String
         do { chatFileAccess = try Self.iCloudChatFileAccess(from: remoteMetadata) }
-        catch { return await writeErrorReply(error.localizedDescription, sessionID: resolvedSessionID) }
+        catch { return await writeErrorReply(error.localizedDescription, sessionID: resolvedSessionID, to: phone) }
         // Register Stop before any await so every later path targets this same admitted run.
         let turnID = TurnTraceContext.mintTurnId()
         let replacementAssistantMessageID = ICloudChatReplacementIntent
@@ -225,16 +202,15 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 "sentAt": .string(NativeTimestampFormat.fractionalZulu(msg.timestamp)),
                 "pickupMs": .double(receivedAt.timeIntervalSince(msg.timestamp) * 1_000)
             ]), turn: admittedTurn))
-        let stopFlag = ChatCancelFlag.accept(dataRoot: PersistenceCore.defaultDataRoot(),
+        let stopFlag = ChatCancelFlag.accept(dataRoot: sync.dataRoot,
                                              sessionId: resolvedSessionID, runId: msg.id, turnId: turnID)
         defer { ChatCancelFlag.finish(stopFlag) }
         do {
-            try await iCloudBridge.bindReplySession(msg, sessionID: resolvedSessionID, dataRoot: PersistenceCore.defaultDataRoot())
+            try await iCloudBridge.bindReplySession(msg, sessionID: resolvedSessionID, dataRoot: sync.dataRoot)
             // Cover early returns before control handoff or supersession can work outside the stream task.
-            if try iCloudBridge.chatStopRequested(session: resolvedSessionID, runID: msg.id, dataRoot: PersistenceCore.defaultDataRoot()) {
-                _ = try await sync.bridge.sendChatMessage(text: "Stopped.", sessionID: resolvedSessionID,
-                    correlationID: msg.id, metadata: ["kind": "cancelled", "targetSourceKey": routeKey])
-                return true
+            if try iCloudBridge.chatStopRequested(session: resolvedSessionID, runID: msg.id, dataRoot: sync.dataRoot) {
+                return await sync.bridge.sendTerminalWithoutSavedReply("Stopped.", kind: "cancelled", to: msg,
+                    sessionID: resolvedSessionID, route: route)
             }
         } catch {
             nativeLog("[iCloudBridge] reply session could not be retained: %@", error.localizedDescription)
@@ -243,63 +219,180 @@ public struct ICloudIncomingTurnForwarder: Sendable {
 
         // Read before any suspension: a handoff after this point supersedes it.
         let receivedAtHandoffGeneration = port.controlHandoffGeneration(sessionID: resolvedSessionID)
-        func supersededByControlHandoff() -> Bool {
-            port.holdsMessageAfterControlHandoff(sessionID: resolvedSessionID,
-                receivedAtGeneration: receivedAtHandoffGeneration, sentAt: msg.timestamp)
-        }
 
         if UserMessageIntentSignals.isControlHandoff(msg.text) {
-            guard let trimmedSessionID, !trimmedSessionID.isEmpty, signatureVerified(msg) else {
-                return await writeErrorReply("Control handoff requires a signed message naming its chat session.", sessionID: nil)
-            }
-            do {
-                let reply = try await port.stopChatForControlHandoff(sessionID: resolvedSessionID, messageDate: msg.timestamp)
-                try await port.residentChatClient().recordControlHandoff(
-                    message: msg.text, reply: reply, sessionId: resolvedSessionID, surface: "ios", runId: msg.id,
-                    turn: admittedTurn
-                )
-                _ = try await sync.bridge.sendChatMessage(text: reply, sessionID: resolvedSessionID,
-                    correlationID: msg.id, metadata: [
-                        "kind": "final", "transport": "icloud", "source": "mac",
-                        "replyTo": route.replyTo, "targetSourceKey": routeKey,
-                    ])
-                await sync.relay.sendICloudReplyPushNotification(text: reply, sessionID: resolvedSessionID,
-                    correlationID: msg.id, kind: "reply")
-                sync.engine.requestChatSnapshotPublication(includeTranscripts: true)
-                port.completed(sessionID: resolvedSessionID)
-                return true
-            } catch {
-                return await writeErrorReply("""
-                    Control handoff could not be confirmed: \(NativeAppSecretRedactor.redactedRemoteErrorDetail(error.localizedDescription))
-                    """,
-                    sessionID: resolvedSessionID, turnReachedTerminalState: true)
-            }
+            return await answerControlHandoff(phone, trimmedSessionID: trimmedSessionID,
+                resolvedSessionID: resolvedSessionID, admittedTurn: admittedTurn)
         }
 
         // Capture the person's surface when takeover arrives, before queueing can change it.
         let takeover = signatureVerified(msg) ? await MacWorkContinuation.admit(msg.text) : nil
 
-        func consumeSupersededMessage() async -> Bool {
-            defer { port.completed(sessionID: resolvedSessionID) }
-            do {
-                _ = try await sync.bridge.sendChatMessage(text: "(cancelled)", sessionID: resolvedSessionID,
-                    correlationID: msg.id, metadata: [
-                        "kind": "cancelled", "transport": "icloud", "source": "mac",
-                        "replyTo": route.replyTo, "targetSourceKey": routeKey,
-                    ])
-            } catch {
-                nativeLog("[iCloudBridge] failed to write superseded reply for msg %@: %@", msg.id, "\(error)")
-            }
-            // A handoff is terminal for this input, even if reply publication fails.
-            return true
+        if let answered = await preparePhoneSession(phone, resolvedSessionID: resolvedSessionID,
+            receivedAtHandoffGeneration: receivedAtHandoffGeneration) {
+            return answered
         }
 
-        guard !supersededByControlHandoff() else {
-            return await consumeSupersededMessage()
+        // MacSyncEngine retains the turn for explicit Stop; passive sync shutdown lets accepted work settle.
+        let replyMetadata = [
+            "kind": "final",
+            "transport": "icloud",
+            "source": "mac",
+            "replyTo": route.replyTo,
+            "targetSourceKey": routeKey
+        ]
+        let chatClient = port.residentChatClient()
+        var continuedTurn = admittedTurn.with(\.macContinuation, takeover)
+        if let takeover { continuedTurn.envelope = continuedTurn.envelope?.withMacContinuation(takeover) }
+        let turn = continuedTurn
+        // Read handoff and Stop without suspending before task registration.
+        guard !supersededByControlHandoff(phone, resolvedSessionID, receivedAtHandoffGeneration) else {
+            return await consumeSupersededMessage(phone, resolvedSessionID)
+        }
+        do {
+            if try iCloudBridge.chatStopRequested(session: resolvedSessionID, runID: msg.id, dataRoot: sync.dataRoot) {
+                return await sync.bridge.sendTerminalWithoutSavedReply("Stopped.", kind: "cancelled", to: msg,
+                    sessionID: resolvedSessionID, route: route)
+            }
+        } catch {
+            nativeLog("[iCloudBridge] phone Stop record could not be read: %@", error.localizedDescription)
+            return false
+        }
+        let progress = ICloudConflatedSender()
+        let streamTask = Task.detached(priority: .userInitiated) { () -> MacSyncEngine.ICloudChatOutcome in
+            await runPhoneTurn(phone, resolvedSessionID: resolvedSessionID, incomingAttachments: incomingAttachments,
+                chatFileAccess: chatFileAccess, suppressUserAppend: suppressUserAppend,
+                chatClient: chatClient, turn: turn, progress: progress)
+        }
+        // The turn and iOS placeholder share one correlation id so Stop targets the waiting run.
+        sync.engine.registerActiveChatTask(streamTask, for: resolvedSessionID, runID: msg.id)
+        let outcome = await streamTask.value
+        progress.close()
+        // Optional sends must settle without delaying durable replies; the phone rejects late progress after terminal resolution.
+        return await withTaskGroup(of: Void.self, returning: Bool.self) { group in
+        group.addTask { await progress.finish() }
+        sync.engine.unregisterActiveChatTask(for: resolvedSessionID, expecting: streamTask)
+        return await deliverPhoneOutcome(outcome, phone, resolvedSessionID: resolvedSessionID, turnID: turnID,
+            turn: turn, replyMetadata: replyMetadata)
+        }
+    }
+
+    /// The phone's error answer for this message; a failed publication still consumes a turn that reached its end.
+    @MainActor
+    private func writeErrorReply(
+        _ text: String,
+        detail: String? = nil,
+        partialReply: String? = nil,
+        sessionID: String?,
+        turnReachedTerminalState: Bool = false,
+        needs: String? = nil,
+        to phone: ICloudPhoneCall
+    ) async -> Bool {
+        let (msg, route, routeKey) = (phone.msg, phone.route, phone.routeKey)
+        do {
+            var metadata = [
+                "kind": "error",
+                "errorDetail": iCloudBridge.phoneErrorDetail(detail ?? text),
+                "transport": "icloud",
+                "source": "mac",
+                "replyTo": route.replyTo,
+                "targetSourceKey": routeKey
+            ]
+            if let needs { metadata["needs"] = needs }
+            let body = partialReply.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+            if body != nil { metadata["partialReply"] = "true" }
+            _ = try await sync.bridge.sendChatMessage(
+                text: body ?? text,
+                sessionID: sessionID,
+                correlationID: msg.id,
+                metadata: metadata
+            )
+            await sync.relay.sendICloudReplyPushNotification(
+                text: body ?? text,
+                sessionID: sessionID,
+                correlationID: msg.id,
+                kind: "error"
+            )
+            port.completed(sessionID: sessionID)
+            return true
+        } catch {
+            nativeLog("[iCloudBridge] failed to write error reply for msg %@: %@", msg.id, "\(error)")
+            if turnReachedTerminalState {
+                port.completed(sessionID: sessionID)
+            }
+            return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+                turnReachedTerminalState: turnReachedTerminalState,
+                replyPublished: false
+            )
+        }
+    }
+
+    /// A signed control handoff stops the session's turn here and answers with its confirmation.
+    @MainActor
+    private func answerControlHandoff(_ phone: ICloudPhoneCall, trimmedSessionID: String?, resolvedSessionID: String,
+                                      admittedTurn: Turn) async -> Bool {
+        let (msg, route, routeKey) = (phone.msg, phone.route, phone.routeKey)
+        guard let trimmedSessionID, !trimmedSessionID.isEmpty, signatureVerified(msg) else {
+            return await writeErrorReply("Control handoff requires a signed message naming its chat session.", sessionID: nil, to: phone)
+        }
+        do {
+            try await iCloudBridge.beginChat(msg, sessionID: resolvedSessionID, dataRoot: sync.dataRoot)
+        } catch {
+            nativeLog("[iCloudBridge] handoff dispatch was not claimed: %@", error.localizedDescription)
+            return false
+        }
+        do {
+            let reply = try await port.stopChatForControlHandoff(sessionID: resolvedSessionID, messageDate: msg.timestamp)
+            try await port.residentChatClient().recordControlHandoff(
+                message: msg.text, reply: reply, sessionId: resolvedSessionID, surface: "ios", runId: msg.id,
+                turn: admittedTurn
+            )
+            _ = try await sync.bridge.sendChatMessage(text: reply, sessionID: resolvedSessionID,
+                correlationID: msg.id, metadata: [
+                    "kind": "final", "transport": "icloud", "source": "mac",
+                    "replyTo": route.replyTo, "targetSourceKey": routeKey,
+                ])
+            await sync.relay.sendICloudReplyPushNotification(text: reply, sessionID: resolvedSessionID,
+                correlationID: msg.id, kind: "reply")
+            sync.engine.requestChatSnapshotPublication(includeTranscripts: true)
+            port.completed(sessionID: resolvedSessionID)
+            return true
+        } catch {
+            return await writeErrorReply("""
+                Control handoff could not be confirmed: \(NativeAppSecretRedactor.redactedRemoteErrorDetail(error.localizedDescription))
+                """,
+                sessionID: resolvedSessionID, turnReachedTerminalState: true, to: phone)
+        }
+    }
+
+    /// A control handoff after this message's arrival supersedes it.
+    @MainActor
+    private func supersededByControlHandoff(_ phone: ICloudPhoneCall, _ resolvedSessionID: String,
+                                            _ receivedAtHandoffGeneration: Int) -> Bool {
+        let msg = phone.msg
+        return port.holdsMessageAfterControlHandoff(sessionID: resolvedSessionID,
+            receivedAtGeneration: receivedAtHandoffGeneration, sentAt: msg.timestamp)
+    }
+
+    /// A superseded message is consumed with a cancelled answer.
+    @MainActor
+    private func consumeSupersededMessage(_ phone: ICloudPhoneCall, _ resolvedSessionID: String) async -> Bool {
+        guard await sync.bridge.sendTerminalWithoutSavedReply("(cancelled)", kind: "cancelled", to: phone.msg,
+            sessionID: resolvedSessionID, route: phone.route) else { return false }
+        port.completed(sessionID: resolvedSessionID)
+        return true
+    }
+
+    /// Before the turn runs: a superseding handoff consumes it, a pending Stop settles, the session is indexed and anchored.
+    @MainActor
+    private func preparePhoneSession(_ phone: ICloudPhoneCall, resolvedSessionID: String,
+                                     receivedAtHandoffGeneration: Int) async -> Bool? {
+        guard !supersededByControlHandoff(phone, resolvedSessionID, receivedAtHandoffGeneration) else {
+            return await consumeSupersededMessage(phone, resolvedSessionID)
         }
         await port.awaitPendingChatStop(sessionID: resolvedSessionID)
-        guard !supersededByControlHandoff() else {
-            return await consumeSupersededMessage()
+        guard !supersededByControlHandoff(phone, resolvedSessionID, receivedAtHandoffGeneration) else {
+            return await consumeSupersededMessage(phone, resolvedSessionID)
         }
 
         // Index the phone session before persisting its messages so conversation lists can discover it.
@@ -312,7 +405,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             nativeLog("[iCloudBridge] ensureChatSessionIndex failed for %@: %@", resolvedSessionID, "\(error)")
             return await writeErrorReply(
                 "Chat history is unavailable because its session index needs repair on the Mac.",
-                sessionID: resolvedSessionID
+                sessionID: resolvedSessionID, to: phone
             )
         }
 
@@ -333,298 +426,194 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 words: "The phone conversation was accepted, but its current-conversation anchor could not be published: \(error.localizedDescription)",
                 lever: "Repair the conversation anchor store and publish the accepted session \(resolvedSessionID); do not replay its message.")
         }
+        return nil
+    }
 
-        // MacSyncEngine retains the turn for explicit Stop; passive sync shutdown lets accepted work settle.
-        let replyMetadata = [
-            "kind": "final",
-            "transport": "icloud",
-            "source": "mac",
-            "replyTo": route.replyTo,
-            "targetSourceKey": routeKey
-        ]
-        let chatClient = port.residentChatClient()
-        var continuedTurn = admittedTurn.with(\.macContinuation, takeover)
-        if let takeover { continuedTurn.envelope = continuedTurn.envelope?.withMacContinuation(takeover) }
-        let turn = continuedTurn
-        // No suspension from this final boundary read through task registration.
-        guard !supersededByControlHandoff() else {
-            return await consumeSupersededMessage()
-        }
-        let progress = ICloudConflatedSender()
-        typealias Outcome = (text: String, deltaSeq: Int, error: String?, toolEvents: Int,
-            attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?)
-        let streamTask = Task.detached(priority: .userInitiated) { () -> MacSyncEngine.ICloudChatOutcome in
-            do {
-            if try iCloudBridge.chatStopRequested(session: resolvedSessionID, runID: msg.id, dataRoot: PersistenceCore.defaultDataRoot()) {
-                throw CancellationError()
-            }
+    /// The admitted phone turn, off the main actor: a helper's reply or the resident chat stream, under turn admission.
+    private func runPhoneTurn(
+        _ phone: ICloudPhoneCall, resolvedSessionID: String, incomingAttachments: [NativeAgentShared.MultimodalAttachment],
+        chatFileAccess: String, suppressUserAppend: Bool,
+        chatClient: SwiftNativeChatOrchestrationClient, turn: Turn, progress: ICloudConflatedSender
+    ) async -> MacSyncEngine.ICloudChatOutcome {
+        let (msg, route, routeKey) = (phone.msg, phone.route, phone.routeKey)
+        let root = sync.dataRoot
+        do {
             let helper = try SessionConversation.checkedIsHelper(resolvedSessionID)
-            let operation: (Turn) async throws -> Outcome = { turn in
-            return await TurnTraceContext.$turnId.withValue(turn.id) {
-            if helper {
-                let textProgress = OSAllocatedUnfairLock(initialState: ICloudTextDeltaCoalescer())
+            let operation: (Turn) async throws -> MacSyncEngine.ICloudChatOutcome = { turn in
                 do {
-                    let reply = try await port.helperReply(message: msg.text, sessionID: resolvedSessionID,
-                            attachments: incomingAttachments, fileAccess: chatFileAccess, progress: { event in
-                                guard case .delta(let text) = event else { return }
-                                let flush = textProgress.withLock { state in
-                                    state.push(delta: text)
-                                }
-                                if let flush {
-                                    sendICloudTextDelta(flush, turn: turn, sender: progress, sessionID: resolvedSessionID, correlationID: msg.id,
-                                        replyTo: route.replyTo, targetSourceKey: routeKey)
-                                }
-                            }, turn: turn)
-                    let attachments = try Self.bridgeAttachments(from: reply.attachments ?? [],
-                        text: reply.output, sessionID: resolvedSessionID, correlationID: msg.id, metadata: replyMetadata)
-                    let cause: Error? = reply.terminalState == .stopped ? CancellationError() : nil
-                    return (reply.output, textProgress.withLock { $0.sequence },
-                        reply.terminalState == .failed || reply.terminalState == .interrupted ? reply.statusDetail : nil, 0, attachments, cause)
+                    try await iCloudBridge.beginChat(msg, sessionID: resolvedSessionID, dataRoot: root)
+                } catch let error as CancellationError {
+                    throw error
                 } catch {
-                    return (textProgress.withLock { $0.text }, textProgress.withLock { $0.sequence },
-                            error.localizedDescription, 0, [], error)
+                    nativeLog("[iCloudBridge] phone dispatch was not claimed: %@", error.localizedDescription)
+                    return .undispatched
                 }
-            }
-            var finalAnswer: String?
-            var sawError: String? = nil
-            var toolEventCounter = 0
-            var attachments: [NativeAgentShared.MultimodalAttachment] = []
-            var cause: Error?
-            var deltaCoalescer = ICloudTextDeltaCoalescer()
-
-            // Core admits the session's execution contract inside the producer.
-            let execution = chatClient.chatStreamExecution(
-                message: msg.text,
-                sessionId: resolvedSessionID,
-                // Admit the Mac-owned iOS execution tuple before append; signed metadata is only evidence.
-                model: "",
-                reasoningEffort: "",
-                fileAccess: chatFileAccess,
-                attachments: incomingAttachments,
-                persona: nil,
-                surface: "ios",
-                suppressUserAppend: suppressUserAppend,
-                replacementAssistantMessageID: turn.rows.replacementAssistantMessageID,
-                turn: turn
-            )
-            await withTaskCancellationHandler {
-            do {
-                for try await event in execution.events {
-                    if Task.isCancelled { break }
-                    switch event {
-                    case .delta(let s):
-                        if s.isEmpty { continue }
-                        if let flush = deltaCoalescer.push(delta: s) {
-                            sendICloudTextDelta(
-                                flush,
-                                turn: turn,
-                                sender: progress,
-                                sessionID: resolvedSessionID,
-                                correlationID: msg.id,
-                                replyTo: route.replyTo,
-                                targetSourceKey: routeKey
-                            )
+                return await TurnTraceContext.$turnId.withValue(turn.id) { () -> MacSyncEngine.ICloudChatOutcome in
+                    if helper {
+                        let textProgress = OSAllocatedUnfairLock(initialState: ICloudTextDeltaCoalescer())
+                        do {
+                            let reply = try await port.helperReply(message: msg.text, sessionID: resolvedSessionID,
+                                attachments: incomingAttachments, fileAccess: chatFileAccess, progress: { event in
+                                    guard case .delta(let text) = event,
+                                          let flush = textProgress.withLock({ $0.push(delta: text) }) else { return }
+                                    sendICloudTextDelta(flush, turn: turn, sender: progress, sessionID: resolvedSessionID,
+                                        correlationID: msg.id, replyTo: route.replyTo, targetSourceKey: routeKey)
+                                }, turn: turn)
+                            return .ran(.success(reply), partial: "")
+                        } catch {
+                            return .ran(.failure(error), partial: textProgress.withLock { $0.text })
                         }
-                    case .final(let r):
-                        // Settlement preserves all produced words, including text shown before tools ran.
-                        let answer = r.reply
-                        finalAnswer = answer
-                        attachments = try Self.bridgeAttachments(
-                            from: ChatGeneratedImageArtifacts.attachments(
-                                from: r.toolDispatches,
-                                dataRoot: PersistenceCore.defaultDataRoot()
-                            ),
-                            text: answer.trimmingCharacters(in: .whitespacesAndNewlines),
-                            sessionID: resolvedSessionID,
-                            correlationID: msg.id,
-                            metadata: replyMetadata
-                        )
-                    case .replyTextSettled:
-                        break
-                    case .writing, .notice:
-                        break
-                    case .toolUse, .toolResult:
-                        toolEventCounter += 1
-                    case .error(let m):
-                        // Stream errors produce an error reply rather than a successful partial answer.
-                        sawError = m
-                        nativeLog("[iCloudBridge] chatStream error msg=%@: %@", msg.id, m)
                     }
+
+                    // Core admits the Mac-owned execution contract. Signed phone metadata is evidence only.
+                    let execution = chatClient.chatStreamExecution(
+                        message: msg.text, sessionId: resolvedSessionID, model: "", reasoningEffort: "",
+                        fileAccess: chatFileAccess, attachments: incomingAttachments, persona: nil, surface: "ios",
+                        suppressUserAppend: suppressUserAppend,
+                        replacementAssistantMessageID: turn.rows.replacementAssistantMessageID, turn: turn)
+                    return await withTaskCancellationHandler {
+                        var movement = ICloudTextDeltaCoalescer()
+                        do {
+                            for try await event in execution.events {
+                                if Task.isCancelled { break }
+                                guard case .delta(let text) = event, !text.isEmpty,
+                                      let flush = movement.push(delta: text) else { continue }
+                                sendICloudTextDelta(flush, turn: turn, sender: progress, sessionID: resolvedSessionID,
+                                    correlationID: msg.id, replyTo: route.replyTo, targetSourceKey: routeKey)
+                            }
+                        } catch {
+                            nativeLog("[iCloudBridge] phone stream ended with error for %@: %@", msg.id, error.localizedDescription)
+                        }
+                        // The producer joins transcript settlement and carries the authoritative ending.
+                        return .ran(await execution.waitForProducerTermination(), partial: movement.text)
+                    } onCancel: { execution.cancel() }
                 }
-            } catch {
-                sawError = "\(error)"
-                cause = error
-                nativeLog("[iCloudBridge] forwardToSwiftRuntime: chatStream() failed for msg %@: %@", msg.id, "\(error)")
             }
-            // Retain admission until the terminal transcript writer joins, even if the stream closes first.
-            await execution.waitForProducerTermination()
-            } onCancel: { execution.cancel() }
-            return (finalAnswer ?? deltaCoalescer.text, deltaCoalescer.sequence, sawError, toolEventCounter, attachments, cause)
-            }
-            }
-            let root = PersistenceCore.defaultDataRoot()
             // A regenerate replaces an answer, so it never joins another turn.
-            let admitted: TurnAdmission.Admitted<Outcome>
             if suppressUserAppend {
-                admitted = .ran(try await TurnAdmission.shared.runAlone(dataRoot: root, sessionID: resolvedSessionID, turn: turn, operation: operation))
-            } else {
-                admitted = try await TurnAdmission.shared.run(dataRoot: root, sessionID: resolvedSessionID,
-                    arrival: TurnArrival(words: msg.text, attachments: incomingAttachments, surface: "ios", row: .shown),
-                    turn: turn, operation: operation)
+                return try await TurnAdmission.shared.runAlone(dataRoot: root, sessionID: resolvedSessionID, turn: turn, operation: operation)
             }
+            let admitted = try await TurnAdmission.shared.run(dataRoot: root, sessionID: resolvedSessionID,
+                arrival: TurnArrival(words: msg.text, attachments: incomingAttachments, surface: "ios", row: .shown),
+                runID: msg.id, turn: turn, operation: operation)
             switch admitted {
-            case .ran(let ran): return (ran.text, ran.deltaSeq, ran.error, ran.toolEvents, ran.attachments, ran.cause, nil)
-            case .steered(let steered): return ("", 0, nil, 0, [], nil, steered.turnID)
+            case .ran(let outcome): return outcome
+            case .steered(let steered): return .steered(readBy: steered.turnID)
             }
-            } catch {
-                return ("", 0, error.localizedDescription, 0, [], error, nil)
-            }
+        } catch {
+            return .ran(.failure(error), partial: "")
         }
-        // The turn and iOS placeholder share one correlation id so Stop targets the waiting run.
-        sync.engine.registerActiveChatTask(streamTask, for: resolvedSessionID, runID: msg.id)
-        let outcome = await streamTask.value
-        progress.close()
-        // Optional sends must settle without delaying durable replies; the phone rejects late progress after terminal resolution.
-        return await withTaskGroup(of: Void.self, returning: Bool.self) { group in
-        group.addTask { await progress.finish() }
-        sync.engine.unregisterActiveChatTask(for: resolvedSessionID, expecting: streamTask)
-        func finishWithoutReply(_ evidence: [String: String]) async -> Bool {
-            let publicationID = "no-post-" + MacSyncSnapshotIntegrity.digest(Data(msg.id.utf8))
-            do {
-                var metadata = replyMetadata
-                metadata["live"] = "true"
-                metadata.merge(evidence, uniquingKeysWith: { _, new in new })
-                _ = try await sync.bridge.sendChatMessage(text: "", sessionID: resolvedSessionID, correlationID: msg.id,
-                    metadata: metadata, messageID: publicationID)
-                await port.completed(sessionID: resolvedSessionID)
-                return true
-            } catch {
-                nativeLog("[iCloudBridge] no-post msg %@ settlement not sent: %@", msg.id, "\(error)")
-                do {
-                    let state = try await sync.bridge.retainedNoPostState(id: publicationID, correlationID: msg.id)
-                    if state == "completed" {
-                        await port.completed(sessionID: resolvedSessionID)
-                        return true
-                    }
-                    if state == "publication_owed" { return true }
-                    await sync.bridge.noteNoPostDeliveryFailure(messageID: msg.id, cause: error.localizedDescription)
-                } catch {
-                    await sync.bridge.noteNoPostDeliveryFailure(messageID: msg.id, cause: error.localizedDescription)
-                }
-                return false
-            }
-        }
-        if let readBy = outcome.readBy { return await finishWithoutReply(["readBy": readBy]) }
-        if outcome.error == nil, outcome.cause == nil,
-           outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, outcome.attachments.isEmpty {
-            do {
-                let silence = try await sync.storage.perform {
-                    try SwiftNativeChatOrchestrationClient.silentTurn(
-                        dataRoot: PersistenceCore.defaultDataRoot(), sessionId: resolvedSessionID, runId: turn.run, turnId: turn.id)
-                }
-                if let silence {
-                    return await finishWithoutReply(["silence": silence])
-                }
-            } catch {
-                return await writeErrorReply("The turn's silence record could not be read; repair its experience storage.",
-                    detail: error.localizedDescription, sessionID: resolvedSessionID, turnReachedTerminalState: true)
-            }
-        }
-        let wasCancelled = streamTask.isCancelled
-            || outcome.cause is CancellationError
+    }
 
-        if wasCancelled {
-            // Tag cancellation so iOS preserves produced words even when terminal delivery overtakes a snapshot.
+    /// A turn that ends without a reply settles the phone's placeholder with its evidence.
+    @MainActor
+    private func finishWithoutReply(_ evidence: [String: String], _ phone: ICloudPhoneCall, _ resolvedSessionID: String,
+                                    _ replyMetadata: [String: String]) async -> Bool {
+        let msg = phone.msg
+        let publicationID = iCloudBridge.noPostPublicationID(msg.id)
+        do {
+            var metadata = replyMetadata
+            metadata["live"] = "true"
+            metadata.merge(evidence, uniquingKeysWith: { _, new in new })
+            _ = try await sync.bridge.sendChatMessage(text: "", sessionID: resolvedSessionID, correlationID: msg.id,
+                metadata: metadata, messageID: publicationID)
+            await port.completed(sessionID: resolvedSessionID)
+            return true
+        } catch {
+            nativeLog("[iCloudBridge] no-post msg %@ settlement not sent: %@", msg.id, "\(error)")
             do {
-                _ = try await sync.bridge.sendChatMessage(
-                    text: outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? "(cancelled)"
-                        : outcome.text,
-                    sessionID: resolvedSessionID,
-                    correlationID: msg.id,
-                    metadata: [
-                        "kind": "cancelled",
-                        "partialReply": outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "false" : "true",
-                        "transport": "icloud",
-                        "source": "mac",
-                        "replyTo": route.replyTo,
-                        "targetSourceKey": routeKey
-                    ]
-                )
-                await sync.relay.sendICloudReplyPushNotification(
-                    text: outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? "NativeAgent cancelled that reply."
-                        : outcome.text,
-                    sessionID: resolvedSessionID,
-                    correlationID: msg.id,
-                    kind: "cancelled"
-                )
-                port.completed(sessionID: resolvedSessionID)
-                return true
+                let state = try await sync.bridge.retainedNoPostState(id: publicationID, correlationID: msg.id)
+                if state == "completed" {
+                    await port.completed(sessionID: resolvedSessionID)
+                    return true
+                }
+                if state == "publication_owed" { return true }
+                await sync.bridge.noteNoPostDeliveryFailure(messageID: msg.id, cause: error.localizedDescription)
             } catch {
-                nativeLog("[iCloudBridge] failed to write cancel reply for msg %@: %@", msg.id, "\(error)")
-                port.completed(sessionID: resolvedSessionID)
-                return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
-                    turnReachedTerminalState: true,
-                    replyPublished: false
-                )
+                await sync.bridge.noteNoPostDeliveryFailure(messageID: msg.id, cause: error.localizedDescription)
             }
+            return false
         }
+    }
 
-        if let errMsg = outcome.error {
-            let error = outcome.cause
+    /// The phone receives the same terminal state during live delivery and recovery.
+    @MainActor
+    private func deliverPhoneOutcome(
+        _ outcome: MacSyncEngine.ICloudChatOutcome, _ phone: ICloudPhoneCall, resolvedSessionID: String, turnID: String,
+        turn: Turn, replyMetadata: [String: String]
+    ) async -> Bool {
+        let (msg, route, routeKey) = (phone.msg, phone.route, phone.routeKey)
+        let response: ChatResponse
+        switch outcome {
+        case .undispatched:
+            return false
+        case .steered(let readBy):
+            return await finishWithoutReply(["readBy": readBy], phone, resolvedSessionID, replyMetadata)
+        case .ran(.success(let settled), _):
+            response = settled
+        case .ran(.failure(let error), let partial):
+            if error is CancellationError {
+                let text = partial.isEmpty ? "(cancelled)" : partial
+                let retained = await sync.bridge.sendTerminalWithoutSavedReply(text, kind: "cancelled", to: msg,
+                    sessionID: resolvedSessionID, route: route, partial: !partial.isEmpty, notifyCancellation: true)
+                if retained { port.completed(sessionID: resolvedSessionID) }
+                return retained
+            }
             if let chatError = error as? ChatOrchestrationError,
                case .helperModelChoice(let sessionID, let reason, let message) = chatError {
                 return await writeErrorReply(
-                    message, partialReply: outcome.text, sessionID: sessionID, turnReachedTerminalState: true,
-                    needs: Self.needsInteractionEnvelope(kind: "model_choice", target: sessionID, reason: reason)
+                    message, partialReply: partial, sessionID: sessionID, turnReachedTerminalState: true,
+                    needs: Self.needsInteractionEnvelope(kind: "model_choice", target: sessionID, reason: reason), to: phone
                 )
             }
             return await writeErrorReply(
                 "NativeAgent hit an error answering that message.",
-                detail: error.flatMap { ProviderRecoveryPolicy.personMessage($0) } ?? ChatStreamErrorText.normalize(
-                    NativeAppSecretRedactor.redactedRemoteErrorDetail(errMsg), retryAction: "Retry"),
-                partialReply: outcome.text,
-                sessionID: resolvedSessionID, turnReachedTerminalState: true
+                detail: ProviderRecoveryPolicy.personMessage(error) ?? ChatStreamErrorText.normalize(
+                    NativeAppSecretRedactor.redactedRemoteErrorDetail(error.localizedDescription), retryAction: "Retry"),
+                partialReply: partial, sessionID: resolvedSessionID, turnReachedTerminalState: true, to: phone
             )
         }
 
-        let replyText = outcome.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !replyText.isEmpty || !outcome.attachments.isEmpty else {
-            nativeLog("[iCloudBridge] forwardToSwiftRuntime: empty reply for msg %@", msg.id)
-            return await writeErrorReply(
-                "NativeAgent returned an empty reply. Check NativeAgent logs for that run.",
-                sessionID: resolvedSessionID,
-                turnReachedTerminalState: true
-            )
+        if response.isSilentCompletion {
+            do {
+                let root = sync.dataRoot
+                let silence = try await sync.storage.perform {
+                    try SwiftNativeChatOrchestrationClient.silentTurn(
+                        dataRoot: root, sessionId: resolvedSessionID, runId: turn.run, turnId: turn.id)
+                }
+                if let silence {
+                    return await finishWithoutReply(["silence": silence], phone, resolvedSessionID, replyMetadata)
+                }
+                return await writeErrorReply("NativeAgent returned an empty reply. Check NativeAgent logs for that run.",
+                    sessionID: resolvedSessionID, turnReachedTerminalState: true, to: phone)
+            } catch {
+                return await writeErrorReply("The turn's silence record could not be read; repair its experience storage.",
+                    detail: error.localizedDescription, sessionID: resolvedSessionID, turnReachedTerminalState: true, to: phone)
+            }
         }
 
         TurnTraceBus.fire(TurnTraceEvent(
             turnId: turnID, kind: "surface.replyDeliveryStarted", sessionId: resolvedSessionID,
-            surface: "ios", payload: .object(["characters": .int(Int64(replyText.count))]), turn: turn))
+            surface: "ios", payload: .object(["characters": .int(Int64(response.output.count))]), turn: turn))
         do {
-            _ = try await sync.bridge.sendChatMessage(
-                text: replyText,
-                sessionID: resolvedSessionID,
-                correlationID: msg.id,
-                metadata: replyMetadata,
-                attachments: outcome.attachments
-            )
-            // Only requested results retain a notification intent; retries deliver that event without notifying on ordinary conversation.
-            port.completed(sessionID: resolvedSessionID)
-            nativeLog("[iCloudBridge] forwarded iOS msg %@ → Swift chatStream (session=%@) → wrote reply (%d chars, %d deltas, %d attachments)",
-                  msg.id, resolvedSessionID, replyText.count, outcome.deltaSeq, outcome.attachments.count)
-            return true
+            let verdict = try await sync.bridge.recoverReply(response, route: AgentBridgeCompletionRoute(
+                surface: "ios", sessionId: resolvedSessionID, sourceKey: routeKey, replyTo: route.replyTo, correlationId: msg.id),
+                firstPublication: true)
+            if verdict == "completed", response.terminalState == .failed || response.terminalState == .stopped {
+                let stopped = response.terminalState == .stopped
+                let text = response.output.isEmpty
+                    ? iCloudBridge.phoneErrorDetail(response.statusDetail
+                        ?? (stopped ? "NativeAgent cancelled that reply." : "The reply could not be completed."))
+                    : response.output
+                await sync.relay.sendICloudReplyPushNotification(text: text, sessionID: resolvedSessionID,
+                    correlationID: msg.id, kind: stopped ? "cancelled" : "error")
+            }
         } catch {
-            nativeLog("[iCloudBridge] failed to publish CloudKit reply for msg %@: %@", msg.id, "\(error)")
-            // Publish the durable Mac transcript so the phone can recover the reply.
-            port.completed(sessionID: resolvedSessionID)
-            return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
-                turnReachedTerminalState: true,
-                replyPublished: false
-            )
+            nativeLog("[iCloudBridge] failed to publish CloudKit reply for msg %@: %@", msg.id, error.localizedDescription)
         }
-        }
+        // The producer already settled. Its answer and delivery obligation survive an unconfirmed upload.
+        port.completed(sessionID: resolvedSessionID)
+        return true
     }
 
     nonisolated static func bridgeAttachments(

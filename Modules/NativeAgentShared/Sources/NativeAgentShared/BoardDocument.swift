@@ -21,22 +21,10 @@ public struct BoardDocument: Sendable, Equatable {
         public var id: String { fields["id"]?.stringValue ?? "" }
         public var type: String { fields["type"]?.stringValue ?? "" }
         public func string(_ key: String) -> String? { fields[key]?.stringValue }
-        public func number(_ key: String) -> Double? {
-            switch fields[key] {
-            case .int(let value)?: Double(value)
-            case .double(let value)?: value
-            default: nil
-            }
-        }
+        public func number(_ key: String) -> Double? { fields[key]?.doubleValue }
         public var numbers: [Double] {
             guard case .array(let values)? = fields["points"] else { return [] }
-            return values.compactMap { value in
-                switch value {
-                case .int(let number): Double(number)
-                case .double(let number): number
-                default: nil
-                }
-            }
+            return values.compactMap(\.doubleValue)
         }
         /// A position or size is written as a whole number: a drag lands on points, never on fractions of one.
         public mutating func set(_ key: String, _ value: Double) { fields[key] = .int(Int64(value.rounded())) }

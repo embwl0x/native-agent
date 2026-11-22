@@ -40,8 +40,6 @@ public enum CapabilityLifecycle {
     }
     private static let authority = OSAllocatedUnfairLock(initialState: Authority())
 
-    public static func writeRefusal(turn: Turn?) -> String? { turnWriteCheck(turn)()?.message }
-
     public static func peerRefusal(_ who: String, tap: String?) -> ToolFailureError {
         ToolFailureError("\(who) is an untrusted source, so it cannot change senses, abilities or skills on this run. "
             + (tap.map { "The owner can trust this source at \($0) to authorize future runs." }
@@ -91,9 +89,4 @@ public enum CapabilityLifecycle {
     }
 
     public static let inputLimit = 10
-
-    public static func date(_ text: String?) -> Date? {
-        guard let text, !text.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(text)
-    }
 }

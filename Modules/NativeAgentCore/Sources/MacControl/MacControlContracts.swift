@@ -3,21 +3,10 @@ import NativeAgentCore
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(UserNotifications)
 import UserNotifications
-#endif
 
 // Blueprint: | `MacControlContracts.swift` | `MacControlResult`, `MacControlClient`, `MacMotorCount`: Dispatch receipts and policy categories |
 
@@ -207,7 +196,6 @@ public final class MacMotorCount: MacControlClient, @unchecked Sendable {
 
 // MARK: - Sub-action classification
 
-/// Include accepted unsupported routes so they return a shaped 501 instead of disappearing at dispatch.
 public let macControlDispatchableActions: Set<String> = Set([
     "notify",
     "applescript",
@@ -225,11 +213,9 @@ public let macControlDispatchableActions: Set<String> = Set([
     "keystroke",
     "click",
 ])
-    .union(macControlUnsupportedActions)
     .union(macControlAccessibilityReadActions)
     .union(macControlAccessibilityActActions)
     .union(macControlAppNavigationActions)
-    .union(macControlAccessibilityNudgeActions)
     .union(macControlClipboardActions)
     .union(macControlDocumentReadActions)
 
@@ -239,21 +225,9 @@ public var macControlLiveReadActions: Set<String> {
         .union(macControlDocumentReadActions).union(["file/read", "file/list", "spotlight"])
 }
 
-/// Known unsupported actions fail closed with 501 instead of proxying to another implementation.
-public let macControlUnsupportedActions: Set<String> = [
-    "jxa",
-    "shortcut",
-    "shortcut/run",
-    "system",
-    "self_test",
-]
-
 /// AX reads emit no input or actions and remain read tier under the Accessibility category. Active reads may prepare advertised renderer modes and clear a
 /// covering saver with the shared inert wake; passive reads never write flags.
 public let macControlAccessibilityReadActions: Set<String> = [
-    "ax_status",
-    "ax_tree",
-    "ax_find",
     // Fused AX/pixel perception is read tier; Screen Recording is a separate system grant.
     "view",
     // Semantic perception is read tier and requires no Screen Recording grant.
@@ -266,14 +240,11 @@ public let macControlAccessibilityReadActions: Set<String> = [
 
 /// Include basic click/keystroke alongside extended AX mutations in injection classification.
 public let macControlAccessibilityActActions: Set<String> = [
-    "scroll",
     "ax_act",
     // Closed-loop acts mutate through the same actuator; returning perception does not make an act read tier.
     "act",
     // Internal physical owner for the four-verb surface. `act` resolves a fresh name/ordinal first; `hand` executes the resulting bounded plan.
     "hand",
-    // Explicit wake emits inert HID input and remains in the injection action family.
-    "wake",
     // Pressing a menu item invokes its handler and stays separate from menu discovery's read authority.
     "menu_press",
 ]
@@ -288,14 +259,8 @@ public let macControlAppNavigationActions: Set<String> = [
 public let macControlAccessibilityInjectionActions: Set<String> =
     macControlAccessibilityActActions.union(["keystroke", "click"])
 
-/// A nudge emits only a bare pointer move and shares read admission without claiming no input. Adding buttons or keys requires injection classification.
-public let macControlAccessibilityNudgeActions: Set<String> = [
-    "nudge",
-]
-
 /// Yield every cursor, keyboard, focus or screen effect to the person. Scripts belong here because they can drive GUI state.
 public let macControlTakeoverActions: Set<String> = macControlAccessibilityInjectionActions
-    .union(macControlAccessibilityNudgeActions)
     .union(["focus_app", "quit_app", "open_target", "applescript"])
 
 /// Clipboard reads emit no input, redact their contents and share the Accessibility category without claiming an AX walk.
@@ -322,14 +287,11 @@ public let macControlDocumentReadActions: Set<String> = [
 public func macControlGateCategory(forAction action: String) -> String? {
     if macControlAccessibilityReadActions.contains(action)
         || macControlAccessibilityInjectionActions.contains(action)
-        || macControlAccessibilityNudgeActions.contains(action)
         || macControlAppNavigationActions.contains(action)
         || macControlClipboardActions.contains(action)
         || macControlDocumentReadActions.contains(action) { return "accessibility" }
     switch action {
     case "applescript":                                   return "applescript"
-    case "jxa":                                           return "jxa"
-    case "shortcut", "shortcut/run":                      return "shortcuts"
     case "focus_app", "quit_app":                          return "accessibility"
     case "system", "volume", "media":                     return "system"
     case "file/read", "file/write", "file/list",

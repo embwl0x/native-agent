@@ -68,7 +68,7 @@ extension TrustBackupPersistence {
         do {
             snapshot = try Self.validateBackupSnapshot(id: id, dataRoot: root)
             // Fail before staging if the current phone version floor cannot be proved.
-            _ = try await SwiftNativePersistenceCore.withFileLock(Self.chatSessionIndexPath(in: root)) {
+            _ = try await SwiftNativePersistenceCore.withFileLock(DataRootPaths.chatSessionIndex(in: root)) {
                 try Self.requiredTranscriptGenerationFloor(in: root)
             }
         } catch {
@@ -93,7 +93,7 @@ extension TrustBackupPersistence {
             targetManifestSHA256: snapshot.manifestSHA256,
             safetyBackupID: nil,
             safetyManifestSHA256: nil,
-            stagedAt: Self.nativeArtifactTimestamp(),
+            stagedAt: NativeTimestampFormat.plainZulu(Date()),
             state: .staged
         )
         do {
@@ -152,7 +152,7 @@ extension TrustBackupPersistence {
         let result = BackupRestoreResult(
             id: target.id,
             restored: target.copied,
-            restoredAt: Self.nativeArtifactTimestamp(),
+            restoredAt: NativeTimestampFormat.plainZulu(Date()),
             requiresRestart: false,
             notCarried: notes
         )
@@ -282,7 +282,7 @@ extension TrustBackupPersistence {
     static func requiredTranscriptGenerationFloor(in root: URL, epochRoot: URL? = nil) throws -> Int64 {
         let archive = root.appendingPathComponent("chat/archive/sessions.jsonl")
         var floor: Int64 = 0
-        for index in [Self.chatSessionIndexPath(in: root), archive] {
+        for index in [DataRootPaths.chatSessionIndex(in: root), archive] {
             do {
                 try Self.requireRegularFile(index, maximumBytes: nil)
             } catch CocoaError.fileReadNoSuchFile where index == archive {
@@ -318,7 +318,7 @@ extension TrustBackupPersistence {
         in root: URL,
         priorGenerationFloor: Int64
     ) throws {
-        let path = Self.chatSessionIndexPath(in: root)
+        let path = DataRootPaths.chatSessionIndex(in: root)
         let restoredFloor = try Self.requiredTranscriptGenerationFloor(in: root)
         var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
         guard !rows.isEmpty else { return }
@@ -366,12 +366,6 @@ extension TrustBackupPersistence {
             )
         }
         return next
-    }
-
-    static func chatSessionIndexPath(in root: URL) -> URL {
-        root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
     }
 
     private static func verifyAppliedSnapshot(

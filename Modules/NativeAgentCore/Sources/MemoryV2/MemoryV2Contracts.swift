@@ -84,11 +84,6 @@ public struct MemoryProposalEvidence: Sendable {
 
 extension ProposalRecord {
     public var evidence: MemoryProposalEvidence { MemoryProposalEvidence(metadata: metadata) }
-    public var evidenceSummary: String {
-        let recorded = evidence
-        return MemoryProposalRecord.evidenceDescription(sessionCount: recorded.sessionIDs.count,
-            recurrenceCount: recorded.recurrenceCount, error: recorded.error)
-    }
 }
 
 public struct MemoryV2RecallRequest: Sendable, Codable, Equatable {

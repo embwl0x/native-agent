@@ -135,7 +135,7 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
             }
             let invalidDates = dropped.filter { _, id in
                 guard let id, let record = byID[id] else { return false }
-                return Self.parseDate(record.updatedAt) == nil || Self.parseDate(record.createdAt) == nil
+                return NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.updatedAt) == nil || NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.createdAt) == nil
             }
             let pending = dropped.filter { $0.1.flatMap { byID[$0] }.map(Self.pendingAdmission) == true }
             return ContextTurnExclusion(atomIDs: Set(dropped.map(\.0.draft.id)), unverified: pending.map {
@@ -163,8 +163,8 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
     }
 
     static func speakable(_ record: MemoryV2.MemoryRecord?, compiledAt: Date, on surface: ContextSurface) -> Bool {
-        guard let record, parseDate(record.createdAt) != nil, isActive(record), !pendingAdmission(record), MemoryLifecycle.isRecallEligible(record.lifecycle),
-              let version = parseDate(record.updatedAt),
+        guard let record, NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.createdAt) != nil, isActive(record), !pendingAdmission(record), MemoryLifecycle.isRecallEligible(record.lifecycle),
+              let version = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.updatedAt),
               version.timeIntervalSince(compiledAt) <= 0.001,
               MemoryRecordDisclosurePolicy.classify(record)?.permits(surface: surface.rawValue, personaID: nil) == true
         else { return false }
@@ -229,11 +229,7 @@ private extension MemoryContext {
               !ContextSecretContentPolicy.containsSecretLikeContent(embeddingText) else {
             return nil
         }
-        guard MemoryCandidateQuality.isDurableCandidate(
-            text: embeddingText,
-            source: record.sourceRunId,
-            kind: record.memoryKind
-        ) else {
+        guard MemoryCandidateQuality.isDurableCandidate(text: embeddingText) else {
             return nil
         }
 
@@ -320,13 +316,10 @@ private extension MemoryContext {
         if case .array(let values)? = record.extras?.objectValue?["context_topics"] {
             // Identity is read from this projection's injected root, through the profile cache that observes renames, never a default install.
             let names = try MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory"))
-            func topicKey(_ text: String) -> String {
-                text.lowercased().split { !$0.isLetter && !$0.isNumber }.joined(separator: " ")
-            }
-            let identities = Set([names.agent, names.user].compactMap { $0 }.map(topicKey))
+            let identities = Set([names.agent, names.user].compactMap { $0 }.map(TextNormalization.lowercaseWords))
             for case .string(let topic) in values.prefix(8) {
                 let clean = topic.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !clean.isEmpty, clean.count <= 120, !identities.contains(topicKey(clean)) else { continue }
+                guard !clean.isEmpty, clean.count <= 120, !identities.contains(TextNormalization.lowercaseWords(clean)) else { continue }
                 entities.append(ContextEntity(
                     kind: ContextCorrectionScope.entityKind,
                     id: ContextStableID.digest(parts: [clean.lowercased()]),
@@ -384,7 +377,7 @@ private extension MemoryContext {
             authority: authority,
             confidence: confidence,
             // A closed truth interval expires the atom from automatic context.
-            freshness: ContextFreshness(updatedAt: updatedAt, expiresAt: parseDate(record.validTo),
+            freshness: ContextFreshness(updatedAt: updatedAt, expiresAt: NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.validTo),
                 createdAt: createdAt, recallSeedAt: recallSeedAt),
             privacy: descriptor.privacy,
             permittedSurfaces: descriptor.permittedSurfaces,
@@ -450,7 +443,7 @@ private extension MemoryContext {
         // The block already labels records as historical; repeat only dates to preserve room for memory content.
         func day(_ raw: String?) -> String? {
             guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), value.utf8.count <= 64,
-                  !NativeContextProjectionText.containsDisallowedControl(value), parseDate(value) != nil else { return nil }
+                  !NativeContextProjectionText.containsDisallowedControl(value), NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(value) != nil else { return nil }
             return String(value.prefix(10))
         }
         let from = day(record.validFrom), until = day(record.validTo), observed = day(record.observedAt)
@@ -507,12 +500,5 @@ private extension MemoryContext {
 extension MemoryContext {
     static func normalizedRecordID(_ value: String) -> String {
         normalizedID(value)
-    }
-
-    static func parseDate(_ raw: String?) -> Date? {
-        guard let raw else { return nil }
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }
 }

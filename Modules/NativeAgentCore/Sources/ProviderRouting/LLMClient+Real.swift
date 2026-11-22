@@ -125,6 +125,8 @@ public protocol LLMTransport: Sendable {
     static var toolWire: ProviderToolWire { get }
     static var carriesImages: Bool { get }
     var providerId: String { get }
+    /// Receipts for whole-reply collection; every adapter that collects its own stream names the recorder it writes to.
+    var telemetry: LLMCallTraceRecorder { get }
     /// Exact wire output cap; zero explicitly declares no output-cap field. A transport that writes a cap takes it, while a run's budget is bound,
     /// from `FirstPartyExecutionControls.budgetedOutputTokens`: min(remaining budget, effective ceiling).
     func requestOutputTokens(model: String, call: LLMCall) throws -> Int
@@ -164,6 +166,28 @@ public enum LLMMessagesStreamKind: String, Sendable {
 
 extension LLMTransport {
     public static var carriesImages: Bool { true }
+
+    /// Collect a whole reply from the adapter's stream.
+    public func complete(
+        prompt: String,
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?,
+        call: LLMCall
+    ) async throws -> String {
+        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
+    }
+
+    public func completeMessages(
+        messages: [LLMMessage],
+        system: String?,
+        model: String,
+        tools: [LLMToolSchema]?,
+        call: LLMCall
+    ) async throws -> String {
+        try await LLMMessageStreamEvent.reply(collecting:
+            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
+    }
 }
 
 // MARK: - LLMError
@@ -197,7 +221,7 @@ public enum LLMError: Error, Equatable, LocalizedError {
 
     public static let retryAfterMaxSeconds = 3600
 
-    public static func rateLimited(message: String, retryAfterSeconds: Int?) -> LLMError {
+    public static func rateLimited(retryAfterSeconds: Int?) -> LLMError {
         .failure(.rateLimited(retryAfter: retryAfterSeconds.flatMap {
             $0 > 0 ? min($0, retryAfterMaxSeconds) : nil
         }))
@@ -710,10 +734,7 @@ extension LLMMessageStreamEvent {
             work.stop()
             await work.join()
             let failure: any Error = stoppedByCaller ? CancellationError() : error
-            let partial = output()
-            // Partial text is evidence beside the failure, never its type. Neither sink throws or checks cancellation: Stop still settles.
-            await call.turn?.partialReply?(partial)
-            await recorder.recordPartialReply(output: partial, error: failure, call: call)
+            await recorder.recordPartialReply(output: output(), error: failure, call: call)
             throw failure
         }
     }

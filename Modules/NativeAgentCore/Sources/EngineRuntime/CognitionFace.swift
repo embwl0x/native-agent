@@ -1,6 +1,6 @@
 import AuthoredCapabilities
 import Cognition
-import CryptoKit
+import CognitiveSubstrate
 import Foundation
 import NativeAgentShared
 import PersistenceCore
@@ -79,7 +79,9 @@ extension NativeAgentEngine {
                 ?? (!detail.organism.enabled ? "Body signals are off in Settings." : nil), role: .destructive),
             setting("capsule", "Give me a thought summary", configuration.capsuleInjectionEnabled, "settings.inner_life_capsule"),
             setting("background", "Keep thinking in the background", configuration.backgroundMicrocyclesEnabled, "settings.inner_life_background")]
-        controls.append(.init(id: "budget", title: "Reflections in 24 hours", detail: blocked,
+        let spent = CognitiveSubstrate.wakingReflectionsSpent(detail.reflections, at: Date())
+        controls.append(.init(id: "budget", title: "Reflections in 24 hours",
+            detail: blocked ?? "\(spent) of \(configuration.dailyReflectionCallBudget) used in the last 24 hours; the night's dream is not counted.",
             control: .init(call: .init("setting.set", ["setting": .string("settings.daily_reflection_budget")]),
                 number: .init(value: Double(configuration.dailyReflectionCallBudget), min: 0, max: 8, step: 1))))
         controls.append(.init(id: "include-workspace", title: "Include workspace", detail: blocked,
@@ -99,7 +101,7 @@ extension NativeAgentEngine {
         sections = try sections.map { section in
             var section = section
             section.rows = section.rows.map { Self.scoped($0, prefix: section.id + ":") }
-            section.revision = try Self.collectionRevision(section.rows)
+            section.revision = try StableHash.sortedJSONSHA256(section.rows)
             return section
         }
         return PartFace(title: "Cognition", sections: sections)
@@ -149,7 +151,7 @@ extension NativeAgentEngine {
         sections = try sections.map { section in
             var section = section
             section.rows = section.rows.map { Self.scoped($0, prefix: section.id + ":") }
-            section.revision = try Self.collectionRevision(section.rows)
+            section.revision = try StableHash.sortedJSONSHA256(section.rows)
             return section
         }
         return PartFace(title: "Memory upkeep", sections: sections)
@@ -207,12 +209,6 @@ extension NativeAgentEngine {
             throw PartCallError(code: "page_epoch_invalid", message: "The system clock cannot identify this page reading.")
         }
         return PartFaces.Packet(facts: .object(facts), epoch: epoch, levers: levers)
-    }
-
-    nonisolated private static func collectionRevision(_ rows: [PartFace.Row]) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return SHA256.hash(data: try encoder.encode(rows)).map { String(format: "%02x", $0) }.joined()
     }
 
     nonisolated private static func scoped(_ row: PartFace.Row, prefix: String) -> PartFace.Row {

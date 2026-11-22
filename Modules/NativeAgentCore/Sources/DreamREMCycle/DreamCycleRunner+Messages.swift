@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
@@ -75,7 +76,7 @@ extension DreamCycleRunner {
                 }
                 let runID: String? = if case .string(let id)? = obj["runId"], !id.isEmpty { id } else { nil }
                 let lived = !CognitiveMechanicalRowKind.marksMechanicalRow(metadata)
-                guard let at = ConversationHistory.parseTimestamp(obj["createdAt"]) else {
+                guard let at = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(obj["createdAt"]?.stringValue) else {
                     throw PersistenceCoreError.ioFailure(
                         "Transcript occurrence time unavailable at \(url.path); preserve and repair its createdAt before dreaming it")
                 }

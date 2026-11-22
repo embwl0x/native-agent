@@ -332,7 +332,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
             switch cause {
             case .authExpired?, .codexCLISessionExpired?:
                 let connection = SwiftNativeProviderRouting.displayName(for: provider)
-                let signIn = NativeOAuthFlow.signInControl(providerID: provider, dataRoot: dataRoot)
+                let signIn = NativeOAuthFlow.signInControl(providerID: provider)
                 let owner = connection + " (" + provider + ") saved " + (signIn == nil ? "API key" : "sign-in")
                 let tap = signIn ?? "Providers → Accounts → \(connection) → Add key → protected connection card"
                 let instruction = "Ask the person to reconnect at \(tap)."

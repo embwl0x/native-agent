@@ -1,9 +1,6 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
 
 enum MacScreenCaptureWindowSelection {
     static func selectedID(
@@ -19,23 +16,14 @@ enum MacScreenCaptureWindowSelection {
         return matches.count == 1 ? matches[0].id : nil
     }
 }
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
 // Blueprint: | `MacScreenViewCapture.swift` | `SystemMacVisualObstructionProbe`, `SystemMacScreenCaptureSource`: Exact capture, hit evidence and cancellation |
-#endif
 
 // MARK: - Production capture source (ScreenCaptureKit)
 
-#if canImport(CoreGraphics)
 /// Select in logical points because adjacent displays may differ in scale or leave a gap under the window centre.
 enum MacScreenCaptureDisplaySelection {
     static func selectedID(
@@ -119,12 +107,8 @@ extension MacImageCapture {
     }
 
     private static func labelDigest(_ label: String?) -> String? {
-        #if canImport(CryptoKit)
         guard let label, !label.isEmpty else { return nil }
-        return SHA256.hash(data: Data(label.utf8)).map { String(format: "%02x", $0) }.joined()
-        #else
-        return nil
-        #endif
+        return SHA256Hex.of(Data(label.utf8))
     }
 
     /// Point revalidation requires the captured window and any captured control’s role, label and frame to agree.
@@ -195,17 +179,12 @@ public struct SystemMacVisualObstructionProbe: Sendable {
         guard let hit = Self.hitPID(x: frame.x + frame.w / 2, y: frame.y + frame.h / 2) else { return listed }
         if hit == targetPID { return [] }
         if !listed.isEmpty { return listed }
-        #if canImport(AppKit)
         let name = NSRunningApplication(processIdentifier: hit)?.localizedName ?? "another app"
-        #else
-        let name = "another app"
-        #endif
         return [MacVisualObstruction(ownerPID: hit, ownerName: name, coverage: 1, frame: frame)]
     }
 
     /// System-wide hits share the dedicated AX thread, leaving this app's window free to answer Accessibility.
     static func hitPID(x: Double, y: Double) -> Int32? {
-        #if canImport(ApplicationServices)
         MacAXExecutionLane.sync {
             var element: AXUIElement?
             guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(x), Float(y), &element) == .success,
@@ -214,9 +193,6 @@ public struct SystemMacVisualObstructionProbe: Sendable {
             guard AXUIElementGetPid(element, &pid) == .success, pid > 0 else { return nil }
             return pid
         }
-        #else
-        return nil
-        #endif
     }
 
     /// Only input-owning windows can obstruct a pointer target.
@@ -279,9 +255,7 @@ public struct SystemMacVisualObstructionProbe: Sendable {
         return width * height
     }
 }
-#endif
 
-#if canImport(ScreenCaptureKit) && os(macOS)
 
 /// ScreenCaptureKit offers no cancellation handle: invalidate delivery and resume once, leaving late callbacks no mutation authority. Transfer its unannotated
 /// immutable snapshot only through the callback-owned envelope.
@@ -490,21 +464,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
     }
 }
 
-#endif
-
-/// Unsupported platforms report unavailability rather than fabricated pixels.
-public struct UnavailableMacScreenCaptureSource: MacScreenCaptureSource {
-    public init() {}
-    public func isScreenRecordingTrusted() -> Bool { false }
-    public func capture(rect: MacAXFrame?, context: MacOperationContext) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
-        .failure(.unavailableOnThisPlatform)
-    }
-}
 
 public func defaultMacScreenCaptureSource() -> any MacScreenCaptureSource {
-    #if canImport(ScreenCaptureKit) && os(macOS)
     return SystemMacScreenCaptureSource()
-    #else
-    return UnavailableMacScreenCaptureSource()
-    #endif
 }

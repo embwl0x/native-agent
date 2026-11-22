@@ -76,7 +76,7 @@ extension EngineFaceActs {
              .setDreamCycleEnabled, .setREMCycleEnabled, .setInnerLifeEnabled, .setContextFlowMode:
             secrets = []
         // Authored conversation, memory, persona and work content has no credential field.
-        case .renameConversation, .send, .notify, .remember, .commitNote, .writeScratch, .searchMemories,
+        case .renameConversation, .send, .revise, .notify, .remember, .commitNote, .writeScratch, .searchMemories,
              .readPersona, .savePersonaProfile, .savePersonaName, .savePersonaDocument, .onboarding,
              .createDeskTask, .addDeskNote, .research, .exportMake, .sendContactMessage, .stopContactMessage,
              .resendContactMessage, .withdrawContactMessage, .ingestAttachment, .captureScreen, .openBrowser, .voice:

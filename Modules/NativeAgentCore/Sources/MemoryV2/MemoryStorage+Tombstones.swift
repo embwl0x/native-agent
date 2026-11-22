@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import GRDB
 import NativeAgentCore
 import PersistenceCore
@@ -26,7 +27,7 @@ extension MemoryStorage {
               COALESCE(?, (SELECT embedding_epoch FROM tombstones WHERE content_hash = ?))
             )
         """, arguments: [
-            hash, content, nowISO8601(), reason,
+            hash, content, NativeTimestampFormat.fractionalZulu(Date()), reason,
             encodeEmbedding(embedding), hash,
             embeddingEpoch, hash,
         ])

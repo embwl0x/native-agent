@@ -176,8 +176,10 @@ public enum FirstPartyModelDiscovery {
             guard let cache = caches[route] else { return false }
             do {
                 let read = try cache.boundRead(dataRoot: dataRoot)
+                guard read.credential != nil else { return false }
+                guard read.catalog?.isComplete == true else { return true }
                 let saved = try FileManager.default.attributesOfItem(atPath: cache.cachePath(dataRoot).path)[.modificationDate] as? Date
-                return read.credential != nil && (read.catalog?.isComplete != true || saved.map { -$0.timeIntervalSinceNow >= 86_400 } != false)
+                return saved.map { -$0.timeIntervalSinceNow >= 86_400 } != false
             } catch { return true }
         }
     }

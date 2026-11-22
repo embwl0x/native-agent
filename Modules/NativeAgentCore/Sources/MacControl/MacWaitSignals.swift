@@ -1,9 +1,7 @@
 import Foundation
 import PersistenceCore
 
-#if canImport(AppKit) && os(macOS)
 import AppKit
-#endif
 
 // Blueprint: | `MacWaitSignals.swift` | `MacWaitSignals`: Cancellable AX/app signal waits with owned observer lifetimes |
 
@@ -15,7 +13,6 @@ public protocol MacAppActivationObserverSource: Sendable {
     ) -> (any MacAXEffectObservation)?
 }
 
-#if canImport(AppKit) && os(macOS)
 public struct SystemMacAppActivationObserverSource: MacAppActivationObserverSource {
     public init() {}
 
@@ -54,21 +51,9 @@ final class MacWorkspaceActivationObservation: MacAXEffectObservation, @unchecke
 
     deinit { stop() }
 }
-#endif
-
-public struct UnavailableMacAppActivationObserverSource: MacAppActivationObserverSource {
-    public init() {}
-    public func install(
-        onActivation: @escaping @Sendable () -> Void
-    ) -> (any MacAXEffectObservation)? { nil }
-}
 
 public func defaultMacAppActivationObserverSource() -> any MacAppActivationObserverSource {
-    #if canImport(AppKit) && os(macOS)
     return SystemMacAppActivationObserverSource()
-    #else
-    return UnavailableMacAppActivationObserverSource()
-    #endif
 }
 
 /// Coalesce AX and activation signals until drained.

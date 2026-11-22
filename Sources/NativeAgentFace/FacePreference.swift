@@ -13,18 +13,11 @@ extension Bool: FacePreferenceScalar {
     var faceValue: PartFace.Value { .bool(self) }
 }
 extension String: FacePreferenceScalar {
-    static func read(_ value: PartFace.Value) -> String? { if case .string(let value) = value { value } else { nil } }
+    static func read(_ value: PartFace.Value) -> String? { value.stringValue }
     var faceValue: PartFace.Value { .string(self) }
 }
 extension Double: FacePreferenceScalar {
-    /// A whole number crosses the link as an int, whichever way it was written.
-    static func read(_ value: PartFace.Value) -> Double? {
-        switch value {
-        case .double(let value): value
-        case .int(let value): Double(value)
-        default: nil
-        }
-    }
+    static func read(_ value: PartFace.Value) -> Double? { value.doubleValue }
     var faceValue: PartFace.Value { .double(self) }
 }
 

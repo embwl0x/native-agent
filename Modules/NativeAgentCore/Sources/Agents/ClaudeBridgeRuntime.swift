@@ -522,13 +522,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 writeJSON(conn, status: 400, obj: ["error": "invalid_caller_result_request"])
                 return
             }
-            func wholeNumber(_ value: Any?) -> Int? {
-                guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
-                      number.doubleValue.isFinite, number.doubleValue == Double(number.intValue) else { return nil }
-                return number.intValue
-            }
-            let offset = json["offset"] == nil ? 0 : wholeNumber(json["offset"])
-            let maxChars = json["max_chars"] == nil ? 8000 : wholeNumber(json["max_chars"])
+            let offset = json["offset"] == nil ? 0 : AgentContactRoutes.peerInteger(json["offset"])
+            let maxChars = json["max_chars"] == nil ? 8000 : AgentContactRoutes.peerInteger(json["max_chars"])
             guard let offset, (0...1_048_576).contains(offset), let maxChars, (1...16000).contains(maxChars) else {
                 writeJSON(conn, status: 400, obj: ["error": "invalid_pagination",
                     "detail": "offset is an integer from 0 through 1048576; max_chars from 1 through 16000."])

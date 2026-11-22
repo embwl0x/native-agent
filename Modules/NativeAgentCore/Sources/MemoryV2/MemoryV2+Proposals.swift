@@ -30,7 +30,7 @@ extension SwiftNativeMemoryV2 {
         }
         let content = MemoryTextClip.memoryDisplayText(content, kind: kind)
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
-        if let reason = MemoryCandidateQuality.rejectionReason(text: content, source: source, kind: kind) {
+        if let reason = MemoryCandidateQuality.rejectionReason(text: content) {
             throw MemoryV2Error.rejectedCandidate(reason)
         }
         try await ensureCanonicalAttachment()
@@ -113,7 +113,7 @@ extension SwiftNativeMemoryV2 {
             id: UUID().uuidString,
             content: content,
             source: source,
-            stagedAt: Self.iso8601Now(),
+            stagedAt: NativeTimestampFormat.plainZulu(Date()),
             status: "pending",
             metadata: meta.isEmpty ? nil : .object(meta)
         )
@@ -146,11 +146,7 @@ extension SwiftNativeMemoryV2 {
             throw MemoryV2Error.recordNotFound
         }
         _ = try MemoryProposalEvidence.confidence(in: proposal.metadata)
-        if let reason = MemoryCandidateQuality.rejectionReason(
-            text: proposal.content,
-            source: proposal.source,
-            kind: MemoryRecallScoring.kind(of: proposal.metadata)
-        ) {
+        if let reason = MemoryCandidateQuality.rejectionReason(text: proposal.content) {
             let rejection = "quality gate at acceptance: \(reason)"
             try await storage.rejectProposal(id: id, reason: rejection)
             requestEmbeddingEpochReconcile()
@@ -190,10 +186,7 @@ extension SwiftNativeMemoryV2 {
 
     /// Read target intent independently so missing fingerprints cannot turn replacements into ordinary accepts.
     static func supersedesTargetId(from metadata: JSONValue?) -> String? {
-        guard case .object(let meta)? = metadata,
-              case .string(let targetId)? = meta[MemoryManagerLane.supersedesKey],
-              !targetId.isEmpty else { return nil }
-        return targetId
+        metadata?.objectValue?[MemoryManagerLane.supersedesKey]?.nonemptyString
     }
 
     /// Retire a pending proposal and record its successor atomically; preserve all tombstones.
@@ -217,18 +210,14 @@ extension SwiftNativeMemoryV2 {
     static let supersessionReasonPrefix = "superseded by a correction: "
 
     /// Share one waiting-for-review rule between Today and the agent's home; superseded or ineligible statements do not count.
-    public static func awaitsReview(content: String, source: String?, metadata: JSONValue?) -> Bool {
+    public static func awaitsReview(content: String, metadata: JSONValue?) -> Bool {
         guard supersededByMarker(in: metadata) == nil else { return false }
-        let kind: String? = if case .object(let meta)? = metadata, case .string(let value)? = meta["kind"] { value } else { nil }
-        return MemoryCandidateQuality.isDurableCandidate(text: content, source: source, kind: kind)
+        return MemoryCandidateQuality.isDurableCandidate(text: content)
     }
 
     /// Successor evidence applies even while a proposal's status remains pending.
     public static func supersededByMarker(in metadata: JSONValue?) -> String? {
-        guard case .object(let meta)? = metadata,
-              case .string(let successor)? = meta["supersededBy"],
-              !successor.isEmpty else { return nil }
-        return successor
+        metadata?.objectValue?["supersededBy"]?.nonemptyString
     }
 
     @discardableResult

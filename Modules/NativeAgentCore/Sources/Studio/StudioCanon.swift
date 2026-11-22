@@ -476,15 +476,14 @@ public extension SwiftNativeStudioStore {
     /// least recently pulled; no preference or decay.
     func noteRecallPulls(
         titles: [(title: String, creator: String?)],
-        now: Date = Date(),
-        maximumTrackedWorks: Int = 256
+        now: Date = Date()
     ) async -> JSONValue? {
         guard !titles.isEmpty else { return nil }
+        let maximumTrackedWorks = 256
         let stamp = NativeTimestampFormat.sixDigitUTCOffset(now)
         let path = canonRecallHitsPath
         var committed = false
         do {
-            guard maximumTrackedWorks > 0 else { throw StudioCanonError.unavailableRecallCounts }
             try FileManager.default.createDirectory(at: canonDirectory, withIntermediateDirectories: true)
             try await SwiftNativePersistenceCore.withFileLock(path) {
             let current = try Self.readRecallCounter(at: path)

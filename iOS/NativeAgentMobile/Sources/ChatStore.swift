@@ -138,11 +138,40 @@ struct QueuedChatSend: Identifiable, Codable, Sendable {
     var suppressRemoteUserAppend: Bool = false
     var replacementAssistantMessageID: UUID? = nil
     var steeringFailure: String? = nil
+    /// Keep the offered run's identity until the Mac settles it, including after relaunch.
+    var awaitingSteerOutcome: Bool? = nil
 
     var preview: String {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !clean.isEmpty { return clean }
         return attachments.count == 1 ? "One attachment" : "\(attachments.count) attachments"
+    }
+}
+
+extension QueuedChatSend {
+    enum CodingKeys: String, CodingKey {
+        case id, sessionID, text, controls, attachments, createdAt, preparedMessage, placeholderID, userMessageID, pairingFingerprint,
+             suppressRemoteUserAppend, replacementAssistantMessageID, steeringFailure, awaitingSteerOutcome
+    }
+
+    /// Entries an earlier build saved lack the fields added since: they decode with those fields' defaults, never failing the whole queue.
+    /// An entry saved before pairing was recorded has an empty fingerprint, so it is held for the person, never sent to whichever Mac is paired now.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        sessionID = try c.decodeIfPresent(String.self, forKey: .sessionID)
+        text = try c.decode(String.self, forKey: .text)
+        controls = try c.decode(ChatRuntimeControls.self, forKey: .controls)
+        attachments = try c.decodeIfPresent([MultimodalAttachment].self, forKey: .attachments) ?? []
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        preparedMessage = try c.decodeIfPresent(BridgeMessage.self, forKey: .preparedMessage)
+        placeholderID = try c.decodeIfPresent(UUID.self, forKey: .placeholderID)
+        userMessageID = try c.decodeIfPresent(UUID.self, forKey: .userMessageID)
+        pairingFingerprint = try c.decodeIfPresent(String.self, forKey: .pairingFingerprint) ?? ""
+        suppressRemoteUserAppend = try c.decodeIfPresent(Bool.self, forKey: .suppressRemoteUserAppend) ?? false
+        replacementAssistantMessageID = try c.decodeIfPresent(UUID.self, forKey: .replacementAssistantMessageID)
+        steeringFailure = try c.decodeIfPresent(String.self, forKey: .steeringFailure)
+        awaitingSteerOutcome = try c.decodeIfPresent(Bool.self, forKey: .awaitingSteerOutcome)
     }
 }
 
@@ -270,7 +299,7 @@ final class ChatStore {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         storage = MobileLocalStorage(defaults: defaults)
-        // Launch follows main; history selection requires an explicit action in this launch.
+        // Launch follows main unless the phone is still handing off a locally created conversation.
         let savedLocal = Self.cleanSessionID(defaults.string(forKey: Self.locallyCreatedSessionIDKey))
         selectedSessionID = nil
         locallyCreatedSessionID = savedLocal
@@ -304,20 +333,21 @@ final class ChatStore {
                 failures.append(message)
             }
             guard sessionSwitchGeneration == 0 else { return }
-            restorePendingExchanges(for: nil)
+            if let savedLocal, pendingExchanges.values.contains(where: { $0.sessionID == savedLocal })
+                || queuedSends.contains(where: { $0.sessionID == savedLocal }) {
+                setSelectedSessionID(savedLocal)
+            }
+            restorePendingExchanges(for: selectedSessionID)
             if !failures.isEmpty { errorBanner = "Chat could not be restored: " + failures.joined(separator: "\n") }
         }
     }
 
     nonisolated static func cleanSessionID(_ value: String?) -> String? {
-        let clean = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return clean.isEmpty ? nil : clean
+        value.trimmedNonEmpty
     }
 
     func setSelectedSessionID(_ value: String?) {
-        let clean = Self.cleanSessionID(value)
-        if clean != selectedSessionID { historyExhaustedSessionIDs.removeAll() }
-        selectedSessionID = clean
+        selectedSessionID = Self.cleanSessionID(value)
     }
 
     func markLocallyCreatedSession(_ value: String) {
@@ -354,14 +384,10 @@ final class ChatStore {
     var inFlightSendIDs: Set<String> = []
     var sendTask: Task<Void, Never>?
     var retiredPendingPlaceholders: [String: UUID] = [:]
-    /// Retain steered queue entries until the Mac evidences reading them or gives them back.
-    var steeringQueuedIDs: Set<UUID> = []
     var resolvedICloudReplyIds: Set<String> = []
     var macPublishedMessageIDs: Set<UUID> { iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.publishedIDs ?? [] }
     var liveTurnBubbles: [String: UUID] = [:]
     var isLoadingHistory = false
-    var historyExhaustedSessionIDs: Set<String> = []
-    var pagedSessionsWithOlder: Set<String> = []
     static weak var visibleStore: ChatStore?
 
     nonisolated static let snapshotTruncationMarker = "[truncated for iPhone snapshot]"

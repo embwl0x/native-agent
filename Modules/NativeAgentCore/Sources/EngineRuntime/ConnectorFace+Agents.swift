@@ -79,6 +79,9 @@ extension NativeAgentEngine {
         var actions = [PartFace.Action(id: "connect", label: "Connect", role: .primary, doors: ["mac"], call: ask("connect"))]
         if row.contact != nil {
             actions = row.repliesOnly ? [] : [PartFace.Action(id: "test", label: "Send a test message", doors: ["mac"], call: ask("test"))]
+            if let contact = row.contact, AgentPeerStore.hostRowID(contact.endpoint) != nil {
+                actions.insert(.init(id: "reconnect", label: "Reconnect", doors: ["mac"], call: ask("connect")), at: 0)
+            }
             actions.append(PartFace.Action(id: "disconnect", label: "Disconnect agent", doors: ["mac"], call: ask("disconnect")))
         }
         var setup: [PartFace.Row] = []

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import MacIntegration
 import PersistenceCore
 import Transcripts
@@ -65,13 +66,12 @@ extension AgentScreen {
 
     static func roomCounts(_ content: [String: JSONValue], fine: Bool, status: String, listed: Int, unreadRows: Int, page: Int) -> [String] {
         guard fine else { return [status] }
-        func int(_ value: JSONValue?) -> Int? { if case .int(let n)? = value { Int(n) } else { nil } }
         let number = NumberFormatter()
         number.numberStyle = .decimal
         func grouped(_ n: Int) -> String { number.string(from: NSNumber(value: n)) ?? String(n) }
-        let total = int(content["inbox_total"]) ?? int(content["total"]) ?? listed
+        let total = content["inbox_total"]?.strictInt ?? content["total"]?.strictInt ?? listed
         var parts: [String]
-        if let unread = int(content["inbox_unread"]) { parts = ["\(grouped(unread)) unread of \(grouped(total))"] }
+        if let unread = content["inbox_unread"]?.strictInt { parts = ["\(grouped(unread)) unread of \(grouped(total))"] }
         else { parts = [total == 0 ? "ready" : grouped(total)] + (unreadRows > 0 ? ["\(unreadRows) unread"] : []) }
         if listed > 0, listed > 8 || total > listed { parts.append("\(page * 8 + 1)–\(min(listed, page * 8 + 8)) shown") }
         return parts
@@ -87,8 +87,7 @@ extension AgentScreen {
 
     static func commsProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         func rows(_ key: String) -> [[String: JSONValue]] {
-            guard case .object(let root) = result, case .array(let list)? = root[key] else { return [] }
-            return list.compactMap { if case .object(let row) = $0 { row } else { nil } }
+            JSONValue.objectArray(result.objectValue?[key])
         }
         let content: JSONValue = if case .object(let root) = result {
             .object(root.filter { !["messages", "notes", "contacts"].contains($0.key) })
@@ -100,7 +99,7 @@ extension AgentScreen {
             } else { content }
             return .init(title: "Notes", content: noteContent, items: rows("notes").compactMap { row in
                 guard let name = text(row["name"]) else { return nil }
-                guard case .string(let id)? = row["id"], nonEmpty(id) != nil, id != "missing value" else {
+                guard case .string(let id)? = row["id"], id.trimmedNonEmpty != nil, id != "missing value" else {
                     return .init(title: name, content: .object([
                         "status": .string("unavailable"), "reason": .string("note_identity_unavailable"),
                         "detail": .string("This Notes row has no recorded ID; it cannot be opened by title."),
@@ -170,10 +169,6 @@ extension AgentScreen {
             let itemKey = key(.record(tool: tool, input: identity, title: title)) ?? title
             let name = family
                 + ".\(try withNames(workspace: workspace, dataRoot) { book in try book.number("item." + family, id: itemKey, title: title) { [itemKey] } })"
-            func rowsOf(_ key: String) -> [[String: JSONValue]] {
-                guard case .array(let list)? = object[key] else { return [] }
-                return list.compactMap { if case .object(let row) = $0 { row } else { nil } }
-            }
             var verbs: [(String, String)] = [], keep: [String: AgentWorkspaceAction] = [:]
             func verb(_ word: String, _ about: String, _ action: AgentWorkspaceAction) {
                 guard AgentWorkspaceReadiness.allows(workspace: workspace, action) else { return }
@@ -182,11 +177,11 @@ extension AgentScreen {
             var header: [String] = [name], sections: [[String]] = []
             switch tool {
             case "mail.recent":
-                guard let row = rowsOf("messages").first else { return nil }
+                guard let row = JSONValue.objectArray(object["messages"]).first else { return nil }
                 let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
                 header += [who(text(row["sender"])), when(text(row["date"]), now: now)] + (row["unread"] == .bool(true) ? ["unread"] : [])
                 let (lines, used) = bodyLines(text(row["body"]) ?? "")
-                let start = int(row["body_offset"]) ?? 0, total = int(row["body_total"]) ?? 0
+                let start = row["body_offset"]?.strictInt ?? 0, total = row["body_total"]?.strictInt ?? 0
                 let body = tabled(lines, row["body_tables"])
                 sections = [section("SUBJECT", [clip(text(row["subject"]) ?? "(no subject)", 100)]), section("BODY", body.isEmpty ? ["(empty)"] : body)]
                 let attachments = mailAttachmentLines(row)
@@ -203,12 +198,12 @@ extension AgentScreen {
                     if let action = actions[word] { verb(word, about, action) }
                 }
             case "messages.recent":
-                guard let thread = rowsOf("threads").first else { return nil }
+                guard let thread = JSONValue.objectArray(object["threads"]).first else { return nil }
                 let people: [[String: JSONValue]] = if case .array(let list)? = thread["participants"] {
                     list.compactMap { if case .object(let row) = $0 { row } else { nil } }
                 } else { [] }
                 header += [clip(text(thread["name"]) ?? people.compactMap { text($0["name"]) ?? text($0["handle"]) }.joined(separator: ", "), 50)]
-                let talk = rowsOf("messages").suffix(10).map { row -> String in
+                let talk = JSONValue.objectArray(object["messages"]).suffix(10).map { row -> String in
                     let prefix = pad(when(text(row["date"]), now: now, short: true), 7)
                         + pad(row["from_me"] == .bool(true) ? "me" : clip(text(row["sender_name"]) ?? who(text(row["sender"])), 16), 12)
                     if text(row["text"]) == nil, row["text_status"] == .string("archived_text_not_decoded") {
@@ -231,25 +226,25 @@ extension AgentScreen {
                     verb("reply", "sends a reply now in this thread (text)", reply)
                 }
             case "notes.search":
-                guard let note = rowsOf("notes").first else { return nil }
+                guard let note = JSONValue.objectArray(object["notes"]).first else { return nil }
                 header += [text(note["folder"]), when(text(note["modified_at"]), now: now)].compactMap { $0 }.filter { !$0.isEmpty }
                 let body = if case .string(let value)? = note["body"] ?? note["body_preview"] { value } else { "" }
                 let (lines, used) = bodyLines(body)
-                let start = int(note["body_offset"]) ?? 0
+                let start = note["body_offset"]?.strictInt ?? 0
                 sections = [section("TITLE", [clip(text(note["name"]) ?? title, 100)]), section("TEXT", lines.isEmpty ? ["(no text on this page)"] : lines)]
-                if let total = int(object["total"]), total > 1 {
+                if let total = object["total"]?.strictInt, total > 1 {
                     sections.append(["\(total) notes have this title; this is one · notes.find (text) to pick another"])
                 }
                 if let id = text(note["id"]) {
                     let next = start + body.prefix(used).utf16.count
-                    if let total = int(note["body_total"]), next < total {
+                    if let total = note["body_total"]?.strictInt, next < total {
                         sections.append(["more text · \(name).more"])
                         keep[name + ".more"] = .open(.record(tool: "notes.search", input: ["id": .string(id), "body_offset": .int(Int64(next))], title: title))
                     }
                     verb("append", "add a line to it (text)", noteAppend(id: id, title: title))
                 }
             case "contacts_search":
-                guard let card = rowsOf("contacts").first else { return nil }
+                guard let card = JSONValue.objectArray(object["contacts"]).first else { return nil }
                 let phones = values(card["phones"]), emails = values(card["emails"])
                 header += [clip(text(card["name"]) ?? title, 40)] + (text(card["organizationName"]).map { [$0] } ?? [])
                 sections = [section("PHONES", phones.isEmpty ? ["none"] : phones.prefix(4).map { clip($0, 40) }),
@@ -389,18 +384,17 @@ extension AgentScreen {
 
     static func tabled(_ lines: [String], _ tables: JSONValue?) -> [String] {
         guard case .array(let list)? = tables else { return lines }
-        func norm(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
         func pair(_ label: String, _ value: String) -> String? { value.isEmpty ? nil : label.isEmpty ? value : label + ": " + value }
         var out = lines
         for case .object(let table) in list {
             guard case .array(let raw)? = table["rows"] else { continue }
             let rows: [[String]] = raw.compactMap { row in
                 guard case .array(let cells) = row else { return nil }
-                return cells.map { if case .string(let cell) = $0 { norm(cell) } else { "" } }
+                return cells.map { if case .string(let cell) = $0 { TextNormalization.collapseWhitespace(cell) } else { "" } }
             }
             guard rows.count >= 2, let width = rows.first?.count, width >= 2, rows.allSatisfy({ $0.count == width }) else { continue }
             let cells = rows.flatMap { $0.filter { !$0.isEmpty } }
-            let shown = out.map(norm)
+            let shown = out.map(TextNormalization.collapseWhitespace)
             guard cells.count >= 4, cells.count <= shown.count,
                   let at = (0...(shown.count - cells.count)).first(where: { Array(shown[$0..<($0 + cells.count)]) == cells }) else { continue }
             let head = rows[0], data = rows.dropFirst()
@@ -419,7 +413,7 @@ extension AgentScreen {
     }
 
     private static func who(_ sender: String?) -> String {
-        guard var name = nonEmpty(sender) else { return "unknown" }
+        guard var name = sender.trimmedNonEmpty else { return "unknown" }
         if let angle = name.firstIndex(of: "<"), angle > name.startIndex {
             name = name[..<angle].trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
         }
@@ -427,20 +421,18 @@ extension AgentScreen {
     }
 
     private static func when(_ raw: String?, now: Date, short: Bool = false) -> String {
-        guard let raw = nonEmpty(raw) else { return "" }
-        guard let at = date(raw) else { return clip(raw, 24) }
+        guard let raw = raw.trimmedNonEmpty else { return "" }
+        guard let at = NativeTimestampFormat.parseISO8601FractionalFirst(raw) else { return clip(raw, 24) }
         return short ? age(now.timeIntervalSince(at)) : friendly(at, now: now)
     }
 
     private static func text(_ value: JSONValue?) -> String? {
         switch value {
-        case .string(let text)?: return nonEmpty(text) == nil || text == "missing value" ? nil : text
+        case .string(let text)?: return text.trimmedNonEmpty == nil || text == "missing value" ? nil : text
         case .int(let n)?: return String(n)
         default: return nil
         }
     }
-
-    private static func int(_ value: JSONValue?) -> Int? { if case .int(let n)? = value { Int(n) } else { nil } }
 
     private static func values(_ value: JSONValue?, labels: Bool = true) -> [String] {
         guard case .array(let list)? = value else { return [] }

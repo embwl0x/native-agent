@@ -58,6 +58,13 @@ function step(state, event) {
 
 // Practice met again: keep the route as she works, so next time she runs it instead of working it out.
 function kept(practice) {
+  var have = practice.ability;
+  if (have && have.worked) return "You have worked this out by hand before (" + practice.route + "), and an ability of yours already " +
+    "makes these calls: authored." + have.id + " (" + have.description + "). What you did here stands; if this is that work, use authored." +
+    have.id + " the next time you do it instead of working it out by hand.";
+  if (have) return "You have worked this out by hand before (" + practice.route + "). An ability of yours makes these calls, authored." +
+    have.id + " (" + have.description + "), but its last run of them failed: " + have.failed + ". What you did here stands; if this is that work, " +
+    "repair it so the next time it does this: app ability.save under id " + have.id + " with code that makes the calls that worked here, in order.";
   var words = practice.hand ? "You have worked this out by hand before (" + practice.route + "). " +
     "Keep the route that works as one of your own abilities as part of this work, so next time you run it instead of working it out again: " +
     "app ability.save {id, description, code, params}, whose run(input) makes the calls that work, in order, " +

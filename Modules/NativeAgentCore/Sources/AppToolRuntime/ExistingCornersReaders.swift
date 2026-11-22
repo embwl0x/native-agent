@@ -1,6 +1,5 @@
 import Foundation
 import ChatToolParsing
-import CryptoKit
 import PersistenceCore
 import Senses
 import AgentWorkspace
@@ -35,247 +34,275 @@ extension ExistingCornersSourceProvider {
         chrome: (@Sendable () -> ChromeControlRuntime)? = nil
     ) {
         self.init(readMaterial: { corner, address, operation in
-            let turn = operation.turn
-            let passiveObservation = operation.passive
-            let (tool, input) = try ExistingCornersReaders.route(corner, address, turn: turn)
-            let readerInput = input.filter { !$0.key.hasPrefix("__sense_") }
-            if case .fileKind = corner, input["__sense_reader"] == .string("read") {
-                let preflight = try await rawRead("read", input.filter { !$0.key.hasPrefix("__") }, turn, .init(sense: operation))
-                if case .object(let fields) = preflight, fields["ok"] == .bool(false), fields["error"] != .string("unsupported_document_type") {
-                    throw SenseFailure(code: "source_unavailable", message: "The original document reader refused this read under the current policy.")
-                }
+            try await ExistingCornersSourceProvider.readCornerMaterial(corner, address: address, operation: operation,
+                rawRead: rawRead, dataRoot: dataRoot, chrome: chrome)
+        }, readPage: { corner, address, operation in
+            try await ExistingCornersSourceProvider.readCornerPage(corner, address: address, operation: operation,
+                rawRead: rawRead, dataRoot: dataRoot)
+        }, readChanges: { corner, address, operation in
+            try await ExistingCornersSourceProvider.observeCorner(corner, address: address, operation: operation,
+                rawRead: rawRead, dataRoot: dataRoot, chrome: chrome)
+        }, reportWatches: { await NativeChromeNews.shared.liveWatches() })
+    }
+
+    private typealias RawCornerRead = @Sendable (String, [String: JSONValue], Turn?, ExistingCornerReadOperation) async throws -> JSONValue
+
+    /// Read material from the selected source through the original tool chain.
+    private static func readCornerMaterial(_ corner: SenseCorner, address: String?, operation: SenseReadOperation,
+                                           rawRead: RawCornerRead, dataRoot: URL,
+                                           chrome: (@Sendable () -> ChromeControlRuntime)?) async throws -> SenseMaterial {
+        let turn = operation.turn
+        let passiveObservation = operation.passive
+        let (tool, input) = try ExistingCornersReaders.route(corner, address, turn: turn)
+        let readerInput = input.filter { !$0.key.hasPrefix("__sense_") }
+        if case .fileKind = corner, input["__sense_reader"] == .string("read") {
+            let preflight = try await rawRead("read", input.filter { !$0.key.hasPrefix("__") }, turn, .init(sense: operation))
+            if case .object(let fields) = preflight, fields["ok"] == .bool(false), fields["error"] != .string("unsupported_document_type") {
+                throw SenseFailure(code: "source_unavailable", message: "The original document reader refused this read under the current policy.")
             }
-            switch corner {
-            case .app:
-                var appInput = readerInput
-                appInput["__sense_app_material"] = .bool(true)
-                appInput["__sense_app_observation"] = passiveObservation
-                    ? .bool(true) : input["__sense_app_observation"]
-                let result = try await rawRead(tool, appInput, turn, .init(sense: operation, passiveObservation: passiveObservation))
-                try ExistingCornersReaders.requireReadable(result)
-                return .accessibility(result)
-            case .fileKind:
-                guard let path = ExistingCornersReaders.string(input["path"]) else {
-                    throw SenseFailure(code: "source_unavailable", message: "A file sense needs a path.")
-                }
-                // A document address explicitly requests today's MacDocumentRead extract; the ordinary file source is path + byte count.
-                if input["document"] == .bool(true) {
-                    try SenseSandboxProfile.requirePublicPath(path, dataRoot: dataRoot,
-                        personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
-                    let result = try await rawRead("read", readerInput, turn, .init(sense: operation))
-                    return .text(try ExistingCornersReaders.documentText(result))
-                }
-                let result = try await rawRead("read_file", readerInput, turn, .init(sense: operation, metadataOnly: true))
-                if case .object(let object) = result, object["ok"] == .bool(false),
-                   object["error_code"] == .string("file_not_found"), object["path_kind"] == .string("missing"),
-                   case .string(let resolved)? = object["path"] {
-                    guard URL(fileURLWithPath: resolved).standardizedFileURL.path
-                        == URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(path)).standardizedFileURL.path else {
-                        throw SenseFailure(code: "source_unavailable", message: "File observation must retain its requested path.")
-                    }
-                    try SenseSandboxProfile.requirePublicPath(resolved, dataRoot: dataRoot,
-                        personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
-                    throw SenseFailure(code: "source_absent", message: "Watched path is absent: \(resolved)")
-                }
-                guard case .object(let object) = result, object["ok"] == .bool(true),
-                      case .string(let resolved)? = object["path"], case .int(let bytes)? = object["bytes"],
-                      let count = Int(exactly: bytes), count >= 0 else {
-                    throw SenseFailure(code: "source_unavailable", message: try ExistingCornersReaders.outputText(result))
+        }
+        switch corner {
+        case .app:
+            var appInput = readerInput
+            appInput["__sense_app_material"] = .bool(true)
+            appInput["__sense_app_observation"] = passiveObservation
+                ? .bool(true) : input["__sense_app_observation"]
+            let result = try await rawRead(tool, appInput, turn, .init(sense: operation, passiveObservation: passiveObservation))
+            try ExistingCornersReaders.requireReadable(result)
+            return .accessibility(result)
+        case .fileKind:
+            guard let path = input["path"]?.nonemptyString else {
+                throw SenseFailure(code: "source_unavailable", message: "A file sense needs a path.")
+            }
+            // A document address explicitly requests today's MacDocumentRead extract; the ordinary file source is path + byte count.
+            if input["document"] == .bool(true) {
+                try SenseSandboxProfile.requirePublicPath(path, dataRoot: dataRoot,
+                    personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
+                let result = try await rawRead("read", readerInput, turn, .init(sense: operation))
+                return .text(try ExistingCornersReaders.documentText(result))
+            }
+            let result = try await rawRead("read_file", readerInput, turn, .init(sense: operation, metadataOnly: true))
+            if case .object(let object) = result, object["ok"] == .bool(false),
+               object["error_code"] == .string("file_not_found"), object["path_kind"] == .string("missing"),
+               case .string(let resolved)? = object["path"] {
+                guard URL(fileURLWithPath: resolved).standardizedFileURL.path
+                    == URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(path)).standardizedFileURL.path else {
+                    throw SenseFailure(code: "source_unavailable", message: "File observation must retain its requested path.")
                 }
                 try SenseSandboxProfile.requirePublicPath(resolved, dataRoot: dataRoot,
                     personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
-                return .file(path: resolved, bytes: count)
-            case .site(let host):
-                if tool == "read_page" {
-                    let fetched = try await rawRead(tool, readerInput, turn, .init(sense: operation))
-                    try ExistingCornersReaders.requireReadable(fetched)
-                    guard case .object(let fields) = fetched, let requestedURL = ExistingCornersReaders.string(fields["url"]) else {
-                        throw SenseFailure(code: "source_unavailable", message: "The web reader did not return its fetched document.")
+                throw SenseFailure(code: "source_absent", message: "Watched path is absent: \(resolved)")
+            }
+            guard case .object(let object) = result, object["ok"] == .bool(true),
+                  case .string(let resolved)? = object["path"], case .int(let bytes)? = object["bytes"],
+                  let count = Int(exactly: bytes), count >= 0 else {
+                throw SenseFailure(code: "source_unavailable", message: try ExistingCornersReaders.outputText(result))
+            }
+            try SenseSandboxProfile.requirePublicPath(resolved, dataRoot: dataRoot,
+                personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
+            return .file(path: resolved, bytes: count)
+        case .site(let host):
+            if tool == "read_page" {
+                let fetched = try await rawRead(tool, readerInput, turn, .init(sense: operation))
+                try ExistingCornersReaders.requireReadable(fetched)
+                guard case .object(let fields) = fetched, let requestedURL = fields["url"]?.nonemptyString else {
+                    throw SenseFailure(code: "source_unavailable", message: "The web reader did not return its fetched document.")
+                }
+                let observedURL: String
+                if fields["text_reader"] == .string("browser") {
+                    guard fields["page"] != nil, fields["receipt"]?.objectValue?["action"] == .string("navigate") else {
+                        throw SenseFailure(code: "source_unavailable", message: "The rendered web reader supplied no page and navigation receipt.")
                     }
-                    let observedURL: String
-                    if fields["text_reader"] == .string("browser") {
-                        guard fields["page"] != nil, fields["receipt"]?.objectValue?["action"] == .string("navigate") else {
-                            throw SenseFailure(code: "source_unavailable", message: "The rendered web reader supplied no page and navigation receipt.")
-                        }
-                        observedURL = requestedURL
-                    } else {
-                        guard case .object(let coverage)? = fields["coverage"] else {
-                            throw SenseFailure(code: "source_unavailable", message: "The HTTP reader supplied no extraction coverage.")
-                        }
-                        observedURL = ExistingCornersReaders.string(coverage["final_url"]) ?? requestedURL
+                    observedURL = requestedURL
+                } else {
+                    guard case .object(let coverage)? = fields["coverage"] else {
+                        throw SenseFailure(code: "source_unavailable", message: "The HTTP reader supplied no extraction coverage.")
                     }
-                    guard host == "*" || URL(string: observedURL)?.host?.lowercased() == host.lowercased() else {
-                        throw SenseFailure(code: "source_unavailable", message: "The fetched document does not match \(corner.key).")
-                    }
-                    return .pageSnapshot(fetched)
+                    observedURL = coverage["final_url"]?.nonemptyString ?? requestedURL
                 }
-                // The shared reader owns default limits. An existing-page read never navigates a tab.
-                var snapshotInput = readerInput
-                guard let chrome else { throw SenseFailure(code: "source_unavailable", message: "The Chrome source is not installed.") }
-                let address: [String: JSONValue]
-                do {
-                    address = try await chrome().existingPageAddress(host: host,
-                        tabID: ExistingCornersReaders.integer(snapshotInput["tab_id"]), context: .init(dataRoot: dataRoot, deadline: operation.deadline,
-                            observationMode: operation.passive ? .passive : .interactive))
-                } catch let error as ChromeControlRuntimeError {
-                    throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
+                guard host == "*" || URL(string: observedURL)?.host?.lowercased() == host.lowercased() else {
+                    throw SenseFailure(code: "source_unavailable", message: "The fetched document does not match \(corner.key).")
                 }
-                snapshotInput.merge(address) { supplied, _ in supplied }
-                let readInput = snapshotInput
-                let snapshot = try await rawRead(tool, readInput, turn, .init(sense: operation, lookSource: "app"))
-                guard case .object(let page) = snapshot,
-                      ExistingCornersReaders.string(page["snapshotId"]) != nil,
-                      case .array? = page["nodes"] else {
-                    throw SenseFailure(code: "source_unavailable", message: try ExistingCornersReaders.outputText(snapshot))
-                }
-                if host != "*", URL(string: ExistingCornersReaders.string(page["url"]) ?? "")?.host?.lowercased() != host.lowercased() {
-                    throw SenseFailure(code: "source_unavailable", message: "The Chrome snapshot does not match \(corner.key).")
-                }
-                return .pageSnapshot(snapshot)
-            case .stream(let id) where id == "mac.read":
-                return .text(try ExistingCornersReaders.documentText(await rawRead(tool, readerInput, turn, .init(sense: operation))))
-            case .stream:
-                return .text(try ExistingCornersReaders.outputText(await rawRead(tool, readerInput, turn, .init(sense: operation))))
-            case .need:
-                throw SenseFailure(code: "unsupported", message: "There is no existing reader for \(corner.key).")
+                return .pageSnapshot(fetched)
             }
-        }, readPage: { corner, address, operation in
-            let turn = operation.turn
-            let (tool, input) = try ExistingCornersReaders.route(corner, address, turn: turn)
-            let result = try await rawRead(tool, input.filter { !$0.key.hasPrefix("__sense_") }, turn, .init(sense: operation))
-            if case .app = corner, let page = try SenseScreenThings.page(in: result) {
-                return try SenseNativePages.window(page, arguments: input)
+            // The shared reader owns default limits. An existing-page read never navigates a tab.
+            var snapshotInput = readerInput
+            guard let chrome else { throw SenseFailure(code: "source_unavailable", message: "The Chrome source is not installed.") }
+            let address: [String: JSONValue]
+            do {
+                address = try await chrome().existingPageAddress(host: host,
+                    tabID: snapshotInput["tab_id"]?.strictInt64, context: .init(dataRoot: dataRoot, deadline: operation.deadline,
+                        observationMode: operation.passive ? .passive : .interactive))
+            } catch let error as ChromeControlRuntimeError {
+                throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
             }
-            // Preserve refusal and byte-window envelopes; the tool-result pager alone owns overflow.
-            let text = try ExistingCornersReaders.outputText(result)
-            let resolvedAddress = address ?? corner.key
-            var things: [NativeThing] = []
-            if case .site = corner,
-               let page = ChromePageMirror.page(tab: ExistingCornersReaders.integer(input["tab_id"]),
-                    dataRoot: dataRoot, session: turn?.verifiedSessionID), text.hasPrefix(page.text) {
-                things = page.rows.map {
-                    NativeThing(name: $0.label, kind: $0.role, address: page.url + "#" + $0.node)
-                }
+            snapshotInput.merge(address) { supplied, _ in supplied }
+            let readInput = snapshotInput
+            let snapshot = try await rawRead(tool, readInput, turn, .init(sense: operation, lookSource: "app"))
+            guard case .object(let page) = snapshot,
+                  page["snapshotId"]?.nonemptyString != nil,
+                  case .array? = page["nodes"] else {
+                throw SenseFailure(code: "source_unavailable", message: try ExistingCornersReaders.outputText(snapshot))
             }
-            if case .object(let object) = result {
-                if case .object(let detail)? = object["detail"],
-                   case .object(let controls)? = detail["controls"],
-                   case .array(let rows)? = controls["affordances"] {
-                    things = rows.compactMap { row in
-                        guard case .object(let fields) = row,
-                              let name = ExistingCornersReaders.string(fields["name"] ?? fields["label"]),
-                              let handle = ExistingCornersReaders.string(fields["handle"]) else { return nil }
-                        // These are pointers for the existing mac.act route; native adapters do not introduce a new action path.
-                        return NativeThing(name: name, kind: ExistingCornersReaders.string(fields["role"]) ?? "control",
-                            address: resolvedAddress + "#" + handle)
-                    }
-                }
+            if host != "*", URL(string: page["url"]?.nonemptyString ?? "")?.host?.lowercased() != host.lowercased() {
+                throw SenseFailure(code: "source_unavailable", message: "The Chrome snapshot does not match \(corner.key).")
             }
-            if case .app = corner { things = try SenseScreenThings.things(in: result, corner: corner) }
-            if things.isEmpty {
-                things = [NativeThing(name: resolvedAddress, kind: "source", address: resolvedAddress)]
+            return .pageSnapshot(snapshot)
+        case .stream(let id) where id == "mac.read":
+            return .text(try ExistingCornersReaders.documentText(await rawRead(tool, readerInput, turn, .init(sense: operation))))
+        case .stream:
+            return .text(try ExistingCornersReaders.outputText(await rawRead(tool, readerInput, turn, .init(sense: operation))))
+        case .need:
+            throw SenseFailure(code: "unsupported", message: "There is no existing reader for \(corner.key).")
+        }
+    }
+
+    /// Bind the page and its handles to the source that was read.
+    private static func readCornerPage(_ corner: SenseCorner, address: String?, operation: SenseReadOperation,
+                                       rawRead: RawCornerRead, dataRoot: URL) async throws -> NativePage {
+        let turn = operation.turn
+        let (tool, input) = try ExistingCornersReaders.route(corner, address, turn: turn)
+        let result = try await rawRead(tool, input.filter { !$0.key.hasPrefix("__sense_") }, turn, .init(sense: operation))
+        if case .app = corner, let page = try SenseScreenThings.page(in: result) {
+            return try SenseNativePages.window(page, arguments: input)
+        }
+        // Preserve refusal and byte-window envelopes; the tool-result pager alone owns overflow.
+        let text = try ExistingCornersReaders.outputText(result)
+        let resolvedAddress = address ?? corner.key
+        var things: [NativeThing] = []
+        if case .site = corner,
+           let page = ChromePageMirror.page(tab: input["tab_id"]?.strictInt64,
+                dataRoot: dataRoot, session: turn?.verifiedSessionID), text.hasPrefix(page.text) {
+            things = page.rows.map {
+                NativeThing(name: $0.label, kind: $0.role, address: page.url + "#" + $0.node)
             }
-            var more: String?
-            if case .object(let object) = result, case .object(let next)? = object["next"] {
-                more = try JSONValue.object(next).serialize(pretty: false)
-            }
-            var windowInput = input
-            var pageCorner = corner
-            if case .fileKind(let kind) = corner {
-                if case .object(let fields) = result, windowInput["version"] == nil, let version = fields["version"] {
-                    windowInput["version"] = version
-                }
-                if kind == "*", let path = ExistingCornersReaders.string(input["path"]) {
-                    pageCorner = .fileKind(URL(fileURLWithPath: path).pathExtension.lowercased())
+        }
+        if case .object(let object) = result {
+            if case .object(let detail)? = object["detail"],
+               case .object(let controls)? = detail["controls"],
+               case .array(let rows)? = controls["affordances"] {
+                things = rows.compactMap { row in
+                    guard case .object(let fields) = row,
+                          let name = (fields["name"] ?? fields["label"])?.nonemptyString,
+                          let handle = fields["handle"]?.nonemptyString else { return nil }
+                    // These are pointers for the existing mac.act route; native adapters do not introduce a new action path.
+                    return NativeThing(name: name, kind: fields["role"]?.nonemptyString ?? "control",
+                        address: resolvedAddress + "#" + handle)
                 }
             }
-            if case .app("*") = corner, let app = ExistingCornersReaders.string(input["app"]),
-               case .matched(let target) = MacBackgroundSight.resolve(app, among: defaultMacAXElementSource().runningApps()),
-               let bundle = target.bundleIdentifier { pageCorner = .app(bundleID: bundle) }
-            if case .site("*") = corner, case .object(let fields) = result,
-               let url = ExistingCornersReaders.string(fields["url"]), let host = URL(string: url)?.host {
-                pageCorner = .site(host: host.lowercased())
+        }
+        if case .app = corner { things = try SenseScreenThings.things(in: result, corner: corner) }
+        if things.isEmpty {
+            things = [NativeThing(name: resolvedAddress, kind: "source", address: resolvedAddress)]
+        }
+        var more: String?
+        if case .object(let object) = result, case .object(let next)? = object["next"] {
+            more = try JSONValue.object(next).serialize(pretty: false)
+        }
+        var windowInput = input
+        var pageCorner = corner
+        if case .fileKind(let kind) = corner {
+            if case .object(let fields) = result, windowInput["version"] == nil, let version = fields["version"] {
+                windowInput["version"] = version
             }
-            return try SenseNativePages.window(NativePage(corner: pageCorner, address: resolvedAddress,
-                title: pageCorner.key, text: text, things: things, more: more), arguments: windowInput)
-        }, readChanges: { corner, address, operation in
-            let operation = operation.observing()
-            let turn = operation.turn
-            let context = MacOperationContext(dataRoot: dataRoot, observationMode: .passive)
-            if case .site(let host) = corner {
-                let (_, input) = try ExistingCornersReaders.route(corner, address, turn: turn)
-                guard input["__sense_action"] != .string("web.read") else {
-                    throw SenseFailure(code: "unsupported", message: "A fetched web document has no event-backed live source; no Chrome page was substituted.")
-                }
-                guard let chrome else {
-                    throw SenseFailure(code: "source_unavailable", message: "The Chrome change source is not installed.")
-                }
-                let tab: Int64
-                let changes: AsyncThrowingStream<JSONValue, Error>
-                do {
-                    let address = try await chrome().existingPageAddress(host: host, tabID: ExistingCornersReaders.integer(input["tab_id"]), context: context)
-                    guard case .int(let resolvedTab)? = address["tab_id"] else {
-                        throw SenseFailure(code: "source_unavailable", message: "The site has no existing Chrome tab.")
-                    }
-                    tab = resolvedTab
-                    changes = try await chrome().pageChanges(host: host, tabID: tab, context: context)
-                } catch let error as ChromeControlRuntimeError {
-                    throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
-                }
-                let pair = AsyncStream<SenseSourceChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
-                let task = Task.detached(priority: .utility) {
-                    defer { pair.continuation.finish() }
-                    func report(_ reason: String) async {
-                        await chrome().recordCaptureError(reason, tabID: tab)
-                    }
-                    do {
-                        for try await snapshot in changes {
-                            guard !Task.isCancelled else { return }
-                            if case .object(let fields) = snapshot, case .string(let reason)? = fields["__sense_change_failure"] {
-                                await report(reason)
-                                continue
-                            }
-                            pair.continuation.yield(.changed(.pageSnapshot(snapshot)))
-                        }
-                    } catch {
-                        guard !Task.isCancelled else { return }
-                        await report(error.localizedDescription)
-                    }
-                }
-                pair.continuation.onTermination = { _ in task.cancel() }
-                return pair.stream
+            if kind == "*", let path = input["path"]?.nonemptyString {
+                pageCorner = .fileKind(URL(fileURLWithPath: path).pathExtension.lowercased())
             }
-            guard case .app(let bundleID) = corner, bundleID != "*" else {
-                throw SenseFailure(code: "source_unavailable", message: "App observation needs a concrete already-running app.")
+        }
+        if case .app("*") = corner, let app = input["app"]?.nonemptyString,
+           case .matched(let target) = MacBackgroundSight.resolve(app, among: defaultMacAXElementSource().runningApps()),
+           let bundle = target.bundleIdentifier { pageCorner = .app(bundleID: bundle) }
+        if case .site("*") = corner, case .object(let fields) = result,
+           let url = fields["url"]?.nonemptyString, let host = URL(string: url)?.host {
+            pageCorner = .site(host: host.lowercased())
+        }
+        return try SenseNativePages.window(NativePage(corner: pageCorner, address: resolvedAddress,
+            title: pageCorner.key, text: text, things: things, more: more), arguments: windowInput)
+    }
+
+    /// Admit an event-backed site or app observation.
+    private static func observeCorner(_ corner: SenseCorner, address: String?, operation: SenseReadOperation,
+                                      rawRead: @escaping RawCornerRead, dataRoot: URL,
+                                      chrome: (@Sendable () -> ChromeControlRuntime)?) async throws -> AsyncStream<SenseSourceChange> {
+        let operation = operation.observing()
+        let turn = operation.turn
+        let context = MacOperationContext(dataRoot: dataRoot, observationMode: .passive)
+        if case .site(let host) = corner {
+            let (_, input) = try ExistingCornersReaders.route(corner, address, turn: turn)
+            guard input["__sense_action"] != .string("web.read") else {
+                throw SenseFailure(code: "unsupported", message: "A fetched web document has no event-backed live source; no Chrome page was substituted.")
             }
-            let provider = ExistingCornersSourceProvider(rawRead: rawRead, dataRoot: dataRoot, chrome: chrome)
-            // Admit observation under today's policy; every change read re-enters that policy without inheriting the original turn's authority.
-            let (_, route) = try ExistingCornersReaders.route(corner, address, turn: turn)
-            let observationAddress = try JSONValue.object(route.merging(["__sense_app_observation": .bool(true)]) { _, new in new }).serialize(pretty: false)
-            _ = try await provider.material(for: corner, address: observationAddress, operation: operation)
-            let events = try MacAppSourceEvents(bundleID: bundleID, context: context)
+            guard let chrome else {
+                throw SenseFailure(code: "source_unavailable", message: "The Chrome change source is not installed.")
+            }
+            let tab: Int64
+            let changes: AsyncThrowingStream<JSONValue, Error>
+            do {
+                let address = try await chrome().existingPageAddress(host: host, tabID: input["tab_id"]?.strictInt64, context: context)
+                guard case .int(let resolvedTab)? = address["tab_id"] else {
+                    throw SenseFailure(code: "source_unavailable", message: "The site has no existing Chrome tab.")
+                }
+                tab = resolvedTab
+                changes = try await chrome().pageChanges(host: host, tabID: tab, context: context)
+            } catch let error as ChromeControlRuntimeError {
+                throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
+            }
             let pair = AsyncStream<SenseSourceChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
             let task = Task.detached(priority: .utility) {
-                defer { events.cancel(); pair.continuation.finish() }
+                defer { pair.continuation.finish() }
                 do {
-                    for try await _ in events.stream {
-                        try Task.checkCancellation()
-                        let material = try await provider.material(for: corner, address: observationAddress, operation: operation)
-                        guard case .accessibility(.object(var fields)) = material else {
-                            throw SenseFailure(code: "source_unavailable", message: "The app reader returned no accessibility object.")
+                    for try await snapshot in changes {
+                        guard !Task.isCancelled else { return }
+                        if case .object(let fields) = snapshot, case .string(let reason)? = fields["__sense_change_failure"] {
+                            await reportChromeObservationFailure(reason, chrome: chrome, tab: tab)
+                            continue
                         }
-                        fields["ax_watch_coverage"] = events.coverage
-                        pair.continuation.yield(.changed(.accessibility(.object(fields))))
+                        pair.continuation.yield(.changed(.pageSnapshot(snapshot)))
                     }
                 } catch {
                     guard !Task.isCancelled else { return }
-                    await ExistingCornersSourceProvider.postWatchFailure(error, corner: corner,
-                        address: address ?? corner.key, observationID: nil, what: "App")
+                    await reportChromeObservationFailure(error.localizedDescription, chrome: chrome, tab: tab)
                 }
             }
-            pair.continuation.onTermination = { _ in task.cancel(); events.cancel() }
+            pair.continuation.onTermination = { _ in task.cancel() }
             return pair.stream
-        }, reportWatches: { await NativeChromeNews.shared.liveWatches() })
+        }
+        guard case .app(let bundleID) = corner, bundleID != "*" else {
+            throw SenseFailure(code: "source_unavailable", message: "App observation needs a concrete already-running app.")
+        }
+        let provider = ExistingCornersSourceProvider(rawRead: rawRead, dataRoot: dataRoot, chrome: chrome)
+        // Admit observation under today's policy; every change read re-enters that policy without inheriting the original turn's authority.
+        let (_, route) = try ExistingCornersReaders.route(corner, address, turn: turn)
+        let observationAddress = try JSONValue.object(route.merging(["__sense_app_observation": .bool(true)]) { _, new in new }).serialize(pretty: false)
+        _ = try await provider.material(for: corner, address: observationAddress, operation: operation)
+        let events = try MacAppSourceEvents(bundleID: bundleID, context: context)
+        let pair = AsyncStream<SenseSourceChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let task = Task.detached(priority: .utility) {
+            defer { events.cancel(); pair.continuation.finish() }
+            do {
+                for try await _ in events.stream {
+                    try Task.checkCancellation()
+                    let material = try await provider.material(for: corner, address: observationAddress, operation: operation)
+                    guard case .accessibility(.object(var fields)) = material else {
+                        throw SenseFailure(code: "source_unavailable", message: "The app reader returned no accessibility object.")
+                    }
+                    fields["ax_watch_coverage"] = events.coverage
+                    pair.continuation.yield(.changed(.accessibility(.object(fields))))
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                await ExistingCornersSourceProvider.postWatchFailure(error, corner: corner,
+                    address: address ?? corner.key, observationID: nil, what: "App")
+            }
+        }
+        pair.continuation.onTermination = { _ in task.cancel(); events.cancel() }
+        return pair.stream
+    }
+
+    /// Record a capture failure against the held Chrome tab.
+    private static func reportChromeObservationFailure(_ reason: String, chrome: @Sendable () -> ChromeControlRuntime,
+                                                        tab: Int64) async {
+        await chrome().recordCaptureError(reason, tabID: tab)
     }
 }
 
@@ -373,7 +400,7 @@ actor NativeChromeNews {
         let id = UUID()
         do {
             let changes = try await chrome.pageChanges(host: "*", tabID: tab, context: context)
-            let host = URL(string: ExistingCornersReaders.string(fields["url"]) ?? "")?.host ?? "*"
+            let host = URL(string: fields["url"]?.nonemptyString ?? "")?.host ?? "*"
             let record = try await SenseDoor.selectedRecord(for: .site(host: host))
             let task = Task { [weak self] in
                 do {
@@ -392,7 +419,7 @@ actor NativeChromeNews {
                 return
             }
             watches[tab] = Watch(id: id, task: task, version: Self.version(.object(fields)) ?? "",
-                url: ExistingCornersReaders.string(fields["url"]) ?? "", view: Self.view(fields), snapshot: fields, chrome: chrome, senseVersion: record
+                url: fields["url"]?.nonemptyString ?? "", view: Self.view(fields), snapshot: fields, chrome: chrome, senseVersion: record
                     .version)
             NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil)
         } catch { await chrome.recordCaptureError(error.localizedDescription, tabID: tab) }
@@ -401,7 +428,7 @@ actor NativeChromeNews {
     private static func version(_ snapshot: JSONValue) -> String? {
         guard case .object(let fields) = snapshot, case .string? = fields["snapshotId"],
               case .array? = fields["nodes"], let version = try? ChromePageText.contentVersion(fields) else { return nil }
-        let document = ExistingCornersReaders.string(fields["documentId"]) ?? ""
+        let document = fields["documentId"]?.nonemptyString ?? ""
         return document + ":" + version
     }
 
@@ -467,7 +494,7 @@ actor NativeChromeNews {
         }
         guard watches[tab]?.id == id else { return false }
         watches[tab]?.version = version
-        watches[tab]?.url = ExistingCornersReaders.string(snapshot["url"]) ?? ""
+        watches[tab]?.url = snapshot["url"]?.nonemptyString ?? ""
         watches[tab]?.view = Self.view(snapshot)
         watches[tab]?.snapshot = snapshot
         watches[tab]?.pendingNews = nil
@@ -563,9 +590,6 @@ actor NativeChromeNews {
 }
 
 private enum ExistingCornersReaders {
-    static func integer(_ value: JSONValue?) -> Int64? {
-        if case .int(let number)? = value { return number }; return nil
-    }
     static func route(_ corner: SenseCorner, _ address: String?, turn: Turn?) throws -> (String, [String: JSONValue]) {
         var input: [String: JSONValue] = ["raw": .bool(true)]
         // Plain addresses are paths/apps/URLs; JSON retains the raw route's arguments exactly.
@@ -583,7 +607,7 @@ private enum ExistingCornersReaders {
             return ("screen", input)
         case .fileKind:
             if input["path"] == nil, let address, !address.hasPrefix("{") { input["path"] = .string(address) }
-            guard string(input["path"]) != nil else {
+            guard input["path"]?.nonemptyString != nil else {
                 throw SenseFailure(code: "source_unavailable", message: "A file sense needs a path.")
             }
             return (input["document"] == .bool(true) ? "read" : "read_file", input)
@@ -594,7 +618,7 @@ private enum ExistingCornersReaders {
                     """)
             }
             if input["__sense_action"] == .string("web.read") {
-                guard string(input["url"]) != nil else {
+                guard input["url"]?.nonemptyString != nil else {
                     throw SenseFailure(code: "source_unavailable", message: "A fetched site read needs its requested URL.")
                 }
                 return ("read_page", input)
@@ -611,7 +635,7 @@ private enum ExistingCornersReaders {
             return ("browser.read_text", input)
         case .stream(let id) where id == "connectors":
             if address == nil { return ("app", ["page": .string("connectors")]) }
-            guard let actionID = string(input.removeValue(forKey: "action")),
+            guard let actionID = input.removeValue(forKey: "action")?.nonemptyString,
                   let action = try AppActions.action(actionID, turn: turn), action.read,
                   connectorPages.contains(action.page), !action.tool.isEmpty else {
                 throw SenseFailure(code: "unsupported", message: "A connector source needs an existing read action.")
@@ -632,11 +656,6 @@ private enum ExistingCornersReaders {
     }
 
     static let connectorPages: Set<String> = ["mail", "calendar", "reminders", "notes", "contacts", "messages", "music"]
-
-    static func string(_ value: JSONValue?) -> String? {
-        if case .string(let text)? = value, !text.isEmpty { return text }
-        return nil
-    }
 
     static func requireReadable(_ result: JSONValue) throws {
         let reply = ToolResult(result)

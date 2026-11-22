@@ -22,7 +22,8 @@ read-only text.
 
 | Area | Current source contract |
 |---|---|
-| Releases | Mac v0.6.9 is the current public release as of 2026-10-20 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
+| Releases | Mac v0.6.20 is the current public release as of 2026-11-19 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through the App Store and TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
+| iPhone link | Signed CloudKit records. Each side rings its bell (`chat.bell`, its newest sent record names) and the reader fetches bell and records by ID, so a message lands in seconds without waiting on CloudKit's query index; the query stays the backstop. See [the bell](docs/mobile_companion.md). |
 | Agent interface | The agent's one door, `app`, is always on. `app {}` is home; `page`, `item`, `find`, `action` and JavaScriptCore `script` reach capabilities through `AppActionRegistry`. |
 | Discovery | Pages and actions arrive in tool results. Argument binding and refused-call advice follow [the one-door contract](docs/ONE_DOOR.md). |
 | macOS grants | Owned permission remedies automatically file `permissions.request` through the composed tool return; already-allowed access skips the card and an open card for the capability is reused. Results retain the original outcome and name the card for the person. Only the person's foreground Allow tap invokes macOS acquisition. Card and Settings acquisition await activation or cancellation, release observation on every exit, and request no grant while inactive or cancelled; Settings retains acquisition problems as failures. See [the one-door contract](docs/ONE_DOOR.md). |
@@ -36,7 +37,7 @@ read-only text.
 | Mac face feed | Transcript paragraphs, page faces and native readouts use Shared slots; see [feed](docs/designs/separate-face.md). |
 | Shared page renderer | Stage 7 source uses image, preview and web leaves in shared Make/Sense pages and removes unused Alive parts and copied body drawing. The renderer owns the main window, detached chats, Shotgun, protected entry and page bitmaps; body settings, engine/tool hosts, permission guidance readings and paragraph preparation remain. Stage 5–7 installed acceptance and performance comparison are pending. [Contract](docs/skill_manifest_spec.md), [stage proof](docs/designs/one-renderer.md#stage-7-leaves-and-what-is-left). |
 | Trust | Full Mac grants autonomy without a timer. macOS privacy permission resets still ask the owner. An untrusted agent's card offers Just this for one call or For this task for the run; a read steers nothing. Agents enabled in Trust → Connected agents carry the owner's authority on authenticated turns; ordinary Trust and domain checks remain. |
-| Arrivals | Any door's typed arrival joins through `TurnAdmission.run`. During generation the selected turn program's optional CPU `hear` may cut the round: prose stays, every proposed call is discarded, and the next request reads arrivals. Missing or failed hearing keeps the boundary read; failure owes repair. Reservations extend before first text, and joined readings are checkpointed for relaunch before their old checkpoints retire. Readable, untainted words from the person also withdraw unstarted proposals and slots, including batch steps. Running calls retain receipts; Stop cancels at once. One reply keeps prose in streamed order and answers joined arrivals; their doors post nothing. Unread arrivals run through their own doors. Contract: [Anatomy of a turn](docs/ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn). Source implemented; installed proof and the agent's authored `hear` remain pending. |
+| Arrivals | Doors submit typed arrivals through `TurnAdmission.run`. During generation the selected turn program's optional CPU `hear` may cut the round for an eligible arrival: prose stays, every proposed call is discarded, and the next request reads arrivals. Missing or failed hearing keeps the boundary read; failure owes repair. Reservations extend before first text, and joined readings are checkpointed for relaunch before their old checkpoints retire. Readable, untainted words from the person also withdraw unstarted proposals and slots, including batch steps. Running calls retain receipts; Stop cancels at once. One reply keeps prose in streamed order and answers joined arrivals; their doors post nothing. Unread arrivals run through their own doors. Contract: [Anatomy of a turn](docs/ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn). Source implemented; installed proof and the agent's authored `hear` remain pending. |
 
 Meta's API-key route offers Standard Muse Wonder 1.0 and Muse Spark 1.3 through
 the shared Anthropic-format Messages adapter with Bearer auth and effort controls.
@@ -89,7 +90,7 @@ failures. Retired tool names run nothing; there is nothing to load or unload.
   settlement. Phone reads Mac-published movement through the activity snapshot.
   Source implemented; build, install and the bounded cross-room navigation,
   cancellation, privacy and settlement observations remain with the lead.
-- The opt-in copied window carries viewport and checked visible-reply receipts,
+- The renderer window carries viewport and checked visible-reply receipts,
   acknowledges chat selection without reading its message file, and opens a
   cold conversation with a backward read of its ending rows. Earlier messages
   load when the ending document fits the reading area, on upward reading toward
@@ -191,7 +192,7 @@ failures. Retired tool names run nothing; there is nothing to load or unload.
   Inbox and attachment work; acknowledged scripts leave the press's pending
   packets. Cached-switch latency still requires installed measurement.
   Dock reopen, the menu-bar Open control
-  and the summon shortcut also reopen the opt-in preview. A replacement child
+  and the summon shortcut also reopen the window. A replacement child
   waits for process exit and the previous connection's release before attaching,
   including when its feed task owns closure independently of the pipe reader.
   Cross-process pointer input has acknowledged preparation, routing and release;

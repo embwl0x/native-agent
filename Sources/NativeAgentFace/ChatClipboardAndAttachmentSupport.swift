@@ -84,7 +84,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
                 showToast(result.phase == .cancelled ? "Dictation cancelled" : "No speech detected")
                 return result.phase != .cancelled
             }
-            draft.edit(voiceDraft(base: base(), transcript: final))
+            draft.edit(ChatAttachmentTypeResolver.voiceDraft(base: base(), transcript: final))
             if let attachment = result.attachment { attach(attachment) }
             return true
         } catch {
@@ -92,14 +92,6 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
             showToast(error.localizedDescription)
             return false
         }
-    }
-
-    static func voiceDraft(base: String, transcript: String) -> String {
-        let base = base.trimmingCharacters(in: .whitespacesAndNewlines)
-        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if base.isEmpty { return spoken }
-        if spoken.isEmpty { return base }
-        return base + " " + spoken
     }
 
     /// A transfer's reply contains the validated resource; no renderer path grants body authority.
@@ -221,14 +213,16 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
         guard let kind = resolveType(url.pathExtension.lowercased()) else { showToast("Unsupported file type"); return }
         Task {
             do {
-                let grant = try await Task.detached(priority: .userInitiated) {
+                // The body verifies the file is the one chosen by its size, so the grant carries the size read when it was made.
+                let (grant, size) = try await Task.detached(priority: .userInitiated) {
                     let held = url.startAccessingSecurityScopedResource()
                     defer { if held { url.stopAccessingSecurityScopedResource() } }
-                    return ResourceGrant(id: UUID(), name: url.lastPathComponent,
-                                         bookmark: try url.bookmarkData(), writable: false)
+                    let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                    return (ResourceGrant(id: UUID(), name: url.lastPathComponent,
+                                          bookmark: try url.bookmarkData(), writable: false), size)
                 }.value
                 let attachment = FaceAttachment(id: UUID().uuidString, name: grant.name, mimeType: kind.mime,
-                                                byteCount: 0, resource: grant, bytes: nil)
+                                                byteCount: size, resource: grant, bytes: nil)
                 let admitted = try await ingest(attachment, appModel: appModel, session: session, showWarning: showToast)
                 guard canAttach() else { return }
                 appModel.chatPendingAttachments[session, default: []].append(admitted)

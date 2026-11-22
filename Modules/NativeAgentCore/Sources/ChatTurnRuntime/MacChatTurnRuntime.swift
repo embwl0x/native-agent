@@ -18,7 +18,9 @@ public final class MacChatTurnRuntime {
         let stop = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: sessionID, runId: turn.run, turnId: turnID)
         defer { ChatCancelFlag.finish(stop) }
         try Task.checkCancellation()
-        return try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID, arrival: arrival, turn: turn, operation: operation)
+        // A Mac arrival is already saved (row and checkpoint), so a full queue is a wait, never a refusal that strands it.
+        return try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID, arrival: arrival, waitForCapacity: true,
+                                                  turn: turn, operation: operation)
     }
 
     /// A regenerate replaces an answer, so it never joins another turn.
@@ -146,6 +148,10 @@ public final class MacChatTurnRuntime {
         if activeTask == nil, let reserved = taskGenerations[sessionId] {
             _ = finishRuntime(sessionId: sessionId, generation: reserved)
         }
+        // Stop names the runs active at the click, so a run that registers while the marker waits (a phone send) is not stopped by it.
+        let clickedRuns = NativeAgentChatSessionID.normalizedPathComponent(sessionId).map {
+            ChatCancelFlag.stopContent(forFlagAt: ChatCancelFlag.path(dataRoot: dataRoot, sessionId: $0)).split(separator: "\n").map(String.init)
+        } ?? []
         let generation = (pendingStopWriteGenerations[sessionId] ?? 0) + 1
         pendingStopWriteGenerations[sessionId] = generation
         let previousWrite = pendingStopWrites[sessionId]
@@ -163,7 +169,7 @@ public final class MacChatTurnRuntime {
             }
             await previousWrite?.value
             let result: Result<Void, Error>
-            do { try await stop(sessionId: sessionId); result = .success(()) }
+            do { try await stop(sessionId: sessionId, runIDs: clickedRuns); result = .success(()) }
             catch { result = .failure(error) }
             if pendingStopWriteGenerations[sessionId] == generation {
                 pendingStopWrites[sessionId] = nil

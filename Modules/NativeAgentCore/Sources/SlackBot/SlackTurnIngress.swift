@@ -23,13 +23,13 @@ extension SlackSocketModeLoop {
         guard let cfg = try SlackSocketModeConfig.load(dataRoot: dataRoot), cfg.enabled else {
             return nil
         }
-        let handler: SlackProgressChat = { inbound, sessionId, handler in
+        let handler: SlackProgressChat = { inbound, attachmentNotice, sessionId, handler in
             let client = makeChatClient()
             let takeover = await MacWorkContinuation.admit(inbound.text)
             let prompt = """
             [from: slack, user: \(inbound.userId), channel: \(inbound.channelId)]
             \(inbound.text)
-            """
+            """ + (attachmentNotice.map { "\n\n[Slack attachment preparation]\n" + $0 } ?? "")
             let replyRoute = ChatToolSessionContext.ReplyRoute(
                 surface: "slack",
                 destinationId: inbound.channelId,

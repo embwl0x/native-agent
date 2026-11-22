@@ -3,20 +3,15 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 import os
 import CoreGraphics
 import UserNotifications
 import Senses
 import Experiences
-import CryptoKit
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacLookFrames.swift` | LatestRead frame publication, explicit compile bounds and batch snapshots retaining original TTL |
 public struct MacLookFrameEntry: Sendable, Equatable {
     public let handle: String

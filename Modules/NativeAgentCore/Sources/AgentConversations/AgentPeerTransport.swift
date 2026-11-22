@@ -71,14 +71,6 @@ public enum AgentPeerCredentials {
         }
     }
 
-    /// Authority checks deny on unreadable credentials. Local projections use `availability` so the same failure remains visible with its remedy.
-    public static func isAvailable(_ peer: AgentPeerContact, peers: [AgentPeerContact]) -> Bool {
-        switch availability(peer, reads: credentialReads(peers)) {
-        case .success(let available): return available
-        case .failure: return false
-        }
-    }
-
     static var service: String {
         get throws {
             guard let bundleID = Bundle.main.bundleIdentifier, !bundleID.isEmpty else {

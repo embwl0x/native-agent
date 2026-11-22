@@ -3,21 +3,10 @@ import Synchronization
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(Carbon) && os(macOS)
 import Carbon
-#endif
 
 // Blueprint: | `MacPointer.swift` | `MacMouseEvent`, `MacScrollEvent`, `AgentPointerHold`: Input-owned pointer holds restore the person's cursor |
 
@@ -70,7 +59,6 @@ public struct MacScrollEvent: Sendable, Equatable {
     }
 }
 
-#if canImport(CoreGraphics) && os(macOS)
 
 /// The emitted gesture holds the cursor until its buttons are released; move and scroll release when their post ends.
 enum AgentPointerHold {
@@ -113,4 +101,3 @@ enum AgentPointerHold {
     }
 }
 
-#endif

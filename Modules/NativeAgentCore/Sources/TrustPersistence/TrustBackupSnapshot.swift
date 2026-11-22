@@ -197,7 +197,7 @@ extension TrustBackupPersistence {
             links: links,
             reason: reason,
             createdAt: createdAt,
-            manifestSHA256: Self.sha256Hex(manifestData)
+            manifestSHA256: SHA256Hex.of(manifestData)
         )
     }
 
@@ -271,10 +271,6 @@ extension TrustBackupPersistence {
             hasher.update(data: chunk)
         }
         return (size, hasher.finalize().map { String(format: "%02x", $0) }.joined())
-    }
-
-    private static func sha256Hex(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     static func backupIntegrityFileJSON(_ file: NativeBackupIntegrityFile) -> JSONValue {

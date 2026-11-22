@@ -115,7 +115,7 @@ extension SwiftToolDispatcher {
             ])
         }
         let proposalID = try requireString(input, "proposal_id")
-        let decisionRaw = (optionalString(input, "decision") ?? "")
+        let decisionRaw = (input["decision"]?.nonblankString ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let decision: ApprovalDecision
         switch decisionRaw {
@@ -127,7 +127,7 @@ extension SwiftToolDispatcher {
             )
         }
         var standing = StudioCanonStanding.canon
-        if let raw = optionalString(input, "standing")?
+        if let raw = input["standing"]?.nonblankString?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty {
             guard let parsed = StudioCanonStanding(rawValue: raw) else {
                 return .object([
@@ -176,7 +176,7 @@ extension SwiftToolDispatcher {
                 dataRoot: dataRoot,
                 provenance: provenance,
                 standing: standing,
-                note: optionalString(input, "note")
+                note: input["note"]?.nonblankString
             )
             switch outcome {
             case .applied(let title, let action, let written):

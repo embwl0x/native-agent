@@ -7,7 +7,7 @@ import ProviderRouting
 // Blueprint: | `FluidContextToolScope.swift` | Explicit prepared-context dependency; expanded memory pages retain stored untrusted sources |
 
 extension SwiftToolDispatcher {
-    func impl_context_expand(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    func impl_context_expand(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
         let locator = (input["atom_id"]?.stringValue ?? "")
             .replacingOccurrences(of: "[context_expand ", with: "")
             .replacingOccurrences(of: "[context.expand ", with: "")

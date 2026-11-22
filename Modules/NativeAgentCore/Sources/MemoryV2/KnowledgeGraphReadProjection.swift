@@ -95,17 +95,6 @@ public enum AgentGraphReads {
         return try snapshot.serializedData(pretty: false)
     }
 
-    public static func graphIndexStatus(from projection: CanonicalAgentGraphReadout) -> GraphIndexStatus {
-        GraphIndexStatus(
-            status: "ready",
-            embeddingModel: "swift-memory-v2",
-            dimensions: nil,
-            nodeCount: projection.entities.count,
-            entityCount: projection.entities.count,
-            updatedAt: projection.updatedAt
-        )
-    }
-
     private static func canonicalKnowledgeGraphUpdatedAt(
         graphPath: URL,
         entities: [GraphEntity],
@@ -124,67 +113,16 @@ public enum AgentGraphReads {
         return timestamp(modified)
     }
 
-    public static func searchGraph(query: String, graphPath: URL) async throws -> GraphSearchResponse {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return GraphSearchResponse(
-                query: query,
-                results: [],
-                summary: GraphSearchCounts(resultCount: 0, nodeCount: 0, edgeCount: 0),
-                createdAt: ISO8601DateFormatter().string(from: Date())
-            )
-        }
-        let envelope = try await makeKnowledgeGraphReader(graphPath: graphPath)
-            .searchChecked(q: trimmed)
-        guard case .object(let object) = envelope,
-              case .array(let rawResults)? = object["results"] else {
-            throw KnowledgeGraphReadError.malformedEnvelope(
-                "search projection did not contain a results array"
-            )
-        }
-        let results: [GraphSearchResult] = rawResults.prefix(50).compactMap { value in
-            guard case .object(let raw) = value,
-                  let id = raw["id"]?.stringValue,
-                  !id.isEmpty else { return nil }
-            let entity = Self.graphEntity(id: id, object: raw)
-            return GraphSearchResult(
-                id: entity.id,
-                node: AgentGraphNode(
-                    id: entity.id,
-                    label: entity.name,
-                    kind: entity.kind,
-                    status: nil
-                ),
-                score: raw["score"]?.numberValue(coercingStrings: true, finiteOnly: false) ?? 0,
-                matchedTerms: [trimmed],
-                matchedEntities: [entity.name],
-                relatedEdges: nil,
-                explanation: nil
-            )
-        }
-        return GraphSearchResponse(
-            query: query,
-            results: results,
-            summary: GraphSearchCounts(resultCount: results.count, nodeCount: results.count, edgeCount: 0),
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
-    }
-
     private static func graphEntity(id: String, object: [String: JSONValue]) -> GraphEntity {
         GraphEntity(
             id: id,
             name: object["name"]?.stringValue ?? id,
-            aliases: graphStringArray(object["aliases"]).isEmpty ? nil : graphStringArray(object["aliases"]),
+            aliases: JSONValue.stringArray(object["aliases"]).isEmpty ? nil : JSONValue.stringArray(object["aliases"]),
             kind: object["type"]?.stringValue,
             confidence: object["confidence"]?.numberValue(coercingStrings: true, finiteOnly: false),
             mentions: object["mention_count"]?.exactIntegerValue,
             updatedAt: object["last_seen"]?.stringValue
         )
-    }
-
-    private static func graphStringArray(_ value: JSONValue?) -> [String] {
-        guard case .array(let values)? = value else { return [] }
-        return values.compactMap(\.stringValue)
     }
 
 }

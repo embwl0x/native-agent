@@ -66,21 +66,20 @@ public struct AnyFaceValue: Sendable {
     public func same(as other: AnyFaceValue) -> Bool { equals(other.base) }
 }
 
-/// Everything that arrived since a face last drew: the latest value per key, and text appended to live lines in order.
+/// Everything that arrived since a face last drew: the latest value per key.
 public struct FaceBatch: Sendable, Codable {
     public var values: [FaceKey: AnyFaceValue] = [:]
-    public var appends: [FaceKey: String] = [:]
     public var barriers: [UUID] = []
     public var removals: Set<FaceKey> = []
     public var epoch: UUID?
     public var sequence: UInt64 = 0
     public var replacesAll = false
-    public var isEmpty: Bool { values.isEmpty && appends.isEmpty && barriers.isEmpty && removals.isEmpty && !replacesAll }
+    public var isEmpty: Bool { values.isEmpty && barriers.isEmpty && removals.isEmpty && !replacesAll }
     public init() {}
 }
 
 /// The agent's side. Her owners post finished values from wherever they run; nothing here touches a face's thread. A value replaces
-/// the pending one at its key; appended text joins what is pending for its key. The first post into an empty batch signals the face once.
+/// the pending one at its key. The first post into an empty batch signals the face once.
 public actor FaceFeedSource {
     private var pending = FaceBatch()
     private var retained = FaceBatch()
@@ -107,29 +106,15 @@ public actor FaceFeedSource {
         if wasEmpty { signal.yield() }
     }
 
-    /// A live line grows by appends; the face extends what it holds and never rebuilds it.
-    public func append(_ text: String, at key: FaceKey) {
-        guard !text.isEmpty else { return }
-        let wasEmpty = pending.isEmpty
-        pending.appends[key, default: ""] += text
-        retained.appends[key, default: ""] += text
-        var change = FaceBatch()
-        change.appends[key] = text
-        forward(change)
-        if wasEmpty { signal.yield() }
-    }
-
     public func take() -> FaceBatch {
         defer { pending = FaceBatch() }
         return pending
     }
 
     public func remove(_ key: FaceKey) {
-        guard retained.values.removeValue(forKey: key) != nil || retained.appends[key] != nil else { return }
-        retained.appends.removeValue(forKey: key)
+        guard retained.values.removeValue(forKey: key) != nil else { return }
         let wasEmpty = pending.isEmpty
         pending.values.removeValue(forKey: key)
-        pending.appends.removeValue(forKey: key)
         pending.removals.insert(key)
         var change = FaceBatch()
         change.removals.insert(key)
@@ -254,9 +239,6 @@ public actor FaceFeedSource {
 @MainActor @Observable
 public final class FaceSlot {
     public private(set) var value: AnyFaceValue?
-    /// Text appended to this key's live line since the face last took it.
-    public private(set) var appended = ""
-    @ObservationIgnored fileprivate var generation = 0
     /// The value as selections read it, outside observation, so a selection never ties its reader to the whole value.
     @ObservationIgnored private var current: AnyFaceValue?
     @ObservationIgnored private var selections: [String: any FaceSelectionBox] = [:]
@@ -274,7 +256,6 @@ public final class FaceSlot {
     fileprivate func clear() {
         current = nil
         value = nil
-        appended = ""
         for selection in selections.values { selection.refresh(nil) }
     }
 
@@ -286,14 +267,6 @@ public final class FaceSlot {
         let selection = FaceSelection(part, from: current)
         selections[name] = selection
         return selection.part
-    }
-
-    fileprivate func extend(_ text: String) { appended += text }
-
-    /// The live line's reader consumes what it has drawn.
-    public func takeAppended() -> String {
-        defer { appended = "" }
-        return appended
     }
 
     public func value<Value: FaceValue>(as type: Value.Type) -> Value? { value?.base as? Value }
@@ -366,7 +339,6 @@ public final class FaceFeed {
         for (key, value) in batch.values {
             slot(key).apply(value)
         }
-        for (key, text) in batch.appends { slot(key).extend(text) }
     }
 
     /// The connection schedules this once per display frame and acknowledges the returned batch's barriers afterward.

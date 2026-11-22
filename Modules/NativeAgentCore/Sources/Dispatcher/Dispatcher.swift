@@ -2,7 +2,6 @@ import Experiences
 import Foundation
 import NativeAgentShared
 import ChatToolParsing
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -158,13 +157,8 @@ public func dispatcherArgsHash(_ input: [String: JSONValue]) -> String {
         canonical = "{}"
     }
     let bytes = Array(canonical.utf8)
-    let hex = _sha256Hex(bytes)
+    let hex = SHA256Hex.of(Data(bytes))
     return String(hex.prefix(16))
-}
-
-private func _sha256Hex(_ bytes: [UInt8]) -> String {
-    let digest = SHA256.hash(data: Data(bytes))
-    return digest.map { String(format: "%02x", $0) }.joined()
 }
 
 /// Use monotonic duration so wall-clock changes cannot distort native action timing.

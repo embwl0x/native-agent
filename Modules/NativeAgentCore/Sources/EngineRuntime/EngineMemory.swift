@@ -69,23 +69,9 @@ public final class MemoryFacade {
     @ObservationIgnored private let statusesRead = LatestRead()
     @ObservationIgnored private let proposalsRead = LatestRead()
 
-    public var memories: [MemoryV2.MemoryRecord] = []
-    public private(set) var memoriesReadError: String?
-    public private(set) var hasLoadedMemories = false
-    @ObservationIgnored private let memoriesRead = LatestRead()
-
     @discardableResult
     public func refreshMemories() async throws -> [MemoryV2.MemoryRecord] {
-        let result: Result<[MemoryV2.MemoryRecord], Error> = await memoriesRead.read({
-            do { return .success(try await activeMemories()) }
-            catch { return .failure(error) }
-        }, publish: { result in
-            switch result {
-            case .success(let rows): memories = rows; hasLoadedMemories = true; memoriesReadError = nil
-            case .failure(let error): memoriesReadError = error.localizedDescription
-            }
-        })
-        return try result.get()
+        try await activeMemories()
     }
     public var totalCount: Int? { status?.counts?.active }
     public private(set) var diagnostics: MemoryV2NativeStackSnapshot = .empty
@@ -97,7 +83,6 @@ public final class MemoryFacade {
     }
     @ObservationIgnored public var proposalsDidChange: (@MainActor () -> Void)?
 
-    public var proposalsReadFailed: Bool { proposalsReadError != nil }
     public private(set) var proposalsReadError: String?
     public private(set) var hasLoadedProposals = false
     public private(set) var rejectedProposals: [ProposalRecord] = []
@@ -132,11 +117,6 @@ public final class MemoryFacade {
 
     /// Share one checked whole-graph snapshot across graph and Capabilities pages.
     public private(set) var graphSnapshot: CanonicalAgentGraphReadout?
-    public var graphEntities: [KnowledgeGraphEntity] { graphSnapshot?.canvasEntities ?? [] }
-    public var graphEdges: [KnowledgeGraphEdge] { graphSnapshot?.canvasEdges ?? [] }
-    public var graphTotalEntities: Int { graphEntities.count }
-    public var graphTotalEdges: Int? { graphSnapshot?.canvasEdges.count }
-    public private(set) var graphLoading = false
     public private(set) var graphLoadError: String?
     public private(set) var graphObservationError: String?
     @ObservationIgnored private var graphRead: Task<Void, Never>?
@@ -262,7 +242,7 @@ public final class MemoryFacade {
     @concurrent private nonisolated func readProposals(status: String) async throws -> [ProposalRecord] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         return try await storage.listProposals(status: status)
-            .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }
+            .filter { status != "pending" || SwiftNativeMemoryV2.awaitsReview(content: $0.content, metadata: $0.metadata) }
             .map(ProposalRecord.init(stored:))
     }
 
@@ -424,13 +404,7 @@ public final class MemoryFacade {
     // MARK: - Knowledge Graph
 
     nonisolated private var graphPath: URL {
-        dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("memory.sqlite")
-    }
-
-    public nonisolated func searchGraph(query: String) async throws -> GraphSearchResponse {
-        try await AgentGraphReads.searchGraph(query: query, graphPath: graphPath)
+        DataRootPaths.memoryDatabase(in: dataRoot)
     }
 
     /// Keep the prior snapshot with its error on failure. Share one graph read across mounts; joining refreshes get a fresh trailing read so captured bytes
@@ -439,12 +413,10 @@ public final class MemoryFacade {
         graphReadRequested = true
         if graphRead == nil {
             graphRead = Task {
-                graphLoading = true
                 while graphReadRequested {
                     graphReadRequested = false
                     await readGraph()
                 }
-                graphLoading = false
                 graphRead = nil
             }
         }

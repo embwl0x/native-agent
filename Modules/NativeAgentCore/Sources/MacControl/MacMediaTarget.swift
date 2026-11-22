@@ -5,7 +5,7 @@ import PersistenceCore
 enum MacMediaTarget {
     struct Failure: Error, LocalizedError, Sendable {
         enum Kind: String, Sendable {
-            case process, channels, timeout, exit, truncated, invalidPID, unsupported
+            case process, channels, timeout, exit, truncated, invalidPID
         }
         let kind: Kind
         let cause: String
@@ -58,7 +58,6 @@ enum MacMediaTarget {
     """#
 
     static func currentPID() async throws -> Int32? {
-        #if canImport(AppKit)
         do {
             try Task.checkCancellation()
             let result = try await ProcessExecution().run(
@@ -84,8 +83,5 @@ enum MacMediaTarget {
             process: error.result, channels: error.channels) }
         catch is CancellationError { throw CancellationError() }
         catch { throw Failure(kind: .process, cause: error.localizedDescription, underlying: error) }
-        #else
-        throw Failure(kind: .unsupported, cause: "Now Playing process discovery requires macOS.")
-        #endif
     }
 }

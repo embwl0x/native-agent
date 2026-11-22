@@ -1,9 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
 
 // Blueprint: | `MacPointerObservation.swift` | `MacPointerPosition`, `MacRegionAim`: Actual cursor and clear-region aim; unknown never invents origin |
 
@@ -31,12 +29,8 @@ public struct MacPointerPosition: Sendable, Equatable {
 public struct SystemMacPointerPositionSource: Sendable {
     public init() {}
     public func currentPosition() -> MacPointerPosition? {
-        #if canImport(CoreGraphics) && os(macOS)
         guard let point = CGEvent(source: nil)?.location else { return nil }
         return MacPointerPosition(x: point.x, y: point.y)
-        #else
-        return nil
-        #endif
     }
 }
 

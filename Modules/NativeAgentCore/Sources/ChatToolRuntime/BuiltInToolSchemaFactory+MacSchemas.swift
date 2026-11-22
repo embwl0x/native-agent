@@ -473,6 +473,7 @@ extension BuiltInToolSchemaFactory {
                         \"[redacted: <reason>]\" and are listed under `redactions`; that is redaction, not an empty clipboard, and re-reading will \
                         not reveal them. Non-text contents (an image, a file, an app's own flavor) are reported by type and size under `types` — \
                         the bytes are never returned. Concealed or transient clipboard content returns no text or text length, with a note saying why. \
+                        A clipboard change during the read returns clipboard_unavailable without a snapshot. \
                         Available only when Full Mac is active with the Accessibility category enabled.
                         """,
                     parametersJSON: ToolSchema.params(
@@ -519,9 +520,9 @@ extension BuiltInToolSchemaFactory {
                     toolClass: .read, reach: .person,
                     description: """
                         Read document text from an explicit file path or the live window. File: extracts PDF/plain text, limited to 32 MiB, 400 PDF \
-                        pages and 400,000 characters. Window: merges overlapping reads, bounded to 40 frames, 400,000 characters and 20 seconds; \
-                        checks scroll restoration after movement. Read reached_end, truncated, truncation_reason, gaps and scroll_restored where \
-                        returned; a stopped read may be incomplete. Presses/types/opens nothing. Page retained output with app result.page and \
+                        pages and 400,000 characters. Window: merges verified overlap, bounded to 40 frames, 400,000 characters and 20 seconds; \
+                        unknown overlap returns gaps and truncated. It checks scroll restoration after movement. Read reached_end, truncation_reason \
+                        and scroll_restored where returned. A stopped read may be incomplete. Presses/types/opens nothing. Page retained output with app result.page and \
                         result_handle; paging cannot recover unread source text. Secret lines become \"[redacted: <reason>]\". On failure, use the \
                         cause and supplied remedy; for a scanned PDF with no text layer, use screen. Requires Full Mac Accessibility; explicit path \
                         also requires Full Mac file access.
@@ -577,8 +578,8 @@ extension BuiltInToolSchemaFactory {
                                 screen.
                                 """)),
                             ("__sense_screen_frame", ToolSchema.strSchema("""
-                                The frozen screen identity from More. Pass the entire More object as mac.look args to continue that page with its \
-                                original handles.
+                                The frozen screen identity from More. To continue that page with its original handles, use the result's \
+                                Continue line: app {page, item} with the More object as item.
                                 """)),
                             ("__sense_text_offset", ToolSchema.intSchema("""
                                 The reading position from More; pass it unchanged with __sense_screen_frame and app.
@@ -695,13 +696,16 @@ extension BuiltInToolSchemaFactory {
                     ToolSchema.obj([("required", .array([.string("app"), .string("target"), .string("__sense_screen_frame")]))]),
                 ])),
             ])
+            let scrollDirections = MacActScrollDirection.allCases.map(\.rawValue)
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "act",
                     toolClass: .write, reach: .person, capabilities: ["ax_injection", "mac_control", "tool_call"],
                     description: """
                         Act by name/visible ordinal against a fresh screen, or run up to 12 steps in order. A name needs no look first: the act \
-                        reads the screen itself before it acts. Steps accept names, menu paths, key \
+                        reads the screen itself before it acts. To see the immediate result, use one app call with actions in order: \
+                        [{action:"mac.act",args:{app:"TextEdit",verb:"scroll",direction:"down"}},{action:"mac.look",args:{app:"TextEdit",pixels:true}}]. \
+                        Steps accept names, menu paths, key \
                         chords, {verb,target,text,mode}, or {verb,handle,frame_id}; handle steps re-resolve the recorded identity live, stopping \
                         when it disappears or changes; each reads/verifies afresh, stops on first failure and returns a receipt line. A trailing ? \
                         skips an absent optional target. Example: app:'TextEdit', front:true, steps:['Format > Make Plain \
@@ -714,6 +718,7 @@ extension BuiltInToolSchemaFactory {
                         append refuses. type with at clicks there then types into the editor that takes focus. Targetless type uses current \
                         editable focus in replace mode, even with frame_id and no handle. An unreadable editor receives keys with an unverified \
                         receipt and a pixel look offered; unknown or noneditable focus refuses. A bare scroll targets the window’s main content. \
+                        A named scroll can use a target whose enabled state is false or unknown. \
                         Key chords post keys directly. repeat re-resolves each attempt and stops on ambiguity, drift, disappearance or time limit. \
                         holding wraps physical input in held keys/modifiers. Parameter help retains each gesture’s controls. With app behind, \
                         accessibility acts in the background; menus/keys/real input stop with needs_front unless the task explicitly requests \
@@ -731,15 +736,15 @@ extension BuiltInToolSchemaFactory {
                                 ("description", .string("""
                                     Omit for scroll of main content or replace-mode type into editable focus. Otherwise the name as the screen \
                                     shows it, or the complete target object returned by that screen (handle/frame_id or a native-surface address). \
-                                    For hold, `key w d` holds W and D simultaneously for seconds; for key, a space-separated sequence remains \
-                                    sequential.
+                                    For hold, `key w d` holds W and D simultaneously for seconds. For key, a space-separated sequence remains \
+                                    sequential and `key:36` uses physical key code 36.
                                     """)),
                             ])),
                             ("handle",
                                 ToolSchema.strSchema("Exact control from screen structured:true, with its frame_id. Supports "
                                 + MacFourVerbs.selectionVerbs.joined(separator: ", ") + """
-                                 on that same live element (press aliases click); no name, point, repeat or other gesture options. A stale handle \
-                                requires a fresh screen read; no name substitution or repeated action.
+                                 on that same live element (press aliases click). Only scroll accepts direction and scroll_amount. A handle \
+                                takes no point, drag, button, holding or repeat options. A stale handle requires a fresh screen read.
                                 """)),
                             ("frame_id", ToolSchema.strSchema("""
                                 The screen observation's reference, shared by handles and image pixels; image is an alias. Required with handle. \
@@ -751,11 +756,11 @@ extension BuiltInToolSchemaFactory {
                                 verified end, preserves prior text, and never sets the whole value. Append requires a named accessibility text \
                                 target and verified contents/end; otherwise it refuses. Omit or use replace for other verbs.
                                 """)),
-                            ("direction", ToolSchema.enumStringSchema(["up", "down", "left", "right"],
+                            ("direction", ToolSchema.enumStringSchema(scrollDirections,
                                 "For `scroll`: which way to move. Left/right sends horizontal wheel input.")),
                             ("scroll_amount", ToolSchema.intSchema("""
-                                For scroll: wheel magnitude in lines, 1 for fine adjustment through120. Use0 (or omit) for ordinary/default \
-                                behavior, including all non-scroll verbs. An explicit amount requests wheel input rather than page-key fallback.
+                                For scroll: wheel magnitude from 1 to 120 lines. Omit or use 0 for the default, three lines for a handle. \
+                                Other handle verbs require omission. A positive amount requests wheel input.
                                 """, minimum: 0, maximum: 120)),
                             ("to", ToolSchema.obj([("anyOf", .array([ToolSchema.strSchema(), ToolSchema.obj(point)])), ("description", .string("""
                                 For `drag`: the named/numbered destination. A displayed canvas is also a target: drag from 'left side of canvas' to \
@@ -794,15 +799,20 @@ extension BuiltInToolSchemaFactory {
                                                 + ". The same verbs and synonyms as a single act.")),
                                             ("handle", ToolSchema.strSchema("""
                                                 Control identity from structured screen, with frame_id here or inherited from the call. Supports \
-                                                the same handle verbs as a single act, including double_click, right_click and hover; no target, \
-                                                point or other gesture options. Each step resolves that identity on the live screen.
+                                                the same handle verbs as a single act. Only scroll takes direction (or to) and scroll_amount. \
+                                                A handle step takes no named target, point, holding or button options.
                                                 """)),
                                             ("target", ToolSchema.strSchema("""
                                                 The name, as the screen shows it. Required for append; omit for scroll of the main content, \
                                                 replace-mode type into editable focus, a handle selection, or when at/from gives a point.
                                                 """)),
                                             ("to", ToolSchema.obj([("anyOf", .array([ToolSchema.strSchema(), ToolSchema.obj(point)])), ("description",
-                                                .string("For drag: the named destination, or with `from` a point {x, y} in image pixels."))])),
+                                                .string("For drag: the named destination, or with `from` a point {x, y} in image pixels. For a handle scroll: an alias for direction."))])),
+                                            ("direction", ToolSchema.enumStringSchema(scrollDirections,
+                                                "For a named, handle or targetless scroll: which way to move. Defaults to down.")),
+                                            ("scroll_amount", ToolSchema.intSchema(
+                                                "For a named, handle or targetless scroll: wheel magnitude in lines. Omit or use 0 for the default.",
+                                                minimum: 0, maximum: 120)),
                                             ("at", at),
                                             ("from", from),
                                             ("image", image),

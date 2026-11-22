@@ -47,14 +47,10 @@ public struct OrganismSleepPressureComponents: Sendable, Equatable {
         fieldChargeResidual: Double = 0,
         calibrationResidual: Double = 0
     ) {
-        self.predictionResidual = Self.clamp(predictionResidual)
-        self.transitionSurprise = Self.clamp(transitionSurprise)
-        self.contradictionResidual = Self.clamp(contradictionResidual)
-        self.fieldChargeResidual = Self.clamp(fieldChargeResidual)
-        self.calibrationResidual = Self.clamp(calibrationResidual)
-    }
-
-    private static func clamp(_ value: Double) -> Double {
-        (value.isFinite ? value : 0).clamped01()
+        self.predictionResidual = predictionResidual.finiteClamped01()
+        self.transitionSurprise = transitionSurprise.finiteClamped01()
+        self.contradictionResidual = contradictionResidual.finiteClamped01()
+        self.fieldChargeResidual = fieldChargeResidual.finiteClamped01()
+        self.calibrationResidual = calibrationResidual.finiteClamped01()
     }
 }

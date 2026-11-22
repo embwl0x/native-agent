@@ -46,7 +46,7 @@ The signature covers sorted-key JSON for the entire envelope excluding only
 `signature` and `deviceSignature`. This includes the action, full payload,
 message/transaction IDs, timestamp, protocol version, and device public key.
 The existing outer HMAC then covers the envelope including the device signature.
-Both Drive and CloudKit retain their HMAC, freshness, and transaction-ledger
+CloudKit transport retains its HMAC, freshness, and transaction-ledger
 checks before the common action router checks the registered device.
 
 Approval, step, and inbox decision routes require the registered signature.

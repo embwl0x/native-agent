@@ -70,7 +70,7 @@ extension AppActions {
         try checkedInventory(dataRoot: dataRoot, turn: turn).authored
     }
 
-    static func authored(dataRoot: URL, catalog: [AppAction], snapshot: SwiftToolDispatcher.AuthoredCatalog,
+    static func authored(catalog: [AppAction], snapshot: SwiftToolDispatcher.AuthoredCatalog,
                                  requested: String? = nil) throws -> [AppAction] {
         // A part that answers verbs is offered only as those verbs; a verb a native declaration still holds stays the native one.
         let tools = snapshot.tools.filter { tool in
@@ -196,6 +196,15 @@ extension AppActions {
         return .object(schema)
     }
 
+    static var trashResultSchema: JSONValue {
+        var schema = resultEnvelope.objectValue ?? [:]
+        var properties = schema["properties"]?.objectValue ?? [:]
+        properties["ok"] = .object(["type": .string("boolean")])
+        properties["trash_path"] = .object(["type": .array([.string("string"), .string("null")])])
+        schema["properties"] = .object(properties)
+        return .object(schema)
+    }
+
     /// Schema annotation removal must preserve argument names and enum/const data.
     static func contractSchema(_ value: JSONValue) -> JSONValue {
         guard case .object(let schema) = value else { return value }
@@ -221,8 +230,8 @@ extension AppActions {
         return .object(result)
     }
 
-    static func dependencyContract(_ action: AppAction, dataRoot: URL) throws -> JSONValue {
-        let args: JSONValue = if case .object(let fields) = try discovery(action, dataRoot: dataRoot) { fields["args_schema"] ?? .null } else { .null }
+    static func dependencyContract(_ action: AppAction) throws -> JSONValue {
+        let args: JSONValue = if case .object(let fields) = try discovery(action) { fields["args_schema"] ?? .null } else { .null }
         return .object(["id": .string(action.id), "args_schema": contractSchema(args),
             "result_schema": contractSchema(action.resultSchema), "revision": .int(Int64(action.revision)),
             "read": .bool(action.read), "readWhen": .object(action.readWhen),

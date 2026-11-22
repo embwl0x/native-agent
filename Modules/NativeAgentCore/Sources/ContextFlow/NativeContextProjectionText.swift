@@ -1,7 +1,7 @@
 import Foundation
 import Context
 import NativeAgentShared
-// Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText`: projection text bounds and trigger tokens |
+// Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText`: projection text cleanup, date validation and trigger tokens |
 
 enum NativeContextProjectionText {
     static func requiredDate(_ raw: String?, owner: String) throws -> Date {
@@ -18,10 +18,6 @@ enum NativeContextProjectionText {
             .joined(separator: " ")
     }
 
-    static func bounded(_ value: String, to maximum: Int) -> String {
-        value.count <= maximum ? value : String(value.prefix(maximum))
-    }
-
     static func containsDisallowedControl(_ value: String) -> Bool {
         value.unicodeScalars.contains {
             CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t"
@@ -32,7 +28,7 @@ enum NativeContextProjectionText {
         triggerTokens([text], minimumLength: minimumLength,
             maximumCount: 12, excluding: excluding,
             tokens: { $0.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init) },
-            bound: { $0 }).map { bounded($0, to: 64) }
+            bound: { $0 }).map { TextClipping.prefix($0, to: 64) }
     }
 
     /// Each projection supplies its trigger-token and bound rules.

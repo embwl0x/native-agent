@@ -117,11 +117,11 @@ extension SwiftNativeTurnEngine {
                 stopped.removeValue(forKey: run)
             }
         }
-        for words in stopped.values.sorted() {
+        for (run, words) in stopped.sorted(by: { $0.value < $1.value }) {
             do {
-                _ = try await MyQueue.add(DeskStep(words: words, when: "own_turn", peers: steer.sources, elevated: steer.elevated,
+                try await MyQueue.addResume(DeskStep(words: words, when: "own_turn", peers: steer.sources, elevated: steer.elevated,
                                                    session: turn.verifiedSessionID, origin: origin,
-                                                   replyRoute: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata()), store: store)
+                                                   replyRoute: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata()), run: run, store: store)
             } catch {
                 nativeLog("[my-queue] a stopped skill run was not queued: \(error)")
             }

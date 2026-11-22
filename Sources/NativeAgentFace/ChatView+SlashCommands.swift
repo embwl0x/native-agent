@@ -37,8 +37,14 @@ extension ChatView {
             defer { isSubmittingSend = false }
             switch await appModel.startActiveChatTurn(message, attachments: attachments, expectedSessionId: session, composerRevision: revision) {
             case .accepted(let accepted):
-                guard accepted == session, appModel.activeChatSessionId == session,
-                      draftSessionId == session, text == message, draftEditedAt == messageEditedAt,
+                guard accepted == session else { return }
+                // Sent words leave the chat they were sent from even if the person has moved on; only scroll and focus need it in view.
+                guard appModel.activeChatSessionId == session, draftSessionId == session else {
+                    appModel.clearChatDraftAfterSend(message, sessionId: session, editedAt: messageEditedAt)
+                    if appModel.chatPendingAttachments[session] == attachments { appModel.chatPendingAttachments[session] = nil }
+                    return
+                }
+                guard text == message, draftEditedAt == messageEditedAt,
                       draft.manualEditRevision == revision, pendingAttachments == attachments else { return }
                 appModel.clearChatDraftAfterSend(message, sessionId: session, editedAt: messageEditedAt)
                 pendingAttachments = []
@@ -57,7 +63,8 @@ extension ChatView {
             showToast(ChatSlashCommandRouting.unknownMessage(command: raw))
             return
         }
-        let argument = parts.dropFirst().joined(separator: " ")
+        // Everything after the command name, exactly as written: a pasted note keeps its paragraphs and indentation.
+        let argument = String(raw.drop { $0.isWhitespace }.drop { !$0.isWhitespace }.drop { $0.isWhitespace })
         switch route {
         case .settings, .helpers, .agents, .today, .desk, .forget, .voice, .context:
             guard argument.isEmpty else { showToast("/" + name + " takes no arguments"); return }
@@ -139,7 +146,7 @@ extension ChatView {
                     try await appModel.chatAct(act).checkedAcknowledgement()
                     showToast(route == .remember ? "Memory saved" : "Note committed")
                 case .scratch:
-                    let parts = argument.split(separator: " ", maxSplits: 1)
+                    let parts = argument.split(maxSplits: 1, whereSeparator: \.isWhitespace)
                     guard let key = parts.first, let value = parts.dropFirst().first else {
                         showToast("Usage: /scratch <key> <value>"); return
                     }
@@ -167,7 +174,7 @@ extension ChatSlashPage {
         case .connector(let service): ConnectorWizardView(provider: service, onDismiss: close)
         case .memories(let query, let choosingToForget):
             ShellPageFrame(title: "Memories", subtitle: choosingToForget
-                           ? "Choose a memory and use ‘Forget this…’ to confirm." : nil, alive: true) {
+                           ? "Choose a memory and use ‘Forget this…’ to confirm." : nil) {
                 FacePageView(page: "memories").modifier(MemoriesFaceNavigation(initialQuery: query))
             }
         }

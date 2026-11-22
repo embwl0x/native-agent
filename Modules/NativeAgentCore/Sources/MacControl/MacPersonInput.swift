@@ -2,10 +2,8 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-#if canImport(CoreGraphics) && os(macOS)
 import CoreGraphics
 import Darwin
-#endif
 // Blueprint: | `MacPersonInput.swift` | `MacPersonInput`, `observeReturn`, `NativeAgentMacEventIdentity`, `ScriptedInputSources`, `NativeAgentMotorEpoch` |
 
 /// The tag contains no user data; shared poster-PID classification distinguishes person and synthetic input.
@@ -108,7 +106,6 @@ public enum MacPersonInput {
             else { return nil }
             return seconds
         }
-        #if canImport(CoreGraphics) && os(macOS)
         let idle = CGEventSource.secondsSinceLastEventType(
             .combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null
         )
@@ -117,9 +114,6 @@ public enum MacPersonInput {
               abs(idle - PersonOnlyWindows.secondsSincePersonInput()) > ownEventTolerance
         else { return nil }
         return idle
-        #else
-        return nil
-        #endif
     }
 
     private static let clock = NSLock()
@@ -156,7 +150,6 @@ public enum MacPersonInput {
 
     /// Close admission before retiring resources, then acknowledge the actual input-thread exit.
     public static func shutdown() async {
-        #if canImport(CoreGraphics) && os(macOS)
         let retiring = clock.withLock {
             stopping = true
             let resources = (port, awayDue, inputSource, inputRunLoop)
@@ -174,19 +167,15 @@ public enum MacPersonInput {
         await withCheckedContinuation { done in
             threadExit.notify(queue: .global(qos: .utility)) { done.resume() }
         }
-        #endif
     }
 
     /// Arm the first presence deadline only after its wake observer is ready.
     public static func startPresenceWakes() {
-        #if canImport(CoreGraphics) && os(macOS)
         guard listening else { return }
         settleSoon()
-        #endif
     }
 
     private static func listen() -> Bool {
-        #if canImport(CoreGraphics) && os(macOS)
         // Preflight never prompts; creating the tap without the grant would.
         guard !clock.withLock({ stopping }), CGPreflightListenEventAccess() else { return false }
         let types: [CGEventType] = [.keyDown, .keyUp, .flagsChanged,
@@ -202,9 +191,11 @@ public enum MacPersonInput {
                     MacPersonInput.clock.withLock {
                         MacPersonInput.port.map { CGEvent.tapEnable(tap: $0, enable: true) }
                     }
-                } else if MacPersonInput.note(event),
-                          MacPersonInput.away || MacPersonInput.clock.withLock({ MacPersonInput.returnAfter != nil }) {
-                    MacPersonInput.settle()
+                } else {
+                    if MacPersonInput.note(event),
+                       MacPersonInput.away || MacPersonInput.clock.withLock({ MacPersonInput.returnAfter != nil }) {
+                        MacPersonInput.settle()
+                    }
                 }
                 return Unmanaged.passUnretained(event)
             }, userInfo: nil
@@ -252,12 +243,8 @@ public enum MacPersonInput {
         thread.start()
         clock.unlock()
         return true
-        #else
-        return false
-        #endif
     }
 
-    #if canImport(CoreGraphics) && os(macOS)
     private static func note(_ event: CGEvent) -> Bool {
         let now = ProcessInfo.processInfo.systemUptime
         let person = NativePersonInput.isPerson(event)
@@ -313,11 +300,9 @@ public enum MacPersonInput {
     }
     /// Read-observed input after settlement began must be reconciled under `clock`.
     private nonisolated(unsafe) static var settleAgain = false
-    #endif
 
     /// Mark missed input before posting so synthetic output cannot make it appear seen; stamp targeted posts here because they bypass the tap.
     static func noteAgentPost(targeted: Bool) {
-        #if canImport(CoreGraphics) && os(macOS)
         guard listening else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let seen = clock.withLock {
@@ -326,12 +311,10 @@ public enum MacPersonInput {
             return seen
         }
         if seen { settleSoon() }
-        #endif
     }
 
     /// No tap or unresolved provenance yields no person-idle number; retain whose input was newest.
     public static func idle() -> (seconds: Double?, lastInput: String)? {
-        #if canImport(CoreGraphics) && os(macOS)
         guard listening, CGPreflightListenEventAccess() else { return nil }
         let now = ProcessInfo.processInfo.systemUptime
         let (seen, idle): (Bool, (seconds: Double?, lastInput: String)) = clock.withLock {
@@ -342,21 +325,14 @@ public enum MacPersonInput {
         }
         if seen { settleSoon() }
         return idle
-        #else
-        return nil
-        #endif
     }
 
     /// Combined idle supplies an absence floor while person provenance is unknown; it can prove away, never here.
     public static func idleAtLeast() -> Double? {
-        #if canImport(CoreGraphics) && os(macOS)
         let any = CGEventSource.secondsSinceLastEventType(
             .combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null
         )
         return any.isFinite && any >= 0 ? any : nil
-        #else
-        return nil
-        #endif
     }
 
     /// Motor-relative input age resumes capture metadata without asserting presence or requiring Input Monitoring. Compare ages so synthetic input remains
@@ -372,7 +348,6 @@ public enum MacPersonInput {
 
     /// Repeated reads cannot move an armed phone return or replay a settled one.
     public static func observeReturn(after departure: Date) {
-        #if canImport(CoreGraphics) && os(macOS)
         guard listening else { return }
         let armed = clock.withLock {
             if let settled = presenceTransition,
@@ -383,7 +358,6 @@ public enum MacPersonInput {
         }
         // Reconcile input that arrived between reading phone evidence and arming the wake, including hidden secure input.
         if armed { settleSoon() }
-        #endif
     }
 
     /// Presence excludes synthetic input; while provenance is unknown, combined idle may prove away but never here.

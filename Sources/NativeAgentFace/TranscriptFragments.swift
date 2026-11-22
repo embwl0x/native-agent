@@ -2,24 +2,9 @@ import AppKit
 import NativeAgentShared
 import SwiftUI
 
-// Blueprint: | `TranscriptFragments.swift` | One layout fragment per drawn paragraph kind, and the delegate that picks them and hides closed folds |
+// Blueprint: | `TranscriptFragments.swift` | The Mac's user bubble (with its provenance line) and code fragments; the shared delegate picks them |
 
 extension TranscriptFragment {
-    final func fillBackground(_ rect: CGRect, color: NSColor, at point: CGPoint, in context: CGContext, shape: (CGRect) -> CGPath) {
-        guard rect.width > 0, rect.height > 0 else { return }
-        if cachedPath == nil || cachedRect != rect {
-            cachedPath = shape(rect)
-            cachedRect = rect
-        }
-        guard let path = cachedPath else { return }
-        context.saveGState()
-        context.translateBy(x: point.x, y: point.y)
-        context.addPath(path)
-        context.setFillColor(color.cgColor)
-        context.fillPath()
-        context.restoreGState()
-    }
-
     /// AppKit string and image drawing into the fragment's flipped space.
     final func drawAppKit(at point: CGPoint, in context: CGContext, _ body: () -> Void) {
         NSGraphicsContext.saveGraphicsState()
@@ -96,9 +81,12 @@ final class TranscriptCodeFragment: TranscriptFragment {
     override var topMargin: CGFloat { topGap + TranscriptMetrics.codeHeader + TranscriptMetrics.codePadV }
     override var bottomMargin: CGFloat { TranscriptMetrics.codePadV }
 
+    // The label is set at the reader's text size, so ⌘+ and ⌘− scale it with the code it names.
     private lazy var language: NSAttributedString? = (paragraphAttributes[TranscriptKey.language] as? String).map {
-        NSAttributedString(string: $0, attributes: [
-            .font: NSFont.systemFont(ofSize: NSFont.preferredFont(forTextStyle: .caption2).pointSize, weight: .medium),
+        let size = (paragraphAttributes[TranscriptKey.languageFontSize] as? NSNumber).map { CGFloat($0.doubleValue) }
+            ?? NSFont.preferredFont(forTextStyle: .caption2).pointSize
+        return NSAttributedString(string: $0, attributes: [
+            .font: NSFont.systemFont(ofSize: size, weight: .medium),
             .foregroundColor: NSColor.secondaryLabelColor,
         ])
     }
@@ -134,84 +122,5 @@ final class TranscriptCodeFragment: TranscriptFragment {
             }
         }
         super.draw(at: point, in: context)
-    }
-}
-
-/// One quiet line for a tool run with a drawn disclosure chevron. Open state is fixed per fragment: a toggle edits the run's range,
-/// which makes TextKit build fresh fragments.
-final class TranscriptFoldFragment: TranscriptFragment {
-    var isOpen = false
-
-    /// Just before the label's first glyph, centred on its first line.
-    private var chevronRect: CGRect {
-        guard let line = textLineFragments.first, let start = textStartX else { return .zero }
-        return CGRect(x: start - 14, y: line.typographicBounds.midY - 4, width: 8, height: 8)
-    }
-
-    private var chevron: CGPath {
-        let rect = chevronRect
-        let path = CGMutablePath()
-        if isOpen {
-            path.move(to: CGPoint(x: rect.minX, y: rect.minY + 2))
-            path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY - 1))
-            path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + 2))
-        } else {
-            path.move(to: CGPoint(x: rect.minX + 2, y: rect.minY))
-            path.addLine(to: CGPoint(x: rect.maxX - 1, y: rect.midY))
-            path.addLine(to: CGPoint(x: rect.minX + 2, y: rect.maxY))
-        }
-        return path
-    }
-
-    override var renderingSurfaceBounds: CGRect { super.renderingSurfaceBounds.union(chevronRect.insetBy(dx: -2, dy: -2)) }
-
-    override func draw(at point: CGPoint, in context: CGContext) {
-        context.saveGState()
-        context.translateBy(x: point.x, y: point.y)
-        context.addPath(chevron)
-        context.setStrokeColor(NSColor.secondaryLabelColor.cgColor)
-        context.setLineWidth(1.5)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-        context.strokePath()
-        context.restoreGState()
-        super.draw(at: point, in: context)
-    }
-}
-
-/// What TextKit asks the document: which fragment draws a paragraph, and whether a folded paragraph is enumerated at all.
-/// A closed fold's paragraphs stay in storage and are skipped, never deleted.
-final class TranscriptLayoutDelegate: NSObject, NSTextContentStorageDelegate, NSTextLayoutManagerDelegate {
-    /// Tool-run group ids the reader opened. Folds start closed.
-    var openFolds: Set<String> = []
-
-    func textContentManager(_ textContentManager: NSTextContentManager, shouldEnumerate textElement: NSTextElement,
-                            options: NSTextContentManager.EnumerationOptions) -> Bool {
-        guard let paragraph = textElement as? NSTextParagraph, paragraph.attributedString.length > 0 else { return true }
-        if paragraph.attributedString.attribute(TranscriptKey.liveHidden, at: 0, effectiveRange: nil) as? Bool == true { return false }
-        guard let group = paragraph.attributedString.attribute(TranscriptKey.foldGroup, at: 0, effectiveRange: nil) as? String else { return true }
-        return openFolds.contains(group)
-    }
-
-    func textLayoutManager(_ textLayoutManager: NSTextLayoutManager, textLayoutFragmentFor location: any NSTextLocation,
-                           in textElement: NSTextElement) -> NSTextLayoutFragment {
-        let range = textElement.elementRange
-        guard let paragraph = textElement as? NSTextParagraph, let kind = TranscriptParagraph.of(paragraph) else {
-            return TranscriptFragment(textElement: textElement, range: range)
-        }
-        switch kind {
-        case .user:
-            return TranscriptUserFragment(textElement: textElement, range: range)
-        case .code:
-            return TranscriptCodeFragment(textElement: textElement, range: range)
-        case .foldHeadline:
-            let fragment = TranscriptFoldFragment(textElement: textElement, range: range)
-            if let group = paragraph.attributedString.attribute(TranscriptKey.foldOpens, at: 0, effectiveRange: nil) as? String {
-                fragment.isOpen = openFolds.contains(group)
-            }
-            return fragment
-        case .reply, .heading, .quote, .listItem, .foldDetail, .gap, .attachment:
-            return TranscriptFragment(textElement: textElement, range: range)
-        }
     }
 }

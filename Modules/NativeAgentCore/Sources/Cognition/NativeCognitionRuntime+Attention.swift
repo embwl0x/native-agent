@@ -466,10 +466,11 @@ extension NativeCognitionRuntime: AttentionIntake {
     /// Waking (the night settled, something owed or the person arrived) records why and weighs what waited, once.
     public func woke(_ reason: String) async {
         guard attention.asleep else { return }
-        do { try await note(Attention.wakeKind, subject: "sleep", row: ["reason": .string(reason)]) }
-        catch { attentionFailed("wake", subject: "sleep", error: error); return }
-        attentionSucceeded("wake", subject: "sleep")
+        // The wake is claimed before the first suspension: a second caller during the note finds her awake, so one sleep has one wake.
         attention.asleep = false
+        do { try await note(Attention.wakeKind, subject: "sleep", row: ["reason": .string(reason)]) }
+        catch { attention.asleep = true; attentionFailed("wake", subject: "sleep", error: error); return }
+        attentionSucceeded("wake", subject: "sleep")
         HeldSends.publish(dataRoot: dataRoot)
         await igniteReady(mode: "waking")
         await weighWaiting(mode: "waking")

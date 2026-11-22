@@ -117,7 +117,7 @@ extension MacActClosedLoop {
             self.renamed = renamed
         }
 
-        public func toJSON(valueChars: Int = MacPerceptionCompiler.affordanceValueChars) -> JSONValue {
+        public func toJSON() -> JSONValue {
             /// Raw values leave the comparison only as count and digest when canonically redacted.
             func emit(_ json: JSONValue?, raw: String?) -> JSONValue {
                 if let json { return json }

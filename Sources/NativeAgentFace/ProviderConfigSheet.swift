@@ -96,7 +96,7 @@ private struct ProviderConfigEditor: View {
                     .init(id: key, footer: "Save keeps the key on this Mac. Only Test checks it with the provider.", rows: [], block: form)
                 ]), receiver: .saveProviderConnection, session: session, validationFree: ["read", "remove"], close: onDone, perform: perform)
                 if ["anthropic", "anthropic_oauth_direct"].contains(provider.provider_id) {
-                    AnthropicOAuthDirectPanel(showConnectionTest: true)
+                    AnthropicOAuthDirectPanel()
                 } else if let oauth = oauthProvider { OAuthSignInButton(provider: oauth) }
             }
         }
@@ -125,7 +125,7 @@ private struct ProviderConfigEditor: View {
                 if case .provider(let saved) = reply,
                    let current = saved.snapshot?.providers.first(where: { $0.provider_id == provider.provider_id }) {
                     if submission.checking {
-                        return .init(words: "The account was read. Its saved credential does not confirm this test's verification write.", effects: .unknown)
+                        return .init(words: "Couldn't confirm the test result. Test again.", effects: .unknown)
                     }
                     baseline = current
                     return .init(words: "Account read. Your edits are kept.", effects: .none, accepted: true)
@@ -180,6 +180,6 @@ private struct ProviderConfigEditor: View {
         } catch { return .interrupted(error) }
     }
     private func unconfirmed() -> WireFailure {
-        .init(code: "provider_reply_unconfirmed", message: "The account owner did not confirm this operation.", cause: nil, effects: .unknown)
+        .init(code: "provider_reply_unconfirmed", message: "Not sure that saved. Check the account again.", cause: nil, effects: .unknown)
     }
 }

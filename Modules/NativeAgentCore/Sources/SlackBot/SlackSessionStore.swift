@@ -37,7 +37,7 @@ struct SlackSessionStore: Sendable {
                 entry = archived
             }
             let now = Date()
-            let stamp = SlackSocketModeLoop.nowString(now)
+            let stamp = NativeTimestampFormat.fractionalZulu(now)
             let resolved: String
             if case .string(let existing)? = entry["activeSessionId"] {
                 resolved = existing.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -177,11 +177,6 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
     @MainActor var activityWatch: ActivityWatchController { .shared }
     var attention: AttentionRouter { .shared }
     var approvals: ApprovalExecution { .app() }
-    func postMacNotification(title: String, body: String, userInfo: [String: String], soundName: String?) async -> NativeAgentNotificationPostResult {
-        await NativeAgentNotifications.postAndReport(
-            title: title, body: body, userInfo: userInfo, soundName: soundName, deadline: nil)
-    }
-
     func runAutoDoctor(checks: SwiftNativeDoctorChecks, dataRoot: URL) async throws -> DoctorReport {
         try await AppDoctorPort(dataRoot: dataRoot).runtime.runDoctor(
             repair: true, repairScope: .automatic, checks: checks)
@@ -470,14 +465,6 @@ extension NativeAgentEnginePorts {
 }
 
 private struct AppDeviceSyncPlatform: EngineDeviceSyncPlatform {
-    @MainActor func settingsHost() throws -> any QuietSettingsHost {
-        guard let appModel = ApplicationLifetime.shared.appModel else {
-            throw QuietSettingError.unavailable("The Mac's settings are not loaded yet. Try again in a moment.")
-        }
-        return AppQuietSettingsHost(appModel)
-    }
-    @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { BodyOAuthPlatform.self }
-    @MainActor func adoptProvider(_ id: String) async { await ApplicationLifetime.shared.appModel?.adoptProviderForBlankSurfaces(id) }
     @MainActor func runMacControl(path: String, bodyData: Data, turn: Turn, context: MacOperationContext) async throws -> JSONValue {
         try await TrustCenterMacControlPolicyProvider.run(path: path, bodyData: bodyData,
             dataRoot: PersistenceCore.defaultDataRoot(), turn: turn, context: context)

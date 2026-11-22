@@ -36,13 +36,9 @@ public struct SwiftNativeStudioStore: Sendable {
 
     /// Archive byte-exact overflow before trimming; history reads archives and the hot journal together.
     public func journalArchivePath(now: Date = Date()) -> URL {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyyMMdd'T'HHmmss"
         return studioRoot
             .appendingPathComponent("journal", isDirectory: true)
-            .appendingPathComponent("journal_archive_\(f.string(from: now)).jsonl")
+            .appendingPathComponent("journal_archive_\(NativeTimestampFormat.compactUTC(now)).jsonl")
     }
 
     /// Inventory every archive so recall, intake and work history share complete journal coverage.
@@ -75,14 +71,10 @@ public struct SwiftNativeStudioStore: Sendable {
 
     /// Sortable, filename-safe IDs keep arbitrary input out of paths.
     static func newIdentifier(prefix: String, now: Date = Date()) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyyMMdd'T'HHmmss"
         let random = UUID().uuidString.lowercased()
             .replacingOccurrences(of: "-", with: "")
             .prefix(8)
-        return "\(prefix)_\(f.string(from: now))_\(random)"
+        return "\(prefix)_\(NativeTimestampFormat.compactUTC(now))_\(random)"
     }
 
     // MARK: Consults

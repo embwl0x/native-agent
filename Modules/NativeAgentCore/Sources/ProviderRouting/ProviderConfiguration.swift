@@ -1,6 +1,5 @@
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
@@ -9,7 +8,7 @@ import os
 extension SwiftNativeProviderRouting {
     nonisolated static func providerConfigurationRevision(_ data: Data?) -> String {
         guard let data else { return "absent" }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return SHA256Hex.of(data)
     }
     public nonisolated func confirmsDisconnection(_ id: String) throws -> Bool {
         guard !id.isEmpty, id.allSatisfy({ "abcdefghijklmnopqrstuvwxyz0123456789_-".contains($0) }) else {
@@ -98,7 +97,7 @@ extension SwiftNativeProviderRouting {
                 guard var object = read.object else { return read }
                 do {
                     if trimmedId == "xai_oauth_direct" {
-                        object = try XAIOAuthCredentialStore.resolve(object, at: path)
+                        object = try XAIOAuthCredentialStore.resolve(object)
                     }
                     // Resolve the Keychain reference under the config writer's lock so readiness and model settings share one credential generation.
                     guard object["api_key"] == nil else {

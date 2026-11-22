@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import MacControl
@@ -19,7 +20,8 @@ extension ResearchFetchRecord {
         var selection: [String: JSONValue]
         let selected: String
         if let find {
-            let paragraphs = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+            // \r\n is one Character, never "\n": a CRLF page splits by isNewline, or it reads as one paragraph.
+            let paragraphs = text.split(whereSeparator: \.isNewline).map(String.init)
             let terms = find.split(whereSeparator: \.isWhitespace).map(String.init)
             var matches: [Int] = []
             for index in paragraphs.indices {
@@ -106,7 +108,11 @@ extension SwiftNativeResearchClient {
         }
         let response: ResearchHTTPResponse
         do {
-            response = try await http.getBounded(url: url, timeout: 25, maxBytes: 1_000_000)
+            do { response = try await http.getBounded(url: url, timeout: 25, maxBytes: 1_000_000) }
+            // A kept-alive connection the server already closed fails before any search ran; the GET is asked again on a fresh one.
+            catch let error as URLError where error.code == .networkConnectionLost {
+                response = try await http.getBounded(url: url, timeout: 25, maxBytes: 1_000_000)
+            }
         } catch {
             if Self.localServerIsDown(error, url: url) {
                 throw ResearchClientError.localServerNotRunning(url.absoluteString)
@@ -286,7 +292,7 @@ extension SwiftNativeResearchClient {
             "access": .string("Normal file permissions apply. This locator does not grant access."),
         ])
         let record = ResearchFetchRecord(
-            id: sourceID, url: url, text: text, createdAt: Self.isoTimestamp(Date()), verdict: verdict, retentionDirectory: receiptsDir, coverage: coverage,
+            id: sourceID, url: url, text: text, createdAt: NativeTimestampFormat.fractionalUTCOffset(Date()), verdict: verdict, retentionDirectory: receiptsDir, coverage: coverage,
             sourceReceipt: sourceReceipt
         )
         try Task.checkCancellation()

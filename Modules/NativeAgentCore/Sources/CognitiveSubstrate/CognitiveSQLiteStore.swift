@@ -140,7 +140,7 @@ public actor CognitiveSQLiteStore {
             model.domainState,
             model.verification.rawValue,
         ].joined(separator: "|"))
-        let ownerUpdatedAt = Self.motorOwnerTimestamp(model.updatedAt)?.timeIntervalSince1970
+        let ownerUpdatedAt = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(model.updatedAt)?.timeIntervalSince1970
         return try await dbQueue.write { db in
             if let existing = try Row.fetchOne(
                 db,
@@ -722,11 +722,6 @@ public actor CognitiveSQLiteStore {
             try createLivedMomentsSchema(db)
         }
         return migrator
-    }
-
-    private static func motorOwnerTimestamp(_ raw: String?) -> Date? {
-        guard let raw else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     static func jsonString(_ value: JSONValue) throws -> String {

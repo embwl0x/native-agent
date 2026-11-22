@@ -7,8 +7,6 @@ import PersistenceCore
 // MARK: - Errors
 
 public enum KnowledgeGraphReadError: Error, LocalizedError, Sendable {
-    /// Surface unreadable storage detail verbatim to the user.
-    case storeUnreadable(String)
     case malformedEnvelope(String)
     case paginationLimitExceeded(Int)
     case queryLimitExceeded(maximumBytes: Int, maximumTokens: Int)
@@ -16,8 +14,6 @@ public enum KnowledgeGraphReadError: Error, LocalizedError, Sendable {
 
     public var errorDescription: String? {
         switch self {
-        case .storeUnreadable(let detail):
-            return "Knowledge graph store could not be read: \(detail)"
         case .malformedEnvelope(let detail):
             return "Knowledge graph projection was malformed: \(detail)"
         case .paginationLimitExceeded(let limit):
@@ -45,9 +41,7 @@ public struct SwiftNativeKnowledgeGraphReader: Sendable {
     }
 
     public static func defaultPath() -> URL {
-        PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("memory.sqlite")
+        DataRootPaths.memoryDatabase(in: PersistenceCore.defaultDataRoot())
     }
 
     public func allEntitiesChecked(page: Int) async throws -> JSONValue {

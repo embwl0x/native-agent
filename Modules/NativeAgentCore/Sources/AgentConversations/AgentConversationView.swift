@@ -1,4 +1,3 @@
-import ChatTurnContracts
 import AgentWorkspace
 import Foundation
 import NativeAgentShared
@@ -178,6 +177,12 @@ public enum AgentConversationView {
         }
         result = withLive(result, row: row, dataRoot: dataRoot)
         guard case .object(var shown) = result else { return result }
+        // Most producers set `untrusted_remote_data` for any peer's words (it marks them as data, not instructions), so it cannot tell a trusted
+        // contact from an untrusted one; the person's trust in this contact is given beside it.
+        if shown["untrusted_remote_data"] != nil {
+            shown["trusted"] = .bool(PeerTrust.ownerTrusts(row.agent, dataRoot: dataRoot))
+            result = .object(shown)
+        }
         if shown["can_reply"] == .bool(true), let presence = peer.flatMap(AgentContactHealth.checkIn) {
             shown["can_reply_detail"] = .string(presence.detail)
             result = .object(shown)
@@ -188,7 +193,7 @@ public enum AgentConversationView {
         }
         // The read keeps its outcome independently of the prefixed retained send.
         let readOwn: Set<String> = shown["session_history"] == nil ? ["read", "nothing_to_read", "unavailable"] : ["read"]
-        if read, !details, let last = AgentConversationSession.string(shown["status"]), !readOwn.contains(last) {
+        if read, !details, let last = shown["status"]?.nonblankString, !readOwn.contains(last) {
             shown["status"] = .string("read")
             result = .object(shown)
         }
@@ -201,17 +206,6 @@ public enum AgentConversationView {
                 shown["effect"] = .string("none")
             }
             result = .object(shown)
-        }
-        // Consume the answering row's stamp, otherwise the cache writer's; history consumes each line separately.
-        let liveText: String? = if case .object(let live)? = shown["live"], live["untrusted_remote_data"] == .bool(true) {
-            AgentConversationSession.string(live["partial_reply"]) ?? AgentConversationSession.string(live["partial_text"]) ?? ""
-        } else { nil }
-        if let reply = AgentConversationSession.string(shown["reply"]) ?? liveText ?? (shown["untrusted_remote_data"] == .bool(true)
-            && shown["session_history"] == nil ? "" : nil) {
-            let transcript = (try? (lines ?? Result { try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity) }).get()) ?? []
-            let answered = transcript.last(where: { !$0.mine && $0.answers == row.operationID })
-                ?? ContactThread.Line(text: reply, stamp: row.cachedReplyStamp)
-            ContactThread.consume(answered) { PeerDataTaint.markConsumed(peer: $0, line: $1) }
         }
         return result
     }
@@ -241,8 +235,7 @@ public enum AgentConversationView {
         let value = row.sendEvidence
         let status = row.sendStatus
         // Unavailable continuation means its backing session is gone.
-        let deadThread = (AgentConversationSession.string(value["reason"]) ?? AgentConversationSession.string(
-            value["execution_error"])) == "continuation_unavailable"
+        let deadThread = (value["reason"]?.nonblankString ?? value["execution_error"]?.nonblankString) == "continuation_unavailable"
         // Terminal attention can be superseded; otherwise explain when a new send can proceed.
         var canReply = !["sending", "waiting"].contains(row.phase)
         var replyDetail: String?
@@ -358,8 +351,7 @@ public enum AgentConversationView {
     }
 
     static func reply(_ row: [String: JSONValue]) -> String? {
-        AgentConversationSession.string(row["reply"]) ?? AgentConversationSession.string(row["answer"])
-            ?? AgentConversationSession.string(row["findings"])
+        row["reply"]?.nonblankString ?? row["answer"]?.nonblankString ?? row["findings"]?.nonblankString
     }
 
     public static func read(_ receipt: JSONValue, agent: String, input: [String: JSONValue]) -> JSONValue {

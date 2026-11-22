@@ -24,10 +24,10 @@ import ChatToolParsing
 // Blueprint: | `TranscriptReading.swift` | TranscriptsFacade canonical file/index reads, retention and one-revision card/attachment preparation |
 extension TranscriptsFacade {
     nonisolated internal var chatRoot: URL {
-        dataRoot.appendingPathComponent("chat", isDirectory: true)
+        DataRootPaths.chatDirectory(in: dataRoot)
     }
     nonisolated internal var sessionsPath: URL {
-        chatRoot.appendingPathComponent("sessions.json")
+        DataRootPaths.chatSessionIndex(in: dataRoot)
     }
 
     /// Selection checks identity without preparing sidebar speech from message files.

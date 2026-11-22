@@ -93,17 +93,15 @@ public enum SessionIdentityLedger {
     public struct MintTally: Sendable, Equatable {
         public let mintedByMintSite: [String: Int]
         public let totalRows: Int
-        public let daysWithEvidence: Int
         public let unreadable: Int
         public let readIssue: String?
 
         public var totalMinted: Int { mintedByMintSite.values.reduce(0, +) }
 
-        public init(mintedByMintSite: [String: Int], totalRows: Int, daysWithEvidence: Int,
+        public init(mintedByMintSite: [String: Int], totalRows: Int,
                     unreadable: Int = 0, readIssue: String? = nil) {
             self.mintedByMintSite = mintedByMintSite
             self.totalRows = totalRows
-            self.daysWithEvidence = daysWithEvidence
             self.unreadable = unreadable
             self.readIssue = readIssue
         }
@@ -120,7 +118,6 @@ public enum SessionIdentityLedger {
             let read = try await TurnTracePersistLane(dataRootOverride: dataRoot)
                 .events(.init(kinds: [SessionIdentityTrace.kind], from: cutoff, through: now))
             var minted: [String: Int] = [:]
-            var days: Set<Date> = []
             var total = 0
             var unreadable = read.unreadable
             for event in read.events {
@@ -134,12 +131,11 @@ public enum SessionIdentityLedger {
                     continue
                 }
                 total += 1
-                days.insert(TurnTracePersistLane.dayCalendar.startOfDay(for: event.ts))
                 if resolvedBy == SessionIdentityTrace.Resolution.minted.rawValue { minted[site, default: 0] += 1 }
             }
-            return MintTally(mintedByMintSite: minted, totalRows: total, daysWithEvidence: days.count, unreadable: unreadable)
+            return MintTally(mintedByMintSite: minted, totalRows: total, unreadable: unreadable)
         } catch {
-            return MintTally(mintedByMintSite: [:], totalRows: 0, daysWithEvidence: 0, readIssue: error.localizedDescription)
+            return MintTally(mintedByMintSite: [:], totalRows: 0, readIssue: error.localizedDescription)
         }
     }
 

@@ -51,7 +51,7 @@ enum MobileIntentRuntime {
         return id
     }
 
-    static func reply(to text: String, sessionID: String? = nil) async throws -> String {
+    static func reply(to text: String, sessionID: String? = nil, expectedPairing: String) async throws -> String {
         try prepare()
         await iCloudBridge.shared.deviceIncomingSetupTask?.value
         await ChatStore.shared.restorationTask?.value
@@ -78,7 +78,7 @@ enum MobileIntentRuntime {
                 case .failed, .stopped:
                     result = .failure(failure(message.metadata?["errorDetail"] ?? message.text))
                 case .incomplete:
-                    let status = message.metadata?["status"] ?? "Reply ending is unconfirmed."
+                    let status = message.metadata?["status"] ?? "The reply may have ended early."
                     let words = message.text.isEmpty ? status : "\(message.text)\n\n\(status)"
                     result = .failure(failure(words))
                 case nil: return
@@ -91,7 +91,7 @@ enum MobileIntentRuntime {
             waiters.disarm(id)
         }
         let client = MacBridgeClient()
-        _ = try await client.sendMessage(text, sessionID: session, messageID: id)
+        _ = try await client.sendMessage(text, sessionID: session, messageID: id, expectedPairing: expectedPairing)
         await bridge.pollIncomingNow()
         while result == nil {
             try Task.checkCancellation()
@@ -134,9 +134,13 @@ enum MobileIntentRuntime {
 
     private static func receiveRetainedChatMessage(_ message: BridgeMessage) {
         // Cold intents settle through the scene's shared store; unrelated transcript rows arrive through snapshots to avoid duplicates.
-        guard ChatStore.visibleStore == nil, let id = message.correlationID,
-              ChatStore.shared.pendingExchanges[id] != nil else { return }
-        Task { await ChatStore.shared.receiveICloudReply(message) }
+        guard ChatStore.visibleStore == nil, let id = message.correlationID else { return }
+        // Chat's saved exchanges load from disk at launch: judge the message against them once they are restored, never before.
+        Task { @MainActor in
+            await ChatStore.shared.restorationTask?.value
+            guard ChatStore.shared.pendingExchanges[id] != nil else { return }
+            await ChatStore.shared.receiveICloudReply(message)
+        }
     }
 
     nonisolated static func failure(_ message: String) -> NSError {

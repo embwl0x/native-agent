@@ -11,7 +11,7 @@ import ToolExecution
 import TurnTrace
 import NativeAgentShared
 import AuthoredCapabilities
-// Blueprint: | `AgentWorkspaceBinding.swift` | Workspace ports and shared recent-life reads bind the originating turn without copying authority |
+// Blueprint: | `AgentWorkspaceBinding.swift` | Workspace ports bind the originating turn. Recent-life readers supply turn facts and trace breath. |
 
 package enum ChatWorkspaceBinding {
     package static func operation(turn: Turn?, invocation: ChatToolInvocation) -> WorkspaceOperation {
@@ -37,16 +37,14 @@ package enum ChatWorkspaceBinding {
         await AgentScreen.glance(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, turn: at, message: message)
     }
 
-    package static func readElsewhere(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String?,
-                                     at: Date) async -> AgentScreen.ElsewhereReading? {
-        await AgentScreen.readElsewhere(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, turn: at,
-                                since: nil)
+    package static func readElsewhere(dataRoot: URL, scope: String?, at: Date) async -> AgentScreen.ElsewhereReading? {
+        await AgentScreen.readElsewhere(dataRoot: dataRoot, scope: scope, turn: at, since: nil)
     }
 
-    package static func breath(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, peer: Bool, since: Date?,
+    package static func breath(turn: Turn, dataRoot: URL, scope: String, peer: Bool, since: Date?,
                                shown: Set<String>, at: Date) async -> (text: String?, read: Bool, acts: [String]) {
-        let reading = await AgentScreen.breath(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, peer: peer,
-                         since: since, shown: shown, now: at)
+        let reading = await AgentScreen.breath(dataRoot: dataRoot, scope: scope, peer: peer,
+                                               since: since, shown: shown, now: at)
         if let text = reading.text {
             TurnTraceBus.fireFromContext(kind: "context.breath", sessionId: scope,
                 payload: .object(["lines": .array(text.components(separatedBy: "\n").map(JSONValue.string)),
@@ -55,10 +53,10 @@ package enum ChatWorkspaceBinding {
         return reading
     }
 
-    package static func elsewhere(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, surface: String, peer: Bool, at: Date?,
+    package static func elsewhere(dataRoot: URL, scope: String, surface: String, peer: Bool, at: Date?,
                                   reading: AgentScreen.ElsewhereReading?, shown: Set<String>) async -> String? {
-        await AgentScreen.elsewhere(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, surface: surface, peer: peer,
-                                  turn: at, reading: reading, shown: shown)
+        await AgentScreen.elsewhere(dataRoot: dataRoot, scope: scope, surface: surface, peer: peer,
+                                    turn: at, reading: reading, shown: shown)
     }
 
     private struct Conversations: AgentWorkspaceConversationPort {
@@ -71,17 +69,6 @@ package enum ChatWorkspaceBinding {
         func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord] {
             let store = AgentConversationStore(dataRoot: dataRoot)
             return try locked ? store.records() : store.recordsUnlocked()
-        }
-        func acceptedSends(dataRoot: URL) throws -> Set<String> {
-            var accepted: Set<String> = []
-            for row in try AgentConversationStore(dataRoot: dataRoot).recordsUnlocked() {
-                if row.phase != "sending", AgentConversationDelivery.accepted(row) { accepted.insert(row.operationID) }
-                // Earlier sends keep their own positive evidence after the current operation advances.
-                for exchange in (row.exchanges ?? []) + (row.releasing ?? []) where exchange.id != row.operationID {
-                    if exchange.reply != nil || ["delivered", "read"].contains(exchange.status) { accepted.insert(exchange.id) }
-                }
-            }
-            return accepted
         }
         func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord? {
             try AgentConversationStore(dataRoot: dataRoot).find(scopeSessionID: scopeSessionID, agent: agent, label: label)
@@ -115,7 +102,7 @@ package enum ChatWorkspaceBinding {
             guard contact.transport == .grokBot else { return }
             // A hand-over belongs to the requesting chat even when viewed elsewhere.
             for (answer, words) in answers {
-                guard try store.read(answer, peer: id).conversationID == scope else { continue }
+                guard try store.kept(answer, peer: id)?.conversationID == scope else { continue }
                 try store.shown(answer, peer: id, by: "the room") { $0 == words }
             }
         }
@@ -141,7 +128,7 @@ package enum ChatWorkspaceBinding {
                 let since = now.addingTimeInterval(-7 * 86_400)
                 var names: [(name: String, changed: Date, builtIn: Bool)] = []
                 for part in tools where callable.contains(part.id) {
-                    let changed = CapabilityLifecycle.date(part.updatedAt ?? part.createdAt) ?? .distantPast
+                    let changed = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(part.updatedAt ?? part.createdAt) ?? .distantPast
                     let builtIn = part.fields["overrides"] == .string("built_in") || part.fields["origin"]?.objectValue?["by"] == .string("pack")
                     if !builtIn || changed >= since { names.append((part.name + " (ability)", changed, builtIn)) }
                 }
@@ -183,7 +170,7 @@ package enum ChatWorkspaceBinding {
             do { return try SwiftToolDispatcher.integrationGate(tool: name, input: [:], turn: nil) } catch { return nil }
         }
         func withWebScheme(_ value: String) -> String { SwiftToolDispatcher.withWebScheme(value) }
-        func markConsumed(peer: String) { PeerDataTaint.markConsumed(peer: peer) }
+        func ownerTrusts(_ source: String, dataRoot: URL) -> Bool { PeerTrust.ownerTrusts(source, dataRoot: dataRoot) }
         func builderSourceRepoRoot(dataRoot: URL) -> URL? { SwiftToolDispatcher.builderSourceRepoRoot(dataRoot: dataRoot) }
         var listedPeerState: String { AgentPeerContactState.listed.rawValue }
     }

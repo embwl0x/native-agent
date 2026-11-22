@@ -137,13 +137,6 @@ public actor SwiftNativeToolRegistry {
         let all = try await listTools()
         return all.first { $0.id == id }
     }
-
-    // MARK: ISO timestamp helper
-
-    /// Use the shared fractional ISO convention with +00:00 so persisted timestamps match their consumers.
-    public nonisolated static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalUTCOffset(date)
-    }
 }
 
 /// Listing and dispatch share the checked record projection; name damage stays row-local while invalid authored fields fail their read.

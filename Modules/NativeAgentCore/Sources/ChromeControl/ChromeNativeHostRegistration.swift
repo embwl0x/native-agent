@@ -16,10 +16,9 @@ public enum ChromeNativeHostRegistration {
 
     static func install(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        relayURL: URL? = nil,
         bundleIdentifier: String? = currentAppBundleIdentifier()
     ) throws {
-        let relay = relayURL ?? bundledRelayURL()
+        let relay = bundledRelayURL()
         guard relay.path.hasPrefix("/"),
               FileManager.default.isExecutableFile(atPath: relay.path) else {
             throw ChromeControlRuntimeError.relayUnavailable

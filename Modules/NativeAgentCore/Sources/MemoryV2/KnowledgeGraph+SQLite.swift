@@ -25,12 +25,6 @@ extension KnowledgeGraphStore {
     public static let sqliteIncidentEdgeLimit = 2_000
     public static let sqliteCompleteSnapshotRelationshipLimit = 100_000
 
-    /// Use the indexer's ISO-8601 shape for lexicographic recency ordering; Z and +00:00 differ only after seconds, and ranking never depends on a subsecond
-    /// tie.
-    static func orderingTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
-    }
-
     /// Read counts, rows and incident edges in one transaction so the envelope cannot mix graph generations.
     public static func pageFromMemoryV2(
         memoryDir: URL,
@@ -138,7 +132,7 @@ extension KnowledgeGraphStore {
                 // malformed timestamps to oldest, matching the Swift reranker's recency rule.
                 arguments.append(qLower)
                 arguments.append(qLower)
-                arguments.append(Self.orderingTimestamp(now))
+                arguments.append(NativeTimestampFormat.fractionalZulu(now))
                 arguments.append(sqliteSearchCandidateLimit)
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT id, name, type, summary, aliases_json, mention_count,

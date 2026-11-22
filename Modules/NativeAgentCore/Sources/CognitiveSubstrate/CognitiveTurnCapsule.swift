@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import Experiences
@@ -61,13 +62,10 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
         memoryActivation: [String: Double] = [:],
         suppressedMemory: [String: [[String]]] = [:]
     ) {
-        func bounded(_ text: String, to limit: Int) -> String {
-            text.count <= limit ? text : String(text.prefix(limit))
-        }
         // Sort strength then lexical identity so equal weights cannot thrash packet fingerprints or selection caches.
         func cappedByWeight(_ dict: [String: Double], cap: Int, keyLimit: Int) -> [String: Double] {
             var entries: [(key: String, value: Double)] = dict.map { entry in
-                (key: bounded(entry.key, to: keyLimit), value: (entry.value).clamped01())
+                (key: TextClipping.prefix(entry.key, to: keyLimit), value: (entry.value).clamped01())
             }
             entries.sort { lhs, rhs in
                 if lhs.value == rhs.value { return lhs.key < rhs.key }
@@ -80,12 +78,12 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
             return result
         }
         self.terms = cappedByWeight(terms, cap: 16, keyLimit: 64)
-        self.unresolvedQuestion = unresolvedQuestion.map { bounded($0, to: 200) }
+        self.unresolvedQuestion = unresolvedQuestion.map { TextClipping.prefix($0, to: 200) }
         self.completionWindow = completionWindow
-        self.activeTask = activeTask.map { bounded($0, to: 200) }
-        self.goal = goal.map { bounded($0, to: 200) }
+        self.activeTask = activeTask.map { TextClipping.prefix($0, to: 200) }
+        self.goal = goal.map { TextClipping.prefix($0, to: 200) }
         self.residentWorkIntent = residentWorkIntent
-        self.predictedToolGroups = Set(predictedToolGroups.sorted().prefix(8).map { bounded($0, to: 64) })
+        self.predictedToolGroups = Set(predictedToolGroups.sorted().prefix(8).map { TextClipping.prefix($0, to: 64) })
         self.memoryActivation = cappedByWeight(memoryActivation, cap: 32, keyLimit: 128)
         self.suppressedMemory = suppressedMemory
     }

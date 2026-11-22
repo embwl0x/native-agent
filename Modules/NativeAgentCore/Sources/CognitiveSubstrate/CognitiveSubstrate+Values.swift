@@ -1,15 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Values.swift` | `CognitiveSubstrate` `metadataString` `isConversationalPresenceStatement` `isOperationalSubconsciousNoise` |
+// Blueprint: | `CognitiveSubstrate+Values.swift` | `CognitiveSubstrate` `isConversationalPresenceStatement` `isOperationalSubconsciousNoise` |
 
 extension CognitiveSubstrate {
-    func metadataString(_ value: JSONValue?) -> String? {
-        guard case .string(let raw)? = value else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
 
     // The Desk owns requested tasks; cognition cannot extract commitments from conversation.
 
@@ -117,11 +111,6 @@ extension CognitiveSubstrate {
             out.append(id)
         }
         return out
-    }
-
-    func bounded(_ text: String, maxCharacters: Int) -> String {
-        guard maxCharacters >= 0, text.count > maxCharacters else { return text }
-        return String(text.prefix(maxCharacters))
     }
 
     func capsuleSignalText(_ text: String, maxCharacters: Int) -> String {

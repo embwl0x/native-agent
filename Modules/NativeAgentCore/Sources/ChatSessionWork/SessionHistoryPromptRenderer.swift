@@ -127,7 +127,10 @@ public enum SessionHistoryPromptRenderer {
     package static func semanticRecallQuery(userMessage: String, recentTurns: [String]) -> String {
         guard ContextCorrectionScope.isReferentialFollowup(userMessage),
               !recentTurns.isEmpty else { return userMessage }
-        let recent = recentTurns.suffix(2).map { String($0.prefix(600)) }.joined(separator: "\n")
+        // A qualification or revised limit often comes at the end. Keep both ends within the same recall budget.
+        let recent = recentTurns.suffix(2).map { text in
+            text.count <= 600 ? text : String(text.prefix(398)) + "… " + String(text.suffix(200))
+        }.joined(separator: "\n")
         return String(userMessage.prefix(400)) + "\nRecent conversation:\n" + recent
     }
 
@@ -327,12 +330,9 @@ public enum SessionHistoryPromptRenderer {
         "where", "with", "would", "yeah", "you", "your",
     ]
 
-    static func normalize(
-        _ text: String,
-        inputCap: Int = normalizationInputCharacterCap
-    ) -> String {
-        let bounded = text.count > inputCap
-            ? String(text.prefix(inputCap))
+    static func normalize(_ text: String) -> String {
+        let bounded = text.count > normalizationInputCharacterCap
+            ? String(text.prefix(normalizationInputCharacterCap))
             : text
         return flatten(ChatSecretRedactor.redactText(bounded))
     }

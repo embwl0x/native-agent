@@ -7,7 +7,6 @@ import Experiences
 import ProviderRouting
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import ToolRegistry
 import ToolExecution
 import MacControl
@@ -33,9 +32,7 @@ extension ChatToolOutcome {
         // The refusing owner's own answer sits beside the receipt or inside its result, where the door hands an action's answer back.
         let owned: [String: JSONValue] = if case .object(let inner)? = object["result"] { inner } else { [:] }
         func text(_ key: String, in fields: [String: JSONValue]? = nil) -> String? {
-            guard case .string(let raw)? = (fields ?? object)[key] else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : value
+            (fields ?? object)[key]?.trimmedString
         }
         func isCode(_ value: String) -> Bool {
             value.count <= 80 && value.range(of: "^[a-z][a-z0-9_]*$", options: .regularExpression) != nil

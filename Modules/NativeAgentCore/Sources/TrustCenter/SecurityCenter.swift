@@ -118,7 +118,7 @@ public actor SwiftNativeSecurityCenter {
                 recentReceipts: recent
             )
         }
-        let security = Self.object(policy["securityPolicy"])
+        let security = JSONValue.objectOrEmpty(policy["securityPolicy"])
         let permission = policy["permissionLevel"]?.scalarText ?? "balanced"
         let developerMode = Self.bool(policy["developerMode"], default: false)
         let fullMac = Self.fullMacActive(policy: policy)
@@ -189,16 +189,15 @@ public actor SwiftNativeSecurityCenter {
         case .failure(let error):
             detail += " Consent details could not be read: \(error.localizedDescription)"
         case .success(let reading):
-            detail += " \(reading.receipts.count) retained receipts read in this view."
+            detail += " \(reading.receipts.count) \(reading.receipts.count == 1 ? "entry" : "entries") in the log so far."
             if !reading.issues.isEmpty { detail += " " + reading.issues.joined(separator: " ") }
         }
-        detail += " Retained history does not establish that every gated action was recorded."
-        return SecurityStatusFlag(id: "audit_receipts", title: "Audit Receipts", status: status, detail: detail, enabled: enabled == true)
+        return SecurityStatusFlag(id: "audit_receipts", title: "Security log", status: status, detail: detail, enabled: enabled == true)
     }
 
     /// "Pause everything": every door that admits an action reads it here.
     public static func killSwitchRefusal(policy: [String: JSONValue]) -> (reason: String, remedy: JSONValue)? {
-        guard bool(object(policy["securityPolicy"])["killSwitchEnabled"], default: false) else { return nil }
+        guard bool(JSONValue.objectOrEmpty(policy["securityPolicy"])["killSwitchEnabled"], default: false) else { return nil }
         return ("trust/policy.json securityPolicy.killSwitchEnabled=true stops this action.",
                 Repair.why(owner: "trust/policy.json securityPolicy.killSwitchEnabled", tap: "Trust > Access > Security Center > Pause everything"))
     }
@@ -258,10 +257,10 @@ public actor SwiftNativeSecurityCenter {
                     """)
         }
         let policy = snapshot.policy
-        let security = Self.object(policy["securityPolicy"])
+        let security = JSONValue.objectOrEmpty(policy["securityPolicy"])
         let canonicalTool = Self.policyToolName(tool)
         let trustedRoots = Self.trustedWorkspaceRoots(
-            filePolicy: Self.object(policy["filePolicy"]),
+            filePolicy: JSONValue.objectOrEmpty(policy["filePolicy"]),
             dataRoot: dataRoot
         )
         let profile = try Self.profile(
@@ -326,7 +325,7 @@ public actor SwiftNativeSecurityCenter {
                 : "\(originAssessment.reason): this request is not authenticated, so it needs the person."))
         }
 
-        let now = Self.isoTimestamp(evaluatedAt)
+        let now = NativeTimestampFormat.fractionalZulu(evaluatedAt)
         return SecurityToolEnvelope(
             id: UUID().uuidString,
             createdAt: now,
@@ -362,7 +361,7 @@ public actor SwiftNativeSecurityCenter {
         let failure = error as? ToolFailureError
         return SecurityToolEnvelope(
             id: UUID().uuidString,
-            createdAt: Self.isoTimestamp(evaluatedAt),
+            createdAt: NativeTimestampFormat.fractionalZulu(evaluatedAt),
             tool: canonicalTool,
             surface: origin.surface,
             origin: origin,
@@ -437,7 +436,7 @@ public actor SwiftNativeSecurityCenter {
             return OriginAssessment(trusted: false, reason: "\(surface) origin is not in allowlist", isRemote: true)
         }
         if surfaceProfile.isIOSRemote {
-            let macControl = Self.object(policy["macControlPolicy"])
+            let macControl = JSONValue.objectOrEmpty(policy["macControlPolicy"])
             // Only a transport-verified command may use the current phone grant.
             let signedFullMac = Self.fullMacActive(policy: policy)
                 && origin.commandSignatureVerified == true

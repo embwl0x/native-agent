@@ -242,7 +242,7 @@ extension NativeAgentEngine {
             }
         }
         for job in snapshot.agentJobs.items {
-            let row = WorkOverviewRead.row(for: job, now: snapshot.now).id
+            let row = WorkOverviewRead.row(for: job).id
             key(row, [.mac("inspect", opens: DeskMacPlace.inspect(row).link)])
         }
         for bot in snapshot.timedBots { key("timer-bot:" + bot.id.uuidString, open: "page:bots") }
@@ -337,7 +337,7 @@ extension NativeAgentEngine {
                      "recentlyDone": overviewRows(reading.recentlyDone, omitted: reading.omittedRecentlyDone)])
         } ?? .null
         let jobs: [JSONValue] = snapshot.agentJobs.items.map { job -> JSONValue in
-            let row = WorkOverviewRead.row(for: job, now: now)
+            let row = WorkOverviewRead.row(for: job)
             return .object(["id": .string(row.id), "title": .string(row.title), "summary": .string(row.summary),
                             "state": .string(row.stateLabel(at: now)), "at": .string(row.updatedAt),
                             "terminal": .bool(job.state.isTerminal), "needsYou": .bool(job.state == .needsYou)])

@@ -13,8 +13,6 @@ import ApprovalInbox
 // Blueprint: | `InboxCardActions.swift` | `AppInboxCardActionEffects`: native navigation for core inbox transactions |
 
 struct AppInboxCardActionEffects: InboxCardActionEffects {
-    let inbox: InboxFacade
-
     func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool, turn: Turn) async throws {
         try await Self.answerRequest(id: id, action: action, dataRoot: dataRoot, quiet: quiet, turn: turn)
     }
@@ -72,10 +70,6 @@ struct AppInboxCardActionEffects: InboxCardActionEffects {
 
     @MainActor func openApprovals() async {
         NotificationCenter.default.post(name: .openApprovalsRequest, object: nil)
-    }
-
-    @MainActor func openDesk() async {
-        NotificationCenter.default.post(name: .openCommandRouteRequest, object: "desk")
     }
 
     @MainActor func openChatDraft(_: String) async throws {

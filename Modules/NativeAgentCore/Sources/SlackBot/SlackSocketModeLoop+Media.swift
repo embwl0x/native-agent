@@ -4,7 +4,7 @@ import ChatTurnRuntime
 import PersistenceCore
 import NativeAgentShared
 import BackgroundLoops
-// Blueprint: | `SlackSocketModeLoop+Media.swift` | Complete attachment hydration precedes chat; preparation failures retain their own reply |
+// Blueprint: | `SlackSocketModeLoop+Media.swift` | Readable Slack input and named attachment failures reach the same turn |
 
 extension SlackSocketModeLoop {
     enum AttachmentFailure: Error {
@@ -44,8 +44,9 @@ extension SlackSocketModeLoop {
     func attachmentAwareReply(_ hydration: AttachmentHydration, original: SlackInboundMessage, sessionId: String,
                               handler: SlackHandler) async throws -> SlackSocketModeReply {
         let inbound = hydration.inbound
-        if let notice = hydration.notice { return SlackSocketModeReply(text: notice) }
+        let notice = hydration.notice
         if inbound.text.isEmpty && inbound.attachments.isEmpty {
+            if let notice { return SlackSocketModeReply(text: notice) }
             throw SlackSocketModeError.api("No readable message was received. Send text or a supported attachment.")
         }
         let preview = replyPreview(for: original, sessionId: sessionId)
@@ -55,7 +56,7 @@ extension SlackSocketModeLoop {
         defer { SessionTurnDelivery.unmount(dataRoot: dataRoot, sessionID: sessionId, runID: runID, lease: lease) }
         let reply: SlackSocketModeReply
         do {
-            reply = try await generateReply(inbound, sessionId: sessionId, handler: handler)
+            reply = try await generateReply(inbound, attachmentNotice: notice, sessionId: sessionId, handler: handler)
         } catch {
             await settle { await preview.finish() }
             throw error
@@ -81,7 +82,7 @@ extension SlackSocketModeLoop {
                 if Task.isCancelled || error is CancellationError { break }
                 failures.append((index, (error as? AttachmentFailure) ?? .transient(Self.redact(error.localizedDescription))))
                 await writeState([
-                    "lastInboundAttachmentErrorAt": .string(Self.nowString()),
+                    "lastInboundAttachmentErrorAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
                     "lastInboundAttachmentError": .string(Self.redact(String(describing: error))),
                 ])
             }

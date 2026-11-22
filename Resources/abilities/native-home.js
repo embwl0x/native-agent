@@ -95,7 +95,7 @@ function face(input) {
                 at: q.at, tone: "quiet", open: open(q.key)});
             if (q.kind === "body") return row({id: q.key, title: q.title, detail: q.assignee, value: "Open body work", at: q.at,
                 open: open(q.key)});
-            if (q.kind === "reviews") return row({id: q.key, title: "Memories to review", detail: "app {action:\"memory.proposals\"}",
+            if (q.kind === "reviews") return row({id: q.key, title: "Memories to review", detail: "Waiting for Keep or Don't keep",
                 value: q.count + (q.capped ? "+" : ""), open: open(q.key)});
             if (q.kind === "input") return row({id: q.key, title: q.name, value: "Asks for input", at: q.at, tone: "attention",
                 open: open(q.key)});

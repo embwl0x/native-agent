@@ -69,9 +69,6 @@ public enum MobileTrustAction: Sendable {
         }
     }
 
-    public static let fullMacTitle = "Enable Full Mac access?"
-    public static let outsideFullMacRefusal = "Full Mac allows access outside workspaces. Choose Safe, Work mode, or Builder before changing Outside default."
-    public static let fullMacButton = "Enable Full Mac"
     public static let fullMacMessage = """
     I will be able to read and modify files anywhere, run shell commands, control the system, and move or trash files across app surfaces.
 

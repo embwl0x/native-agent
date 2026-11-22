@@ -1,4 +1,5 @@
 import EngineRuntime
+import NativeAgentShared
 import ActivityWatch
 import AgentConversations
 import AppToolRuntime
@@ -183,7 +184,7 @@ extension AppQuietToolHost {
 
     func connections(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
         func text(_ key: String) -> String {
-            input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            JSONValue.trimmedScalarTextOrEmpty(input[key])
         }
         func outcome(_ result: AppMutationResult) -> JSONValue {
             .object(["status": .string(result.succeeded ? "ok" : "failed"), "detail": .string(result.agentMessage)])
@@ -199,7 +200,7 @@ extension AppQuietToolHost {
         case "telegram_disconnect":
             // Defer Telegram poll restart until all turns finish because shutdown awaits them, including this turn.
             // Read metadata independently so a Keychain fault cannot erase settings or block revocation.
-            let result = await appModel.clearTelegramToken(restartPollLoop: false)
+            let result = await appModel.clearTelegramToken()
             let loops = appModel.backgroundLoopsManager
             Task.detached {
                 await TelegramTurns.shared.waitUntilAllIdle()

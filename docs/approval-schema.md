@@ -44,10 +44,10 @@ The phone sends the envelope in a signed CloudKit `BridgeMessage` with
 | `faceAction` | `page`, `row`, `action`, optional `value`: the row's own call runs through the person's door as this paired phone. Every card is its matter's Inbox row (`page` `inbox`, `row` the matter id: an approval's own id, `interaction:<id>` for an ask), so this is how an approval or an ask is answered. |
 | `approveApproval`, `rejectApproval`, `cancelApproval` | Installed builds 61/63: `approvalId` reaches the same approval transaction with verified signed-phone provenance; decision and execution remain separate, with `approvalJSON` and `approvalReadbackRevision` readback. |
 | `inboxAction`, `interaction_action` | Installed builds 61/63: `itemId`/`actionId` translate to the canonical Inbox row; sealed interaction answers bind `sessionID`, `interactionID`, `revision`, `action`, optional `choice`/`scope`. They select that row's answer or check saved owner state. Credential-bearing answers refuse with protected Mac entry as the remedy. |
-| `approveMemoryProposal`, `rejectMemoryProposal` | `proposalId`: decide a staged memory proposal. |
-| `submitDeskTask` | `title`, `objective`: create a Desk item and start a line of theirs that carries it ([Desk](DESK.md)). |
-| `set_trust_policy` | Validated trust change through the Mac policy owner. |
 | `mac_control` | Remote Mac control through its policy/dispatch owner. |
+
+Memory proposal decisions and Trust changes use the Memories and Trust rows
+through `faceAction`.
 
 These are iOS wire actions, not the agent's tool names. The agent uses its one
 door, `app`, and its action registry.
@@ -260,10 +260,9 @@ Approve alone means Just this; after-card peers keep their floor. Inline
 continuations likewise require recorded `peerSources` and
 `elevatedPeerSources`. A refusal preserves the saved work and its unresolved
 obligations, reports the unavailable provenance, and runs no continuation;
-it never invents a principal or an empty steering verdict. A claimed authored
-checkpoint is saved back through its owner on provenance refusal, with
-`checkpoint_preserved` reporting whether that write succeeded; a failed save
-owes repair instead of claiming preservation. Previews record no repair debt.
+it never invents a principal or an empty steering verdict. On provenance refusal,
+settlement releases the original authored checkpoint claim. A failed release is
+recorded in `settlement_failures` and owes repair. Previews record no repair debt.
 
 Current owners under `Modules/NativeAgentCore/Sources/`:
 
@@ -359,13 +358,6 @@ The retired `memory.repair` truncated-row executor has no registration. Its
 retirement checked retained approvals, execution fences and settlement debts;
 historical completed markers remain untouched. Kind backfill remains data-gated
 under [the memory contract](MEMORY_SYSTEM_MAP.md).
-An application error remains owed for inspection at its domain owner; it is
-never evidence that an already returned effect failed. REM application checks
-Memory repair commits its one-shot outcome at `memory/repairs/executions.json`
-before returning to that settlement owner. Relaunch reads the completed result
-and original safety-backup path without rerunning edits. An application recorded
-as started without a completed result stays unknown and owes inspection; missing
-approval annotation never authorizes another repair.
 An unknown application outcome remains owed for inspection at its domain owner;
 it is never evidence that an already returned effect failed. A definitive
 no-effect refusal is a terminal `refused` execution with `Not done: <reason>`

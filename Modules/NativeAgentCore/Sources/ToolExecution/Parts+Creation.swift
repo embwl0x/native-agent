@@ -119,20 +119,41 @@ extension Parts {
     private func save(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue?,
         invocation: Invocation, keptSelf: (kept: OwnedProgramStore.Candidate, why: String?)?) async throws -> [String: JSONValue] {
         let started = ContinuousClock.now
+        let timing = SaveTiming(started: started)
+        switch try await prepareSave(input, steer: steer, fullMac: fullMac, origin: given, invocation: invocation, timing: timing) {
+        case .finished(let receipt):
+            return receipt
+        case .draft(let named, let existing, let id, let opening, let timing):
+            return try await prepareSaveCandidate(input, steer: steer, fullMac: fullMac, origin: given, invocation: invocation,
+                keptSelf: keptSelf, named: named, existing: existing, id: id, opening: opening, timing: timing)
+        }
+    }
+
+    private enum SavePreparation: Sendable {
+        case finished([String: JSONValue])
+        case draft(named: String, existing: [String: JSONValue]?, id: String, opening: (kept: String, why: String)?, timing: SaveTiming)
+    }
+
+    private struct SaveTiming: Sendable {
+        let started: ContinuousClock.Instant
         // A phase this save never ran is absent from its timing, never a zero.
         var validateMS: Double?, proofMS: Double?
         var descriptionNote: String?
         var whyNote: String?
+
+        /// Measure a save phase against its original start time.
         func milliseconds(since start: ContinuousClock.Instant) -> Double {
             let elapsed = start.duration(to: .now).components
             return Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
         }
+
+        /// Attach the notes and measurements this save produced.
         func timed(_ receipt: [String: JSONValue]) -> [String: JSONValue] {
             var receipt = receipt
             for (key, note) in [("description_note", descriptionNote), ("why_note", whyNote)] {
                 if let note {
                     receipt[key] = .string(note)
-                    receipt["detail"] = .string((Self.string(receipt, "detail").map { $0 + " " } ?? "") + note + ".")
+                    receipt["detail"] = .string((Parts.string(receipt, "detail").map { $0 + " " } ?? "") + note + ".")
                 }
             }
             var timing: [String: JSONValue] = ["write_ms": .double(max(0, milliseconds(since: started) - (validateMS ?? 0) - (proofMS ?? 0)))]
@@ -140,7 +161,14 @@ extension Parts {
             timing["proof_ms"] = proofMS.map(JSONValue.double)
             return receipt.merging(["timing": .object(timing)]) { _, value in value }
         }
-        func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
+    }
+
+    private func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
+
+    /// Admit the request and settle turn, set-aside or occupied-name saves at their existing boundaries.
+    private func prepareSave(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue?,
+        invocation: Invocation, timing: SaveTiming) async throws -> SavePreparation {
+        var timing = timing
         guard case .object(let declaredArguments)? = Self.fields(Self.saveArgumentsSchema)["properties"] else {
             throw refuse("The installed ability.save schema has no argument properties. Repair that schema before saving.")
         }
@@ -163,7 +191,7 @@ extension Parts {
         }
         // A new part never takes a shipped name; revising a part the agent has, shipped ones included, is the agent's call. The turn program is the
         // agent's own: it is revised, never created.
-        if existing == nil, id == Self.turnID { return timed(try saveTurn(input, steer: steer, fullMac: fullMac, invocation: invocation)) }
+        if existing == nil, id == Self.turnID { return .finished(timing.timed(try saveTurn(input, steer: steer, fullMac: fullMac, invocation: invocation))) }
         if existing == nil, let shipped = try AbilityStore.reservedPart(id) {
             throw refuse("\(shipped) is reserved for the app's own part. Choose another id.")
         }
@@ -179,7 +207,7 @@ extension Parts {
             guard text.count <= Self.whyLimit else { throw refuse("why is at most \(Self.whyLimit) characters after trimming; this one has \(text.count).") }
             why = text
             if !trial && !settingAside {
-                whyNote = "The reason was not kept because only trials and setting a trial aside have a saved reason record"
+                timing.whyNote = "The reason was not kept because only trials and setting a trial aside have a saved reason record"
             }
         }
         // The stem's own record decides whether a trial is open, read unredacted, after any trial whose version left both slots is closed.
@@ -199,13 +227,21 @@ extension Parts {
             if let extra = input.keys.sorted().first(where: { !$0.hasPrefix("__") && !["verb", "preview", "id", "set_aside", "why"].contains($0) }) {
                 throw refuse("set_aside saves the kept version forward as it was; send only id and why, not \(extra).")
             }
-            return try await setAside(id, accounting: accounting, why: why, steer: steer, fullMac: fullMac, origin: given, invocation: invocation)
+            return .finished(try await setAside(id, accounting: accounting, why: why, steer: steer, fullMac: fullMac, origin: given, invocation: invocation))
         }
         if input["create_only"] == .bool(true), try existing != nil || abilities.contains(id: id) {
-            validateMS = milliseconds(since: started)
-            return timed(["status": .string("failed"), "id": .string(id), "effects": .string("none"), "reason": .string("name_exists"),
-                    "detail": .string("That ability name already exists. Choose a fresh name; nothing was replaced.")])
+            timing.validateMS = timing.milliseconds(since: timing.started)
+            return .finished(timing.timed(["status": .string("failed"), "id": .string(id), "effects": .string("none"), "reason": .string("name_exists"),
+                    "detail": .string("That ability name already exists. Choose a fresh name; nothing was replaced.")]))
         }
+        return .draft(named: named, existing: existing, id: id, opening: opening, timing: timing)
+    }
+
+    /// Assemble the candidate from checked source, declarations and fixtures.
+    private func prepareSaveCandidate(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue?,
+        invocation: Invocation, keptSelf: (kept: OwnedProgramStore.Candidate, why: String?)?, named: String, existing: [String: JSONValue]?,
+        id: String, opening: (kept: String, why: String)?, timing: SaveTiming) async throws -> [String: JSONValue] {
+        var timing = timing
         let base = try keptSelf?.kept ?? existing.flatMap(latest)
         let was = base.map { Self.fields($0.manifest) } ?? [:]
         var code = Self.string(input, "code")
@@ -231,7 +267,7 @@ extension Parts {
             description = sentence.map { String(head[...$0]) } ?? String(head.prefix(Self.descriptionLimit - 1)).trimmingCharacters(in: .whitespaces) + "…"
         }
         if description != suppliedDescription {
-            descriptionNote = "description kept to its first \(description.count) characters"
+            timing.descriptionNote = "description kept to its first \(description.count) characters"
         }
         // Inputs inherit the latest version's contract unless explicitly restated.
         var params = was["params"]
@@ -320,11 +356,15 @@ extension Parts {
                         throw refuse("\(id) changed while its content was compared; read its current version.")
                     }
                 }
-                validateMS = milliseconds(since: started)
-                return timed(["status": .string("ok"), "id": .string(id), "name": .string(name), "effects": .string("none"),
+                timing.validateMS = timing.milliseconds(since: timing.started)
+                return timing.timed(["status": .string("ok"), "id": .string(id), "name": .string(name), "effects": .string("none"),
                     "version": .string(base.digest), "ability_status": existing?["status"] ?? .null,
                     "detail": .string("\(name) already has this authored content; its versions and trial were left as they are.")])
             }
+        }
+        // A callable ability runs as run(input); a bare body (a top-level return) would save active and fail on its first run.
+        if AbilityStore.answersCalls(source, header: part), !AbilityStore.definesRun(source) {
+            throw refuse("code must define function run(input) { … }; a bare body with a top-level return fails when run. Wrap it in run.")
         }
         let candidate = try OwnedProgramStore.Candidate(
             program: OwnedProgram(kind: .part, id: id, version: "candidate", source: source,
@@ -332,10 +372,21 @@ extension Parts {
                                   dependencies: actions, permissions: permissions, resident: part["resident"] == .bool(true)),
             manifest: .object(manifest), fixtures: fixtures, dependencyShapes: shapes,
             prior: OwnedProgramStore.selection(existing.map(JSONValue.object)))
+        return try await stageSaveCandidate(candidate, id: id, name: name, manifest: manifest, actions: actions, calls: calls,
+            opening: opening, keptSelf: keptSelf, fixtures: fixtures, origin: origin, given: given, fullMac: fullMac,
+            invocation: invocation, timing: timing)
+    }
+
+    /// Stage the candidate, account for its trial and keep it when authorized.
+    private func stageSaveCandidate(_ candidate: OwnedProgramStore.Candidate, id: String, name: String, manifest: [String: JSONValue],
+        actions: [String], calls: OwnedProgram.Calls, opening: (kept: String, why: String)?,
+        keptSelf: (kept: OwnedProgramStore.Candidate, why: String?)?, fixtures: JSONValue, origin: JSONValue, given: JSONValue?,
+        fullMac: Bool, invocation: Invocation, timing: SaveTiming) async throws -> [String: JSONValue] {
+        var timing = timing
         let stamp = Self.now()
         enum Staging { case none, attempted, committed }
         var staged = Staging.none
-        validateMS = milliseconds(since: started)
+        timing.validateMS = timing.milliseconds(since: timing.started)
         do {
             try mutate(id, turn: invocation.execution.turn) { current in
                 guard OwnedProgramStore.selection(current.map(JSONValue.object)) == candidate.prior else {
@@ -373,7 +424,7 @@ extension Parts {
                 // Kept by the agent under Full Mac, or by the person: a rehearsal proves no live behavior, so its first real run is its proof.
                 let proving = ContinuousClock.now
                 try store.kept(candidate, key: try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey(), turn: invocation.execution.turn)
-                proofMS = milliseconds(since: proving)
+                timing.proofMS = timing.milliseconds(since: proving)
                 if let closed = try await admit(id: id, digest: candidate.digest, by: person ? "user" : "agent", ownerAuthorized: person,
                     invocation: invocation) {
                     receipt["trial"] = closed
@@ -386,13 +437,13 @@ extension Parts {
                     receipt["next_call"] = .object(["action": .string("ability.read"), "args": .object(["id": .string(id)])])
                     receipt["detail"] = .string("\(name) is kept and on. It is a page, drawn by face(input), never called; it defines no run(input).")
                 }
-                return timed(receipt)
+                return timing.timed(receipt)
             }
             receipt["ability_status"] = try row(id)?["status"] ?? .null
             receipt["next_call"] = .object(["action": .string("ability.validate"), "args": .object(["id": .string(id)])])
             receipt["detail"] = .string("\(name) is saved as a draft. ability.validate rehearses it; ability.enable keeps it "
                 + (fullMac ? "(yours when it is your own work)." : "(below Full Mac, the owner's card)."))
-            return timed(receipt)
+            return timing.timed(receipt)
         } catch {
             switch staged {
             case .none: throw error
@@ -431,7 +482,7 @@ extension Parts {
 
     /// Actions a version declared beyond those its reach and literal calls derive.
     static func declaredActions(_ manifest: [String: JSONValue], source: String) throws -> [String] {
-        let earlier = Self.strings(manifest["declaredActions"] ?? manifest["actions"])
+        let earlier = JSONValue.stringArray(manifest["declaredActions"] ?? manifest["actions"])
         let derived = Set(AbilityStore.reachActions(try Self.declaredStrings(Self.fields(manifest["reach"] ?? .null)["capabilities"],
             name: "reach.capabilities")) + OwnedProgram.calledActions(source))
         return manifest["declaredActions"] != nil ? earlier : earlier.filter { !derived.contains($0) }
@@ -505,7 +556,7 @@ extension Parts {
     /// Missing or malformed authorship stays unknown.
     static func originKind(_ value: JSONValue?) -> String? {
         let fields = fields(value ?? .null)
-        switch string(fields, "by") {
+        switch fields["by"]?.stringValue {
         case "hers"?: return "hers"
         case "peer"?:
             // Every peer a nonempty string: a malformed list is no origin, never filtered.
@@ -523,7 +574,7 @@ extension Parts {
         for given in origins.isEmpty ? [nil] : origins {
             guard let kind = originKind(given) else { peers.append("unrecorded"); continue }
             let recorded = Self.fields(given ?? .null)
-            if kind == "peer" { peers += strings(recorded["peers"]).filter { !CapabilityLifecycle.ownerTrusts($0) } }
+            if kind == "peer" { peers += JSONValue.stringArray(recorded["peers"]).filter { !CapabilityLifecycle.ownerTrusts($0) } }
         }
         var seen: Set<String> = []
         peers = peers.filter { seen.insert($0).inserted }
@@ -539,7 +590,7 @@ extension Parts {
     /// Own work needs no untrusted-origin attribution.
     public static func voices(_ row: [String: JSONValue]) -> [String] {
         guard row["origin"] != nil, case .object(let origin) = merged([row["origin"]]) else { return [] }
-        return strings(origin["peers"])
+        return JSONValue.stringArray(origin["peers"])
     }
 
     // MARK: - Inputs
@@ -596,7 +647,7 @@ extension Parts {
                 guard case .array(let list) = names, list.allSatisfy({ if case .string = $0 { true } else { false } }) else {
                     throw refuse("params.required is a list of param names.")
                 }
-                required = Set(strings(names))
+                required = Set(JSONValue.stringArray(names))
                 if let stray = required.sorted().first(where: { properties[$0] == nil }) {
                     throw refuse("params.required names \(stray), which properties does not declare.")
                 }
@@ -644,7 +695,7 @@ extension Parts {
     }
 
     static func parameterType(_ value: JSONValue?) -> String? {
-        parameterDeclaration(value).flatMap { string($0, "type") }
+        parameterDeclaration(value).flatMap { $0["type"]?.stringValue }
     }
 
     /// Strings retain their description. Words end at whitespace, commas, colons or parentheses; the leading type may follow optional.

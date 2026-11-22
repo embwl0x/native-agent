@@ -278,6 +278,7 @@ final class TranscriptTextView: NSTextView {
         if let message, controller.canRegenerate(message) {
             add("Regenerate response", "arrow.clockwise", #selector(regenerate(_:)))
         }
+        if let message, message.role == "assistant" { add("Revise…", "pencil", #selector(revise(_:))) }
         if message != nil {
             ours.append(.separator())
             add("Remember this", "brain", #selector(rememberThis(_:)), enabled: message?.action?.canRemember == true)
@@ -328,6 +329,11 @@ final class TranscriptTextView: NSTextView {
     @objc func regenerate(_ sender: Any?) {
         guard let id = target(sender)?.message?.id else { return }
         controller?.regenerate(id)
+    }
+
+    @objc func revise(_ sender: Any?) {
+        guard let id = target(sender)?.message?.id else { return }
+        controller?.revise(id)
     }
 
     @objc func rememberThis(_ sender: Any?) {

@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentShared
 import MemoryV2
 import Observation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -123,7 +122,7 @@ extension SwiftNativeOnboardingClient {
                     personaType: personaType,
                     userName: userName,
                     targets: staged.map {
-                        OnboardingTargetIntent(role: $0.0, content: $0.1, sha256: Self.sha256(Data($0.1.utf8)), baseSHA256: $0.2)
+                        OnboardingTargetIntent(role: $0.0, content: $0.1, sha256: SHA256Hex.of(Data($0.1.utf8)), baseSHA256: $0.2)
                     }
                 )
                 try Self.writeTransaction(manifest, to: manifestPath, encodingContext: "onboarding transaction")
@@ -237,7 +236,7 @@ extension SwiftNativeOnboardingClient {
             throw OnboardingError.ioFailure("onboarding transaction target set is invalid")
         }
         for target in manifest.targets {
-            guard sha256(Data(target.content.utf8)) == target.sha256 else {
+            guard SHA256Hex.of(Data(target.content.utf8)) == target.sha256 else {
                 throw OnboardingError.ioFailure("onboarding transaction hash mismatch for '\(target.role)'")
             }
         }

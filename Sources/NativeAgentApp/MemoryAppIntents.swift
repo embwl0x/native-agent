@@ -1,6 +1,7 @@
 import AppIntents
 import Foundation
 import MemoryV2
+import NativeAgentCore
 // Blueprint: | `MemoryAppIntents.swift` | `QueryMemoryIntent` struct; `perform`; pending proposals use the engine's review-eligible reader |
 
 private func formatMemoryUnavailable(_ error: Error) -> String {
@@ -15,6 +16,8 @@ struct QueryMemoryIntent: AppIntent {
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
 
     static let title: LocalizedStringResource = "Query Assistant Memory"
+    // Memory is private: like Ask Your Agent, it never runs on a locked Mac.
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description: IntentDescription = IntentDescription("Search the assistant's accumulated memory for relevant context.")
     static let openAppWhenRun = false
 
@@ -48,6 +51,8 @@ struct StoreMemoryIntent: AppIntent {
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
 
     static let title: LocalizedStringResource = "Remember"
+    // Memory is private: like Ask Your Agent, it never runs on a locked Mac.
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description: IntentDescription = IntentDescription("Store a new memory in the assistant's accumulated memory.")
     static let openAppWhenRun = false
 
@@ -87,6 +92,8 @@ struct ListPendingMemoryProposalsIntent: AppIntent {
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
 
     static let title: LocalizedStringResource = "List Pending Memory Proposals"
+    // Memory is private: like Ask Your Agent, it never runs on a locked Mac.
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     static let description: IntentDescription = IntentDescription("Return the count and list of the assistant's pending memory proposals.")
     static let openAppWhenRun = false
 
@@ -104,8 +111,8 @@ struct ListPendingMemoryProposalsIntent: AppIntent {
             let text = ([header] + lines).joined(separator: "\n")
             return .result(value: text, dialog: IntentDialog(stringLiteral: text))
         } catch {
-            let msg = formatMemoryUnavailable(error)
-            return .result(value: msg, dialog: IntentDialog(stringLiteral: msg))
+            // A failed read is a failure, never proposal text a shortcut would process as data.
+            throw ToolFailureError(formatMemoryUnavailable(error), effects: .none)
         }
     }
 }

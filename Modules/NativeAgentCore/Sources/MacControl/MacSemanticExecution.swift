@@ -3,7 +3,6 @@ import NativeAgentCore
 import PersistenceCore
 import AppKit
 import Experiences
-import CryptoKit
 import NativeAgentShared
 import ApplicationServices
 import TrustCenter
@@ -32,8 +31,11 @@ extension MacFourVerbs {
     }
     static func pressesReturn(_ step: MacActStep) -> Bool {
         let verb = parseVerb(step.verb).0
-        guard verb == "key" || (verb == "press" && pressMeansKey(step.target)) else { return false }
-        return ["return", "enter"].contains(normalize(keySpec(step.target) ?? step.target))
+        let target = step.target.hasSuffix("?") && step.target.count > 1 ? String(step.target.dropLast()) : step.target
+        guard verb == "key" || (verb == "press" && pressMeansKey(target)),
+              let chords = try? MacKeySyntax.parseChords(keySpec(target) ?? target), chords.count == 1,
+              let chord = chords.first else { return false }
+        return chord.modifiers.isEmpty && chord.keyCode == MacKeySyntax.namedKeys["return"]
     }
 
     /// Keyboard focus must belong to the exact named element or its subtree.
@@ -127,9 +129,11 @@ extension MacFourVerbs {
                 verb: verb.rawValue,
                 attention: attention
             , turn: turn, context: context)
-            // On mark drift, refresh once and resolve the same name before one dispatch.
+            // On mark drift, refresh the same process once before resolving the name again.
             guard !first.ok, Self.string(first.detail["error"])?.hasPrefix("mark_drifted") == true,
+                  let pid = context.requiredFrontPid ?? before.pid,
                   case .seen(let fresh) = await sight(part: nil, turn: turn, context: context),
+                  fresh.pid == pid,
                   case .hit(let again) = Self.resolve(target, among: fresh.targets),
                   Self.answers(target, again, exact: Self.committingVerbs.contains(verb)),
                   let freshView = again.viewId, let freshMark = again.mark else { return first }
@@ -393,7 +397,10 @@ extension MacFourVerbs {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = trimmed.lowercased()
         for prefix in ["key ", "key:", "chord ", "chord:"] where lower.hasPrefix(prefix) {
-            return String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let suffix = trimmed.dropFirst(prefix.count)
+            // A numeric key token belongs to the physical-key parser, including when it starts a sequence.
+            if prefix == "key:", Int(suffix.prefix(while: { !$0.isWhitespace })) != nil { return trimmed }
+            return suffix.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return nil
     }

@@ -58,7 +58,8 @@ struct ContentView: View {
     private func openSharedChatIfNeeded() {
         Task {
             do {
-                if try await !chatStore.readSharedInbox().items.isEmpty { selection = .chat }
+                // Choosing the tab needs only whether a share waits, never every attachment decoded.
+                if try await Task.detached(priority: .utility) { try !SharedChatInbox.pendingFiles().isEmpty }.value { selection = .chat }
             } catch { chatStore.errorBanner = "Sharing is unavailable: \(error.localizedDescription)" }
         }
     }
@@ -368,6 +369,8 @@ enum NativeAgentActivityNotificationCleaner {
             }
 
             if let itemID = infoString("itemId", in: info), !itemID.isEmpty {
+                // A result that lives in a chat is never an Inbox row, so the Inbox cannot say it was read.
+                if let session = infoString("sessionId", in: info), !session.isEmpty { continue }
                 if let activeItemIDs, !activeItemIDs.contains(itemID) {
                     removeIDs.append(notification.request.identifier)
                 }

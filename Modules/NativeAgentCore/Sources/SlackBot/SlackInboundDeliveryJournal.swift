@@ -82,6 +82,7 @@ struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
     var previewCreationUnknown: Bool? = nil
     var completedWithoutPostTurnID: String? = nil
     var resolvedRetryInbound: SlackInboundMessage? = nil
+    var claimedByRetryEventId: String? = nil
 
     var confirmedTextCount: Int { confirmedText == true ? (prepared?.textParts.count ?? 0) : (confirmedTextPartCount ?? 0) }
 
@@ -405,10 +406,21 @@ public actor SlackInboundDeliveryJournal {
     func retryInterruptedGeneration(for inbound: SlackInboundMessage) throws -> SlackInboundDeliveryRecord? {
         try CredentialFileLock.withLock(path) {
             var file = try load()
-            guard let command = file.records.firstIndex(where: { $0.inbound.eventId == inbound.eventId && $0.phase == .claimed }),
+            // Earlier builds could pin several retries to the same source. A live or settled sibling
+            // supersedes interrupted siblings as well as the source.
+            let retries = file.records.filter { $0.resolvedRetryInbound != nil }
+            let previouslyRetried = Set(retries.compactMap { $0.resolvedRetryInbound?.eventId })
+            let supersededSources = Set(retries.compactMap { record in
+                record.phase == .interrupted ? nil : record.resolvedRetryInbound?.eventId
+            })
+            guard let command = file.records.firstIndex(where: {
+                $0.inbound.eventId == inbound.eventId && $0.phase == .claimed && $0.resolvedRetryInbound == nil
+            }),
                   let index = file.records.indices.filter({ index in
                       let record = file.records[index]
                       return record.phase == .interrupted && record.prepared == nil
+                          && record.claimedByRetryEventId == nil && !previouslyRetried.contains(record.inbound.eventId)
+                          && !supersededSources.contains(record.resolvedRetryInbound?.eventId ?? record.inbound.eventId)
                           && record.inbound.teamId == inbound.teamId && record.inbound.channelId == inbound.channelId
                           && record.inbound.userId == inbound.userId
                           && (record.inbound.threadTs == inbound.threadTs
@@ -416,9 +428,15 @@ public actor SlackInboundDeliveryJournal {
                   }).max(by: { file.records[$0].updatedAt < file.records[$1].updatedAt }) else { return nil }
             let interrupted = file.records[index]
             guard let session = interrupted.assistantSessionId else { throw SlackInboundJournalError.malformed }
-            file.records[command].resolvedRetryInbound = interrupted.resolvedRetryInbound ?? interrupted.inbound
+            let source = interrupted.resolvedRetryInbound ?? interrupted.inbound
+            file.records[command].resolvedRetryInbound = source
             file.records[command].assistantSessionId = session
             file.records[command].updatedAt = Date()
+            for i in file.records.indices where file.records[i].phase == .interrupted
+                && file.records[i].claimedByRetryEventId == nil
+                && (file.records[i].resolvedRetryInbound?.eventId ?? file.records[i].inbound.eventId) == source.eventId {
+                file.records[i].claimedByRetryEventId = inbound.eventId
+            }
             let record = file.records[command]
             try save(file)
             return record

@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import AppKit
 import Cognition
 import Combine
@@ -15,7 +14,7 @@ import Network
 
 extension iCloudBridge {
     enum ChatAdmission: Sendable {
-        case reserved(url: URL, contents: Data)
+        case reserved
         case completed, interrupted, cancelled, unreadable, collision, stale, unavailable
     }
 
@@ -37,6 +36,7 @@ extension iCloudBridge {
         var resendSessionId: String?
         var targetSourceKey: String?
         var stopRequestedSessionId: String?
+        var replyPublicationId: String?
         /// Exact signed publication bytes survive an ambiguous upload or receipt failure.
         var outboundMessage: BridgeMessage?
         var hasAdmission: Bool { id != nil && createdAt != nil && updatedAt != nil && attempts != nil }
@@ -96,10 +96,12 @@ extension iCloudBridge {
             let id = MacSyncSnapshotIntegrity.digest(Data(message.id.utf8))
             let url = Self.chatURL(message.id, dataRoot: dataRoot)
             return try await SwiftNativePersistenceCore.withFileLock(url) {
+                let age = Date().timeIntervalSince(message.timestamp)
+                let inWindow = age <= 24 * 60 * 60 && age >= -15 * 60
                 var stopSession: String?
                 switch MacSyncEngine.coordinatedReadOutcome(at: url) {
                 case .data(let data):
-                    guard let row = try? JSONDecoder().decode(ChatRecord.self, from: data) else { return .unreadable }
+                    guard var row = try? JSONDecoder().decode(ChatRecord.self, from: data) else { return .unreadable }
                     if !row.hasAdmission {
                         guard row.msgId == message.id, row.direction == "ios_to_mac", row.action == "chat",
                               row.state == "stop_requested", let session = row.stopRequestedSessionId else { return .unreadable }
@@ -110,7 +112,23 @@ extension iCloudBridge {
                     guard row.id == id, row.msgId == message.id, row.actionDigest == digest,
                           row.direction == "ios_to_mac", row.action == "chat" else { return .collision }
                     if ["completed", "failed_before_answer"].contains(row.state) { return .completed }
-                    return row.stopRequestedSessionId == message.sessionID && row.stopRequestedSessionId != nil ? .cancelled : .interrupted
+                    if let stop = row.stopRequestedSessionId, stop == (row.assistantSessionId ?? message.sessionID) { return .cancelled }
+                    // Older reservations said running before the forwarder had bound the session.
+                    // Both versions bind the session before starting work.
+                    if row.state == "running", row.assistantSessionId == nil {
+                        guard inWindow else { return .stale }
+                        // A message older than this data root's life is another life's, readmitted or not.
+                        if message.timestamp < (try DataRootLife.began(in: dataRoot)) { return .completed }
+                        guard canDispatch else { return .unavailable }
+                        row.state = "reserved"
+                        row.updatedAt = NativeTimestampFormat.plainZulu(Date())
+                        try writeChat(row, to: url)
+                    }
+                    if row.state == "reserved" {
+                        guard inWindow else { return .stale }
+                        return canDispatch ? .reserved : .unavailable
+                    }
+                    return .interrupted
                 case .failed:
                     return .unreadable
                 case .missing:
@@ -118,18 +136,17 @@ extension iCloudBridge {
                 }
                 // Pre-life messages are history owned by another install or restore, never new turns.
                 if message.timestamp < (try DataRootLife.began(in: dataRoot)) { return .completed }
-                let age = Date().timeIntervalSince(message.timestamp)
-                guard age <= 24 * 60 * 60, age >= -15 * 60 else { return .stale }
+                guard inWindow else { return .stale }
                 guard canDispatch else { return .unavailable }
                 let now = ISO8601DateFormatter().string(from: Date())
                 let row = ChatRecord(id: id, direction: "ios_to_mac", action: "chat",
-                                                 state: "running", createdAt: now, updatedAt: now,
+                                                 state: "reserved", createdAt: now, updatedAt: now,
                                                  attempts: 1, msgId: message.id, actionDigest: digest,
                                                  stopRequestedSessionId: stopSession)
                 let data = try Self.writeChat(row, to: url)
                 guard case .data(let retained) = MacSyncEngine.coordinatedReadOutcome(at: url),
                       retained == data else { return .unavailable }
-                return stopSession == nil ? .reserved(url: url, contents: data) : .cancelled
+                return stopSession == nil ? .reserved : .cancelled
             }
         } catch {
             nativeLog("[iCloudBridge] chat reservation unavailable: %@", error.localizedDescription)
@@ -137,22 +154,24 @@ extension iCloudBridge {
         }
     }
 
-    /// Release only before handler entry; exact-byte comparison protects interrupted or advanced rows.
-    nonisolated static func releaseUndispatchedChat(_ admission: ChatAdmission) async {
-        await settle {
-            if case .reserved(let url, let contents) = admission {
-                do {
-                    try await SwiftNativePersistenceCore.withFileLock(url) {
-                        if try Data(contentsOf: url) == contents { try FileManager.default.removeItem(at: url) }
-                    }
-                } catch {
-                    nativeLog("[iCloudBridge] undispatched chat reservation could not be released: %@", error.localizedDescription)
-                }
+    /// The forwarder claims execution after preflight, just before handing work to its owner.
+    nonisolated static func beginChat(_ message: BridgeMessage, sessionID: String, dataRoot: URL) async throws {
+        let url = chatURL(message.id, dataRoot: dataRoot)
+        try await SwiftNativePersistenceCore.withFileLock(url) {
+            try Task.checkCancellation()
+            var row = try readChat(message.id, dataRoot: dataRoot)
+            guard row.state == "reserved", row.assistantSessionId == sessionID,
+                  row.actionDigest == MacSyncSnapshotIntegrity.digest(try message.canonicalBodyForSigning()) else {
+                throw DeviceSyncError.conflict
             }
+            if row.stopRequestedSessionId == sessionID { throw CancellationError() }
+            row.state = "running"
+            row.updatedAt = NativeTimestampFormat.plainZulu(Date())
+            try writeChat(row, to: url)
         }
     }
 
-    nonisolated static func finishChat(_ message: BridgeMessage, dataRoot: URL, completed: Bool) async -> Bool {
+    nonisolated static func finishChat(_ message: BridgeMessage, dataRoot: URL) async -> Bool {
         return await settle {
             do {
                 let url = Self.chatURL(message.id, dataRoot: dataRoot)
@@ -160,7 +179,8 @@ extension iCloudBridge {
                     var row = try Self.readChat(message.id, dataRoot: dataRoot)
                     guard row.hasAdmission, row.msgId == message.id,
                           row.actionDigest == MacSyncSnapshotIntegrity.digest(try message.canonicalBodyForSigning()) else { return false }
-                    row.state = completed ? "completed" : "unknown"
+                    if row.state == "completed" { return true }
+                    row.state = "completed"
                     row.updatedAt = ISO8601DateFormatter().string(from: Date())
                     try Self.writeChat(row, to: url)
                     return true
@@ -189,30 +209,69 @@ extension iCloudBridge {
         }
     }
 
-    /// Recovery must use the retained producer envelope's publication id, never a generated recovery id.
-    nonisolated static func retainedReplyPublication(correlationID: String, runID: String, dataRoot: URL) throws -> BridgeMessage? {
-        let directory = dataRoot.appendingPathComponent("icloud/chat_transactions", isDirectory: true)
-        let files: [URL]
+    /// Recover the exact signed bytes named by the owning transaction (or its existing legacy receipt).
+    nonisolated static func retainedReplyPublication(id: String, correlationID: String, dataRoot: URL) throws -> BridgeMessage? {
+        let row: ChatRecord
         do {
-            files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            row = try readChat(id, dataRoot: dataRoot)
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             return nil
         }
+        let secret = try PairingSecret.requireExistingSecret()
+        guard row.action == "chat", row.direction == "mac_to_ios", row.msgId == id,
+              let saved = row.outboundMessage, saved.id == id, saved.correlationID == correlationID,
+              saved.verifySignature(secret: secret) else { throw CocoaError(.fileReadCorruptFile) }
+        return saved
+    }
+
+    nonisolated static func matchesReplyPublication(_ message: BridgeMessage, correlationID: String, runID: String) -> Bool {
+        let metadata = message.metadata
+        return message.correlationID == correlationID
+            && isRetainedChatReply(kind: metadata?["kind"], canonicalRun: metadata?["canonicalAnswerRunId"])
+            && ((metadata?["assistantRunId"] ?? message.correlationID) == runID
+                || metadata?["kind"] == "codex_completion" && metadata?["assistantRunId"] == correlationID)
+    }
+
+    /// Before links were written, a reply could be retained under a random ID without a receipt.
+    nonisolated static func unlinkedReplyPublication(correlationID: String, runID: String, dataRoot: URL) throws -> BridgeMessage? {
+        let directory = chatURL(correlationID, dataRoot: dataRoot).deletingLastPathComponent()
+        let files: [URL]
+        do { files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
         var publication: BridgeMessage?
         for file in files where file.pathExtension == "json" {
-            let row = try JSONDecoder().decode(ChatRecord.self, from: Data(contentsOf: file))
-            guard row.direction == "mac_to_ios", let saved = row.outboundMessage,
-                  saved.correlationID == correlationID,
-                  isRetainedChatReply(kind: saved.metadata?["kind"], canonicalRun: saved.metadata?["canonicalAnswerRunId"]),
-                  (saved.metadata?["assistantRunId"] ?? saved.correlationID) == runID
-                    || saved.metadata?["kind"] == "codex_completion" && saved.metadata?["assistantRunId"] == correlationID else { continue }
-            guard row.action == "chat", row.msgId == saved.id, chatURL(saved.id, dataRoot: dataRoot) == file else {
+            guard let data = try? Data(contentsOf: file),
+                  let row = try? JSONDecoder().decode(ChatRecord.self, from: data), let saved = row.outboundMessage,
+                  matchesReplyPublication(saved, correlationID: correlationID, runID: runID) else { continue }
+            guard chatURL(saved.id, dataRoot: dataRoot) == file,
+                  let verified = try retainedReplyPublication(id: saved.id, correlationID: correlationID, dataRoot: dataRoot) else {
                 throw CocoaError(.fileReadCorruptFile)
             }
             guard publication == nil else { throw DeviceSyncError.conflict }
-            publication = saved
+            publication = verified
         }
         return publication
+    }
+
+    /// Link the retained envelope before CloudKit can see the publication.
+    nonisolated static func linkReplyPublication(_ message: BridgeMessage, dataRoot: URL) async throws {
+        guard let correlation = message.correlationID, correlation != message.id else { return }
+        let path = chatURL(correlation, dataRoot: dataRoot)
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            var row: ChatRecord
+            switch MacSyncEngine.coordinatedReadOutcome(at: path) {
+            case .data(let data): row = try JSONDecoder().decode(ChatRecord.self, from: data)
+            case .failed: throw CocoaError(.fileReadUnknown)
+            case .missing:
+                row = ChatRecord(direction: "mac_to_ios", action: "chat", state: "owed", msgId: correlation,
+                    assistantSessionId: message.sessionID, targetSourceKey: message.metadata?["targetSourceKey"])
+            }
+            guard row.msgId == correlation, row.action == "chat",
+                  row.replyPublicationId == nil || row.replyPublicationId == message.id else { throw DeviceSyncError.conflict }
+            if row.replyPublicationId == message.id { return }
+            row.replyPublicationId = message.id
+            try writeChat(row, to: path)
+        }
     }
 
     /// One retained publication in the existing ledger, before any send effect.

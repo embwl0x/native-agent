@@ -30,10 +30,6 @@ public struct AgentPeerReplayClaimStore: Sendable {
         directory = dataRoot.appendingPathComponent("agents/peer-claims")
     }
 
-    public static func digest(_ body: Data) -> String {
-        SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
-    }
-
     /// An authenticated principal cannot consume another peer's ids.
     public static func key(principal: String, protocolName: String, messageID: String) -> String {
         "\(principal)\u{1F}\(protocolName)\u{1F}\(messageID)"
@@ -44,7 +40,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         return directory.appendingPathComponent("\(hashed).json")
     }
 
-    public func claim(key: String, digest: String) throws -> Outcome {
+    public func claim(key: String, digest: String, admissionID: UUID? = nil) throws -> Outcome {
         try prepareDirectory()
         let url = fileURL(for: key)
         return try withStoreLock {
@@ -58,7 +54,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
             }
             try makeRoomForClaim()
             try write(Record(lifeID: try DataRootLife.current(in: directory.deletingLastPathComponent().deletingLastPathComponent()),
-                             key: key, digest: digest, receipt: nil, at: Date()), to: url)
+                             key: key, digest: digest, receipt: nil, at: Date(), admissionID: admissionID), to: url)
             return .claimed
         }
     }
@@ -88,15 +84,23 @@ public struct AgentPeerReplayClaimStore: Sendable {
         }
     }
 
-    /// Only validation before a turn starts may release its current-life claim.
-    public func release(key: String) {
+    /// Only failed admission before a task is retained may release its current-life claim.
+    @discardableResult public func release(key: String, admissionID: UUID? = nil) -> String? {
         let url = fileURL(for: key)
-        try? withStoreLock {
-            if let existing = try read(url), existing.receipt == nil,
-               try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent()),
-               Date().timeIntervalSince(existing.at) < Self.maximumClaimAgeSeconds {
-                try? FileManager.default.removeItem(at: url)
+        do {
+            try withStoreLock {
+                guard let existing = try read(url, expiringReceipt: false), existing.receipt == nil,
+                      existing.admissionID == admissionID,
+                      Date().timeIntervalSince(existing.at) < Self.maximumClaimAgeSeconds,
+                      try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent())
+                else { return }
+                try FileManager.default.removeItem(at: url)
+                try SwiftNativePersistenceCore.syncDirectory(directory)
             }
+            return nil
+        } catch {
+            nativeLog("Agent replay claim release failed: %@", error.localizedDescription)
+            return "The task could not be accepted and its replay claim release could not be confirmed."
         }
     }
 
@@ -108,6 +112,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         let digest: String
         let receipt: String?
         let at: Date
+        var admissionID: UUID? = nil
     }
 
     private func prepareDirectory() throws {
@@ -122,7 +127,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         try CredentialFileLock.withLock(directory.appendingPathComponent("claims"), body)
     }
 
-    private func read(_ url: URL) throws -> Record? {
+    private func read(_ url: URL, expiringReceipt: Bool = true) throws -> Record? {
         let fd = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else {
             if errno == ENOENT { return nil }
@@ -144,7 +149,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         let record = try JSONDecoder().decode(Record.self, from: data)
         guard fileURL(for: record.key) == url else { throw POSIXError(.EIO) }
         // Expire only receipt bytes. The identity/digest tombstone still refuses replay.
-        guard Date().timeIntervalSince(record.at) < Self.maximumClaimAgeSeconds else {
+        if expiringReceipt, Date().timeIntervalSince(record.at) >= Self.maximumClaimAgeSeconds {
             guard record.receipt != nil else { return record }
             let tombstone = Record(lifeID: record.lifeID, key: record.key, digest: record.digest, receipt: nil, at: record.at)
             try? write(tombstone, to: url)

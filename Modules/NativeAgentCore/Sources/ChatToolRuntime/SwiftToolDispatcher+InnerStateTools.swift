@@ -24,7 +24,7 @@ extension SwiftToolDispatcher {
     func impl_inner_state(input: [String: JSONValue], surface: String) async -> JSONValue {
         let requested = Self.innerStateWindowHours(input)
         let detail: CognitiveInnerStateReading.Detail =
-            (optionalString(input, "detail")?.lowercased() == "full") ? .full : .compact
+            (input["detail"]?.nonblankString?.lowercased() == "full") ? .full : .compact
 
         guard let observer = providerLifecycleObserver,
               let mind = observer as? any InnerStateProviding else {

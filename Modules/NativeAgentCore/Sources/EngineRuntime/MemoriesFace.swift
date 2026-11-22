@@ -216,7 +216,7 @@ extension NativeAgentEngine {
         let from = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath).standardizedFileURL
         let root = dataRoot
         let owner = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
-        let prepared = try await MemoryBringBack.prepare(from: from, into: root, owner: owner)
+        let prepared = try await MemoryBringBack.prepare(from: from, into: root)
         guard !prepared.memories.isEmpty || prepared.toRename > 0 else {
             throw PartCallError(code: "nothing_to_bring", message: prepared.words + " Nothing was brought back.")
         }

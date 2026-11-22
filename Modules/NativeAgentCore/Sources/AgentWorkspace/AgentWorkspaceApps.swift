@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceApps.swift` | `AgentWorkspaceApps`: file/Mac/browser projections and app action discovery |
+// Blueprint: | `AgentWorkspaceApps.swift` | `AgentWorkspaceApps`: file/Mac/browser projections, app action discovery, and bounded workspace text fields |
 
 enum AgentWorkspaceApps {
     static let destinations: [AgentWorkspaceDestination] = [
@@ -52,26 +52,26 @@ enum AgentWorkspaceApps {
     }
 
     static func computerLocation(input: [String: JSONValue] = [:], result: JSONValue) -> AgentWorkspaceLocation? {
-        let row = object(result), controls = object(object(row["detail"] ?? .null)["controls"] ?? .null)
-        let app = object(controls["app"] ?? .null)
-        guard row["ok"] == .bool(true), let identity = string(app["bundle_id"]) ?? string(app["name"]) else { return nil }
+        let row = JSONValue.objectOrEmpty(result), controls = JSONValue.objectOrEmpty(JSONValue.objectOrEmpty(row["detail"])["controls"] ?? .null)
+        let app = JSONValue.objectOrEmpty(controls["app"])
+        guard row["ok"] == .bool(true), let identity = boundedString(app["bundle_id"]) ?? boundedString(app["name"]) else { return nil }
         var arguments: [String: JSONValue] = ["app": .string(identity), "structured": .bool(true)]
         if let part = input["part"] { arguments["part"] = part }
-        return .record(tool: "screen", input: arguments, title: string(app["name"]) ?? identity)
+        return .record(tool: "screen", input: arguments, title: boundedString(app["name"]) ?? identity)
     }
 
     private static func computer(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
-        var row = object(result)
-        var detail = object(row["detail"] ?? .null)
-        var controls = object(detail["controls"] ?? .null)
+        var row = JSONValue.objectOrEmpty(result)
+        var detail = JSONValue.objectOrEmpty(row["detail"])
+        var controls = JSONValue.objectOrEmpty(detail["controls"])
         var items: [AgentWorkspaceItem] = []
-        if row["ok"] == .bool(true), let frame = string(controls["frame_id"]),
+        if row["ok"] == .bool(true), let frame = boundedString(controls["frame_id"]),
            case .array(let affordances)? = controls["affordances"] {
             for value in affordances.prefix(60) {
-                let control = object(value)
+                let control = JSONValue.objectOrEmpty(value)
                 guard control["enabled"] == .bool(true), control["handle_ambiguous"] != .bool(true),
-                      let handle = string(control["handle"]), let role = string(control["role"]) else { continue }
-                let name = string(control["label"]) ?? "Unnamed " + role
+                      let handle = boundedString(control["handle"]), let role = boundedString(control["role"]) else { continue }
+                let name = boundedString(control["label"]) ?? "Unnamed " + role
                 let bound: [String: JSONValue] = ["handle": .string(handle), "frame_id": .string(frame), "target": .string(name)]
                 func button(_ label: String, verb: String, text: Bool = false) -> AgentWorkspaceButton {
                     .init(label: label, action: .perform(tool: "act", input: bound.merging(["verb": .string(verb)]) { _, new in new },
@@ -91,8 +91,8 @@ enum AgentWorkspaceApps {
                 if controls["front"] != .bool(true) { actions = [] }
                 items.append(.init(title: name, content: value, actions: actions))
             }
-            let projected = Set(items.compactMap { string(object($0.content)["handle"]) })
-            controls["affordances"] = .array(affordances.filter { !projected.contains(string(object($0)["handle"]) ?? "") })
+            let projected = Set(items.compactMap { boundedString(JSONValue.objectOrEmpty($0.content)["handle"]) })
+            controls["affordances"] = .array(affordances.filter { !projected.contains(boundedString(JSONValue.objectOrEmpty($0)["handle"]) ?? "") })
             detail["controls"] = .object(controls)
             row["detail"] = .object(detail)
         }
@@ -110,8 +110,8 @@ enum AgentWorkspaceApps {
                 Select a control and its action. NativeAgent carries the exact observation binding; a changed target is refused and refreshed rather than \
                 guessed or clicked again.
                 """)
-        let app = object(controls["app"] ?? .null)
-        let appName = string(app["bundle_id"]) ?? string(app["name"]) ?? string(input["app"])
+        let app = JSONValue.objectOrEmpty(controls["app"])
+        let appName = boundedString(app["bundle_id"]) ?? boundedString(app["name"]) ?? boundedString(input["app"])
         var readInput: [String: JSONValue] = ["structured": .bool(true)]
         if let appName { readInput["app"] = .string(appName) }
         if let part = input["part"] { readInput["part"] = part }
@@ -125,30 +125,30 @@ enum AgentWorkspaceApps {
         ]
         if let appName {
             actions.insert(.init(label: "Bring this app forward", action: .perform(tool: "go",
-                input: ["name": .string(appName)], title: "Open " + (string(app["name"]) ?? appName), textField: nil, isEffect: true)), at: 1)
+                input: ["name": .string(appName)], title: "Open " + (boundedString(app["name"]) ?? appName), textField: nil, isEffect: true)), at: 1)
             actions.append(readButton("Look at frontmost app", tool: "screen", input: ["structured": .bool(true)]))
         }
-        return .init(title: string(app["name"]) ?? string(input["app"]) ?? "Computer", content: .object(row), items: items, actions: actions)
+        return .init(title: boundedString(app["name"]) ?? boundedString(input["app"]) ?? "Computer", content: .object(row), items: items, actions: actions)
     }
 
     private static func menu(result: JSONValue) -> WorkspacePage {
-        let envelope = object(result)
-        var output = object(envelope["output"] ?? .null)
-        let app = object(output["app"] ?? .null)
+        let envelope = JSONValue.objectOrEmpty(result)
+        var output = JSONValue.objectOrEmpty(envelope["output"])
+        let app = JSONValue.objectOrEmpty(output["app"])
         guard envelope["ok"] == .bool(true), output["available"] == .bool(true),
-              let appName = string(app["bundle_id"]) ?? string(app["name"]),
+              let appName = boundedString(app["bundle_id"]) ?? boundedString(app["name"]),
               case .array(let paths)? = output["paths"] else {
             return .init(title: "Computer menu", content: result, items: [], actions: [readButton("Look again", tool: "screen", input: ["structured": .bool(
                 true)])])
         }
         let items: [AgentWorkspaceItem] = paths.prefix(80).compactMap { value in
-            let item = object(value)
-            guard item["enabled"] == .bool(true), item["opens_submenu"] != .bool(true), let path = string(item["path"]) else { return nil }
+            let item = JSONValue.objectOrEmpty(value)
+            guard item["enabled"] == .bool(true), item["opens_submenu"] != .bool(true), let path = boundedString(item["path"]) else { return nil }
             return .init(title: path, content: value, actions: [.init(label: "Choose", action: .perform(tool: "menu_press",
                 input: ["app": .string(appName), "path": .string(path)], title: path, textField: nil, isEffect: true))])
         }
         let projected = Set(items.map(\.title))
-        output["paths"] = .array(paths.filter { !projected.contains(string(object($0)["path"]) ?? "") })
+        output["paths"] = .array(paths.filter { !projected.contains(boundedString(JSONValue.objectOrEmpty($0)["path"]) ?? "") })
         var content = envelope; content["output"] = .object(output)
         return .init(title: "Computer menu", content: .object(content), items: items, actions: [
             readButton("Read this app menu again", tool: "menu", input: ["app": .string(appName)]),
@@ -157,9 +157,9 @@ enum AgentWorkspaceApps {
     }
 
     private static func directory(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
-        let row = object(result)
+        let row = JSONValue.objectOrEmpty(result)
         guard row["ok"] == .bool(true), row["status"] == .string("ok"),
-              let path = string(row["path"]), path.hasPrefix("/"),
+              let path = boundedString(row["path"]), path.hasPrefix("/"),
               case .array(let entries)? = row["entries"] else {
             return .init(title: "Files", content: result, items: [], actions: [])
         }
@@ -187,9 +187,9 @@ enum AgentWorkspaceApps {
            Set(next.keys).isSubset(of: ["path", "name_contains", "case_sensitive", "max_entries", "offset", "snapshot"]),
            next["path"] == input["path"], next["name_contains"] == row["name_contains"],
            next["case_sensitive"] == row["case_sensitive"], next["snapshot"] == row["snapshot"],
-           string(next["snapshot"]) != nil,
-           let offset = integer(next["offset"]), let current = integer(row["offset"]), offset > current,
-           let count = integer(next["max_entries"]), count > 0, count <= 200 {
+           boundedString(next["snapshot"]) != nil,
+           let offset = next["offset"]?.strictInt64, let current = row["offset"]?.strictInt64, offset > current,
+           let count = next["max_entries"]?.strictInt64, count > 0, count <= 200 {
             actions.insert(readButton("Next files", tool: "list_dir", input: next), at: 0)
         }
         var metadata = row
@@ -198,13 +198,13 @@ enum AgentWorkspaceApps {
     }
 
     private static func browser(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
-        let row = object(result)
+        let row = JSONValue.objectOrEmpty(result)
         guard row["ok"] != .bool(false), row["error"] == nil,
-              let snapshot = string(row["snapshotId"]),
-              let sequence = integer(row["userSequence"]), sequence >= 0,
-              let tab = integer(row["tabId"]), tab >= 0,
+              let snapshot = boundedString(row["snapshotId"]),
+              let sequence = row["userSequence"]?.strictInt64, sequence >= 0,
+              let tab = row["tabId"]?.strictInt64, tab >= 0,
               case .array(let nodes)? = row["nodes"] else {
-            let retry: [AgentWorkspaceButton] = integer(input["tab_id"]).map { tab in
+            let retry: [AgentWorkspaceButton] = input["tab_id"]?.strictInt64.map { tab in
                 var arguments: [String: JSONValue] = ["tab_id": .int(tab)]
                 if input["scope"] == .string("main_content") { arguments["scope"] = .string("main_content") }
                 return [readButton("Read this page again", tool: "browser.chrome_snapshot", input: arguments)]
@@ -213,14 +213,14 @@ enum AgentWorkspaceApps {
         }
         var items: [AgentWorkspaceItem] = []
         for value in nodes {
-            guard case .object(let node) = value, let id = string(node["nodeId"]),
+            guard case .object(let node) = value, let id = boundedString(node["nodeId"]),
                   node["visible"] == .bool(true), case .object(let states)? = node["states"],
                   states["disabled"] == .bool(false), states["blockedByModal"] != .bool(true),
                   case .array(let available)? = node["actions"] else { continue }
             let number = id.hasPrefix("n") ? String(id.dropFirst()) : id
             let bound: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence), "snapshot_id": .string(snapshot), "node_id"
                 : .string(number)]
-            let name = string(node["name"]) ?? string(node["text"]) ?? "Page control"
+            let name = boundedString(node["name"]) ?? boundedString(node["text"]) ?? "Page control"
             var buttons: [AgentWorkspaceButton] = []
             if available.contains(.string("click")) {
                 buttons.append(.init(label: "Click", action: .perform(tool: "browser.chrome_click", input: bound, title: name, textField: nil, isEffect: true)))
@@ -235,14 +235,14 @@ enum AgentWorkspaceApps {
             if !buttons.isEmpty { items.append(.init(title: name, content: value, actions: buttons)) }
         }
         var metadata = row
-        let projectedIDs = Set(items.compactMap { string(object($0.content)["nodeId"]) })
+        let projectedIDs = Set(items.compactMap { boundedString(JSONValue.objectOrEmpty($0.content)["nodeId"]) })
         metadata["nodes"] = .array(nodes.filter { value in
-            guard let id = string(object(value)["nodeId"]) else { return true }
+            guard let id = boundedString(JSONValue.objectOrEmpty(value)["nodeId"]) else { return true }
             return !projectedIDs.contains(id)
         })
         metadata["workspace_actionable_count"] = .int(Int64(items.count))
         var current: [String: JSONValue] = ["tab_id": .int(tab)]
-        let reading = object(row["reading"] ?? .null)
+        let reading = JSONValue.objectOrEmpty(row["reading"])
         let mainContent = reading["scope"] == .string("main_content")
         if mainContent { current["scope"] = .string("main_content") }
         var readingActions: [AgentWorkspaceButton] = []
@@ -259,7 +259,7 @@ enum AgentWorkspaceApps {
         let navigation: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence)]
         let pageDown = navigation.merging(["delta_x": .int(0), "delta_y": .int(700)]) { _, new in new }
         let pageUp = navigation.merging(["delta_x": .int(0), "delta_y": .int(-700)]) { _, new in new }
-        return .init(title: string(row["title"]) ?? "Browser page", content: .object(metadata), items: items, actions: readingActions + [
+        return .init(title: boundedString(row["title"]) ?? "Browser page", content: .object(metadata), items: items, actions: readingActions + [
             readButton("Read page again", tool: "browser.chrome_snapshot", input: current),
             .init(label: "Go to a website", action: .perform(tool: "browser.chrome_navigate", input: navigation, title: "Go to a website", textField: "url",
                 isEffect: true), needsText: true),
@@ -272,8 +272,8 @@ enum AgentWorkspaceApps {
     private static func readButton(_ label: String, tool: String, input: [String: JSONValue], title: String? = nil) -> AgentWorkspaceButton {
         .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
     }
-    private static func object(_ value: JSONValue) -> [String: JSONValue] { if case .object(let row) = value { return row }; return [:] }
-    private static func string(_ value: JSONValue?) -> String? { guard case .string(let text)? = value, !text.isEmpty, text.count <= 8192 else { return nil };
-        return text }
-    private static func integer(_ value: JSONValue?) -> Int64? { guard case .int(let number)? = value else { return nil }; return number }
+    static func boundedString(_ value: JSONValue?) -> String? {
+        guard let text = value?.nonemptyString, text.count <= 8192 else { return nil }
+        return text
+    }
 }

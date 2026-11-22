@@ -149,7 +149,7 @@ extension Parts {
 
     /// Only enabled selected JavaScript runs; Markdown guidance is read, never executed, and a page (`AbilityStore.answersCalls`) is drawn, never called.
     static func runs(_ row: [String: JSONValue]) -> Bool {
-        row["status"] == .string("active") && row["language"] == .string("javascript") && string(row, "codeFingerprint") != nil
+        row["status"] == .string("active") && row["language"] == .string("javascript") && row["codeFingerprint"]?.stringValue != nil
             && row["callable"] == .bool(true)
     }
 
@@ -165,6 +165,7 @@ extension Parts {
         var before: (input: JSONValue, answer: JSONValue)?
         // What every run did, so the one receipt never denies an earlier run's writes.
         var calls: [JSONValue] = [], changed: [JSONValue] = [], effects: [String] = [], ledgerBytes = 0
+        var notebookChanged: JSONValue?
         while true {
             let startedAt = Date()
             let receipt: JSONValue
@@ -213,15 +214,34 @@ extension Parts {
             if case .array(let rows)? = result["changed"] {
                 changed += rows.map { if case .string(let call) = $0 { .string("run \(runs) " + call) } else { $0 } }
             }
-            effects.append(Self.string(result, "effects") ?? "unknown")
+            let lastEffects = Self.string(result, "effects") ?? "unknown"
+            effects.append(lastEffects)
+            if let reported = result["notebook_changed"], notebookChanged != .null,
+               notebookChanged != .bool(true) || reported == .null {
+                notebookChanged = reported
+            }
             if runs > 1 {
                 // Seal the actual last input so resumed work matches stopped work.
                 result["ran_on"] = input
                 result["calls"] = .array(calls)
                 result["changed"] = changed.isEmpty ? nil : .array(changed)
-                result["effects"] = .string(["unknown", "partial", "occurred"].first(where: effects.contains) ?? effects.last ?? "unknown")
+                let combinedEffects = ["unknown", "partial", "occurred"].first(where: effects.contains) ?? lastEffects
+                result["effects"] = .string(combinedEffects)
+                result["notebook_changed"] = notebookChanged
                 // A later run's pre-entry refusal cannot say the whole ability never ran: an earlier completed run carried it this far.
                 result["execution"] = .string(result["status"] == .string("ok") ? "executed" : "attempted")
+                if result["status"] != .string("ok"), lastEffects == "none", combinedEffects != "none" {
+                    let notebook = switch notebookChanged {
+                    case .bool(true): "An earlier invocation changed the ability's notebook. "
+                    case .null: "An earlier notebook write has an unconfirmed result. "
+                    default: ""
+                    }
+                    result["remedy"] = Repair.reconcile(instruction: notebook
+                        + "Inspect the earlier invocations' effects before continuing. Preserve completed writes and do only what remains.",
+                        nextCall: Self.readCall(id))
+                    result["try_instead"] = nil
+                    result["next_call"] = nil
+                }
             }
             result["runs"] = .int(runs)
             guard carrying else { return .object(result) }
@@ -346,7 +366,7 @@ extension Parts {
             program = candidate.owned
         }
         let dataRoot = root
-        let readPaths = Self.strings(Self.fields(Self.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([]))
+        let readPaths = JSONValue.stringArray(Self.fields(Self.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([]))
         let broker = program.isResident && !preview
             ? try await OwnedProgramRunner.holding(program, dataRoot: dataRoot,
                 make: { ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot,

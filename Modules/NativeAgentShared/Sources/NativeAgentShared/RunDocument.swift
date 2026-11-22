@@ -7,7 +7,7 @@ public enum RunDocument {
             guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "Unknown" }
             return value
         }
-        var lines = [RunKindVocabulary.displayName(run.kind, on: .mac),
+        var lines = [RunKindVocabulary.displayName(run.kind),
             "Started: " + known(run.createdAt), "Status: " + known(run.status),
             "Duration: " + (run.durationSeconds.map { String($0) + " seconds" } ?? "Unknown"),
             "Model: " + known(run.model), "Requested model: " + known(run.requestedModel),

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SecurityCenter+RegistryReceipts.swift` | `SwiftNativeSecurityCenter`: `receiptSummary`, `isoTimestamp` |
+// Blueprint: | `SecurityCenter+RegistryReceipts.swift` | `SwiftNativeSecurityCenter`: `receiptSummary` |
 
 extension SwiftNativeSecurityCenter {
     static func receiptSummary(_ value: JSONValue) -> SecurityReceiptSummary? {
@@ -21,11 +21,7 @@ extension SwiftNativeSecurityCenter {
               let risk = required("risk") else {
             return nil
         }
-        let reasons: [String] = {
-            guard case .array(let arr)? = obj["reasons"] else { return [] }
-            return arr.compactMap { $0.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-        }()
+        let reasons = JSONValue.trimmedScalarTextArray(obj["reasons"])
         return SecurityReceiptSummary(
             id: id,
             at: at,
@@ -35,9 +31,5 @@ extension SwiftNativeSecurityCenter {
             risk: risk,
             reason: SecurityReason.firstCause(in: reasons.map(SecurityReason.init(persistedValue:)))
         )
-    }
-
-    static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
     }
 }

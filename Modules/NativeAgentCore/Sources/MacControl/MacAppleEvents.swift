@@ -3,18 +3,11 @@ import NativeAgentCore
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(Darwin)
 import Darwin
-#endif
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import Carbon
 import OSAKit
 import os
-#endif
 
 // Blueprint: | `MacAppleEvents.swift` | Native OSA: per-event target/Write checks, bounded replies, held calls and their settle, volume recipe |
 
@@ -25,7 +18,6 @@ public final class AppleScriptExecution: Sendable {
     /// quit, not answering when the ping cannot complete. Without accessibility the app cannot be asked, so it says nothing.
     public static func appLife(pid: pid_t, name: String) -> CallLife {
         CallLife(what: name) {
-            #if canImport(AppKit)
             guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return .dead("\(name) has quit") }
             let element = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(element, 3)
@@ -36,9 +28,6 @@ public final class AppleScriptExecution: Sendable {
             case .invalidUIElement: return .dead("\(name) has quit")
             default: return .unknown
             }
-            #else
-            return .unknown
-            #endif
         }
     }
 
@@ -125,7 +114,6 @@ public final class AppleScriptExecution: Sendable {
     }
 
     public static func automationPermission(bundleID: String, ask: Bool = false) async -> JSONValue {
-        #if canImport(AppKit)
         // Resolve even if the caller cancels: an unfinished lookup must not be reported as an app that is not installed.
         guard let url = await Task.detached(priority: .userInitiated, operation: {
             NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
@@ -144,12 +132,8 @@ public final class AppleScriptExecution: Sendable {
             return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path),
                             "state": .string("unavailable"), "detail": .string(error.localizedDescription)])
         }
-        #else
-        return .object(["state": .string("unavailable")])
-        #endif
     }
 
-    #if canImport(AppKit)
     // One serial queue owns OSA/consent/reply work; queued cancellation sends nothing and running cancellation is checked per event.
     private static let appleScriptQueue = DispatchQueue(label: "NativeAgent.AppleScript", qos: .userInitiated)
     // The latest held call on an app process owns its settle; any later write to that process supersedes it, so an earlier hold settles nothing.
@@ -217,7 +201,6 @@ public final class AppleScriptExecution: Sendable {
         }
         return .object(fields)
     }
-    #endif
 
     /// Keep app events in-process; the isolated executor supplies only JSON.
     public func callApp(_ arguments: JSONValue, targets: [String: String], context: MacOperationContext) async throws -> JSONValue {
@@ -235,7 +218,6 @@ public final class AppleScriptExecution: Sendable {
             throw SenseFailure(code: "read_only", message: "A read-declared app refuses modifying or unclassified events.")
         }
         try Self.checkAppScript(args)
-        #if canImport(AppKit)
         guard let url = await Task.detached(priority: .userInitiated, operation: {
             NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
         }).value else {
@@ -371,12 +353,8 @@ public final class AppleScriptExecution: Sendable {
         }
         done["hold"] = .object(receipt)
         return .object(done)
-        #else
-        throw SenseFailure(code: "unavailable", message: "App events require macOS.")
-        #endif
     }
 
-    #if canImport(AppKit)
     private static func appError(_ error: Error, pid: pid_t, app: String, context: MacOperationContext) -> Error {
         let ns = error as NSError
         guard (ns.userInfo["apple_event_code"] as? Int ?? ns.code) == -1712 else { return error }
@@ -598,10 +576,8 @@ public final class AppleScriptExecution: Sendable {
     private static func codeText(_ code: OSType) -> String {
         String(decoding: [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: code >> $0) }, as: UTF8.self)
     }
-    #endif
     /// Only the fixed system-volume recipe calls this subprocess exit. App scripts use callApp and its native, per-event target enforcement.
     package func runSystemVolume(script: String) async throws -> String {
-        #if canImport(AppKit)
         let result = try await ProcessExecution().run(
             executable: "/usr/bin/osascript", arguments: ["-"], currentDirectory: nil,
             environment: nil, standardInput: Data(script.utf8), timeoutSeconds: 30)
@@ -613,9 +589,6 @@ public final class AppleScriptExecution: Sendable {
         var output = result.stdout
         if output.hasSuffix("\n") { output.removeLast() }
         return output
-        #else
-        throw MacControlError.applescriptFailed("AppKit unavailable on this platform")
-        #endif
     }
 
 }

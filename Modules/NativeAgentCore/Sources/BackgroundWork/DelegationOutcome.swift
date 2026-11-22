@@ -140,7 +140,7 @@ extension DelegationReadout {
         )
     }
     /// Without a completion stamp, dedupe by identity alone rather than inventing cursor order.
-    var completionStamp: Date? { DelegationOutcomeCursor.parseISO(completedAt) }
+    var completionStamp: Date? { NativeTimestampFormat.parseOptionalISO8601FractionalFirst(completedAt) }
 }
 public enum DelegationOutcome: String, Sendable, Equatable, CaseIterable {
     case succeeded

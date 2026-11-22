@@ -8,13 +8,6 @@ import PersistenceCore
 public enum AgentConversationWatches {
     public static func begin(row: String, operation: String) { AgentConversationRunning.shared.beginWatch(row + ":" + operation) }
     public static func end(row: String, operation: String) { AgentConversationRunning.shared.endWatch(row + ":" + operation) }
-    /// Settlement retains the reader until its owner exits.
-    public static func retain(_ id: UUID, row: String, operation: String, task: Task<Void, Never>) {
-        AgentConversationRunning.shared.retainWatch(id, row: row, operation: operation, task: task)
-    }
-    public static func finish(_ id: UUID) { AgentConversationRunning.shared.finishWatch(id) }
-    public static func start() { AgentConversationRunning.shared.openWatches() }
-    public static func stop() async { await AgentConversationRunning.shared.shutdownWatches() }
 }
 
 /// In-flight ownership is process-local; durable records remain the state every surface reads.
@@ -38,47 +31,11 @@ final class AgentConversationRunning: @unchecked Sendable {
     }
     private var senders: [String: Sender] = [:]
     private var routeWatches: Set<String> = []
-    private var retainedWatches: [UUID: (row: String, operation: String, task: Task<Void, Never>)] = [:]
-    private var closed = false
     private var watches: [String: Int] = [:]
     private var generation = 0
     private var changeWaiter = ScopedWaiter()
 
     private init() {}
-    func openWatches() { lock.withLock { closed = false } }
-
-    func retainWatch(_ id: UUID, row: String, operation: String, task: Task<Void, Never>) {
-        let admitted = lock.withLock {
-            retainedWatches[id] = (row, operation, task)
-            return !closed && sends[SendKey(row: row, operation: operation)]?.stopped != true
-        }
-        if !admitted { task.cancel() }
-    }
-
-    func finishWatch(_ id: UUID) { lock.withLock { _ = retainedWatches.removeValue(forKey: id) }; changed() }
-
-    func observing(row: String, operation: String) -> Bool {
-        lock.withLock { retainedWatches.values.contains { $0.row == row && $0.operation == operation } }
-    }
-
-    /// Explicit retirement joins every retained watch for this operation.
-    func retireWatches(row: String, operation: String) async -> Bool {
-        let tasks = lock.withLock {
-            retainedWatches.values.filter { $0.row == row && $0.operation == operation }.map(\.task)
-        }
-        tasks.forEach { $0.cancel() }
-        for task in tasks { await task.value }
-        return !tasks.isEmpty
-    }
-
-    func shutdownWatches() async {
-        let tasks = lock.withLock {
-            closed = true // Close admission before retiring resources.
-            return retainedWatches.values.map(\.task)
-        }
-        tasks.forEach { $0.cancel() }
-        for task in tasks { await task.value }
-    }
 
     func begin(row: String, operation: String, stop: @escaping @Sendable () -> Void) {
         let key = SendKey(row: row, operation: operation)
@@ -134,8 +91,9 @@ final class AgentConversationRunning: @unchecked Sendable {
 
     func beginWatch(_ key: String) { lock.withLock { _ = routeWatches.insert(key) } }
     func endWatch(_ key: String) { lock.withLock { _ = routeWatches.remove(key) }; changed() }
-    func routeWatching(row: String, operation: String) -> Bool { lock.withLock { routeWatches.contains(row + ":" + operation) } || observing(row: row,
-        operation: operation) }
+    func routeWatching(row: String, operation: String) -> Bool {
+        lock.withLock { routeWatches.contains(row + ":" + operation) }
+    }
 
     /// One sender per queued message, for this process's lifetime.
     func adopt(_ item: String) -> Bool {

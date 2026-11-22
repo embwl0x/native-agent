@@ -90,8 +90,7 @@ public enum FirstConversationPersonaProgression {
         dataRoot: URL,
         sessionID: String,
         title: String,
-        token: String, spent spentName: String,
-        fileManager: FileManager = .default
+        token: String, spent spentName: String
     ) throws {
         let session = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         let sectionTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -131,10 +130,7 @@ public enum FirstConversationPersonaProgression {
     }
 
     /// Match the receipt against the live or spent token's exact title so unrelated writes cannot settle it.
-    public static func recordedWriteTitle(
-        dataRoot: URL,
-        fileManager: FileManager = .default
-    ) -> String? {
+    public static func recordedWriteTitle(dataRoot: URL) -> String? {
         let root = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
         do {
             return try decodeToken(at: root.appendingPathComponent(writeTokenFilename))?.title
@@ -221,7 +217,7 @@ public enum FirstConversationPersonaProgression {
                 guard title.hasPrefix(roleSectionPrefix) else { return false }
                 try armWriteToken(dataRoot: dataRoot, sessionID: session,
                     title: voiceSectionPrefix + title.dropFirst(roleSectionPrefix.count),
-                    token: voiceTokenFilename, spent: voiceSpentTokenFilename, fileManager: fileManager)
+                    token: voiceTokenFilename, spent: voiceSpentTokenFilename)
             }
             // Commit the next step first. A failed settlement keeps the source token
             // and exact intent for repair, never inviting another persona append.
@@ -237,8 +233,7 @@ public enum FirstConversationPersonaProgression {
     /// token is live for this session. Delivery never spends write eligibility.
     public static func pendingVoiceDirective(
         dataRoot: URL?,
-        sessionID: String?,
-        fileManager: FileManager = .default
+        sessionID: String?
     ) throws -> String? {
         guard let dataRoot, let sessionID, !sessionID.isEmpty else { return nil }
         let root = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)

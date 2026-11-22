@@ -3,20 +3,15 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 import os
 import CoreGraphics
 import UserNotifications
 import Senses
 import Experiences
-import CryptoKit
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacLookPercept.swift` | Immutable semantic percept, handle and readout vocabulary |
 // One AX snapshot supplies all grades so perception cannot disagree across walkers. Handles hash titles, roles and ancestors, excluding values and indices so
 // edits and scrolling preserve identity. Retitles mint new handles; document-order ordinals disambiguate siblings and hash collisions. Frames are pulled,
@@ -60,7 +55,7 @@ public enum MacLookHandle {
             + "if the container reorders; re-look before acting on it"
     }
     public static func token(fingerprint: String) -> String {
-        base36(fnv1a64(fingerprint), length: tokenLength)
+        base36(StableHash.fnv1a64(fingerprint), length: tokenLength)
     }
     /// Document-order suffixes disambiguate repeated tokens.
     public static func rendered(token: String, ordinal: Int) -> String {

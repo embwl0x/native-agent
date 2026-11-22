@@ -1,7 +1,7 @@
 import Foundation
 import Synchronization
 
-// Blueprint: | `OrganPulse.swift` | `OrganPulse` beats and recording hook; `OrganRecord` derives profile and deviation from the record's newest beats |
+// Blueprint: | `OrganPulse.swift` | `OrganPulse` beats and recording hook; `OrganRecord` derives deviation from the record's newest beats |
 
 /// One beat of an organ: when its pass was judged, the outcome, note, what it yielded and its cadence. A fresh timestamp alone does not prove successful
 /// work. BackgroundLoops writes beat details into the experience record and reads the newest 32 per organ. Every organ reaches it through this one hook —
@@ -72,7 +72,7 @@ public struct OrganPulse: Sendable, Equatable {
     private static let sink = Mutex<Sink?>(nil)
 }
 
-/// One organ's record: its last beats, oldest first, and what they predict. Profile and deviation are derived from the beats on every read and never stored.
+/// One organ's record: its last beats, oldest first, and what they predict. Deviation is derived from the beats on every read and never stored.
 public struct OrganRecord: Sendable, Equatable {
     /// Beats kept per organ, so a busy organ never evicts another organ's beats.
     public static let capacity = 32
@@ -89,22 +89,6 @@ public struct OrganRecord: Sendable, Equatable {
         self.organ = organ
         self.beats = beats
         self.latest = latest
-    }
-
-    /// What the record predicts: the interval it keeps, its usual outcomes and its usual yield when it works.
-    public struct Profile: Sendable, Equatable {
-        /// Median seconds between beats; nil with fewer than two beats.
-        public let medianInterval: TimeInterval?
-        public let outcomes: [OrganPulse.Outcome: Int]
-        /// Median yield of worked beats that counted one; nil when none did.
-        public let medianYield: Double?
-    }
-
-    public var profile: Profile {
-        let intervals = zip(beats.dropFirst(), beats).map { $0.at.timeIntervalSince($1.at) }
-        return Profile(medianInterval: Self.median(intervals),
-                       outcomes: beats.reduce(into: [:]) { $0[$1.outcome, default: 0] += 1 },
-                       medianYield: Self.median(Self.workedYields(beats)))
     }
 
     /// A beat the record did not predict, with its why in the words the agent feels. `since` and `size` name it: one deviation keeps its onset while it

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `MemoryStorageModels.swift` | `MemoryV2Defaults` enum |
@@ -79,7 +80,7 @@ public struct StoredMemory: Sendable {
         personaId: String = MemoryV2Defaults.personaID,
         source: String? = nil,
         confidence: Double = 1.0,
-        createdAt: String = MemoryStorage.nowISO8601(),
+        createdAt: String = NativeTimestampFormat.fractionalZulu(Date()),
         updatedAt: String? = nil,
         embedding: [Float]? = nil,
         embeddingEpoch: String? = nil,
@@ -132,7 +133,7 @@ public struct StoredProposal: Sendable {
         content: String,
         personaId: String = MemoryV2Defaults.personaID,
         source: String? = nil,
-        stagedAt: String = MemoryStorage.nowISO8601(),
+        stagedAt: String = NativeTimestampFormat.fractionalZulu(Date()),
         status: String = "pending",
         resolvedAt: String? = nil,
         rejectionReason: String? = nil,

@@ -12,7 +12,6 @@ extension AppModel {
     func pruneSessionChatState(_ sessionId: String) async {
         engine.transcripts.removeMessages(for: sessionId)
         engine.turns.runtime.pruneSessionState(sessionId)
-        await engine.panelFreshness.removeDetached(sessionId)
     }
 
     /// Pruning must preserve live work and mounted panels.
@@ -26,10 +25,8 @@ extension AppModel {
             setFailureStatus(error, action: "read visible conversations before pruning chat state")
             return
         }
-        let detachedIDs = await engine.panelFreshness.detachedSessionIDs()
         guard Set(engine.transcripts.sessions.map(\.id)) == knownSessionIds else { return }
         let cached = engine.transcripts.loadedSessionIDs
-            .union(detachedIDs)
         for sessionId in engine.turns.runtime.staleSessionIDs(
             cached: cached, known: knownSessionIds,
             keepVisible: { visible.contains($0) }

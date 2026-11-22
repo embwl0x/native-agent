@@ -177,6 +177,16 @@ public actor MemoryStorage {
             if let row = try Self.admissionDuplicate(of: memory, among: rows, in: db) {
                 try Self.recordCorrectionOccurrence(metadata: memory.metadata, rowID: memory.id, createdAt: memory.createdAt, on: row.id, in: db)
                 var saved = try Self.foldDuplicate(memory, into: row, in: db)
+                // A still-pending replacement is not recallable yet: its targets retire when its own vector lands, not now.
+                if Self.metadataFlag(saved.metadata, Self.pendingAdmissionKey), !superseding.isEmpty {
+                    let owed = try Self.owedSupersessions(saved.metadata)
+                    let added = superseding.filter { new in new.targetId != saved.id && !owed.contains { $0.targetId == new.targetId } }
+                    saved.metadata = Self.owingAdmission(saved.metadata, preservingID: Self.metadataFlag(saved.metadata, Self.preservesIDKey),
+                                                         superseding: owed + added)
+                    try db.execute(sql: "UPDATE memories SET metadata_json = ? WHERE id = ?",
+                                   arguments: [try Self.encodeMetadata(saved.metadata), saved.id])
+                    return (saved, [], [])
+                }
                 let demoted = try superseding.filter { $0.targetId != saved.id }
                     .map { try Self.demoteSuperseded($0, by: &saved, in: db) }
                 return (saved, [], demoted)
@@ -219,15 +229,17 @@ public actor MemoryStorage {
            let vector = memory.embedding, let epoch = memory.embeddingEpoch, !epoch.isEmpty {
             let activeEpoch = try Self.embeddingEpochState(in: db).activeEpoch
             if activeEpoch == nil || activeEpoch == epoch {
-                let nearest = rows.filter { Self.comparableEpochs($0.embeddingEpoch, epoch) && $0.embedding != nil }
+                // Only a row that could count as the duplicate competes for nearest: an ineligible closer row never hides a qualifying one.
+                let nearest = rows.filter { row in
+                    Self.comparableEpochs(row.embeddingEpoch, epoch) && row.embedding != nil
+                        && !MemoryRecallScoring.isExplicitCorrection(row.metadata)
+                        && scope != nil
+                        && Self.disclosureScopeKey(personaId: row.personaId, metadata: row.metadata) == scopeKey
+                        && MemoryRecallScoring.parseTimestamp(row.createdAt).map { now.timeIntervalSince($0) < 24 * 3600 } == true
+                }
                     .map { (row: $0, cosine: VectorMath.cosine(vector, $0.embedding)) }
                     .max { $0.cosine < $1.cosine }
-                if let nearest, Self.semanticDuplicate(nearest.row.content, memory.content, similarity: nearest.cosine),
-                   !MemoryRecallScoring.isExplicitCorrection(nearest.row.metadata),
-                   scope != nil,
-                   Self.disclosureScopeKey(personaId: nearest.row.personaId, metadata: nearest.row.metadata) == scopeKey,
-                   let created = MemoryRecallScoring.parseTimestamp(nearest.row.createdAt),
-                   now.timeIntervalSince(created) < 24 * 3600 {
+                if let nearest, Self.semanticDuplicate(nearest.row.content, memory.content, similarity: nearest.cosine) {
                     duplicate = nearest.row
                 }
             }
@@ -344,7 +356,7 @@ public actor MemoryStorage {
             }
         }
         row.metadata = MemoryRoot.setting(MemoryRoot.union([held, incoming]), in: .object(metadata))
-        row.updatedAt = Self.nowISO8601()
+        row.updatedAt = NativeTimestampFormat.fractionalZulu(Date())
         try Self.validateTemporalEvidence(row)
         try db.execute(sql: """
             UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?
@@ -538,13 +550,26 @@ public actor MemoryStorage {
         return outcome
     }
 
+    /// An owed row whose admission Trust refused is archived with the refusal as its reason, so the fill goes on to the next row.
+    func archiveRefusedOwed(id: String, content: String, reason: String) async throws {
+        let archived: StoredMemory? = try await dbPool.write { db in
+            guard let owed = try Row.fetchOne(db, sql: """
+                SELECT * FROM memories WHERE id = ? AND embedding IS NULL AND content = ? AND status = 'active'
+                """, arguments: [id, content]).map(Self.decodeMemory) else { return nil }
+            return try Self.archiveMemory(owed, reason: reason, in: db)
+        }
+        guard let archived else { return }
+        invalidateRecallCache()
+        await pokeProjectionHooks(archived)
+    }
+
     private static func archiveMemory(_ memory: StoredMemory, reason: String, in db: Database) throws -> StoredMemory {
         var metadata: [String: JSONValue] = [:]
         if case .object(let current)? = memory.metadata { metadata = current }
         metadata["archived_reason"] = .string(reason)
         try db.execute(sql: """
             UPDATE memories SET status = 'archived', updated_at = ?, metadata_json = ? WHERE id = ?
-            """, arguments: [Self.nowISO8601(), Self.encodeMetadata(.object(metadata)), memory.id])
+            """, arguments: [NativeTimestampFormat.fractionalZulu(Date()), Self.encodeMetadata(.object(metadata)), memory.id])
         guard let archived = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [memory.id]).map(Self.decodeMemory) else {
             throw MemoryStorageError.databaseUnavailable("archived memory is missing")
         }
@@ -584,6 +609,9 @@ public actor MemoryStorage {
             let prior = existing
             let priorMetadata = existing.metadata
             let contentChanged = patch.content.map { $0 != existing.content } == true
+            if contentChanged, let content = patch.content, let reason = MemoryCandidateQuality.rejectionReason(text: content) {
+                throw MemoryV2Error.rejectedCandidate(reason)
+            }
             let owesVector = contentChanged && patch.embedding == nil
             if let c = patch.content { existing.content = c }
             if let s = patch.source { existing.source = s }
@@ -657,7 +685,7 @@ public actor MemoryStorage {
                     existing.metadata = .object(metadata)
                 }
             }
-            existing.updatedAt = Self.nowISO8601()
+            existing.updatedAt = NativeTimestampFormat.fractionalZulu(Date())
             try Self.validateTemporalEvidence(existing)
             try Self.requireWritableEpoch(
                 in: db,
@@ -767,26 +795,30 @@ public actor MemoryStorage {
     @discardableResult
     public func deleteMemory(id: String) async throws -> Bool {
         // Read before deletion so projection hooks retain the actual persona and content.
-        let result: (deleted: Bool, row: StoredMemory?) = try await dbPool.write { db in
-            let row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory)
-            try db.execute(sql: "DELETE FROM memories WHERE id = ?", arguments: [id])
-            let deleted = db.changesCount > 0
-            if deleted, let row {
-                // Preserve the deleted memory's embedding so the tombstone blocks paraphrases.
-                try Self.upsertTombstone(
-                    db: db, content: row.content, reason: "deleted_memory",
-                    embedding: row.embedding,
-                    embeddingEpoch: row.embeddingEpoch
-                )
+        let result: (deleted: Bool, rows: [StoredMemory]) = try await dbPool.write { db in
+            guard let row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory) else {
+                return (false, [])
             }
-            return (deleted, row)
+            // Forgetting a text forgets it everywhere it is that text: a copy saved under another surface goes with it.
+            let rows = try Row.fetchAll(db, sql: "SELECT * FROM memories WHERE id = ? OR content = ?",
+                                        arguments: [id, row.content]).map(Self.decodeMemory)
+            for copy in rows { try db.execute(sql: "DELETE FROM memories WHERE id = ?", arguments: [copy.id]) }
+            // Preserve the deleted memory's embedding so the tombstone blocks paraphrases.
+            try Self.upsertTombstone(
+                db: db, content: row.content, reason: "deleted_memory",
+                embedding: row.embedding,
+                embeddingEpoch: row.embeddingEpoch
+            )
+            return (true, rows)
         }
-        if result.deleted, let row = result.row {
+        if result.deleted {
             invalidateRecallCache()
-            pokeUserMDRegen(persona: row.personaId)
-            pokeSpotlight(row)
-            pokeKnowledgeGraph(row.id)
-            await pokeDerivedState(row, deleted: true)
+            for row in result.rows {
+                pokeUserMDRegen(persona: row.personaId)
+                pokeSpotlight(row)
+                pokeKnowledgeGraph(row.id)
+                await pokeDerivedState(row, deleted: true)
+            }
         }
         return result.deleted
     }
@@ -898,7 +930,7 @@ public actor MemoryStorage {
 
     /// Atomically increment use_count and stamp last_used_at for returned recall hits. Usage is access, not content: updated_at and recall_generation stay
     /// unchanged.
-    public func recordRecallHits(ids: [String], at when: String = MemoryStorage.nowISO8601()) async throws {
+    public func recordRecallHits(ids: [String], at when: String = NativeTimestampFormat.fractionalZulu(Date())) async throws {
         guard !ids.isEmpty else { return }
         try await dbPool.write { db in
             let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")

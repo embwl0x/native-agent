@@ -18,23 +18,14 @@ extension SwiftNativeDeskStore {
             }
             let proposed = Self.normalizeBlockers(blockers)
             try Self.validateBlockedOn(handle: handle, proposed: proposed, in: state)
-            let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
-                handle: handle,
-                body: .setBlockedOn(handles: proposed)
-            )
-            var committed = try await appendAndRecompactUnlocked(op, feed: feed).feed
-            var bodies: [DeskOpBody] = []
+            var bodies: [DeskOpBody] = [.setBlockedOn(handles: proposed)]
             if waiting {
                 bodies.append(.setStatus(status: item.status == .blocked ? .next : item.status,
                     blockedReason: nil, waitingOn: nil, progress: item.progress, assignee: item.assignee, laneOf: item.laneOf))
             }
             if let note { bodies.append(.appendNote(text: note, author: "agent")) }
-            for body in bodies {
-                let next = DeskOp(ts: DeskClock.commitStamp(notBefore: committed.maxCommittedTs), handle: handle, body: body)
-                committed = try await appendAndRecompactUnlocked(next, feed: committed).feed
-            }
-            return op
+            let ops = bodies.map { DeskOp(handle: handle, body: $0) }
+            return try await commitUnlocked(ops, feed: feed).ops[0]
         }
     }
     /// Reject malformed defer dates because readers treat them as not deferred, making a write silently ineffective.
@@ -52,12 +43,10 @@ extension SwiftNativeDeskStore {
                 throw DeskError.deferUntilUnparseable(handle: handle, value: value)
             }
             let op = DeskOp(
-                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
                 body: .setDeferUntil(until: value)
             )
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return op
+            return try await commitUnlocked([op], feed: feed).ops[0]
         }
     }
     /// Preserve first-seen order so the stored set reads back as named.
@@ -74,15 +63,15 @@ extension SwiftNativeDeskStore {
     /// Remove settled waits under the lock so a concurrently committed wait survives.
     public func releaseBlockers(_ handle: String, removing settled: Set<String>, note: String, author: String) async throws {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
+            let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
             guard let item = state.items.first(where: { $0.handle == handle }),
                   item.blockedOn.contains(where: settled.contains) else { return }
-            for body in [DeskOpBody.setBlockedOn(handles: item.blockedOn.filter { !settled.contains($0) }),
-                         .appendNote(text: note, author: author)] {
-                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: body)
-                feed = try await appendAndRecompactUnlocked(op, feed: feed).feed
-            }
+            let ops = [
+                DeskOp(handle: handle, body: .setBlockedOn(handles: item.blockedOn.filter { !settled.contains($0) })),
+                DeskOp(handle: handle, body: .appendNote(text: note, author: author)),
+            ]
+            try await commitUnlocked(ops, feed: feed)
         }
     }
     /// Validate the prospective graph: every Desk blocker is live and no edge closes an unresolvable cycle.
@@ -137,11 +126,10 @@ extension SwiftNativeDeskStore {
             }
             guard !item.status.isTerminal, item.updatedAt == expectedUpdatedAt else { return false }
             let status: DeskStatus = canceled ? .canceled : .done
-            var op = DeskOp(handle: handle, body: .closeItem(outcomeSummary: outcomeSummary, status: status))
+            let op = DeskOp(handle: handle, body: .closeItem(outcomeSummary: outcomeSummary, status: status))
             try Self.validateHierarchyTransition(op, in: state)
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            try await commitUnlocked([op], feed: feed)
             return true
         }
     }
@@ -150,9 +138,9 @@ extension SwiftNativeDeskStore {
     @discardableResult
     public func reconcileTerminalParentsWithNonTerminalDescendants() async throws -> [DeskOp] {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
+            let feed = try await readFeedUnlocked()
             var state = Self.compact(base: feed.base, feed.ops)
-            // Reopen outer ancestors first so each appended repair respects hierarchy invariants.
+            // Reopen outer ancestors first so each staged repair respects hierarchy invariants.
             let candidates = Self.terminalParentsWithNonTerminalDescendants(in: state)
             var repairs: [DeskOp] = []
             for candidate in candidates {
@@ -161,10 +149,9 @@ extension SwiftNativeDeskStore {
                       Self.descendants(of: live.handle, in: state).contains(where: { !$0.status.isTerminal }) else {
                     continue
                 }
-                let prior = Self.foldLastNonTerminal(seed: feed.base?.lastNonTerminal ?? [:], ops: feed.ops)[live.handle]
+                let prior = Self.foldLastNonTerminal(seed: feed.base?.lastNonTerminal ?? [:], ops: feed.ops + repairs)[live.handle]
                     ?? DeskNonTerminalRecord(status: .watch, blockedReason: nil, waitingOn: nil)
                 let repair = DeskOp(
-                    ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                     handle: live.handle,
                     body: .setStatus(
                         status: prior.status,
@@ -182,12 +169,11 @@ extension SwiftNativeDeskStore {
                 } catch DeskError.pursuitCapReached {
                     continue
                 }
-                let committed = try await appendAndRecompactUnlocked(repair, feed: feed)
                 repairs.append(repair)
-                feed = committed.feed
-                state = committed.state
+                state = Self.compact(base: feed.base, feed.ops + repairs)
             }
-            return repairs
+            guard !repairs.isEmpty else { return [] }
+            return try await commitUnlocked(repairs, feed: feed).ops
         }
     }
     /// Stamp notification attempts without changing updatedAt so one change cannot fan out into duplicate pings.
@@ -205,8 +191,8 @@ extension SwiftNativeDeskStore {
                   item.updatedAt == expectedUpdatedAt else { return false }
             // Mint the stamp inside the flock so it cannot precede a mutation that wins the lock.
             let stamp = at ?? DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-            _ = try await appendAndRecompactUnlocked(
-                DeskOp(ts: stamp, handle: handle, body: .markNotified(at: stamp)),
+            try await commitUnlocked(
+                [DeskOp(handle: handle, body: .markNotified(at: stamp))],
                 feed: feed
             )
             return true

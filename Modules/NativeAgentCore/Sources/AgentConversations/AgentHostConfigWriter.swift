@@ -1,6 +1,6 @@
 import AgentLinkTransport
+import NativeAgentShared
 import Darwin
-import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -464,7 +464,7 @@ public enum AgentHostConfigWriter {
         // Restore exact original spacing (including an originally absent section) only while the file still matches our write. Later host edits win.
         var restoreAbsence = false
         if removing, let record = try backupRecords(at: backupRecordURL).last,
-           record.restoresOriginal == true, record.writtenDigest == digest(existing), record.path.hasPrefix(path + ".") {
+           record.restoresOriginal == true, record.writtenDigest == SHA256Hex.of(existing), record.path.hasPrefix(path + ".") {
             let (original, identity) = try read(path: record.path)
             if identity == record.identity {
                 result.data = original
@@ -585,7 +585,6 @@ public enum AgentHostConfigWriter {
     }
 
     /// Keep undo beside the settings so the person can find it.
-    private static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
     private struct PreparedBackup {
         let record: BackupRecord
@@ -607,7 +606,7 @@ public enum AgentHostConfigWriter {
             if write(data, to: backup) {
                 do {
                     let (_, identity) = try read(path: backup)
-                    let record = BackupRecord(path: backup, identity: identity, writtenDigest: digest(written),
+                    let record = BackupRecord(path: backup, identity: identity, writtenDigest: SHA256Hex.of(written),
                                                 originallyAbsent: originallyAbsent, restoresOriginal: restoresOriginal,
                                                 jsonOwnership: jsonOwnership, tomlOwnership: tomlOwnership)
                     return PreparedBackup(record: record, previous: records)

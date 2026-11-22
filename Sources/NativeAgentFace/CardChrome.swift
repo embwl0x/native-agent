@@ -44,15 +44,15 @@ struct CardChrome: View {
                     if let failure = result.failure { throw failure }
                     guard result.identity.card == identity.card, result.identity.session == identity.session else { throw unconfirmed() }
                     if input.submission.checking, !result.verified {
-                        return .init(words: "This request is still waiting on its setup owner.", effects: .unknown)
+                        return .init(words: "Still setting up…", effects: .unknown)
                     }
-                    return .init(words: result.verified ? "The request is settled." : "The setup owner accepted your answer.",
+                    return .init(words: result.verified ? "Done." : "Got it. Checking now.",
                         effects: result.effects, accepted: true, committed: card.fields.map { .init(id: $0.id) })
                 } catch { return .interrupted(error) }
             }
         }
     }
     private func unconfirmed() -> WireFailure {
-        .init(code: "card_unconfirmed", message: "The card owner did not confirm this answer.", cause: nil, effects: .unknown)
+        .init(code: "card_unconfirmed", message: "Not sure that went through. Check the card again.", cause: nil, effects: .unknown)
     }
 }

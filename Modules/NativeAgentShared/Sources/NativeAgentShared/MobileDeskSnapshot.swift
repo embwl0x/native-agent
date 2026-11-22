@@ -135,10 +135,6 @@ public struct WorkOverview: Codable, Equatable, Sendable {
         return waiting == 0 ? "Nothing needs you on this overview."
             : "\(waiting) \(waiting == 1 ? "thing needs" : "things need") you."
     }
-
-    public var needsYouOverflow: String? {
-        omittedNeedsYou > 0 ? "And \(omittedNeedsYou) more waiting in Approvals, Inbox, and Desk." : nil
-    }
 }
 
 /// Execution-owned movement, independent of edits to a Desk row.
@@ -161,16 +157,12 @@ public enum DeskActivityState: String, Sendable {
 
     public static let movementWindow: TimeInterval = 5 * 60
 
-    public static func movementDate(_ raw: String?) -> Date? {
-        raw.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
-    }
-
     public static func execution(_ evidence: DeskExecutionEvidence?, now: Date) -> Self {
         guard let evidence else { return .unknown }
         if evidence.status == "queued" { return .queued }
         if evidence.status == "blocked_on_approval" { return .blocked }
         guard evidence.status == "running",
-              let movement = movementDate(evidence.lastMovementAt), movement <= now else { return .unknown }
+              let movement = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(evidence.lastMovementAt), movement <= now else { return .unknown }
         return now.timeIntervalSince(movement) < movementWindow ? .working : .stale
     }
 
@@ -186,7 +178,7 @@ public enum DeskActivityState: String, Sendable {
         // "watch" is the status an item starts with. Only a watch is watching; any other item not yet started is queued.
         if kind == "watch" { return .watching }
         if ["todo", "next", "watch"].contains(status) { return .queued }
-        if status == "now", let updated = movementDate(updatedAt),
+        if status == "now", let updated = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(updatedAt),
            now.timeIntervalSince(updated) >= movementWindow { return .stale }
         return .unknown
     }
@@ -198,7 +190,7 @@ public enum DeskActivityState: String, Sendable {
         case .watching: "Watching"
         case .deferred: "Deferred"
         case .blocked: "Blocked"
-        case .stale: "Stale — activity unconfirmed"
+        case .stale: "No recent activity"
         case .unknown: "Activity unknown"
         case .finished: "Finished"
         }

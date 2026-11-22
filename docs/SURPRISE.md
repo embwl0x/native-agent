@@ -216,16 +216,12 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
      reads; if there is no such hand work, it is the single repeated call,
      counted once. Its `practice: ` line uses `FamiliarLines.firstMet` in
      the existing bounded `mind/familiar.bin`.
-   - An active ability's current learned-use or validation route suppresses
-     the note when it contains the practice ids in order. Declared reach
-     proves no route. That encounter is still met.
-   - `practice.keep` traces `practice`, `met: first|again` and `kept`;
-     `kept` means admission of the keep call, not an ability save.
-   - The gate is in `ChatOrchestration+StreamingToolLoop.swift`, before the
-     first keep request; later rounds finish the admitted
-     keep. The delivered reply and reflection retain their existing path.
-     This replaces the unfamiliar whole-turn-signature gate. The nightly
-   - `practice.keep` traces `practice`, `met: first|again` and `noted`;
+   - When an active ability's current learned-use or validation route makes
+     exactly the practice ids in order (its other steps only reads), the note
+     names it: to use next time when its newest covering run's own outcome
+     completed or it passed, else with the step that run failed at, to repair. Declared reach proves no route.
+   - `practice.keep` traces `practice`, `met: first|again`, `noted` and the
+     covering `ability` (`id`, `worked` or `failed`) when there is one;
      `noted` means the note was sent, not an ability save.
    - The nerve is in `ChatOrchestration+StreamingToolLoop.swift`, after each
      tool round; there is no private keep call after the reply. The nightly
@@ -348,8 +344,8 @@ nothing today.
    - It applies to intentions owed to User, or of origin self. Any other `say`
      is posted as a `moment` happening and opens a thought.
    - Its key is the item handle plus the occurrence (`IntentionClock` for a
-     rhythm, the due time for `at`), so a retry reconciles the original
-     transcript row instead of saying it twice. Other moments use the carry
+     rhythm, the due time for `at`) and the revision of a rebound habit. A
+     retry reconciles the original transcript row. Other moments use the carry
      fingerprint and latest non-agent note. Its destination carries User's
      own conversation route, as `chat.post` does.
    - A new post knocks through the informational shoulder tap. The words
@@ -357,17 +353,20 @@ nothing today.
      attention router holds the informational knock until quiet ends
      (User 10-12). An earlier draft held the speech itself, which let a
      rhythm's occurrence age past its two-hour grace and never be said.
-   - Its story gets an agent note, `Said <MyQueue.shown(now)>: "<words>"`. A
-     once intention closes with reason `said`; a rhythm goes on, and an
-     until-time ends it. Settlement uses `settle` and records the occurrence
+   - Its story gets an agent note, `Said <MyQueue.shown(now)>: "<words>"`. The
+     moment still comes to their and they ends the step themselves. A finished
+     once habit with fixed words closes through its own settlement.
+     Settlement uses `settle` and records the occurrence
      and its owed Desk settlement in one write in MY QUEUE's carried ledger
-     (`desk/my-queue-carried.json`). Launch and carried passes finish the
-     idempotent notes and unchanged once-close without speech or another
-     habit run, then clear the debt. This opens no thought.
+     (`desk/my-queue-carried.json`). Launch, carried passes and queue closure
+     finish saved settlements without speech or another habit run.
+     Notes still land after an edit, closure or archive. A habit settlement
+     closes only the same open once step. A completed habit saves its
+     `Ran` note before any follow-up speech so closure can settle that note.
      The old full-turn path for these eligible
      fixed words comes out; no parallel delivery ledger is added.
-   - Failed speech stays due for the next carried pass and never becomes a
-     thought. A committed duplicate can establish delivery interrupted
+   - Failed speech stays due for the next carried pass while the step is
+     still eligible. A committed duplicate can establish delivery interrupted
      before its ledger write; saved debts finish without another post or knock.
      The release lead still owes installed proof.
 

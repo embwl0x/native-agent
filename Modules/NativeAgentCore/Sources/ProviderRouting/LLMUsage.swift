@@ -61,7 +61,7 @@ public struct LLMUsage: Sendable, Equatable {
     }
 
     /// Anthropic counters are disjoint; OpenAI cached tokens are a subset of input, so adding them would double-count occupancy.
-    public func logicalInputTokens(provider: String) -> Int? {
+    public func logicalInputTokens() -> Int? {
         guard let inputTokens, inputTokens >= 0 else { return nil }
         if additiveInputCounters {
             guard let read = cacheReadInputTokens, read >= 0,

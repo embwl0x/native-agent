@@ -12,7 +12,7 @@ import MacIntegration
 
 extension SwiftToolDispatcher {
     /// Share existing evidence readers; this lazy read must not write memory or replay work.
-    func impl_work_context(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    func impl_work_context(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
         let rawQuery = try requireString(input, "query").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawQuery.isEmpty, rawQuery.count <= 400 else {
             throw AutonomyGateError.toolDenied(reason: "work_context: give a work topic in 1–400 characters")
@@ -52,7 +52,7 @@ extension SwiftToolDispatcher {
             historyInput["session_id"] = .string(session)
         }
 
-        async let mail = workContextMail(turn: turn, invocation: invocation, query: query, surface: surface)
+        async let mail = workContextMail(turn: turn, invocation: invocation, query: query)
         async let history: JSONValue = impl_search_chat_history(
             input: historyInput, invokedAs: "search_chat_history",
             workContextQuery: query,
@@ -174,7 +174,7 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    private func workContextMail(turn: Turn, invocation: ChatToolInvocation, query: WorkContextQuery, surface: String) async throws -> JSONValue {
+    private func workContextMail(turn: Turn, invocation: ChatToolInvocation, query: WorkContextQuery) async throws -> JSONValue {
         let since = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-90 * 86_400))
         let input: [String: JSONValue] = ["query": .array(query.terms.map(JSONValue.string)),
             "sort": .string("newest"), "limit": .int(5), "since": .string(since)]
@@ -198,7 +198,7 @@ extension SwiftToolDispatcher {
         case .value(let result):
             try Task.checkCancellation()
             return AgentWorkspace.attachReadReferences(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
-                tool: "mail.search", input: input, result: result, dataRoot: dataRoot)
+                input: input, result: result, dataRoot: dataRoot)
         case .timedOut:
             return .object(["status": .string("skipped"),
                 "message": .string("Mail search exceeded 1.5 seconds and was skipped; Desk and chat results are retained. No Mail matches were established.")])

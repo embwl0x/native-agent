@@ -178,7 +178,9 @@ extension CognitiveSubstrate {
     private func currentHandPain() -> [OrganismHandPain] {
         var seen = Set<String>()
         var pain: [OrganismHandPain] = []
-        let nodes = field.peekNodes().filter { $0.kind == .toolObservation && $0.turnKind.contributesToLivedState }
+        // Pain is acute: a failure the act has not repeated in half an hour has healed, as has one the same act later did well.
+        let healed = Date().addingTimeInterval(-30 * 60)
+        let nodes = field.peekNodes().filter { $0.kind == .toolObservation && $0.turnKind.contributesToLivedState && $0.lastActivatedAt >= healed }
             .sorted {
                 if $0.lastActivatedAt != $1.lastActivatedAt { return $0.lastActivatedAt > $1.lastActivatedAt }
                 return $0.id.uuidString < $1.id.uuidString
@@ -197,7 +199,7 @@ extension CognitiveSubstrate {
             case "motor_action":
                 guard let domain = node.metadata["motorDomain"]?.stringValue, !domain.isEmpty else { continue }
                 act = domain
-                identity = "motor:" + node.subjectReference.id
+                identity = "motor:" + domain
             default:
                 continue
             }
@@ -385,15 +387,8 @@ extension CognitiveSubstrate {
         }
         // A measured feeling bypasses residue arithmetic, regardless of its owner.
         if event.carriesMeasuredFeltValence {
-            func metadataDouble(_ value: JSONValue?) -> Double? {
-                switch value {
-                case .double(let d): return d
-                case .int(let i): return Double(i)
-                default: return nil
-                }
-            }
-            let felt = min(0.7, max(-0.7, metadataDouble(event.metadata["feltValence"]) ?? 0))
-            let feltArousal = (metadataDouble(event.metadata["feltArousal"]) ?? 0.2).clamped01()
+            let felt = min(0.7, max(-0.7, event.metadata["feltValence"]?.doubleValue ?? 0))
+            let feltArousal = (event.metadata["feltArousal"]?.doubleValue ?? 0.2).clamped01()
             return (valence: felt, arousal: feltArousal, warmth: (affect.socialWarmth).clamped01())
         }
         let affectTerm = affect.socialWarmth

@@ -3,10 +3,11 @@ import Foundation
 // Blueprint: | `PhoneSenseEvent.swift` | Authenticated phone observations and setup evidence; confidence never proves absence |
 public struct PhoneSenseEvent: Codable, Sendable, Identifiable {
     public enum Source: String, Codable, Sendable, Hashable, CaseIterable {
-        case places, motion, focus, charging, battery, headphones, network, music, photos
+        case places, location, motion, focus, charging, battery, headphones, network, music, photos
         public var title: String {
             switch self {
             case .places: "Places"
+            case .location: "Location"
             case .motion: "Motion"
             case .focus: "Focus"
             case .charging: "Sleep clues"
@@ -71,6 +72,7 @@ public struct PhoneSenseEvent: Codable, Sendable, Identifiable {
     public var isValid: Bool {
         let values: Set<String> = switch source {
         case .places: []
+        case .location: ["known", "unknown", "disabled"]
         case .motion: ["stationary", "walking", "running", "cycling", "driving", "unknown", "disabled"]
         case .focus: ["on", "off", "unknown", "disabled"]
         case .charging: ["charging", "unplugged", "unknown", "disabled"]

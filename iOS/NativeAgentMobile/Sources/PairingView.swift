@@ -71,7 +71,7 @@ struct PairingView: View {
                         AliveCard {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("This phone’s code").font(.headline).foregroundStyle(AlivePalette.text)
-                                Text(phoneCode).font(.callout.monospaced()).textSelection(.enabled)
+                                Text("\(phoneCode.prefix(4)) \(phoneCode.dropFirst(4).prefix(4))").font(.callout.monospaced()).textSelection(.enabled)
                                     .foregroundStyle(AlivePalette.text)
                                 Text("""
                                     Open \(IOSPairingPresentation.macPairingRoute), match this code and choose Pair. This phone goes on by \

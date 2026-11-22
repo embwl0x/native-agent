@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentShared
 import MemoryV2
 import Observation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
@@ -80,7 +79,7 @@ extension SwiftNativeOnboardingClient {
                 return OnboardingResetTargetIntent(
                     role: definition.role,
                     contentBase64: data.base64EncodedString(),
-                    sha256: Self.sha256(data),
+                    sha256: SHA256Hex.of(data),
                     backupFileName: Self.resetBackupFileName(
                         sourceFileName: definition.fileName,
                         backupStamp: backupStamp,
@@ -234,7 +233,7 @@ extension SwiftNativeOnboardingClient {
             guard target.backupFileName == expectedBackup,
                   URL(fileURLWithPath: target.backupFileName).lastPathComponent == target.backupFileName,
                   let content = Data(base64Encoded: target.contentBase64),
-                  sha256(content) == target.sha256 else {
+                  SHA256Hex.of(content) == target.sha256 else {
                 throw OnboardingError.ioFailure(
                     "onboarding reset transaction evidence is invalid for '\(target.role)'"
                 )
@@ -256,13 +255,13 @@ extension SwiftNativeOnboardingClient {
     static func fileHashIfPresent(_ path: URL, label: String) throws -> String? {
         guard FileManager.default.fileExists(atPath: path.path) else { return nil }
         do {
-            return sha256(try Data(contentsOf: path))
+            return SHA256Hex.of(try Data(contentsOf: path))
         } catch {
             throw OnboardingError.ioFailure("read \(label) during reset failed: \(error.localizedDescription)")
         }
     }
     private static func resetContent(_ intent: OnboardingResetTargetIntent) throws -> Data {
-        guard let data = Data(base64Encoded: intent.contentBase64), sha256(data) == intent.sha256 else {
+        guard let data = Data(base64Encoded: intent.contentBase64), SHA256Hex.of(data) == intent.sha256 else {
             throw OnboardingError.ioFailure("reset evidence hash mismatch for '\(intent.role)'")
         }
         return data
@@ -281,7 +280,7 @@ extension SwiftNativeOnboardingClient {
                     "read reset backup \(backup.lastPathComponent) failed: \(error.localizedDescription)"
                 )
             }
-            guard sha256(existing) == intent.sha256 else {
+            guard SHA256Hex.of(existing) == intent.sha256 else {
                 throw OnboardingError.ioFailure(
                     "reset backup \(backup.lastPathComponent) changed outside the pending transaction"
                 )
@@ -291,7 +290,7 @@ extension SwiftNativeOnboardingClient {
         }
         try atomicWriteData(intended, to: backup)
         let persisted = try Data(contentsOf: backup)
-        guard sha256(persisted) == intent.sha256 else {
+        guard SHA256Hex.of(persisted) == intent.sha256 else {
             throw OnboardingError.ioFailure(
                 "reset backup \(backup.lastPathComponent) failed post-write verification"
             )
@@ -315,7 +314,7 @@ extension SwiftNativeOnboardingClient {
         } catch {
             throw OnboardingError.ioFailure("read \(label) before reset removal failed")
         }
-        guard sha256(data) == expectedSHA256 else {
+        guard SHA256Hex.of(data) == expectedSHA256 else {
             throw OnboardingError.ioFailure("\(label) changed outside the pending reset transaction")
         }
         do {

@@ -59,7 +59,78 @@ public actor REMConsolidator {
     public func runWeeklyREM(force: Bool = false) async throws -> REMReport {
         // Use wall time for report duration and the injected clock for weekly semantics.
         let runStartedAt = Date()
+        try await checkREMEnabled(runStartedAt: runStartedAt)
+        let now = clock()
+        guard let runReservation = try await reserveREMRun(runStartedAt: runStartedAt) else {
+            return await reportREMAlreadyRunning(runStartedAt: runStartedAt)
+        }
+        defer { runReservation.release() }
 
+        // Only undo a reservation acquired by this invocation; earlier failures still need durable run records.
+        var rollback: (@Sendable () async -> Void)?
+        do {
+            // Check cancellation before any proposal write.
+            try Task.checkCancellation()
+
+            // Validate tombstone authority before weekly claims or effects so corrupt rejection state cannot be treated as empty.
+            let tombStore = REMTombstoneStore(dataRoot: dataRoot)
+            _ = try await tombStore.loadAll()
+
+            let store = REMProposalStore(dataRoot: dataRoot)
+            // Validate eviction evidence before marker claims or staging so malformed history cannot leave new effects for a retry.
+            let growthProposalRows = try store.loadAllStrictly()
+            switch try await claimWeeklyREM(force: force, now: now, store: store, runStartedAt: runStartedAt) {
+            case .skipped(let report): return report
+            case .reserved(let restore): rollback = restore
+            }
+
+            let evidence = try await readREMDreamEvidence()
+            let (kept, tombSkips) = try await selectREMProposals(entries: evidence.entries,
+                identities: evidence.identities, tombStore: tombStore)
+            let appendReceipt: REMProposalStore.AppendReceipt
+            (appendReceipt, rollback) = try await appendREMProposals(kept, store: store, rollback: rollback)
+            let (evicted, moved) = try await settleREMEffects(store: store, resolver: evidence.resolver,
+                growthProposalRows: growthProposalRows)
+            let unavailableSections = evidence.unavailableSections
+            let report = try await assembleREMReport(appendReceipt: appendReceipt, tombSkips: tombSkips,
+                evicted: evicted, moved: moved, kept: kept, evidence: evidence, store: store)
+            // A partial read fails its pass; release only this claim and only before durable proposals.
+            if !unavailableSections.isEmpty, let release = rollback {
+                await release()
+                rollback = nil
+            }
+            await persistRunReport(
+                outcome: report.outcome,
+                reason: unavailableSections.isEmpty ? nil : "dream_evidence_unavailable",
+                report: report,
+                startedAt: runStartedAt
+            )
+            return report
+        } catch {
+            if let rollback {
+                await rollback()
+            }
+            FileHandle.standardError.write(Data("REMConsolidator: run failed: \(error)\n".utf8))
+            await persistRunReport(
+                outcome: .failed,
+                reason: Self.runFailureReason(error),
+                error: error,
+                startedAt: runStartedAt
+            )
+            throw error
+        }
+    }
+
+    private enum WeeklyREMClaim {
+        case skipped(REMReport)
+        case reserved(@Sendable () async -> Void)
+    }
+
+    private typealias REMDreamEvidence = (entries: [DreamEntry], unavailableSections: [String],
+        resolver: ConversationHistory.ExperienceResolver, identities: [String: String],
+        reflectionMaterial: [String: CognitiveReflectionCause], sourcePeers: [String]?)
+
+    private func checkREMEnabled(runStartedAt: Date) async throws {
         guard gate.remEnabled else {
             let error = DreamREMCycleError.cycleDisabled(
                 error: "rem_cycle_disabled",
@@ -73,9 +144,9 @@ public actor REMConsolidator {
             )
             throw error
         }
+    }
 
-        let now = clock()
-
+    private func reserveREMRun(runStartedAt: Date) async throws -> DreamRunReservation? {
         // Keep concurrent passes excluded even when force bypasses weekly freshness.
         let bodyDir = dataRoot.appendingPathComponent("body", isDirectory: true)
         try? FileManager.default.createDirectory(
@@ -93,61 +164,50 @@ public actor REMConsolidator {
             )
             throw error
         }
-        guard let runReservation else {
-            FileHandle.standardError.write(Data(
-                "REMConsolidator: another REM pass holds the run reservation — skipping\n".utf8
-            ))
-            let report = REMReport(
-                proposalsGenerated: 0,
-                evidenceDatesMin: REMConstants.minimumEvidenceCount,
-                tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0,
-                skipReason: "already_running"
-            )
-            await persistRunReport(
-                outcome: report.outcome,
-                reason: "rem_already_running",
-                report: report,
-                startedAt: runStartedAt
-            )
-            return report
-        }
-        defer { runReservation.release() }
+        return runReservation
+    }
 
-        // Only undo a reservation acquired by this invocation; earlier failures still need durable run records.
-        var rollback: (@Sendable () async -> Void)?
-        do {
-            // Check cancellation before any proposal write.
-            try Task.checkCancellation()
+    private func reportREMAlreadyRunning(runStartedAt: Date) async -> REMReport {
+        FileHandle.standardError.write(Data(
+            "REMConsolidator: another REM pass holds the run reservation — skipping\n".utf8
+        ))
+        let report = REMReport(
+            proposalsGenerated: 0,
+            evidenceDatesMin: REMConstants.minimumEvidenceCount,
+            tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0,
+            skipReason: "already_running"
+        )
+        await persistRunReport(
+            outcome: report.outcome,
+            reason: "rem_already_running",
+            report: report,
+            startedAt: runStartedAt
+        )
+        return report
+    }
 
-            // Validate tombstone authority before weekly claims or effects so corrupt rejection state cannot be treated as empty.
-            let tombStore = REMTombstoneStore(dataRoot: dataRoot)
-            _ = try await tombStore.loadAll()
-
-            let store = REMProposalStore(dataRoot: dataRoot)
-            // Validate eviction evidence before marker claims or staging so malformed history cannot leave new effects for a retry.
-            let growthProposalRows = try store.loadAllStrictly()
-
+    private func claimWeeklyREM(force: Bool, now: Date, store: REMProposalStore, runStartedAt: Date) async throws -> WeeklyREMClaim {
         // Claim weekly exclusion before distillation; it is not completion proof.
         // Release failed claims only before durable proposals; later work retains IDs and terminal evidence in the run ledger.
-            let markerURL = dataRoot
-                .appendingPathComponent("body", isDirectory: true)
-                .appendingPathComponent("last_weekly_rem_run")
+        let markerURL = dataRoot
+            .appendingPathComponent("body", isDirectory: true)
+            .appendingPathComponent("last_weekly_rem_run")
         // Claims can restore only their locked predecessor; failed exclusion forbids work.
-            let claimToken = "\(ISO8601DateFormatter().string(from: now)) \(UUID().uuidString)"
-            let reservation = await reserveOncePerPeriod(at: markerURL, stamp: claimToken) { stored in
-                if force { return false }
-                guard let stored else { return false }
-                guard let firstToken = stored.split(separator: " ", maxSplits: 1).first,
-                      let priorRun = ISO8601DateFormatter().date(
-                        from: String(firstToken).trimmingCharacters(in: .whitespacesAndNewlines)
-                      ) else {
-                    throw PersistenceCoreError.ioFailure(
-                        "weekly REM marker is malformed: \(markerURL.path)"
-                    )
-                }
-                return now.timeIntervalSince(priorRun) < 6 * 86_400
+        let claimToken = "\(ISO8601DateFormatter().string(from: now)) \(UUID().uuidString)"
+        let reservation = await reserveOncePerPeriod(at: markerURL, stamp: claimToken) { stored in
+            if force { return false }
+            guard let stored else { return false }
+            guard let firstToken = stored.split(separator: " ", maxSplits: 1).first,
+                  let priorRun = ISO8601DateFormatter().date(
+                    from: String(firstToken).trimmingCharacters(in: .whitespacesAndNewlines)
+                  ) else {
+                throw PersistenceCoreError.ioFailure(
+                    "weekly REM marker is malformed: \(markerURL.path)"
+                )
             }
-            switch reservation {
+            return now.timeIntervalSince(priorRun) < 6 * 86_400
+        }
+        switch reservation {
         case .alreadyReserved:
             FileHandle.standardError.write(Data(
                 "REMConsolidator: weekly REM already claimed within 6 days — skipping\n".utf8
@@ -166,16 +226,18 @@ public actor REMConsolidator {
                 report: report,
                 startedAt: runStartedAt
             )
-            return report
+            return .skipped(report)
         case .failed(let error):
             FileHandle.standardError.write(Data(
                 "REMConsolidator: weekly reservation failed closed: \(error)\n".utf8
             ))
             throw error
         case .reserved(_, let restore):
-            rollback = restore
+            return .reserved(restore)
         }
+    }
 
+    private func readREMDreamEvidence() async throws -> REMDreamEvidence {
         // Unreadable sections stay active for repair; age cannot remove them from the next pass.
         let pendingEntries = try FileBackedDreamDiary(dataRoot: dataRoot).entriesSince(nil)
         var entries: [DreamEntry] = []
@@ -217,6 +279,11 @@ public actor REMConsolidator {
             reflectionMaterial["dream_diary/\($0.filename ?? "\($0.date).md")"]?.sourcePeerIds
         })
 
+        return (entries, unavailableSections, resolver, identities, reflectionMaterial, sourcePeers)
+    }
+
+    private func selectREMProposals(entries: [DreamEntry], identities: [String: String], tombStore: REMTombstoneStore) async throws
+        -> (kept: [REMProposalRow], tombSkips: Int) {
         // Bind distillation to the selected persona and REM routing surface.
         let growthBody = try readGrowthBody()
         let contextDocs = try await readDreamPersonaDocs(
@@ -274,6 +341,11 @@ public actor REMConsolidator {
         // Rank by supporting experiences and stable emission order while reserving a slot for labelled dwelling.
         let kept = Self.rankedByRecurrence(passTomb, identities: identities)
 
+        return (kept, tombSkips)
+    }
+
+    private func appendREMProposals(_ kept: [REMProposalRow], store: REMProposalStore, rollback: (@Sendable () async -> Void)?) async throws
+        -> (REMProposalStore.AppendReceipt, (@Sendable () async -> Void)?) {
         try Task.checkCancellation()
         let saved: Result<(REMProposalStore.AppendReceipt, (@Sendable () async -> Void)?), Error> = await settle { [rollback] in
             do {
@@ -281,9 +353,11 @@ public actor REMConsolidator {
                 return .success((appendReceipt, appendReceipt.appended > 0 ? nil : rollback))
             } catch { return .failure(error) }
         }
-        let appendReceipt: REMProposalStore.AppendReceipt
-        (appendReceipt, rollback) = try saved.get()
+        return try saved.get()
+    }
 
+    private func settleREMEffects(store: REMProposalStore, resolver: ConversationHistory.ExperienceResolver,
+                                  growthProposalRows: [REMProposalRow]) async throws -> (evicted: Int, moved: Int) {
         // Stage and stamp under the shared owner so retries cannot create duplicate cards; failed stages remain owed.
         try Task.checkCancellation()
         var stagingFailure: (any Error)?
@@ -301,6 +375,12 @@ public actor REMConsolidator {
         let moved = try await archiveDreams()
         if let stagingFailure { throw stagingFailure }
 
+        return (evicted, moved)
+    }
+
+    private func assembleREMReport(appendReceipt: REMProposalStore.AppendReceipt, tombSkips: Int, evicted: Int, moved: Int,
+                                   kept: [REMProposalRow], evidence: REMDreamEvidence, store: REMProposalStore) async throws -> REMReport {
+        let (entries, unavailableSections, _, _, reflectionMaterial, sourcePeers) = evidence
         let dweltOnKept = kept.filter { $0.support == .dweltOn }.count
         let unavailableKept = kept.filter { $0.support == .provenanceUnavailable }.count
         var report = REMReport(
@@ -334,31 +414,7 @@ public actor REMConsolidator {
             cause.sourcePeerIds = sourcePeers
             report.reflectionMaterial["rem_proposal:\(row.id)"] = cause
         }
-        // A partial read fails its pass; release only this claim and only before durable proposals.
-        if !unavailableSections.isEmpty, let release = rollback {
-            await release()
-            rollback = nil
-        }
-        await persistRunReport(
-            outcome: report.outcome,
-            reason: unavailableSections.isEmpty ? nil : "dream_evidence_unavailable",
-            report: report,
-            startedAt: runStartedAt
-        )
         return report
-        } catch {
-            if let rollback {
-                await rollback()
-            }
-            FileHandle.standardError.write(Data("REMConsolidator: run failed: \(error)\n".utf8))
-            await persistRunReport(
-                outcome: .failed,
-                reason: Self.runFailureReason(error),
-                error: error,
-                startedAt: runStartedAt
-            )
-            throw error
-        }
     }
 
     /// Rank supported recurrence first while retaining a reserved slot for a labelled dwelt-on candidate.

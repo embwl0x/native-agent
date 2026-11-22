@@ -63,9 +63,9 @@ public struct PKCE {
     public static func generate() -> PKCE {
         var bytes = [UInt8](repeating: 0, count: 32)
         arc4random_buf(&bytes, bytes.count)
-        let verifier = OAuthGrantOperations.base64URLEncode(Data(bytes))
+        let verifier = Data(bytes).base64URLEncodedString()
         let digest = SHA256.hash(data: Data(verifier.utf8))
-        let challenge = OAuthGrantOperations.base64URLEncode(Data(digest))
+        let challenge = Data(digest).base64URLEncodedString()
         return PKCE(verifier: verifier, challenge: challenge)
     }
 }
@@ -133,12 +133,6 @@ public enum OAuthGrantOperations {
             }
             return TokenResponse(fields: fields, accessToken: access, refreshToken: refresh, expiresIn: lifetime)
         } catch { throw malformedTokenResponse() }
-    }
-    public static func base64URLEncode(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
     }
 
     public static func randomHex(_ byteCount: Int) -> String {

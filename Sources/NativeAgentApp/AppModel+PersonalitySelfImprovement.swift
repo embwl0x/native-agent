@@ -79,7 +79,6 @@ extension AppModel {
             report: engine.doctor.report, completedAt: engine.doctor.reportCompletedAt
         )
         let diagnostics = await SupportDiagnostics.read(reusingChecks: reuse?.checks)
-        supportDiagnostics = diagnostics
         statusText = reuse != nil
             ? "Support diagnostics refreshed (reused recent Doctor result)"
             : "Support diagnostics refreshed"

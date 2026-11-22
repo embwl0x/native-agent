@@ -42,7 +42,7 @@ public struct TurnTraceRecentReader: Sendable {
     /// `now`'s whole day (with history, of every retained day through it), as a day's evidence read before. Holding selects kinds or turn ids
     /// after coverage is checked; `kinds` narrows the query itself. Trace names a turn's subject in the record.
     public func read(now: Date = Date(), history: Bool = false, since: Date? = nil, holding marks: [String] = [],
-                     trace: String? = nil, kinds: [String]? = nil, kindContains: String? = nil) async throws -> Snapshot {
+                     trace: String? = nil, kinds: [String]? = nil, kindContains: String? = nil, receipt: String? = nil) async throws -> Snapshot {
         if let trace, NativeAgentChatSessionID.normalizedPathComponent(trace) != trace {
             throw PersistenceCoreError.ioFailure("trace must name a turn id in the record.")
         }
@@ -59,6 +59,8 @@ public struct TurnTraceRecentReader: Sendable {
         var query = ExperienceStore.DetailQuery(subjects: trace.map { [$0] }, kinds: kinds, from: from, through: through, limit: limit,
                                                 newestFirst: limit != nil)
         query.kindContains = kindContains
+        // One receipt is found by its id in the store, never by reading the whole history.
+        if let receipt { query.holding["$.payload.receipt.id"] = try JSONValue.string(receipt).serialize(pretty: false) }
         let read = try await lane.events(query)
         let first = try await lane.events(.init(through: now, limit: 1))
         let ordered = limit == nil ? read.events : Array(read.events.reversed())

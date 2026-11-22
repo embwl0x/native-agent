@@ -1,7 +1,6 @@
 import Foundation
 import ChatToolParsing
 import CoreGraphics
-import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
 import ChatTurnContracts
@@ -168,7 +167,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         let key = window + "|" + (region?.name ?? "")
         let geometryKey = [source.origin.x, source.origin.y, source.logicalSize.width, source.logicalSize.height]
             .map { String($0) }.joined(separator: "|")
-        let fingerprint = SHA256.hash(data: Data((png + "|" + geometryKey).utf8)).map { String(format: "%02x", $0) }.joined()
+        let fingerprint = SHA256Hex.of(Data((png + "|" + geometryKey).utf8))
         let execution = forced ? nil : turn.execution
         if let previousID = execution?.attachedPixelFrame(window: key, fingerprint: fingerprint),
            let previous = MacImageFrames.frame(previousID, turn: turn) {

@@ -11,7 +11,6 @@ import MemoryV2
 import NativeAgentCore
 import ProviderRouting
 import ToolRegistry
-import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
 import Dispatcher
@@ -45,10 +44,29 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     func rejected() { pixels?.discard(); invocation.readCapture?.discardWindowText() }
 
     func observe(app requestedApp: String?, turn: Turn, context: MacOperationContext) async -> MacFourVerbsSupplement? {
-        func unavailable(_ code: String, _ message: String) -> MacFourVerbsSupplement {
-            MacFourVerbsSupplement(diagnostics: ["error": .string(code), "message": .string(message),
-                "remedy": MacScreenCaptureFailure.operationFailed(code, message).remedy(app: requestedApp, part: pixels?.part)])
+        switch await captureWindow(app: requestedApp, turn: turn, context: context) {
+        case .failed(let reply): return reply
+        case .captured(let capture): return await observeCapturedWindow(capture, app: requestedApp, turn: turn)
         }
+    }
+
+    private typealias WindowCapture = (
+        output: [String: JSONValue], frameID: String, reply: ToolResult, observationStartedNs: UInt64, captureFinishedNs: UInt64
+    )
+
+    private enum WindowCaptureOutcome: Sendable {
+        case failed(MacFourVerbsSupplement)
+        case captured(WindowCapture)
+    }
+
+    /// Report the capture failure with the remedy for the requested app and part.
+    private func unavailable(_ code: String, _ message: String, app requestedApp: String?) -> MacFourVerbsSupplement {
+        MacFourVerbsSupplement(diagnostics: ["error": .string(code), "message": .string(message),
+            "remedy": MacScreenCaptureFailure.operationFailed(code, message).remedy(app: requestedApp, part: pixels?.part)])
+    }
+
+    /// Request the window view and admit only a reply with a usable frame identity.
+    private func captureWindow(app requestedApp: String?, turn: Turn, context: MacOperationContext) async -> WindowCaptureOutcome {
         let observationStartedNs = DispatchTime.now().uptimeNanoseconds
         let result: MacControlResult
         do {
@@ -65,7 +83,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             result = try await host.dispatch(action: "view", body: body, turn: turn,
                 context: context)
         } catch {
-            return unavailable("capture_failed", "The requested window observation failed: \(error.localizedDescription)")
+            return .failed(unavailable("capture_failed", "The requested window observation failed: \(error.localizedDescription)", app: requestedApp))
         }
         let captureFinishedNs = DispatchTime.now().uptimeNanoseconds
         let reply = ToolResult(result.output)
@@ -77,17 +95,22 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 remedy = MacScreenCaptureFailure.operationFailed(result.error ?? "capture_failed",
                     output["message"]?.stringValue ?? "The requested screen capture failed.").remedy(app: requestedApp, part: pixels?.part)
             }
-            return MacFourVerbsSupplement(diagnostics: ["error": .string(result.error ?? "capture_failed"),
-                "message": output["message"] ?? .string("The requested screen capture failed."), "remedy": remedy])
+            return .failed(MacFourVerbsSupplement(diagnostics: ["error": .string(result.error ?? "capture_failed"),
+                "message": output["message"] ?? .string("The requested screen capture failed."), "remedy": remedy]))
         }
         guard result.ok, case .object(let output) = result.output,
               let frameID = output["frame_id"]?.stringValue, !frameID.isEmpty else {
-            return unavailable(result.error ?? "capture_identity_unavailable", """
+            return .failed(unavailable(result.error ?? "capture_identity_unavailable", """
                 The requested window observation did not return a usable frame identity. Observe the window again after repairing the capture \
                 failure.
-                """)
+                """, app: requestedApp))
         }
+        return .captured((output, frameID, reply, observationStartedNs, captureFinishedNs))
+    }
 
+    /// Render structure, publish the preview and record pixels before interpreting the visual evidence.
+    private func observeCapturedWindow(_ capture: WindowCapture, app requestedApp: String?, turn: Turn) async -> MacFourVerbsSupplement {
+        let (output, frameID, reply, _, _) = capture
         let viewId = output["view"]?.stringValue
         let marks = (output["marks"]?.arrayValue ?? [])
         let app = (output["app"]?.objectValue ?? [:])
@@ -178,10 +201,43 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             return unavailable("visual_observation_unavailable", """
                 The requested visual observation has missing or undecodable pixels or invalid capture geometry. Repair the capture before \
                 interpreting its visual contents.
-                """ + (output["image_unavailable_reason"]?.stringValue.map { " Capture: \($0)" } ?? ""))
+                """ + (output["image_unavailable_reason"]?.stringValue.map { " Capture: \($0)" } ?? ""), app: requestedApp)
         }
+        let evidence = WindowVisionEvidence(viewId: viewId, bundleIdentifier: bundleIdentifier, visibleFrame: visibleFrame, pointer: pointer,
+            structural: structural, obstructions: obstructions, handObstructions: handObstructions)
+        return await compileWindowVision(capture, evidence: evidence, image: image,
+            originX: originX, originY: originY, logicalW: logicalW, logicalH: logicalH, app: requestedApp)
+    }
 
-        #if canImport(Vision)
+    private final class WindowVisionEvidence: Sendable {
+        let viewId: String?
+        let bundleIdentifier: String?
+        let visibleFrame: MacAXFrame?
+        let pointer: MacPointerPosition?
+        let structural: MacFourVerbsSupplement
+        let obstructions: [MacVisualObstruction]
+        let handObstructions: [MacAXFrame]
+
+        init(viewId: String?, bundleIdentifier: String?, visibleFrame: MacAXFrame?, pointer: MacPointerPosition?,
+             structural: MacFourVerbsSupplement, obstructions: [MacVisualObstruction], handObstructions: [MacAXFrame]) {
+            self.viewId = viewId
+            self.bundleIdentifier = bundleIdentifier
+            self.visibleFrame = visibleFrame
+            self.pointer = pointer
+            self.structural = structural
+            self.obstructions = obstructions
+            self.handObstructions = handObstructions
+        }
+    }
+
+    /// Compile visual regions, resolve live identities and render the unobstructed evidence.
+    private func compileWindowVision(
+        _ capture: WindowCapture, evidence: WindowVisionEvidence, image: CGImage,
+        originX: Double, originY: Double, logicalW: Double, logicalH: Double, app requestedApp: String?
+    ) async -> MacFourVerbsSupplement {
+        let (output, _, _, observationStartedNs, captureFinishedNs) = capture
+        let (viewId, bundleIdentifier, visibleFrame, pointer) = (evidence.viewId, evidence.bundleIdentifier, evidence.visibleFrame, evidence.pointer)
+        let (structural, obstructions, handObstructions) = (evidence.structural, evidence.obstructions, evidence.handObstructions)
         do {
             let visualCompileStartedNs = DispatchTime.now().uptimeNanoseconds
             let appName = ((output["app"]?.objectValue ?? [:])["name"])?.stringValue
@@ -315,14 +371,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 ] as [String: JSONValue]).merging(timings) { _, timing in timing }
             )
         } catch let failure as ToolFailureError {
-            return unavailable(failure.code ?? "visual_observation_failed", failure.message)
+            return unavailable(failure.code ?? "visual_observation_failed", failure.message, app: requestedApp)
         } catch {
-            return unavailable("visual_observation_failed", "The requested visual observation could not be interpreted: \(error.localizedDescription)")
+            return unavailable("visual_observation_failed", "The requested visual observation could not be interpreted: \(error.localizedDescription)", app: requestedApp)
         }
-        #else
-        return unavailable("visual_observation_unsupported",
-            "Visual recognition is unavailable in this build. Use a build with Vision support for this requested observation.")
-        #endif
     }
 
     static func captureDate(from output: [String: JSONValue]) throws -> Date {

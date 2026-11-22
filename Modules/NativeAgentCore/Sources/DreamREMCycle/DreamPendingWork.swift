@@ -170,11 +170,40 @@ extension DreamCycleRunner {
         } catch {
             return (0, 0, ["dream work discovery failed: \(error)"], [], true, [])
         }
+        let progress = DreamRetryProgress()
+        let records = readPendingDreams(files, progress: progress)
+        for (file, saved) in records.sorted(by: {
+            $0.1.date == $1.1.date ? $0.0.path < $1.0.path : $0.1.date < $1.1.date
+        }) {
+            if Task.isCancelled { progress.errors.append("dream delivery remains pending after Stop"); break }
+            var work = saved
+            guard !work.isSettled else { continue }
+            let path = dataRoot.appendingPathComponent("dream_diary/\(work.date).md")
+            do {
+                do { try publishPendingDream(&work) }
+                catch { progress.publicationUnavailable = true; throw error }
+                work = try await retryDreamLessonsAndReflection(work, file: file, delivery: delivery, progress: progress)
+                work = try await retryRemainingDreamEffects(work, file: file, delivery: delivery, progress: progress)
+                if work.isSettled { progress.settled += 1 }
+                else { progress.pendingPaths.insert(path.path) }
+            } catch {
+                progress.pendingPaths.insert(path.path)
+                progress.errors.append("\(file.path) settlement unavailable: \(error)")
+            }
+        }
+        return (progress.settled, progress.lessonsSaved, progress.errors, progress.pendingPaths, progress.publicationUnavailable, progress.busy)
+    }
+
+    private final class DreamRetryProgress {
         var errors: [String] = []
         var busy: [String] = []
         var pendingPaths: Set<String> = []
-        var settled = 0, lessonsSaved = 0
+        var settled = 0
+        var lessonsSaved = 0
         var publicationUnavailable = false
+    }
+
+    private func readPendingDreams(_ files: [URL], progress: DreamRetryProgress) -> [(URL, DreamPendingWork)] {
         // Read before delivery so damaged records cannot be replaced silently.
         var records: [(URL, DreamPendingWork)] = []
         for file in files {
@@ -192,9 +221,9 @@ extension DreamCycleRunner {
                 }
                 records.append((file, work))
             } catch {
-                errors.append("\(file.path) settlement unavailable: \(error)")
+                progress.errors.append("\(file.path) settlement unavailable: \(error)")
                 // An unreadable journal may still owe publication.
-                publicationUnavailable = true
+                progress.publicationUnavailable = true
             }
         }
         // Resolve work by actual diary identity; missing retained input owes repair and cannot be reconstructed from prose.
@@ -213,171 +242,166 @@ extension DreamCycleRunner {
                         }
                     }
                 } catch {
-                    pendingPaths.insert(dataRoot.appendingPathComponent("dream_diary/\(file.day ?? file.stem).md").path)
-                    errors.append("\(file.url.path) saved work unavailable: \(error)")
+                    progress.pendingPaths.insert(dataRoot.appendingPathComponent("dream_diary/\(file.day ?? file.stem).md").path)
+                    progress.errors.append("\(file.url.path) saved work unavailable: \(error)")
                 }
             }
         } catch {
-            publicationUnavailable = true
-            errors.append("dream diary discovery failed: \(error)")
+            progress.publicationUnavailable = true
+            progress.errors.append("dream diary discovery failed: \(error)")
         }
-        for (file, saved) in records.sorted(by: {
-            $0.1.date == $1.1.date ? $0.0.path < $1.0.path : $0.1.date < $1.1.date
-        }) {
-            if Task.isCancelled { errors.append("dream delivery remains pending after Stop"); break }
-            var work = saved
-            guard !work.isSettled else { continue }
-            let path = dataRoot.appendingPathComponent("dream_diary/\(work.date).md")
+        return records
+    }
+
+    private func retryDreamLessonsAndReflection(_ pending: DreamPendingWork, file: URL, delivery: DreamEffectSink?,
+                                                progress: DreamRetryProgress) async throws -> DreamPendingWork {
+        var work = pending
+        let offered = work.lessons.count
+        var saved = 0
+        for index in work.lessons.indices.reversed() {
+            try Task.checkCancellation()
+            let lesson = work.lessons[index]
             do {
-                do { try publishPendingDream(&work) }
-                catch { publicationUnavailable = true; throw error }
-                let offered = work.lessons.count
-                var saved = 0
-                for index in work.lessons.indices.reversed() {
-                    try Task.checkCancellation()
-                    let lesson = work.lessons[index]
-                    do {
-                        try await commitLesson(lesson, dateKey: work.date, sourcePeerIds: work.sourcePeerIds)
-                        saved += 1
-                    } catch {
-                        let failure = (error as? ToolFailureError) ?? (error as? MemoryStorageError)?.failure
-                        guard let failure, failure.status == .refused, failure.effects == .none, failure.recovery == .terminal else {
-                            work.note("lessons", error: error)
-                            errors.append("\(file.path) lesson \(lesson.from): \(error)")
-                            continue
-                        }
-                        let input = JSONValue.array([.string(lesson.lesson), .string(lesson.from), .string(lesson.kind)])
-                        work.finish("lesson:" + (try input.serialize(pretty: false)), result: "refused: \(failure.message)")
-                        errors.append("\(file.path) lesson \(lesson.from) refused: \(failure.message)")
-                    }
-                    work.lessons.remove(at: index)
-                    if work.lessons.isEmpty { work.finish("lessons") }
-                    try work.save(in: dataRoot)
-                }
-                if offered > 0 { try work.save(in: dataRoot) }
-                lessonsSaved += saved
-                if offered > 0 {
-                    do {
-                        try await receiptSink("dream.lessons", .object([
-                            "date": .string(work.date), "dreamId": .string(work.id.uuidString),
-                            "offered": .int(Int64(offered)), "saved": .int(Int64(saved)),
-                            "failed": .int(Int64(offered - saved))]))
-                    } catch { errors.append("\(file.path) lesson receipt failed: \(error)") }
-                }
-                // Failure notes cannot block another attempt; only Stop or shared-journal failure prevents sibling steps.
-                if let material = work.reflection {
-                    try Task.checkCancellation()
-                    do {
-                        guard !material.isEmpty else { throw PersistenceCoreError.ioFailure("captured dream reflection material is empty") }
-                        let result = try await deliver(.reflectionJudgment(material), work: work, sink: delivery)
-                        switch result {
-                        case .reflection(let receipt):
-                            guard receipt.request.reason == "dream:\(work.id.uuidString)", receipt.judgment != nil else {
-                                throw PersistenceCoreError.ioFailure("reflection returned a receipt for another dream or no judgment")
-                            }
-                            work.reflectionReceipt = receipt
-                            work.finish("reflection.judgment")
-                        case .skipped(let reason):
-                            work.finish("reflection.judgment", result: "skipped: " + reason)
-                            work.finish("reflection.integration", result: "skipped: " + reason)
-                        case .done:
-                            throw PersistenceCoreError.ioFailure("reflection judgment returned without a receipt")
-                        }
-                        work.reflection = nil
-                    } catch let held as DreamBusy {
-                        // Busy keeps the judgment owed for the next run without failing this one.
-                        work.note("reflection.judgment", error: held)
-                        busy.append("reflection for \(work.date): \(held.words)")
-                    } catch {
-                        work.note("reflection.judgment", error: error)
-                        errors.append("\(file.path) reflection judgment owed: \(error)")
-                    }
-                    // Checkpoint judgment before integration so no effect precedes its durable cause.
-                    try work.save(in: dataRoot)
-                }
-                if let receipt = work.reflectionReceipt {
-                    try Task.checkCancellation()
-                    do {
-                        let result = try await deliver(.reflectionIntegration(receipt), work: work, sink: delivery)
-                        try finishDelivery(result, step: "reflection.integration", work: &work)
-                        work.reflectionAcknowledgment = receipt.id
-                        work.reflectionReceipt = nil
-                    } catch {
-                        work.note("reflection.integration", error: error)
-                        errors.append("\(file.path) reflection integration owed: \(error)")
-                    }
-                    try work.save(in: dataRoot)
-                }
-                if let id = work.reflectionAcknowledgment {
-                    try Task.checkCancellation()
-                    do {
-                        let result = try await deliver(.reflectionAcknowledgment(id), work: work, sink: delivery)
-                        try finishDelivery(result, step: "reflection.acknowledgment", work: &work)
-                        work.reflectionAcknowledgment = nil
-                    } catch {
-                        work.note("reflection.acknowledgment", error: error)
-                        errors.append("\(file.path) reflection acknowledgment owed: \(error)")
-                    }
-                    try work.save(in: dataRoot)
-                }
-                if let care = work.care {
-                    try Task.checkCancellation()
-                    do {
-                        let result = try await deliver(.care(care.night), work: work, sink: delivery)
-                        try finishDelivery(result, step: "care", work: &work)
-                        work.care = nil
-                    } catch {
-                        work.note("care", error: error)
-                        errors.append("\(file.path) care delivery owed: \(error)")
-                    }
-                    try work.save(in: dataRoot)
-                }
-                if let affect = work.affect {
-                    try Task.checkCancellation()
-                    do {
-                        let skipped = try await integrateMood(affect: affect, dateKey: work.date)
-                        work.affect = nil
-                        work.finish("mood", result: skipped.map { "skipped: " + $0 } ?? "done")
-                    } catch {
-                        work.note("mood", error: error)
-                        errors.append("\(file.path) mood delivery owed: \(error)")
-                    }
-                    try work.save(in: dataRoot)
-                }
-                if !work.studioEntries.isEmpty {
-                    try Task.checkCancellation()
-                    do {
-                        try await receiptSink(Self.studioCitationReceiptKind, .object([
-                            "date": .string(work.date), "dreamId": .string(work.id.uuidString), "trigger": .string(work.trigger.rawValue),
-                            "entries": .array(work.studioEntries.map(JSONValue.string))]))
-                        work.studioEntries = []
-                        work.finish("studio.citations")
-                    } catch {
-                        work.note("studio.citations", error: error)
-                        errors.append("\(file.path) studio citation owed: \(error)")
-                    }
-                    try work.save(in: dataRoot)
-                }
-                if let completion = work.completion, work.completedSteps?["dreamCompleted"] == nil {
-                    try Task.checkCancellation()
-                    do {
-                        let result = try await deliver(.completion(occurredAt: completion.occurredAt,
-                            feltSummary: completion.feltSummary), work: work, sink: delivery)
-                        try finishDelivery(result, step: "dreamCompleted", work: &work)
-                    } catch {
-                        work.note("dreamCompleted", error: error)
-                        errors.append("\(file.path) dream completion owed: \(error)")
-                    }
-                    try work.save(in: dataRoot)
-                }
-                if work.isSettled { settled += 1 }
-                else { pendingPaths.insert(path.path) }
+                try await commitLesson(lesson, dateKey: work.date, sourcePeerIds: work.sourcePeerIds)
+                saved += 1
             } catch {
-                pendingPaths.insert(path.path)
-                errors.append("\(file.path) settlement unavailable: \(error)")
+                let failure = (error as? ToolFailureError) ?? (error as? MemoryStorageError)?.failure
+                guard let failure, failure.status == .refused, failure.effects == .none, failure.recovery == .terminal else {
+                    work.note("lessons", error: error)
+                    progress.errors.append("\(file.path) lesson \(lesson.from): \(error)")
+                    continue
+                }
+                let input = JSONValue.array([.string(lesson.lesson), .string(lesson.from), .string(lesson.kind)])
+                work.finish("lesson:" + (try input.serialize(pretty: false)), result: "refused: \(failure.message)")
+                progress.errors.append("\(file.path) lesson \(lesson.from) refused: \(failure.message)")
             }
+            work.lessons.remove(at: index)
+            if work.lessons.isEmpty { work.finish("lessons") }
+            try work.save(in: dataRoot)
         }
-        return (settled, lessonsSaved, errors, pendingPaths, publicationUnavailable, busy)
+        if offered > 0 { try work.save(in: dataRoot) }
+        progress.lessonsSaved += saved
+        if offered > 0 {
+            do {
+                try await receiptSink("dream.lessons", .object([
+                    "date": .string(work.date), "dreamId": .string(work.id.uuidString),
+                    "offered": .int(Int64(offered)), "saved": .int(Int64(saved)),
+                    "failed": .int(Int64(offered - saved))]))
+            } catch { progress.errors.append("\(file.path) lesson receipt failed: \(error)") }
+        }
+        // Failure notes cannot block another attempt; only Stop or shared-journal failure prevents sibling steps.
+        if let material = work.reflection {
+            try Task.checkCancellation()
+            do {
+                guard !material.isEmpty else { throw PersistenceCoreError.ioFailure("captured dream reflection material is empty") }
+                let result = try await deliver(.reflectionJudgment(material), work: work, sink: delivery)
+                switch result {
+                case .reflection(let receipt):
+                    guard receipt.request.reason == "dream:\(work.id.uuidString)", receipt.judgment != nil else {
+                        throw PersistenceCoreError.ioFailure("reflection returned a receipt for another dream or no judgment")
+                    }
+                    work.reflectionReceipt = receipt
+                    work.finish("reflection.judgment")
+                case .skipped(let reason):
+                    work.finish("reflection.judgment", result: "skipped: " + reason)
+                    work.finish("reflection.integration", result: "skipped: " + reason)
+                case .done:
+                    throw PersistenceCoreError.ioFailure("reflection judgment returned without a receipt")
+                }
+                work.reflection = nil
+            } catch let held as DreamBusy {
+                // Busy keeps the judgment owed for the next run without failing this one.
+                work.note("reflection.judgment", error: held)
+                progress.busy.append("reflection for \(work.date): \(held.words)")
+            } catch {
+                work.note("reflection.judgment", error: error)
+                progress.errors.append("\(file.path) reflection judgment owed: \(error)")
+            }
+            // Checkpoint judgment before integration so no effect precedes its durable cause.
+            try work.save(in: dataRoot)
+        }
+        if let receipt = work.reflectionReceipt {
+            try Task.checkCancellation()
+            do {
+                let result = try await deliver(.reflectionIntegration(receipt), work: work, sink: delivery)
+                try finishDelivery(result, step: "reflection.integration", work: &work)
+                work.reflectionAcknowledgment = receipt.id
+                work.reflectionReceipt = nil
+            } catch {
+                work.note("reflection.integration", error: error)
+                progress.errors.append("\(file.path) reflection integration owed: \(error)")
+            }
+            try work.save(in: dataRoot)
+        }
+        if let id = work.reflectionAcknowledgment {
+            try Task.checkCancellation()
+            do {
+                let result = try await deliver(.reflectionAcknowledgment(id), work: work, sink: delivery)
+                try finishDelivery(result, step: "reflection.acknowledgment", work: &work)
+                work.reflectionAcknowledgment = nil
+            } catch {
+                work.note("reflection.acknowledgment", error: error)
+                progress.errors.append("\(file.path) reflection acknowledgment owed: \(error)")
+            }
+            try work.save(in: dataRoot)
+        }
+        return work
+    }
+
+    private func retryRemainingDreamEffects(_ pending: DreamPendingWork, file: URL, delivery: DreamEffectSink?,
+                                            progress: DreamRetryProgress) async throws -> DreamPendingWork {
+        var work = pending
+        if let care = work.care {
+            try Task.checkCancellation()
+            do {
+                let result = try await deliver(.care(care.night), work: work, sink: delivery)
+                try finishDelivery(result, step: "care", work: &work)
+                work.care = nil
+            } catch {
+                work.note("care", error: error)
+                progress.errors.append("\(file.path) care delivery owed: \(error)")
+            }
+            try work.save(in: dataRoot)
+        }
+        if let affect = work.affect {
+            try Task.checkCancellation()
+            do {
+                let skipped = try await integrateMood(affect: affect, dateKey: work.date)
+                work.affect = nil
+                work.finish("mood", result: skipped.map { "skipped: " + $0 } ?? "done")
+            } catch {
+                work.note("mood", error: error)
+                progress.errors.append("\(file.path) mood delivery owed: \(error)")
+            }
+            try work.save(in: dataRoot)
+        }
+        if !work.studioEntries.isEmpty {
+            try Task.checkCancellation()
+            do {
+                try await receiptSink(Self.studioCitationReceiptKind, .object([
+                    "date": .string(work.date), "dreamId": .string(work.id.uuidString), "trigger": .string(work.trigger.rawValue),
+                    "entries": .array(work.studioEntries.map(JSONValue.string))]))
+                work.studioEntries = []
+                work.finish("studio.citations")
+            } catch {
+                work.note("studio.citations", error: error)
+                progress.errors.append("\(file.path) studio citation owed: \(error)")
+            }
+            try work.save(in: dataRoot)
+        }
+        if let completion = work.completion, work.completedSteps?["dreamCompleted"] == nil {
+            try Task.checkCancellation()
+            do {
+                let result = try await deliver(.completion(occurredAt: completion.occurredAt,
+                    feltSummary: completion.feltSummary), work: work, sink: delivery)
+                try finishDelivery(result, step: "dreamCompleted", work: &work)
+            } catch {
+                work.note("dreamCompleted", error: error)
+                progress.errors.append("\(file.path) dream completion owed: \(error)")
+            }
+            try work.save(in: dataRoot)
+        }
+        return work
     }
 
     private func deliver(_ effect: DreamEffect, work: DreamPendingWork, sink: DreamEffectSink?) async throws -> DreamEffectResult {

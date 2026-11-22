@@ -288,11 +288,10 @@ public enum SenseNativePages {
 
     /// Retain structural sense addresses under the compact display without duplicating a path catalog in the envelope.
     public static func chromeThings(_ snapshot: JSONValue) throws -> [NativeThing] {
-        func text(_ value: JSONValue?) -> String? { if case .string(let text)? = value { return text }; return nil }
-        guard case .object(let page) = snapshot, let url = text(page["url"]),
+        guard case .object(let page) = snapshot, let url = page["url"]?.stringValue,
               let host = URL(string: url)?.host, case .array(let nodes)? = page["nodes"] else { return [] }
         guard nodes.allSatisfy({ value in
-            guard case .object(let node) = value, let fragment = text(node["addressFragment"]) else { return false }
+            guard case .object(let node) = value, let fragment = node["addressFragment"]?.stringValue else { return false }
             return !fragment.isEmpty
         }) else {
             throw SenseFailure(code: "reader_update_required", message: """
@@ -301,12 +300,12 @@ public enum SenseNativePages {
                 """)
         }
         return nodes.compactMap { value in
-            guard case .object(let node) = value, let fragment = text(node["addressFragment"]) else { return nil }
+            guard case .object(let node) = value, let fragment = node["addressFragment"]?.stringValue else { return nil }
             var verbs: [String] = []
-            if case .array(let actions)? = node["actions"] { verbs = actions.compactMap { text($0) }.filter { ["click", "fill", "select"].contains($0) } }
+            if case .array(let actions)? = node["actions"] { verbs = actions.compactMap { $0.stringValue }.filter { ["click", "fill", "select"].contains($0) } }
             if case .object(let states)? = node["states"], states["disabled"] == .bool(true) || states["blockedByModal"] == .bool(true) { verbs = [] }
-            let name = [text(node["name"]), text(node["text"]), text(node["url"])].compactMap { $0 }.first { !$0.isEmpty } ?? "element"
-            return NativeThing(name: name, kind: text(node["role"]) ?? text(node["kind"]) ?? "element",
+            let name = [node["name"]?.stringValue, node["text"]?.stringValue, node["url"]?.stringValue].compactMap { $0 }.first { !$0.isEmpty } ?? "element"
+            return NativeThing(name: name, kind: node["role"]?.stringValue ?? node["kind"]?.stringValue ?? "element",
                 address: chromeAddress(host: host, url: url, fragment: fragment), verbs: verbs)
         }
     }
@@ -408,7 +407,10 @@ public enum SenseNativePages {
                 throw SenseFailure(code: "bad_output", message: "The native screen snapshot has no continuation identity.")
             }
             next["__sense_screen_frame"] = .string(frame)
-            next["app"] = if case .app(let bundle) = page.corner { .string(bundle) } else { nil }
+            // The app this frame was read from, not a second frontmost lookup that may have moved since (loginwindow).
+            // The page is that app's too, so its Or line names it.
+            if case .string(let read)? = identity["app"] { next["app"] = .string(read); result.corner = .app(bundleID: read) }
+            else if case .app(let bundle) = page.corner { next["app"] = .string(bundle) }
             next["__sense_text_offset"] = .int(Int64(end))
             next.removeValue(forKey: "__sense_thing_offset")
             result.more = try JSONValue.object(next).serialize(pretty: false)

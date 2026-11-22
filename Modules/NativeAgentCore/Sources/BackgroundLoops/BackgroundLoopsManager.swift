@@ -94,7 +94,7 @@ public actor BackgroundLoopLifetimes {
     }
 
     /// The body projection, judged against this launch: a loop manager that has not started judges no silence. Each organ's record (its ring,
-    /// latest beat, profile and deviation) is read from the beats themselves; an organ whose beats do not decode is named unreadable, and a failed
+    /// latest beat and deviation) is read from the beats themselves; an organ whose beats do not decode is named unreadable, and a failed
     /// record read throws.
     public func organBody(now: Date) async throws -> OrganBody {
         let reading = try await scheduler.organRecords()

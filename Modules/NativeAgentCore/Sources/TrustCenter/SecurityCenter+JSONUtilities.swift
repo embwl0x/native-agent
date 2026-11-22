@@ -3,20 +3,9 @@ import PersistenceCore
 // Blueprint: | `SecurityCenter+JSONUtilities.swift` | Resolved workspace containment shares execution spelling. |
 
 extension SwiftNativeSecurityCenter {
-    static func object(_ value: JSONValue?) -> [String: JSONValue] {
-        if case .object(let obj)? = value { return obj }
-        return [:]
-    }
-
     static func bool(_ value: JSONValue?, default fallback: Bool) -> Bool {
         if case .double = value { return fallback }
         return ConnectorInputValue.bool(value, default: fallback)
-    }
-
-    static func stringArray(_ value: JSONValue?) -> [String] {
-        guard case .array(let array)? = value else { return [] }
-        return array.compactMap { $0.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
     }
 
     package static func trustedWorkspaceRoots(
@@ -56,7 +45,7 @@ extension SwiftNativeSecurityCenter {
     public static func isInsideTrustedWorkspace(
         _ file: URL, policy: [String: JSONValue], dataRoot: URL
     ) -> Bool {
-        trustedWorkspaceRoots(filePolicy: object(policy["filePolicy"]), dataRoot: dataRoot)
+        trustedWorkspaceRoots(filePolicy: JSONValue.objectOrEmpty(policy["filePolicy"]), dataRoot: dataRoot)
             .contains { isSelfOrAncestor(root: $0, of: file) }
     }
 

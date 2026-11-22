@@ -7,7 +7,6 @@ import AgentWorkspace
 import Experiences
 import Foundation
 import ApprovalInbox
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -21,7 +20,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import StandingBots
-// Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's own turn deciding what is theirs; audit failures owe repairs |
+// Blueprint: | `ChatOrchestrationClient+DispatchWrappers.swift` | File-access gates; exact-call consent carried to dispatch, the person's own turn deciding what is theirs; audit failures owe repairs; `dispatchNormalized` reads as its stages over one `JudgedCall`: replay verification, the decision, who decides, then the allowed run or the approval card, judged again when an owner's or the person's ask turns the decision |
 
 /// Carry request ceilings to Trust's canonical refusal before any inner work.
 final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValidating, Sendable {
@@ -420,31 +419,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             ),
             enforceAutonomy: false, turn: turn
         )
-        // Arguments first: the call is checked against its schema and its owner's own checks (targets, names, ids, values) before any
-        // decision but .allow is acted on, so a call that cannot run is refused at once in its owner's words and never becomes a card, an
-        // approval, a notification or a deny. The order is validate, decide, card, run, for every caller. An allowed call pays no preview:
-        // its run's own prepare refuses in the same shape. A question the check would put to the person (a permission it needs) gives way
-        // to a deny, which raises nothing.
-        func argumentRefusal(denied: Bool) async -> JSONValue? {
-            // Screen control's card admits a part's hand on its watched window before primitive validation.
-            let primitiveCall = work.authoredCall?.tool == tool && !AuthoredToolEffects.handOperations.contains(tool)
-            var refusal: JSONValue?
-            if !primitiveCall, let validating = inner as? any PreApprovalToolValidating {
-                refusal = await holding(turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID)) { turn in
-                    await validating.preApprovalRefusal(turn: turn, invocation: work.invocation, tool: tool, input: input, surface: surface)
-                }
-            } else if !primitiveCall, let validating = inner as? any PureToolArgumentValidating {
-                refusal = await validating.argumentRefusal(tool: tool, input: input, turn: turn)
-            }
-            guard let refusal else { return nil }
-            if ChatToolOutcome.isWaitingInteraction(refusal) { return denied ? nil : refusal }
-            return ChatToolOutcome.refusedBeforeRunning(owner: refusal)
-        }
         // .block is the person's Trust (Safe's blocked level, Pause everything) or their security policy: a good call it stops is refused
         // before it ran, as the person's call. .ask enters the approval flow and denies if no filer exists.
         if envelope.decision == .block {
             await audit(envelope)
-            if let refusal = await argumentRefusal(denied: true) { return refusal }
+            if let refusal = await argumentRefusal(denied: true, tool: tool, input: input, surface: surface, turn: turn, work: work) { return refusal }
             return ChatToolOutcome.refusedBeforeRunning(code: "owners_call", detail: envelope.primaryReason,
                 extra: (envelope.remedy.map { ["remedy": $0] } ?? [:]).merging(["decided_by": .string("trust")]) { $1 })
         }
@@ -454,6 +433,123 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         // The saved posture is Full Mac, whoever is asking (a peer or helper
         // surface is never admitted, but it is still running under Full Mac).
         let fullMacOn = [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority)
+        let approvedReplayAuthorizes: Bool, injectionReplayApprovalID: String?
+        switch try await verifyReplay(tool: tool, input: input, surface: surface, turn: turn, envelope: envelope) {
+        case .refused(let refusal): return refusal
+        case .checked(let authorizes, let approvalID):
+            approvedReplayAuthorizes = authorizes
+            injectionReplayApprovalID = approvalID
+        }
+        let decided = try decideCall(tool: tool, input: input, surface: surface, turn: turn, envelope: envelope, autonomyLevel: autonomyLevel,
+            fullMacOn: fullMacOn, approvedReplayAuthorizes: approvedReplayAuthorizes, injectionReplayApprovalID: injectionReplayApprovalID)
+        let judged = JudgedCall(tool: tool, input: input, surface: surface, turn: turn, work: work, namedConnect: namedConnect,
+            envelope: envelope, approvedReplayAuthorizes: approvedReplayAuthorizes, injectionReplayApprovalID: injectionReplayApprovalID,
+            autonomyDecision: decided.autonomyDecision, securityAsked: decided.securityAsked, decidedRequester: decided.decidedRequester,
+            trustedBridge: decided.trustedBridge, requester: decided.requester, peerWorded: decided.peerWorded, decision: decided.decision,
+            admission: decided.admission)
+        if let refusal = try await settleWhoDecides(judged) { return refusal }
+        try Task.checkCancellation()
+        // An owner that needs the person's yes for this exact call says so in its reply (`needs_person`, with its words): the call then asks
+        // as a gate's ask does, and the person's Approve replays it as their own act. The person's own act, or its replay, never asks again.
+        while true {
+        switch judged.decision {
+        case .allow:
+            if let result = try await runAllowed(judged) { return result }
+        case .deny(let reason):
+            // A good call the person's Trust denies is refused before it ran, in the gate's words: the person's call, not a failure. Its
+            // deny was audited above, with the argument check.
+            return ChatToolOutcome.refusedBeforeRunning(code: "owners_call", detail: reason,
+                extra: (envelope.remedy.map { ["remedy": $0] } ?? [:]).merging(["decided_by": .string("trust")]) { $1 })
+        case .requireApproval(let gateReason):
+            if let result = try await requestApproval(judged, gateReason: gateReason) { return result }
+        }
+        }
+    }
+
+    /// One gated call once its arguments, envelope and replay are read: what decides it and who, carried through every round of
+    /// its decision (an owner's ask or the person's own ask turns the decision, and the call is judged again). The stages are this
+    /// dispatcher's methods that take it; it lives for one call.
+    private final class JudgedCall {
+        let tool: String
+        let input: [String: JSONValue]
+        let surface: String
+        let turn: Turn
+        let work: ChatTurnWork
+        let namedConnect: Bool
+        let envelope: SecurityToolEnvelope
+        let approvedReplayAuthorizes: Bool
+        let injectionReplayApprovalID: String?
+        let autonomyDecision: AutonomyDecision
+        let securityAsked: Bool
+        let decidedRequester: String?
+        let trustedBridge: Bool
+        let requester: String?
+        let peerWorded: Bool
+        var decision: AutonomyDecision
+        var admission: SecurityToolEnvelope
+        var ownUndo: String?
+        var theirs = false
+        // The person's ask, once it decides this call: their act for this exact call, as their card's Approve would be; and the cards it
+        // settled that were waiting for this call.
+        var wordTurn: Turn?
+        var cardsSettled: JSONValue = .null
+        var ownerAsked = false
+        init(tool: String, input: [String: JSONValue], surface: String, turn: Turn, work: ChatTurnWork, namedConnect: Bool,
+             envelope: SecurityToolEnvelope, approvedReplayAuthorizes: Bool, injectionReplayApprovalID: String?,
+             autonomyDecision: AutonomyDecision, securityAsked: Bool, decidedRequester: String?, trustedBridge: Bool, requester: String?,
+             peerWorded: Bool, decision: AutonomyDecision, admission: SecurityToolEnvelope) {
+            self.tool = tool
+            self.input = input
+            self.surface = surface
+            self.turn = turn
+            self.work = work
+            self.namedConnect = namedConnect
+            self.envelope = envelope
+            self.approvedReplayAuthorizes = approvedReplayAuthorizes
+            self.injectionReplayApprovalID = injectionReplayApprovalID
+            self.autonomyDecision = autonomyDecision
+            self.securityAsked = securityAsked
+            self.decidedRequester = decidedRequester
+            self.trustedBridge = trustedBridge
+            self.requester = requester
+            self.peerWorded = peerWorded
+            self.decision = decision
+            self.admission = admission
+        }
+    }
+
+    // Arguments first: the call is checked against its schema and its owner's own checks (targets, names, ids, values) before any
+    // decision but .allow is acted on, so a call that cannot run is refused at once in its owner's words and never becomes a card, an
+    // approval, a notification or a deny. The order is validate, decide, card, run, for every caller. An allowed call pays no preview:
+    // its run's own prepare refuses in the same shape. A question the check would put to the person (a permission it needs) gives way
+    // to a deny, which raises nothing.
+    private func argumentRefusal(denied: Bool, tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+                                 work: ChatTurnWork) async -> JSONValue? {
+        // Screen control's card admits a part's hand on its watched window before primitive validation.
+        let primitiveCall = work.authoredCall?.tool == tool && !AuthoredToolEffects.handOperations.contains(tool)
+        var refusal: JSONValue?
+        if !primitiveCall, let validating = inner as? any PreApprovalToolValidating {
+            refusal = await holding(turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID)) { turn in
+                await validating.preApprovalRefusal(turn: turn, invocation: work.invocation, tool: tool, input: input, surface: surface)
+            }
+        } else if !primitiveCall, let validating = inner as? any PureToolArgumentValidating {
+            refusal = await validating.argumentRefusal(tool: tool, input: input, turn: turn)
+        }
+        guard let refusal else { return nil }
+        if ChatToolOutcome.isWaitingInteraction(refusal) { return denied ? nil : refusal }
+        return ChatToolOutcome.refusedBeforeRunning(owner: refusal)
+    }
+
+    /// What the replay checks found: a refusal that ends the call, or whether a verified replay authorizes it and the injection
+    /// approval it carries.
+    private enum ReplayCheck {
+        case refused(JSONValue)
+        case checked(approvedReplayAuthorizes: Bool, injectionReplayApprovalID: String?)
+    }
+
+    /// Verifies a replay this call claims against the inbox before any exemption or minting; an unverified replay never runs.
+    private func verifyReplay(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+                              envelope: SecurityToolEnvelope) async throws -> ReplayCheck {
         // Verify every replay against the inbox and burn its exemption for one dispatch; unverified replays are denied.
         let approvedReplayAuthorizes: Bool
         if !MacInjectionToolNames.isInjectionTool(tool),
@@ -490,7 +586,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                         """),
                     "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("files.read"),
                         "args": .object(["path": .string(path)])])])])
-                return .object(["status": .string("failed"), "reason": .string(reason), "effects": .string("unknown"), "remedy": remedy])
+                return .refused(.object(["status": .string("failed"), "reason": .string(reason), "effects": .string("unknown"), "remedy": remedy]))
             }
             approvedReplayAuthorizes = true
         } else {
@@ -525,6 +621,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             }
             injectionReplayApprovalID = replay.approvalID
         }
+        return .checked(approvedReplayAuthorizes: approvedReplayAuthorizes, injectionReplayApprovalID: injectionReplayApprovalID)
+    }
+
+    /// Decides the call from the security envelope and the autonomy level, then words it for another agent's steering: who asks,
+    /// and whether the agent decided for them.
+    private func decideCall(tool: String, input: [String: JSONValue], surface: String, turn: Turn, envelope: SecurityToolEnvelope,
+                            autonomyLevel: String, fullMacOn: Bool, approvedReplayAuthorizes: Bool, injectionReplayApprovalID: String?) throws
+        -> (autonomyDecision: AutonomyDecision, securityAsked: Bool, decidedRequester: String?, trustedBridge: Bool, requester: String?,
+            peerWorded: Bool, decision: AutonomyDecision, admission: SecurityToolEnvelope) {
         let autonomyDecision: AutonomyDecision
         switch AutonomyGate.map(level: autonomyLevel, toolName: tool) {
         case .requireApproval where approvedReplayAuthorizes: autonomyDecision = .allow
@@ -576,18 +681,21 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         let peerApproval = PeerDataTaintDispatcher.peerApproval(turn: turn, surface: surface,
             protectedAction: protectedAction, peerName: peerDisplayName(peerID: peerTurnID))
         let requester = peerApproval.requester
+        var peerWorded = false
         if !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
            peerReasonMayReplace, requester != nil {
+            // The cards name the steering peers by their contact names, never a raw peer id.
+            let sources = (taint?.checkpointSources ?? []).filter { !PeerDataTaint.ownerTrusts($0) }
+            let named = sources.map { source -> String in
+                if source.hasPrefix("peer:") { return peerDisplayName(peerID: String(source.dropFirst(5))) ?? source }
+                return source.contains(" ") ? source : source.prefix(1).uppercased() + source.dropFirst()
+            }.joined(separator: ", ")
             if fullMacOn, peerApproval.required {
                 // The Full Mac card names steering peers and quotes their relevant line.
-                let sources = (taint?.checkpointSources ?? []).filter { !PeerDataTaint.ownerTrusts($0) }
-                let named = sources.map { source -> String in
-                    if source.hasPrefix("peer:") { return peerDisplayName(peerID: String(source.dropFirst(5))) ?? source }
-                    return source.contains(" ") ? source : source.prefix(1).uppercased() + source.dropFirst()
-                }.joined(separator: ", ")
                 decision = .requireApproval(reason: try PeerTurnEffectPolicy.floorReason(
                     tool: tool, input: input, requester: named.isEmpty ? requester ?? "" : named,
                     quote: Self.peerQuote(taint?.lastLine ?? ""), turn: turn))
+                peerWorded = true
             } else if let requester, protectedAction {
                 if fullMacOn {
                     // Under Full Mac, audit the agent's allowed decision for the requester.
@@ -596,43 +704,46 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                         decidedRequester = requester
                     }
                 } else if peerApproval.required {
-                    decision = .requireApproval(
-                        reason: PeerTurnEffectPolicy.approvalReason(tool: tool, requester: requester)
-                    )
+                    decision = .requireApproval(reason: PeerTurnEffectPolicy.approvalReason(
+                        requester: named.isEmpty ? peerDisplayName(peerID: peerTurnID) ?? "" : named))
+                    peerWorded = true
                 }
             }
         }
+        return (autonomyDecision, securityAsked, decidedRequester, trustedBridge, requester, peerWorded, decision, admission)
+    }
+
+    /// Settles who decides before the call runs or asks: the agent undoing its own act, the person's lever, the argument check a
+    /// card would carry, the person's own contact send. Returns a refusal that ends the call.
+    private func settleWhoDecides(_ judged: JudgedCall) async throws -> JSONValue? {
+        let tool = judged.tool, input = judged.input, surface = judged.surface, turn = judged.turn, work = judged.work,
+            envelope = judged.envelope, securityAsked = judged.securityAsked, autonomyDecision = judged.autonomyDecision,
+            requester = judged.requester
         // Removing what the agent's own create made is the agent undoing its own act, not deleting the person's things: it runs without a
         // card in this turn or a later one, as long as the create would run without a card for this same asker now. Another agent's
         // steering and a security ask keep their card; Safe's refusal is a deny and stands.
-        var ownUndo: String?
-        if case .requireApproval = decision, !securityAsked,
+        if case .requireApproval = judged.decision, !securityAsked,
            let words = await AgentMade.undoing(tool: tool, input: input, surface: surface,
                origin: .currentTurn(turn: turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID), surface: surface),
                security: envelope, turn: turn, securityCenter: securityCenter) {
-            admission = Self.securityEnvelope(envelope, decision: .allow, reason: words)
-            decision = .allow
-            ownUndo = words
+            judged.admission = Self.securityEnvelope(envelope, decision: .allow, reason: words)
+            judged.decision = .allow
+            judged.ownUndo = words
         }
         // A change that is the person's to decide and that a card can carry (a lever's ask here, a setting raise's or an owner-only row's
         // from its owner below) is decided by their card, or by their own ask when the turn is theirs (`personsAsk`). A security ask,
         // another agent's steering or a peer's request keeps its card.
-        var theirs = false
         if case .requireApproval = autonomyDecision, !securityAsked, requester == nil,
            try PermissionLaw.lever(tool: tool, input: input, turn: turn)?.asks == true {
             let owns = try await SwiftNativeTrustCenter(dataRoot: securityCenter.dataRoot).agentOwnsLevers(turn: turn)
-            theirs = !owns
+            judged.theirs = !owns
         }
-        // The person's ask, once it decides this call: their act for this exact call, as their card's Approve would be; and the cards it
-        // settled that were waiting for this call.
-        var wordTurn: Turn?
-        var cardsSettled: JSONValue = .null
-        if case .allow = decision {} else {
-            if case .deny(let reason) = decision {
+        if case .allow = judged.decision {} else {
+            if case .deny(let reason) = judged.decision {
                 // Trust's consent history keeps every deny, a call refused for its arguments too.
                 await audit(Self.securityEnvelope(envelope, decision: .block, reason: reason))
-                if let refusal = await argumentRefusal(denied: true) { return refusal }
-            } else if let refusal = await argumentRefusal(denied: false) { return refusal }
+                if let refusal = await argumentRefusal(denied: true, tool: tool, input: input, surface: surface, turn: turn, work: work) { return refusal }
+            } else if let refusal = await argumentRefusal(denied: false, tool: tool, input: input, surface: surface, turn: turn, work: work) { return refusal }
         }
         // The user's own contact send needs no card. Broader execution and Trust refusals must be stated plainly.
         if turn.personInitiatedSend?.claim(tool: tool, input: input, surface: surface) == true {
@@ -640,11 +751,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 guard case .string(let agent)? = input["agent"], agent.hasPrefix("peer:") else { return "This contact" }
                 return peerDisplayName(peerID: String(agent.dropFirst(5))) ?? "This contact"
             }()
-            switch decision {
+            switch judged.decision {
             case .allow: break
             case .requireApproval where Set(envelope.capabilities).isSubset(of: PersonInitiatedSend.sendOnly):
-                admission = Self.securityEnvelope(envelope, decision: .allow, reason: "person-initiated send from a contact thread")
-                decision = .allow
+                judged.admission = Self.securityEnvelope(envelope, decision: .allow, reason: "person-initiated send from a contact thread")
+                judged.decision = .allow
             case .requireApproval:
                 await audit(Self.securityEnvelope(envelope, decision: .ask,
                     reason: "person-initiated send needs more than the send"))
@@ -655,271 +766,290 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 return PersonInitiatedSend.refusal("Your Trust settings don't allow messaging \(name) right now. Nothing was sent.")
             }
         }
-        try Task.checkCancellation()
-        // An owner that needs the person's yes for this exact call says so in its reply (`needs_person`, with its words): the call then asks
-        // as a gate's ask does, and the person's Approve replays it as their own act. The person's own act, or its replay, never asks again.
-        var ownerAsked = false
-        while true {
-        switch decision {
-        case .allow:
-            if work.admissionOnly {
-                if tool != "app" || input["preview"] != .bool(true) {
-                    await audit(Self.securityEnvelope(admission, decision: .allow, reason: "admitted"))
-                }
-                return .object(["status": .string("admitted"), "effects": .string("none"),
-                                "execution": .string("not_run"), "reason": .string("admitted")])
+        return nil
+    }
+
+    /// Runs an allowed call, or admits it only; an owner that answers that the person must decide turns the decision to their ask.
+    /// Returns nil when the decision turned and the call is judged again.
+    private func runAllowed(_ judged: JudgedCall) async throws -> JSONValue? {
+        let tool = judged.tool, input = judged.input, surface = judged.surface, turn = judged.turn, work = judged.work,
+            namedConnect = judged.namedConnect, approvedReplayAuthorizes = judged.approvedReplayAuthorizes,
+            injectionReplayApprovalID = judged.injectionReplayApprovalID, requester = judged.requester,
+            decidedRequester = judged.decidedRequester, trustedBridge = judged.trustedBridge
+        if work.admissionOnly {
+            if tool != "app" || input["preview"] != .bool(true) {
+                await audit(Self.securityEnvelope(judged.admission, decision: .allow, reason: "admitted"))
             }
-            // Bind the approved session so downstream dispatch reconstructs the same origin instead of falsely blocking it.
-            // Injection still requires exact approved replay; `runInner` refuses any allow without its approval ID.
-            var result = try await runInner(
-                admission: admission,
+            return .object(["status": .string("admitted"), "effects": .string("none"),
+                            "execution": .string("not_run"), "reason": .string("admitted")])
+        }
+        // Bind the approved session so downstream dispatch reconstructs the same origin instead of falsely blocking it.
+        // Injection still requires exact approved replay; `runInner` refuses any allow without its approval ID.
+        var result = try await runInner(
+            admission: judged.admission,
+            tool: tool,
+            input: input,
+            surface: surface,
+            injectionApprovalID: injectionReplayApprovalID ?? (approvedReplayAuthorizes ? approvedReplay?.approvalID : nil),
+            // Reaching .allow IS the person's go-ahead: their approval, or Full Mac.
+            personApprovedHost: namedConnect,
+            // A verified replay of the person's approved card runs as their decision of this exact call, levers included; so does a call
+            // the person asked for in their own words.
+            turn: approvedReplay.flatMap { (replay) -> Turn? in
+                guard approvedReplayAuthorizes else { return nil }
+                turn.cardCause?.approved(by: replay.approvalID)
+                return turn.with(\.personAct, PersonAct(by: .card(id: replay.approvalID), tool: tool, input: input, spent: [.call])) }
+                ?? judged.wordTurn ?? turn,
+            work: work)
+        let reply = ToolResult(result)
+        // Only the stem's own verbs ask this way (an app action that is no part's, connector's or folded tool's, or the door's own list
+        // of calls that are all the person's to decide), so no reply a part, a peer or a remote tool writes can word the person's card.
+        let stemAsks: Bool = if let asking = input["action"]?.stringValue { AppActionBinding.declaredBinding(asking)?.folded == false }
+            else { input["action"] == nil && input["actions"]?.arrayValue != nil }
+        if reply.said("needs_person"), !approvedReplayAuthorizes, turn.personAct == nil, input["preview"] != .bool(true), tool == "app",
+           stemAsks, let words = Self.ownersDetail(result) {
+            judged.decision = .requireApproval(reason: words)
+            judged.ownerAsked = true
+            // The owner's ask is the person's, as a lever's is, unless another agent is behind this turn; one their ask already
+            // decided and that still asks goes on their card.
+            judged.theirs = requester == nil && judged.wordTurn == nil
+            judged.wordTurn = nil
+            return nil
+        }
+        // What the agent reads says it undid its own act, and what it made.
+        if let ownUndo = judged.ownUndo, case .object(var fields) = result {
+            fields["undoing_own_act"] = .string(ownUndo)
+            result = .object(fields)
+        }
+        // What the agent reads says the call ran as the person's act, on their own ask.
+        if let words = judged.wordTurn?.personAct?.words, case .object(var fields) = result {
+            fields["decided_by"] = .string("person")
+            fields["persons_word"] = .string(words)
+            if judged.cardsSettled != .null { fields["cards_settled_by_persons_word"] = judged.cardsSettled }
+            result = .object(fields)
+        }
+        // A call the person's card decided says which card and that the person decided it, so the agent's own log ties it to them.
+        if approvedReplayAuthorizes, let replay = approvedReplay, case .object(var fields) = result {
+            fields["decided_by"] = .string("person")
+            fields["card"] = .string("\(ApprovalWords.call(tool: tool, input: .object(input)).act) (\(replay.approvalID)), approved by the person")
+            result = .object(fields)
+        }
+        if let decidedRequester, !trustedBridge, tool != "app",
+           reply.outcome == .succeeded {
+            BodyDecidedRow.post(turn: turn, requester: decidedRequester, tool: tool, sessionID: verifiedSessionId,
+                                  dataRoot: peerDirectoryDataRoot ?? defaultDataRoot(), ran: true)
+        }
+        return result
+    }
+
+    /// Asks for the call: refusals no card can carry, then the card's words, the staging shortcut, the person's own ask, and the
+    /// card itself. Returns nil when the person's own ask decided the call and it is judged again.
+    private func requestApproval(_ judged: JudgedCall, gateReason: String) async throws -> JSONValue? {
+        let tool = judged.tool, input = judged.input, surface = judged.surface, turn = judged.turn, work = judged.work,
+            envelope = judged.envelope, namedConnect = judged.namedConnect, securityAsked = judged.securityAsked,
+            peerWorded = judged.peerWorded
+        // The arguments were checked above, before any decision was acted on.
+        let root = peerDirectoryDataRoot ?? defaultDataRoot()
+        if let refusal = try await MacAppActGate.requestRefusal(tool: tool, input: input, dataRoot: root,
+            turn: turn, context: work.invocation.macContext(dataRoot: root)) {
+            return ChatToolOutcome.refusedBeforeRunning(owner: .object(refusal.fields))
+        }
+        // A switch the user turned off refuses before any card, regardless of posture.
+        if let gate = try SwiftToolDispatcher.integrationGate(tool: tool, input: input, turn: turn) {
+            let root = peerDirectoryDataRoot ?? defaultDataRoot()
+            let store = root == defaultDataRoot() ? MacIntegrationPermissionStore.shared : MacIntegrationPermissionStore(dataRoot: root)
+            if let refusal = try await SwiftToolDispatcher.switchRefusal(integration: gate.integration, mode: gate.mode, store: store) {
+                return ChatToolOutcome.refusedBeforeRunning(owner: refusal)
+            }
+        }
+        // A skill's step never files a card: it hands back to the agent.
+        if work.handsBack, !work.admissionOnly { return SkillRunContext.handBack(ApprovalActionText.reason(gateReason,
+            tool: tool, input: input)) }
+        // Preserve the deciding rule alongside the implementation's disclosure; another agent's ask says who and why in the person's words, so
+        // the policy line (kept in the security receipt) stays off its card.
+        var reason = ApprovalActionText.reason(gateReason, tool: tool, input: input)
+        if !peerWorded, let cause = envelope.autonomyReason, !reason.contains(cause) { reason += " " + cause }
+        if tool.hasPrefix("fetch."), case .string(let raw)? = input["url"], let url = URL(string: raw) {
+            let method = input["method"]?.scalarText.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })?.uppercased()
+                ?? "GET"
+            reason = "\(method) \(url.host ?? "")\(url.path) through \(tool). \(reason)"
+        } else if let validating = inner as? any PreApprovalToolValidating,
+           let disclosed = await validating.approvalCardReason(
+            tool: tool, input: input, surface: surface) {
+            reason = disclosed + " " + reason
+        }
+        let ownsACPConnectCard: Bool
+        if namedConnect, case .string(let name)? = input["name"] {
+            ownsACPConnectCard = AgentHostDirectory.row(named: name)?.acp != nil
+        } else { ownsACPConnectCard = false }
+        if !securityAsked, envelope.capabilities.contains("approval_stage") || ownsACPConnectCard {
+            // ACP owns the connect card and immutable executable proposal; no executable grant precedes approval.
+            // Staging persists only bounded replay requests. Injection never takes this shortcut; its approval path must remain separate.
+            return try await runInner(
+                admission: judged.admission,
                 tool: tool,
                 input: input,
                 surface: surface,
-                injectionApprovalID: injectionReplayApprovalID ?? (approvedReplayAuthorizes ? approvedReplay?.approvalID : nil),
-                // Reaching .allow IS the person's go-ahead: their approval, or Full Mac.
-                personApprovedHost: namedConnect,
-                // A verified replay of the person's approved card runs as their decision of this exact call, levers included; so does a call
-                // the person asked for in their own words.
-                turn: approvedReplay.flatMap { (replay) -> Turn? in
-                    guard approvedReplayAuthorizes else { return nil }
-                    turn.cardCause?.approved(by: replay.approvalID)
-                    return turn.with(\.personAct, PersonAct(by: .card(id: replay.approvalID), tool: tool, input: input, spent: [.call])) }
-                    ?? wordTurn ?? turn,
-                work: work)
-            let reply = ToolResult(result)
-            // Only the stem's own verbs ask this way (an app action that is no part's, connector's or folded tool's, or the door's own list
-            // of calls that are all the person's to decide), so no reply a part, a peer or a remote tool writes can word the person's card.
-            let stemAsks: Bool = if let asking = input["action"]?.stringValue { AppActionBinding.declaredBinding(asking)?.folded == false }
-                else { input["action"] == nil && input["actions"]?.arrayValue != nil }
-            if reply.said("needs_person"), !approvedReplayAuthorizes, turn.personAct == nil, input["preview"] != .bool(true), tool == "app",
-               stemAsks, let words = Self.ownersDetail(result) {
-                decision = .requireApproval(reason: words)
-                ownerAsked = true
-                // The owner's ask is the person's, as a lever's is, unless another agent is behind this turn; one their ask already
-                // decided and that still asks goes on their card.
-                theirs = requester == nil && wordTurn == nil
-                wordTurn = nil
-                continue
-            }
-            // What the agent reads says it undid its own act, and what it made.
-            if let ownUndo, case .object(var fields) = result {
-                fields["undoing_own_act"] = .string(ownUndo)
-                result = .object(fields)
-            }
-            // What the agent reads says the call ran as the person's act, on their own ask.
-            if let words = wordTurn?.personAct?.words, case .object(var fields) = result {
-                fields["decided_by"] = .string("person")
-                fields["persons_word"] = .string(words)
-                if cardsSettled != .null { fields["cards_settled_by_persons_word"] = cardsSettled }
-                result = .object(fields)
-            }
-            // A call the person's card decided says which card and that the person decided it, so the agent's own log ties it to them.
-            if approvedReplayAuthorizes, let replay = approvedReplay, case .object(var fields) = result {
-                fields["decided_by"] = .string("person")
-                fields["card"] = .string("\(ApprovalWords.call(tool: tool, input: .object(input)).act) (\(replay.approvalID)), approved by the person")
-                result = .object(fields)
-            }
-            if let decidedRequester, !trustedBridge, tool != "app",
-               reply.outcome == .succeeded {
-                BodyDecidedRow.post(turn: turn, requester: decidedRequester, tool: tool, sessionID: verifiedSessionId,
-                                      dataRoot: peerDirectoryDataRoot ?? defaultDataRoot(), ran: true)
-            }
-            return result
-        case .deny(let reason):
-            // A good call the person's Trust denies is refused before it ran, in the gate's words: the person's call, not a failure. Its
-            // deny was audited above, with the argument check.
-            return ChatToolOutcome.refusedBeforeRunning(code: "owners_call", detail: reason,
-                extra: (envelope.remedy.map { ["remedy": $0] } ?? [:]).merging(["decided_by": .string("trust")]) { $1 })
-        case .requireApproval(let gateReason):
-            // The arguments were checked above, before any decision was acted on.
-            let root = peerDirectoryDataRoot ?? defaultDataRoot()
-            if let refusal = try await MacAppActGate.requestRefusal(tool: tool, input: input, dataRoot: root,
-                turn: turn, context: work.invocation.macContext(dataRoot: root)) {
-                return ChatToolOutcome.refusedBeforeRunning(owner: .object(refusal.fields))
-            }
-            // A switch the user turned off refuses before any card, regardless of posture.
-            if let gate = try SwiftToolDispatcher.integrationGate(tool: tool, input: input, turn: turn) {
-                let root = peerDirectoryDataRoot ?? defaultDataRoot()
-                let store = root == defaultDataRoot() ? MacIntegrationPermissionStore.shared : MacIntegrationPermissionStore(dataRoot: root)
-                if let refusal = try await SwiftToolDispatcher.switchRefusal(integration: gate.integration, mode: gate.mode, store: store) {
-                    return ChatToolOutcome.refusedBeforeRunning(owner: refusal)
-                }
-            }
-            // A skill's step never files a card: it hands back to the agent.
-            if work.handsBack, !work.admissionOnly { return SkillRunContext.handBack(ApprovalActionText.reason(gateReason,
-                tool: tool)) }
-            // Preserve the deciding rule alongside the implementation's disclosure.
-            var reason = ApprovalActionText.reason(gateReason, tool: tool)
-            if let cause = envelope.autonomyReason, !reason.contains(cause) { reason += " " + cause }
-            if tool.hasPrefix("fetch."), case .string(let raw)? = input["url"], let url = URL(string: raw) {
-                let method = input["method"]?.scalarText.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })?.uppercased()
-                    ?? "GET"
-                reason = "\(method) \(url.host ?? "")\(url.path) through \(tool). \(reason)"
-            } else if let validating = inner as? any PreApprovalToolValidating,
-               let disclosed = await validating.approvalCardReason(
-                tool: tool, input: input, surface: surface) {
-                reason = disclosed + " " + reason
-            }
-            let ownsACPConnectCard: Bool
-            if namedConnect, case .string(let name)? = input["name"] {
-                ownsACPConnectCard = AgentHostDirectory.row(named: name)?.acp != nil
-            } else { ownsACPConnectCard = false }
-            if !securityAsked, envelope.capabilities.contains("approval_stage") || ownsACPConnectCard {
-                // ACP owns the connect card and immutable executable proposal; no executable grant precedes approval.
-                // Staging persists only bounded replay requests. Injection never takes this shortcut; its approval path must remain separate.
-                return try await runInner(
-                    admission: admission,
-                    tool: tool,
-                    input: input,
-                    surface: surface,
-                    injectionApprovalID: nil,
-                 turn: turn, work: work)
-            }
-            // In the person's own turn their ask is their act: this exact call runs as theirs, admitted the way their card's Approve is (this
-            // call, once), and the receipt and consent record carry their message. No card is filed; one still waiting for it is settled.
-            if theirs, let words = await personsAsk(tool: tool, input: input, turn: turn) {
-                wordTurn = turn.with(\.personAct, PersonAct(by: .word(quote: words), tool: tool, input: input, spent: [.call]))
-                if !work.admissionOnly { cardsSettled = await settleCards(decidedBy: words, tool: tool, input: input, turn: turn) }
-                admission = Self.securityEnvelope(envelope, decision: .allow,
-                    reason: "The person asked for this in their own message in this conversation: “\(words)”.")
-                theirs = false
-                decision = .allow
-                continue
-            }
-            // File approval and await gate resolution; without a usable filer,
-            // deny explicitly so the loop records the rejection.
-            guard approvalFiler != nil, !work.admissionOnly || approvalFiler is any NonBlockingApprovalFiler else {
-                await audit(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
-                // Missing filers fail closed. User-chat profiles wire the canonical inbox; policy edits must never bypass TrustCenter.
-                return ToolNotRunStatus.approvalUnavailable.reporting(.object([
-                    "status": .string("refused"), "reason": .string("approval_unavailable"), "checker": .string("approval_admission"),
-                    "effects": .string("none"), "remedy": Repair.why(owner: "approval for this call", tap: "NativeAgent chat on Mac, phone or Telegram",
-                        instruction: "Make this request in a conversation with an approval inbox; no card was filed here and policy edits cannot grant it.")]))
-            }
-            // Persist and display injection arguments as count + digest;
-            // execution characters stay only in this process's memory.
-            let approvalPayloadInput = MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn)
-            let injectionSecrets = try MacInjectionArgRedaction.extractSecrets(tool: tool, input: input, turn: turn)
-            if let nonBlocking = approvalFiler as? (any NonBlockingApprovalFiler) {
-                let payload = JSONValue.object(approvalPayloadInput)
-                let approvalId = try await withFilingSession(turn: turn) { turn in
-                    do {
-                        return try await nonBlocking.fileApprovalRequest(
-                            toolName: tool, surface: surface, payload: payload, reason: reason
-                        ,turn: turn)
-                    } catch let error as AutonomyGateError {
-                        throw error
-                    } catch {
-                        throw AutonomyGateError.approvalFilingFailed(String(describing: error))
-                    }
-                }
-                // Keep injection characters in the one-use in-memory approval vault; after process death, replay must refuse absent characters.
-                if !injectionSecrets.isEmpty {
-                    await MacInjectionSecretVault.shared.store(
-                        approvalID: approvalId,
-                        secrets: injectionSecrets
-                    )
-                }
-                await audit(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
-                var pending = await nonBlocking.pendingApprovalResult(
-                    id: approvalId,
-                    toolName: tool,
-                    surface: surface,
-                    payload: payload,
-                    reason: reason
+                injectionApprovalID: nil,
+             turn: turn, work: work)
+        }
+        // In the person's own turn their ask is their act: this exact call runs as theirs, admitted the way their card's Approve is (this
+        // call, once), and the receipt and consent record carry their message. No card is filed; one still waiting for it is settled.
+        if judged.theirs, let words = await personsAsk(tool: tool, input: input, turn: turn) {
+            judged.wordTurn = turn.with(\.personAct, PersonAct(by: .word(quote: words), tool: tool, input: input, spent: [.call]))
+            if !work.admissionOnly { judged.cardsSettled = await settleCards(decidedBy: words, tool: tool, input: input, turn: turn) }
+            judged.admission = Self.securityEnvelope(envelope, decision: .allow,
+                reason: "The person asked for this in their own message in this conversation: “\(words)”.")
+            judged.theirs = false
+            judged.decision = .allow
+            return nil
+        }
+        // File approval and await gate resolution; without a usable filer,
+        // deny explicitly so the loop records the rejection.
+        guard approvalFiler != nil, !work.admissionOnly || approvalFiler is any NonBlockingApprovalFiler else {
+            await audit(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
+            // Missing filers fail closed. User-chat profiles wire the canonical inbox; policy edits must never bypass TrustCenter.
+            return ToolNotRunStatus.approvalUnavailable.reporting(.object([
+                "status": .string("refused"), "reason": .string("approval_unavailable"), "checker": .string("approval_admission"),
+                "effects": .string("none"), "remedy": Repair.why(owner: "approval for this call", tap: "NativeAgent chat on Mac, phone or Telegram",
+                    instruction: "Make this request in a conversation with an approval inbox; no card was filed here and policy edits cannot grant it.")]))
+        }
+        // Persist and display injection arguments as count + digest;
+        // execution characters stay only in this process's memory.
+        let approvalPayloadInput = MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn)
+        let injectionSecrets = try MacInjectionArgRedaction.extractSecrets(tool: tool, input: input, turn: turn)
+        if let nonBlocking = approvalFiler as? (any NonBlockingApprovalFiler) {
+            return try await fileApprovalCard(judged, nonBlocking: nonBlocking, reason: reason, approvalPayloadInput: approvalPayloadInput,
+                injectionSecrets: injectionSecrets)
+        }
+        return try await resolveApproval(judged, reason: reason, approvalPayloadInput: approvalPayloadInput, injectionSecrets: injectionSecrets)
+    }
+
+    /// Files the person's card without waiting on it; the call returns pending with its card.
+    private func fileApprovalCard(_ judged: JudgedCall, nonBlocking: any NonBlockingApprovalFiler, reason: String,
+                                  approvalPayloadInput: [String: JSONValue], injectionSecrets: [String: String]) async throws -> JSONValue {
+        let tool = judged.tool, surface = judged.surface, turn = judged.turn, envelope = judged.envelope
+        let payload = JSONValue.object(approvalPayloadInput)
+        let approvalId = try await withFilingSession(turn: turn) { turn in
+            do {
+                return try await nonBlocking.fileApprovalRequest(
+                    toolName: tool, surface: surface, payload: payload, reason: reason
                 ,turn: turn)
-                if case .object(let fields) = pending, fields["not_run_status"] == nil {
-                    pending = ToolNotRunStatus.approvalFiled.reporting(pending)
-                }
-                if let remedy = envelope.remedy, case .object(var fields) = pending {
-                    fields["remedy"] = remedy
-                    pending = .object(fields)
-                }
-                // The owner's ask, or a lever's, is now the person's card: what the agent reads says so, and what to do next.
-                if ownerAsked || theirs, case .object(var fields) = pending {
-                    let card = ApprovalWords.call(tool: tool, input: .object(approvalPayloadInput)).act
-                    fields["card"] = .string("The person's card \"\(card)\" (\(approvalId)) is up in Mac chat and on their phone, and they decide: "
-                        + "their Approve runs this exact call as theirs, their Decline leaves everything as it is; do not call it again.")
-                    pending = .object(fields)
-                }
-                if StandingBotContinuity.isHelperTurn(turn: turn) { turn.execution?.keepApproval(id: approvalId, pending) }
-                return pending
-            }
-            let resolved = try await withFilingSession(turn: turn) { turn in
-                try await gate.resolveWithApprovalDetailed(
-                    toolName: tool,
-                    surface: surface,
-                    requestPayload: .object(approvalPayloadInput),
-                    timeoutSeconds: approvalTimeoutSeconds,
-                    reason: reason
-                ,turn: turn)
-            }
-            if !injectionSecrets.isEmpty, let filedID = resolved.approvalID {
-                await MacInjectionSecretVault.shared.store(
-                    approvalID: filedID,
-                    secrets: injectionSecrets
-                )
-            }
-            switch resolved.decision {
-            case .allow:
-                // Verify the filer's injection approval against the real inbox
-                // record and exact body before minting; its claimed ID alone grants no authority.
-                var mintApprovalID = resolved.approvalID
-                if MacInjectionToolNames.isInjectionTool(tool) {
-                    let verdict = try await injectionApprovalVerifier.verifyInjectionApproval(
-                        approvalID: resolved.approvalID ?? "",
-                        tool: tool,
-                        surface: surface,
-                        input: input,
-                        turn: turn
-                    )
-                    guard verdict == .verified else {
-                        let r = "injection_approval_unverified: \(verdict.rawValue) "
-                            + "(\(tool) resolved approval \(resolved.approvalID ?? "<none>"))"
-                        await audit(
-                            Self.securityEnvelope(envelope, decision: .block, reason: r)
-                        )
-                        throw AutonomyGateError.toolDenied(reason: r)
-                    }
-                    mintApprovalID = resolved.approvalID
-                }
-                // The person may answer after the saved policy changes. The membrane refreshes hard blocks before carrying the approved call.
-                let current = await securityCenter.evaluateTool(tool: tool,
-                    input: MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn),
-                    origin: .currentTurn(turn: turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID), surface: surface),
-                    enforceAutonomy: false, turn: turn)
-                if current.decision == .block {
-                    await audit(current)
-                    throw AutonomyGateError.toolDenied(reason: current.primaryReason, remedy: current.remedy)
-                }
-                return try await runInner(
-                    admission: Self.securityEnvelope(current, decision: .allow, reason: "The person approved this call."),
-                    tool: tool,
-                    input: input,
-                    surface: surface,
-                    injectionApprovalID: mintApprovalID,
-                    personApprovedHost: namedConnect,
-                    // The person approved this exact call on its card: it runs as their decision, levers included.
-                    turn: resolved.approvalID.map { (id) -> Turn in
-                        turn.cardCause?.approved(by: id)
-                        return turn.with(\.personAct, PersonAct(by: .card(id: id), tool: tool, input: input, spent: [.call])) } ?? turn,
-                    work: work)
-            case .deny(let r):
-                await audit(Self.securityEnvelope(envelope, decision: .block, reason: r))
-                var refused: [String: JSONValue] = ["status": .string("refused"), "reason": .string(r), "gate_reason": .string(r),
-                    "checker": .string("approval_admission"), "effects": .string("none"),
-                    "remedy": Repair.terminal(instruction: "Respect the reported approval outcome. Inspect the retained card before another request; "
-                        + "do not repeat prior effects to answer an unresolved outcome.")]
-                refused["approvalId"] = resolved.approvalID.map(JSONValue.string)
-                if let status = resolved.notRunStatus { return status.reporting(.object(refused), tool: tool) }
-                return .object(refused)
-            case .requireApproval(let r):
-                await audit(Self.securityEnvelope(envelope, decision: .ask, reason: r))
-                throw AutonomyGateError.toolDenied(reason: r, remedy: Repair.why(owner: "approval for this call",
-                    tap: "NativeAgent chat on Mac, phone or Telegram", instruction: "Inspect the existing approval request before asking again."))
+            } catch let error as AutonomyGateError {
+                throw error
+            } catch {
+                throw AutonomyGateError.approvalFilingFailed(String(describing: error))
             }
         }
+        // Keep injection characters in the one-use in-memory approval vault; after process death, replay must refuse absent characters.
+        if !injectionSecrets.isEmpty {
+            await MacInjectionSecretVault.shared.store(
+                approvalID: approvalId,
+                secrets: injectionSecrets
+            )
+        }
+        await audit(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
+        var pending = await nonBlocking.pendingApprovalResult(
+            id: approvalId,
+            toolName: tool,
+            surface: surface,
+            reason: reason
+        )
+        if case .object(let fields) = pending, fields["not_run_status"] == nil {
+            pending = ToolNotRunStatus.approvalFiled.reporting(pending)
+        }
+        if let remedy = envelope.remedy, case .object(var fields) = pending {
+            fields["remedy"] = remedy
+            pending = .object(fields)
+        }
+        // The owner's ask, or a lever's, is now the person's card: what the agent reads says so, and what to do next.
+        if judged.ownerAsked || judged.theirs, case .object(var fields) = pending {
+            let card = ApprovalWords.call(tool: tool, input: .object(approvalPayloadInput)).act
+            fields["card"] = .string("The person's card \"\(card)\" (\(approvalId)) is up in Mac chat and on their phone, and they decide: "
+                + "their Approve runs this exact call as theirs, their Decline leaves everything as it is; do not call it again.")
+            pending = .object(fields)
+        }
+        if StandingBotContinuity.isHelperTurn(turn: turn) { turn.execution?.keepApproval(id: approvalId, pending) }
+        return pending
+    }
+
+    /// Files the card and waits on the gate's resolution; an approved call runs as the person's decision under the policy current now.
+    private func resolveApproval(_ judged: JudgedCall, reason: String, approvalPayloadInput: [String: JSONValue],
+                                 injectionSecrets: [String: String]) async throws -> JSONValue {
+        let tool = judged.tool, input = judged.input, surface = judged.surface, turn = judged.turn, work = judged.work,
+            envelope = judged.envelope, namedConnect = judged.namedConnect
+        let resolved = try await withFilingSession(turn: turn) { turn in
+            try await gate.resolveWithApprovalDetailed(
+                toolName: tool,
+                surface: surface,
+                requestPayload: .object(approvalPayloadInput),
+                timeoutSeconds: approvalTimeoutSeconds,
+                reason: reason
+            ,turn: turn)
+        }
+        if !injectionSecrets.isEmpty, let filedID = resolved.approvalID {
+            await MacInjectionSecretVault.shared.store(
+                approvalID: filedID,
+                secrets: injectionSecrets
+            )
+        }
+        switch resolved.decision {
+        case .allow:
+            // Verify the filer's injection approval against the real inbox
+            // record and exact body before minting; its claimed ID alone grants no authority.
+            var mintApprovalID = resolved.approvalID
+            if MacInjectionToolNames.isInjectionTool(tool) {
+                let verdict = try await injectionApprovalVerifier.verifyInjectionApproval(
+                    approvalID: resolved.approvalID ?? "",
+                    tool: tool,
+                    surface: surface,
+                    input: input,
+                    turn: turn
+                )
+                guard verdict == .verified else {
+                    let r = "injection_approval_unverified: \(verdict.rawValue) "
+                        + "(\(tool) resolved approval \(resolved.approvalID ?? "<none>"))"
+                    await audit(
+                        Self.securityEnvelope(envelope, decision: .block, reason: r)
+                    )
+                    throw AutonomyGateError.toolDenied(reason: r)
+                }
+                mintApprovalID = resolved.approvalID
+            }
+            // The person may answer after the saved policy changes. The membrane refreshes hard blocks before carrying the approved call.
+            let current = await securityCenter.evaluateTool(tool: tool,
+                input: MacInjectionArgRedaction.redacted(tool: tool, input: input, turn: turn),
+                origin: .currentTurn(turn: turn.with(\.verifiedSessionID, verifiedSessionId ?? turn.verifiedSessionID), surface: surface),
+                enforceAutonomy: false, turn: turn)
+            if current.decision == .block {
+                await audit(current)
+                throw AutonomyGateError.toolDenied(reason: current.primaryReason, remedy: current.remedy)
+            }
+            return try await runInner(
+                admission: Self.securityEnvelope(current, decision: .allow, reason: "The person approved this call."),
+                tool: tool,
+                input: input,
+                surface: surface,
+                injectionApprovalID: mintApprovalID,
+                personApprovedHost: namedConnect,
+                // The person approved this exact call on its card: it runs as their decision, levers included.
+                turn: resolved.approvalID.map { (id) -> Turn in
+                    turn.cardCause?.approved(by: id)
+                    return turn.with(\.personAct, PersonAct(by: .card(id: id), tool: tool, input: input, spent: [.call])) } ?? turn,
+                work: work)
+        case .deny(let r):
+            await audit(Self.securityEnvelope(envelope, decision: .block, reason: r))
+            var refused: [String: JSONValue] = ["status": .string("refused"), "reason": .string(r), "gate_reason": .string(r),
+                "checker": .string("approval_admission"), "effects": .string("none"),
+                "remedy": Repair.terminal(instruction: "Respect the reported approval outcome. Inspect the retained card before another request; "
+                    + "do not repeat prior effects to answer an unresolved outcome.")]
+            refused["approvalId"] = resolved.approvalID.map(JSONValue.string)
+            if let status = resolved.notRunStatus { return status.reporting(.object(refused), tool: tool) }
+            return .object(refused)
+        case .requireApproval(let r):
+            await audit(Self.securityEnvelope(envelope, decision: .ask, reason: r))
+            throw AutonomyGateError.toolDenied(reason: r, remedy: Repair.why(owner: "approval for this call",
+                tap: "NativeAgent chat on Mac, phone or Telegram", instruction: "Inspect the existing approval request before asking again."))
         }
     }
 

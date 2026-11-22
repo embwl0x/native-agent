@@ -60,7 +60,7 @@ unknown or modified download.
 3. Keep both devices signed into the intended Apple account with iCloud enabled.
 4. Launch NativeAgent on iPhone or iPad.
 5. Tap **Connect** once the pairing key has arrived. Match **This phone's code**
-   to the waiting device on the Mac and choose **Pair** there, then tap
+   (two groups of four) to the **Code** on the waiting device on the Mac and choose **Pair** there, then tap
    **Connect** on the phone again. Keep both apps open until the Mac confirms.
 6. If waiting, tap **Check for Mac** on the phone. Keep the Mac app open and
    allow the pairing details to arrive.
@@ -89,7 +89,7 @@ iPhone and iPad updates are delivered by the App Store or TestFlight.
 - Confirm iCloud is available on both devices.
 - Pull to refresh, or use **More → Settings → Check for Mac updates** when the
   iCloud connection is available. Otherwise follow **Connection setup help**.
-- For recovery, open **More → Settings → Connection → Diagnostics → Repair connection**.
+- For recovery, open **More → Settings → Connection → Repair connection**.
   This reconciles pending actions, removes the phone's local pairing key,
   clears connection delivery history, and opens pairing setup. It does not
   erase conversations or Mac data. Depending on connection state, **Pair with Mac**,

@@ -55,7 +55,7 @@ extension NativeAgentEngine {
                     tone: item.fact.state == .holds ? .done : item.fact.state == .waiting ? .attention : .failed)
             }
         }
-        rows.append(.init(id: "iphone.latest", title: "Latest from iCloud", detail: state.status, tone: .quiet))
+        rows.append(.init(id: "iphone.latest", title: "iCloud status", detail: state.status, tone: .quiet))
         if let standing = state.standing {
             rows.append(.init(id: "iphone.standing", title: standing.line, tone: standing.waiting > 0 ? .attention : nil))
         }
@@ -99,6 +99,9 @@ extension NativeAgentEngine {
                      tone: tone, rows: rows)
     }
 
+    /// The phone's short code as both screens show it: the first eight characters of its id, in two groups ("7e6d cae1").
+    private static func groupedCode(_ id: String) -> String { "\(id.prefix(4)) \(id.dropFirst(4).prefix(4))" }
+
     private func phoneDeviceRows(_ devices: [PairedPhoneStore.Phone], connected: Bool, message: String?) -> [PartFace.Row] {
         let phones = devices.filter { $0.status != .removed }
         var rows = phones.map { phone in
@@ -106,7 +109,7 @@ extension NativeAgentEngine {
             let pair = PartFace.Action(id: "pair", label: "Pair", role: .primary, doors: ["mac"], call: .init("pairing.pair", id))
             let canApprove = phone.status == .paired && !phone.confirmationOwed
             return PartFace.Row(id: "phone:" + phone.id, title: phone.status == .paired ? "iPhone or iPad" : "Phone waiting to pair",
-                detail: String(phone.id.prefix(8)), value: canApprove ? "Can approve" : phone.status == .paired ? "Waiting for it to confirm" : "Waiting",
+                detail: "Code: \(Self.groupedCode(phone.id))", value: canApprove ? "Can approve" : phone.status == .paired ? "Waiting for it to confirm" : "Waiting",
                 symbol: "iphone", tone: canApprove ? .live : .attention,
                 actions: (phone.status == .pending ? [pair] : [])
                     + [PartFace.Action(id: "remove", label: "Remove", role: .destructive, doors: ["mac"], call: .init("pairing.remove", id))])
@@ -170,9 +173,10 @@ extension NativeAgentEngine {
     @MainActor func pairingRotate() throws -> HostVerbEffect {
         _ = try pairingOwner()
         return { [self] in
-            await sync.regenerateSecret()
+            let published = await sync.regenerateSecret()
             if let error = sync.pairingError { throw PartCallError(code: "rotate_failed", message: error) }
-            return "A new pairing key was made; iCloud is delivering it to each paired iPhone and iPad."
+            return published ? "A new pairing key was made; iCloud is delivering it to each paired iPhone and iPad."
+                : "A new pairing key was made, but iCloud has not taken it yet; it is delivered at the next sync. Don't rotate again: the old key already stopped working."
         }
     }
 
@@ -180,7 +184,7 @@ extension NativeAgentEngine {
     /// approve (the effect).
     @MainActor func pairingPair(_ id: String) throws -> HostVerbEffect {
         let owner = try pairingOwner()
-        let phone = try NamedRow.find(id, kind: "phone", in: sync.phones, ids: { [$0.id, String($0.id.prefix(8))] }, shown: { String($0.id.prefix(8)) })
+        let phone = try NamedRow.find(id, kind: "phone", in: sync.phones, ids: { [$0.id, String($0.id.prefix(8)), Self.groupedCode($0.id)] }, shown: { Self.groupedCode($0.id) })
         guard phone.status != .removed else { throw NamedRow.stale("That phone was removed from the paired list.") }
         return {
             guard await owner.pairedPhones.setStatus(.paired, id: phone.id) else {

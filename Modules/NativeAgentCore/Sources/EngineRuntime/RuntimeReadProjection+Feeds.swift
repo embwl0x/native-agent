@@ -3,17 +3,14 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustPersistence
-import TrustCenter
 import Browser
-import NotificationInbox
-import ApprovalInbox
 import PersonaEngine
 import Desk
 import StandingBots
 import DreamREMCycle
 import Observation
 import SwarmRuns
-// Blueprint: | `RuntimeReadProjection+Feeds.swift` | Checked owner-backed guidance, history, approval counts and bounded evidence tails |
+// Blueprint: | `RuntimeReadProjection+Feeds.swift` | Checked guidance, run history, browser status and bounded evidence tails |
 
 extension RuntimeReadouts {
     @MainActor @Observable
@@ -63,35 +60,6 @@ extension RuntimeReadouts {
         return try RunLedger.records(from: data)
     }
 
-    public static func getNotificationStatus(dataRoot: URL) async throws -> NotificationRuntimeStatus {
-        // Read pending counts from the approval owner.
-        let approvalsPath = dataRoot
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let availability = Self.statusFeedAvailability([approvalsPath])
-        guard availability == .measured else {
-            return NotificationRuntimeStatus(
-                status: availability == .absent ? "unmeasured" : "unavailable",
-                pendingApprovals: nil,
-                createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
-            )
-        }
-        do {
-            let pendingApprovals = try SwiftNativeApprovalInbox(root: dataRoot)
-                .recordsUnlocked().filter { $0.status == "pending" }.count
-            return NotificationRuntimeStatus(
-                status: "ready", pendingApprovals: pendingApprovals,
-                createdAt: NativeTimestampFormat.sixDigitUTCOffset(Date())
-            )
-        } catch {
-            return NotificationRuntimeStatus(
-                status: "unavailable", pendingApprovals: nil,
-                createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
-            )
-        }
-    }
-
     public static func getBrowserStatus(dataRoot: URL) async throws -> BrowserRuntimeStatus {
         // Read without write-back; absent feeds stay unmeasured until owner recovery succeeds.
         let root = dataRoot
@@ -117,7 +85,7 @@ extension RuntimeReadouts {
         }
         do {
             let envelope = try await client.browserStatus()
-            return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
+            return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self)
         } catch {
             return BrowserRuntimeStatus(
                 status: "unavailable", sourcePath: nil,
@@ -143,7 +111,7 @@ extension RuntimeReadouts {
         return foundEvidence ? .measured : .absent
     }
 
-    public static func decodeJSONValue<T: Decodable>(_ value: JSONValue, as type: T.Type, context: String) throws -> T {
+    public static func decodeJSONValue<T: Decodable>(_ value: JSONValue, as type: T.Type) throws -> T {
         let data = try value.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(T.self, from: data)
     }

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import Experiences
 import NativeAgentCore
 import PersistenceCore
@@ -42,7 +43,7 @@ extension DreamBackgroundWork {
             let corrections = records.filter { record in
                 guard record.status == "active",
                       !MemoryStorage.metadataFlag(record.extras, MemoryStorage.pendingAdmissionKey),
-                      let date = ConversationHistory.parseTimestamp(.string(record.createdAt)),
+                      let date = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.createdAt),
                       date > since, date <= through else { return false }
                 let meta = record.extras?.objectValue ?? [:]
                 let replaces = meta[MemoryManagerLane.supersedesKey] != nil

@@ -9,7 +9,7 @@ import ProviderRouting
 import StandingBots
 import ToolRegistry
 import TurnTrace
-// Blueprint: | `SwiftToolDispatcher+StandingBots.swift` | `SwiftToolDispatcher` `standingBotApprovalReason` `standingBotsArgumentRefusal` `impl_standingBots` |
+// Blueprint: | `SwiftToolDispatcher+StandingBots.swift` | `SwiftToolDispatcher` `standingBotApprovalReason` `standingBotsArgumentRefusal` `impl_standingBots` (stages `standingBotAsk`, `standingBotList`, `standingBotShelfEntry`, `standingBotShelfRead`; `BotCallProgress` says whether a write began) |
 
 extension SwiftToolDispatcher {
     func standingBotApprovalReason(tool: String, input: [String: JSONValue]) -> String? {
@@ -31,7 +31,7 @@ extension SwiftToolDispatcher {
             let args = try botArguments(tool: tool, input: input, reportShim: false)
             let candidate = tool == "bot_create"
                 ? try await botCreateCandidate(args)
-                : try await botUpdateCandidate(args, definitions: definitions, reportShim: false)
+                : try await botUpdateCandidate(args, definitions: definitions)
             // Read persisted-shape rules from the store so cadence admission cannot drift.
             do {
                 try botCheck(candidate.bot, definitions: definitions, input: tool == "bot_create" ? args : try botObject(args["fields"], field: "fields"))
@@ -118,7 +118,7 @@ extension SwiftToolDispatcher {
     }
 
     /// Share the write-free update builder with pre-approval so preview admits the same edit.
-    private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore, reportShim: Bool = true) async throws -> (
+    private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore) async throws -> (
         bot: BotDefinition, notes: [String]) {
         _ = try botDetails(args)
         let fields = try botObject(args["fields"], field: "fields")
@@ -246,66 +246,12 @@ extension SwiftToolDispatcher {
         surface: String = "chat") async throws -> JSONValue {
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
         let shelf = ShelfStore(dataRoot: dataRoot)
-        var writeStarted = false
+        let progress = BotCallProgress()
         do {
             let args = try botArguments(tool: tool, input: input)
             switch tool {
             case "bot_ask":
-                let question = try botString(args["question"], field: "question")
-                let botID = try botReference(args, definitions: definitions, dataRoot: dataRoot, question: question)
-                guard allowsCanonicalBodyTools else { throw BotRunnerError.notPermitted }
-                guard let standingBotSession else { throw StandingBotsError.invalidValue("Bot chat is unavailable.") }
-                _ = try definitions.get(botID)
-                writeStarted = true
-                let outcome = try await BotRunner(dataRoot: dataRoot, session: standingBotSession).ask(
-                    bot: botID, question: question, parent: turn, scope: .init(ancestry: invocation.botAncestry))
-                // Approved replay needs an explicit status to distinguish failed asks from success; retain any partial answer.
-                let status = outcome.runtimeStatus
-                // Use the trace’s verdict vocabulary: an approval hold is neither failure nor progress.
-                let wire: String
-                switch status {
-                case .completed: wire = "completed"
-                case .failed: wire = "failed"
-                case .stopped: wire = "stopped"
-                case .interrupted: wire = "interrupted"
-                case .waitingForApproval: wire = "waiting_approval"
-                case .waitingOnPerson: wire = "waiting_on_you"
-                }
-                var result: [String: JSONValue] = [
-                    "answer": .string(outcome.actualReply), "status": .string(wire),
-                    // Retain the runner’s saved return address so retrieving output needs no repeated run or shelf search.
-                    "entry_id": .string(outcome.id.uuidString),
-                ]
-                if status != .completed, let detail = outcome.statusDetail ?? outcome.uncertainties.first {
-                    result["detail"] = .string(detail)
-                }
-                if let sessionID = outcome.sessionID, !sessionID.isEmpty {
-                    result["session_id"] = .string(sessionID)
-                }
-                if let approvalID = outcome.approvalID, !approvalID.isEmpty {
-                    result["approval_id"] = .string(approvalID)
-                }
-                // Bound artifact references and leave inline bytes in storage so large runs cannot flood the answer.
-                let artifacts = outcome.artifacts ?? []
-                if !artifacts.isEmpty {
-                    let shown = artifacts.prefix(8)
-                    result["artifacts"] = .array(shown.map { artifact in
-                        var row: [String: JSONValue] = [
-                            "name": .string(artifact.name), "path": .string(artifact.path),
-                        ]
-                        if let type = artifact.type { row["type"] = .string(type) }
-                        if let mime = artifact.mime { row["mime"] = .string(mime) }
-                        if let bytes = artifact.byteSize { row["byte_size"] = .int(Int64(bytes)) }
-                        return .object(row)
-                    })
-                    if artifacts.count > shown.count {
-                        result["artifacts_truncated"] = .int(Int64(artifacts.count - shown.count))
-                    }
-                }
-                result["shelf_entry"] = .object([
-                    "tool": .string("shelf_entry"), "id": .string(outcome.id.uuidString),
-                ])
-                return .object(result)
+                return try await standingBotAsk(turn: turn, invocation: invocation, args: args, definitions: definitions, progress: progress)
             case "bot_create":
                 let candidate = try await botCreateCandidate(args)
                 try botCheck(candidate.bot, definitions: definitions, input: args)
@@ -313,7 +259,7 @@ extension SwiftToolDispatcher {
                 if candidate.bot.modelPinned == true { currentModel = nil }
                 else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model }
                 let created: BotDefinition
-                writeStarted = true
+                progress.writeStarted = true
                 do { created = try definitions.create(candidate.bot) }
                 catch let error as ToolFailureError { throw botTimingError(error, input: args) }
                 return try botDefinitionJSON(created,
@@ -329,7 +275,7 @@ extension SwiftToolDispatcher {
                 if candidate.bot.modelPinned == true { currentModel = nil }
                 else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model }
                 let updated: BotDefinition
-                writeStarted = true
+                progress.writeStarted = true
                 do { updated = try definitions.update(candidate.bot) }
                 catch let error as ToolFailureError {
                     throw botFieldsError(botTimingError(error, input: try botObject(args["fields"], field: "fields")))
@@ -341,7 +287,7 @@ extension SwiftToolDispatcher {
             case "bot_delete":
                 let id = try botReference(args, definitions: definitions, dataRoot: dataRoot)
                 _ = try definitions.get(id)
-                writeStarted = true
+                progress.writeStarted = true
                 try definitions.delete(id)
                 return .object(["status": .string("deleted"), "detail": .string("The session and saved replies are kept.")])
             case "bot_pause":
@@ -355,31 +301,12 @@ extension SwiftToolDispatcher {
                 let currentModel: String?
                 if bot.modelPinned == true { currentModel = nil }
                 else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model }
-                writeStarted = true
+                progress.writeStarted = true
                 return try botDefinitionJSON(definitions.pause(bot.id, paused: paused),
                     details: details, operation: paused ? "paused" : "resumed",
                     currentModel: currentModel)
             case "bot_list":
-                let details = try botDetails(args)
-                let includeModels = try args["include_models"].map { try botDecode(Bool.self, $0, field: "include_models") } ?? false
-                let selected = try args["id"].map { _ in try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot)) }
-                let currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model
-                // Each helper's last run and last reply are distinct.
-                let byBot = try shelf.entriesByBot()
-                let iso = ISO8601DateFormatter()
-                var result: [String: JSONValue] = ["status": .string("ok"), "bots": .array(try (selected.map { [$0] } ?? definitions.list()).map { bot in
-                    guard case .object(var row) = try botDefinitionJSON(bot, details: details, currentModel: currentModel) else {
-                        return try botDefinitionJSON(bot, details: details, currentModel: currentModel)
-                    }
-                    let entries = byBot[bot.id] ?? []
-                    if let run = entries.filter({ $0.asked != true }).max(by: { $0.runAt < $1.runAt }) { row["lastRunAt"] = .string(iso.string(
-                        from: run.runAt)) }
-                    if let reply = entries.filter({ $0.asked == true }).max(by: { $0.runAt < $1.runAt }) { row["lastReplyAt"] = .string(iso
-                        .string(from: reply.runAt)) }
-                    return .object(row)
-                })]
-                if includeModels { result["model_choices"] = try await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelChoices() }
-                return .object(result)
+                return try await standingBotList(args: args, definitions: definitions, shelf: shelf)
             case "bot_run_once":
                 let bot = try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot))
                 let question = try args["question"].map { try botString($0, field: "question") }
@@ -388,7 +315,7 @@ extension SwiftToolDispatcher {
                                     "effects": .string("none"),
                                     "detail": .string("The bot run queue is not connected.")])
                 }
-                writeStarted = true
+                progress.writeStarted = true
                 let receipt = try standingBotRunEnqueue(bot.id, question, turn)
                 let request = receipt.runID.uuidString
                 return .object(["status": .string(receipt.accepted ? "queued" : "joined"), "id": .string(bot.id.uuidString),
@@ -397,152 +324,16 @@ extension SwiftToolDispatcher {
                         "id": .string(request), "bot_id": .string(bot.id.uuidString)])]),
                     "detail": .string("\(receipt.accepted ? "Queued" : "Joined") run \(request). Its result will be saved on the helper's shelf.")])
             case "shelf_entry":
-                let markRead = try args["mark_read"].map { try botDecode(Bool.self, $0, field: "mark_read") } ?? true
-                let selection = args.filter { !["save_to", "mark_read"].contains($0.key) }
-                let savedEntry: ShelfEntry
-                if let id = selection["id"] {
-                    // The read a run receipt hands back: until the run lands it is running, not missing.
-                    let entryID = try botID(id)
-                    let landed: ShelfEntry?
-                    do { landed = try shelf.entry(entryID) }
-                    catch StandingBotsError.notFound { landed = nil }
-                    if let owner = selection["bot_id"], landed == nil {
-                        let presence = try BotRunQueue(dataRoot: dataRoot).presence(bot: try botID(owner), requestID: entryID)
-                        switch presence {
-                        case .queued, .running:
-                            return .object(["status": .string("running"), "id": .string(entryID.uuidString),
-                                "detail": .string("Run \(entryID.uuidString) is \(presence == .queued ? "queued" : "still running") and not on the shelf yet; "
-                                    + "its result returns to the asking conversation when it lands. This does not start or repeat a run.")])
-                        case .absent:
-                            if let detail = try BotRunQueue(dataRoot: dataRoot).refusal(bot: botID(owner), requestID: entryID) {
-                                return .object(["status": .string("refused"), "effects": .string("none"),
-                                    "id": .string(entryID.uuidString), "terminal": .bool(true), "detail": .string(detail)])
-                            }
-                        }
-                    }
-                    guard let landed else { throw StandingBotsError.notFound(entryID) }
-                    savedEntry = landed
-                    if let expected = selection["bot_id"], savedEntry.botId != (try botID(expected)) {
-                        throw StandingBotsError.invalidValue(
-                            "This shelf entry belongs to a different bot. Use the exact message_id returned by the selected bot.")
-                    }
-                } else {
-                    let selected = try definitions.get(botReference(["id": selection["bot_id"] ?? .null], definitions: definitions, dataRoot: dataRoot))
-                    guard let latest = try shelf.entriesByBot()[selected.id]?.last else {
-                        return .object(["status": .string("empty"), "agent_name": .string(selected.name),
-                            "session_id": .string(selected.sessionID),
-                            "detail": .string("No settled reply yet. This does not start or repeat a run.")])
-                    }
-                    savedEntry = latest
-                }
-                let entry = savedEntry
-                // Encode before exporting: a projection error cannot discard committed files.
-                var result = try botJSON(entry)
-                var saved: JSONValue?
-                var needs: [JSONValue] = []
-                if let folder = args["save_to"] {
-                    _ = try botString(folder, field: "save_to")
-                    let exported = try await shelfSave(turn: turn, invocation: invocation, entry.artifacts ?? [], folder: botString(folder,
-                        field: "save_to"), surface: surface, writeStarted: &writeStarted)
-                    saved = exported.receipt
-                    needs = exported.needs
-                }
-                if case .object(var fields) = result {
-                    fields["status"] = saved?.objectValue?["status"] ?? .string("ok")
-                    fields["answer"] = .string(entry.actualReply)
-                    fields["run_status"] = .string(entry.runtimeStatus.rawValue)
-                    fields["status_detail"] = entry.statusDetail.map(JSONValue.string) ?? .null
-                    if let name = try? definitions.get(entry.botId).name {
-                        fields["agent_name"] = .string(name)
-                    }
-                    if let saved { fields["saved"] = saved }
-                    if !needs.isEmpty { fields[InlineInteractionWire.needsKey] = .array(needs) }
-                    result = .object(fields)
-                }
-                if markRead {
-                    writeStarted = true
-                    do {
-                        try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: [entry.id])
-                    } catch {
-                        guard case .object(var fields) = result else { throw error }
-                        fields["status"] = .string("partial")
-                        fields["acknowledgeError"] = .string(error.localizedDescription)
-                        return .object(fields)
-                    }
-                }
-                return result
+                return try await standingBotShelfEntry(turn: turn, invocation: invocation, args: args, definitions: definitions, shelf: shelf,
+                    surface: surface, progress: progress)
             case "shelf_read":
-                let bot = botSuppliedReferences(args).isEmpty
-                    ? nil : try botReference(args, definitions: definitions, dataRoot: dataRoot)
-                let since = try args["since"].map { value in
-                    let text = try botString(value, field: "since")
-                    let day = DateFormatter()
-                    day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"; day.isLenient = false
-                    guard let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) ?? (text.count == 10 ? day.date(from: text) : nil) else {
-                        throw StandingBotsError.invalidValue("since must be YYYY-MM-DD (local day) or an ISO 8601 time with time zone")
-                    }
-                    return date
-                }
-                let topic = try args["topic"].map { try botDecode(String.self, $0, field: "topic") }
-                let cursor = try args["cursor"].map { try botString($0, field: "cursor") }
-                let limit = try args["limit"].map { try botDecode(Int.self, $0, field: "limit") } ?? 20
-                let offset = try args["offset"].map { try botDecode(Int.self, $0, field: "offset") } ?? 0
-                guard offset >= 0, cursor == nil || args["offset"] == nil else {
-                    throw botArgumentError("Use a nonnegative offset or a cursor, not both.", field: "offset",
-                        accepted: "A nonnegative integer without cursor.")
-                }
-                let sort = try args["sort"].map { try botString($0, field: "sort") }
-                if let sort, !["newest_first", "oldest_first", "oldest_unread"].contains(sort) {
-                    throw botArgumentError("Unknown reply sort.", field: "sort", accepted: "newest_first, oldest_first or oldest_unread.")
-                }
-                let includeRead = try args["include_read"].flatMap { $0 == .null ? nil : $0 }
-                    .map { try botDecode(Bool.self, $0, field: "include_read") } ?? (sort != "oldest_unread")
-                guard sort != "oldest_unread" || !includeRead else {
-                    throw botArgumentError("oldest_unread selects unread replies; include_read true conflicts with it.", field: "include_read",
-                        accepted: "false or omitted with oldest_unread.")
-                }
-                let newestFirst = sort == nil || sort == "newest_first"
-                let markRead = try args["mark_read"].flatMap { $0 == .null ? nil : $0 }
-                    .map { try botDecode(Bool.self, $0, field: "mark_read") } ?? false
-                let page = try shelf.shelfRead(bot: bot, since: since, topic: topic, limit: limit,
-                                              cursor: cursor, readerId: includeRead ? nil : Self.standingBotReaderID,
-                                              newestFirst: newestFirst, offset: offset)
-                // Saved replies and names outlive their helper’s definition.
-                let agentNames = Dictionary(try definitions.list(includeDeleted: true).map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
-                var shortenedChange = false
-                let reconciled = try page.rows.map { try shelf.entry($0.id) }
-                let rows: [JSONValue] = try zip(page.rows, reconciled).map { row, entry in
-                    shortenedChange = shortenedChange || entry.changedSinceLastGood.count > 240
-                    return .object([
-                        "id": .string(row.id.uuidString), "bot": .string(row.botId.uuidString),
-                        "agent_name": agentNames[row.botId].map(JSONValue.string) ?? .null,
-                        "runAt": try botJSON(row.runAt), "headline": .string(row.headline),
-                        "status": .string(entry.runtimeStatus.rawValue),
-                        "session_id": .string(entry.sessionID ?? "bot-" + entry.botId.uuidString.lowercased()),
-                        "changedSinceLastGood": .string(String(entry.changedSinceLastGood.prefix(240))),
-                    ])
-                }
-                let result: JSONValue = .object([
-                    "status": .string("ok"),
-                    "view": .string(includeRead ? "saved_replies" : "unread_replies"),
-                    "order": .string(newestFirst ? "newest_first" : "oldest_first"),
-                    "offset": .int(Int64(offset)),
-                    "next_offset": page.nextOffset.map { .int(Int64(markRead && !includeRead ? offset : $0)) } ?? .null,
-                    "entries": .array(rows), "nextCursor": page.nextCursor.map(JSONValue.string) ?? .null,
-                    "truncated": .bool(page.truncated || shortenedChange),
-                ])
-                // Finish every read and response conversion before acknowledging. Lookahead rows, filtered rows and unread earlier gaps stay unread.
-                if markRead, !page.rows.isEmpty {
-                    writeStarted = true
-                    try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: page.rows.map(\.id))
-                }
-                return result
+                return try standingBotShelfRead(args: args, definitions: definitions, shelf: shelf, progress: progress)
             default:
                 throw StandingBotsError.invalidValue("unknown bots tool")
             }
         } catch let error as BotRunAdmissionError {
             return .object(["status": .string("unavailable"), "reason": .string(error.rawValue),
-                "effects": .string(writeStarted ? "unknown" : "none"), "detail": .string(error == .paused
+                "effects": .string(progress.writeStarted ? "unknown" : "none"), "detail": .string(error == .paused
                 ? "This bot is paused; resume it to run it."
                 : "This bot is already running; its result lands on the shelf when it finishes.")])
         } catch let error as BotChatContract.FollowingSettingsRefusal {
@@ -555,7 +346,7 @@ extension SwiftToolDispatcher {
                 fields["reason"] = .string(code)
                 fields["failure_code"] = .string(code)
                 fields["detail"] = .string(ChatToolOutcome.errorMessage(error))
-                if !writeStarted { fields["effects"] = .string("none") }
+                if !progress.writeStarted { fields["effects"] = .string("none") }
                 result = .object(fields)
             }
             return result
@@ -564,17 +355,251 @@ extension SwiftToolDispatcher {
             let refusal: Bool
             switch error {
             case .notFound, .alreadyExists, .staleDefinition, .invalidValue, .invalidCursor:
-                refusal = !writeStarted || ["bot_create", "bot_update", "bot_pause", "bot_delete", "bot_run_once"].contains(tool)
-            case .corruptStore: refusal = !writeStarted
+                refusal = !progress.writeStarted || ["bot_create", "bot_update", "bot_pause", "bot_delete", "bot_run_once"].contains(tool)
+            case .corruptStore: refusal = !progress.writeStarted
             }
             return .object(["status": .string("failed"), "reason": .string("bots_tool_failed"),
                             "effects": .string(refusal ? "none" : "unknown"),
                             "detail": .string(ChatToolOutcome.errorMessage(error))])
         } catch {
             return .object(["status": .string("failed"), "reason": .string("bots_tool_failed"),
-                            "effects": .string(writeStarted ? "unknown" : "none"),
+                            "effects": .string(progress.writeStarted ? "unknown" : "none"),
                             "detail": .string(ChatToolOutcome.errorMessage(error))])
         }
+    }
+
+    /// Asks a helper in its own chat and answers with its reply and status, its saved return address and bounded artifact references.
+    private func standingBotAsk(turn: Turn, invocation: ChatToolInvocation, args: [String: JSONValue], definitions: BotDefinitionStore,
+        progress: BotCallProgress) async throws -> JSONValue {
+        let question = try botString(args["question"], field: "question")
+        let botID = try botReference(args, definitions: definitions, dataRoot: dataRoot, question: question)
+        guard allowsCanonicalBodyTools else { throw BotRunnerError.notPermitted }
+        guard let standingBotSession else { throw StandingBotsError.invalidValue("Bot chat is unavailable.") }
+        _ = try definitions.get(botID)
+        progress.writeStarted = true
+        let outcome = try await BotRunner(dataRoot: dataRoot, session: standingBotSession).ask(
+            bot: botID, question: question, parent: turn, scope: .init(ancestry: invocation.botAncestry))
+        // Approved replay needs an explicit status to distinguish failed asks from success; retain any partial answer.
+        let status = outcome.runtimeStatus
+        // Use the trace’s verdict vocabulary: an approval hold is neither failure nor progress.
+        let wire: String
+        switch status {
+        case .completed: wire = "completed"
+        case .failed: wire = "failed"
+        case .stopped: wire = "stopped"
+        case .interrupted: wire = "interrupted"
+        case .waitingForApproval: wire = "waiting_approval"
+        case .waitingOnPerson: wire = "waiting_on_you"
+        }
+        var result: [String: JSONValue] = [
+            "answer": .string(outcome.actualReply), "status": .string(wire),
+            // Retain the runner’s saved return address so retrieving output needs no repeated run or shelf search.
+            "entry_id": .string(outcome.id.uuidString),
+        ]
+        if status != .completed, let detail = outcome.statusDetail ?? outcome.uncertainties.first {
+            result["detail"] = .string(detail)
+        }
+        if let sessionID = outcome.sessionID, !sessionID.isEmpty {
+            result["session_id"] = .string(sessionID)
+        }
+        if let approvalID = outcome.approvalID, !approvalID.isEmpty {
+            result["approval_id"] = .string(approvalID)
+        }
+        // Bound artifact references and leave inline bytes in storage so large runs cannot flood the answer.
+        let artifacts = outcome.artifacts ?? []
+        if !artifacts.isEmpty {
+            let shown = artifacts.prefix(8)
+            result["artifacts"] = .array(shown.map { artifact in
+                var row: [String: JSONValue] = [
+                    "name": .string(artifact.name), "path": .string(artifact.path),
+                ]
+                if let type = artifact.type { row["type"] = .string(type) }
+                if let mime = artifact.mime { row["mime"] = .string(mime) }
+                if let bytes = artifact.byteSize { row["byte_size"] = .int(Int64(bytes)) }
+                return .object(row)
+            })
+            if artifacts.count > shown.count {
+                result["artifacts_truncated"] = .int(Int64(artifacts.count - shown.count))
+            }
+        }
+        result["shelf_entry"] = .object([
+            "tool": .string("shelf_entry"), "id": .string(outcome.id.uuidString),
+        ])
+        return .object(result)
+    }
+
+    /// Every helper, or the one named, with its last run and last reply; the model choices when asked.
+    private func standingBotList(args: [String: JSONValue], definitions: BotDefinitionStore, shelf: ShelfStore) async throws -> JSONValue {
+        let details = try botDetails(args)
+        let includeModels = try args["include_models"].map { try botDecode(Bool.self, $0, field: "include_models") } ?? false
+        let selected = try args["id"].map { _ in try definitions.get(botReference(args, definitions: definitions, dataRoot: dataRoot)) }
+        let currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model
+        // Each helper's last run and last reply are distinct.
+        let byBot = try shelf.entriesByBot()
+        let iso = ISO8601DateFormatter()
+        var result: [String: JSONValue] = ["status": .string("ok"), "bots": .array(try (selected.map { [$0] } ?? definitions.list()).map { bot in
+            guard case .object(var row) = try botDefinitionJSON(bot, details: details, currentModel: currentModel) else {
+                return try botDefinitionJSON(bot, details: details, currentModel: currentModel)
+            }
+            let entries = byBot[bot.id] ?? []
+            if let run = entries.filter({ $0.asked != true }).max(by: { $0.runAt < $1.runAt }) { row["lastRunAt"] = .string(iso.string(
+                from: run.runAt)) }
+            if let reply = entries.filter({ $0.asked == true }).max(by: { $0.runAt < $1.runAt }) { row["lastReplyAt"] = .string(iso
+                .string(from: reply.runAt)) }
+            return .object(row)
+        })]
+        if includeModels { result["model_choices"] = try await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelChoices() }
+        return .object(result)
+    }
+
+    /// One shelf entry: a landed run, a run still on its way, or the helper's latest reply; its files are saved when asked and it is marked
+    /// read after the response is built.
+    private func standingBotShelfEntry(turn: Turn, invocation: ChatToolInvocation, args: [String: JSONValue], definitions: BotDefinitionStore,
+        shelf: ShelfStore, surface: String, progress: BotCallProgress) async throws -> JSONValue {
+        let markRead = try args["mark_read"].map { try botDecode(Bool.self, $0, field: "mark_read") } ?? true
+        let selection = args.filter { !["save_to", "mark_read"].contains($0.key) }
+        let savedEntry: ShelfEntry
+        if let id = selection["id"] {
+            // The read a run receipt hands back: until the run lands it is running, not missing.
+            let entryID = try botID(id)
+            let landed: ShelfEntry?
+            do { landed = try shelf.entry(entryID) }
+            catch StandingBotsError.notFound { landed = nil }
+            if let owner = selection["bot_id"], landed == nil {
+                let presence = try BotRunQueue(dataRoot: dataRoot).presence(bot: try botID(owner), requestID: entryID)
+                switch presence {
+                case .queued, .running:
+                    return .object(["status": .string("running"), "id": .string(entryID.uuidString),
+                        "detail": .string("Run \(entryID.uuidString) is \(presence == .queued ? "queued" : "still running") and not on the shelf yet; "
+                            + "its result returns to the asking conversation when it lands. This does not start or repeat a run.")])
+                case .absent:
+                    if let detail = try BotRunQueue(dataRoot: dataRoot).refusal(bot: botID(owner), requestID: entryID) {
+                        return .object(["status": .string("refused"), "effects": .string("none"),
+                            "id": .string(entryID.uuidString), "terminal": .bool(true), "detail": .string(detail)])
+                    }
+                }
+            }
+            guard let landed else { throw StandingBotsError.notFound(entryID) }
+            savedEntry = landed
+            if let expected = selection["bot_id"], savedEntry.botId != (try botID(expected)) {
+                throw StandingBotsError.invalidValue(
+                    "This shelf entry belongs to a different bot. Use the exact message_id returned by the selected bot.")
+            }
+        } else {
+            let selected = try definitions.get(botReference(["id": selection["bot_id"] ?? .null], definitions: definitions, dataRoot: dataRoot))
+            guard let latest = try shelf.entriesByBot()[selected.id]?.last else {
+                return .object(["status": .string("empty"), "agent_name": .string(selected.name),
+                    "session_id": .string(selected.sessionID),
+                    "detail": .string("No settled reply yet. This does not start or repeat a run.")])
+            }
+            savedEntry = latest
+        }
+        let entry = savedEntry
+        // Encode before exporting: a projection error cannot discard committed files.
+        var result = try botJSON(entry)
+        var saved: JSONValue?
+        var needs: [JSONValue] = []
+        if let folder = args["save_to"] {
+            _ = try botString(folder, field: "save_to")
+            let exported = try await shelfSave(turn: turn, invocation: invocation, entry.artifacts ?? [], folder: botString(folder,
+                        field: "save_to"), surface: surface, writeStarted: &progress.writeStarted)
+            saved = exported.receipt
+            needs = exported.needs
+        }
+        if case .object(var fields) = result {
+            fields["status"] = saved?.objectValue?["status"] ?? .string("ok")
+            fields["answer"] = .string(entry.actualReply)
+            fields["run_status"] = .string(entry.runtimeStatus.rawValue)
+            fields["status_detail"] = entry.statusDetail.map(JSONValue.string) ?? .null
+            if let name = try? definitions.get(entry.botId).name {
+                fields["agent_name"] = .string(name)
+            }
+            if let saved { fields["saved"] = saved }
+            if !needs.isEmpty { fields[InlineInteractionWire.needsKey] = .array(needs) }
+            result = .object(fields)
+        }
+        if markRead {
+            progress.writeStarted = true
+            do {
+                try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: [entry.id])
+            } catch {
+                guard case .object(var fields) = result else { throw error }
+                fields["status"] = .string("partial")
+                fields["acknowledgeError"] = .string(error.localizedDescription)
+                return .object(fields)
+            }
+        }
+        return result
+    }
+
+    /// A page of a helper's saved or unread replies; they are acknowledged only after the whole response is built.
+    private func standingBotShelfRead(args: [String: JSONValue], definitions: BotDefinitionStore, shelf: ShelfStore,
+        progress: BotCallProgress) throws -> JSONValue {
+        let bot = botSuppliedReferences(args).isEmpty
+            ? nil : try botReference(args, definitions: definitions, dataRoot: dataRoot)
+        let since = try args["since"].map { value in
+            let text = try botString(value, field: "since")
+            let day = DateFormatter()
+            day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"; day.isLenient = false
+            guard let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) ?? (text.count == 10 ? day.date(from: text) : nil) else {
+                throw StandingBotsError.invalidValue("since must be YYYY-MM-DD (local day) or an ISO 8601 time with time zone")
+            }
+            return date
+        }
+        let topic = try args["topic"].map { try botDecode(String.self, $0, field: "topic") }
+        let cursor = try args["cursor"].map { try botString($0, field: "cursor") }
+        let limit = try args["limit"].map { try botDecode(Int.self, $0, field: "limit") } ?? 20
+        let offset = try args["offset"].map { try botDecode(Int.self, $0, field: "offset") } ?? 0
+        guard offset >= 0, cursor == nil || args["offset"] == nil else {
+            throw botArgumentError("Use a nonnegative offset or a cursor, not both.", field: "offset",
+                accepted: "A nonnegative integer without cursor.")
+        }
+        let sort = try args["sort"].map { try botString($0, field: "sort") }
+        if let sort, !["newest_first", "oldest_first", "oldest_unread"].contains(sort) {
+            throw botArgumentError("Unknown reply sort.", field: "sort", accepted: "newest_first, oldest_first or oldest_unread.")
+        }
+        let includeRead = try args["include_read"].flatMap { $0 == .null ? nil : $0 }
+            .map { try botDecode(Bool.self, $0, field: "include_read") } ?? (sort != "oldest_unread")
+        guard sort != "oldest_unread" || !includeRead else {
+            throw botArgumentError("oldest_unread selects unread replies; include_read true conflicts with it.", field: "include_read",
+                accepted: "false or omitted with oldest_unread.")
+        }
+        let newestFirst = sort == nil || sort == "newest_first"
+        let markRead = try args["mark_read"].flatMap { $0 == .null ? nil : $0 }
+            .map { try botDecode(Bool.self, $0, field: "mark_read") } ?? false
+        let page = try shelf.shelfRead(bot: bot, since: since, topic: topic, limit: limit,
+                                      cursor: cursor, readerId: includeRead ? nil : Self.standingBotReaderID,
+                                      newestFirst: newestFirst, offset: offset)
+        // Saved replies and names outlive their helper’s definition.
+        let agentNames = Dictionary(try definitions.list(includeDeleted: true).map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+        var shortenedChange = false
+        let reconciled = try page.rows.map { try shelf.entry($0.id) }
+        let rows: [JSONValue] = try zip(page.rows, reconciled).map { row, entry in
+            shortenedChange = shortenedChange || entry.changedSinceLastGood.count > 240
+            return .object([
+                "id": .string(row.id.uuidString), "bot": .string(row.botId.uuidString),
+                "agent_name": agentNames[row.botId].map(JSONValue.string) ?? .null,
+                "runAt": try botJSON(row.runAt), "headline": .string(row.headline),
+                "status": .string(entry.runtimeStatus.rawValue),
+                "session_id": .string(entry.sessionID ?? "bot-" + entry.botId.uuidString.lowercased()),
+                "changedSinceLastGood": .string(String(entry.changedSinceLastGood.prefix(240))),
+            ])
+        }
+        let result: JSONValue = .object([
+            "status": .string("ok"),
+            "view": .string(includeRead ? "saved_replies" : "unread_replies"),
+            "order": .string(newestFirst ? "newest_first" : "oldest_first"),
+            "offset": .int(Int64(offset)),
+            "next_offset": page.nextOffset.map { .int(Int64(markRead && !includeRead ? offset : $0)) } ?? .null,
+            "entries": .array(rows), "nextCursor": page.nextCursor.map(JSONValue.string) ?? .null,
+            "truncated": .bool(page.truncated || shortenedChange),
+        ])
+        // Finish every read and response conversion before acknowledging. Lookahead rows, filtered rows and unread earlier gaps stay unread.
+        if markRead, !page.rows.isEmpty {
+            progress.writeStarted = true
+            try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: page.rows.map(\.id))
+        }
+        return result
     }
 }
 
@@ -844,4 +869,9 @@ private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, oper
     }
     fields.removeValue(forKey: "sources")
     return .object(fields)
+}
+
+/// Whether a bots call has begun a write, so a failure reports unknown effects rather than none.
+private final class BotCallProgress {
+    var writeStarted = false
 }

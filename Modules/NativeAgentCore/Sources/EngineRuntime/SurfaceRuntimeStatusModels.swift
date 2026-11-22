@@ -1,18 +1,7 @@
 import Foundation
 import Browser
 import PersistenceCore
-// Blueprint: | `SurfaceRuntimeStatusModels.swift` | Approval-backed pending status and browser recovery availability |
-
-public struct NotificationRuntimeStatus: Codable, Hashable {
-    public var status: String
-    public var pendingApprovals: Int?
-    public var createdAt: String?
-    public init(status: String, pendingApprovals: Int? = nil, createdAt: String? = nil) {
-        self.status = status
-        self.pendingApprovals = pendingApprovals
-        self.createdAt = createdAt
-    }
-}
+// Blueprint: | `SurfaceRuntimeStatusModels.swift` | Browser recovery availability and receipt types |
 
 public struct BrowserRuntimeStatus: Codable, Hashable, Sendable {
     public var status: String

@@ -29,7 +29,6 @@ public struct DeskPageSnapshot: Sendable {
     public var wanderHour: DeskWanderHourPresentation.State = .absent
     public var missedBots: [DeskMissedBot] = []
     public var timedBots: [DeskTimedBot] = []
-    public var botsUnavailable: String?
     public var rows: DeskPageContent.Content = (.quiet, [], nil)
 
     public static let empty = DeskPageSnapshot()
@@ -129,7 +128,7 @@ public enum DeskPageContent {
         let muteExpiry = loaded.nagConfigError == nil && loaded.nagConfig.mutedUntil != DeskNagConfig.indefiniteMuteSentinel
             ? loaded.nagConfig.mutedUntil.flatMap(DeskSequencing.parseDeferStamp) : nil
         let nowExpiry = items.filter { $0.status == .now }.compactMap {
-            DeskActivityState.movementDate($0.updatedAt)?.addingTimeInterval(DeskActivityState.movementWindow)
+            NativeTimestampFormat.parseOptionalISO8601FractionalFirst($0.updatedAt)?.addingTimeInterval(DeskActivityState.movementWindow)
         }.filter { $0 > presentationNow }.min()
         let deadline = [activity.nextRefreshAt, movementExpiry, deferExpiry, muteExpiry, nowExpiry, parkingExpiry]
             .compactMap { $0 }.filter { $0 > presentationNow }.min()

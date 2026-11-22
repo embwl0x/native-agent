@@ -42,19 +42,6 @@ struct TelegramAssistantDeliveryState: Sendable, Equatable, Codable {
 
 /// Private chats use native drafts; groups grow durable rich messages in place. Finals retain confirmed progress; an ambiguous chunk needs explicit resend.
 actor TelegramAssistantDeliveryDriver {
-    typealias SendRichDraft = @Sendable (
-        _ token: String,
-        _ destination: TelegramDestination,
-        _ draftId: Int,
-        _ richMessage: TelegramInputRichMessage
-    ) async throws -> Void
-    typealias SendRichFinal = @Sendable (
-        _ token: String,
-        _ destination: TelegramDestination,
-        _ richMessage: TelegramInputRichMessage
-    ) async throws -> Int
-    typealias EditRichMessage = @Sendable (String, TelegramDestination, Int, TelegramInputRichMessage) async throws -> Void
-    typealias DeleteMessage = @Sendable (String, Int, Int) async throws -> Void
     typealias FailureRecorder = @Sendable (_ redactedError: String) async -> Void
     typealias PersistDelivery = @Sendable (TelegramAssistantDeliveryState) async throws -> Void
 
@@ -62,10 +49,7 @@ actor TelegramAssistantDeliveryDriver {
     private let turn: Turn?
     private let destination: TelegramDestination
     private let draftId: Int
-    private let sendRichDraft: SendRichDraft
-    private let sendRichFinal: SendRichFinal
-    private let editRichMessage: EditRichMessage
-    private let deleteMessage: DeleteMessage
+    private let silent: Bool
     private let recordFailure: FailureRecorder
     private let persistDelivery: PersistDelivery
     private let sendGeneratedImage: @Sendable (String, Data) async throws -> Void
@@ -86,10 +70,7 @@ actor TelegramAssistantDeliveryDriver {
         draftKey: String,
         turn: Turn?,
         savedDelivery: TelegramAssistantDeliveryState? = nil,
-        sendRichDraft: @escaping SendRichDraft,
-        sendRichFinal: @escaping SendRichFinal,
-        editRichMessage: @escaping EditRichMessage,
-        deleteMessage: @escaping DeleteMessage,
+        silent: Bool,
         recordFailure: @escaping FailureRecorder = { _ in },
         persistDelivery: @escaping PersistDelivery,
         holdDelivery: @escaping @Sendable () async throws -> Bool,
@@ -101,14 +82,15 @@ actor TelegramAssistantDeliveryDriver {
         self.draftId = Self.draftId(for: draftKey)
         self.groupDelivery = savedDelivery
         self.draftsUnavailable = savedDelivery?.outcomeUnknown == true
-        self.sendRichDraft = sendRichDraft
-        self.sendRichFinal = sendRichFinal
-        self.editRichMessage = editRichMessage
-        self.deleteMessage = deleteMessage
+        self.silent = silent
         self.recordFailure = recordFailure
         self.persistDelivery = persistDelivery
         self.holdDelivery = holdDelivery
         self.sendGeneratedImage = sendGeneratedImage
+    }
+
+    private func sendRichFinal(_ destination: TelegramDestination, _ richMessage: TelegramInputRichMessage) async throws -> Int {
+        try await (silent ? TelegramPollLoop.defaultSendSilentRichMessage : TelegramPollLoop.defaultSendRichMessage)(token, destination, richMessage)
     }
 
     func onDelta(_ chunk: String) async {
@@ -137,7 +119,7 @@ actor TelegramAssistantDeliveryDriver {
                 if try await holdDelivery() { draftsUnavailable = true; break }
                 guard !terminal else { break }
                 if destination.chatId > 0 {
-                    try await sendRichDraft(token, destination, draftId, rich)
+                    try await TelegramPollLoop.defaultSendRichMessageDraft(token, destination, draftId, rich)
                     tracePreviewAccepted(characters: safeText.count)
                 } else {
                     try await publishGroupPreview(safeText, packets: packets)
@@ -171,7 +153,7 @@ actor TelegramAssistantDeliveryDriver {
             guard !terminal else { break }
             if let id = delivery.previewMessageIds?.dropFirst(index).first {
                 if renderedGroupPackets[id] == packet { continue }
-                try await editRichMessage(token, destination, id, packet)
+                try await TelegramPollLoop.defaultEditRichMessage(token, destination, id, packet)
                 renderedGroupPackets[id] = packet
                 tracePreviewAccepted(characters: text.count)
             } else {
@@ -186,7 +168,7 @@ actor TelegramAssistantDeliveryDriver {
                     break
                 }
                 let id: Int
-                do { id = try await sendRichFinal(token, destination, packet) }
+                do { id = try await sendRichFinal(destination, packet) }
                 catch {
                     if Self.isKnownNotDelivered(error) {
                         delivery.outcomeUnknown = false
@@ -281,10 +263,10 @@ actor TelegramAssistantDeliveryDriver {
                 let messageId: Int
                 do {
                     if let previewId = delivery.previewMessageIds?.dropFirst(index).first {
-                        try await editRichMessage(token, destination, previewId, message)
+                        try await TelegramPollLoop.defaultEditRichMessage(token, destination, previewId, message)
                         messageId = previewId
                     } else {
-                        messageId = try await sendRichFinal(token, destination, message)
+                        messageId = try await sendRichFinal(destination, message)
                     }
                 } catch {
                     try await recordRejection(error, delivery: &delivery)
@@ -297,11 +279,15 @@ actor TelegramAssistantDeliveryDriver {
                 delivery = confirmed
             }
             // Parsing an unfinished fence/table may have used more packets than the completed reply. Remove only those superseded preview packets.
-            for id in (delivery.previewMessageIds ?? []).dropFirst(messages.count) {
-                try await deleteMessage(token, destination.chatId, id)
+            while let ids = delivery.previewMessageIds, ids.count > messages.count, let id = ids.last {
+                try await TelegramPollLoop.defaultDeleteMessage(token, destination.chatId, id)
+                delivery.previewMessageIds = Array(ids.dropLast())
+                try await persistDelivery(delivery)
             }
-            delivery.previewMessageIds = nil
-            try await persistDelivery(delivery)
+            if delivery.previewMessageIds != nil {
+                delivery.previewMessageIds = nil
+                try await persistDelivery(delivery)
+            }
             return try await deliverGeneratedImages(&delivery, preparedImages: preparedImages)
         } catch {
             await reportFailure(step: "rich final", error: error)

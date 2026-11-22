@@ -346,7 +346,7 @@ extension CognitiveSubstrate {
                     precomputedCares: touchedCares)
                 let tag = emotionTag(for: event, affect: updated, semantic: semantic,
                                      precomputedAppraisal: weighted)
-                field.stampEmotionTag(key: outcome.key, tag: tag, isNewNode: true, configuration: configuration)
+                field.stampEmotionTag(key: outcome.key, tag: tag, isNewNode: true)
                 field.markLived(seq, key: outcome.key)
                 touchedMind = true
             }

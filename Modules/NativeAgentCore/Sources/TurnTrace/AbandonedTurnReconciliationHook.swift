@@ -121,18 +121,23 @@ public enum AbandonedTurnReconciliationHook {
             }
             let outcome = await AbandonedTurnReconciler().sweep(inFlightTurnIds: active)
             guard self.generation == generation, !Task.isCancelled else { return }
-            for checkpoint in outcome.resumable where !inFlight().contains(checkpoint.turnId) {
+            // One job per conversation, in the order its sends were accepted: a session runs one turn at a time, so its
+            // second saved send waits for the first instead of colliding with it. Conversations still recover side by side.
+            let bySession = Dictionary(grouping: outcome.resumable.filter { !inFlight().contains($0.turnId) }, by: \.sessionId)
+            for (_, checkpoints) in bySession {
                 let id = UUID()
                 resumeJobs[id] = Task {
                     defer { resumeJobs[id] = nil }
-                    guard self.generation == generation, !Task.isCancelled else { return }
-                    do {
-                        try await reconcile(dataRoot: PersistenceCore.defaultDataRoot(),
-                            sessionId: checkpoint.sessionId, turnId: checkpoint.turnId)
-                    } catch {
+                    for checkpoint in checkpoints.sorted(by: { $0.acceptedAt < $1.acceptedAt }) {
                         guard self.generation == generation, !Task.isCancelled else { return }
-                        OrganPulse.record("abandoned_turns", .failed,
-                            note: "Turn \(checkpoint.turnId) still owes recovery: \(error.localizedDescription)")
+                        do {
+                            try await reconcile(dataRoot: PersistenceCore.defaultDataRoot(),
+                                sessionId: checkpoint.sessionId, turnId: checkpoint.turnId)
+                        } catch {
+                            guard self.generation == generation, !Task.isCancelled else { return }
+                            OrganPulse.record("abandoned_turns", .failed,
+                                note: "Turn \(checkpoint.turnId) still owes recovery: \(error.localizedDescription)")
+                        }
                     }
                 }
             }

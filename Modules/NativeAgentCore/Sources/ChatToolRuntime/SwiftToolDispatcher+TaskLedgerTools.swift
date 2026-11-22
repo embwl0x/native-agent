@@ -26,7 +26,7 @@ extension SwiftToolDispatcher {
             )
         }
         // taskId is required for follow-up events; for `created` we mint one when omitted so the model can open a fresh task without a round-trip.
-        let providedTaskId = optionalString(input, "task_id")?
+        let providedTaskId = input["task_id"]?.nonblankString?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let taskId: String
         if let providedTaskId, !providedTaskId.isEmpty {
@@ -38,8 +38,8 @@ extension SwiftToolDispatcher {
                 reason: "task_ledger_post: task_id is required for kind '\(kind.rawValue)' (only 'created' may omit it)"
             )
         }
-        let title = optionalString(input, "title")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let note = optionalString(input, "note")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = input["title"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let note = input["note"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
         var refs: [String] = []
         if case .array(let arr)? = input["refs"] {
             refs = arr.compactMap { if case .string(let s) = $0 { return s.trimmingCharacters(in: .whitespacesAndNewlines) } else { return nil } }
@@ -58,7 +58,7 @@ extension SwiftToolDispatcher {
         do {
             let written: TaskLedgerEvent
             if kind == .deleted {
-                guard let expectedTitle = optionalString(input, "expected_title"), !expectedTitle.isEmpty else {
+                guard let expectedTitle = input["expected_title"]?.nonblankString, !expectedTitle.isEmpty else {
                     throw AutonomyGateError.toolDenied(reason: "task_ledger_post: deleted requires expected_title from task_ledger_list")
                 }
                 guard try await ledger.delete(event, expectedTitle: expectedTitle) else {
@@ -97,7 +97,7 @@ extension SwiftToolDispatcher {
         let offset = Self.jsonInt(input["offset"]) ?? 0
         // Input bounds above keep this sum at or below 1_000_100.
         let nextOffset = offset + limit
-        let id = optionalString(input, "task_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = input["task_id"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let id, !id.isEmpty {
             let (state, forTask) = try await ledger.taskDetail(id: id)

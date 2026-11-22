@@ -32,7 +32,8 @@ public enum SlackWebAPI {
         input: [String: JSONValue],
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         tokenOverride: String? = nil,
-        updatingMessageTs: String? = nil
+        updatingMessageTs: String? = nil,
+        beforeDispatch: (@Sendable () async throws -> Void)? = nil
     ) async throws -> JSONValue {
         let input = input.filter { $0.value != .null && $0.value != .string("") }
         let channel = input["channel"]?.scalarText?
@@ -81,6 +82,7 @@ public enum SlackWebAPI {
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         do { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
         catch { throw NotificationDeliveryFailure(.notDelivered(reason: error.localizedDescription), error.localizedDescription) }
+        try await beforeDispatch?()
         return envelope(
             action: updatingMessageTs == nil ? "slack.post_message" : "slack.update_message",
             response: try await response(for: request, dataRoot: dataRoot, session: replySession)
@@ -148,7 +150,9 @@ public enum SlackWebAPI {
         channel: String,
         threadTs: String?,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        tokenOverride: String? = nil
+        tokenOverride: String? = nil,
+        authorizeUpload: @Sendable () throws -> Void,
+        beforeShare: @escaping @Sendable () async throws -> Void
     ) async throws -> JSONValue {
         let channel = channel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !channel.isEmpty else {
@@ -159,6 +163,7 @@ public enum SlackWebAPI {
         let name = upload.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let filename = name.isEmpty ? URL(fileURLWithPath: upload.path).lastPathComponent : name
 
+        try authorizeUpload()
         let uploadURLResponse = try await callForm(
             method: "files.getUploadURLExternal",
             form: [
@@ -182,7 +187,8 @@ public enum SlackWebAPI {
             )
         }
 
-        // The bytes go only while the token is still granted (Disconnect may land mid-upload).
+        // The bytes go only while the destination and token are still authorized.
+        try authorizeUpload()
         _ = try resolvedToken(override: tokenOverride, dataRoot: dataRoot)
         var uploadReq = URLRequest(url: uploadURL)
         uploadReq.httpMethod = "POST"
@@ -218,7 +224,8 @@ public enum SlackWebAPI {
             method: "files.completeUploadExternal",
             form: completeForm,
             dataRoot: dataRoot,
-            tokenOverride: tokenOverride
+            tokenOverride: tokenOverride,
+            beforeDispatch: beforeShare
         )
         return envelope(
             action: "slack.upload_file",
@@ -230,7 +237,8 @@ public enum SlackWebAPI {
         method: String,
         form: [String: String],
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        tokenOverride: String? = nil
+        tokenOverride: String? = nil,
+        beforeDispatch: (@Sendable () async throws -> Void)? = nil
     ) async throws -> [String: Any] {
         let token = try resolvedToken(override: tokenOverride, dataRoot: dataRoot)
         var req = URLRequest(url: apiURL(method))
@@ -240,6 +248,7 @@ public enum SlackWebAPI {
         req.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
         req.httpBody = formURLEncoded(form)
 
+        try await beforeDispatch?()
         return try await response(for: req, dataRoot: dataRoot)
     }
 

@@ -9,7 +9,8 @@ struct TranscriptAttachmentRoot: View {
 
     var body: some View {
         if let environment = box.environment {
-            TranscriptAttachmentBody(box: box)
+            TranscriptAttachmentFrame(resized: { box.resized() }) { TranscriptAttachmentBody(box: box) }
+                .accessibilityElement(children: .contain)
                 // Every attachment has its own host, including in detached conversations.
                 .macFaceStyle()
                 .environment(\.self, environment)
@@ -20,13 +21,7 @@ struct TranscriptAttachmentRoot: View {
 private struct TranscriptAttachmentBody: View {
     let box: TranscriptAttachmentBox
 
-    var body: some View {
-        content.fixedSize(horizontal: false, vertical: true)
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in box.resized() }
-            .accessibilityElement(children: .contain)
-    }
-
-    @ViewBuilder private var content: some View {
+    @ViewBuilder var body: some View {
         switch box.model {
         case .resolved(let attachment, let ref, let role):
             TranscriptResolvedAttachmentView(attachment: attachment, reference: ref, role: role, retry: box.retry)

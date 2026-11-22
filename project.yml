@@ -322,7 +322,6 @@ targets:
         NativeAgentMacAppGroupID: $(NATIVEAGENT_MAC_APP_GROUP_ID)
         NativeAgentICloudContainerID: $(NATIVEAGENT_ICLOUD_CONTAINER_ID)
         NativeAgentMobileSourceKey: $(NATIVEAGENT_MOBILE_SOURCE_KEY)
-        NativeAgentBackgroundTaskIDPrefix: $(NATIVEAGENT_BACKGROUND_TASK_PREFIX)
         NativeAgentDeviceSync: $(NATIVEAGENT_DEVICE_SYNC)
         NativeAgentReleasePageURL: $(NATIVEAGENT_RELEASE_PAGE_URL)
         # Her body has no Dock icon from its first instant; the window's app owns the Dock and menus.

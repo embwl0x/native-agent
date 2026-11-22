@@ -45,7 +45,6 @@ public actor HelperSenseRunner: SenseWatchReporting {
     }
     private var onCall: [UUID: Call] = [:]
     private var admissions: [UUID: String] = [:]
-    private var viewAddresses: [String: (selection: String, address: String?)] = [:]
     private var shutDown = false
 
     public func liveWatches() async -> [SenseLiveWatch] {
@@ -117,20 +116,28 @@ public actor HelperSenseRunner: SenseWatchReporting {
             let callID = UUID()
             admissions[callID] = selection
             defer { admissions.removeValue(forKey: callID) }
-            if case .event(let event) = request {
+            try requireHelper()
+            let route: SenseNewsBoard.ViewRoute?
+            if case .event(let event, let revision) = request {
                 guard record.language != .native, record.status == .on, SensesHub.shared.registry != nil,
                       try JSONEncoder().encode(event).count <= 16_384 else {
                     throw SenseFailure(code: "view_unavailable", message: "Sense view is no longer enabled or its event is too large.")
                 }
-            }
-            try requireHelper()
+                route = await SenseNewsBoard.shared.viewRoute(selection: selection, revision: revision)
+                if revision != nil, route == nil {
+                    throw SenseFailure(code: "view_unavailable", message: "This sense view changed or closed before its event was admitted.")
+                }
+            } else { route = nil }
             let address: String? = switch request {
             case .read(let address): address
             case .act(_, let address, _): address
             case .watch: nil
-            case .event: viewAddresses[record.id].flatMap { $0.selection == selection ? $0.address : nil }
+            case .event: route?.address
             }
             let key = try await slotKey(record, selection: selection, source: source, address: address, operation: operation)
+            if let route, key != route.slot {
+                throw SenseFailure(code: "view_unavailable", message: "The source of this sense view has changed. Read it again before sending another event.")
+            }
             if record.status == .on, let registry = SensesHub.shared.registry {
                 guard let current = try await registry.sense(for: record.corner),
                       current.status == .on, try fileRegistry.helperSelection(current) == selection else {
@@ -154,7 +161,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
                     process = existing
                 } else {
                     generation = UUID()
-                    let created = try makeProcess(record, key: key, generation: generation, address: address)
+                    let created = try makeProcess(record, selection: selection, key: key, generation: generation, address: address)
                     live[key] = Live(record: record, selection: selection, source: source, process: created,
                         generation: generation, failures: live[key]?.failures ?? [], address: address, idleAt: Date().addingTimeInterval(limits.idleSeconds))
                     armIdle(key)
@@ -162,7 +169,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
                 }
             } else {
                 generation = UUID()
-                process = try makeProcess(record, key: key, generation: generation, address: address)
+                process = try makeProcess(record, selection: selection, key: key, generation: generation, address: address)
                 onCall[callID] = Call(selection: selection, passive: operation.passive, process: process)
             }
             let outcome: SenseOutcome
@@ -187,16 +194,12 @@ public actor HelperSenseRunner: SenseWatchReporting {
             } else {
                 var helperOperation = operation
                 if isEvent { helperOperation.perform = nil }
-                outcome = await process.request(request, source: source, operation: helperOperation)
+                let eventSource: any SenseSourceProvider = if let bound = route?.siteSource { bound } else { source }
+                outcome = await process.request(request, source: eventSource, operation: helperOperation, eventRoute: route)
             }
             if record.mode == .onCall {
                 await process.stop()
                 onCall.removeValue(forKey: callID)
-            }
-            if let view = await SenseNewsBoard.shared.interactiveView(), view.senseID == record.id, view.version == record.version {
-                if !shutDown, !Task.isCancelled, admissions[callID] == selection {
-                    viewAddresses[record.id] = (selection, address)
-                }
             }
             return await complete(outcome, record: record, request: request, selection: selection, turn: operation.turn)
         } catch {
@@ -250,12 +253,12 @@ public actor HelperSenseRunner: SenseWatchReporting {
     func retire(selection: String) async {
         defer { NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil) }
         admissions = admissions.filter { $0.value != selection }
-        viewAddresses = viewAddresses.filter { $0.value.selection != selection }
         // Close admission and detach all passive resources before the first await.
         let slots = live.filter { $0.value.selection == selection }
         for (key, slot) in slots { live.removeValue(forKey: key); slot.idle?.cancel() }
         let calls = onCall.filter { $0.value.selection == selection && $0.value.passive }
         for (id, _) in calls { onCall.removeValue(forKey: id) }
+        await SenseNewsBoard.shared.retirePresentation(selection: selection)
         // Accepted human reads/actions keep their call-owned helper until settlement.
         for slot in slots.values { await slot.process?.stop() }
         for call in calls.values { await call.process.stop() }
@@ -272,7 +275,6 @@ public actor HelperSenseRunner: SenseWatchReporting {
         defer { NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil) }
         shutDown = true
         admissions.removeAll()
-        viewAddresses.removeAll()
         for key in Array(live.keys) { await stopSlot(key) }
         let active = Array(onCall.values)
         onCall.removeAll()
@@ -292,7 +294,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
         return record.id + "\0" + selection + "\0" + identity
     }
 
-    private func makeProcess(_ record: SenseRecord, key: String, generation: UUID, address: String? = nil) throws -> SenseHelperProcess {
+    private func makeProcess(_ record: SenseRecord, selection: String, key: String, generation: UUID, address: String?) throws -> SenseHelperProcess {
         // Shutdown is terminal; this actor check and helper publication never suspend.
         try requireRunning()
         try requireHelper()
@@ -316,7 +318,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
             let notebook = record.status == .draft ? scratch.appendingPathComponent("state.json") : AbilityStore.notebookPath(dataRoot: dataRoot, id: record.id)
             return try SenseHelperProcess(record: record, dataRoot: dataRoot, script: script, notebook: notebook,
                 scratch: scratch, helper: helperURL, profile: profile(record, registry.root, scratch), limits: limits,
-                initialAddress: address, apps: apps,
+                selection: selection, slot: key, initialAddress: address, apps: apps,
                 onSourceChange: { [dataRoot] in
                     AbilityStore(dataRoot: dataRoot).signal("sense.source.changed", part: record.id,
                         ["slot": .string(key), "generation": .string(generation.uuidString)])
@@ -400,7 +402,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
                 slot = refreshed
             }
             let next = UUID()
-            let process = try makeProcess(slot.record, key: id, generation: next, address: slot.address)
+            let process = try makeProcess(slot.record, selection: slot.selection, key: id, generation: next, address: slot.address)
             slot.process = process; slot.generation = next
             live[id] = slot
             _ = await process.startWatching(source: slot.source)

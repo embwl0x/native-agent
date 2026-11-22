@@ -105,21 +105,8 @@ extension ContextSQLiteStore {
                 db,
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
             )
-            let healthy = try Self.countSources(health: .healthy, db: db)
             let degraded = try Self.countSources(health: .degraded, db: db)
-            let removed = try Self.countSources(health: .removed, db: db)
-            let atoms = try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM context_atom_versions WHERE valid_to_generation IS NULL"
-            ) ?? 0
-            return ContextStoreHealthSnapshot(
-                databaseURL: self.databaseURL,
-                activeGenerationID: activeGenerationID,
-                healthySources: healthy,
-                degradedSources: degraded,
-                removedSources: removed,
-                activeAtoms: atoms
-            )
+            return ContextStoreHealthSnapshot(activeGenerationID: activeGenerationID, degradedSources: degraded)
         }
     }
 

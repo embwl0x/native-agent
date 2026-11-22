@@ -48,9 +48,7 @@ public enum MemoryKindStamp {
     }
 
     public static func kindSource(of metadata: JSONValue?) -> String? {
-        guard case .object(let obj)? = metadata,
-              case .string(let s)? = obj["kind_source"], !s.isEmpty else { return nil }
-        return s
+        metadata?.objectValue?["kind_source"]?.nonemptyString
     }
 
     /// Existing kinds always win; preserve non-object metadata rather than destroying an unknown shape.

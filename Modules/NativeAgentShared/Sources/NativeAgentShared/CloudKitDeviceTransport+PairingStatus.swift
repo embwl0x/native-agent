@@ -160,7 +160,7 @@ extension CloudKitDeviceTransport {
 
     // MARK: status
 
-    private static func statusRecordName(role: NADeviceRole, key: String, pairingSecret: Data) -> String {
+    static func statusRecordName(role: NADeviceRole, key: String, pairingSecret: Data) -> String {
         let identity = HMAC<SHA256>.authenticationCode(for: Data("NativeAgent.status.identity.v1".utf8),
                                                      using: SymmetricKey(data: pairingSecret))
         return "status.\(role.rawValue)." + identity.map { String(format: "%02x", $0) }.joined() + ".\(key)"
@@ -168,6 +168,11 @@ extension CloudKitDeviceTransport {
 
     /// One status record belongs to the authenticated pairing.
     public func setStatus(key: String, value: String, pairingSecret: Data) async throws {
+        try await writeStatus(key: key, pairingSecret: pairingSecret) { value }
+    }
+
+    /// The value is made when the write reaches the wire, so the one write a burst coalesces into carries the burst's latest state.
+    func writeStatus(key: String, pairingSecret: Data, value: @escaping @Sendable () throws -> String) async throws {
         try refuseUnlessHoldingPairing()
         guard pairingSecret.count == 32 else { throw DeviceSyncError.notConfigured }
         let recordType = NADeviceSyncRecordType.status
@@ -179,7 +184,7 @@ extension CloudKitDeviceTransport {
                 try self.refuseUnlessHoldingPairing()
                 let ck = CKRecord(recordType: recordType, recordID: CKRecord.ID(recordName: recordName))
                 ck["key"] = key as CKRecordValue
-                ck["value"] = value as CKRecordValue
+                ck["value"] = try value() as CKRecordValue
                 ck["role"] = self.role.rawValue as CKRecordValue
                 ck["updatedAt"] = updatedAt as CKRecordValue
                 let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)

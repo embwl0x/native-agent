@@ -1,13 +1,9 @@
-// Blueprint: | `RecallLexicalNormalization.swift` | `characterEditDistance`, `RecallLexicalNormalization`: shared retrieval normalization |
+import NativeAgentShared
+// Blueprint: | `RecallLexicalNormalization.swift` | `characterEditDistance`, `RecallLexicalNormalization`, and Core forwarding to Shared's `fnv1a64` |
 
-/// Stable FNV-1a-64 over exact UTF-8; callers own seeds, normalization and formatting.
-public func fnv1a64(_ text: String, seed: UInt64 = 0xcbf2_9ce4_8422_2325) -> UInt64 {
-    var hash = seed
-    for byte in text.utf8 {
-        hash ^= UInt64(byte)
-        hash = hash &* 0x0000_0100_0000_01b3
-    }
-    return hash
+/// Forward Core's published hash function to the shared UTF-8 implementation.
+public func fnv1a64(_ text: String, seed: UInt64 = StableHash.fnv1a64OffsetBasis) -> UInt64 {
+    StableHash.fnv1a64(text, seed: seed)
 }
 
 /// Character insertion, deletion and substitution distance; callers own normalization.

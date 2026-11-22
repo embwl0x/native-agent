@@ -16,7 +16,7 @@ is what it declares, never which door made it.
   `noop: {tries, empty, lower, stands, silent}`, its class's no-op record by `Expectation`; `silent` is the stem's one draw at the
   rule-of-succession rate, so a replay reads the same. The seed ends the thought on CPU with `reply.end` when `noop.silent` is true.
 - `model`: final text and requested calls, each with `id` and `index`. Visible text streams directly; no chunk events. If readable, untainted words from the person wait before the proposal reaches the part, the stem keeps the prose and delivers an `observation` naming the unstarted calls instead. The part decides again; no turn-program edit is required.
-- `result`: one call's `{index,id,name,ok,effect}`; their own call's result has its `id` and no `index`. A round's last result may carry `practice: {route, hand, loop?: {call, count}}`, the familiarity nerve's signal for their next thought. Effect comes from explicit receipts, else `execution:executed`, including batch receipts/script ledgers: an ability's all-read ledger reports `read`; `part` names effectful ability/sense work, else strongest of irreversible/write/read; absent when nothing landed. The broker's per-call class, not declared ability permissions or its prose, decides whether a reached call reads.
+- `result`: one call's `{index,id,name,ok,effect}`; their own call's result has its `id` and no `index`. A round's last result may carry `practice: {route, hand, loop?: {call, count}, ability?: {id, description, worked?, failed?}}`, the familiarity nerve's signal for their next thought; `ability` names an active ability whose recorded route makes exactly those writes (worked, to use next time; or the step its newest run failed at, to repair). Each operation record keeps its newest run's outcome as `last`. Effect comes from explicit receipts, else `execution:executed`, including batch receipts/script ledgers: an ability's all-read ledger reports `read`; `part` names effectful ability/sense work, else strongest of irreversible/write/read; absent when nothing landed. The broker's per-call class, not declared ability permissions or its prose, decides whether a reached call reads.
 - `provider_failure`: provider, model, text, remedy, work, owed, tries and available repair calls.
 - `observation`; `resumed`, whose `effect` uses the same reading over saved receipts.
 
@@ -46,7 +46,8 @@ the agent's words before the call); the first requires `system:{stable,dynamic}`
 primitive `host.model.call` below.
 `app` either runs one model-requested call verbatim, by id or index, or, at any step, runs their own `call:{tool:"app",input:{…}}`, named `own_<event>_<position>_<input digest>`; each runs once through the turn's door and gates, and resume never reruns a started one. A step cannot call `app.*` itself (`effects_only`): steps replay.
 `notebook` is `{effect:"notebook", set:{…}}`: it merges `set` into the turn program's notebook (`attention/notebook.json`; a null value removes
-its key), the settings `weigh` reads ("hold the world until five"). An unchanged merge writes nothing, including an empty merge or removing an absent key.
+its key), the settings `weigh` reads ("hold the world until five"). An unchanged merge reads the notebook without creating a lock file,
+including an empty merge or removing an absent key. A changing merge rereads and writes under the notebook path's lock across turns.
 It runs once and a replay matches it by identity; one without an object `set`
 is malformed and invokes recovery.
 `reply.end` may come at any step, after their own words or none; in its step only
@@ -111,8 +112,14 @@ the seed adds its words. Swift retains settlement classifiers and identity stora
 
 A settled Desk wait returns as a `returned` happening (`EngineRuntime/EngineTurnContinuation.swift`): to the conversation that started the work
 with its recorded reply route, or to the mind stream for a helper's item. Its line names the item; beside it the thought is shown the checked
+record's remaining work, last twelve settled receipts and first 1,000 characters of the last reply, within the happening's display limit.
+Desk completes only once Attention confirms the committed return's full material and settles any repair for that post.
+An exact return that is still owed is offered to attention again on retry. Native verification, claims, CAS, scope and settlement remain authoritative.
 record's remaining work, last twelve settled receipts and first 1,000 characters of the last reply. Native verification, claims, CAS, scope and
 settlement remain authoritative.
+A parked call never enters the journal. A reply after the refusal keeps the
+continuation waiting for Desk readiness. A defer on the item or an ancestor
+arms the return wake when it expires.
 
 <a id="turn-recovery"></a>
 
@@ -138,7 +145,7 @@ If every available source fails, recovery ends plainly rather than retrying fore
 | **wake** | String array, default `[]` (called only). [Wake signals](#wake-signals) defines names, payloads and delivery. |
 | **face** | `{page?: string, action?: string, projection?: bool}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed door id, never beside `answers`. Unknown pages refuse at save. `projection:true` declares `face(input)`; its typed sections/rows are computed from frozen native sources outside view rendering and published through `LatestRead` (contract below). A projection part that defines no `run(input)` is a page, never a call (below). |
 | **answers** | Door verbs the part answers, by action id: `{description, class, args, irreversible?, screen?, summary?}` each, absent when none. `class` is `read`, `write`, `send` or `destructive`; `args` is the verb's JSON Schema (no argument named `verb`). The door registers each verb on `face.page` with that contract and judges it by its class, its Mac integration switch taken from the part's `app_read:`/`app_write:` reach; a verb a native declaration still holds stays native, and a verb two active parts answer is the first by id. `run(input)` receives `{verb, ...args}`; the part's input schema is derived from the verbs and takes no `params`. A `read` verb runs read-confined: read-only app events, read actions and read primitives only. A class other than the four refuses at admission. A verb a shipped seed answers keeps that seed's class and irreversibility as its floor: a revision may raise them, never lower them; and every revision's keep passes the one keep gate (the person's card below Full Mac, the agent's own keep under Full Mac). |
-| **state** | Abilities use `host.state.get()` → saved JSON (initially `null`) and `host.state.set(value)` → `null`. One durable notebook owner, shared with senses' keyed `state.get/set`, stores it by ability id at `senses/<id>/state.json` under key `part`; it survives helper restarts and app relaunch, and `ability.drop` deletes it with the ability. Values are limited to 16 KiB and the notebook to 64 KiB. Validation and preview use a scratch notebook. Resume replays journaled state results without repeating their operations, then reads and writes durable state normally. State calls do not renew stalled execution. `abilities/state.json` remains lifecycle/run accounting only; there is no authored header `state` key. |
+| **state** | Abilities use `host.state.get()` → saved JSON (initially `null`) and `host.state.set(value)` → `null`. One durable notebook owner, shared with senses' keyed `state.get/set`, stores it by ability id at `senses/<id>/state.json` under key `part`; it survives helper restarts and app relaunch, and `ability.drop` deletes it with the ability. Values are limited to 16 KiB and the notebook to 64 KiB. Preview uses a scratch notebook, and each validation fixture shares its own scratch notebook across decision passes. Resume verifies prior notebook reads against the current value or the run's last later set, as applicable, before replaying their answers. Journaled writes return their saved acknowledgement. After the answer, notebook operations run live. State calls do not renew stalled execution. `abilities/state.json` remains lifecycle/run accounting only; there is no authored header `state` key. |
 | **learned** | Optional arbitrary JSON, preserved verbatim; a declared value teaches nothing, and a declared `trial` is refused at save. The stem projects `learned.use`, `learned.versions`, `learned.trial` and `learned.trials` (below). The former door-prediction layer is [retired](#expansion-a-part-is-a-prediction). |
 
 `id` and integer `version` identify the part and version.
@@ -219,7 +226,7 @@ deeply frozen, with the version pinned before suspension. Replacement/off can en
 but never substitute another version. Returns are complete JSON up to 4 MiB;
 truncation fails. Swift uses `Parts.call(id:input:preview:within:as:)`, returning the same
 `PartCallResult<Value>` with a Codable, Sendable value. Native callers bind the
-originating gated `OwnedProgramInvocation.host`; they validate and commit the
+originating gated `Parts.Invocation.host`; they validate and commit the
 decision in their own transaction after the call returns. Optional
 `within: Parts.CallReach` narrows the selected version's actions and primitive
 capabilities, checked before any suspension or effect; it grants no authority.
@@ -363,10 +370,11 @@ for an owner query, `args.query`. The reader's frozen result enters the selected
 it does not fetch. A query demand's query and result share their request identity.
 
 `detail:{of:<section id>}` makes that section the selection list. Each selected row links
-`page:<page>/<item>`; the host holds the item's face while selected, under the `page/item`
-namespace. Native owners register one structured item reader; authored owners use the item's
+`page:<page>/<item>`. While selected, `PartFaces` holds the item's face under
+`page/item/request:<UUID>`, using the page and `FaceReadRequest.scope`.
+Native owners register one structured item reader. Authored owners use the item's
 declared read and pure projection. Item actions re-read their owner before comparing the drawn
-call, and use that item namespace for settlement. Item snapshots stay outside top-level
+call and settle in the same request scope. Item snapshots stay outside top-level
 `faces.json`. A missing or unreadable item supplies its own error; a pending read stays waiting
 with Cancel until its owner answers, closes or the demand is released. No clock supplies an outcome.
 The agent reads the same structured item through `app {page,item}`; `offset` reads a current
@@ -821,8 +829,11 @@ accounted before it is reduced when read) and terminal error/stop evidence. `at`
 refused attempt, not its accounting-write time; an older settlement cannot replace
 a newer `lastRun`.
 a newer `lastRun`. A successful computation updates its retained run like any other completed run.
-A failed notebook operation makes `notebook_changed` null even if its code
-catches the error: a durable write may have renamed the file before failing.
+A live notebook change counts toward `effects:occurred`. An unconfirmed
+durable notebook write makes `notebook_changed` null and `effects:unknown`,
+even if the code catches the error. The write may have renamed the file
+before failing. A resume retains the original journal's notebook effects,
+including uncertainty for older sets recorded without write evidence.
 Run call labels and input previews are redacted before accounting is saved;
 retained accounting text is redacted again when projected, including previews
 saved under an older content policy. Retained accounting bytes are not migrated.
@@ -982,7 +993,7 @@ claiming it, in either spelling.
 | `ability.validate` | A read: `effect:none`, `read_only:true`; a reached rehearsal reports `execution:rehearsed` and `effects:none`. Rehearses its waiting version with the shared helper and intercepted replies, on fixtures or one captured run with `input`. A version with tape fixtures replays its recorded calls instead (`candidateValidation` `replayed`). Proves no live behavior; never keeps. |
 | `ability.enable`, `ability.restore` | Keeps its waiting version, or turns it back on: theirs under Full Mac for their own work (sealed as kept when never rehearsed); otherwise, once rehearsed, the owner's card for this exact version (code, fixtures and dependency shapes), approvable on the Mac and the phone, or Keep on the Tools page. Code requires `version` equal to its full digest, captured with the displayed code when the card or row was staged and saved with it; self-improvement cards and approval replay carry that same saved digest. A caller without the exact review offers a read rather than executable approval. A version with tape fixtures is kept by no one until its tape replayed (`not_replayed`). Omitting `version` restores only disabled Markdown guidance with no candidate or code fingerprint, checked and written under the ability-store lock. |
 | `authored.<id>` | Its one run, with input by its params, under one signed admission re-verified on every run. `preview:true` runs its code with every write previewed and says where it would card or hand back. |
-| `ability.resume` | A stopped run_id and bounded answer; optional `id` binds it to that ability, with a mismatch claiming nothing. A rename claims the checkpoint; its bytes are read and verified once. Read/admission failures preserve the claimed evidence; pre-run refusals and busy admission release the original bytes. Completed or deliberately closed runs consume the checkpoint at settlement; cleanup failures stay in `settlement_failures` with cause and remedy. Rechecks selection, host revision and admission and replays prior reads. A woken run resumes with the `input.wake` it stopped on. `preview:true` only reads the checkpoint: it reports the question, input, wake and stopped call, without claiming the run, transferring holds or closing its queued step. |
+| `ability.resume` | A stopped run_id and bounded answer; optional `id` binds it to that ability, with a mismatch claiming nothing. A rename claims the checkpoint; its bytes are read and verified once. Busy admission or an admission receipt with `execution:not_run` restores the holds and original checkpoint and leaves its Desk step open. Invalid bytes stay claimed for inspection. Completed or deliberately closed runs consume the checkpoint at settlement; cleanup failures stay in `settlement_failures` with cause and remedy. Rechecks selection, host revision and admission and replays prior reads. A woken run resumes with the `input.wake` it stopped on. `preview:true` only reads the checkpoint: it reports the question, input, wake and stopped call, without claiming the run, transferring holds or closing its queued step. |
 | `ability.read` | Every stored kind, including turn and sense: kind, version, declarations, status, retained versions, `run_counts` (all_versions, current_version), evidence and code in pages (`offset`), or one `step`; ordinary abilities also expose waiting/last-clean and converted versions. |
 | `ability.disable`, `ability.drop` | Off with every version kept, as whoever did it (`disabledBy`): `theirs` for their turn or their ability (a trusted agent's turn included), `owner` only for their own surface (the Tools page), `peer` for an untrusted agent's; theirs they turns back on, the owner's is their to lift (`ability.enable` asks on their card); delete it, its versions, its run state and its `host.state` notebook (`pending:true` discards only the waiting version). A built-in skill's own version is the owner's to switch off or drop below Full Mac. |
 | `ability.list` | Every stored part, including turn and sense, in a bounded page (at most 40 rows and a 24 KB row budget), ordered by id. Rows carry kind, version, `run_counts` (all_versions from stored useCount, current_version from the selected version's count) and `last_run_at` from stored `lastUsedAt` (ISO timestamp, null when never run). `count` is the rows printed, `total` is the inventory; follow `next_call`/`next_offset` with `offset` when `has_more`. The Tools page reads this same projection and accepts `args.offset`; a named Tools item accepts a source offset, also reachable by `ability.read`. Full declarations and versions remain on `ability.read`. Unshadowed built-in guidance remains discoverable; unreadable bodies are named in `guidance_gaps` and refuse only their own read. A missing guidance directory is empty; an unreadable one fails with its read error. |
@@ -1143,9 +1154,9 @@ candidate, fixtures, dependency shapes and host revision. A keep or bundled
 seed seal is not rehearsal. An existing capture must match a requested input;
 an explicit new capture without an existing capture still runs. When rehearsal
 is needed, its fixtures and decision replays share one helper, started lazily
-at the first run and released at settlement; every run has a fresh journal,
-scratch notebook and JavaScript context. No save or proof completion waits on a
-timer.
+at the first run and released at settlement. Every pass has a fresh journal
+and JavaScript context. The scratch notebook is isolated per fixture and
+survives that fixture's decision passes. No save or proof completion waits on a timer.
 
 Current calls use `ability.*` and `authored.<id>`. Retired `skill.*`,
 `tool.*` and old public tool spellings are unknown calls; they do not execute
@@ -1160,14 +1171,28 @@ handling. Historical transcript labels remain recorded text.
 
 Desk writes serialize under the store's lock and retain their changed-state
 refusals. Conversations, turns, operations and ability inputs acquire no holds.
-Only a stopped part-run with a retained checkpoint reserves its journaled Desk
-items until resumed or released. Mutation and resume callers only check those
-reservations. Run refusals name the holder, since and end event, with a next call
+Only a stopped part-run with a retained checkpoint reserves the open Desk items
+identified by its journaled edit receipts. The receipt's stable handle
+names the same item across title changes. A matched `queue.add` reschedule or
+`desk.add` deferral counts as an edit. Reused items are reserved only when the
+call edits them. Reservations last until the run is resumed or released.
+Mutation and resume callers only check those reservations. Run refusals name
+the holder, since and end event, with a next call
 previewing that run's resume; session evidence is optional. The single locked
 editor drops non-run markers and reservations without an open item or checkpoint.
 Resume releases its run's markers while retaining the claimed checkpoint through
-execution. A refused or busy resume restores reservations without displacing
-another stopped run. No reservation uses a clock. A stopped run's
+execution. A refused resume that never starts restores reservations without
+displacing another stopped run and returns the same bytes to waiting, with the
+admission remedy intact. Invalid checkpoint bytes stay claimed. Dropping a resume
+step with a recorded run binding releases its reservations and keeps any ownerless
+claim as `.abandoned` evidence. A live claim settles through its resuming
+execution. A pre-execution admission refusal or busy helper returns the same
+bytes to waiting, restores eligible reservations without displacing another
+stopped run, and keeps the Desk step open. A replay refusal's `resume.held`
+lists the reservations actually restored. Invalid checkpoint bytes stay
+claimed. Dropping a resume step with a recorded run binding releases its
+reservations and keeps any ownerless claim as `.abandoned` evidence. A live claim settles through its resuming
+call. No reservation uses a clock. A stopped run's
 reservation or metadata failure retains the run result and identifies the failed
 settlement with a repair debt. Upgrade evidence remains on the result until its
 queue append succeeds. Resume reservation release, queue closure and restoration
@@ -1193,7 +1218,8 @@ function run(input) {
 ```
 
 `app.read`, `find`, `log`, `expect`, `expect_fail`, `decide` and `step` are built in. At most 50 dependencies. Define `function run(input)` or `async function run(input)`, use host/app calls and return JSON.
-A part that is not done returns `{again: <input>, ...what it has so far}`: the stem runs it again on that input through the same admission and gates (each run its own run on its record), until it answers without `again`, a run fails or is refused, Stop, a message arrives in the calling conversation, its runs' ledger reaches 4 MiB, or a run repeats the one before in input and answer; it goes on only inside a conversation turn in flight that the person can Stop. Its one call answers with the last answer and `runs`, its `effects`, `calls` and `changed` covering every run (a later run that cannot start, its input or admission refused, answers as that run's refusal beside what the runs before it did, which is never replayed); handed back early, `again` stays and `handed_back` says why. The combined effect summary preserves `unknown` before `partial` before `occurred`, so a later uncertain run cannot be hidden by an earlier confirmed effect. A call-ledger encoding failure ends carrying with `call_ledger_encoding_failed`, unknown effects and a reconciliation instruction; its completed run has already settled, and no next run starts. It never counts an unreadable ledger as zero bytes. Previews, rehearsal and resume never go on.
+A part that is not done returns `{again: <input>, ...what it has so far}`. The stem runs it again on that input through the same admission and gates, recording each run separately. It carries only inside a conversation turn in flight that the person can Stop. It finishes when it answers without `again`, a run fails or is refused, Stop, its runs' ledger reaches 4 MiB, or a run repeats the one before in input and answer. After a completed run returns `again`, a readable arrival waiting in the calling conversation also hands the ability back before its next run. Its one call answers with the last answer and `runs`, its `effects`, `calls` and `changed` covering every run (a later run that cannot start, its input or admission refused, answers as that run's refusal beside what the runs before it did, which is never replayed); handed back early, `again` stays and `handed_back` says why. The combined effect summary preserves `unknown` before `partial` before `occurred`, so a later uncertain run cannot be hidden by an earlier confirmed effect. A call-ledger encoding failure ends carrying with `call_ledger_encoding_failed`, unknown effects and a reconciliation instruction; its completed run has already settled, and no next run starts. It never counts an unreadable ledger as zero bytes. Previews, rehearsal and resume never go on.
+If the final run fails without effects after earlier invocations changed or may have changed state, the combined receipt points to reconciliation before continuing, including any earlier notebook write evidence.
 An intentional decline returns `status:"refused"`, a stable `reason`, plain `detail`, receipt-backed `effects` and `remedy`: the fix with an executable `next_call` or person-owned `tap`. A terminal remedy explains why no further call applies. A lawful refusal is an answer; a source fault owes repair (`AbilityStore.runOutcome`).
 Run accounting classifies a runner-marked JavaScript exception as `error` before
 reading its authored `reason`; a thrown `reason:"network"` or `reason:"cancelled"`
@@ -1370,16 +1396,20 @@ beside `args`; replay compares these outer operational choices exactly.
 Versions returned from a prior taped read remain exact and flow into later
 options. Old action tape rows with no recorded options cannot replay. In
 hand-written fixtures an omitted `options` means `{}`.
-A card never holds a running call: an app call that needs the person's card answers pending at once with its card and the run sees it (the person's Approve replays that call from the card); only the ability's own authored body, which runs nowhere but in its live run, waits on its card. Only `app.decide` hands back a bounded checkpoint. Resume returns landed-write receipts without repeating effects. Any prior primitive call (network, program, screen, hands, model, fetch, apps) prevents resume. A fresh-run call is offered only when the runner reports no effects; otherwise its reconciliation remedy stands. An aborted replay still accounts for every effect in the original journal. Changed code, admission, host revision or reads, or a dependency call that no longer fits, visibly refuse/close the saved run, preserving journal and held work. The same world stop at the same place in 2 of the last 3 runs leaves one MY QUEUE upgrade line.
+A card never holds a running call: an app call that needs the person's card answers pending at once with its card and the run sees it (the person's Approve replays that call from the card); only the ability's own authored body, which runs nowhere but in its live run, waits on its card. Only `app.decide` hands back a bounded checkpoint. Resume returns landed-write receipts without repeating effects. Any prior primitive call (network, program, screen, hands, model, fetch, apps) prevents resume. A fresh-run call is offered only when the runner reports no effects; otherwise its reconciliation remedy stands. An aborted replay still accounts for every effect in the original journal. A changed ability selection or host revision closes a mismatched checkpoint. A replay that finds changed reads or an incompatible dependency call closes with its journal and held work accounted for. Admission that refuses to start leaves the checkpoint waiting. The same world stop at the same place in 2 of the last 3 runs leaves one MY QUEUE upgrade line.
+A card never holds a running call: an app call that needs the person's card answers pending at once with its card and the run sees it (the person's Approve replays that call from the card); only the ability's own authored body, which runs nowhere but in its live run, waits on its card. Only `app.decide` hands back a bounded checkpoint. Resume returns landed-write receipts without repeating effects. Any prior primitive call (network, program, screen, hands, model, fetch, apps) prevents resume. A fresh-run call is offered only when the runner reports no effects; otherwise its reconciliation remedy stands. An aborted replay still accounts for every effect in the original journal. A read superseded by the run's own later write must have a matching post-write version in the original read's scope, or a verified notebook value for notebook reads. Returning before reaching the saved stop reports `diverged`. Admission refusals before execution restore the checkpoint and its eligible holds and keep its Desk step open. Changed code, host revision or stale reads can close the saved run. The same world stop at the same place in 2 of the last 3 runs leaves one MY QUEUE upgrade line.
 
 The checkpoint owner reports save, inventory, read, seal, claim and cleanup
 failures through the typed failure/remedy shape. A claim verifies one byte
 image and preserves it on failure; successful consumption and release are
 explicit settlement operations. A failed cleanup cannot turn a committed
 queue closure or run result into an unrecorded outcome.
-Queue closure discards only waiting checkpoints. A claimed
-checkpoint survives hold reads and cleanup until its claimant consumes
-or releases it; ending another hold grants no ownership of the claimed bytes.
+On checkpointing failure, `saved_run_id` identifies a confirmed write, such
+as when later retention or Desk hold bookkeeping fails.
+Checkpoint cleanup uses the run identity filed with the resume step, which
+survives archival. A drop removes waiting bytes and moves an ownerless claim
+to `.abandoned`. The resuming call owns a live claim through settlement.
+Older queue rows with only a prose run reference carry no cleanup authority.
 
 Origins ratchet across revisions and restores: an untrusted agent's
 or an unrecorded origin cannot become their own by saving it again. A

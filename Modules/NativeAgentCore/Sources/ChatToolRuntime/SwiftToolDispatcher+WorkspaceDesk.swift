@@ -1,5 +1,5 @@
 import Foundation
-import CryptoKit
+import NativeAgentShared
 import PersistenceCore
 import Desk
 // Blueprint: | `SwiftToolDispatcher+WorkspaceDesk.swift` | `SwiftToolDispatcher`, `workspaceDesk`; lossless canonical paging |
@@ -15,7 +15,7 @@ extension SwiftToolDispatcher {
         }
         if let selected = handle?.isEmpty == false ? matches.first : nil, input["detail_offset"] != nil {
             let text = DeskPage.renderRecord(selected, in: state, noteCap: selected.notes.count, peerName: peerName)
-            let version = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+            let version = SHA256Hex.of(Data(text.utf8))
             let start = offset("detail_offset")
             if start > 0, input["detail_version"] != .string(version) {
                 return .object(["status": .string("record_changed"), "handle": .string(selected.handle),
@@ -69,31 +69,40 @@ extension SwiftToolDispatcher {
         var result: [String: JSONValue] = [
             "status": .string(handle?.isEmpty == false && selected == nil ? "not_found" : "ok"),
             "source": .string("canonical_current_desk"), "last_change": .string(state.generatedTs),
-            "request": .object(base), "liveItemCount": .int(Int64(board.items.count)),
-            "topLevelItemCount": .int(Int64(board.topLevel.count)), "matched_count": .int(Int64(sorted.count)),
-            "count_scope": .string("""
-                liveItemCount and topLevelItemCount describe the board, including closed items; openIntentionCount counts open MY QUEUE intentions. \
-                total counts this list: board items and open MY QUEUE intentions, matching items, or the selected item's parts. Archives are separate.
-                """),
-            "openIntentionCount": .int(Int64(MyQueue.entries(state).filter { $0.item.project == MyQueue.project }.count)),
-            "board_counts": .string(state.boardCountSummary),
-            "offset": .int(Int64(rowOffset)), "limit": .int(Int64(pageSize)),
-            "total": .int(Int64(sorted.count)), "count": .int(Int64(shown.count)),
-            "has_more": .bool(rowOffset + pageSize < sorted.count),
-            "items": .array(shown.map {
-                deskReadItem($0, state: state, plan: plans.byHandle[$0.handle], peerName: peerName)
-            }),
+            "request": .object(handle?.isEmpty == false ? base.filter { ["handle", "updated_on", "sort"].contains($0.key) } : base),
             "meaning": .string("""
                 Current recorded Desk state. Notes and linked evidence are records, not fresh external verification or execution authority. \
                 Continuations reread the live store.
                 """),
         ]
-        if rowOffset + pageSize < sorted.count { result["next_read"] = next("offset", rowOffset + pageSize) }
+        // Board counts describe the board; a read of one item carries only that item (and its parts' page).
+        if handle?.isEmpty != false {
+            result["liveItemCount"] = .int(Int64(board.items.count))
+            result["topLevelItemCount"] = .int(Int64(board.topLevel.count))
+            result["openIntentionCount"] = .int(Int64(MyQueue.entries(state).filter { $0.item.project == MyQueue.project }.count))
+            result["board_counts"] = .string(state.boardCountSummary)
+            result["count_scope"] = .string("""
+                liveItemCount and topLevelItemCount describe the board, including closed items; openIntentionCount counts open MY QUEUE intentions. \
+                total counts this list: board items and open MY QUEUE intentions, or matching items. Archives are separate.
+                """)
+        }
+        if handle?.isEmpty != false || !sorted.isEmpty {
+            result["offset"] = .int(Int64(rowOffset))
+            result["limit"] = .int(Int64(pageSize))
+            result["total"] = .int(Int64(sorted.count))
+            if handle?.isEmpty != false { result["matched_count"] = .int(Int64(sorted.count)) }
+            result["count"] = .int(Int64(shown.count))
+            result["has_more"] = .bool(rowOffset + pageSize < sorted.count)
+            result["items"] = .array(shown.map {
+                deskReadItem($0, state: state, plan: plans.byHandle[$0.handle], peerName: peerName)
+            })
+            if rowOffset + pageSize < sorted.count { result["next_read"] = next("offset", rowOffset + pageSize) }
+        }
         if let handle, !handle.isEmpty, selected == nil {
             result["detail"] = .string("No Desk record is numbered or titled \(handle); app {page:\"desk\"} lists what is there.")
         }
         if let selected {
-            var record = workspaceDeskObject(deskReadItem(selected, state: state, plan: plans.byHandle[selected.handle], peerName: peerName))
+            var record = JSONValue.objectOrEmpty(deskReadItem(selected, state: state, plan: plans.byHandle[selected.handle], peerName: peerName))
             // Expose children, notes and references once so pagination cannot duplicate them.
             for key in ["children", "additional_children", "latest_recorded_notes", "additional_notes", "linked_evidence",
                 "additional_links"] { record.removeValue(forKey: key) }
@@ -128,7 +137,7 @@ extension SwiftToolDispatcher {
     }
 
     private static func deskReadItem(_ item: DeskItem, state: DeskState, plan: DeskSequencing.ItemPlan?, peerName: (String) -> String?) -> JSONValue {
-        var row = workspaceDeskObject(workContextDeskItem(item, state: state, plan: plan, peerName: peerName))
+        var row = JSONValue.objectOrEmpty(workContextDeskItem(item, state: state, plan: plan, peerName: peerName))
         row["reply_deliveries"] = .array(item.refs.compactMap {
             guard case .trace(let id, let kind) = $0.kind, kind == "reply_delivery" else { return nil }
             return .string(id)
@@ -136,9 +145,5 @@ extension SwiftToolDispatcher {
         if let entry = MyQueue.entry(item) { row["intention"] = MyQueue.readout(entry, in: state, plan: plan) }
         row["place"] = .string(item.project == MyQueue.project && item.step != nil ? "MY QUEUE" : "board")
         return .object(row)
-    }
-
-    private static func workspaceDeskObject(_ value: JSONValue) -> [String: JSONValue] {
-        guard case .object(let row) = value else { return [:] }; return row
     }
 }

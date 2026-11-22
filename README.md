@@ -25,10 +25,9 @@ Telegram, Slack and local agent bridges reach that same runtime.
 - **Advanced** — the full rail of pages: Chat, Today, Memories, Desk,
   Notifications, Helpers, Personality, Providers, Trust, Connectors,
   Capabilities, Diagnostics and Settings.
-- **Agent** — a read-only view of the agent's own desktop.
+- **Agent** — the agent's own home and rooms; a conversation opened there shows in Simple.
 
-A fresh install starts in Simple; an install with existing chats defaults to
-Advanced. The [User and Agent Guide](docs/USER_GUIDE.md) covers setup and the
+A view preference that was never set starts in Simple, whatever chats exist. The [User and Agent Guide](docs/USER_GUIDE.md) covers setup and the
 main pages.
 
 ## What exists today

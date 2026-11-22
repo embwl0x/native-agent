@@ -18,8 +18,8 @@ Event kind selects exactly one renderer before transport:
 
 The record-family choice reads the signed message's existing metadata, not an
 APNS outcome or a second routing flag. Both record families are pulled into the
-same signature verification and consumer boundary. The requested-result
-envelope, settlement timestamp, local rendering and deduplication stay unchanged.
+same signature verification and consumer boundary. The phone's signed reader
+renders and deduplicates requested results.
 Ordinary records acknowledge `icloud_bridge_record` receipt without posting a
 local notification, including when their CloudKit alert has not arrived.
 
@@ -54,19 +54,27 @@ token reads, provider rejections and unknown wake outcomes remain diagnostic
 ordinary notification fails at publication rather than claiming a Drive record
 will produce a CloudKit alert.
 
-Before transport, immutable title, subtitle (when the call gave one), body, userInfo and
-timestamp are retained in `notifications/publications/<eventId>.json` under a per-event
-lock (five-second acquisition limit). Retries send the retained publication itself, byte
-for byte (its title, subtitle, body, userInfo and timestamp); an incoming attempt must
-match its words, and a requested result its settlement time. CloudKit's alert names only
-title and body; the subtitle rides in the signed envelope's metadata and the phone's
-notification service extension draws it from the exact notified record. Retained bytes are preserved. Conflicting or
-unreadable publication state reports `notification_publication_unavailable`
-with its bytes preserved. Exact server replay proof re-signals the existing
-record rather than creating a second event, including when an already-published
-requested result occupies the notification record family. Re-signalling an
-ordinary record is an update and cannot trigger its creation-only alert again.
-Requested results keep their owner's `resultCreatedAt` timestamp.
+Before transport, the relay retains the title, optional subtitle, body, userInfo
+and current time in `notifications/publications/<eventId>.json` under a per-event
+lock. Contended acquisition is cancellable and has no fixed deadline. A retry
+must match the retained title, subtitle, body and userInfo. The relay sends the
+retained publication with its original timestamp.
+CloudKit's alert names only title and body. The subtitle rides in
+the signed envelope's metadata, and the phone's notification service extension
+draws it from the exact notified record. Conflicting or unreadable publication
+state leaves the retained bytes intact. `sendNotification` throws
+`NotificationDeliveryFailure` with unknown delivery and the localized error description.
+New publications carry the signing key's pairing fingerprint. The notification
+service and the signed local renderer retain the envelope for Reply. The phone
+app verifies its signature with the current pairing key and takes the conversation
+from the signed metadata. Previously retained events keep their original envelope
+shape for exact server replay.
+Exact server replay requires the existing record's type, direction and signed
+payload to match. A requested result already stored as `NANotification`
+returns `DeviceSyncError.conflict` on the current `NAChatMessage` route. An exact
+replay queues a write to the separate `chat.bell` status record naming the
+existing message. The ordinary notification's creation-only alert cannot fire
+again from that write.
 
 Foreground chat reply presentation remains conversation-scoped: `willPresent`
 suppresses the banner and sound for the visible conversation, retaining alerts

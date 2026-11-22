@@ -77,12 +77,6 @@ public enum TranscriptBuilder {
         return TranscriptDocument(blocks: blocks)
     }
 
-    /// Live blocks close unfinished Markdown; settlement restores the authored text with the same block identities.
-    public static func liveBlocks(messageID: String, role: String, text: String, lead: TranscriptBlock.Lead) -> [TranscriptBlock] {
-        TranscriptDocument.stamp(TranscriptDocument.replyPieces(TranscriptGrouping.readableText(text), ink: .primary, edge: true),
-                                 messageID: messageID, role: role, lead: lead)
-    }
-
     // MARK: Groups
 
     /// The cards a group draws, in order: a reply hosts the cards relocated from the run before it, a run keeps the cards of its rows that
@@ -118,7 +112,7 @@ public enum TranscriptBuilder {
     static func cardBlocks(_ slots: [TranscriptCardSlot]) -> [TranscriptBlock] {
         slots.flatMap { slot in
             slot.cardIDs.enumerated().map { index, cardID in
-                TranscriptBlock(id: "card-" + cardID, messageID: slot.rowID, role: "system", kind: .attachment(.card(rowID: slot.rowID, cardID: cardID)),
+                TranscriptBlock(id: TranscriptBlockID.card(cardID), messageID: slot.rowID, role: "system", kind: .attachment(.card(rowID: slot.rowID, cardID: cardID)),
                                 source: "", lead: index == 0 ? .message : .paragraph, foldGroup: nil)
             }
         }
@@ -139,25 +133,25 @@ public enum TranscriptBuilder {
         var out: [TranscriptBlock] = []
         var images: [Int] = [], voices: [Int] = [], files: [Int] = []
         for (index, attachment) in (row.metadata?.attachments ?? []).enumerated() {
-            switch attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "audio": voices.append(index)
-            case "image": images.append(index)
-            default: files.append(index)
+            switch TranscriptAttachmentKind(type: attachment.type) {
+            case .voice: voices.append(index)
+            case .image: images.append(index)
+            case .file: files.append(index)
             }
         }
-        func attach(_ name: String, _ index: Int, _ ref: TranscriptAttachmentRef) {
-            out.append(TranscriptBlock(id: "\(id)@\(name)-\(index)", messageID: id, role: role, kind: .attachment(ref), source: "",
+        func attach(_ kind: TranscriptAttachmentKind, _ index: Int, _ ref: TranscriptAttachmentRef) {
+            out.append(TranscriptBlock(id: kind.blockID(messageID: id, index: index), messageID: id, role: role, kind: .attachment(ref), source: "",
                                        lead: out.isEmpty ? .message : .paragraph, foldGroup: nil))
         }
-        for index in images { attach("image", index, .image(messageID: id, index: index)) }
-        for index in voices { attach("voice", index, .voice(messageID: id, index: index)) }
-        for index in files { attach("file", index, .file(messageID: id, index: index)) }
+        for index in images { attach(.image, index, .image(messageID: id, index: index)) }
+        for index in voices { attach(.voice, index, .voice(messageID: id, index: index)) }
+        for index in files { attach(.file, index, .file(messageID: id, index: index)) }
 
         let lead: TranscriptBlock.Lead = out.isEmpty ? .message : .paragraph
         let readable = TranscriptGrouping.readableText(text)
         let hasWords = readable.contains { !$0.isWhitespace }
         if let live, live.rowID == id, !hasWords, prepared?.isEmpty != false {
-            out.append(TranscriptBlock(id: id + "#0", messageID: id, role: role,
+            out.append(TranscriptBlock(id: TranscriptBlockID.words(id, 0), messageID: id, role: role,
                                        kind: .reply(runs: [TranscriptRun(text: TranscriptDocument.lineBreaks(live.waiting))], ink: .quiet),
                                        source: "", lead: lead, foldGroup: nil))
             return out + cardBlocks(slots)
@@ -207,7 +201,7 @@ public enum TranscriptBuilder {
                                           source: line, lead: folds ? .detail : .message, foldGroup: folds ? group.id : nil))
         }
         for (row, face) in rows where face.asks == true {
-            blocks.append(TranscriptBlock(id: "approval-" + row.id, messageID: row.id, role: "system", kind: .attachment(.approval(rowID: row.id)),
+            blocks.append(TranscriptBlock(id: TranscriptBlockID.approval(row.id), messageID: row.id, role: "system", kind: .attachment(.approval(rowID: row.id)),
                                           source: "", lead: .message, foldGroup: nil))
         }
         return (blocks + cardBlocks(slots), wordKeys, foldRows.map(\.row))

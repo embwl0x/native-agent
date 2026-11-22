@@ -80,14 +80,32 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var detail: String? {
         get {
             // An approved action still running says so, not an empty outcome.
-            if executedAction == nil, let runningSince { return "Running since \(runningSince); its outcome lands here when it settles." }
+            if executedAction == nil, let running = runningWords { return running }
             return executedAction == nil ? executionDetail : decisionExperience.face?.words
         }
         set { executionDetail = newValue }
     }
 
+    /// An approved action still running, in the person's clock: "Running since 2:14 PM. The result shows here when it finishes."
+    var runningWords: String? {
+        guard let runningSince else { return nil }
+        let at = NativeTimestampFormat.parseISO8601(runningSince)
+            .map { $0.formatted(date: .omitted, time: .shortened) } ?? runningSince
+        return "Running since \(at). The result shows here when it finishes."
+    }
+
     public var executionResultClass: ChatToolOutcome.ExactResultClass {
         guard let executedAction else { return .unknown }
+        // Historical Canon receipts recorded a domain operation without a status.
+        if let fields = executedAction.objectValue, fields["status"] == nil, fields["rowWritten"] == .bool(false) {
+            switch fields["op"]?.stringValue {
+            case "studio_canon_already_applied": return .succeeded
+            case "studio_canon_refused": return .refused
+            case "studio_canon_needs_agent_turn": return .unknown
+            case "studio_canon_payload_unavailable": return .failed
+            default: break
+            }
+        }
         guard case .object(let execution) = executedAction,
               execution["op"] == .string("chat_tool_approval_replay") else {
             let reply = ToolResult(executedAction)
@@ -116,7 +134,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
                choices: payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? []
                    : [.init(id: "approve", label: peerCard ? "Just this" : "Approve", role: .primary)]
                      + (peerCard ? [.init(id: "approve_task", label: "For this task")] : [])
-                     + [.init(id: "reject", label: "Reject", role: .destructive)],
+                     + [.init(id: "reject", label: "Decline", role: .destructive)],
                evidence: [.init(source: Matter.approvals, id: id)])
     }
 
@@ -187,13 +205,16 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
             words = [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
                 .compactMap { $0 }.joined(separator: " ")
         } else {
-            words = executionDetail ?? (decision == nil ? payloadPreview : decision == "approved" ? "" : "Nothing ran.")
+            words = executionDetail ?? (decision == nil ? payloadPreview
+                : decision == "approved" ? runningWords ?? "The result shows here when it finishes." : "Nothing ran.")
         }
         // A saved decision is not proof of a successful effect. Lead its receipt with the execution owner's verdict.
         let outcomeLead: String?
         switch decision {
         case "denied": outcomeLead = "Declined"
         case "canceled": outcomeLead = decidedByPersonsWord ? "Decided by word" : "Not now"
+        // Approved and not yet settled reads as running, never as an unknown outcome.
+        case "approved" where executedAction == nil: outcomeLead = runningSince == nil ? "Approved" : "Running"
         case "approved":
             switch executionResultClass {
             case .succeeded: outcomeLead = "Done"
@@ -499,8 +520,8 @@ public enum ApprovalResolutionProvenance: Sendable, Equatable {
     }
 
     public var messageAttribution: String? {
-        guard case .personMessage(let sessionID, let messageID, let door) = self else { return nil }
-        return "Decided by the agent on your message \(messageID) in conversation \(sessionID), through \(door.messageDoorName)"
+        guard case .personMessage(_, _, let door) = self else { return nil }
+        return "Decided by the agent from your message, through \(door.messageDoorName)."
     }
 
     var isRemote: Bool {

@@ -128,6 +128,7 @@ public typealias SlackBotEventIntake = @Sendable (_ channelId: String, _ text: S
 
 typealias SlackProgressChat = @Sendable (
     _ message: SlackInboundMessage,
+    _ attachmentNotice: String?,
     _ sessionId: String,
     _ handler: SlackHandler
 ) async throws -> SlackSocketModeReply

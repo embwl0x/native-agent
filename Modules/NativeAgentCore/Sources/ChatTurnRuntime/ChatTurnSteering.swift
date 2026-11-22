@@ -380,7 +380,13 @@ public actor ChatTurnSteering {
 
     /// Shown words say who sent them and through which door, since any door's arrival joins the agent's turn.
     nonisolated static func deliveryText(_ text: String, turn: Turn) -> String {
-        let who = turn.origin?.authored == .agent ? turn.origin?.agent ?? "An agent" : "The person"
+        let who: String
+        switch turn.originPrincipal {
+        case "person": who = "The person"
+        case "self": who = "You"
+        case "agent:unknown": who = "An agent"
+        default: who = turn.origin?.agent ?? turn.envelope?.agent ?? "An agent"
+        }
         let door = turn.arrivalSurface(authorizing: turn.envelope?.surface ?? "chat")
         return "[\(who) sent this just now from \(door), while you were working:]\n" + text
     }

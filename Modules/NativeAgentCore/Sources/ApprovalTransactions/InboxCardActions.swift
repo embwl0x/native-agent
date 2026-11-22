@@ -18,7 +18,6 @@ public protocol InboxCardActionEffects: Sendable {
     func cleanUpDiskHygiene(dataRoot: URL) async throws -> String
     func chatClient(dataRoot: URL) -> SwiftNativeChatOrchestrationClient
     @MainActor func openApprovals() async throws
-    @MainActor func openDesk() async throws
     @MainActor func openChatDraft(_ draft: String) async throws
     @MainActor func openSpokenChat(_ sessionID: String) async throws
 }

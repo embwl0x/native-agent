@@ -7,7 +7,7 @@ import BackgroundLoops
 extension SlackSocketModeLoop {
     func recordReceipt(kind _: String, inbound: SlackInboundMessage, reply _: String) async {
         let statePatch: [String: JSONValue] = [
-            "lastReplyAt": .string(Self.nowString()),
+            "lastReplyAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             "lastReplyEventId": .string(inbound.eventId),
             "lastReplyChannelId": .string(inbound.channelId),
             "lastError": .null,
@@ -18,7 +18,7 @@ extension SlackSocketModeLoop {
 
     func recordEnvelope(envelope: [String: JSONValue], envelopeId: String?) async {
         var patch: [String: JSONValue] = [
-            "lastEnvelopeAt": .string(Self.nowString()),
+            "lastEnvelopeAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             "lastEnvelopeType": .string(envelope["type"]?.stringValue ?? "unknown"),
         ]
         if let envelopeId, !envelopeId.isEmpty {
@@ -47,7 +47,7 @@ extension SlackSocketModeLoop {
         reason: String, envelopeType: String, eventType: String?, channelType: String?, channel: String?
     )) async {
         var statePatch: [String: JSONValue] = [
-            "lastIgnoredAt": .string(Self.nowString()),
+            "lastIgnoredAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             "lastIgnoredReason": .string(detail.reason),
             "lastIgnoredEnvelopeType": .string(detail.envelopeType),
         ]
@@ -61,7 +61,7 @@ extension SlackSocketModeLoop {
         let safeError = Self.preview(String(describing: error), limit: 1_024)
         var row: [String: JSONValue] = [
             "id": .string(UUID().uuidString),
-            "at": .string(Self.nowString()),
+            "at": .string(NativeTimestampFormat.fractionalZulu(Date())),
             "context": .string(context),
             "errorClass": .string(Self.errorClass(for: error)),
             "error": .string(safeError),
@@ -80,7 +80,7 @@ extension SlackSocketModeLoop {
         }
         var statePatch: [String: JSONValue] = [
             "lastError": .string("\(context): \(safeError)"),
-            "lastErrorAt": .string(Self.nowString()),
+            "lastErrorAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
         ]
         do {
             try await appendJSONLCapped(
@@ -114,10 +114,6 @@ extension SlackSocketModeLoop {
         let trimmed = redact(text).trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > limit else { return trimmed }
         return String(trimmed.prefix(limit)) + "..."
-    }
-
-    static func nowString(_ date: Date = Date()) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
     }
 
     private static let authenticatedURL = try! NSRegularExpression(

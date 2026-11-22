@@ -60,8 +60,6 @@ struct BodyInboxCardActionEffects: InboxCardActionEffects {
 
     @MainActor func openApprovals() async throws { try await present(.navigate(.init(
         destination: .init(page: "inbox", item: nil, session: nil, message: nil), policy: .foreground))) }
-    @MainActor func openDesk() async throws { try await present(.navigate(.init(
-        destination: .init(page: "desk", item: nil, session: nil, message: nil), policy: .foreground))) }
     @MainActor func openChatDraft(_ draft: String) async throws { try Self.requireDraft(try await call(.prepareChatDraft(text: draft))) }
     @MainActor func openSpokenChat(_ sessionID: String) async throws {
         try await present(.openConversation(session: sessionID, message: nil))

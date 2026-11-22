@@ -82,7 +82,7 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             let key = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let page: String
             let item: String?
-            if let home = QuietComposerCommands.tabs[key], let door = ShellPageContent.doorPage(home.page) {
+            if let home = QuietComposerCommands.tabs[key], let door = SidebarItem.doorPage(home.page) {
                 page = door; item = home.tab
             } else { page = value; item = choice.isEmpty ? nil : choice }
             request = .navigate(.init(destination: .init(page: page, item: item, session: nil, message: nil), policy: .quiet))
@@ -115,7 +115,10 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             let item = QuietPage(value: target).item
             let rail = SidebarItem.shellHome(for: item)?.parent ?? item
             guard let home = QuietComposerCommands.tabs[tabKey], home.page == rail else {
-                return AppToolExecutor.failure("unknown_tab", "Choose a tab belonging to this page.")
+                let names = QuietComposerCommands.tabs.filter { $0.value.page == rail }.keys.sorted()
+                return AppToolExecutor.failure("unknown_tab", names.isEmpty
+                    ? "This page has no tabs; leave tab out to draw the whole page" + (rail == .desk ? ", the table included." : ".")
+                    : "Choose one of this page's tabs: \(names.joined(separator: ", ")).")
             }
             tab = home.tab
         }
@@ -173,7 +176,7 @@ struct BodyFacePresentation: QuietToolPresentationPort {
                ShellRailTab.all(layout).first(where: { $0.page == rail })?.tabs.contains(where: { $0.key == tab }) != true {
                 throw PartCallError(code: "capture_tab_unavailable", message: "This Diagnostics tab is absent from the current layout.")
             }
-            let nativePage = ShellPageContent.doorPage(item)
+            let nativePage = SidebarItem.doorPage(item)
             if rail == .chat {
                 _ = try await model.engine.transcripts.readSessionIndex()
                 await model.engine.transcripts.refreshNavigationIdentity()

@@ -31,7 +31,7 @@ extension MacScreenWatch {
         for query in queries {
             try Task.checkCancellation()
             guard case .object(let fields) = query, fields.count == 1, let (kind, value) = fields.first,
-                  case .array(let raw) = value, case let n = raw.compactMap({ Self.number($0).flatMap { abs($0) < 1e9 ? Int($0.rounded(.down)) : nil } }),
+                  case .array(let raw) = value, case let n = raw.compactMap({ $0.finiteDoubleValue.flatMap { abs($0) < 1e9 ? Int($0.rounded(.down)) : nil } }),
                   n.count == raw.count else { throw bad() }
             if kind == "at", n.count == 2 {
                 guard (0..<width).contains(n[0]), (0..<height).contains(n[1]) else { throw bad() }

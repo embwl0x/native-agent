@@ -82,7 +82,7 @@ enum BotsFace {
         else if !conversation { detail.append("No conversation yet — Run once, or tell me in chat.") }
         var rows: [PartFace.Row] = [
             .init(id: id, title: bot.name, detail: detail.joined(separator: " · "), value: timingKind(bot),
-                at: record.running ? record.startedAt.map(absolute) : nil,
+                at: record.running ? record.startedAt.map { NativeTimestampFormat.plainZulu($0) } : nil,
                 symbol: bot.eventTrigger != nil ? "bolt" : bot.cadence == .manual ? "wrench.and.screwdriver" : "clock",
                 tone: record.running ? .live : issue != nil || indexProblem != nil ? .attention : tone(record.status),
                 open: issue == nil && conversation ? "chat:" + bot.sessionID : nil,
@@ -94,7 +94,7 @@ enum BotsFace {
         }
         if let wake = record.wakeLine { rows.append(.init(id: id + "/wake", title: "Wake", detail: wake)) }
         if let missed = record.missed {
-            rows.append(.init(id: id + "/missed", title: "Missed run", detail: missed.words, at: absolute(missed.dueAt), tone: .attention))
+            rows.append(.init(id: id + "/missed", title: "Missed run", detail: missed.words, at: NativeTimestampFormat.plainZulu(missed.dueAt), tone: .attention))
         }
         let runs = record.sortedEntries.prefix(5).map { entry -> PartFace.Row in
             var words = [entry.runtimeStatus.rawValue, String(format: "%.1fs", entry.spend.seconds), entry.model ?? "Model not recorded"]
@@ -106,7 +106,7 @@ enum BotsFace {
             if let indexProblem { words.append(indexProblem) }
             else if session == nil { words.append("Conversation not recorded.") }
             return .init(id: entry.id.uuidString, title: headline(entry), detail: words.joined(separator: " · "),
-                at: absolute(entry.runAt), tone: runTone(entry.runtimeStatus),
+                at: NativeTimestampFormat.plainZulu(entry.runAt), tone: runTone(entry.runtimeStatus),
                 open: session.flatMap { sessions.contains($0) ? "chat:" + $0 : nil })
         }
         return [
@@ -193,6 +193,4 @@ enum BotsFace {
         }
         return BotHeadline.make(from: entry.headline.isEmpty ? entry.actualReply : entry.headline)
     }
-
-    private static func absolute(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
 }

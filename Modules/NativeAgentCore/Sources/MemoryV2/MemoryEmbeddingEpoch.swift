@@ -37,17 +37,13 @@ public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatab
             "dimensions=\(dimensions)",
             "maximum_sequence_length=\(maximumSequenceLength.map(String.init) ?? "none")",
         ].joined(separator: "\n")
-        let digest = SHA256.hash(data: Data(canonical.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        let digest = SHA256Hex.of(Data(canonical.utf8))
         self.rawValue = "memory-embedding-v1:\(digest)"
     }
 
     static func sha256(file url: URL) throws -> String {
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        return SHA256.hash(data: data)
-            .map { String(format: "%02x", $0) }
-            .joined()
+        return SHA256Hex.of(data)
     }
 
     /// Length-prefix directory digest fields with big-endian 64-bit lengths to keep framing unambiguous.
@@ -164,7 +160,13 @@ extension SwiftNativeMemoryV2 {
                     try checkEmbeddingConvergence()
                 case .vector(let vector):
                     try VectorMath.requireUsable(vector, dimensions: embedder.dimensions)
-                    let outcome = try await disk.landOwedVector(id: row.id, content: row.content, vector: vector, epoch: batch.epoch)
+                    let outcome: MemoryStorage.OwedVectorLanding
+                    do { outcome = try await disk.landOwedVector(id: row.id, content: row.content, vector: vector, epoch: batch.epoch) }
+                    catch let refusal as ToolFailureError where refusal.code == "memory_restatement_steered" {
+                        // One refused memory is kept with its reason; it never blocks the rows after it.
+                        try await disk.archiveRefusedOwed(id: row.id, content: row.content, reason: refusal.message)
+                        outcome = .archived(reason: refusal.message)
+                    }
                     try checkEmbeddingConvergence()
                     switch outcome {
                     case .landed, .superseded: break

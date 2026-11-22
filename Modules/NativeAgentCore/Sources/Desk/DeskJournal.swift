@@ -4,32 +4,33 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskJournal.swift` | Locked event feed append, integrity and compaction |
+// Blueprint: | `DeskJournal.swift` | Locked multi-op `commitUnlocked`, ordered stamps, feed integrity and compaction |
 extension SwiftNativeDeskStore {
+    /// Replace the caller's timestamp with the journal's commit stamp and return the stamped operation.
     @discardableResult
     public func append(_ op: DeskOp) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
-            try Self.validateHierarchyTransition(op, in: state)
-            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: true)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return try await commitUnlocked([op], feed: feed) { stamped in
+                try Self.validateHierarchyTransition(stamped, in: state)
+                try Self.validatePursuitInvariants(stamped, in: state, viaGenericPath: true)
+            }.ops[0]
         }
-        return op
     }
     /// Validate and stamp under the lock; explicit todo starts another life’s stopped work fresh.
     @discardableResult
     func appendValidated(_ op: DeskOp) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
+            let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
-            guard state.items.contains(where: { $0.handle == op.handle }) else {
+            guard let item = state.items.first(where: { $0.handle == op.handle }) else {
                 throw DeskError.unknownHandle(op.handle)
             }
             try Self.validateHierarchyTransition(op, in: state)
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            if case .setStatus(.todo, _, _, _, _, _) = op.body,
-               let item = state.items.first(where: { $0.handle == op.handle }) {
+            var ops: [DeskOp] = []
+            if case .setStatus(.todo, _, _, _, _, _) = op.body {
                 if var record = item.continuation, ![.complete, .canceled].contains(record.state),
                    try !DataRootLife.isCurrent(record.lifeID, in: dataRoot) {
                     record.lifeID = try DataRootLife.current(in: dataRoot)
@@ -43,64 +44,71 @@ extension SwiftNativeDeskStore {
                     record.response = nil
                     record.resumeCount = 0
                     record.nextRunAt = Date()
-                    let fresh = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: op.handle,
-                                       body: .setContinuation(record: record))
-                    feed = try await appendAndRecompactUnlocked(fresh, feed: feed).feed
+                    ops.append(DeskOp(handle: op.handle, body: .setContinuation(record: record)))
                 }
                 if var step = item.step, try !DataRootLife.isCurrent(step.lifeID, in: dataRoot) {
                     step.lifeID = try DataRootLife.current(in: dataRoot)
                     step.status = nil
                     step.reason = nil
-                    let fresh = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: op.handle,
-                                       body: .addRef(ref: DeskRef(kind: .step(step))))
-                    feed = try await appendAndRecompactUnlocked(fresh, feed: feed).feed
+                    ops.append(DeskOp(handle: op.handle, body: .addRef(ref: DeskRef(kind: .step(step)))))
                 }
             }
-            var stamped = op
-            stamped.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-            _ = try await appendAndRecompactUnlocked(stamped, feed: feed)
-            return stamped
+            let index = ops.count
+            ops.append(op)
+            return try await commitUnlocked(ops, feed: feed).ops[index]
         }
     }
-    /// The caller holds the ops flock; fold tail ops into the base before removing them so items and aliases survive.
-    /// Return the post-compaction feed so multi-op transactions continue from the committed view.
+    /// The caller holds the ops flock and validates domain transitions before writing.
+    /// Return the stamped ops even if compaction moves them out of the tail.
     @discardableResult
-    func appendAndRecompactUnlocked(
-        _ op: DeskOp,
-        feed: DeskFeed
-    ) async throws -> (state: DeskState, feed: DeskFeed) {
-        switch op.body {
-        case let .setNotify(policy), let .openPursuit(_, _, _, _, _, policy):
-            let supported: Set<String> = ["state_change", "blocked", "done", "explicit"]
-            for trigger in policy.on {
-                let normalized = trigger.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                if !normalized.isEmpty, !supported.contains(normalized) {
-                    throw DeskError.notifyTriggerUnsupported(trigger)
-                }
-            }
-        default:
-            break
+    func commitUnlocked(
+        _ ops: [DeskOp],
+        feed: DeskFeed,
+        validateStamped: @Sendable (DeskOp) throws -> Void = { _ in }
+    ) async throws -> (state: DeskState, feed: DeskFeed, ops: [DeskOp]) {
+        precondition(!ops.isEmpty)
+        var floor = feed.maxCommittedTs
+        let stamped = ops.map { op in
+            var stamped = op
+            stamped.ts = DeskClock.commitStamp(notBefore: floor)
+            floor = stamped.ts
+            return stamped
         }
-        try await appendOpUnlocked(op)
+        let supportedTriggers: Set<String> = ["state_change", "blocked", "done", "explicit"]
+        for op in stamped {
+            try validateStamped(op)
+            switch op.body {
+            case let .setNotify(policy), let .openPursuit(_, _, _, _, _, policy):
+                for trigger in policy.on {
+                    let normalized = trigger.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    if !normalized.isEmpty, !supportedTriggers.contains(normalized) {
+                        throw DeskError.notifyTriggerUnsupported(trigger)
+                    }
+                }
+            default:
+                break
+            }
+        }
+        try DeskOp.requireComplete(stamped)
+        try await appendOpsUnlocked(stamped)
         changeBus.emit(StoreChange(store: .desk, path: opsPath))
         // Carry physical row accounting forward because every retained row passed admission.
         var next = DeskFeed(
-            base: feed.base, ops: feed.ops + [op],
+            base: feed.base, ops: feed.ops + stamped,
             fileOpCount: feed.fileOpCount, integrity: feed.integrity
         )
-        next.noteAppendedRows(1)
+        next.noteAppendedRows(stamped.count)
         let state = Self.compact(base: next.base, next.ops)
         if let newBase = try await compactIfNeededUnlocked(state: state, feed: next) {
             next = DeskFeed(base: newBase, ops: [], fileOpCount: 0, integrity: .clean)
         }
-        return (state, next)
+        return (state, next, stamped)
     }
-    func appendOpUnlocked(_ op: DeskOp) async throws {
-        try DeskOp.requireComplete([op])
+    private func appendOpsUnlocked(_ ops: [DeskOp]) async throws {
         // Reject projections read before or during the awaited write, even if it throws.
         Self.truthRevision.withLock { $0 += 1 }
         defer { Self.truthRevision.withLock { $0 += 1 } }
-        try await SwiftNativePersistenceCore.appendJSONLDurable(op.toJSON(), to: opsPath)
+        try await SwiftNativePersistenceCore.appendJSONLDurable(ops.map { $0.toJSON() }, to: opsPath)
     }
     /// Require the complete retained feed before alias allocation, finding lookup, mutation or compaction.
     func readOpsWithIntegrityUnlocked() async throws -> (ops: [DeskOp], integrity: SnapshotTailOpLog.OpLogIntegrity) {
@@ -173,7 +181,7 @@ extension SwiftNativeDeskStore {
     }
     /// With the ops flock held, write the base atomically before truncation.
     /// Replay prefix-drop makes a crash between them safe against loss and duplicate application.
-    func compactIfNeededUnlocked(
+    private func compactIfNeededUnlocked(
         state: DeskState,
         feed: DeskFeed
     ) async throws -> DeskCompactionBase? {
@@ -243,8 +251,7 @@ extension SwiftNativeDeskStore {
 }
 
 extension DeskOp {
-    /// The journal keeps only ops that read back as themselves. A transaction checks every op before it writes the first, so a refused op
-    /// never leaves its siblings half-written (a queue item without its step).
+    /// Every op in a journal commit must round-trip before the commit can write.
     static func requireComplete(_ ops: [DeskOp]) throws {
         for op in ops {
             let encoded = op.toJSON()

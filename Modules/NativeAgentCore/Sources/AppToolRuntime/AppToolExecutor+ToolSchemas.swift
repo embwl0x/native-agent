@@ -201,10 +201,15 @@ extension AppToolExecutor {
                                              write's new version passing to the next on its page. then_say beside it carries your closing words. To compute \
                                              on a result or glue text, use script.
                                              """))])),
+                        ("expect", ToolSchema.obj([
+                            ("description", .string("With action and then_say: the expected result shape, as for a step in actions.")),
+                            ("anyOf", .array(["object", "string", "number", "boolean"].map { .object(["type": .string($0)]) }
+                                + [.object(["type": .string("array"), "items": .object([:])])])),
+                        ])),
                         ("then_say", ToolSchema.strSchema("""
-                            With actions: your closing words. When every step ran, had an expect that held, and none is beyond undoing, they are said and \
-                            the turn ends without a read-back; otherwise the result says why they did not stand. One deed is enough: \
-                            actions:[{action:"desk.wait",args:{…},expect:"waiting"}], then_say:"Parked it." acts and answers in one pass.
+                            When the result only needs reporting, give the action an expect and put your answer here, with {slots} filled from the \
+                            result using with (step 1). For actions, give each step its own expect. If the expectations hold and the deed can close, \
+                            the turn finishes in one pass. Leave the answer open when you need to interpret the result.
                             """)),
                         ("with", ToolSchema.obj([("type", .string("object")),
                                       ("description", .string("""

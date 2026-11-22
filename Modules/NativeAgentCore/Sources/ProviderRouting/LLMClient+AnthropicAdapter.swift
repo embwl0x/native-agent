@@ -18,7 +18,7 @@ public final class AnthropicTransport: LLMTransport {
     let maxTokensOverride: Int?
     /// First-party identity gates key-header auth, strict schemas and conversation cache markers.
     let firstPartyAnthropicToolContract: Bool
-    let telemetry: LLMCallTraceRecorder
+    public let telemetry: LLMCallTraceRecorder
     /// Thinking replay is memory-only and bounded by tool-call identity.
     let thinkingLedger = ToolCallReplayLedger<AnthropicThinkingRecord>()
 
@@ -148,18 +148,6 @@ public final class AnthropicTransport: LLMTransport {
             "type": "text",
             "text": sys,
         ]]
-    }
-
-    /// Whole replies collect the same checked SSE events as a turn.
-    public func complete(prompt: String, system: String?, model: String, tools: [LLMToolSchema]?, call: LLMCall) async throws -> String {
-        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
-    }
-
-    public func completeMessages(
-        messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
     // MARK: - Thinking controls

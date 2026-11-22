@@ -48,16 +48,13 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     public var isExpired: Bool {
         outcome == .expired
     }
-    public func expirationGuidance(agentName: String) -> String? {
-        isExpired ? "Ask \(agentName) to raise this request again if you still want it." : nil
-    }
 
     public var decisionSummary: String {
         let word: String
         switch outcome {
         case .pending: word = "Pending"
         case .approved: word = "Approved"
-        case .denied: word = "Denied"
+        case .denied: word = "Declined"
         case .expired: word = "Expired before a decision"
         case .unresolved: word = "Decision unavailable"
         }

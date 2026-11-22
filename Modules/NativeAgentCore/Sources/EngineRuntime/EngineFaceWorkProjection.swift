@@ -122,7 +122,7 @@ enum EngineFaceWorkProjection {
             throw failure("sense_view_changed", "This Sense view has changed or closed. Read its current presentation before sending another event.")
         }
         try Task.checkCancellation()
-        let issue = await SensesHub.shared.receiveViewEvent(JSONValue(event), presentation: view)
+        let issue = await SensesHub.shared.receiveViewEvent(JSONValue(event), presentation: view, revision: revision)
         await engine.senses.refresh()
         if let issue {
             throw WireFailure(code: "sense_event_unconfirmed", message: "The Sense event did not complete.",
@@ -160,7 +160,7 @@ enum EngineFaceWorkProjection {
                 guard let job = board.agentJobs.items.first(where: { $0.id == id }) else {
                     throw failure("work_job_missing", "This work is absent from the checked job records.")
                 }
-                work = WorkOverviewRead.row(for: job, now: page.now)
+                work = WorkOverviewRead.row(for: job)
                 result.text = [job.request.map { "Asking: " + $0.title }, WorkOverviewRead.text(for: job)].compactMap { $0 }.joined(separator: "\n\n")
             case "approval":
                 guard let approval = try board.approvals.get().first(where: { $0.id == id }) else {

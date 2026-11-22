@@ -1,10 +1,9 @@
-import CryptoKit
 import Foundation
 import NativeAgentShared
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Codecs.swift` | `MemoryStorage`: `validateTemporalEvidence`, `contentHash`, `nowISO8601` |
+// Blueprint: | `MemoryStorage+Codecs.swift` | `MemoryStorage`: `validateTemporalEvidence`, `contentHash` |
 
 extension MemoryStorage {
     static func validateTemporalEvidence(_ memory: StoredMemory) throws {
@@ -31,17 +30,12 @@ extension MemoryStorage {
     // MARK: - Helpers
 
     static func contentFingerprint(_ content: String) -> String {
-        SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(utf8: content)
     }
 
     public static func contentHash(_ s: String) -> String {
         let normalized = comparisonKey(s, mode: .recall)
-        let digest = SHA256.hash(data: Data(normalized.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    public static func nowISO8601() -> String {
-        NativeTimestampFormat.fractionalZulu(Date())
+        return SHA256Hex.of(Data(normalized.utf8))
     }
 
     static func encodeEmbedding(_ e: [Float]?) -> Data? {

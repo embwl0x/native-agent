@@ -63,7 +63,8 @@ extension AppModel {
             case .null, nil: detail = nil
             default: throw FaceActionFeedback.unexpected("the setup failure's detail")
             }
-            throw WireFailure(code: code, message: "Setup did not finish: " + code, cause: detail, effects: .unknown)
+            throw WireFailure(code: code, message: detail.flatMap { $0.isEmpty ? nil : $0 } ?? "Setup couldn't finish.",
+                              cause: detail, effects: .unknown)
         }
         return value
     }

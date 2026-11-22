@@ -1,7 +1,6 @@
 
 import Foundation
 import OSLog
-import CryptoKit
 import SwiftUI
 import NativeAgentShared
 import UIKit
@@ -111,12 +110,12 @@ final class iCloudBridge: ObservableObject {
     private static let refusedRecordsKept = 200
 
     func deliveryPairingMatches(_ secret: Data) -> Bool {
-        deliveryPairingKey == "mobile.icloud.unaccepted.\(keyDigest(secret))"
+        deliveryPairingKey == "mobile.icloud.unaccepted.\(SHA256Hex.of(secret))"
     }
 
     func deliveryPairingDidChange() {
         guard let material = pairingStore?.material, material != .unavailable else { return }
-        let key = material.secret.map { "mobile.icloud.unaccepted.\(keyDigest($0))" }
+        let key = material.secret.map { "mobile.icloud.unaccepted.\(SHA256Hex.of($0))" }
         guard deliveryPairingKey != key else { return }
         let stored: [String: String]
         if let key, let raw = userDefaults.object(forKey: key) {
@@ -168,16 +167,12 @@ final class iCloudBridge: ObservableObject {
     @Published private(set) var unverifiedRecordsError: String?
     private let unverifiedRecordsKey = "mobile.icloud.unverifiedRecords.v1"
 
-    private func keyDigest(_ secret: Data) -> String {
-        SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
-    }
-
     func retainUnverified(_ msg: BridgeMessage, secret: Data, version: Int64, reason: String) async {
         let prior = unverifiedRecords
         unverifiedRecords.removeAll { $0.id == msg.id }
         unverifiedRecords.append(.init(id: msg.id, kind: msg.metadata?["kind"] ?? "chat",
             sender: msg.sender, timestamp: msg.timestamp, reason: reason,
-            pairingVersion: version, keyDigest: keyDigest(secret)))
+            pairingVersion: version, keyDigest: SHA256Hex.of(secret)))
         if unverifiedRecords.count > Self.refusedRecordsKept { unverifiedRecords.removeFirst(unverifiedRecords.count - Self.refusedRecordsKept) }
         if unverifiedRecords != prior { await persistUnverifiedRecords() }
         NSLog("[iCloudBridge] verification_deferred id=%@ kind=%@ sender=%@ timestamp=%@ pairing_version=%lld reason=%@",
@@ -188,7 +183,7 @@ final class iCloudBridge: ObservableObject {
     /// Once this phone holds the Mac's current key, a record that failed verification was signed with another key, whichever key this phone
     /// held then: the list is let go, and so are deliveries owed under earlier keys.
     func settleUnverifiedRecords(currentKey: Data) async {
-        let current = "mobile.icloud.unaccepted.\(keyDigest(currentKey))"
+        let current = "mobile.icloud.unaccepted.\(SHA256Hex.of(currentKey))"
         for key in userDefaults.dictionaryRepresentation().keys where key.hasPrefix("mobile.icloud.unaccepted.") && key != current {
             userDefaults.removeObject(forKey: key)
         }
@@ -467,11 +462,6 @@ final class iCloudBridge: ObservableObject {
         messageHandlers.removeValue(forKey: id)
     }
 
-    func removeRejectedObserver(_ id: UUID?) {
-        guard let id else { return }
-        rejectionHandlers.removeValue(forKey: id)
-    }
-
     @discardableResult
     func observeResyncHints(onResync: @escaping (BridgeMessage) -> Void) -> UUID {
         let id = UUID()
@@ -479,11 +469,6 @@ final class iCloudBridge: ObservableObject {
         // Deliver retained resync hints when their consumer registers.
         if let ck = deviceTransport { Task { await ck.drainIncoming() } }
         return id
-    }
-
-    func removeResyncObserver(_ id: UUID?) {
-        guard let id else { return }
-        resyncHintHandlers.removeValue(forKey: id)
     }
 
     @discardableResult
@@ -794,14 +779,14 @@ final class iCloudBridge: ObservableObject {
         let repaired = failingMacRecords.filter { repairedReasons.contains($0.value.reason) }.map(\.key)
         for id in repaired {
             guard generation == setupGeneration else { return }
-            await reconsiderRefusedMacRecord(id, saving: false)
+            await reconsiderRefusedMacRecord(id)
         }
         // One write for the whole pass: per record, a pass over thousands of refusals rewrote both ledgers thousands of times.
         guard generation == setupGeneration, !repaired.isEmpty else { return }
         _ = await saveReceiveLedgers()
     }
 
-    func reconsiderRefusedMacRecord(_ id: String, saving: Bool = true) async {
+    func reconsiderRefusedMacRecord(_ id: String) async {
         guard await restoreReceiveLedgers(), let entry = failingMacRecords[id] else { return }
         let generation = setupGeneration
         refusal = nil
@@ -809,7 +794,6 @@ final class iCloudBridge: ObservableObject {
         guard generation == setupGeneration else { return }
         if admitted { failingMacRecords.removeValue(forKey: id) }
         else if let refusal { failingMacRecords[id]?.reason = refusal }
-        if saving { _ = await saveReceiveLedgers() }
     }
 
     /// Transport acceptance waits for the durable receipt, including during a drain. Failure leaves its claim and cursor retryable.
@@ -839,7 +823,7 @@ final class iCloudBridge: ObservableObject {
             return true
         } catch {
             seenMacRecordsDirty = true
-            syncStatus = "Mac receive history could not be saved: \(error.localizedDescription). Its settlement remains owed."
+            syncStatus = "Couldn\u{2019}t save what this iPhone received from your Mac: \(error.localizedDescription). It will try again."
             return false
         }
     }

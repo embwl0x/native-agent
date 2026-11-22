@@ -3,9 +3,6 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
 
 // Blueprint: | `MacControlOperationStore.swift` | `MacControlOperationStore`: Payload-free lifecycle, recovery admission and cancellation |
 
@@ -183,11 +180,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             "action": .string(action),
             "body": .object(body),
         ]).serializedData(pretty: false)
-        #if canImport(CryptoKit)
-        return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
-        #else
-        throw MacControlOperationStoreError.requestMismatch
-        #endif
+        return SHA256Hex.of(canonical)
     }
 
     public nonisolated static func validRequestDigest(_ value: String) -> Bool {
@@ -254,11 +247,14 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         acknowledgePreStartCancellation: Bool = false,
         settlingActualExit: Bool = false
     ) async throws -> MacControlOperationRecord {
-        try await mutate { snapshot in
+        let requestingCancellation = next == .cancelRequested
+        return try await mutate(ifChanged: requestingCancellation) { snapshot in
             guard let index = snapshot.operations.firstIndex(where: { $0.operationId == operationId }) else {
                 throw MacControlOperationStoreError.operationNotFound
             }
             let current = snapshot.operations[index]
+            // Cancellation returns the current outcome if the body has already settled or owns an outcome-unknown reporting record.
+            if requestingCancellation, current.state.isTerminal { return current }
             if acknowledgePreStartCancellation, current.state == .cancelAcknowledged,
                current.startedAt == nil { return current }
             let cancelledBeforeStart = acknowledgePreStartCancellation
@@ -365,7 +361,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             domainState: record.state.rawValue,
             verification: record.verification,
             expectedNextEvidence: record.expectedNextEvidence,
-            updatedAt: Self.iso8601(record.terminalAt ?? record.cancelRequestedAt ?? record.startedAt ?? record.acceptedAt),
+            updatedAt: NativeTimestampFormat.fractionalZulu(record.terminalAt ?? record.cancelRequestedAt ?? record.startedAt ?? record.acceptedAt),
             cancellationIdentity: record.state.isTerminal ? nil : record.operationId,
             deadline: record.state.isTerminal ? nil : record.deadlineAt.map { deadlineAt in
                 MotorActionDeadlineReadModel(
@@ -399,11 +395,14 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     }
 
     private func mutate<T: Sendable>(
+        ifChanged: Bool = false,
         _ body: @Sendable (inout Snapshot) throws -> T
     ) async throws -> T {
         try await SwiftNativePersistenceCore.withFileLock(path) { [path] in
             var snapshot = try await self.load()
+            let previous: [MacControlOperationRecord]? = ifChanged ? snapshot.operations : nil
             let result = try body(&snapshot)
+            if let previous, snapshot.operations == previous { return result }
             let encoded = try JSONEncoder.nativeAgent.encode(snapshot)
             try SwiftNativePersistenceCore.atomicWrite(encoded, to: path)
             return result
@@ -447,10 +446,6 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
 
     private static func clip(_ value: String, limit: Int) -> String {
         String(value.prefix(limit))
-    }
-
-    private static func iso8601(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
     }
 }
 

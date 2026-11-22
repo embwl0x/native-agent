@@ -83,10 +83,6 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     }
     /// Whether the helper waits on the person: for their answer, their approval or their choice of model.
     public var needsYou: Bool { [.waitingOnPerson, .waitingForApproval, .needsModelChoice].contains(status) }
-    public var missedLine: String? {
-        guard let missed else { return nil }
-        return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.words)"
-    }
     public var sortedEntries: [ShelfEntry] { entries.sorted { $0.runAt > $1.runAt } }
     /// Equal timestamps retain the first entry in recorded order.
     public var latestEntry: ShelfEntry? { entries.max { $0.runAt < $1.runAt } }
@@ -98,9 +94,6 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         formatter.setLocalizedDateFormatFromTemplate("MMMdjm")
         formatter.timeZone = TimeZone.autoupdatingCurrent
         return formatter.string(from: date)
-    }
-    public var choiceLine: String {
-        definition.modelSelection(currentModel: followingModel) + " · " + cadence
     }
     public var wakeLine: String? {
         guard let trigger = definition.eventTrigger else { return nil }
@@ -132,38 +125,6 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         if case .manual = definition.cadence { return "Manual" }
         if let nextRun { return "\(cadence) · Next \(Self.metadataDate(nextRun))" }
         return "\(cadence) · Not scheduled yet"
-    }
-    public var timingLine: String {
-        var parts: [String] = []
-        if let last = latestEntry { parts.append("Last \(Self.metadataDate(last.runAt))") }
-        if let nextRun {
-            parts.append("Next \(Self.metadataDate(nextRun))")
-        }
-        return parts.isEmpty ? "No runs yet" : parts.joined(separator: " · ")
-    }
-    /// Pair the observed reply with its time so a result card conveys more than a timestamp.
-    public var lastOutcomeLine: String {
-        guard let last = latestEntry else { return "No runs yet" }
-        let firstLine = last.actualReply.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty }?.replacingOccurrences(of: "**", with: "")
-        let said: String
-        switch last.runtimeStatus {
-        case .completed: said = firstLine.map { "Reply saved: " + $0 } ?? (last.runHealth == .nothingNew ? "Checked, nothing new" : "Ended, nothing saved")
-        case .waitingForApproval: said = "Waiting for approval"
-        // Awaiting a person's answer is a waiting status, not an interruption.
-        case .waitingOnPerson: said = last.statusDetail.map { "Waiting on you — \($0)" } ?? "Waiting on you"
-        case .stopped:
-            said = last.statusDetail.map { "Stopped, " + $0 } ?? firstLine.map { "Stopped, partial reply kept: " + $0 } ?? "Stopped"
-        case .failed, .interrupted:
-            // The cause when one was recorded; never invented.
-            if last.runtimeStatus == .interrupted, let detail = last.statusDetail ?? firstLine.map({ "partial reply kept: " + $0 }) {
-                said = "Interrupted, \(detail)"
-            } else {
-                said = "\(last.runtimeStatus == .failed ? "Failed" : "Interrupted"): \(last.statusDetail ?? "cause not recorded")"
-            }
-        }
-        return "\(Self.metadataDate(last.runAt)) · \(said)"
     }
     public var cadence: String { Self.cadence(definition.cadence) }
     public static func cadence(_ cadence: BotCadence) -> String { StandingBotSchedule.words(cadence) }

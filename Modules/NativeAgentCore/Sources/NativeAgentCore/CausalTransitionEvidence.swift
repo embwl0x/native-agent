@@ -1,4 +1,4 @@
-import CryptoKit
+import NativeAgentShared
 import Foundation
 
 // Blueprint: | `CausalTransitionEvidence.swift` | `CausalTransitionEvidence`: assignment evidence grants no authority |
@@ -175,6 +175,6 @@ public struct CausalTransitionEvidence: Codable, Sendable, Equatable {
     }
 
     public static func opaqueIdentity(_ raw: String) -> String {
-        SHA256.hash(data: Data(raw.utf8)).map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(utf8: raw)
     }
 }

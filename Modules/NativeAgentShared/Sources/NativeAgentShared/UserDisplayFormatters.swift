@@ -16,56 +16,12 @@ public enum UserDisplayFormatters {
     private static let plainISO = Date.ISO8601FormatStyle()
     private static let timestampParseCache = TimestampParseCache(capacity: 2_048)
 
-    /// Keep unreadable timestamps visible as raw input so a parse failure does not erase evidence.
-    public static func humanizeISOTimestamp(_ iso: String) -> String {
-        let trimmed = iso.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return "" }
-        let date = parseISOTimestamp(trimmed)
-        guard let date else { return trimmed }
-        let rel = RelativeDateTimeFormatter()
-        rel.unitsStyle = .full
-        return rel.localizedString(for: date, relativeTo: Date())
-    }
-
     public static func parseISOTimestamp(_ iso: String) -> Date? {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
         return timestampParseCache.value(for: trimmed) {
             (try? fractionalISO.parse(trimmed)) ?? (try? plainISO.parse(trimmed))
         }
-    }
-
-    /// Timestamp used under a chat bubble. Kept here with the canonical wire parser so every bubble does not rebuild its own pair of ISO formatters.
-    public static func chatTimestamp(_ iso: String, calendar: Calendar = .current) -> String {
-        guard let date = parseISOTimestamp(iso) else { return iso }
-        return date.formatted(
-            date: calendar.isDateInToday(date) ? .omitted : .abbreviated,
-            time: .shortened
-        )
-    }
-
-    /// Callers choose failure wording explicitly when a timestamp cannot be parsed.
-    public static func relativeISOTimestamp(
-        _ iso: String,
-        unitsStyle: RelativeDateTimeFormatter.UnitsStyle,
-        fallback: String
-    ) -> String {
-        guard let date = parseISOTimestamp(iso) else { return fallback }
-        // Clock skew can put a fresh stamp a hair in the future; "in 0s" is nonsense to a person, so anything under a minute reads "now".
-        let now = Date()
-        if date > now || now.timeIntervalSince(date) < 60 { return "now" }
-        let rel = RelativeDateTimeFormatter()
-        rel.unitsStyle = unitsStyle
-        return rel.localizedString(for: date, relativeTo: now)
-    }
-
-    /// Unreadable timestamps stay visible as raw input; presentation uses the current locale and time zone.
-    public static func shortTime(_ iso: String) -> String {
-        guard let date = parseISOTimestamp(iso) else { return iso }
-        let out = DateFormatter()
-        out.dateStyle = .none
-        out.timeStyle = .short
-        return out.string(from: date)
     }
 
     public static func humanizeDuration(_ seconds: Double) -> String {

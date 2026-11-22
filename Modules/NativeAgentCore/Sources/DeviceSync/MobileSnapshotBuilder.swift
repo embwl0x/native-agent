@@ -1,5 +1,4 @@
 import CommonCrypto
-import CryptoKit
 import AppKit
 import Foundation
 import DeviceSyncState
@@ -32,7 +31,6 @@ enum MacSyncSnapshotIntegrity {
         let missingManagedFiles: [String]
         let mismatchedManagedFiles: [String]
         let unreadableManagedFiles: [String]
-        let retiredDigestKeys: [String]
 
         var requiresRepair: Bool {
             !missingManagedFiles.isEmpty
@@ -59,18 +57,16 @@ enum MacSyncSnapshotIntegrity {
         var missing: [String] = []
         var mismatched: [String] = []
         var unreadable: [String] = []
-        var retired: [String] = []
 
         for (filename, expectedDigest) in digests {
             let isManaged = managedFilenames.contains(filename)
             let url = directory.appendingPathComponent(filename)
             guard fileManager.fileExists(atPath: url.path) else {
-                if isManaged { missing.append(filename) } else { retired.append(filename) }
+                if isManaged { missing.append(filename) }
                 continue
             }
             guard isManaged else {
                 // A stale digest cannot claim a file outside the mobile contract, even when a same-name artifact remains.
-                retired.append(filename)
                 continue
             }
             do {
@@ -96,13 +92,12 @@ enum MacSyncSnapshotIntegrity {
             retainedDigests: retained,
             missingManagedFiles: missing.sorted(),
             mismatchedManagedFiles: mismatched.sorted(),
-            unreadableManagedFiles: unreadable.sorted(),
-            retiredDigestKeys: retired.sorted()
+            unreadableManagedFiles: unreadable.sorted()
         )
     }
 
     static func digest(_ data: Data) -> String {
-        Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(data)
     }
 }
 
@@ -123,12 +118,12 @@ actor MobileSnapshotBuilder {
     }
 
     func encode<Value: Encodable & Sendable>(_ value: Value) throws -> Data {
-        try Self.encoder().encode(value)
+        try TurnSummaryComputer.makeEncoder().encode(value)
     }
 
     /// Health contains launch facts. The committed elapsed sample required by installed phones changes only with those facts.
     func health(_ health: RuntimeHealth, storedAt url: URL, rebuilding: Bool) async throws -> Data {
-        let data = try Self.encoder().encode(health)
+        let data = try TurnSummaryComputer.makeEncoder().encode(health)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let candidate = try decoder.decode(RuntimeHealth.self, from: data)
@@ -164,7 +159,7 @@ actor MobileSnapshotBuilder {
     ) async throws -> Value {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let candidate = try decoder.decode(Value.self, from: Self.encoder().encode(candidate))
+        let candidate = try decoder.decode(Value.self, from: TurnSummaryComputer.makeEncoder().encode(candidate))
         let stored: (value: Value?, clock: Clock?) = try await VolumeIO.run {
             let data: Data
             do { data = try VolumeIO.contents(of: url) }
@@ -197,29 +192,27 @@ actor MobileSnapshotBuilder {
         return value
     }
 
-    nonisolated static func encoder() -> JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = .sortedKeys
-        return encoder
+    /// The one byte form every snapshot file is written in; every budget measures these bytes, not the encoder's.
+    nonisolated static func wireBytes(_ data: Data) throws -> Data {
+        try JSONSerialization.data(withJSONObject: JSONSerialization.jsonObject(with: data), options: [.sortedKeys])
     }
 
     func inbox(_ items: [InboxItemRecord]) throws -> (data: Data, included: Int) {
-        try MobileInbox.data(from: items, encoder: Self.encoder(), alreadyNewestFirst: true)
+        try MobileInbox.data(from: items, encoder: TurnSummaryComputer.makeEncoder(), alreadyNewestFirst: true)
     }
 
     /// The jobs carrying Desk items are their movement on the phone, as on the Mac.
     func desk(_ items: [DeskItem], evidence: [DeskExecutionEvidence]?) throws -> (data: Data, included: Int) {
-        try MobileDesk.data(from: items, evidence: evidence ?? [], encoder: Self.encoder())
+        try MobileDesk.data(from: items, evidence: evidence ?? [], encoder: TurnSummaryComputer.makeEncoder())
     }
 
     func deskReadingCopies(_ items: [DeskItem]) throws -> (data: Data, included: Int) {
-        try MobileDeskReadingCopy.data(from: items, encoder: Self.encoder())
+        try MobileDeskReadingCopy.data(from: items, encoder: TurnSummaryComputer.makeEncoder())
     }
 
     /// Whole pages share the phone's file budget; a page that cannot fit carries its own unavailable cause.
     func faces(_ snapshots: [String: PartFaceSnapshot]) throws -> Data {
-        let encoder = Self.encoder()
+        let encoder = TurnSummaryComputer.makeEncoder()
         var pages = try snapshots.map { id, snapshot in
             (id: id, key: try encoder.encode(id), snapshot: snapshot, data: try encoder.encode(snapshot))
         }.sorted { $0.id < $1.id }
@@ -254,7 +247,7 @@ actor MobileSnapshotBuilder {
         guard data.count <= maximumFileBytes else {
             throw DeviceSyncError.payloadTooLarge(actualBytes: data.count, maximumBytes: maximumFileBytes)
         }
-        _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": data])
+        _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": try Self.wireBytes(data)])
         return data
     }
 

@@ -8,45 +8,45 @@ public enum SenseScreenThings {
     public static func isNativeScreenPage(_ page: NativePage) -> Bool {
         guard case .app = page.corner, page.address.hasPrefix("{"),
               let value = try? JSONValue.parse(Data(page.address.utf8)) else { return false }
-        return string(object(value)["__sense_screen_frame"]) != nil
+        return JSONValue.objectOrEmpty(value)["__sense_screen_frame"]?.nonemptyString != nil
     }
 
     /// Use exact selection handles so the page need state its frame only once; other addresses remain whole.
     public static func printed(_ address: String) -> String {
         guard address.hasPrefix("{"), case .object(let fields)? = try? JSONValue.parse(Data(address.utf8)),
-              string(fields["frame_id"]) != nil, let handle = string(fields["handle"]) else { return address }
+              fields["frame_id"]?.nonemptyString != nil, let handle = fields["handle"]?.nonemptyString else { return address }
         return handle
     }
 
     public static func page(in result: JSONValue) throws -> NativePage? {
-        guard case .object(let fields) = result, let page = object(fields["detail"])["native_page"] else { return nil }
+        guard case .object(let fields) = result, let page = JSONValue.objectOrEmpty(fields["detail"])["native_page"] else { return nil }
         return try JSONDecoder().decode(NativePage.self, from: page.serializedData(pretty: false))
     }
 
     public static func text(in result: JSONValue) -> String? {
-        guard case .object(let fields) = result, object(fields["detail"])["native_page"] != nil else { return nil }
-        return string(fields["text"])
+        guard case .object(let fields) = result, JSONValue.objectOrEmpty(fields["detail"])["native_page"] != nil else { return nil }
+        return fields["text"]?.nonemptyString
     }
 
     public static func captureStatus(in result: JSONValue) -> String? {
         guard case .object(let fields) = result else { return nil }
-        return string(object(fields["detail"])["pixel_capture_status"])
+        return JSONValue.objectOrEmpty(fields["detail"])["pixel_capture_status"]?.nonemptyString
     }
     public static func things(in result: JSONValue, corner: SenseCorner) throws -> [NativeThing] {
         guard case .app(let bundleID) = corner, case .object(let fields) = result else { return [] }
         if let page = try page(in: result) { return page.things }
-        let detail = object(fields["detail"])
-        let controls = object(detail["controls"] ?? fields["controls"])
-        guard let frame = string(controls["frame_id"]), case .array(let rows)? = controls["affordances"] else { return [] }
+        let detail = JSONValue.objectOrEmpty(fields["detail"])
+        let controls = JSONValue.objectOrEmpty(detail["controls"] ?? fields["controls"])
+        guard let frame = controls["frame_id"]?.nonemptyString, case .array(let rows)? = controls["affordances"] else { return [] }
         return try rows.compactMap { row in
-            let node = object(row)
-            guard let handle = string(node["handle"]),
-                  let role = string(node["role"]) else { return nil }
+            let node = JSONValue.objectOrEmpty(row)
+            guard let handle = node["handle"]?.nonemptyString,
+                  let role = node["role"]?.nonemptyString else { return nil }
             let kind = plainRole(role)
-            let label = string(node["label"])
+            let label = node["label"]?.nonemptyString
             let name = label == role ? kind : label ?? kind
             let address = try JSONValue.object(["app": .string(bundleID), "frame_id": .string(frame), "handle": .string(handle)]).serialize(pretty: false)
-            let detail = [string(node["value"]), string(node["state"]), node["enabled"] == .bool(false) ? "disabled" : nil]
+            let detail = [node["value"]?.nonemptyString, node["state"]?.nonemptyString, node["enabled"] == .bool(false) ? "disabled" : nil]
                 .compactMap { $0 }.joined(separator: "; ")
             // A look affordance is pressable, but supplies no evidence of editability.
             return NativeThing(name: name, kind: kind, address: address, detail: detail.isEmpty ? nil : detail,
@@ -75,23 +75,23 @@ public enum SenseScreenThings {
 
     public static func selection(_ address: String, verb: String, args: JSONValue) throws -> JSONValue {
         guard case .object(let target) = try JSONValue.parse(Data(address.utf8)),
-              string(target["app"]) != nil,
+              target["app"]?.nonemptyString != nil,
               case .object(let supplied) = args,
               supplied.keys.allSatisfy({ ["text", "mode"].contains($0) }) else {
             throw SenseFailure(code: "invalid_address", message: "Read the screen again to select a current app thing.")
         }
         var request: [String: JSONValue]
         var activation = verb
-        if string(target["frame_id"]) != nil, string(target["handle"]) != nil {
+        if target["frame_id"]?.nonemptyString != nil, target["handle"]?.nonemptyString != nil {
             request = ["app": target["app"]!, "frame_id": target["frame_id"]!, "handle": target["handle"]!]
-            if let related = object(target["__sense_screen_activations"])[verb],
-               let handle = string(object(related)["handle"]), let boundVerb = string(object(related)["verb"]) {
+            if let related = JSONValue.objectOrEmpty(target["__sense_screen_activations"])[verb],
+               let handle = JSONValue.objectOrEmpty(related)["handle"]?.nonemptyString, let boundVerb = JSONValue.objectOrEmpty(related)["verb"]?.nonemptyString {
                 request["handle"] = .string(handle)
                 activation = boundVerb
             }
-        } else if let name = string(target["target"]), string(target["__sense_screen_frame"]) != nil {
+        } else if let name = target["target"]?.nonemptyString, target["__sense_screen_frame"]?.nonemptyString != nil {
             request = ["app": target["app"]!, "target": .string(name), "__sense_native_surface": .bool(true)]
-            if let label = string(target["label"]) { request["__sense_native_label"] = .string(label) }
+            if let label = target["label"]?.nonemptyString { request["__sense_native_label"] = .string(label) }
         } else {
             throw SenseFailure(code: "invalid_address", message: "Read the screen again to select a current app thing.")
         }
@@ -102,7 +102,4 @@ public enum SenseScreenThings {
         request.merge(supplied) { _, new in new }
         return .object(request)
     }
-
-    private static func object(_ value: JSONValue?) -> [String: JSONValue] { if case .object(let fields)? = value { fields } else { [:] } }
-    private static func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value, !text.isEmpty { text } else { nil } }
 }

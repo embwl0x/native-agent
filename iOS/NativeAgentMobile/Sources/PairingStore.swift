@@ -203,10 +203,11 @@ final class PairingStore: ObservableObject {
         }
     }
 
-    private func pairingUnavailable(_ message: String) {
-        secretStorageError = message
+    /// The person reads `person`; the log keeps `detail` (the Keychain status and what was left as it was).
+    private func pairingUnavailable(_ person: String, detail: String) {
+        secretStorageError = person
         material = .unavailable
-        NSLog("[PairingStore] %@", message)
+        NSLog("[PairingStore] %@", detail)
     }
     /// Counts the Mac's acceptances taken here; an open pairing screen closes on the next one.
     @Published private(set) var macAcceptances = 0
@@ -224,12 +225,14 @@ final class PairingStore: ObservableObject {
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
-            pairingUnavailable("Pairing removal could not be verified (Keychain status \(status)). Retained sense state is unchanged.")
+            pairingUnavailable("Couldn\u{2019}t remove the pairing from this iPhone. Unlock it and try again.",
+                               detail: "Pairing removal could not be verified (Keychain status \(status)). Retained sense state is unchanged.")
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
         }
         let verified = readSecretFromKeychain()
         guard verified.status == errSecItemNotFound else {
-            pairingUnavailable("Pairing removal could not be verified (Keychain status \(verified.status)). Retained sense state is unchanged.")
+            pairingUnavailable("Couldn\u{2019}t remove the pairing from this iPhone. Unlock it and try again.",
+                               detail: "Pairing removal could not be verified (Keychain status \(verified.status)). Retained sense state is unchanged.")
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(verified.status == errSecSuccess ? errSecDecode : verified.status))
         }
         connectionRepairPending = true
@@ -285,10 +288,11 @@ final class PairingStore: ObservableObject {
                 material = .installed(data)
             } else {
                 // Keep the import source when writing fails so secret material is not lost.
-                secretStorageError = """
-                    Pairing could not be saved in this iPhone's Keychain (status \(saveStatus)). The original key is retained. Unlock the iPhone and check \
-                    Keychain access before trying Connect again.
-                    """
+                secretStorageError = "Couldn\u{2019}t save the pairing on this iPhone. Unlock it and try again."
+                NSLog("""
+                    [PairingStore] Pairing could not be saved in this iPhone's Keychain (status \(saveStatus)). The original key is retained. Unlock the \
+                    iPhone and check Keychain access before trying Connect again.
+                    """)
                 NSLog("""
                     [PairingStore] Pairing unavailable: Keychain migration failed (status=\(saveStatus)); source bytes retained. Repair iPhone Keychain \
                     access before pairing can resume.
@@ -300,10 +304,11 @@ final class PairingStore: ObservableObject {
                 material = .removed
                 AgentNameCache.forget()
             } else {
-                secretStorageError = """
-                    The saved pairing key could not be read or has an invalid shape (Keychain status \(keychainRead.status)). Its bytes are retained. Unlock \
-                    the iPhone and repair Keychain access before reconnecting.
-                    """
+                secretStorageError = "Couldn\u{2019}t read the pairing saved on this iPhone. Unlock it and try again."
+                NSLog("""
+                    [PairingStore] The saved pairing key could not be read or has an invalid shape (Keychain status \(keychainRead.status)). Its bytes \
+                    are retained. Unlock the iPhone and repair Keychain access before reconnecting.
+                    """)
             }
         }
 
@@ -335,7 +340,7 @@ final class PairingStore: ObservableObject {
                 self.material = .removed
                 self.secretStorageError = nil
             } else {
-                self.pairingUnavailable("""
+                self.pairingUnavailable("Couldn\u{2019}t read the pairing saved on this iPhone. Unlock it and try again.", detail: """
                     The saved pairing key could not be verified after unlock (Keychain status \(result.status)). Retained sense state is unchanged; check the \
                     Mac connection.
                     """)
@@ -379,7 +384,7 @@ final class PairingStore: ObservableObject {
         }
         let writeStatus = persist?(data) ?? saveSecretToKeychain(data)
         guard writeStatus == errSecSuccess else {
-            pairingUnavailable("""
+            pairingUnavailable("Couldn\u{2019}t save the pairing on this iPhone. Unlock it and try again.", detail: """
                 \(source) pairing Keychain write could not be verified (status \(writeStatus)). Unlock the iPhone and check the Mac connection; retained \
                 sense state is unchanged.
                 """)
@@ -408,7 +413,7 @@ final class PairingStore: ObservableObject {
     func applyICloudPairing(acceptance: String?) {
         isICloudPaired = true
         macAcceptances &+= 1
-        confirmationStep = "Telling your Mac this phone has its acceptance\u{2026}"
+        confirmationStep = "Finishing pairing with your Mac\u{2026}"
         Task {
             do {
                 let answer = try await iCloudSyncEngine.shared.sendActionAndWait(.make(action: NAPairingConfirmation.acknowledgement,

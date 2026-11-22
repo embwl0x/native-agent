@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 // Blueprint: | `VisionHandles.swift` | `VisionHandles` |
@@ -39,7 +40,7 @@ public enum VisionHandles {
     }
 
     public static func token(fingerprint: String) -> String {
-        MacLookHandle.base36(fnv1a64(fingerprint), length: MacLookHandle.tokenLength)
+        MacLookHandle.base36(StableHash.fnv1a64(fingerprint), length: MacLookHandle.tokenLength)
     }
 
 }

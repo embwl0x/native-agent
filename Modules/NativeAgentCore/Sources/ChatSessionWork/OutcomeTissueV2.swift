@@ -126,7 +126,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
               NativeAgentChatSessionID.normalizedPathComponent(decoded.sessionID)
                 == decoded.sessionID,
               Self.closedToken(decoded.surface, maximum: 128) != nil,
-              Self.parseDate(decoded.observedAt) != nil,
+              NativeTimestampFormat.parseISO8601FractionalFirst(decoded.observedAt) != nil,
               ["persisted", "partial", "cancelled", "failed"].contains(decoded.responsePersistence),
               decoded.tools.count <= 64,
               decoded.motorActions.count <= 64,
@@ -246,10 +246,6 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         guard raw == trimmed, !trimmed.isEmpty, trimmed.count <= maximum,
               trimmed.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
         return trimmed
-    }
-
-    fileprivate static func parseDate(_ raw: String) -> Date? {
-        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 }
 
@@ -442,7 +438,7 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
             let sourceSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
             truncated = truncated || result.stats.truncated
                 || result.stats.malformedRowCount > 0 || result.stats.invalidShapeRowCount > 0
-                || result.stats.mode == "missing" || result.stats.mode == "read_failed"
+                || ["missing", "read_failed", "invalid_encoding"].contains(result.stats.mode)
                 || (result.stats.bytesRead == 0 && sourceSize != 0)
             let messages = result.messages
             for (index, message) in messages.enumerated() where message.role == "assistant" {

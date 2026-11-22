@@ -69,10 +69,6 @@ public struct GrokLinkCredential: Codable, Sendable {
         let status = SecItemDelete(try query(peer) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw Failure.unavailable }
     }
-    public mutating func importWebhook(url: String, key: String) throws {
-        guard Self.usableURL(url), Self.usableKey(key) else { throw Failure.invalid }
-        webhookURL = url; webhookKey = key
-    }
     private static func usableURL(_ url: String) -> Bool {
         guard url.utf8.count <= 4096, let parts = URLComponents(string: url) else { return false }
         return parts.scheme == "https" && parts.host?.isEmpty == false && parts.user == nil && parts.password == nil && parts.fragment == nil

@@ -8,7 +8,6 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import ChatToolRuntime
 import CognitiveSubstrate
-import CryptoKit
 import Desk
 import Foundation
 import NativeAgentCore
@@ -46,10 +45,9 @@ public struct TurnContinuationRuntime: Sendable {
         resumeMacTurn: @Sendable (TurnCheckpoint, TurnContinuationRuntime) async throws -> Void) async throws {
         // Worker checkpoints belong to their sessionless caller; abandon interrupted answers there so claim recovery cannot also resume them as chat turns.
         if checkpoint.sessionId == "worker-" + checkpoint.runId {
+            // The caller's answer is let go durably first; only then is the checkpoint, its evidence, retired.
+            try await ExperienceStore.at(dataRoot).append([.letGo(key: "answer", reason: .abandoned)], to: checkpoint.runId, durable: true)
             try checkpoint.remove(dataRoot: dataRoot)
-            ExperienceStore.record(dataRoot, checkpoint.runId) { store in
-                try await store.append([.letGo(key: "answer", reason: .abandoned)], to: checkpoint.runId)
-            }
             return
         }
         if checkpoint.capabilityProfile == "mac", checkpoint.surface == "chat", checkpoint.helperDefinition == nil {
@@ -90,7 +88,7 @@ public struct TurnContinuationRuntime: Sendable {
             metadata[CognitiveMechanicalRowKind.metadataKey] == nil, case .object(let envelope)? = metadata["envelope"],
             envelope["agent"] == nil, case .string(let surface)? = envelope["surface"], let door = mirrorDoors[surface] else { return }
         let deliveryId = "anchor-mirror:" + rowId
-        let digest = SHA256.hash(data: Data((rowId + "\u{1f}" + response.output).utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256Hex.of(Data((rowId + "\u{1f}" + response.output).utf8))
         var route: AgentBridgeCompletionRoute?
         var preparationError: Error?
         do {
@@ -166,8 +164,11 @@ public struct TurnContinuationRuntime: Sendable {
     /// on its own; one with a checkpoint of its run is the relaunch's to resume. One item's failure is that item's; its siblings proceed.
     public func returnSettledDeskWaits() async throws {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
+        let state = try await store.liveState()
+        let plan = DeskSequencing.compute(state)
         var failures: [String] = []
-        for item in try await store.liveState().items.sorted(by: { $0.handle < $1.handle }) {
+        for item in state.items.sorted(by: { $0.handle < $1.handle }) {
+            if item.continuation?.reason == DeskContinuation.parkedReason, plan.byHandle[item.handle]?.isReady != true { continue }
             do { try await returnIfSettled(item, store: store) }
             catch is CancellationError { throw CancellationError() }
             catch { failures.append("Desk item \(item.alias): \(error.localizedDescription)") }
@@ -221,11 +222,13 @@ public struct TurnContinuationRuntime: Sendable {
         let helper = record.helperDefinition != nil
         let reply: String? = try helper ? nil : JSONValue.object(record.envelope).serialize(pretty: false)
         let whose = helper ? "A helper's Desk item" : "Your Desk item"
-        // Written before the record lets the wait go, so a quit between the two returns it on the next change, once.
-        await Attention.post(Happening(.returned, subject: "desk:" + item.handle, door: "desk",
-            words: "What \(whose) \(item.alias) (\"\(String(item.title.prefix(80)))\") waited on came back; it is yours to go on with.",
+        let named = "\(whose) \(item.alias) (\"\(String(item.title.prefix(80)))\")"
+        let words = record.reason == DeskContinuation.parkedReason ? "\(named) is ready to continue."
+            : "What \(named) waited on came back; it is yours to go on with."
+        // A quit after the return commits leaves the same once key for the next pass to confirm.
+        try await Attention.postChecked(Happening(.returned, subject: "desk:" + item.handle, door: "desk", words: words,
             once: "desk:" + item.handle + ":" + record.runID, route: helper ? nil : record.sessionID, reply: reply, peers: record.peerSources,
-            shows: shown), dataRoot: dataRoot).value
+            shows: shown), dataRoot: dataRoot)
         record.state = .complete
         record.reason = "returned"
         record.revision = UUID().uuidString
@@ -267,11 +270,11 @@ public struct TurnContinuationRuntime: Sendable {
 
     public func resumeTurn(_ checkpoint: TurnCheckpoint, turn parent: Turn? = nil) async throws {
         guard try DataRootLife.isCurrent(checkpoint.lifeID, in: dataRoot) else { throw CancellationError() }
-        guard let surface = text(checkpoint.replyRoute, "surface") else { throw DeskContinuationError.unavailable }
+        guard let surface = checkpoint.replyRoute["surface"]?.stringValue else { throw DeskContinuationError.unavailable }
         let route = AgentBridgeCompletionRoute(surface: surface, sessionId: checkpoint.sessionId,
-            destinationId: text(checkpoint.replyRoute, "destinationId"), threadId: text(checkpoint.replyRoute, "threadId"),
-            sourceKey: text(checkpoint.replyRoute, "sourceKey"), replyTo: text(checkpoint.replyRoute, "replyTo"),
-            correlationId: text(checkpoint.replyRoute, "correlationId"), requesterUserId: text(checkpoint.replyRoute, "requesterUserId"))
+            destinationId: checkpoint.replyRoute["destinationId"]?.stringValue, threadId: checkpoint.replyRoute["threadId"]?.stringValue,
+            sourceKey: checkpoint.replyRoute["sourceKey"]?.stringValue, replyTo: checkpoint.replyRoute["replyTo"]?.stringValue,
+            correlationId: checkpoint.replyRoute["correlationId"]?.stringValue, requesterUserId: checkpoint.replyRoute["requesterUserId"]?.stringValue)
         let resume: @Sendable () async throws -> Void = {
             try await resumeCheckpoint(checkpoint, route: route, parent: parent)
         }
@@ -374,18 +377,13 @@ public struct TurnContinuationRuntime: Sendable {
         return response
     }
 
-    private func text(_ object: [String: JSONValue], _ key: String) -> String? {
-        if case .string(let value)? = object[key] { return value }
-        return nil
-    }
-
     public func continueChatToolApproval(sessionID: String, turn: Turn, prompt: String,
                                          fileAccess: String) async throws {
         guard let envelope = turn.envelope else {
             throw ToolFailureError("The approval continuation has no recorded origin. Nothing ran.",
                 effects: .none, code: "approval_origin_unavailable")
         }
-        try await runApprovalAdmission(sessionID: sessionID, envelope: envelope, prompt: prompt, turn: turn) { turn in
+        try await runApprovalAdmission(envelope: envelope, prompt: prompt, turn: turn) { turn in
             let response = try await runApprovalFollowUp(sessionID: sessionID, envelope: envelope, prompt: prompt,
                 fileAccess: fileAccess, turn: turn)
             guard let route = redeliveryRoute(envelope, sessionID: sessionID) else { return }
@@ -402,7 +400,7 @@ public struct TurnContinuationRuntime: Sendable {
             throw ToolFailureError("The card's continuation has no recorded origin. Nothing ran.", effects: .none, code: "card_origin_unavailable")
         }
         let fileAccess = turn.fileAccess ?? "auto"
-        try await runApprovalAdmission(sessionID: sessionID, envelope: envelope, prompt: prompt, turn: turn) { turn in
+        try await runApprovalAdmission(envelope: envelope, prompt: prompt, turn: turn) { turn in
             // Admitted, the follow-up is the card's resumed work: a failure from here is owed, never a second run of the turn. Stop still stops it.
             func owe(_ what: String, _ error: any Error, lever: String) {
                 RepairOwed.owe(dataRoot, id: "card-followup:" + turn.run, kind: .message, steeredBy: turn.steeringStamp(), operation: "card.followup:" + turn.run,
@@ -505,7 +503,7 @@ public struct TurnContinuationRuntime: Sendable {
             arrival: TurnArrival(words: prompt, surface: surface, row: .hidden), runID: turn.run, turn: turn, operation: operation)
     }
 
-    private func runApprovalAdmission(sessionID: String, envelope: TurnEnvelope, prompt: String, turn: Turn,
+    private func runApprovalAdmission(envelope: TurnEnvelope, prompt: String, turn: Turn,
         operation: @escaping @Sendable (Turn) async throws -> Void) async throws {
         if ConversationSurfaceProfile(envelope.surface).id == "bot" {
             try await operation(turn)

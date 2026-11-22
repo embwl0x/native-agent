@@ -23,8 +23,6 @@ public struct SessionContextMeasurement: Sendable {
     public let turnDeltaTokens: Int?
     /// Observed head of the last successful request on this route, never a replay selection input.
     package let previousHistoryContextWindow: String?
-    public var hasReceipt: Bool { source != "rendered_history_estimate" }
-    let rowCharacters: [String: Int]
 
     /// Ask the admitted request owner for overrides and remaining budget; unbound readouts use the same resident assembly.
     static func outputAllowance(model: String, providerID: String?, dataRoot: URL, call: LLMCall) async throws -> Int {
@@ -153,14 +151,12 @@ public struct SessionContextMeasurement: Sendable {
         }
         let characters: Int
         let historyCharacters: Int
-        let rowCharacters: [String: Int]
         let source: String
         let output = try await outputAllowance(model: model, providerID: providerID, dataRoot: dataRoot, call: call)
         if let requestBuilder {
             let request = try await requestBuilder(rows, windowTokens, matching ? receipt?.requestPlan : nil)
             characters = request.characters
             historyCharacters = request.historyCharacters
-            rowCharacters = request.rowCharacters
             source = calibrated ? "provider_calibrated_request" : "rendered_history_estimate"
         } else if calibrated, let data = receipt?.requestPlan {
             let plan = try JSONDecoder().decode(SessionContextPlan.self, from: data)
@@ -171,13 +167,11 @@ public struct SessionContextMeasurement: Sendable {
                 windowTokens: windowTokens, outputTokens: output, charactersPerToken: ratio)
             characters = request.characters
             historyCharacters = request.historyCharacters
-            rowCharacters = request.rowCharacters
             source = "provider_calibrated_request"
         } else {
             let history = try rendered(rows, windowTokens: windowTokens, outputTokens: output)
-            characters = history.characters
-            historyCharacters = history.characters
-            rowCharacters = history.rows
+            characters = history
+            historyCharacters = history
             source = "rendered_history_estimate"
         }
         let value = Double(characters) / ratio
@@ -190,13 +184,12 @@ public struct SessionContextMeasurement: Sendable {
             charactersPerToken: ratio, source: source,
             previousTurnTokens: calibrated ? receipt?.previousTurnInputTokens : nil,
             turnDeltaTokens: calibrated ? receipt?.turnInputDeltaTokens : nil,
-            previousHistoryContextWindow: matching ? receipt?.historyContextWindow : nil,
-            rowCharacters: rowCharacters)
+            previousHistoryContextWindow: matching ? receipt?.historyContextWindow : nil)
     }
 
     /// The readout sizes the conversation under the same input budget as a live request.
     private static func rendered(_ rows: [JSONValue], windowTokens: Int,
-                                 outputTokens: Int) throws -> (characters: Int, rows: [String: Int]) {
+                                 outputTokens: Int) throws -> Int {
         let renderables = try rows.compactMap { row -> SessionHistoryPromptRenderer.Renderable? in
             guard case .object(let fields) = row,
                   case .string(let id)? = fields["id"], !id.isEmpty,
@@ -211,7 +204,7 @@ public struct SessionContextMeasurement: Sendable {
             return SessionHistoryPromptRenderer.renderable(message)
         }
         guard let admission = try SessionHistoryMessages.admission(renderables: renderables, historyLimit: 1,
-            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens)) else { return (0, [:]) }
+            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens)) else { return 0 }
         var projected = SessionHistoryMessages.project(admission)
         let inputBudget = Double(ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: outputTokens))
             * ContextBudgetPolicy.transcriptCharactersPerToken
@@ -225,13 +218,6 @@ public struct SessionContextMeasurement: Sendable {
                 if Double(projected.characters) <= inputBudget { break }
             }
         }
-        return (projected.characters, projected.rowCharacters)
-    }
-
-    func characters(in rows: [JSONValue]) -> Int {
-        rows.reduce(0) { total, row in
-            guard case .object(let fields) = row, case .string(let id)? = fields["id"] else { return total }
-            return total + (rowCharacters["id\u{1F}\(id)"] ?? 0)
-        }
+        return projected.characters
     }
 }

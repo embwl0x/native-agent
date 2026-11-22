@@ -85,6 +85,13 @@ package enum ChatTranscriptEvidenceRendering {
             keep(key, receiptField(key, in: result), limit: ["status", "effects"].contains(key) ? 120 : 1_000)
         }
         if case .object(let fields) = result {
+            // A process may have run successfully as a tool call while leaving its intended work unconfirmed.
+            if receiptField("timed_out", in: result) == .bool(true) {
+                keep("timed_out", .bool(true))
+                keep("exit_code", receiptField("exit_code", in: result))
+                keep("detail", receiptField("detail", in: result))
+            }
+            if call == "app files.trash" { keep("trash_path", receiptField("trash_path", in: result)) }
             // An exact continuation is usable only if redaction did not change it.
             if let next = fields["next"], next != .null {
                 if historicalContinuationIsExact(next) {

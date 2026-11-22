@@ -58,10 +58,6 @@ public enum ChatSessionRetention {
             """)
 
     // Archived transcripts and their locator rows are durable history. Only explicit deletion may remove them; the active index remains bounded.
-    public nonisolated static func defaultBestEffortFailureLogger(_ message: String) {
-        nativeLog("%@", message)
-    }
-
     public static func enforce(
         dataRoot: URL,
         rows: [[String: JSONValue]],
@@ -144,15 +140,12 @@ public enum ChatSessionRetention {
         rows: [[String: JSONValue]],
         now: Date = Date(),
         policy: ChatSessionRetentionPolicy = .default,
-        context: String,
-        failureLogger: @escaping @Sendable (String) -> Void = defaultBestEffortFailureLogger
+        context: String
     ) -> (rows: [[String: JSONValue]], report: ChatSessionRetentionReport)? {
         do {
             return try enforce(dataRoot: dataRoot, rows: rows, now: now, policy: policy)
         } catch {
-            failureLogger(
-                "\(context): ChatSessionRetention.enforce failed at \(dataRoot.path): \(error)"
-            )
+            nativeLog("%@", "\(context): ChatSessionRetention.enforce failed at \(dataRoot.path): \(error)")
             return nil
         }
     }
@@ -371,7 +364,10 @@ public enum ChatSessionRetention {
 
             // Lock archive after transcript. On contention, discard the copy and keep the session hot; no removal may precede its durable archive row.
             let indexRowWritten = try CredentialFileLock.tryWithLock(archiveIndex) {
-                if !reused { try appendJSONL(.object(archivedRow), to: archiveIndex) }
+                if !reused {
+                    try dropUnfinishedArchiveAppend(at: archiveIndex)
+                    try appendJSONL(.object(archivedRow), to: archiveIndex)
+                }
                 return true
             }
             guard indexRowWritten == true else {
@@ -384,8 +380,10 @@ public enum ChatSessionRetention {
             // Both archive bytes and its row exist before the active row goes. If interrupted after this checkpoint, the hot copy may survive and be recovered
             // as an orphan; an active row never loses history.
             try commitIndexRemoval()
+            // The archive is committed now; a leftover live copy that will not delete is a cleanup note, not a failed archive.
             if archivedMessagesPath != nil && hotExists {
-                try FileManager.default.removeItem(at: messagesPath)
+                do { try FileManager.default.removeItem(at: messagesPath) }
+                catch { ModuleLog.app("[retention] archived %@ but its live copy remains: %@", sessionId, error.localizedDescription) }
             }
             return archivedRow
         }
@@ -411,7 +409,7 @@ public enum ChatSessionRetention {
         policy: ChatSessionRetentionPolicy
     ) -> Bool {
         guard messageCount(row) <= 0,
-              let stamp = date(row["updatedAt"]) ?? date(row["createdAt"]) else {
+              let stamp = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(row["updatedAt"]?.stringValue) ?? NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(row["createdAt"]?.stringValue) else {
             return false
         }
         return now.timeIntervalSince(stamp) >= policy.staleEmptySessionAgeSeconds
@@ -428,13 +426,6 @@ public enum ChatSessionRetention {
         default:
             return 0
         }
-    }
-
-    private static func date(_ value: JSONValue?) -> Date? {
-        guard case .string(let raw)? = value else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
     }
 
     private static func uniqueArchivePath(

@@ -13,7 +13,6 @@ import ToolRegistry
 
 public protocol MacChatRenderedMessage: MacChatRetryMessage {
     var sessionId: String? { get }
-    var macChatHasMetadata: Bool { get }
     var macChatPartial: Bool { get }
     var macChatCancelled: Bool { get }
 }
@@ -136,7 +135,7 @@ public extension ChatStreamExecution {
     static func macChatStream(
         client: SwiftNativeChatOrchestrationClient,
         text: String, attachments: [NativeAgentShared.MultimodalAttachment],
-        sessionId: String, activityIdentity: MacChatTurnIdentity, replyRowId: String,
+        sessionId: String, replyRowId: String,
         hideUserBubble: Bool,
         onScreenPreview: @escaping @Sendable (MacScreenPreviewUpdate) async -> Void,
         helperSession: @escaping @Sendable (TurnEventSink?, Turn) -> BotRunnerSession,

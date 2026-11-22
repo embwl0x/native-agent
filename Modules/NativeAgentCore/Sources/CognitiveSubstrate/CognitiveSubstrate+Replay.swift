@@ -5,62 +5,58 @@ import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`, proposal-owned REM history |
 
 extension CognitiveSubstrate {
-    /// Scheduled replay's checked boundary. All replay artifacts, lineage, and its receipt commit in one SQLite transaction; in-memory state rolls back on
-    /// failure so evidence remains eligible for a later retry.
+    /// All replay artifacts, lineage, and the receipt commit together. A failed transaction discards the staged changes, keeping evidence eligible.
     @discardableResult
     public func integrateReplayChecked(
         _ input: CognitiveReplayIntegrationInput
     ) async throws -> CognitiveReplayIntegrationResult {
-        await waitForMaintenanceTransition()
+        await waitForMaintenanceTransition(includingReplay: true)
         guard configuration.enabled else { return CognitiveReplayIntegrationResult() }
+        let done = ScopedWaiter()
+        replayTransitionDone = done
+        defer {
+            replayTransitionDone = nil
+            done.resume()
+        }
         let now = dependencies.now()
-        let priorEpisodes = episodes
-        let priorSchemas = schemaProposals
-        let priorTimeline = developmentalTimeline
-        let priorDirtySince = dirtySince
-        var stagedDirtyRevision = dirtyRevision
         var episodeIds: [UUID] = []
         var schemaProposalIds: [UUID] = []
         var skippedEvidenceIds: [String] = []
         var timelineEventIds: [UUID] = []
         var writes: [CognitiveArtifactWrite] = []
-        var stagedEpisodes: [UUID: CognitiveEpisodeReference] = [:]
-        var stagedSchemas: [UUID: CognitiveSchemaProposal] = [:]
-        var stagedTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
-        var insertedReplayEvidence: Set<String> = []
+        var stagedEpisodes: [CognitiveEpisodeReference] = []
+        var stagedSchemas: [CognitiveSchemaProposal] = []
+        var stagedTimeline: [CognitiveDevelopmentalTimelineEvent] = []
+        var stagedEvidence = replayEvidenceIds
         var unavailableEvidence = input.unavailableEvidence
-
-        do {
 
         for dream in input.dreamEntries.prefix(8) {
             let evidenceId = dreamReplayEvidenceID(dream)
-            guard let occurredAt = dateFromFullDate(dream.date) else {
+            // A second entry on one date is archived as `YYYY-MM-DD_<id>`: its date is the first ten characters.
+            guard let occurredAt = dateFromFullDate(dream.date) ?? dateFromFullDate(String(dream.date.prefix(10))) else {
                 unavailableEvidence.append("\(evidenceId): invalid dream date \(dream.date)")
                 continue
             }
-            guard replayEvidenceIds.insert(evidenceId).inserted,
+            guard stagedEvidence.insert(evidenceId).inserted,
                   episodes.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) == false else {
                 skippedEvidenceIds.append(evidenceId)
                 continue
             }
             let episode = CognitiveEpisodeReference(
                 id: stableArtifactID("episode|\(evidenceId)"),
-                title: bounded("Dream replay \(dream.date)", maxCharacters: 120),
+                title: TextClipping.prefixOrWhole("Dream replay \(dream.date)", maxCharacters: 120),
                 summary: dreamSummary(dream.content),
                 occurredAt: occurredAt,
                 externalEvidenceIds: [evidenceId],
-                lineageId: bounded("dream:\(dream.date)", maxCharacters: 120)
+                lineageId: TextClipping.prefixOrWhole("dream:\(dream.date)", maxCharacters: 120)
             )
-            episodes[episode.id] = episode
-            stagedEpisodes[episode.id] = episode
-            insertedReplayEvidence.insert(evidenceId)
+            stagedEpisodes.append(episode)
             episodeIds.append(episode.id)
-            markDirty(at: now)
             writes.append(CognitiveArtifactWrite(
                 kind: "episode", id: episode.id, status: "recorded",
                 score: 0.5, payload: episode.toJSON()
             ))
-            let timeline = recordTimelineEventInMemory(
+            let timeline = makeTimelineEvent(
                 kind: .dreamEpisode,
                 title: episode.title,
                 summary: episode.summary,
@@ -68,7 +64,7 @@ extension CognitiveSubstrate {
                 lineageId: episode.lineageId,
                 externalEvidenceIds: episode.externalEvidenceIds
             )
-            stagedTimeline[timeline.id] = timeline
+            stagedTimeline.append(timeline)
             writes.append(CognitiveArtifactWrite(
                 kind: "developmental_timeline", id: timeline.id, status: "recorded",
                 score: 0.5, payload: timeline.toJSON()
@@ -78,33 +74,32 @@ extension CognitiveSubstrate {
 
         for proposal in input.remProposals.prefix(8) {
             let evidenceId = remReplayEvidenceID(proposal)
-            guard let createdAt = dateFromInternetDate(proposal.createdAt) else {
+            guard let createdAt = NativeTimestampFormat.parseISO8601FractionalFirst(proposal.createdAt) else {
                 unavailableEvidence.append("\(evidenceId): invalid REM createdAt \(proposal.createdAt)")
                 continue
             }
-            if schemaProposals.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) {
+            if schemaProposals.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) })
+                || stagedSchemas.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) {
                 skippedEvidenceIds.append(evidenceId)
                 continue
             }
 
             let schema = CognitiveSchemaProposal(
                 id: stableArtifactID("schema|\(evidenceId)"),
-                title: bounded("\(proposal.target) REM proposal", maxCharacters: 120),
-                body: bounded(proposal.text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),
-                target: bounded(proposal.target.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
+                title: TextClipping.prefixOrWhole("\(proposal.target) REM proposal", maxCharacters: 120),
+                body: TextClipping.prefixOrWhole(proposal.text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),
+                target: TextClipping.prefixOrWhole(proposal.target.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
                 confidence: proposal.confidence,
                 createdAt: createdAt,
-                externalEvidenceIds: [evidenceId] + proposal.evidenceDates.map { bounded("dream:\($0)", maxCharacters: 120) },
-                lineageId: bounded("rem:\(proposal.id)", maxCharacters: 120)
+                externalEvidenceIds: [evidenceId] + proposal.evidenceDates.map { TextClipping.prefixOrWhole("dream:\($0)", maxCharacters: 120) },
+                lineageId: TextClipping.prefixOrWhole("rem:\(proposal.id)", maxCharacters: 120)
             )
             guard !schema.body.isEmpty else {
                 skippedEvidenceIds.append(evidenceId)
                 continue
             }
-            schemaProposals[schema.id] = schema
-            stagedSchemas[schema.id] = schema
+            stagedSchemas.append(schema)
             schemaProposalIds.append(schema.id)
-            markDirty(at: now)
             writes.append(CognitiveArtifactWrite(
                 kind: "schema_proposal", id: schema.id, status: "referenced",
                 score: schema.confidence, payload: schema.toJSON()
@@ -114,9 +109,9 @@ extension CognitiveSubstrate {
         let receiptPayload: JSONValue? =
             !writes.isEmpty || !unavailableEvidence.isEmpty
             ? .object([
-                    "reason": .string(bounded(input.reason, maxCharacters: 120)),
+                    "reason": .string(TextClipping.prefixOrWhole(input.reason, maxCharacters: 120)),
                     "unavailableEvidence": .array(unavailableEvidence.prefix(16).map {
-                        .string(bounded($0, maxCharacters: 240))
+                        .string(TextClipping.prefixOrWhole($0, maxCharacters: 240))
                     }),
                     "episodeCount": .int(Int64(episodeIds.count)),
                     "schemaProposalCount": .int(Int64(schemaProposalIds.count)),
@@ -126,10 +121,9 @@ extension CognitiveSubstrate {
                     "artifactIds": .array(writes.map { .string($0.id.uuidString) }),
                 ])
             : nil
-        stagedDirtyRevision = dirtyRevision
         if configuration.persistenceEnabled {
             guard let store else { throw CognitivePersistenceError.storeUnavailable }
-            guard !persistenceHealth.writesBlocked, !forgettingInFlight else {
+            guard !persistenceHealth.writesBlocked else {
                 throw CognitivePersistenceError.writesBlocked(
                     status: persistenceHealth.status,
                     detail: persistenceHealth.failureDetail
@@ -142,6 +136,13 @@ extension CognitiveSubstrate {
                 at: now
             )
         }
+        // Publish only committed evidence so maintenance can run while SQLite is writing the replay.
+        for episode in stagedEpisodes { episodes[episode.id] = episode }
+        for schema in stagedSchemas { schemaProposals[schema.id] = schema }
+        replayEvidenceIds = stagedEvidence
+        publishTimelineEvents(stagedTimeline)
+        // Replay requests a microcycle without changing any family maintenance may need to restore.
+        if !writes.isEmpty { dirtySince = dirtySince ?? now }
         // Direct replay writes bypass item helpers, so enforce episode/schema/evidence caps after commit; newest retained rows survive.
         enforceEpisodeCap()
         enforceSchemaProposalCap()
@@ -152,30 +153,6 @@ extension CognitiveSubstrate {
             skippedEvidenceIds: skippedEvidenceIds,
             timelineEventIds: timelineEventIds
         )
-        } catch {
-            // Actor reentrancy permits unrelated mutations while SQLite is committing. Roll back only values still equal to this replay's staged delta; never
-            // overwrite a newer concurrent mutation.
-            for (id, staged) in stagedEpisodes where episodes[id] == staged {
-                if let prior = priorEpisodes[id] { episodes[id] = prior }
-                else { episodes.removeValue(forKey: id) }
-            }
-            for (id, staged) in stagedSchemas where schemaProposals[id] == staged {
-                if let prior = priorSchemas[id] { schemaProposals[id] = prior }
-                else { schemaProposals.removeValue(forKey: id) }
-            }
-            for (id, staged) in stagedTimeline where developmentalTimeline[id] == staged {
-                if let prior = priorTimeline[id] { developmentalTimeline[id] = prior }
-                else { developmentalTimeline.removeValue(forKey: id) }
-            }
-            for evidenceID in insertedReplayEvidence
-            where episodes.values.contains(where: { $0.externalEvidenceIds.contains(evidenceID) }) == false {
-                replayEvidenceIds.remove(evidenceID)
-            }
-            if dirtyRevision == stagedDirtyRevision {
-                dirtySince = priorDirtySince
-            }
-            throw error
-        }
     }
 
     // Cognition owns feelings and continuity; the Desk owns explicit task tracking.
@@ -257,7 +234,7 @@ extension CognitiveSubstrate {
                 artifactId: proposal.id, lineageId: proposal.lineageId,
                 externalEvidenceIds: proposal.externalEvidenceIds)
             let decision = proposal.decision
-            if let decision, let stamp = decision.outcome?.at, let at = dateFromInternetDate(stamp) {
+            if let decision, let stamp = decision.outcome?.at, let at = NativeTimestampFormat.parseISO8601FractionalFirst(stamp) {
                 var resolution = event
                 resolution.id = stableArtifactID("decision|\(decision.id)")
                 resolution.kind = .proposalResolution
@@ -278,7 +255,7 @@ extension CognitiveSubstrate {
     }
 
 
-    func recordTimelineEventInMemory(
+    func makeTimelineEvent(
         kind: CognitiveDevelopmentalTimelineKind,
         title: String,
         summary: String,
@@ -287,39 +264,40 @@ extension CognitiveSubstrate {
         externalEvidenceIds: [String]
     ) -> CognitiveDevelopmentalTimelineEvent {
         let now = dependencies.now()
-        let event = CognitiveDevelopmentalTimelineEvent(
+        let idTitle = TextClipping.prefixOrWhole(title, maxCharacters: 80)
+        let idSummary = TextClipping.prefixOrWhole(summary, maxCharacters: 80)
+        return CognitiveDevelopmentalTimelineEvent(
             id: stableArtifactID("""
-                timeline|\(kind.rawValue)|\(artifactId?.uuidString ?? lineageId)|\(bounded(title, maxCharacters: 80))|\(bounded(summary, maxCharacters: 80))
+                timeline|\(kind.rawValue)|\(artifactId?.uuidString ?? lineageId)|\(idTitle)|\(idSummary)
                 """),
             kind: kind,
-            title: bounded(title.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
-            summary: bounded(summary.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),
+            title: TextClipping.prefixOrWhole(title.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
+            summary: TextClipping.prefixOrWhole(summary.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),
             occurredAt: now,
             artifactId: artifactId,
-            lineageId: bounded(lineageId.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
+            lineageId: TextClipping.prefixOrWhole(lineageId.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
             subjectId: lineageSubjectId(lineageId),
             instanceId: stableDigest("\(kind.rawValue)|\(lineageId)|\(artifactId?.uuidString ?? "")"),
             forkMetadata: ["fork": "none"],
             externalEvidenceIds: boundedExternalEvidenceIds(externalEvidenceIds)
         )
-        developmentalTimeline[event.id] = event
-        enforceDevelopmentalTimelineCap()
-        return event
     }
 
-    func removeTimelineEventsIfMatching(_ events: [CognitiveDevelopmentalTimelineEvent]) {
-        for event in events where developmentalTimeline[event.id] == event {
-            developmentalTimeline.removeValue(forKey: event.id)
+    /// Publish the committed batch before applying retention to the resident timeline.
+    func publishTimelineEvents(_ events: [CognitiveDevelopmentalTimelineEvent]) {
+        for event in events {
+            developmentalTimeline[event.id] = event
         }
+        enforceDevelopmentalTimelineCap()
     }
 
     private func dreamReplayEvidenceID(_ dream: CognitiveDreamReplayReference) -> String {
         let file = dream.filename ?? dream.id
-        return bounded("dream:\(dream.date):\(file):\(stableDigest(dream.content))", maxCharacters: 180)
+        return TextClipping.prefixOrWhole("dream:\(dream.date):\(file):\(stableDigest(dream.content))", maxCharacters: 180)
     }
 
     private func remReplayEvidenceID(_ proposal: CognitiveREMProposalReference) -> String {
-        bounded("rem:\(proposal.id)", maxCharacters: 180)
+        TextClipping.prefixOrWhole("rem:\(proposal.id)", maxCharacters: 180)
     }
 
     private func dreamSummary(_ content: String) -> String {
@@ -328,7 +306,7 @@ extension CognitiveSubstrate {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        return bounded(normalized, maxCharacters: 500)
+        return TextClipping.prefixOrWhole(normalized, maxCharacters: 500)
     }
 
     private func dateFromFullDate(_ raw: String) -> Date? {
@@ -350,15 +328,11 @@ extension CognitiveSubstrate {
         return date
     }
 
-    private func dateFromInternetDate(_ raw: String) -> Date? {
-        NativeTimestampFormat.parseISO8601FractionalFirst(raw)
-    }
-
     private func boundedExternalEvidenceIds(_ ids: [String]) -> [String] {
         var seen: Set<String> = []
         var out: [String] = []
         for raw in ids {
-            let id = bounded(raw.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 180)
+            let id = TextClipping.prefixOrWhole(raw.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 180)
             guard !id.isEmpty, seen.insert(id).inserted else { continue }
             out.append(id)
             if out.count >= 12 { break }
@@ -369,6 +343,6 @@ extension CognitiveSubstrate {
     private func lineageSubjectId(_ lineageId: String) -> String {
         let trimmed = lineageId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "unknown" }
-        return bounded(trimmed.split(separator: ":").first.map(String.init) ?? trimmed, maxCharacters: 80)
+        return TextClipping.prefixOrWhole(trimmed.split(separator: ":").first.map(String.init) ?? trimmed, maxCharacters: 80)
     }
 }

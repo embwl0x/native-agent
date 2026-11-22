@@ -37,6 +37,9 @@ struct ChatPendingExchange: Codable, Equatable, Sendable {
         let controls: ChatRuntimeControls
         let attachments: [MultimodalAttachment]
         let appendedUserId: UUID?
+        /// A Regenerate keeps being one after expiry: Send now resends it as the same replacement, never a second question.
+        var suppressRemoteUserAppend: Bool? = nil
+        var replacementAssistantMessageID: UUID? = nil
     }
 
     var correlationID: String

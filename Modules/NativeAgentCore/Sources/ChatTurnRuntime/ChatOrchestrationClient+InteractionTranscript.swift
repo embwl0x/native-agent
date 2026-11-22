@@ -3,7 +3,6 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Experiences
-import CryptoKit
 import TurnTrace
 import Transcripts
 import TrustCenter
@@ -230,23 +229,7 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     package static func checkedInlineInteraction(in row: JSONValue, lifeID: String? = nil) throws -> InlineInteraction? {
-        guard case .object(let object) = row,
-              case .object(let metadata)? = object["metadata"],
-              case .string(InlineInteractionWire.transcriptKind)? = metadata["kind"]
-        else { return nil }
-        guard let raw = metadata[InlineInteractionWire.metadataKey] else {
-            throw InlineInteractionResolveError.noControl("The saved interaction card has no interaction payload. Repair its transcript row.")
-        }
-        var card = try InlineInteractionWire.decoder().decode(InlineInteraction.self,
-            from: raw.serializedData(pretty: false))
-        if let lifeID, let continuation = card.continuation,
-           DataRootLife.life(of: continuation.lifeID) != lifeID,
-           [.waiting, .claimed, .replaying, .stopped].contains(continuation.state) {
-            card.continuation?.state = .stopped
-            card.continuation?.reason = DataRootLife.stoppedReason
-            card.state = .stopped(reason: DataRootLife.stoppedReason)
-        }
-        return card
+        try InlineInteractionWire.checkedCard(in: row, lifeID: lifeID)
     }
 
     /// The same-row card CAS: compare the persisted revision and continuation
@@ -590,7 +573,7 @@ extension SwiftNativeChatOrchestrationClient {
         encoder.outputFormatting = [.sortedKeys]
         let bytes = try encoder.encode(Subject(question: card.title,
             options: card.options.sorted { $0.id < $1.id }))
-        return .string(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+        return .string(SHA256Hex.of(bytes))
     }
 
     nonisolated static func redactedProgressEvent(_ event: TurnStreamEvent) -> TurnStreamEvent {

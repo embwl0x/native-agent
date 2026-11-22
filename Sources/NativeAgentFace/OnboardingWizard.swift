@@ -133,7 +133,7 @@ private struct IdentityAndAbilitiesStep: View {
     @Bindable var state: OnboardingWizardState
     let onContinue: () async -> Void
     private var face: PartFace {
-        PartFace(title: "Let's start with names.", line: "Saved on this Mac; change them anytime.", sections: [
+        PartFace(title: "Let's start with names.", line: "The agent's name is a suggestion. Pick your own; both can change anytime.", sections: [
             .init(id: "onboarding.names", rows: [], block: .init(kind: "form", key: "onboarding.names", fields: [
                 .init(id: "user", label: "Your name", value: .string(state.userName), required: true),
                 .init(id: "agent", label: "Agent name", value: .string(state.agentName), required: true)
@@ -222,7 +222,7 @@ private struct ProviderConnectStep: View {
         .task { await state.reloadProviders(refresh: { await appModel.loadProvidersForChat() }) }
     }
     private var door: ClosureFaceDoor {
-        ClosureFaceDoor(open: { _ in }, waitingOn: "the provider owner") { input in
+        ClosureFaceDoor(open: { _ in }, waitingOn: "your account") { input in
             do {
                 switch input.action {
                 case "configure":
@@ -271,7 +271,7 @@ private struct BuildingStep: View {
             for operation in state.forms.operations.values where operation.item.row != "building" {
                 state.forms.cancel(operation.item)
             }
-            return .init(words: "Cancellation requested; waiting for setup to settle.", effects: .none, accepted: true)
+            return .init(words: "Canceling setup…", effects: .none, accepted: true)
         }, session: state.forms)
     }
 }

@@ -77,7 +77,7 @@ struct MobileAgentThreadView: View {
         ClosureFaceDoor(open: { _ in }, cancellationLabel: "Cancel waiting", waitingOn: "your Mac") { submission in
             if submission.checking {
                 await refresh()
-                return .init(words: "The conversation has been refreshed; acceptance of the original message remains unconfirmed.", effects: .unknown)
+                return .init(words: "The conversation was refreshed. Not sure your Mac received the original message.", effects: .unknown)
             }
             guard submission.expectedCall.action == "contact.send", let text = submission.values?["text"]?.stringValue else {
                 return .interrupted(WireFailure(code: "contact_message_missing", message: "The message form needs its text.",

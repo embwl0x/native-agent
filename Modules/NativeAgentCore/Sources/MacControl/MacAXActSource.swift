@@ -2,20 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(AppKit)
 import AppKit
 import Carbon
 import NativeAgentShared
-#endif
 // Blueprint: | `MacAXActSource.swift` | AX targets retain stage, cause and remedy; window identity and URL evidence stay exact |
 
 /// Opaque handles remain source-owned; callers must not interpret them.
@@ -24,7 +15,8 @@ public struct MacAXActTarget: Sendable, Equatable {
     public let role: String
     public let title: String?
     public let value: String?
-    public let enabled: Bool
+    /// Nil when the action does not read enabled state.
+    public let enabled: Bool?
     public let frame: MacAXFrame?
     public let actions: [String]
 
@@ -33,7 +25,7 @@ public struct MacAXActTarget: Sendable, Equatable {
         role: String,
         title: String? = nil,
         value: String? = nil,
-        enabled: Bool = true,
+        enabled: Bool? = true,
         frame: MacAXFrame? = nil,
         actions: [String] = []
     ) {
@@ -55,7 +47,7 @@ public struct MacAXActTarget: Sendable, Equatable {
     public func toJSON(redactingValue: Bool = false) -> JSONValue {
         var object: [String: JSONValue] = [
             "role": .string(role),
-            "enabled": .bool(enabled),
+            "enabled": enabled.map(JSONValue.bool) ?? .null,
             "actions": .array(actions.map { .string($0) }),
         ]
         object["title"] = title.map { .string(MacAccessibilityReader.truncate($0, to: MacAXLimits.hardValueChars)) } ?? .null
@@ -150,7 +142,7 @@ public protocol MacAXActSource: Sendable {
     /// Exact presence in the owning process's window inventory. Nil is an unreadable inventory, never evidence that a window was removed.
     func windowPresence(_ window: MacAXWindowRef, context: MacOperationContext) -> Bool?
     /// Resolve from the captured window; current focus may belong to another window.
-    func resolve(path: [Int], inWindow window: MacAXWindowRef, context: MacOperationContext) -> MacAXPidResolution
+    func resolve(path: [Int], inWindow window: MacAXWindowRef, readEnabled: Bool, context: MacOperationContext) -> MacAXPidResolution
     /// A stale child path cannot prove uniqueness after relayout. Incomplete reads throw their cause; nil establishes no unique target.
     func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef, context: MacOperationContext) throws -> MacAXActTarget?
     /// Resolve directly from AXMenuBar; window-relative paths cannot address menu items. Unavailable sources report `.appGone`.
@@ -197,7 +189,7 @@ public extension MacAXActSource {
     func isFocusedElement(_ target: MacAXActTarget, pid: Int32, context: MacOperationContext) -> Bool { false }
     func focusedElement(pid: Int32, context: MacOperationContext) -> MacAXActTarget? { nil }
     func acceptsTextInput(_ target: MacAXActTarget, context: MacOperationContext) -> Bool {
-        target.enabled && !MacActClosedLoop.isSecureField(role: target.role)
+        target.enabled == true && !MacActClosedLoop.isSecureField(role: target.role)
             && MacActClosedLoop.canType(role: target.role)
     }
     func matchesTextInputTarget(_ focused: MacAXActTarget, target: MacAXActTarget, context: MacOperationContext) -> Bool { false }
@@ -230,7 +222,7 @@ public extension MacAXActSource {
     }
 
     func resolve(path: [Int], inWindow window: MacAXWindowRef, context: MacOperationContext) -> MacAXPidResolution {
-        resolve(path: path, inAppPid: window.identity.pid, context: context)
+        resolve(path: path, inWindow: window, readEnabled: true, context: context)
     }
 
     /// Without a window server, key-window ownership is unknown.
@@ -242,20 +234,6 @@ public extension MacAXActSource {
     var raiseDiagnostic: String? { nil }
 }
 
-public struct UnavailableMacAXActSource: MacAXActSource {
-    public init() {}
-    public func isTrusted() -> Bool { false }
-    public func resolve(path: [Int], inAppPid pid: Int32, context: MacOperationContext) -> MacAXPidResolution { .pathNotFound }
-    public func resolve(menuPath: [Int], inAppPid pid: Int32, titlePath: [String]?, context: MacOperationContext) -> MacAXPidResolution { .pathNotFound }
-    public func perform(_ target: MacAXActTarget, action: String, turn: Turn, context: MacOperationContext) -> MacAXActOutcome { .invalidTarget }
-    public func setValue(_ target: MacAXActTarget, value: String, turn: Turn, context: MacOperationContext) -> MacAXActOutcome { .invalidTarget }
-    public func reread(_ target: MacAXActTarget, context: MacOperationContext) -> MacAXActTarget? { nil }
-}
-
 public func defaultMacAXActSource() -> any MacAXActSource {
-    #if canImport(ApplicationServices) && os(macOS)
     return SystemMacAXActSource()
-    #else
-    return UnavailableMacAXActSource()
-    #endif
 }

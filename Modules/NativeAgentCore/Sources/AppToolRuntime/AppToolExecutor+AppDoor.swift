@@ -9,7 +9,6 @@ import ChatTurnRuntime
 import ChatToolRuntime
 import AgentConversations
 import ChatToolParsing
-import CryptoKit
 import Foundation
 import Privacy
 import MacIntegration
@@ -42,13 +41,10 @@ extension AppToolExecutor {
         return await presentation.page(named: key)
     }
     public static let doorDoctor = "Doctor (app {page:\"diagnostics\", item:\"doctor\"})"
-    static func doorText(_ value: JSONValue?) -> String {
-        value?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
     /// Home and unpaged items may name effects, so they share resolution with scripts.
     static func opensHomeItem(_ input: [String: JSONValue]) -> Bool {
-        guard !doorText(input["item"]).isEmpty else { return false }
-        let page = doorText(input["page"]).lowercased()
+        guard !JSONValue.trimmedScalarTextOrEmpty(input["item"]).isEmpty else { return false }
+        let page = JSONValue.trimmedScalarTextOrEmpty(input["page"]).lowercased()
         return page.isEmpty || page == "home"
     }
     static let doorScriptKey = "__script"
@@ -82,7 +78,7 @@ extension AppToolExecutor {
             }
             call.merge(shared) { current, supplied in current == .null ? supplied : current }
             if call["args"] != nil, call["args"] != .null,
-               !["action", "page", "item", "find", "script"].contains(where: { !doorText(call[$0]).isEmpty }) {
+               !["action", "page", "item", "find", "script"].contains(where: { !JSONValue.trimmedScalarTextOrEmpty(call[$0]).isEmpty }) {
                 return try shape()
             }
             calls.append(.object(call))
@@ -272,10 +268,12 @@ extension AppToolExecutor {
             try Task.checkCancellation()
             var owed = try await store.experience(id)
             try Task.checkCancellation()
-            // A named subject may settle only the unique open repair whose operation ends with that subject.
+            // A named subject, or the short id Home and Doctor show, may settle only the unique open repair it names.
             if owed == nil {
+                let short = id.count >= 6 && !id.contains(":")
                 let named = try await store.open().filter { debt in
-                    RepairOwed.isOwed(debt) && RepairDebt(debt).operation.map { $0 == id || $0.hasSuffix(":" + id) } == true
+                    RepairOwed.isOwed(debt) && (RepairDebt(debt).operation.map { $0 == id || $0.hasSuffix(":" + id) } == true
+                        || short && debt.id.split(separator: ":").contains { $0.hasPrefix(id) })
                 }
                 if named.count == 1 { owed = named[0]; id = named[0].id }
             }
@@ -369,7 +367,7 @@ extension AppToolExecutor {
         let root = quietHost()?.dataRootOverride ?? securityCenter.dataRoot
         do {
             try await AbandonedTurnReconciliationHook.reconcile(dataRoot: root,
-                sessionId: Self.doorText(input["session_id"]), turnId: Self.doorText(input["turn_id"]))
+                sessionId: JSONValue.trimmedScalarTextOrEmpty(input["session_id"]), turnId: JSONValue.trimmedScalarTextOrEmpty(input["turn_id"]))
             return .object(["status": .string("ok"), "detail": .string("The saved turn was reconciled.")])
         } catch { return ChatToolOutcome.failure(error: error) }
     }
@@ -388,7 +386,7 @@ extension AppToolExecutor {
         TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T16"), "site": .string(
             "AppToolExecutor+AppDoor.swift:doorActionCorrection")]), turn: turn)
         let advice = try AppActions.callAdvice(action, input: call,
-            discovery: AppActions.discovery(action, dataRoot: PersistenceCore.defaultDataRoot()).objectValue ?? [:])
+            discovery: AppActions.discovery(action).objectValue ?? [:])
         return doorRefusal("action_route", "Use try_instead's app call or declared argument shape. Nothing ran.",
             remedy: "correct_route", "Make next_call instead.", next: call,
             extra: ["resolved": call["action"] ?? .null, "try_instead": advice])
@@ -443,12 +441,12 @@ extension AppToolExecutor {
     func runAppDoor(input rawInput: [String: JSONValue], surface: String, inProcess: Bool = false, turn: Turn,
         execution: AppActionExecution) async throws -> JSONValue {
         var input = rawInput
-        if AppDoorNames.resolve(Self.doorText(input["page"])) == "visible", input["action"] == nil {
+        if AppDoorNames.resolve(JSONValue.trimmedScalarTextOrEmpty(input["page"])) == "visible", input["action"] == nil {
             guard let visible = presentation.visiblePageInput else { return Self.unattachedFailure() }
             input.merge(visible) { _, visible in visible }
         }
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let resolved = try await AppActions.resolvedAction(Self.doorText(input["action"]), dataRoot: root, turn: turn)
+        let resolved = try await AppActions.resolvedAction(JSONValue.trimmedScalarTextOrEmpty(input["action"]), dataRoot: root, turn: turn)
         let form: String?
         if let resolved {
             guard let schema = resolved.discovery["args_schema"] else {
@@ -461,7 +459,7 @@ extension AppToolExecutor {
         do {
             if execution.argumentPreflightOnly {
                 guard let resolved else {
-                    return Self.doorRefusal("unknown_action", "No action is called \(Self.doorText(input["action"])). Nothing ran.",
+                    return Self.doorRefusal("unknown_action", "No action is called \(JSONValue.trimmedScalarTextOrEmpty(input["action"])). Nothing ran.",
                         remedy: "find", "Find the action's current name and argument schema before calling it.",
                         next: ["find": input["action"] ?? .string("")])
                 }
@@ -490,25 +488,13 @@ extension AppToolExecutor {
         let workspace = ChatWorkspaceBinding.operation(turn: turn, invocation: execution.invocation)
         // Approval replay carries the same receipt into this action's explicit execution.
         if let saved = input.removeValue(forKey: "__undo_receipt") {
-            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let session = turn.verifiedSessionID ?? input["__session_id"]?.scalarText ?? ""
-            guard !session.isEmpty, case .object(let receipt) = saved, receipt["action"] == input["action"],
-                  saved == (await AgentWorkspaceNavigation.shared.undoReceipt(dataRoot: root, scope: session)) else {
-                return Self.failure("stale_undo", "That undo receipt is no longer this conversation's last change. Nothing was written.")
-            }
-            var undoExecution = execution
-            undoExecution.undoReceipt = saved
-            let result = try await runAppDoor(input: input, surface: surface, inProcess: inProcess, turn: turn, execution: undoExecution)
-            if input["preview"] != .bool(true), ChatToolOutcome.outputLooksSuccessful(result), !ChatToolOutcome.isWaitingOnPerson(result) {
-                await AgentWorkspaceNavigation.shared.clearUndo(saved, dataRoot: root, scope: session)
-            }
-            return result
+            return try await doorUndoReplay(saved, input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
         }
-        if case .string? = input["item"], Self.doorText(input["item"]).isEmpty { input.removeValue(forKey: "item") }
-        let action = Self.doorText(input["action"])
+        if case .string? = input["item"], JSONValue.trimmedScalarTextOrEmpty(input["item"]).isEmpty { input.removeValue(forKey: "item") }
+        let action = JSONValue.trimmedScalarTextOrEmpty(input["action"])
         // With an action, the action is what runs. An item it did not take as its own names nothing beside it, so it is refused, never opened in
         // the action's place; a page or find beside an action stays the context it always was.
-        if let named = resolvedAction?.action, !Self.doorText(input["item"]).isEmpty {
+        if let named = resolvedAction?.action, !JSONValue.trimmedScalarTextOrEmpty(input["item"]).isEmpty {
             return Self.doorRefusal("beside_action",
                 "\(named.id) is what runs, and a field beside it is not one of its arguments. Nothing was read or done.",
                 remedy: "correct_arguments", "Put the action's own arguments inside args, as its args_schema names them.",
@@ -516,26 +502,58 @@ extension AppToolExecutor {
         }
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let scope = input["__session_id"]?.scalarText ?? turn.verifiedSessionID ?? ""
-        if action.isEmpty, Self.doorText(input["page"]).isEmpty, !Self.doorText(input["item"]).isEmpty,
+        let route = AppDoorRoute(input: input, action: action, resolvedAction: resolvedAction, workspace: workspace, root: root, scope: scope,
+            surface: surface, inProcess: inProcess, turn: turn, execution: execution)
+        if let routed = try await doorRouteByName(route) { return routed }
+        if let routed = try await doorRouteDeed(route) { return routed }
+        if let routed = try await doorRouteAction(route) { return routed }
+        return try await doorRoutePage(route)
+    }
+    /// An approval's replay of an undo runs the action with the receipt it carries, only while it is still this conversation's last change.
+    @MainActor
+    private func doorUndoReplay(_ saved: JSONValue, input: [String: JSONValue], surface: String, inProcess: Bool, turn: Turn,
+        execution: AppActionExecution) async throws -> JSONValue {
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let session = turn.verifiedSessionID ?? input["__session_id"]?.scalarText ?? ""
+        guard !session.isEmpty, case .object(let receipt) = saved, receipt["action"] == input["action"],
+              saved == (await AgentWorkspaceNavigation.shared.undoReceipt(dataRoot: root, scope: session)) else {
+            return Self.failure("stale_undo", "That undo receipt is no longer this conversation's last change. Nothing was written.")
+        }
+        var undoExecution = execution
+        undoExecution.undoReceipt = saved
+        let result = try await runAppDoor(input: input, surface: surface, inProcess: inProcess, turn: turn, execution: undoExecution)
+        if input["preview"] != .bool(true), ChatToolOutcome.outputLooksSuccessful(result), !ChatToolOutcome.isWaitingOnPerson(result) {
+            await AgentWorkspaceNavigation.shared.clearUndo(saved, dataRoot: root, scope: session)
+        }
+        return result
+    }
+    /// A name with no action: the page the call last read, a home step, or the one owner a bare item names.
+    @MainActor
+    private func doorRouteByName(_ route: AppDoorRoute) async throws -> JSONValue? {
+        var input = route.input
+        let action = route.action, workspace = route.workspace, root = route.root, scope = route.scope
+        let surface = route.surface, inProcess = route.inProcess, turn = route.turn, execution = route.execution
+        if action.isEmpty, JSONValue.trimmedScalarTextOrEmpty(input["page"]).isEmpty, !JSONValue.trimmedScalarTextOrEmpty(input["item"]).isEmpty,
            input[Self.doorScriptKey] != .bool(true), !scope.isEmpty,
            let page = await AgentWorkspaceNavigation.shared.lastDoorPage(dataRoot: root, scope: scope),
            ["tools", "skills"].contains(page) {
-            let item = Self.doorText(input["item"])
+            let item = JSONValue.trimmedScalarTextOrEmpty(input["item"])
             let known = page == "tools" ? try Parts(root: root).row(item, kind: nil) != nil
                 : try InstalledSkillInventory.match(item, in: InstalledSkillInventory.entries(dataRoot: root)) != nil
             if known || item.lowercased() == "census" { input["page"] = .string(page) }
         }
         // Call prediction must share the exact page/item resolution used by execution.
-        if let step = AppDoorNames.step(page: Self.doorText(input["page"]), item: Self.doorText(input["item"]),
-                                        action: !Self.doorText(input["action"]).isEmpty) {
+        if let step = AppDoorNames.step(page: JSONValue.trimmedScalarTextOrEmpty(input["page"]), item: JSONValue.trimmedScalarTextOrEmpty(input["item"]),
+                                        action: !JSONValue.trimmedScalarTextOrEmpty(input["action"]).isEmpty) {
             if step.page.isEmpty { input.removeValue(forKey: "page") } else { input["page"] = .string(step.page) }
             if let item = step.item { input["item"] = .string(item) }
             let result = try await runAppDoor(input: input, surface: surface, inProcess: inProcess, turn: turn, execution: execution)
             return AgentWorkspace.resolvedRead(result, as: step.label)
         }
         // A bare item names its unique owner; ambiguity is explicit, including a home room. With an action, the action runs instead.
-        if action.isEmpty, Self.doorText(input["page"]).isEmpty, case .string? = input["item"], !Self.doorText(input["item"]).isEmpty {
-            let named = Self.doorText(input["item"])
+        if action.isEmpty, JSONValue.trimmedScalarTextOrEmpty(input["page"]).isEmpty,
+           case .string? = input["item"], !JSONValue.trimmedScalarTextOrEmpty(input["item"]).isEmpty {
+            let named = JSONValue.trimmedScalarTextOrEmpty(input["item"])
             var owners = Dictionary(uniqueKeysWithValues: Self.doorItemReads.filter {
                 $0.value[named.lowercased()] != nil
             }.map { ($0.key, named.lowercased()) })
@@ -589,8 +607,30 @@ extension AppToolExecutor {
                 return shown
             }
         }
+        route.input = input
+        return nil
+    }
+    /// A deed: its keys checked, one action or a found folded into a batch, the batch run, or a script.
+    @MainActor
+    private func doorRouteDeed(_ route: AppDoorRoute) async throws -> JSONValue? {
+        var input = route.input
+        let action = route.action, surface = route.surface, turn = route.turn, execution = route.execution
         // Other keys app does not take still fail loudly; a deed key sent as null was omitted.
         for key in ToolNameAliases.appDeedKeys where input[key] == .null { input.removeValue(forKey: key) }
+        if input["expect"] == .null { input.removeValue(forKey: "expect") }
+        // A deed beside one action is a batch of one; a find beside actions is one more step of it.
+        if input["actions"] == nil || input["actions"] == .null, !action.isEmpty,
+           ToolNameAliases.appDeedKeys.contains(where: { input[$0] != nil }) {
+            var step: [String: JSONValue] = [:]
+            for key in ["action", "args", "page", "item", "expect"] {
+                if let value = input.removeValue(forKey: key), value != .null { step[key] = value }
+            }
+            input["actions"] = .array([.object(step)])
+        }
+        if case .array(let steps)? = input["actions"], let found = input["find"], found != .null {
+            input["actions"] = .array(steps + [.object(["find": found])])
+            input.removeValue(forKey: "find")
+        }
         let deed = input["actions"] != nil && input["actions"] != .null
         let valid = deed ? ToolNameAliases.appDoorKeys.union(ToolNameAliases.appDeedKeys) : ToolNameAliases.appDoorKeys
         let stray = input.keys.filter { !valid.contains($0) && !$0.hasPrefix("__") }.sorted()
@@ -601,7 +641,7 @@ extension AppToolExecutor {
             }
             return Self.doorRefusal("unknown_key",
                 "app takes no \(stray.joined(separator: ", ")). Its keys are page, item, action, args, actions, preview, "
-                + "expected_version, because, find and script, and then_say and with beside actions. An action's own arguments go inside args, "
+                + "expected_version, because, find and script. Use expect with action and then_say, or on each step of actions. An action's own arguments go inside args, "
                 + "or beside action when the call has no args. Nothing was read or done.",
                 remedy: "correct_arguments", "Call app again with only those keys; {} lists the pages.",
                 next: [:], extra: ["unrecognised": .array(stray.map(JSONValue.string)), "valid": .array(valid.sorted().map(JSONValue.string))])
@@ -636,6 +676,15 @@ extension AppToolExecutor {
             return Self.previewApproval(await doorScript(script, input: input, surface: surface, turn: turn, execution: execution),
                 preview: input["preview"] == .bool(true))
         }
+        route.input = input
+        return nil
+    }
+    /// An action: a screen name opened as its item, a scalar list fanned out, or the action itself run.
+    @MainActor
+    private func doorRouteAction(_ route: AppDoorRoute) async throws -> JSONValue? {
+        let input = route.input, action = route.action, resolvedAction = route.resolvedAction, workspace = route.workspace
+        let root = route.root, scope = route.scope, surface = route.surface, inProcess = route.inProcess, turn = route.turn
+        let execution = route.execution
         // A screen name given as an action opens the same item its DO list names.
         if !action.isEmpty, resolvedAction == nil,
            input[Self.doorScriptKey] != .bool(true),
@@ -664,9 +713,16 @@ extension AppToolExecutor {
             }
             return Self.previewApproval(value, preview: input["preview"] == .bool(true))
         }
-        let find = Self.doorText(input["find"])
-        let page = Self.doorText(input["page"])
-        var item = Self.doorText(input["item"])
+        return nil
+    }
+    /// A read: find, a guide, a home item or the index, a sense, or a page and its item.
+    @MainActor
+    private func doorRoutePage(_ route: AppDoorRoute) async throws -> JSONValue {
+        let input = route.input, workspace = route.workspace, root = route.root, scope = route.scope
+        let surface = route.surface, inProcess = route.inProcess, turn = route.turn, execution = route.execution
+        let find = JSONValue.trimmedScalarTextOrEmpty(input["find"])
+        let page = JSONValue.trimmedScalarTextOrEmpty(input["page"])
+        var item = JSONValue.trimmedScalarTextOrEmpty(input["item"])
         let pageOwner = await doorPage(page)
         if !page.isEmpty, item.isEmpty, pageOwner == nil, let correction = try await Self.doorActionCorrection(page, input: input, turn: turn) {
             return correction
@@ -693,7 +749,7 @@ extension AppToolExecutor {
                 remedy: "none", "Call the item's named action through app instead.")
         }
         // A home item does what its name says at once: there is nothing to preview, and no page version guards it.
-        if homeItem, input["preview"] == .bool(true) || !Self.doorText(input["expected_version"]).isEmpty {
+        if homeItem, input["preview"] == .bool(true) || !JSONValue.trimmedScalarTextOrEmpty(input["expected_version"]).isEmpty {
             if item.lowercased().hasSuffix(".say") {
                 var args: [String: JSONValue]
                 switch input["args"] {
@@ -714,10 +770,10 @@ extension AppToolExecutor {
                 remedy: "correct_arguments",
                 "Call app {item} again without preview or expected_version; open its room first to see what it does.")
         }
-        if !find.isEmpty { return try await doorFind(find, turn: turn, execution: execution) }
+        if !find.isEmpty { return try await doorFind(find, turn: turn) }
         if homeItem || page.lowercased() == "home" {
             if input[Self.doorScriptKey] != .bool(true), !scope.isEmpty {
-                try await AgentWorkspaceNavigation.shared.rememberDoorPage(workspace: workspace, nil, dataRoot: root, scope: scope)
+                try await AgentWorkspaceNavigation.shared.rememberDoorPage(nil, dataRoot: root, scope: scope)
             }
             var call: [String: JSONValue] = [:]
             if !item.isEmpty { call["action"] = .string(item) }
@@ -731,13 +787,13 @@ extension AppToolExecutor {
                 }
                 for (key, value) in args where value != .null { call[key] = value }
             }
-            return await doorHome(call, input: input, turn: turn, execution: execution)
+            return await doorHome(call, turn: turn, execution: execution)
         }
         if page.isEmpty {
             if input[Self.doorScriptKey] != .bool(true), !scope.isEmpty {
-                try await AgentWorkspaceNavigation.shared.rememberDoorPage(workspace: workspace, nil, dataRoot: root, scope: scope)
+                try await AgentWorkspaceNavigation.shared.rememberDoorPage(nil, dataRoot: root, scope: scope)
             }
-            return try await doorIndex(input, turn: turn, execution: execution)
+            return try await doorIndex(turn: turn, execution: execution)
         }
         if let corner = SenseCorner(key: page), let result = try await doorSenseRead(corner: corner, item: item, input: input, turn: turn,
             execution: execution) {
@@ -771,6 +827,12 @@ extension AppToolExecutor {
                 "Read {} for the pages; a page's own row opens with app {page:\"<page>\", item:\"<row>\"}. Nothing was done.", next: [:],
                 extra: ["requested": .string(page), "pages": .array(try await doorPages.map { .string($0.id) })])
         }
+        if let refused = Self.doorPageArgsRefusal(input, resolved: resolved, item: item) { return refused }
+        return try await doorRoutePageRead(route, page: page, item: item, resolved: resolved)
+    }
+    /// A page read takes args only where the page pages (offset) or bounds a conversation (limit).
+    @MainActor
+    private static func doorPageArgsRefusal(_ input: [String: JSONValue], resolved: QuietToolPage, item: String) -> JSONValue? {
         switch input["args"] {
         case .object(let args)?:
             let acceptsLimit = resolved.id == "chat" && !item.isEmpty && !item.hasPrefix("guide:")
@@ -808,6 +870,13 @@ extension AppToolExecutor {
                 remedy: "correct_arguments", "Omit args, or pass only arguments this page read accepts.",
                 extra: ["argument_path": .string("args")])
         }
+        return nil
+    }
+    /// The page's read, with what the agent needs beside it: its version, item reads, this conversation and its actions.
+    @MainActor
+    private func doorRoutePageRead(_ route: AppDoorRoute, page: String, item: String, resolved: QuietToolPage) async throws -> JSONValue {
+        let input = route.input, root = route.root, scope = route.scope
+        let surface = route.surface, turn = route.turn, execution = route.execution
         let catalog = item == "actions"
         let offset: Int64 = if case .int(let value)? = input["args"]?.objectValue?["offset"] { value } else { 0 }
         let result = Self.doorItemRead(try await doorRead(page: resolved, item: catalog ? "" : item, offset: Int(offset), surface: surface,
@@ -822,8 +891,7 @@ extension AppToolExecutor {
                 """)
         }
         if input[Self.doorScriptKey] != .bool(true), !scope.isEmpty {
-            try await AgentWorkspaceNavigation.shared.rememberDoorPage(
-                workspace: workspace, resolved.id, dataRoot: root, scope: scope)
+            try await AgentWorkspaceNavigation.shared.rememberDoorPage(resolved.id, dataRoot: root, scope: scope)
         }
         // A row that opens another place read that place (`doorOpened`): its version and `resolved` already name it.
         read["version"] = try read["version"] ?? .string(Self.doorVersion(asked: resolved.id, item: catalog ? "" : item, read))
@@ -876,6 +944,32 @@ extension AppToolExecutor {
         return Self.pageReadResult(page: resolved.id, fields: read)
     }
 }
+/// One app call on its way to its route: what it asks, as each route before it left it, and where it was asked from.
+private final class AppDoorRoute {
+    var input: [String: JSONValue]
+    let action: String
+    let resolvedAction: (action: AppAction, discovery: [String: JSONValue])?
+    let workspace: WorkspaceOperation
+    let root: URL
+    let scope: String
+    let surface: String
+    let inProcess: Bool
+    let turn: Turn
+    let execution: AppActionExecution
+    init(input: [String: JSONValue], action: String, resolvedAction: (action: AppAction, discovery: [String: JSONValue])?,
+         workspace: WorkspaceOperation, root: URL, scope: String, surface: String, inProcess: Bool, turn: Turn, execution: AppActionExecution) {
+        self.input = input
+        self.action = action
+        self.resolvedAction = resolvedAction
+        self.workspace = workspace
+        self.root = root
+        self.scope = scope
+        self.surface = surface
+        self.inProcess = inProcess
+        self.turn = turn
+        self.execution = execution
+    }
+}
 /// Preview shares execution checks and refuses invalid/user-only calls before any card can be filed.
 extension AppToolExecutor: PureToolArgumentValidating {
     public func argumentRefusal(tool: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
@@ -902,7 +996,7 @@ extension AppToolExecutor: PureToolArgumentValidating {
         if case .string(let code)? = fields["would_refuse"] {
             fields["reason"] = .string(code)
             // The detail is the owner's own words, without the preview's "Would refuse: <code>." and "Nothing was done." around them.
-            var words = Self.doorText(fields["detail"])
+            var words = JSONValue.trimmedScalarTextOrEmpty(fields["detail"])
             for prefix in ["Would refuse: \(code). ", "Would refuse: "] where words.hasPrefix(prefix) {
                 words.removeFirst(prefix.count)
                 break

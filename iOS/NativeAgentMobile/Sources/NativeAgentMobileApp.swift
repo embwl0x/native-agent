@@ -1,6 +1,5 @@
 import SwiftUI
 import AppIntents
-import CryptoKit
 import UserNotifications
 import UIKit
 import ActivityKit
@@ -175,7 +174,7 @@ struct NativeAgentMobileApp: App {
             let talk = TalkModeController.shared
             guard talk.acceptsCommand(callID: callID) else { return false }
             switch command {
-            case .mute: talk.toggleMute()
+            case .setMuted(let muted): talk.setMuted(muted)
             case .end: talk.end()
             }
             return true

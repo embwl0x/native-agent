@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import NativeAgentCore
 import Darwin
 import PersistenceCore
@@ -20,7 +21,7 @@ private enum LinkFailure: Error {
     }
 
     /// Local owner evidence goes to stderr; rejected HTTP callers still learn nothing.
-    func diagnose() {
+    @discardableResult func diagnose() -> [String: Any]? {
         let detail: String, remedy: JSONValue
         switch self {
         case .descriptor(let path, let failed):
@@ -28,17 +29,19 @@ private enum LinkFailure: Error {
             remedy = .object(["kind": .string("inspect"), "instruction": .string(detail),
                 "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("files.info"), "args": .object(["path": .string(path)])])])])
         case .http(401):
-            guard let peer = ProcessInfo.processInfo.environment["NATIVE_AGENT_PEER_ID"], UUID(uuidString: peer) != nil else { return }
+            guard let peer = ProcessInfo.processInfo.environment["NATIVE_AGENT_PEER_ID"], UUID(uuidString: peer) != nil else { return nil }
             detail = """
-                The local connector's credential was rejected. Connect this same contact to repair its entry, then reconcile the retained request_id; do not \
-                resend an uncertain message.
+                The local connector's credential was rejected. Run nativeagent-link contacts to open Connections in this installation. \
+                Choose the existing contact and Reconnect. Then check the retained request ID before sending again.
                 """
-            remedy = Repair.remedy(owner: "Keychain peer:" + peer, nextCall: .object(["tool": .string("app"),
-                "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer)])])]), tap: nil)
-        default: return
+            remedy = .object(["kind": .string("repair"), "open_url": .string("nativeagent://contacts"),
+                              "tap": .string("Connections → existing contact → Reconnect"), "next_call": .null])
+        default: return nil
         }
         let value = JSONValue.object(["detail": .string(detail), "remedy": remedy])
-        if let data = try? value.serializedData(pretty: false) { FileHandle.standardError.write(data + Data([10])) }
+        guard let data = try? value.serializedData(pretty: false) else { return nil }
+        FileHandle.standardError.write(data + Data([10]))
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 }
 
@@ -229,6 +232,7 @@ private struct NativeAgentLink {
     nativeagent-link reply --session id --request id [--offset n] [--artifact id] [--contact id]
     nativeagent-link reply --contact id < reply.json
     nativeagent-link mcp
+    nativeagent-link contacts
 
     Connects to the running NativeAgent on this Mac. Message waits up to 25 s
     for the reply; if it is still in progress it returns the enqueue
@@ -250,6 +254,18 @@ private struct NativeAgentLink {
         let args = Array(CommandLine.arguments.dropFirst())
         if args == ["--help"] || args == ["-h"] { print(usage); return }
         if args == ["mcp"] { await relay(); return }
+        if args == ["contacts"] {
+            let app = Bundle.main.executableURL?.resolvingSymlinksInPath()
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            guard let app, app.pathExtension == "app", let url = URL(string: "nativeagent://contacts") else {
+                output(["error": "Run the helper inside the installed NativeAgent.app."]); Darwin.exit(1)
+            }
+            do {
+                _ = try await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: .init())
+                output(["status": "open_requested"])
+            } catch { output(["error": error.localizedDescription]); Darwin.exit(1) }
+            return
+        }
         if args.count == 3, args[0] == "reply", args[1] == "--contact" {
             await submitReply(peer: args[2]); return
         }
@@ -333,7 +349,7 @@ private struct NativeAgentLink {
             }
             output(result)
         } catch {
-            (error as? LinkFailure)?.diagnose()
+            recovery["diagnostic"] = (error as? LinkFailure)?.diagnose()
             recovery["error"] = (error as? LinkFailure)?.label ?? "request_failed"
             recovery["automatically_resent"] = false
             output(recovery)
@@ -432,10 +448,12 @@ private struct NativeAgentLink {
                 ? ["jsonrpc": "2.0", "id": id, "result": ["content": [["type": "text", "text": text]], "isError": true]]
                 : ["jsonrpc": "2.0", "id": id, "error": ["code": -32000, "message": text]])
         } catch {
-            (error as? LinkFailure)?.diagnose()
+            let diagnostic = (error as? LinkFailure)?.diagnose()
             if let id {
+                var failure: [String: Any] = ["code": -32000, "message": (error as? LinkFailure)?.label ?? "request_failed"]
+                failure["data"] = diagnostic
                 output(["jsonrpc": "2.0", "id": id,
-                        "error": ["code": -32000, "message": (error as? LinkFailure)?.label ?? "request_failed"]])
+                        "error": failure])
             }
         }
     }

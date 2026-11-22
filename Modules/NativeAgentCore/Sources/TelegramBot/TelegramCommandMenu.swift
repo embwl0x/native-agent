@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `TelegramCommandMenu.swift` | `TelegramCommandMenuStatus` and `TelegramCommandMenuSync`: command-menu synchronization status contract |
+// Blueprint: | `TelegramCommandMenu.swift` | `TelegramCommandMenuStatus`: command-menu synchronization status contract |
 
 public struct TelegramCommandMenuStatus: Sendable, Codable, Equatable {
     public let commandCount: Int
@@ -13,8 +13,3 @@ public struct TelegramCommandMenuStatus: Sendable, Codable, Equatable {
         self.syncedAt = syncedAt
     }
 }
-
-public typealias TelegramCommandMenuSync = @Sendable (
-    _ token: String,
-    _ commands: [TelegramBotCommand]
-) async throws -> TelegramCommandMenuStatus

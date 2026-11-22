@@ -31,11 +31,7 @@ public struct SessionConversation: Sendable {
         helperSessions = Set(helpers.filter { $0.value }.keys)
         kinds = rows.reduce(into: [:]) { result, row in
             guard case .string(let id)? = row["id"] else { return }
-            func string(_ key: String) -> String? {
-                if case .string(let value)? = row[key] { return value }
-                return nil
-            }
-            result[id] = Self.kind(threadKind: string("threadKind"), source: string("source"), sourceKey: string("sourceKey"))
+            result[id] = Self.kind(threadKind: row["threadKind"]?.stringValue, source: row["source"]?.stringValue, sourceKey: row["sourceKey"]?.stringValue)
         }
     }
 

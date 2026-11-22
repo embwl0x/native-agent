@@ -3,148 +3,51 @@ import Foundation
 import NativeAgentShared
 import SwiftUI
 
-// Blueprint: | `TranscriptAttachments.swift` | Document view attachments: one hosted view per block id, fed from the model, sized to fit |
+// Blueprint: | `TranscriptAttachments.swift` | The Mac's hosted attachment views on the Shared hosts: conversation data, box, host and model |
 
-/// Retain one hosted view per block id; updates push the model and the controller places its measured frame.
-@MainActor final class TranscriptAttachments {
-    /// Set by the view. Called when a hosted view's height changes; the view re-lays that block's paragraph.
-    var heightChanged: (_ blockID: String) -> Void = { _ in }
+/// The Mac's hosted views: each block's box reads the conversation's resolved attachments, and its card or other-room row can open
+/// a contact thread or retry a message through the view.
+@MainActor final class TranscriptAttachments: TranscriptAttachmentHosts<TranscriptAttachmentBox, TranscriptAttachmentRoot> {
     /// Set by the view. An other-room row was clicked: open that contact thread.
     var openExchange: (OtherRoomExchange) -> Void = { _ in }
     var retryMessage: (String) -> Void = { _ in }
 
-    private var entries: [String: Entry] = [:]
     private var data: TranscriptAttachmentData?
     private var environment: EnvironmentValues?
-    private var columnWidth: CGFloat = 0
-    /// Blocks whose size must be read again; read together on the next main-actor turn, outside any layout pass.
-    private var pending: Set<String> = []
-    private var measureScheduled = false
-
-    init() {}
 
     /// The same block id returns the same attachment while the block lives.
     func attachment(blockID: String, ref: TranscriptAttachmentRef, role: String) -> NSTextAttachment {
-        if let entry = entries[blockID] {
-            // A growing reply can change what its block shows (a table gains rows) under the same id.
-            if entry.ref != ref {
-                entry.ref = ref
-                entry.box.model = data.map { TranscriptAttachmentModel(ref, blockID: blockID, role: role, in: $0) }
-                    ?? .waiting("Waiting on attachment data… Close this conversation to stop viewing it.")
-                remeasure(blockID)
-            }
-            return entry.attachment
+        retained(blockID: blockID, ref: ref, role: role, rebind: { box in
+            box.model = data.map { TranscriptAttachmentModel(ref, blockID: blockID, role: role, in: $0) }
+                ?? .waiting("Waiting on attachment data… Close this conversation to stop viewing it.")
+        }) { resized in
+            let model = data.map { TranscriptAttachmentModel(ref, blockID: blockID, role: role, in: $0) }
+                ?? .waiting("Waiting on attachment data… Close this conversation to stop viewing it.")
+            let box = TranscriptAttachmentBox(model: model, environment: environment)
+            box.resized = resized
+            box.open = { [weak self] exchange in self?.openExchange(exchange) }
+            box.retry = { [weak self] message in self?.retryMessage(message) }
+            // The controller's view (an NSHostingView) is the attachment's view; the controller measures it at the column width.
+            let host = NSHostingController(rootView: TranscriptAttachmentRoot(box: box))
+            // TextKit places the view by frame; the host neither drives Auto Layout nor insets for the window's bars.
+            host.sizingOptions = []
+            host.safeAreaRegions = []
+            // A hosted view draws only inside its paragraph's room: a card that settles smaller never leaves its old controls over the next row.
+            host.view.clipsToBounds = true
+            return (box, host)
         }
-        let model = data.map { TranscriptAttachmentModel(ref, blockID: blockID, role: role, in: $0) }
-            ?? .waiting("Waiting on attachment data… Close this conversation to stop viewing it.")
-        let box = TranscriptAttachmentBox(model: model, environment: environment)
-        box.resized = { [weak self] in self?.remeasure(blockID) }
-        box.open = { [weak self] exchange in self?.openExchange(exchange) }
-        box.retry = { [weak self] message in self?.retryMessage(message) }
-        // The controller's view (an NSHostingView) is the attachment's view; the controller measures it at the column width.
-        let host = NSHostingController(rootView: TranscriptAttachmentRoot(box: box))
-        // TextKit places the view by frame; the host neither drives Auto Layout nor insets for the window's bars.
-        host.sizingOptions = []
-        host.safeAreaRegions = []
-        // A hosted view draws only inside its paragraph's room: a card that settles smaller never leaves its old controls over the next row.
-        host.view.clipsToBounds = true
-        let entry = Entry(ref: ref, role: role, box: box, host: host, attachment: TranscriptAttachment(blockID: blockID))
-        entries[blockID] = entry
-        // Sized before TextKit first lays the paragraph out, so the first layout is the right one.
-        measure(entry)
-        return entry.attachment
     }
 
     /// Fresh data, SwiftUI environment and column width before every document edit; live hosted views refresh from it.
     func update(_ data: TranscriptAttachmentData, environment: EnvironmentValues, columnWidth: CGFloat) {
-        let resized = columnWidth != self.columnWidth
         self.data = data
         self.environment = environment
-        self.columnWidth = columnWidth
-        for (blockID, entry) in entries {
+        refresh(columnWidth: columnWidth) { entry, blockID in
             entry.box.environment = environment
             let model = TranscriptAttachmentModel(entry.ref, blockID: blockID, role: entry.role, in: data)
-            if model != entry.box.model {
-                entry.box.model = model
-                remeasure(blockID)
-            } else if resized {
-                remeasure(blockID)
-            }
-        }
-    }
-
-    /// The view is a block's hosted view or inside one.
-    func hosts(_ view: NSView) -> Bool {
-        entries.values.contains { view.isDescendant(of: $0.host.view) }
-    }
-
-    /// Blocks gone from the document.
-    func forget(_ blockIDs: Set<String>) {
-        for blockID in blockIDs {
-            entries[blockID]?.host.view.removeFromSuperview()
-            entries[blockID] = nil
-        }
-        pending.subtract(blockIDs)
-    }
-
-    /// Place retained hosts at their laid-out attachment frames; hide hosts outside layout.
-    func place(_ frames: [String: CGRect], in textView: NSView) {
-        for (blockID, entry) in entries {
-            let view = entry.host.view
-            guard let frame = frames[blockID] else {
-                if view.superview != nil, !view.isHidden { view.isHidden = true }
-                continue
-            }
-            if view.superview !== textView { textView.addSubview(view) }
-            if view.frame != frame { view.frame = frame }
-            if view.isHidden { view.isHidden = false }
-        }
-    }
-
-
-    private func remeasure(_ blockID: String) {
-        pending.insert(blockID)
-        guard !measureScheduled else { return }
-        measureScheduled = true
-        Task { @MainActor [weak self] in self?.measurePending() }
-    }
-
-    private func measurePending() {
-        measureScheduled = false
-        let blockIDs = pending
-        pending = []
-        for blockID in blockIDs {
-            guard let entry = entries[blockID], measure(entry) else { continue }
-            heightChanged(blockID)
-        }
-    }
-
-    /// The hosted view's fitting size at the column width: its own width up to the column (so paragraph alignment can seat it)
-    /// and its whole height. Returns whether the size changed. Before the view gives a column width there is nothing to fit.
-    @discardableResult
-    private func measure(_ entry: Entry) -> Bool {
-        guard columnWidth > 0 else { return false }
-        let fit = entry.host.sizeThatFits(in: CGSize(width: columnWidth, height: .greatestFiniteMagnitude))
-        let size = CGSize(width: min(fit.width.rounded(.up), columnWidth), height: fit.height.rounded(.up))
-        guard size != entry.attachment.bounds.size else { return false }
-        entry.attachment.bounds = CGRect(origin: .zero, size: size)
-        return true
-    }
-
-    private final class Entry {
-        var ref: TranscriptAttachmentRef
-        let role: String
-        let box: TranscriptAttachmentBox
-        let host: NSHostingController<TranscriptAttachmentRoot>
-        let attachment: TranscriptAttachment
-
-        init(ref: TranscriptAttachmentRef, role: String, box: TranscriptAttachmentBox, host: NSHostingController<TranscriptAttachmentRoot>,
-             attachment: TranscriptAttachment) {
-            self.ref = ref
-            self.role = role
-            self.box = box
-            self.host = host
-            self.attachment = attachment
+            guard model != entry.box.model else { return false }
+            entry.box.model = model
+            return true
         }
     }
 }
@@ -219,28 +122,5 @@ enum TranscriptAttachmentModel: Equatable {
                 self = .waiting("Waiting on attachment \(blockID)'s resolved presentation. Its absence does not settle it.")
             }
         }
-    }
-}
-
-/// TextKit reserves the measured room; the document controller places the hosted view over it.
-final class TranscriptAttachment: NSTextAttachment {
-    let blockID: String
-
-    init(blockID: String) {
-        self.blockID = blockID
-        super.init(data: Data(blockID.utf8), ofType: "com.nativeagent.transcript.attachment")
-        allowsTextAttachmentView = false
-    }
-
-    required init?(coder: NSCoder) { nil }
-
-    /// The hosted view is the only drawing; there is no image under it.
-    override func image(for bounds: CGRect, attributes: [NSAttributedString.Key: Any], location: any NSTextLocation,
-                        textContainer: NSTextContainer?) -> NSImage? { nil }
-
-    /// The hosted view's measured size (kept in `bounds` by the owner), never wider than the line; zero until measured.
-    override func attachmentBounds(for attributes: [NSAttributedString.Key: Any], location: any NSTextLocation,
-                                   textContainer: NSTextContainer?, proposedLineFragment: CGRect, position: CGPoint) -> CGRect {
-        CGRect(x: 0, y: 0, width: min(bounds.width, proposedLineFragment.width), height: bounds.height)
     }
 }

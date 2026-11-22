@@ -30,22 +30,25 @@ enum AgentWorkspaceActionReadback {
     static func followUp(tool: String, input: [String: JSONValue], receipt: JSONValue,
                          title: String, perform: AgentWorkspace.Perform) async throws -> Readback? {
         let reply = ToolResult(receipt)
-        let owner = object(receipt)
-        let status = string(owner["status"])
+        let owner = JSONValue.objectOrEmpty(receipt)
+        let status = AgentWorkspaceApps.boundedString(owner["status"])
         var source: AgentWorkspaceLocation?
         var scope: String?
         var failure = "The action returned, but its current result could not be read: "
         var caution = ". Reopen this source to read; do not repeat the action."
         if computerEffects.contains(tool) {
             var arguments: [String: JSONValue] = ["structured": .bool(true)]
-            let detail = object(owner["detail"] ?? .null)
-            let output = object(owner["output"] ?? .null)
+            let detail = JSONValue.objectOrEmpty(owner["detail"])
+            let output = JSONValue.objectOrEmpty(owner["output"])
             func recipient(_ fields: [String: JSONValue]) -> String? {
-                let app = object(fields["app"] ?? .null)
-                return string(fields["bundle_identifier"]) ?? string(app["bundle_id"])
-                    ?? string(fields["app"]) ?? string(app["name"]) ?? string(fields["matched_name"])
+                let app = JSONValue.objectOrEmpty(fields["app"])
+                return AgentWorkspaceApps.boundedString(fields["bundle_identifier"])
+                    ?? AgentWorkspaceApps.boundedString(app["bundle_id"])
+                    ?? AgentWorkspaceApps.boundedString(fields["app"])
+                    ?? AgentWorkspaceApps.boundedString(app["name"])
+                    ?? AgentWorkspaceApps.boundedString(fields["matched_name"])
             }
-            let app = recipient(detail) ?? recipient(output) ?? recipient(owner) ?? string(input["app"])
+            let app = recipient(detail) ?? recipient(output) ?? recipient(owner) ?? AgentWorkspaceApps.boundedString(input["app"])
             if let app { arguments["app"] = .string(app) }
             let computer = AgentWorkspaceLocation.record(tool: "screen", input: arguments, title: "Computer")
             guard app != nil else {
@@ -61,7 +64,7 @@ enum AgentWorkspaceActionReadback {
         } else if tool == "mac_reminders_complete", status == "completed",
            owner["source"] == .string("eventkit"), reply.outcome == .succeeded {
             caution = ". Do not repeat the change."
-            if let id = string(owner["reminderId"]) {
+            if let id = AgentWorkspaceApps.boundedString(owner["reminderId"]) {
                 source = .record(tool: "mac_reminders_read", input: ["id": .string(id)], title: "Reminder")
                 failure = "The change completed, but the exact reminder could not be read: "
             } else {
@@ -83,7 +86,7 @@ enum AgentWorkspaceActionReadback {
                     ? AgentWorkspaceLocation.record(tool: reader, input: arguments,
                         title: AgentWorkspaceWork.desk(input: arguments, result: current).title)
                     : source
-                var row = object(attaching(current, receipt: receipt))
+                var row = JSONValue.objectOrEmpty(attaching(current, receipt: receipt))
                 if let scope { row["workspace_readback_scope"] = .string(scope) }
                 return .init(location: location, result: .object(row))
             } catch is CancellationError { throw CancellationError() }
@@ -93,12 +96,12 @@ enum AgentWorkspaceActionReadback {
             }
         }
         if browserEffects.contains(tool), status == "outcome_unknown", owner["error"] != nil,
-           let tab = integer(input["tab_id"]) {
+           let tab = input["tab_id"]?.nonnegativeInt64 {
             let arguments: [String: JSONValue] = ["tab_id": .int(tab)]
             let source = AgentWorkspaceLocation.record(tool: "browser.chrome_snapshot", input: arguments, title: title)
             do {
                 let fresh = try await perform("browser.chrome_snapshot", arguments)
-                if matches(fresh, tab: tab, sequence: integer(input["expected_user_sequence"])) {
+                if matches(fresh, tab: tab, sequence: input["expected_user_sequence"]?.nonnegativeInt64) {
                     return .init(location: source, result: attaching(fresh, receipt: receipt))
                 }
                 return .init(location: source, result: unavailable(receipt: receipt,
@@ -109,13 +112,13 @@ enum AgentWorkspaceActionReadback {
         }
         guard browserEffects.contains(tool), owner["ok"] != .bool(false), owner["error"] == nil,
               owner["error_code"] == nil else { return nil }
-        let actionReceipt = object(owner["receipt"] ?? .null)
-        let outcome = string(owner["outcome"]) ?? string(actionReceipt["outcome"])
+        let actionReceipt = JSONValue.objectOrEmpty(owner["receipt"])
+        let outcome = AgentWorkspaceApps.boundedString(owner["outcome"]) ?? AgentWorkspaceApps.boundedString(actionReceipt["outcome"])
         let succeeded = outcome == "succeeded"
         guard succeeded,
-              let tab = integer(owner["tabId"]) ?? integer(actionReceipt["tabId"]) ?? integer(input["tab_id"]) else { return nil }
-        if tool != "browser.chrome_navigate", let selected = integer(input["tab_id"]), selected != tab { return nil }
-        let sequence = integer(owner["userSequence"]) ?? integer(actionReceipt["userSequence"]) ?? integer(input["expected_user_sequence"])
+              let tab = owner["tabId"]?.nonnegativeInt64 ?? actionReceipt["tabId"]?.nonnegativeInt64 ?? input["tab_id"]?.nonnegativeInt64 else { return nil }
+        if tool != "browser.chrome_navigate", let selected = input["tab_id"]?.nonnegativeInt64, selected != tab { return nil }
+        let sequence = owner["userSequence"]?.nonnegativeInt64 ?? actionReceipt["userSequence"]?.nonnegativeInt64 ?? input["expected_user_sequence"]?.nonnegativeInt64
         let readInput: [String: JSONValue] = ["tab_id": .int(tab)]
         var requestInput = readInput
         if tool == "browser.chrome_navigate" {
@@ -141,16 +144,16 @@ enum AgentWorkspaceActionReadback {
 
     private static func matches(_ snapshot: JSONValue, tab: Int64, sequence: Int64?) -> Bool {
         let reply = ToolResult(snapshot)
-        let row = object(snapshot)
+        let row = JSONValue.objectOrEmpty(snapshot)
         guard reply.hasReadEvidence(),
-              row["tabId"] == .int(tab), string(row["snapshotId"]) != nil,
-              integer(row["tabId"]) != nil, case .array? = row["nodes"],
-              let observed = integer(row["userSequence"]) else { return false }
+              row["tabId"] == .int(tab), AgentWorkspaceApps.boundedString(row["snapshotId"]) != nil,
+              row["tabId"]?.nonnegativeInt64 != nil, case .array? = row["nodes"],
+              let observed = row["userSequence"]?.nonnegativeInt64 else { return false }
         return sequence == nil || observed == sequence
     }
 
     private static func attaching(_ result: JSONValue, receipt: JSONValue) -> JSONValue {
-        var row = object(result)
+        var row = JSONValue.objectOrEmpty(result)
         if case .string(let text) = result { row["content"] = .string(text) }
         row["action_receipt"] = AgentWorkspaceEnvironment.retained(receipt)
         return .object(row)
@@ -162,9 +165,4 @@ enum AgentWorkspaceActionReadback {
         if let observation { row["readback"] = AgentWorkspaceEnvironment.retained(observation) }
         return .object(row)
     }
-
-    private static func object(_ value: JSONValue) -> [String: JSONValue] { if case .object(let row) = value { return row }; return [:] }
-    private static func string(_ value: JSONValue?) -> String? { guard case .string(let text)? = value, !text.isEmpty, text.count <= 8192 else { return nil };
-        return text }
-    private static func integer(_ value: JSONValue?) -> Int64? { guard case .int(let value)? = value, value >= 0 else { return nil }; return value }
 }

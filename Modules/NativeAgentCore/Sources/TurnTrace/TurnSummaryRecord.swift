@@ -158,18 +158,4 @@ public enum TurnSummarySource {
         }
         return (next, read.lastSeq ?? after, true)
     }
-
-    /// Append yesterday after today so equal-time grouping retains today's original arrival precedence.
-    public static func loadEvents(root: URL, now: Date = Date(), includeYesterday: Bool = true) async throws -> [TurnTraceEvent] {
-        let calendar = TurnTracePersistLane.dayCalendar
-        let today = calendar.startOfDay(for: now)
-        guard let from = calendar.date(byAdding: .day, value: includeYesterday ? -1 : 0, to: today) else {
-            throw CocoaError(.fileReadUnknown)
-        }
-        let read = try await TurnTraceReplayReader.read(.init(from: from, through: now), root: root)
-        guard read.isClean else { throw CocoaError(.fileReadCorruptFile) }
-        // Today's equal-time arrival precedence is the same on both faces.
-        let turns = read.events.filter { $0.turnId != "unknown" }
-        return turns.filter { $0.ts >= today } + turns.filter { $0.ts < today }
-    }
 }

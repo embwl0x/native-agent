@@ -56,6 +56,17 @@ extension AppDelegate {
     }
 
     @MainActor
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard urls.contains(where: { $0.absoluteString == "nativeagent://contacts" }) else { return }
+        Task { @MainActor in
+            do {
+                try await ApplicationLifetime.shared.prepare()
+                SettingsLink.open(.connectors)
+            } catch { Self.presentFaceUnavailable(error) }
+        }
+    }
+
+    @MainActor
     func applicationShouldHandleReopen(_: NSApplication, hasVisibleWindows _: Bool) -> Bool {
         guard Self.faceProcess != nil else { return false }
         Self.requestFaceWindowIfInstalled()

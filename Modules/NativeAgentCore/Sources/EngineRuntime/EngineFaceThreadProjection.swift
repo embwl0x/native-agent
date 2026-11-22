@@ -115,7 +115,7 @@ enum EngineFaceThreadProjection {
         if let stop = flight.stop {
             if stop.state == "stopped" { value.receipt = "Stopped." }
             if !stop.detail.isEmpty {
-                value.waiting.append(row("stop:" + flight.recordID, title: stop.state, detail: stop.detail, state: stop.state))
+                value.waiting.append(row("stop:" + flight.recordID, title: "Stopped", detail: stop.detail, state: stop.state))
             }
         }
         value.queued = flight.queued.map { queued in

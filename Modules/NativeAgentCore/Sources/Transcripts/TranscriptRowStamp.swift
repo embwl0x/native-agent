@@ -43,13 +43,12 @@ public struct TranscriptRowStamp: Sendable, Equatable {
     }
 
     public static func of(id: String, role: String, metadata: [String: JSONValue], rowSource: String? = nil) -> Self {
-        func text(_ value: JSONValue?) -> String? { if case .string(let text)? = value { text } else { nil } }
         let origin: [String: JSONValue] = if case .object(let value)? = metadata["origin"] { value } else { [:] }
         let envelope: [String: JSONValue] = if case .object(let value)? = metadata["envelope"] { value } else { [:] }
-        let untrusted: [String] = if case .array(let values)? = metadata["untrusted_sources"] { values.compactMap(text) } else { [] }
-        return of(id: id, role: role, userId: text(envelope["userId"]), originAgent: text(origin["agent"]), replyTo: text(origin["replyTo"]),
-                  authored: text(origin["authored"]), envelopeAgent: text(envelope["agent"]),
-                  surfaces: [text(origin["surface"]), text(envelope["surface"]), rowSource].compactMap { $0 },
+        let untrusted: [String] = if case .array(let values)? = metadata["untrusted_sources"] { values.compactMap(\.stringValue) } else { [] }
+        return of(id: id, role: role, userId: envelope["userId"]?.stringValue, originAgent: origin["agent"]?.stringValue, replyTo: origin["replyTo"]?.stringValue,
+                  authored: origin["authored"]?.stringValue, envelopeAgent: envelope["agent"]?.stringValue,
+                  surfaces: [origin["surface"]?.stringValue, envelope["surface"]?.stringValue, rowSource].compactMap { $0 },
                   byPerson: metadata["byPerson"] == .bool(true), unattested: metadata["unattested"] == .bool(true), untrusted: untrusted)
     }
 

@@ -51,14 +51,10 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
             fields["status"] = .string([.approvalFiled, .approvalDeliveryFailed].contains(self) ? "waiting_approval" : "not_run")
         }
         if self == .blocked {
-            func text(_ key: String) -> String? {
-                if case .string(let value)? = fields[key] { return value }
-                return nil
-            }
             var named = tool
-            if named == nil { named = text("tool") }
+            if named == nil { named = fields["tool"]?.stringValue }
             fields["detail"] = .string(Self.blockedSentence(
-                reason: text("gate_reason") ?? text("detail") ?? text("message"), tool: named))
+                reason: fields["gate_reason"]?.stringValue ?? fields["detail"]?.stringValue ?? fields["message"]?.stringValue, tool: named))
         } else {
             fields["detail"] = .string(sentence(location: location))
         }
@@ -126,9 +122,7 @@ public protocol NonBlockingApprovalFiler: ApprovalFiler {
         id: String,
         toolName: String,
         surface: String,
-        payload: JSONValue,
-        reason: String,
-        turn: Turn
+        reason: String
     ) async -> JSONValue
 }
 

@@ -88,8 +88,7 @@ struct DiagnosticsRailPage: View {
             title: "Diagnostics",
             subtitlePage: .diagnostics,
             tabs: ShellRailTab.shown(.diagnostics, Self.tabs, layout),
-            selection: $tab,
-            alive: true
+            selection: $tab
         ) { key in
             switch key {
             case "diagnostics":

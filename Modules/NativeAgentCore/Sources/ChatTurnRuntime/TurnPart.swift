@@ -1,7 +1,6 @@
 import AuthoredCapabilities
 import AgentWorkspace
 import ChatTurnContracts
-import CryptoKit
 import Experiences
 import Foundation
 import NativeAgentCore
@@ -128,8 +127,10 @@ struct TurnPart {
         let before = heals
         let inFlight = try await rebuild()
         let lastStart = log.lastIndex { if case .object(let entry) = $0 { entry["start"] != nil } else { false } } ?? -1
+        // Effects queued beside the last started one were decided on certain ground unless a call is still in flight:
+        // then finish them (reply.end and after a checkpointed stream); with a call in flight, the program decides again.
         let pending = queue.filter {
-            $0.effect["effect"] != .string("app") && (heals != before || $0.step > lastStart)
+            $0.effect["effect"] != .string("app") && (heals != before || !inFlight || $0.step > lastStart)
         }
         let dropped = pending.count != queue.count
         queue = pending
@@ -290,11 +291,6 @@ struct TurnPart {
         return found
     }
 
-    private static func digest(_ value: JSONValue) throws -> String {
-        let text = try value.serialize(pretty: false)
-        return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
     /// Replay one log for resume and repair; match effects by identity, retain unknown in-flight starts and queue only unstarted work.
     private mutating func reconstruct() async throws -> Bool {
         state = .null; queue = []; round = nil; rounds = 0; seen = [:]
@@ -391,7 +387,7 @@ struct TurnPart {
                     guard call["tool"] == .string("app"), case .object(let input)? = call["input"] else {
                         throw Fault(code: "malformed", why: "Its own app call must be {tool: \"app\", input: {…}}.")
                     }
-                    let digest = try Self.digest(.object(input))
+                    let digest = try JSONValue.object(input).serializedSHA256()
                     let id = "own_\(index)_\(place)_" + String(digest.prefix(16))
                     effect = ["effect": .string("app"), "call": .object(["id": .string(id), "tool": .string("app"), "input": .object(input)])]
                     admittedCall = "app:" + id
@@ -448,7 +444,7 @@ struct TurnPart {
             if let admittedCall { identity = admittedCall }
             else if case .string(let own)? = effect["id"], !own.isEmpty { identity = name + ":" + own }
             else {
-                identity = name + ":" + (try Self.digest(item))
+                identity = name + ":" + (try item.serializedSHA256())
                 seen[identity, default: 0] += 1
                 identity += "#\(seen[identity] ?? 1)"
             }
@@ -859,13 +855,16 @@ public enum AttentionNotebook {
     }
 
     /// Merge `set` into the notebook; a null value removes its key.
-    static func write(_ set: [String: JSONValue], dataRoot: URL) throws {
-        let before = try read(dataRoot: dataRoot)
-        var notebook = before
-        for (key, value) in set { notebook[key] = value == .null ? nil : value }
-        guard notebook != before else { return }
-        let target = url(dataRoot)
-        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(try JSONValue.object(notebook).serialize(pretty: false).utf8), to: target)
+    static func write(_ set: [String: JSONValue], dataRoot: URL) async throws {
+        let snapshot = try read(dataRoot: dataRoot)
+        if set.allSatisfy({ key, value in snapshot[key] == (value == .null ? nil : value) }) { return }
+        let target = url(dataRoot).standardizedFileURL
+        try await SwiftNativePersistenceCore.withFileLock(target) {
+            let before = try read(dataRoot: dataRoot)
+            var notebook = before
+            for (key, value) in set { notebook[key] = value == .null ? nil : value }
+            guard notebook != before else { return }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(try JSONValue.object(notebook).serialize(pretty: false).utf8), to: target)
+        }
     }
 }

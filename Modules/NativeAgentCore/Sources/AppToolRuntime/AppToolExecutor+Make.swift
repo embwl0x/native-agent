@@ -174,7 +174,7 @@ extension AppToolExecutor {
 
     /// Reply images share make.add's workspace fence and belong only to the current turn.
     @MainActor
-    func runReplyAttach(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
+    func runReplyAttach(input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let path = input["path"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the image to send with this reply.") }
         guard let choices = turn.replyChoices else {

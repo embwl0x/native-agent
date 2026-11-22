@@ -321,7 +321,6 @@ extension MemoryStorage {
     /// Carry pinned person facts and whether any eligible person facts exist, from one disclosure-filtered read.
     public func userPromptCore(surface: String) async throws -> (facts: [String], established: Bool) {
         let now = Date()
-        let dataRoot = path.deletingLastPathComponent().deletingLastPathComponent()
         return try await dbPool.read { db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT \(Self.memoryProjectionColumns) FROM memories WHERE status = 'active' AND persona_id = ?
@@ -332,8 +331,8 @@ extension MemoryStorage {
                     .permits(surface: surface, personaID: nil) == true
             }
             let pinned = rows.filter { Self.metadataFlag($0.metadata, "pinned") }
-            return (Array(UserMDGenerator.userFacts(memories: pinned, now: now, dataRoot: dataRoot)),
-                    UserMDGenerator.userFacts(memories: rows, now: now, dataRoot: dataRoot).contains { _ in true })
+            return (Array(UserMDGenerator.userFacts(memories: pinned, now: now)),
+                    UserMDGenerator.userFacts(memories: rows, now: now).contains { _ in true })
         }
     }
 }

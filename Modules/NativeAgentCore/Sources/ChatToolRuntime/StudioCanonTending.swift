@@ -11,10 +11,8 @@ import TrustCenter
 
 public struct StudioCanonTendingReport: Sendable, Equatable {
     public var evaluatedWorks: Int
-    public var proposalsConsidered: Int
     public var stagedApprovalIDs: [String]
     public var duplicatesSkipped: Int
-    public var pendingCapReached: Bool
     public var nextAt: Date?
     public var audit: StudioRelationAuditReport
     public var auditReadFailure: String? = nil
@@ -79,14 +77,13 @@ public enum StudioCanonTending {
             let drafts = entries.isEmpty ? [] : projection.drafts
             guard !drafts.isEmpty else {
                 return StudioCanonTendingReport(
-                    evaluatedWorks: evidence.count, proposalsConsidered: 0,
+                    evaluatedWorks: evidence.count,
                     stagedApprovalIDs: [], duplicatesSkipped: 0,
-                    pendingCapReached: false, nextAt: projection.nextAt, audit: audit,
+                    nextAt: projection.nextAt, audit: audit,
                     auditReadFailure: auditReadFailure, auditPersistenceFailure: auditPersistenceFailure
                 )
             }
             let inbox = inbox ?? SwiftNativeApprovalInbox(root: dataRoot)
-            var capReached = false
             var staged: [String] = []
             var duplicates = 0
             var stagingFailure: String?
@@ -99,10 +96,7 @@ public enum StudioCanonTending {
                     let records = try await inbox.list(filter: ApprovalFilter(
                         status: nil, action: StudioCanonProposal.approvalAction
                     ))
-                    guard records.filter({ $0.status == "pending" }).count < StudioCanonProposal.pendingProposalCap else {
-                        capReached = true
-                        break
-                    }
+                    guard records.filter({ $0.status == "pending" }).count < StudioCanonProposal.pendingProposalCap else { break }
                     let alreadyFiled: Bool
                     do {
                         alreadyFiled = try StudioCanonProposal.isAlreadyFiled(
@@ -133,10 +127,8 @@ public enum StudioCanonTending {
             }
             return StudioCanonTendingReport(
                 evaluatedWorks: evidence.count,
-                proposalsConsidered: drafts.count,
                 stagedApprovalIDs: staged,
                 duplicatesSkipped: duplicates,
-                pendingCapReached: capReached,
                 nextAt: projection.nextAt,
                 audit: audit,
                 auditReadFailure: auditReadFailure, auditPersistenceFailure: auditPersistenceFailure,

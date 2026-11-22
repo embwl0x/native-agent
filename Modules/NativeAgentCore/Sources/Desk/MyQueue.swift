@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `MyQueue.swift` | `MyQueue`, `entries`, `add`, `releaseSignal`, `releaseNews`, `freeAfter`, `shown`, `spoken`, `Entry.owedToPerson` |
 
@@ -191,7 +192,39 @@ public enum MyQueue {
 
     /// An after_card step its card's settle released to run on its own: the card had no continued turn to hand it to. A card that continues a
     /// turn hands its steps to that turn instead (`AgentScreen.resume`), so a card answer never wakes a second turn.
-    public static let cardReleased = "card_released"
+    private static let legacyCardRelease = "card_released"
+    private static let cardReleasePrefix = legacyCardRelease + ":"
+
+    package static func cardReleaseStatus(_ card: String) -> String { cardReleasePrefix + card }
+
+    static func isCardReleaseStatus(_ status: String?) -> Bool {
+        status == legacyCardRelease || status?.hasPrefix(cardReleasePrefix) == true
+    }
+
+    package static func cardIsReleased(_ entry: Entry, card: String, completedCards: Set<String> = []) -> Bool {
+        if entry.step.status == cardReleaseStatus(card) { return true }
+        guard entry.step.status == legacyCardRelease else { return false }
+        return legacyCardReleaseEvidence(entry, card: card) ?? completedCards.contains(card)
+    }
+
+    package static func cardNeedingReleaseEvidence(_ entry: Entry) -> String? {
+        guard entry.step.status == legacyCardRelease, case .afterCard(let card)? = when(entry),
+              legacyCardReleaseEvidence(entry, card: card) == nil else { return nil }
+        return card
+    }
+
+    private static func legacyCardReleaseEvidence(_ entry: Entry, card: String) -> Bool? {
+        // A retained transition must match this filing and card. When the history was trimmed, check the card's outcome.
+        let previous = entry.item.refs.reversed().lazy.compactMap { ref -> DeskStep? in
+            if case .step(let step) = ref.kind { return step }
+            return nil
+        }.drop(while: {
+            $0.status == legacyCardRelease && $0.filedAt == entry.step.filedAt && When($0.when, card: $0.card) == .afterCard(card)
+        }).first
+        return previous.map {
+            !isCardReleaseStatus($0.status) && $0.filedAt == entry.step.filedAt && When($0.when, card: $0.card) == .afterCard(card)
+        }
+    }
 
     /// When-free work is due this long after the agent's last turn.
     public static let freeAfter: TimeInterval = 30 * 60
@@ -294,7 +327,7 @@ public enum MyQueue {
         switch condition {
         case .nextTurn: return true
         case .ownTurn, .quiet: return context.ownTurn
-        case .afterCard: return entry.step.status == cardReleased
+        case .afterCard(let card): return cardIsReleased(entry, card: card, completedCards: context.completedCards)
         case .at(let date): return context.now >= date
         case .every: return context.occurrence(entry.step, context.now) != nil
         case .userHere, .userAway:
@@ -314,7 +347,10 @@ public enum MyQueue {
         guard let condition = when(entry),
               let filed = DeskClock.parseISO(entry.step.filedAt ?? entry.item.openedAt) else { return [] }
         let handled = entry.item.notes.filter { $0.author == "agent" && !$0.text.hasPrefix("Said ") }
-            .compactMap { DeskClock.parseISO($0.ts) }.max()
+            .compactMap { note in
+                if let occurrence = note.carriedOccurrence { return MyQueueCarried.occurrenceDate(occurrence) }
+                return DeskClock.parseISO(note.ts)
+            }.max()
         let floor = max(filed, handled ?? filed)
         return entry.item.notes.filter {
             $0.author == "system" && $0.releaseCondition == condition.stored
@@ -340,20 +376,20 @@ public enum MyQueue {
                                      suppressing echoes: Set<String> = []) async throws -> Bool {
         guard !signal.hasPrefix("schedule:"), !["held", "resumed"].contains(signal) else { return false }
         return try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
-            var feed = try await store.readFeedUnlocked()
+            let feed = try await store.readFeedUnlocked()
             let state = try store.inCurrentLife(SwiftNativeDeskStore.compact(base: feed.base, feed.ops))
-            var released = false
+            var ops: [DeskOp] = []
             for entry in entries(state) {
                 guard !echoes.contains(entry.item.handle),
                       case .signal(let pattern)? = when(entry), entry.step.status != "stopped",
                       !isOver(entry, at: now), signalMatches(signal, pattern: pattern, dataRoot: store.dataRoot) else { continue }
-                let note = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: entry.item.handle,
+                ops.append(DeskOp(handle: entry.item.handle,
                     body: .appendNote(text: "Released: " + signal + (summary.isEmpty ? "" : " " + summary), author: "system",
-                                      releaseCondition: When.signal(pattern).stored))
-                feed = try await store.appendAndRecompactUnlocked(note, feed: feed).feed
-                released = true
+                                      releaseCondition: When.signal(pattern).stored)))
             }
-            return released
+            guard !ops.isEmpty else { return false }
+            try await store.commitUnlocked(ops, feed: feed)
+            return true
         }
     }
 
@@ -365,9 +401,9 @@ public enum MyQueue {
             guard let item = state.items.first(where: { $0.handle == expected.item.handle }), let entry = Self.entry(item),
                   entry.step.when == expected.step.when, entry.step.filedAt == expected.step.filedAt,
                   case .news(let topic)? = when(entry), entry.step.status != "stopped", !isOver(entry, at: now) else { return false }
-            let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: item.handle,
+            let op = DeskOp(handle: item.handle,
                 body: .appendNote(text: "Released: news: " + summary, author: "system", releaseCondition: When.news(topic).stored))
-            _ = try await store.appendAndRecompactUnlocked(op, feed: feed)
+            try await store.commitUnlocked([op], feed: feed)
             return true
         }
     }
@@ -414,11 +450,7 @@ public enum MyQueue {
                             let updated = try await update(entry, step: step, store: store)
                             landing = PromiseLanding(id: updated.name, change: updated.step == entry.step ? .reused : .updated)
                         } else {
-                            step.filedAt = DeskClock.commitStamp(notBefore: item.updatedAt)
-                            if item.title != step.title {
-                                _ = try await store.updateTitle(item.handle, title: step.title)
-                            }
-                            _ = try await store.addRef(item.handle, ref: DeskRef(kind: .step(step)))
+                            try await store.attachCapturedStepUnlocked(step, to: item.handle)
                             landing = PromiseLanding(id: "desk." + item.alias, change: .updated)
                         }
                     } else {
@@ -437,6 +469,10 @@ public enum MyQueue {
         try await store.addQueueStep(step)
     }
 
+    package static func addResume(_ step: DeskStep, run: String, store: SwiftNativeDeskStore) async throws {
+        _ = try await store.addQueueStep(step, resumeRun: run)
+    }
+
     public static func update(_ entry: Entry, step: DeskStep, store: SwiftNativeDeskStore) async throws -> Entry {
         try await store.addQueueStep(step, replacing: entry).entry
     }
@@ -446,37 +482,76 @@ public enum MyQueue {
         public var errorDescription: String? { "The queued step changed or closed before settlement; the newer state was kept." }
     }
 
-    /// Close only the unchanged snapshot so a stale handler cannot drop refiled work.
-    public static func finish(_ entry: Entry, dropped: Bool, why: String, store: SwiftNativeDeskStore) async throws {
+    public enum Closure: Sendable, Equatable { case requested, finishedHabit }
+
+    /// Close only the unchanged snapshot. A saved once-habit settlement may itself commit the ending.
+    @discardableResult
+    public static func finish(_ entry: Entry, dropped: Bool, why: String, store: SwiftNativeDeskStore) async throws -> Closure {
+        try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
+            guard let current = try await Self.entry(entry.item.handle, store: store),
+                  current.item.updatedAt == entry.item.updatedAt else { throw Superseded() }
+            let debts = try await MyQueueCarried.owedSettlements(dataRoot: store.dataRoot).filter {
+                $0.item.objectValue?["handle"] == .string(entry.item.handle)
+            }
+            guard !debts.isEmpty else {
+                try await close(current, dropped: dropped, why: why, store: store)
+                return .requested
+            }
+            for debt in debts { try await MyQueueCarried.finish(debt, store: store, closingStep: true) }
+            guard let remaining = try await Self.entry(entry.item.handle, store: store) else { return .finishedHabit }
+            try await close(remaining, dropped: dropped, why: why, store: store)
+            return .requested
+        }
+    }
+
+    /// Commit a closure after carried settlement has had its turn.
+    static func close(_ entry: Entry, dropped: Bool, why: String, store: SwiftNativeDeskStore) async throws {
+        let run = resumeRun(findingKey: entry.item.findingKey)
+        let abandonment = try (dropped ? run : nil).map { try PartRunStore.ClaimOwnership($0, root: store.dataRoot) }
         guard try await store.closeItemIfUnchanged(entry.item.handle, expectedUpdatedAt: entry.item.updatedAt,
                                                    outcomeSummary: why, canceled: dropped) else {
             throw Superseded()
         }
-        if let run = skillRun(in: entry.step.words) {
-            do { try PartRunStore.discard(run, root: store.dataRoot) }
-            catch { throw RunCleanupFailure(entry: entry, runID: run, underlying: error) }
+        if let run {
+            let result: Result<Void, RunCleanupFailure> = await settle {
+                do {
+                    if let abandonment { try abandonment.abandon() }
+                    else { try PartRunStore.discard(run, root: store.dataRoot) }
+                    return .success(())
+                } catch { return .failure(RunCleanupFailure(entry: entry, dropped: dropped, runID: run, underlying: error)) }
+            }
+            try result.get()
         }
     }
 
     public struct RunCleanupFailure: Error, LocalizedError, Sendable {
         public let entry: Entry
+        public let dropped: Bool
         public let runID: String
         public let underlying: any Error
         public var errorDescription: String? { underlying.localizedDescription }
     }
 
     /// A closed resume step releases its retained run and the reservations that depend on it.
-    public static func releaseFinishedRun(words: String, store: SwiftNativeDeskStore) throws {
-        if let run = skillRun(in: words) { try PartRunStore.discard(run, root: store.dataRoot) }
+    package static func releaseFinishedRun(findingKey: String?, dropped: Bool, store: SwiftNativeDeskStore) throws {
+        if let run = resumeRun(findingKey: findingKey) {
+            if dropped { try abandonDroppedRun(run, store: store) }
+            else { try PartRunStore.discard(run, root: store.dataRoot) }
+        }
+    }
+
+    /// An explicit repeat of a drop can settle a retained checkpoint after the close has already landed.
+    @discardableResult
+    package static func abandonDroppedRun(_ run: String, store: SwiftNativeDeskStore) throws -> Bool {
+        try PartRunStore.ClaimOwnership(run, root: store.dataRoot).abandon()
     }
 
     /// Stopped runs retain landed holds while their resume step waits for an own turn.
     public static func skillRunPrefix(skill: String, run: String) -> String { "Resume \(skill) run \(run):" }
 
-    public static func skillRun(in words: String) -> String? {
-        guard words.hasPrefix("Resume "), let range = words.range(of: #" run (run-[0-9a-f]{8}):"#, options: .regularExpression)
-        else { return nil }
-        return String(words[range].dropFirst(5).dropLast())
+    package static func resumeRun(findingKey: String?) -> String? {
+        guard let findingKey, findingKey.range(of: #"^ability\.resume:run-[0-9a-f]{8}$"#, options: .regularExpression) != nil else { return nil }
+        return String(findingKey.dropFirst("ability.resume:".count))
     }
 
     public static func skillRunWords(skill: String, run: String, question: String, held: [String]) -> String {

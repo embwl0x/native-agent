@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -74,7 +75,7 @@ extension CognitiveSubstrate {
                     receipts: [CognitiveReceiptWrite(
                         kind: "microcycle",
                         payload: .object([
-                        "reason": .string(bounded(reason, maxCharacters: 120)),
+                        "reason": .string(TextClipping.prefixOrWhole(reason, maxCharacters: 120)),
                         "workspaceCount": .int(Int64(workspace.items.count)),
                         "inhibitedCount": .int(Int64(workspace.inhibitedNodeIds.count)),
                         ]),
@@ -141,12 +142,12 @@ extension CognitiveSubstrate {
         receipts.append(CognitiveReceiptWrite(
             kind: "maintenance",
             payload: .object([
-                "reason": .string(bounded(reason, maxCharacters: 120)),
+                "reason": .string(TextClipping.prefixOrWhole(reason, maxCharacters: 120)),
                 "nodeCount": .int(Int64(nodes.count)),
             ])
         ))
 
-        guard configuration.persistenceEnabled else { return .ran }
+        let persistenceEnabled = configuration.persistenceEnabled
         do {
             try await persistMaintenanceTransition(
                 nodes: nodes,
@@ -161,7 +162,6 @@ extension CognitiveSubstrate {
             if dirtyRevision == initialDirtyRevision {
                 field = previousField
                 affect = previousAffect
-                removeTimelineEventsIfMatching(stagedTimelineEvents)
                 lastEmotionalConsolidationAt = previousConsolidationAt
                 disposition = previousDisposition
                 dispositionTransitions = previousDispositionTransitions
@@ -171,7 +171,8 @@ extension CognitiveSubstrate {
             await notingPersistence("maintenance") { throw error }
             throw error
         }
-        await notingPersistence("maintenance") { }
+        publishTimelineEvents(stagedTimelineEvents)
+        if persistenceEnabled { await notingPersistence("maintenance") { } }
         return .ran
     }
 
@@ -217,7 +218,7 @@ extension CognitiveSubstrate {
             return nil
         }
         let previousTick = lastEmotionalConsolidationAt
-        let counts = field.consolidateEmotionalArousal(at: now, configuration: configuration)
+        let counts = field.consolidateEmotionalArousal(at: now)
         lastEmotionalConsolidationAt = now
         // Resolution patterns share disposition caps and day-scale decay; growth admits new evidence, with at most one nudge per path/kind/day.
         var artifacts: [CognitiveArtifactWrite] = []
@@ -250,7 +251,7 @@ extension CognitiveSubstrate {
         let receipts = [CognitiveReceiptWrite(
             kind: "emotional_consolidation",
             payload: .object([
-                "reason": .string(bounded(reason, maxCharacters: 120)),
+                "reason": .string(TextClipping.prefixOrWhole(reason, maxCharacters: 120)),
                 "reinforced": .int(Int64(counts.reinforced)),
                 "calmed": .int(Int64(counts.calmed)),
             ])
@@ -263,7 +264,7 @@ extension CognitiveSubstrate {
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.timeZone = .current
             formatter.dateFormat = "yyyy-MM-dd HH:mm zzz"
-            let event = recordTimelineEventInMemory(
+            let event = makeTimelineEvent(
                 kind: .replayRun,
                 title: "Overnight emotional consolidation",
                 summary: "softened \(counts.calmed), sustained \(counts.reinforced) · \(formatter.string(from: now))",

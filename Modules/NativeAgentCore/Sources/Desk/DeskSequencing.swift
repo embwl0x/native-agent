@@ -111,6 +111,7 @@ public enum DeskSequencing {
         }
 
         let onCycle = cycleNodes(in: items, effectiveBlockers: effectiveBlockers)
+        var waitsOutsideSubtree: Set<String> = []
 
         // Ancestor waits propagate to descendants; visited handles keep authored parent cycles finite.
         func ancestorObstructs(_ handle: String) -> Bool {
@@ -123,8 +124,9 @@ public enum DeskSequencing {
                 if ancestor.status == .blocked || ancestor.requiresOwnerInput || ancestor.blockedReason?.trimmingCharacters(
                     in: .whitespacesAndNewlines).isEmpty == false { return true }
                 if deferred[cur] == true { return true }
-                // An ancestor waiting on this item, or on what lies between them, is waiting for this very work and does not hold it back.
-                if !(effectiveBlockers[cur] ?? []).allSatisfy(seen.contains) { return true }
+                if waitsOutsideSubtree.contains(cur) { return true }
+                // An internal wait exempts its named blocker and the work beneath that blocker.
+                if let blockers = effectiveBlockers[cur], !blockers.isEmpty, seen.isDisjoint(with: blockers) { return true }
                 if onCycle.contains(cur) { return true }
                 current = ancestor.parent
             }
@@ -138,13 +140,17 @@ public enum DeskSequencing {
             let isDef = deferred[item.handle] ?? false
             let cyc = onCycle.contains(item.handle)
             let descendants = SwiftNativeDeskStore.descendants(of: item.handle, in: children, maxDepth: deskMaxGraphDepth)
+            // External waits still obstruct even the descendants this item directly waits on.
+            if !blockers.isEmpty {
+                let internalHandles = Set(descendants.map(\.handle))
+                if blockers.contains(where: { !internalHandles.contains($0) }) { waitsOutsideSubtree.insert(item.handle) }
+            }
             let ready = !item.status.isTerminal && item.status != .blocked
                 && !item.requiresOwnerInput
                 && item.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
                 && blockers.isEmpty
                 && !isDef
                 && !cyc
-                && !ancestorObstructs(item.handle)
             plans[item.handle] = ItemPlan(
                 handle: item.handle,
                 effectiveBlockers: blockers,
@@ -156,6 +162,9 @@ public enum DeskSequencing {
             )
         }
 
+        for item in items where plans[item.handle]?.isReady == true && ancestorObstructs(item.handle) {
+            plans[item.handle]?.isReady = false
+        }
         let ready = items.filter { plans[$0.handle]?.isReady == true }
         let ordered = ready.sorted { a, b in
             let ra = statusRank(a.status), rb = statusRank(b.status)

@@ -49,7 +49,7 @@ enum MacActReceiptRendering {
                 )
             } ?? .null
         }
-        object["enabled"] = .bool(target.enabled)
+        object["enabled"] = target.enabled.map(JSONValue.bool) ?? .null
         return .object(object)
     }
 
@@ -57,8 +57,7 @@ enum MacActReceiptRendering {
     static func denseEffectSummaryJSON(
         diff: MacActClosedLoop.EffectDiff,
         after: MacLookPercept,
-        snapshot: MacAXTreeSnapshot,
-        valueChars: Int
+        snapshot: MacAXTreeSnapshot
     ) -> JSONValue {
         func census(_ byRole: [String: Int]) -> JSONValue {
             .object(byRole.mapValues { .int(Int64($0)) })
@@ -127,7 +126,7 @@ enum MacActReceiptRendering {
             // Exclude censuses under mismatched walk bounds and report that exclusion so caps cannot masquerade as changes.
             "diff_comparable": .bool(diff.diffComparable),
             // Include changed read-only values, even when affordances are unchanged.
-            "readouts_changed": .array(diff.readoutsChanged.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
+            "readouts_changed": .array(diff.readoutsChanged.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON() }),
             "readouts_changed_total": .int(Int64(diff.readoutsChangedTotal)),
             "readouts_added_total": .int(Int64(diff.readoutsAddedTotal)),
             "readouts_removed_total": .int(Int64(diff.readoutsRemovedTotal)),

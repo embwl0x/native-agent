@@ -61,10 +61,13 @@ extension SwiftToolDispatcher {
         let state: DeskState
         do { state = try await store.liveState() }
         catch {
-            return ChatToolOutcome.failure(error: ToolFailureError(
+            let failure = ChatToolOutcome.failure(error: ToolFailureError(
                 "\(prefix) committed for \(handle), but its current Desk state could not be read: \(error.localizedDescription)",
                 effects: .occurred, owner: "Desk", code: "desk_confirmation_unavailable",
                 instruction: "Repair the reported Desk read failure, then read this handle before repeating the mutation."), tool: "desk")
+            var fields = JSONValue.objectOrEmpty(failure)
+            fields["handle"] = .string(handle)
+            return .object(fields)
         }
         let item = state.items.first { $0.handle == handle }
         let label: String
@@ -84,7 +87,7 @@ extension SwiftToolDispatcher {
     }
 
     func deskCSV(_ input: [String: JSONValue], _ key: String) -> [String] {
-        guard let raw = optionalString(input, key) else { return [] }
+        guard let raw = input[key]?.nonblankString else { return [] }
         return raw.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -161,9 +164,10 @@ extension SwiftToolDispatcher {
         guard !reference.isEmpty else {
             throw deskInvalid("lane_of", reason: "desk: empty lane_of reference")
         }
-        guard let laneParent = state.items.first(where: {
-            $0.handle == reference || $0.alias == reference
-        }) else {
+        // A numbered label ("2 Renew insurance") names its item the same way every Desk reference does.
+        let named = try? state.matching(raw, field: "lane_of")
+        guard let laneParent = state.items.first(where: { $0.handle == reference || $0.alias == reference })
+                ?? (named?.count == 1 ? named?.first : nil) else {
             throw deskInvalid("lane_of",
                 reason: "desk: lane_of '\(reference)' is not a live Desk item"
             )
@@ -179,17 +183,17 @@ extension SwiftToolDispatcher {
     func impl_desk_add_item(input: [String: JSONValue]) async throws -> JSONValue {
         let kind = try deskKind(input, "kind")
         let title = try deskString(input, "title").trimmingCharacters(in: .whitespacesAndNewlines)
-        let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let assignee = optionalString(input, "assignee")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let laneRaw = optionalString(input, "lane_of")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let until = optionalString(input, "until")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let deferred = optionalString(input, "defer")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parentRaw = input["parent"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let summary = input["summary"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assignee = input["assignee"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let laneRaw = input["lane_of"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let until = input["until"]?.trimmedString
+        let deferred = input["defer"]?.trimmedString
         if let until, let deferred, until != deferred {
             throw deskInvalid("until", reason: "desk_add_item: until and defer must agree")
         }
         let park = until ?? deferred
-        if let park, !park.isEmpty, !DeskClock.isParseableDate(park) {
+        if let park, !DeskClock.isParseableDate(park) {
             throw deskInvalid("until", reason: "desk_add_item: until must be yyyy-MM-dd or an ISO timestamp; nothing was added")
         }
         // Persist stable parent handles rather than display numbers.
@@ -226,14 +230,22 @@ extension SwiftToolDispatcher {
             )
         }
         let item = result.item
-        if let park, !park.isEmpty { _ = try await store.setDeferUntil(item.handle, until: park) }
+        if let park {
+            let refusal: JSONValue? = try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
+                if result.reusedEquivalent, let conflict = try await store.runHold(item.handle) { return conflict.refusal() }
+                try await store.setDeferUntil(item.handle, until: park)
+                return nil
+            }
+            if let refusal { return refusal }
+        }
         return .object([
             "status": .string("ok"),
+            "effects": .string(result.reusedEquivalent && park == nil ? "none" : "occurred"),
             "disposition": .string(result.reusedEquivalent ? "existing" : "created"),
             "created": .bool(!result.reusedEquivalent),
             "handle": .string(item.handle),
             "alias": .string(item.alias),
-            "defer_until": (park?.isEmpty == false ? park : item.deferUntil).map(JSONValue.string) ?? .null,
+            "defer_until": (park ?? item.deferUntil).map(JSONValue.string) ?? .null,
             "next_call": .object(["tool": .string("app"), "input": .object([
                 "action": .string("desk.read"), "args": .object(["handle": .string(item.handle)])])]),
             "confirmation": .string(result.reusedEquivalent
@@ -249,10 +261,10 @@ extension SwiftToolDispatcher {
         let project = try deskProject(input, absent: DeskItem.workshopProject)
         let title = try deskString(input, "title").trimmingCharacters(in: .whitespacesAndNewlines)
         // The store owns refusal of empty pursuit fields.
-        let why = (optionalString(input, "why") ?? "")
-        let doneLooksLike = (optionalString(input, "done_looks_like") ?? "")
-        let abandonCondition = (optionalString(input, "abandon_condition") ?? "")
-        let privateName = optionalString(input, "private_name")
+        let why = (input["why"]?.nonblankString ?? "")
+        let doneLooksLike = (input["done_looks_like"]?.nonblankString ?? "")
+        let abandonCondition = (input["abandon_condition"]?.nonblankString ?? "")
+        let privateName = input["private_name"]?.nonblankString
         let dossier = try deskParseDossier(input)
         func bound(_ key: String, defaultValue value: Int) throws -> Int {
             guard let raw = input[key] else { return value }
@@ -270,7 +282,7 @@ extension SwiftToolDispatcher {
             abandonCondition: abandonCondition,
             privateName: (privateName?.isEmpty == false) ? privateName : nil
         )
-        let summary = optionalString(input, "summary")
+        let summary = input["summary"]?.nonblankString
         let store = deskStore()
         do {
             let item = try await store.openPursuit(
@@ -484,8 +496,8 @@ extension SwiftToolDispatcher {
 
     func impl_desk_update_item(input: [String: JSONValue]) async throws -> JSONValue {
         let handle = try deskString(input, "handle")
-        let title = optionalString(input, "title")
-        let summary = optionalString(input, "summary")
+        let title = input["title"]?.nonblankString
+        let summary = input["summary"]?.nonblankString
         if title == nil && summary == nil {
             throw deskInvalid("title", reason: "desk_update_item: provide at least one of title/summary")
         }
@@ -547,8 +559,8 @@ extension SwiftToolDispatcher {
         }
         let cadence = Cadence(
             mode: mode,
-            interval: optionalString(input, "interval"),
-            staleAfter: optionalString(input, "stale_after"),
+            interval: input["interval"]?.nonblankString,
+            staleAfter: input["stale_after"]?.nonblankString,
             refreshSources: deskCSV(input, "refresh_sources")
         )
         let store = deskStore()
@@ -587,7 +599,7 @@ extension SwiftToolDispatcher {
         let canceled = input["canceled"] == .bool(true)
         let subtree = input["subtree"] == .bool(true)
         let store = deskStore()
-        let expectedUpdatedAt = optionalString(input, "expected_updated_at")?.trimmingCharacters(
+        let expectedUpdatedAt = input["expected_updated_at"]?.nonblankString?.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
         let refusedChanged: JSONValue = .object([
@@ -651,6 +663,13 @@ extension SwiftToolDispatcher {
         } else {
             do {
                 _ = try await store.closeItem(handle, outcomeSummary: outcome, canceled: canceled)
+            } catch let DeskError.closeRefusedTerminal(_, status) {
+                // Closing what is already closed asks for what already holds: nothing changes and the batch goes on.
+                return .object([
+                    "status": .string("ok"), "effects": .string("none"), "already": .string(status.rawValue),
+                    "note": .string("\(handle) was already \(status.rawValue); its recorded outcome stands and nothing was changed. "
+                        + "Reopen it first if that outcome is wrong."),
+                ])
             } catch let e as DeskError {
                 // Report attempts to close terminal items as Desk refusals, preserving their recorded outcomes.
                 return .object([
@@ -693,7 +712,7 @@ extension SwiftToolDispatcher {
     func impl_desk_defer(input: [String: JSONValue]) async throws -> JSONValue {
         try Self.validateDeskMutationArguments("desk_defer", input: input)
         let handle = try deskString(input, "handle")
-        let raw = optionalString(input, "until")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = input["until"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
         let until: String? = (raw?.isEmpty == false) ? raw : nil
         if let until, !DeskClock.isParseableDate(until) {
             throw deskInvalid("until", reason: "until must be yyyy-MM-dd or an ISO timestamp.")

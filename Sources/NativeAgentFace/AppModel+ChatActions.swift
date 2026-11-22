@@ -80,7 +80,8 @@ extension AppModel {
                 await newChatSession()
                 guard !activeChatSessionId.isEmpty else { return .failure(statusText) }
             }
-            statusText = "Chat archived"
+            // Nothing archived says so: the conversation was already out of the active list.
+            statusText = changed ? "Chat archived" : "This chat was already out of the active list; nothing changed"
             return .success(statusText)
         } catch {
             setFailureStatus(error, action: "archive this chat")

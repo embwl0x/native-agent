@@ -18,20 +18,6 @@ public enum NativeAgentICloudBridgeConstants {
         get throws { try configuredValue(infoKey: "NativeAgentMobileSourceKey") }
     }
 
-    public static var backgroundTaskIDPrefix: String {
-        get throws {
-            let value = try configuredValue(infoKey: "NativeAgentBackgroundTaskIDPrefix")
-            guard validDottedIdentifier(value), value.contains(".") else {
-                throw ConfigurationFailure(infoKey: "NativeAgentBackgroundTaskIDPrefix")
-            }
-            return value
-        }
-    }
-
-    public static func backgroundTaskIdentifier(_ suffix: String) throws -> String {
-        "\(try backgroundTaskIDPrefix).\(suffix)"
-    }
-
     public struct ConfigurationFailure: LocalizedError, Sendable {
         public let infoKey: String
         public var errorDescription: String? {

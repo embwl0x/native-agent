@@ -113,13 +113,6 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func adoptProviderForBlankSurfaces(_ providerId: String) async {
-        _ = await engine.providers.adoptProviderForBlankSurfaces(
-            providerId, dataRoot: engine.dataRoot,
-            failure: { error, action in setFailureStatus(error, action: action) }
-        )
-    }
     // MARK: Providers
     /// Remove the registry row before sign-in; only a durable removal may claim success.
     func disconnectProvider(_ id: String) async -> (ok: Bool, detail: String, cause: String?) {

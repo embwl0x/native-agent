@@ -4,7 +4,7 @@ import Foundation
 
 public enum MemoryCandidateQuality {
     /// Apply empty, transient-state and tool-noise rejection in that order for every source.
-    public static func rejectionReason(text: String, source: String? = nil, kind: String? = nil) -> String? {
+    public static func rejectionReason(text: String) -> String? {
         let normalized = normalize(text)
         guard !normalized.isEmpty else { return "empty memory candidate" }
         if isTransientSessionState(normalized) {
@@ -16,8 +16,8 @@ public enum MemoryCandidateQuality {
         return nil
     }
 
-    public static func isDurableCandidate(text: String, source: String? = nil, kind: String? = nil) -> Bool {
-        rejectionReason(text: text, source: source, kind: kind) == nil
+    public static func isDurableCandidate(text: String) -> Bool {
+        rejectionReason(text: text) == nil
     }
 
     private static func normalize(_ text: String) -> String {

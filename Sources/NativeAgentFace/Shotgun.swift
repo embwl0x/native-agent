@@ -151,6 +151,11 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         } else {
             ApplicationLifetime.shared.request(.sidebar(.chat))
         }
+        // Expand opens the conversation Shotgun was showing, not whatever the main window last held.
+        if let appModel, let session = driver?.session ?? selectedSessionID {
+            if main != nil { ApplicationLifetime.shared.request(.sidebar(.chat)) }
+            if appModel.activeChatSessionId != session { Task { await appModel.selectChatSession(id: session) } }
+        }
     }
 
     func close() { hide() }

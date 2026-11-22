@@ -4,12 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
 import TrustCenter
-// Blueprint: | `AppActions+CardVerbs.swift` | `AppActions.cardVerbs` (a card's answers are the declared `inbox.*` and `card.*` verbs) and `AppToolExecutor.personDecided`, the one admission of the person's own act in the inbox and card handlers |
-
-extension AppActions {
-    /// A card is its matter's Inbox row: its answers are the declared `inbox.*` and `card.*` verbs, so a card declares none of its own.
-    static var cardVerbs: [AppAction] { get throws { [] } }
-}
+// Blueprint: | `AppActions+CardVerbs.swift` | `AppToolExecutor.personDecided`, the one admission of the person's own act in the inbox and card handlers |
 
 extension AppToolExecutor {
     /// Whether the person decided the `app` call that reached `tool`'s handler with `input`: the person's act names an action this tool runs,

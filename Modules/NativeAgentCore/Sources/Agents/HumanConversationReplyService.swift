@@ -1,7 +1,7 @@
 import ChatTurnRuntime
+import NativeAgentShared
 import ChatTurnContracts
 import ChatToolRuntime
-import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -44,8 +44,8 @@ public actor HumanConversationReplies {
         let route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: id,
             destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
             replyTo: saved.replyTo, correlationId: saved.correlationId, requesterUserId: saved.requesterUserId)
-        let deliveryID = "human-reply:" + digest(id + "\u{1f}" + expected)
-        let requestDigest = digest(id + "\u{1f}" + expected + "\u{1f}" + text)
+        let deliveryID = "human-reply:" + SHA256Hex.of(utf8: id + "\u{1f}" + expected)
+        let requestDigest = SHA256Hex.of(utf8: id + "\u{1f}" + expected + "\u{1f}" + text)
         // Validate known setup failures before claiming or mutating transcript.
         do {
             let artifacts = try AgentBridgeCompletionRouter.artifacts(deliveryId: deliveryID,
@@ -85,9 +85,6 @@ public actor HumanConversationReplies {
             return failure("outcome_unknown",
                 "Reply completion could not be confirmed. Read the conversation before taking further action; do not resend automatically.")
         }
-    }
-    private func digest(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
     private func failure(_ status: String, _ message: String) -> JSONValue {
         .object(["status": .string(status), "message": .string(message), "ok": .bool(false)])

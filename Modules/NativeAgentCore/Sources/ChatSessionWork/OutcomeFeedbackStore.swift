@@ -3,17 +3,13 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Experiences
-// Blueprint: | `OutcomeFeedbackStore.swift` | `OutcomeFeedbackStore`, `record`, `recordConversationContinuation`. |
+// Blueprint: | `OutcomeFeedbackStore.swift` | `OutcomeFeedbackStore`, `recordConversationContinuation`, `reactionEvidenceKeys`. |
 
 public enum OutcomeFeedbackError: Error, Sendable, Equatable {
     case invalidSessionID
     case invalidMessageID
-    case invalidRating
     case transcriptMissing
     case transcriptCorrupt
-    case messageNotUnique
-    case messageNotAssistant
-    case messageMissingOutcomeAnchor
     case feedbackStoreCorrupt
 }
 
@@ -49,116 +45,6 @@ public struct OutcomeFeedbackStore: Sendable {
         self.dataRoot = dataRoot
         self.clock = clock
         self.makeEventID = makeEventID
-    }
-
-    @discardableResult
-    public func record(
-        sessionID rawSessionID: String,
-        messageID rawMessageID: String,
-        rating rawRating: String
-    ) async throws -> JSONValue {
-        guard let sessionID = NativeAgentChatSessionID.normalizedPathComponent(rawSessionID) else {
-            throw OutcomeFeedbackError.invalidSessionID
-        }
-        guard let messageID = OutcomeTraceIdentity.normalized(rawMessageID) else {
-            throw OutcomeFeedbackError.invalidMessageID
-        }
-        let rating = rawRating.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard rating == "up" || rating == "down" else {
-            throw OutcomeFeedbackError.invalidRating
-        }
-        let transcript = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(sessionID).jsonl")
-
-        let anchor: (turnID: String, surface: String, contextSelectionReceiptID: String?) = try await SwiftNativePersistenceCore.withFileLock(transcript) {
-            guard FileManager.default.fileExists(atPath: transcript.path) else {
-                throw OutcomeFeedbackError.transcriptMissing
-            }
-            let rows: [JSONValue]
-            do { rows = try await SwiftNativePersistenceCore.readJSONL(transcript) }
-            catch { throw OutcomeFeedbackError.transcriptCorrupt }
-            let matching = rows.filter { row in
-                guard case .object(let object) = row,
-                      case .string(let id)? = object["id"] else { return false }
-                return id == messageID
-            }
-            guard matching.count == 1 else { throw OutcomeFeedbackError.messageNotUnique }
-            guard case .object(let object) = matching[0],
-                  case .string("assistant")? = object["role"] else {
-                throw OutcomeFeedbackError.messageNotAssistant
-            }
-            guard case .object(let metadata)? = object["metadata"],
-                  case .object(let outcome)? = metadata["outcomeObservation"],
-                  outcome["schema"] == .string("response.outcome-observation.v2"),
-                  case .string(let turnID)? = outcome["turnID"],
-                  case .string(let anchoredMessageID)? = outcome["messageID"],
-                  anchoredMessageID == messageID,
-                  case .string(let anchoredSessionID)? = outcome["sessionID"],
-                  anchoredSessionID == sessionID,
-                  case .string(let surface)? = outcome["surface"],
-                  OutcomeTraceIdentity.normalized(turnID) != nil,
-                  OutcomeTraceIdentity.normalized(surface) != nil else {
-                throw OutcomeFeedbackError.messageMissingOutcomeAnchor
-            }
-            let selectionReceiptID: String? = {
-                guard case .string(let value)? = outcome["contextSelectionReceiptID"] else {
-                    return nil
-                }
-                return OutcomeTraceIdentity.normalized(value)
-            }()
-            return (turnID, surface, selectionReceiptID)
-        }
-
-        let rawEventID = makeEventID()
-        let eventID = OutcomeTraceIdentity.normalized(rawEventID)
-            ?? CausalTransitionEvidence.opaqueIdentity(rawEventID)
-        let at = clock()
-        let observedAt = NativeTimestampFormat.fractionalZulu(at)
-        let reaction = rating == "up" ? "thumbs_up" : "thumbs_down"
-        let subject = anchor.turnID
-        // The comparison and the write are one record transaction: the write lands only while the rating it supersedes is still the latest.
-        // A miss means another rating landed between the read and the write; the next pass compares against it.
-        while true {
-            let rows = try await readExistingFeedback(subjects: [subject]).compactMap(\.objectValue)
-            let prior = Self.latestRating(in: rows, sessionID: sessionID, messageID: messageID)
-            // Repeated clicks on the current value are idempotent so they cannot manufacture calibration weight.
-            if let prior, prior["reaction"] == .string(reaction) { return .object(prior) }
-            var object: [String: JSONValue] = [
-                "schema": .string(Self.schema),
-                "eventId": .string(eventID),
-                "messageId": .string(messageID),
-                "turnId": .string(anchor.turnID),
-                "sessionId": .string(sessionID),
-                "surface": .string(anchor.surface),
-                "reaction": .string(reaction),
-                "observedAt": .string(observedAt),
-                "observedBy": .string("canonical_transcript_feedback"),
-                "payloadFree": .bool(true),
-                "controlAuthority": .bool(false),
-            ]
-            if let selectionReceiptID = anchor.contextSelectionReceiptID {
-                object["contextSelectionReceiptId"] = .string(selectionReceiptID)
-            }
-            if case .string(let priorEventID)? = prior?["eventId"] {
-                object["supersedesEventId"] = .string(priorEventID)
-            }
-            let record = JSONValue.object(object)
-            let superseded = prior?["eventId"]
-            let detail = ExperienceStore.Detail(source: "feedback", at: at, subject: subject, kind: Self.detailKind,
-                                                row: try record.serializedData(pretty: false))
-            let wrote = try await store.note(detail) { details in
-                try Self.latestRating(in: Self.feedbackRows(details, subject: subject), sessionID: sessionID, messageID: messageID)?["eventId"]
-                    != superseded
-            }
-            if wrote { return record }
-        }
-    }
-
-    /// The newest thumbs rating of one answer among its turn's feedback rows.
-    private static func latestRating(in rows: [[String: JSONValue]], sessionID: String, messageID: String) -> [String: JSONValue]? {
-        rows.last { $0["schema"] == .string(schema) && $0["sessionId"] == .string(sessionID) && $0["messageId"] == .string(messageID) }
     }
 
     /// The feedback rows among a subject's details, in record order; a feedback detail that is not this turn's object is a corrupt store.

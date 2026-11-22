@@ -7,9 +7,7 @@ import PersistenceCore
 import TrustCenter
 import CoreWLAN
 import SystemConfiguration
-#if canImport(Darwin)
 import Darwin
-#endif
 // Blueprint: | `RepositoryReadActions.swift` | `FileSystemActions`: confined grep/Git; `FileReadSourceMaterial.shellReadLaunch` shares Git policy |
 
 let connectorGrepMaxResults = 50
@@ -51,6 +49,32 @@ extension FileSystemActions {
         let rawSearchPath = rawPathField.isEmpty ? "." : rawPathField
         let searchPath = resolvePath(rawSearchPath, repoRoot: ctx.repoRoot, workspaceRoot: ctx.workspaceRoot)
 
+        if let refusal = grepPathRefusal(searchPath, ctx) { return refusal }
+
+        var searchTarget = searchPath.path
+        var spawnDirectory: URL? = nil
+        var fileDisplayPath: String? = nil
+        #if canImport(Darwin)
+        let inheritedChildDescriptor: Int32 = 3
+        var cwdFD: Int32 = -1
+        var searchFD: Int32 = -1
+        defer {
+            if cwdFD >= 0 { _ = Darwin.close(cwdFD) }
+            if searchFD >= 0 { _ = Darwin.close(searchFD) }
+        }
+        if let refusal = prepareGrepTarget(searchPath, inheritedChildDescriptor: inheritedChildDescriptor,
+            cwdFD: &cwdFD, searchFD: &searchFD, searchTarget: &searchTarget, spawnDirectory: &spawnDirectory,
+            fileDisplayPath: &fileDisplayPath) {
+            return refusal
+        }
+        #endif
+        return runVerifiedGrep(pattern: pattern, maxResults: maxResults, sliceCount: sliceCount, searchPath: searchPath,
+            searchTarget: searchTarget, spawnDirectory: spawnDirectory, fileDisplayPath: fileDisplayPath,
+            cwdFD: cwdFD, searchFD: searchFD, inheritedChildDescriptor: inheritedChildDescriptor, ctx: ctx)
+    }
+
+    /// Check whether the requested search path may be read.
+    private static func grepPathRefusal(_ searchPath: URL, _ ctx: ConnectorActionContext) -> JSONValue? {
         let allowed = allowedRoots(ctx)
         if !allowed.isEmpty && !isWithinRoots(searchPath, allowed) {
             return errResult(
@@ -66,18 +90,13 @@ extension FileSystemActions {
                 code: "path_not_allowed"
             )
         }
+        return nil
+    }
 
-        var searchTarget = searchPath.path
-        var spawnDirectory: URL? = nil
-        var fileDisplayPath: String? = nil
-        #if canImport(Darwin)
-        let inheritedChildDescriptor: Int32 = 3
-        var cwdFD: Int32 = -1
-        var searchFD: Int32 = -1
-        defer {
-            if cwdFD >= 0 { _ = Darwin.close(cwdFD) }
-            if searchFD >= 0 { _ = Darwin.close(searchFD) }
-        }
+    #if canImport(Darwin)
+    /// Open the verified target and transfer its descriptors to the caller's defer.
+    private static func prepareGrepTarget(_ searchPath: URL, inheritedChildDescriptor: Int32, cwdFD: inout Int32, searchFD: inout Int32,
+        searchTarget: inout String, spawnDirectory: inout URL?, fileDisplayPath: inout String?) -> JSONValue? {
         do {
             let parent = try VerifiedPath.openParent(of: searchPath)
             // Defer already owns the descriptor, including when openFinal throws.
@@ -120,8 +139,14 @@ extension FileSystemActions {
                 code: "path_not_allowed"
             )
         }
-        #endif
+        return nil
+    }
+    #endif
 
+    /// Launch grep with the verified target and bounded capture.
+    private static func runVerifiedGrep(pattern: String, maxResults: Int, sliceCount: Int, searchPath: URL, searchTarget: String,
+        spawnDirectory: URL?, fileDisplayPath: String?, cwdFD: Int32, searchFD: Int32, inheritedChildDescriptor: Int32,
+        ctx: ConnectorActionContext) -> JSONValue {
         let launch = "/usr/bin/grep"
         guard FileManager.default.isExecutableFile(atPath: launch) else {
             return errResult(
@@ -151,17 +176,19 @@ extension FileSystemActions {
         // -m bounds each file, not recursive output; also bound pipe capture and presentation.
         let captureLimit = 1_048_576
         let searchDeadline: TimeInterval = 30
-        #if canImport(Darwin)
         let run = runProcess(
             launch, args, cwdDescriptor: cwdFD,
             inheritDescriptor: searchFD >= 0
                 ? (source: searchFD, target: inheritedChildDescriptor) : nil,
             timeout: searchDeadline, environment: environment, captureByteLimit: captureLimit, captureAsBytes: true
         )
-        #else
-        let run = runProcess(launch, args, timeout: searchDeadline, environment: environment,
-            captureByteLimit: captureLimit, captureAsBytes: true)
-        #endif
+        return grepReceipt(run, pattern: pattern, sliceCount: sliceCount, searchPath: searchPath, searchTarget: searchTarget,
+            spawnDirectory: spawnDirectory, fileDisplayPath: fileDisplayPath, captureLimit: captureLimit, searchDeadline: searchDeadline, ctx: ctx)
+    }
+
+    /// Admit captured matches and assemble the coverage receipt.
+    private static func grepReceipt(_ run: FileSystemProcessRunResult, pattern: String, sliceCount: Int, searchPath: URL, searchTarget: String,
+        spawnDirectory: URL?, fileDisplayPath: String?, captureLimit: Int, searchDeadline: TimeInterval, ctx: ConnectorActionContext) -> JSONValue {
         if !run.launched { return errResult("Could not start /usr/bin/grep: \(run.stderr)", code: "grep_error") }
         guard let raw = run.rawOutput else {
             return errResult("Search capture did not return its requested bytes; search coverage is unknown.", code: "grep_error")
@@ -223,45 +250,8 @@ extension FileSystemActions {
             }
             return path + ":" + line + ":" + decoded
         }
-        // BSD diagnostics use grep: path: reason in the fixed C locale; split at the last colon-space. Preserve embedded filename LFs; name undecodable or cut
-        // diagnostics by byte offset without inventing a path.
-        let diagnosticBoundary = Data("\ngrep: ".utf8)
-        var remainingDiagnostics = raw.stderr[...]
-        var hasPathDiagnostic = false
-        while !remainingDiagnostics.isEmpty {
-            let offset = remainingDiagnostics.startIndex
-            let end = remainingDiagnostics.range(of: diagnosticBoundary)?.lowerBound ?? remainingDiagnostics.endIndex
-            var row = remainingDiagnostics[..<end]
-            let cut = end == remainingDiagnostics.endIndex && run.stderrTruncated && row.last != 10
-            remainingDiagnostics = end == remainingDiagnostics.endIndex
-                ? remainingDiagnostics[end...] : remainingDiagnostics[remainingDiagnostics.index(after: end)...]
-            if row.last == 10 { row = row.dropLast() }
-            if row.isEmpty { continue }
-            var detail: [String: JSONValue] = ["code": .string("search_diagnostic"),
-                "capture_byte_offset": .int(Int64(offset))]
-            if cut {
-                detail["message"] = .string("Search diagnostic was capped; its full path and reason are unavailable.")
-            } else if let diagnostic = String(data: Data(row), encoding: .utf8) {
-                let body = diagnostic.hasPrefix("grep: ") ? String(diagnostic.dropFirst(6)) : diagnostic
-                if diagnostic.hasPrefix("grep: "), let separator = body.range(of: ": ", options: .backwards) {
-                    let recordPath = String(body[..<separator.lowerBound])
-                    if recordPath.hasPrefix("./") || recordPath.hasPrefix("/") || recordPath == searchTarget {
-                        hasPathDiagnostic = true
-                        guard let path = displayPath(recordPath) else { continue }
-                        detail["code"] = .string("unreadable_search_path")
-                        detail["path"] = .string(path)
-                        detail["message"] = .string(String(body[separator.upperBound...]))
-                    } else {
-                        detail["message"] = .string(diagnostic)
-                    }
-                } else {
-                    detail["message"] = .string(diagnostic)
-                }
-            } else {
-                detail["message"] = .string("Search diagnostic is not valid UTF-8; its text is unavailable.")
-            }
-            gap(detail)
-        }
+        let hasPathDiagnostic = recordGrepDiagnostics(raw.stderr, stderrTruncated: run.stderrTruncated, searchTarget: searchTarget,
+            displayPath: displayPath, gap: gap)
         if run.captureReadFailed {
             gap(["code": .string("search_output_read_incomplete"),
                  "message": .string("The search's output could not be read completely; matches shown may be missing some.")])
@@ -340,6 +330,51 @@ extension FileSystemActions {
         return .object(result)
     }
 
+    /// Record diagnostic gaps after filtering any reported paths.
+    private static func recordGrepDiagnostics(_ stderr: Data, stderrTruncated: Bool, searchTarget: String,
+        displayPath: (String) -> String?, gap: ([String: JSONValue]) -> Void) -> Bool {
+        // BSD diagnostics use grep: path: reason in the fixed C locale; split at the last colon-space. Preserve embedded filename LFs; name undecodable or cut
+        // diagnostics by byte offset without inventing a path.
+        let diagnosticBoundary = Data("\ngrep: ".utf8)
+        var remainingDiagnostics = stderr[...]
+        var hasPathDiagnostic = false
+        while !remainingDiagnostics.isEmpty {
+            let offset = remainingDiagnostics.startIndex
+            let end = remainingDiagnostics.range(of: diagnosticBoundary)?.lowerBound ?? remainingDiagnostics.endIndex
+            var row = remainingDiagnostics[..<end]
+            let cut = end == remainingDiagnostics.endIndex && stderrTruncated && row.last != 10
+            remainingDiagnostics = end == remainingDiagnostics.endIndex
+                ? remainingDiagnostics[end...] : remainingDiagnostics[remainingDiagnostics.index(after: end)...]
+            if row.last == 10 { row = row.dropLast() }
+            if row.isEmpty { continue }
+            var detail: [String: JSONValue] = ["code": .string("search_diagnostic"),
+                "capture_byte_offset": .int(Int64(offset))]
+            if cut {
+                detail["message"] = .string("Search diagnostic was capped; its full path and reason are unavailable.")
+            } else if let diagnostic = String(data: Data(row), encoding: .utf8) {
+                let body = diagnostic.hasPrefix("grep: ") ? String(diagnostic.dropFirst(6)) : diagnostic
+                if diagnostic.hasPrefix("grep: "), let separator = body.range(of: ": ", options: .backwards) {
+                    let recordPath = String(body[..<separator.lowerBound])
+                    if recordPath.hasPrefix("./") || recordPath.hasPrefix("/") || recordPath == searchTarget {
+                        hasPathDiagnostic = true
+                        guard let path = displayPath(recordPath) else { continue }
+                        detail["code"] = .string("unreadable_search_path")
+                        detail["path"] = .string(path)
+                        detail["message"] = .string(String(body[separator.upperBound...]))
+                    } else {
+                        detail["message"] = .string(diagnostic)
+                    }
+                } else {
+                    detail["message"] = .string(diagnostic)
+                }
+            } else {
+                detail["message"] = .string("Search diagnostic is not valid UTF-8; its text is unavailable.")
+            }
+            gap(detail)
+        }
+        return hasPathDiagnostic
+    }
+
     /// Read Git rules once; grep supports unordered basename globs, not Git's ordered path language. Negations that may re-include a basename must prevent its
     /// exclusion.
     private static func enclosingRepository(_ path: URL) -> URL? {
@@ -380,11 +415,7 @@ extension FileSystemActions {
                 let name = String(later.dropFirst()).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                 // Wildcard or escaped negations cannot safely become unordered excludes; keep the earlier rule searchable.
                 if name.contains(where: { "*?[\\".contains($0) }) { return true }
-                #if canImport(Darwin)
                 return fnmatch(pattern, (name as NSString).lastPathComponent, 0) == 0
-                #else
-                return true
-                #endif
             }
             guard !mayReinclude else { continue }
             arguments.append("--exclude-dir=\(pattern)")
@@ -449,7 +480,7 @@ extension FileSystemActions {
     // MARK: - git_status
     package static func gitStatus(
         _ input: [String: JSONValue], _ ctx: ConnectorActionContext, timeout: TimeInterval = 15, captureByteLimit: Int? = nil) -> JSONValue {
-        guard let cwd = gitResolveCwd(input, ctx, tool: "git_status") else {
+        guard let cwd = gitResolveCwd(input, ctx) else {
             return gitCwdBlocked(input, ctx, tool: "git_status")
         }
         let run = runGit(["status", "--short", "--branch"], cwd: cwd, timeout: timeout, label: "git status", context: ctx, captureByteLimit: captureByteLimit)
@@ -513,7 +544,7 @@ extension FileSystemActions {
     // MARK: - git_diff
 
     static func gitDiff(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
-        guard let cwd = gitResolveCwd(input, ctx, tool: "git_diff") else {
+        guard let cwd = gitResolveCwd(input, ctx) else {
             return gitCwdBlocked(input, ctx, tool: "git_diff")
         }
         let staged: Bool = {
@@ -546,7 +577,7 @@ extension FileSystemActions {
 
     // MARK: - git_log
     static func gitLog(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
-        guard let cwd = gitResolveCwd(input, ctx, tool: "git_log") else {
+        guard let cwd = gitResolveCwd(input, ctx) else {
             return gitCwdBlocked(input, ctx, tool: "git_log")
         }
         let parsed = safeInt(input["limit"], default: 10)
@@ -607,7 +638,7 @@ extension FileSystemActions {
     // MARK: - repo_dirty_summary
 
     static func repoDirtySummary(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
-        guard let cwd = gitResolveCwd(input, ctx, tool: "repo_dirty_summary") else {
+        guard let cwd = gitResolveCwd(input, ctx) else {
             return gitCwdBlocked(input, ctx, tool: "repo_dirty_summary")
         }
         let parsed = safeInt(input["log_limit"], default: 5)
@@ -652,7 +683,7 @@ extension FileSystemActions {
         var historyState: String? = nil
     }
 
-    static func gitResolveCwd(_ input: [String: JSONValue], _ ctx: ConnectorActionContext, tool: String) -> URL? {
+    static func gitResolveCwd(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> URL? {
         let rawCwd = input["cwd"]?.stringValue ?? ""
         let base = rawCwd.isEmpty ? "." : rawCwd
         let cwd = resolvePath(base, repoRoot: ctx.repoRoot)

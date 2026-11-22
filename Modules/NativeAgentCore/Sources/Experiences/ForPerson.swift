@@ -211,7 +211,8 @@ public actor ForPerson {
     public func owed(retrying: Bool = false) async throws -> [(matter: Experience, door: Door)] {
         try await matters().reversed().flatMap { matter in
             matter.owes.compactMap { key, owed -> (matter: Experience, door: Door)? in
-                guard key.hasPrefix("deliver:"), owed.phase == .owed || retrying && owed.phase == .rejected,
+                // A retry also takes a reservation whose send never started (a quit between reserve and send), so it is sent, not stranded.
+                guard key.hasPrefix("deliver:"), owed.phase == .owed || retrying && (owed.phase == .rejected || owed.phase == .reserved),
                       let door = Door(address: owed.to), door.surface != "conversation" else { return nil }
                 return (matter, door)
             }
@@ -288,7 +289,9 @@ public actor ForPerson {
             let domain = how == .resolved ? current.face?.from ?? Self.person : Self.person
             let outcome = Experience.Outcome(domain: domain, status: how.rawValue, at: NativeTimestampFormat.fractionalZulu(Date()))
             let ask: [ExperienceStore.Change] = current.owes["decide"]?.phase.isSettled == false ? [.letGo(key: "decide", reason: .cancelled)] : []
-            try await store.append([.outcome(outcome)] + ask + Self.unsettledDeliveries(current).map { .letGo(key: $0, reason: .cancelled) }, to: id)
+            // A send already in flight settles from its own transport result or receipt; only deliveries not yet started are let go.
+            let unstarted = Self.unsettledDeliveries(current).filter { current.owes[$0]?.phase != .dispatchStarted }
+            try await store.append([.outcome(outcome)] + ask + unstarted.map { .letGo(key: $0, reason: .cancelled) }, to: id)
         }
     }
 
@@ -310,7 +313,8 @@ public actor ForPerson {
         let won = OSAllocatedUnfairLock(initialState: false)
         try await write(id) { store in
             guard let current = try await store.experience(id), current.outcome == nil, current.owes["decide"]?.phase.isSettled != true,
-                  let owed = current.owes[door.key], owed.phase == .owed || owed.phase == .rejected else { return }
+                  // A reservation whose send never started (a quit between reserve and send) is reserved again, never stranded; a started send waits for evidence.
+                  let owed = current.owes[door.key], owed.phase == .owed || owed.phase == .rejected || owed.phase == .reserved else { return }
             try await store.append([.obligation(key: door.key, phase: .reserved, attempt: attempt.id)], to: id)
             won.withLock { $0 = true }
         }
@@ -358,7 +362,7 @@ public actor ForPerson {
                 let written = await store.written(addressedTo: Self.person)
                 do {
                     let recent = try await store.addressed(to: Self.person, after: Date().addingTimeInterval(-Self.horizon), limit: Self.bound)
-                    for matter in try await recent + store.open() where matter.addressedTo.contains(Self.person) { feed(matter) }
+                    for matter in try await recent + store.open(addressedTo: Self.person) { feed(matter) }
                 } catch { return .failure(error) }
                 Task { for await matter in written { await self.feed(matter) } }
                 return .success(())
@@ -373,7 +377,12 @@ public actor ForPerson {
 
     /// An answer anywhere closes it everywhere: once the person's `decide` settles, the doors still owed let it go.
     private func feed(_ matter: Experience) {
-        if let held = reading[matter.id], (held.updatedAt ?? held.at) > (matter.updatedAt ?? matter.at) { return }
+        // Newer is the later committed event, not the later wall clock: a clock moved backward never hides a committed change.
+        if let held = reading[matter.id] {
+            if let heldSequence = held.sequence, let sequence = matter.sequence {
+                if heldSequence > sequence { return }
+            } else if (held.updatedAt ?? held.at) > (matter.updatedAt ?? matter.at) { return }
+        }
         // The write stream and the writer's readback meet here. An unchanged matter is no change, including a no-op tell/answer.
         guard reading[matter.id] != matter else { return }
         reading[matter.id] = matter

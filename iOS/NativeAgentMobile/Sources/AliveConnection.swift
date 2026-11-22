@@ -39,20 +39,15 @@ struct AliveConnectionFactLine: View {
 
 /// Unavailable controls share dimming and guidance; never display a value the Mac has not sent.
 struct AliveUnpairedReason: View {
-    var showsAction = true
     @State private var showsPairing = false
 
     var body: some View {
-        if showsAction {
-            AliveStatusNote(systemImage: "lock", text: AliveConnection.pairToChange + ".",
-                            actionTitle: "Pair with Mac", actionHint: "Connects this iPhone to your Mac") {
-                showsPairing = true
-            }
-            .sheet(isPresented: $showsPairing) {
-                PairingView(onSkip: { showsPairing = false }, onPaired: { showsPairing = false })
-            }
-        } else {
-            AliveFootnote(AliveConnection.pairToChange + ".", systemImage: "lock")
+        AliveStatusNote(systemImage: "lock", text: AliveConnection.pairToChange + ".",
+                        actionTitle: "Pair with Mac", actionHint: "Connects this iPhone to your Mac") {
+            showsPairing = true
+        }
+        .sheet(isPresented: $showsPairing) {
+            PairingView(onSkip: { showsPairing = false }, onPaired: { showsPairing = false })
         }
     }
 }

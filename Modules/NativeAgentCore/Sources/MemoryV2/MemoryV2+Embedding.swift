@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import Synchronization
 #if os(Linux)
@@ -74,7 +75,7 @@ public struct MockEmbeddingProvider: EmbeddingProvider {
     }
 
     private static func vector(for text: String, dim: Int) -> [Float] {
-        var state = fnv1a64(text)
+        var state = StableHash.fnv1a64(text)
         if state == 0 { state = 0x9E3779B97F4A7C15 }
         var out = [Float](repeating: 0, count: dim)
         for i in 0..<dim {
@@ -91,32 +92,6 @@ public struct MockEmbeddingProvider: EmbeddingProvider {
         let norm = sumsq > 0 ? sqrtf(sumsq) : 1
         for i in 0..<dim { out[i] /= norm }
         return out
-    }
-}
-
-// MARK: - FailClosedEmbeddingProvider
-// Metadata remains readable; every embed call reports the unavailable search model.
-public struct FailClosedEmbeddingProvider: EmbeddingProvider {
-    public let dimensions: Int
-    public let modelId: String = "fail-closed"
-
-    public init(dimensions: Int = CoreMLEmbeddingProvider.bundledDimensions) {
-        self.dimensions = dimensions
-    }
-
-
-    public var embeddingEpoch: MemoryEmbeddingEpoch {
-        get throws { throw unavailable }
-    }
-
-    private var unavailable: ToolFailureError {
-        MemoryStorageError.searchFailure("The memory search model is unavailable.",
-            code: "memory_search_model_unavailable",
-            instruction: "Tell the person: NativeAgent's bge-large-en-v1.5 search model is unavailable; read Doctor for the model file and failure.")
-    }
-
-    public func embed(_ texts: [String]) async throws -> [[Float]] {
-        throw unavailable
     }
 }
 
@@ -210,7 +185,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             }
         }
         self.embeddingEpoch = try Self.epoch(
-            modelURL: modelURL,
             vocabURL: vocabURL,
             dimensions: dimensions,
             modelID: modelId,
@@ -247,7 +221,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
 
     private static func epoch(
-        modelURL: URL,
         vocabURL: URL?,
         dimensions: Int,
         modelID: String,
@@ -527,7 +500,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         if let epoch = cached?.epoch { return epoch }
         let digest = try cached?.digest ?? modelArtifactDigest(modelURL: installed.modelURL)
         let resolvedEpoch = try epoch(
-            modelURL: installed.modelURL,
             vocabURL: installed.vocabURL,
             dimensions: installed.dimensions,
             modelID: installed.modelID,
@@ -536,21 +508,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         )
         cachedExtrasEpoch.withLock { $0 = (fingerprint, digest, resolvedEpoch) }
         return resolvedEpoch
-    }
-
-    /// Probe resources without compiling or loading CoreML so opening Settings cannot allocate the model.
-    public static func bundledResourcesAvailable(extrasRoot: URL? = nil) -> Bool {
-        do {
-            _ = try installedExtrasModel(root: extrasRoot)
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    /// The shadow check must not infer absence from a clipped sentence. This reads the already-loaded tokenizer's exact window, without inference.
-    func coversCompleteTexts(_ texts: [String]) -> Bool {
-        texts.allSatisfy { tokenizer.encode($0, maxLength: maxSeqLength).isComplete }
     }
 
     public func embed(_ texts: [String]) async throws -> [[Float]] {

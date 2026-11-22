@@ -118,7 +118,7 @@ preserved and posting throws a storage error.
 | `notifications/publications/<eventId>.json` | `DeviceSync/MacSyncMobileNotificationRelay.swift` owns immutable notification title/body/userInfo/timestamp retained before transport under a per-event lock. Retries reuse it, including after restart; unreadable or conflicting content stays preserved and fails through `ToolFailureError`. Covered by the notifications privacy scope, excluded from local backup/export; only the signed wire envelope goes to the phone. |
 | `chat/sessions.json` | Chat session index; `Transcripts/ChatSessionIndexFile.swift` owns every live commit, including transport row restoration/creation, binding-failure cleanup and retention under one index lock |
 | `chat/pinned_session_ids.json` | `Transcripts/ChatSessionRetention+PinnedChats.swift` owns the ordered pin list for Mac navigation, retention protection and phone projection. Only absence means no pins; malformed/unreadable bytes halt retention and preserve the last UI publication. No defaults mirror. Off-disk backup only; no local backup, data export or raw phone sync. |
-| `life-id` | `PersistenceCore/DataRootLife.swift` owns the data root's life through the durable writer and exclusive first-life link; written once when absent, replaced by the restore intent's new identity, retained in backup metadata |
+| `life-id` | `PersistenceCore/DataRootLife.swift` owns the data root's life through the durable writer and exclusive first-life link; written at launch when absent (its birth is the life's start, which phone chat admission reads), replaced by the restore intent's new identity, retained in backup metadata |
 | `.onboarded` | Onboarding's durable completion evidence; pending completion/reset still blocks admission. Carried by local/off-disk backup and production export with identity data, never raw phone sync. Restore installs the captured marker; a snapshot without it leaves the live marker unchanged and never creates one from missing evidence. |
 | `chat/proactive_speech.json` | `ChatTurnRuntime/ProactiveAssistantSpeech.swift` owns [speech claims](#speech-claims). |
 | `chat/messages/<sessionId>.jsonl` | Per-session transcript; [owners and evidence](#conversation-transcripts). |
@@ -148,7 +148,7 @@ preserved and posting throws a storage error.
 | `cognition/cognition.sqlite` | Cognitive state and artifacts; `CognitiveSubstrate/CognitiveSQLiteStore.swift`. Also holds, outside what Clear deletes and outside the restore bundle: `cognitive_epochs` (the mind's forgetting epoch, when Clear last moved it, and the fold-seq allocation) and `lived_moments`, the settled-turn journal (`CognitiveSQLiteStore+LivedMoments.swift`; rows stamped with their `DataRootLife`, owed → meant → lived or refused; ordinary settlement drops payloads, retains identities and prunes rows after 30 days; damaged rows are refused individually with reason and repair debt, payloads preserved outside pruning; unsettled rows never pruned by age; [SUBCONSCIOUS.md](SUBCONSCIOUS.md#lived-moments)). Clear and Reset are owner transactions, outside this journal. Continuity nodes carry `lived_seq` |
 | `cognition/organism_state.json` | Organism continuity, with the body's forgetting epoch (`epoch`), its lived-moment watermark (`lived`) and its recently-dosed encounters; `Cognition/NativeCognitionRuntime+BodyContinuity.swift` (one atomic writer, the persistence drain; persists only after its restore finished) |
 | `clock/times.json` | The one clock's saved Time fields (`id` as `<owner>:<key>`, `rhythm`, `next`, `payload`, optional `delivered` occurrence and `ended` flag); declarations, consumption and local/off-disk capture share its file lock. Ended times retain delivery/withdrawal evidence but are absent from pending listings and deadlines. Both backup forms and production export carry current clock declarations; engine launch does not read a carry-over marker or retired scheduler format. No projection zone or civil occurrence identity is saved, so a time-zone change while quit remains deferred ([clock limitation](AUTOMATED_SYSTEMS.md#8-bounded-inspection)); `TriggerScheduler/OneClock.swift` |
-| `desk/my-queue-carried.json` | MY QUEUE's current run and owed-settlement ledger. Only an absent current file begins an empty ledger; unreadable bytes throw. No retired arrival ledger is read; `AgentWorkspace/MyQueueCarried.swift` |
+| `desk/my-queue-carried.json` | MY QUEUE's current run and owed-settlement ledger. Only an absent current file begins an empty ledger; unreadable bytes throw. No retired arrival ledger is read; `Desk/MyQueueCarried.swift` |
 | `attention/notebook.json` | The turn program's notebook, which `weigh` reads as `felt.notebook`; `ChatTurnRuntime/TurnPart.swift` |
 | `cognition/user_turn.json` | The person's last turn stamp (`at`, `previous`, `key`, optional `door`) read by Since gap and rhythm; `ChatTurnRuntime/ChatTurnEvidence.swift` (`UserTurnStamp`) holds its sidecar file lock across the read/update and writes atomically; a delayed older timestamp cannot replace a newer stamp. Only a missing file bootstraps; unreadable/invalid bytes stay intact and owe repair through Experiences, including unavailable reads |
 | `mind/rhythm.json` | Timestamp/door-only evidence for the person's day: 24 seven-day forgetting bins, 30 days of hourly first activities and starts, standing claims and once-per-kind/local-day break identities. `Cognition/NativeCognitionRuntime+Rhythm.swift` is the sole writer, using `CognitiveSubstrate/PersonRhythm.swift`; only absence cold-starts from indexed owner history, corrupt bytes remain intact with repair owed. [Rhythm](RHYTHM.md) owns the evidence and admission rules |
@@ -159,7 +159,7 @@ preserved and posting throws a storage error.
 | `workflows/approvals/requests.json` | Approval records; `ApprovalInbox/ApprovalInbox.swift` |
 | `workflows/approvals/telegram-deliveries.json` | Telegram approval/inline prompt dispatch and returned-send receipts; `ApprovalTransactions/TelegramApprovalCoordinator.swift`. A dispatch without a returned receipt is unknown and cannot authorize a resend. Local approval backup/export scope; not a phone snapshot. |
 | `runs/runs.json` | Run ledger; `SwarmRuns/RunLedger.swift` |
-| `improvements/gauntlet/runs.json` | Bounded run array (latest 200); `AppToolRuntime/NativeRegistryEvaluation.swift` appends under the file lock. Only absence starts empty; an existing non-array root raises a schema error and preserves the file. |
+| `improvements/gauntlet/runs.json` | Retired: no code reads or writes it. Existing files are untouched. |
 | `turn_traces/<yyyy-MM-dd>.jsonl`, `traces/events.jsonl` | Retired: turn events and standalone receipts are details in the record (`experiences/experiences.sqlite`, [Storage](EXPERIENCE.md#storage)), written by `TurnTrace/TurnTracePersistLane.swift` and read through it. Existing files are untouched and no code reads or writes them; `~/.claude`-side tooling may import their last two weeks once. |
 | `ability_fetches/<uuid>.json` | `ToolExecution/ToolExecution+RunSandbox.swift` saves each admitted modifying fetch's (any method but GET/HEAD) complete redacted transport receipt once, after actual exit; a read keeps no receipt or experience and is safe to repeat. Excluded from off-disk backup. Its `fetch:<uuid>` experience references this file and owns the `finish` obligation; caller expiry/Stop/run close never removes the request or its late result. Missing/unreadable receipts are unavailable evidence requiring service reconciliation, never automatic replay. No age-based cleanup is currently applied. |
 | `turn_traces/practice/<agent>.json`, `turn_traces/practice/<agent>.tape.jsonl` | Retired nightly candidate ledger and nominated-call tape ([Habits H4](HABITS.md#h4--one-crystallizer)); no live reader or writer. Existing files are untouched and remain under turn-trace privacy exclusions (no backup, archive input or phone sync). Existing abilities' embedded tape fixtures stay with the ability owner and its replay/admission checks. |
@@ -168,7 +168,10 @@ Source paths above are under `Modules/NativeAgentCore/Sources/`.
 
 Telegram claim mutations compare retained fields before changing `updatedAt`.
 Index upserts compare the stored update ID and phase before writing or publishing
-a delivery change.
+a delivery change. A generation retry retains the input's source session with
+the resolved request. Older retries can establish it from the matching original
+inbox claim. Group preview cleanup persists the remaining message IDs
+after each confirmed deletion.
 
 `AgentWorkspace/BodyQueue.swift` files and settles self-findings through the
 canonical Desk store with `project: "body"`; findings keep their producer's key,
@@ -182,11 +185,11 @@ folds these rows by kind: that identity without its source prefix and its last
 two parts (`BodyDecidedRow.kind`).
 
 `Cognition/CaringReceiptLog.swift` writes `caring.appraisal` and the body's later
-`caring.dosing` response. `ChatSessionWork/OutcomeFeedbackStore.swift` writes and
-reads transcript-anchored `feedback.reaction` details. The experience record owns
-their two-week horizon. Local backup, export and raw phone sync exclude the whole
-record. Off-disk backup includes its experiences and events, removing only the
-detail table from the staged copy; the live record is unchanged. Retired trail files stay
+`caring.dosing` response. `ChatSessionWork/OutcomeFeedbackStore.swift` records
+transcript-anchored continuations and reads retained `feedback.reaction` details.
+The experience record owns their two-week horizon. Local backup, export and raw
+phone sync exclude the whole record. Off-disk backup includes its experiences and
+events. Only the staged copy's detail table is removed. Retired trail files stay
 untouched. The inbox, its archive shelf and the delivery ledger are readings of the experiences addressed to them
 (`Experiences/ForPerson.swift`); their old files are converted once offline and leave the data root.
 
@@ -260,6 +263,9 @@ replies retain confirmed text-part and image progress. Each text part has its
 own fingerprint under the saved reply. Explicit `/retry resend` resumes the same
 answer and run from its first unconfirmed part; confirmed text and images are
 never resent. Only a new successor answer resets that progress.
+An explicit generation retry marks the interrupted row claimed in the same
+write that pins its input and conversation to the retry command. A retained
+live or settled retry supersedes interrupted retries pinned to the same source.
 A truncation warning settles unconfirmed,
 and reconciliation requires one matching bot/thread post with the next part's
 echoed event/fingerprint metadata before continuing. Slack's URL and emoji text

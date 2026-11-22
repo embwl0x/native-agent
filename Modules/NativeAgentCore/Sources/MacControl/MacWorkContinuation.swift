@@ -2,21 +2,16 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 import TrustCenter
 import CoreGraphics
 import UserNotifications
 import Senses
 import Experiences
-import CryptoKit
 import os
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacWorkContinuation.swift` | One request's bounded native takeover continuation |
 /// Keep live references out of metadata; the reader validates them until the first effect begins.
 public final class MacWorkContinuation: @unchecked Sendable, Equatable {

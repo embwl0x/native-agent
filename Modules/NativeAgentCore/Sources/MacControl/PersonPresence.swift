@@ -34,7 +34,8 @@ public enum PersonPresence {
             }
             var latest: [PhoneSenseEvent.Source: PhoneSenseEvent] = [:]
             for event in senses where !event.isSetup && (latest[event.source].map({ $0.timestamp < event.timestamp }) ?? true) { latest[event.source] = event }
-            for source in PhoneSenseEvent.Source.allCases {
+            // Location is looked up on the phone-senses page when wanted, never carried in every turn.
+            for source in PhoneSenseEvent.Source.allCases where source != .location {
                 guard let event = latest[source] else { continue }
                 lines.append(PhoneSenseHistory.observationLine(event, now: now))
             }

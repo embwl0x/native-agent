@@ -126,5 +126,4 @@ public struct ProviderOAuthConfig: Sendable {
     )
 
     public static let xaiClientID = "b1a00492-073a-47ea-816f-4c329264a828"
-    public static let xaiTokenEndpoint = "https://auth.x.ai/oauth/token"
 }

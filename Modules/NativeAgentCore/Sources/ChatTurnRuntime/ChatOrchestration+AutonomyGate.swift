@@ -34,7 +34,7 @@ public actor AutonomyGate {
             throw AutonomyGateError.noApprovalInboxWired
         }
         // Preserve the caller's safety reason; describe the action only when no specific reason is supplied.
-        let resolvedReason = ApprovalActionText.reason(reason, tool: toolName)
+        let resolvedReason = ApprovalActionText.reason(reason, tool: toolName, input: requestPayload.objectValue ?? [:])
         let id: String
         do {
             id = try await filer.fileApprovalRequest(

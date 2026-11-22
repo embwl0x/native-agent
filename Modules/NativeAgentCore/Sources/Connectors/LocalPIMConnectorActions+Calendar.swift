@@ -533,6 +533,8 @@ extension LocalPIMConnectorActions {
         ]
         if let start = event.startDate { obj["startAt"] = .string(iso(start)) }
         if let end = event.endDate { obj["endAt"] = .string(iso(end)) }
+        // A watch knows an edited event (moved, renamed) by when it last changed, as it knows a new one by its id.
+        if let modified = event.lastModifiedDate { obj["modifiedAt"] = .string(iso(modified)) }
         if let location = event.location, !location.isEmpty {
             obj["location"] = .string(NativeAppSecretRedactor.redactText(location))
         }

@@ -50,12 +50,14 @@ extension ContextPreparedTurn {
         // its always-atoms is required here, and a moment's different words cannot admit some that outgrow the budget.
         let memorySources = Set(generation.atoms.lazy.filter { $0.draft.kind == .memory }.map(\.draft.sourceID))
         let others = Set(generation.atoms.lazy.map(\.draft.sourceID)).subtracting(memorySources)
+        let held = Set(packet.selectedItems.map(\.pointer.atomID)).union(excluding)
+        // Memories the turn already holds are filtered after selection, so the selector is asked for that many more: a held match never
+        // spends the last slot an unseen one needed.
         let picked = try ContextSelector(memoryStandout: ContextSelectionConfiguration.ambientStandoutDeviations).select(
-                need.moment(text, embedding: embedding, limit: limit, covering: others),
+                need.moment(text, embedding: embedding, limit: limit + held.count, covering: others),
                 from: generation, pinnedTo: lease.snapshot,
                 sourceReadFailures: packet.degradedSources
               )
-        let held = Set(packet.selectedItems.map(\.pointer.atomID)).union(excluding)
         let candidates = Array(picked.selectedItems.lazy
             .filter { $0.pointer.kind == .memory && !held.contains($0.pointer.atomID) }
             .prefix(limit))

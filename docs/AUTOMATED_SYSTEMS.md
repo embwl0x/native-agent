@@ -27,7 +27,7 @@ Paths below are relative to that root unless identified as source paths.
 | `BackgroundLoops/BackgroundLoops.swift`, `LoopHistory.swift`, `LoopFailureReceipts.swift` | Scheduler timing, outcome accounting, durable clocks and failure receipts. |
 | `BackgroundLoops/LoopContracts.swift`, `LoopStatusEvidence.swift` | Runner contracts, outcomes, backoff and status evidence. |
 | `BackgroundWork` | Maintenance, work, heartbeat and connector runner bodies. |
-| `BackgroundLoops/LoopContracts.swift`, `LoopStatusEvidence.swift` | Runner contracts, outcomes, backoff, bounded tick execution and status evidence; watchdog wire keys remain unchanged. |
+| `BackgroundLoops/LoopContracts.swift`, `LoopStatusEvidence.swift` | Runner contracts, outcomes, backoff, tick execution until completion or cancellation and status evidence; watchdog wire keys remain unchanged. |
 | `BackgroundWork` | Maintenance, work and connector runner bodies. |
 | `EngineRuntime/EngineLaunch.swift`, `EngineComposition.swift` | Launch ordering and concrete loop composition; `EngineChatSurfaces.swift`, `EngineDreams.swift` and `EngineScheduledWork.swift` compose chat surfaces, Dream/REM and scheduled work through installed host effects. |
 | `TriggerScheduler/OneClock.swift`, `EngineScheduledWork.swift` | The one clock: each declared time (`clock/times.json`), delivered once to its owner. |
@@ -135,8 +135,7 @@ Inspect these together:
   including across relaunch. Every beat still feeds the live ring for liveness and
   repeated holds. Each organ retains its last 32 beats in memory, so a busy organ
   never evicts another's. Relaunch restores changed facts from the record. `OrganRecord` reads a ring: its
-  latest beat, its profile (median interval, outcome mix, median yield) and
-  its deviation (missed, failed, stuck, off record), derived on every read
+  latest beat and its deviation (missed, failed, stuck, off record), derived on every read
   and never stored. `OrganBody` is the one body projection over those records:
   each organ's line (latest beat, why, next beat due) and its deviation,
   deviations first. Doctor's `live.pulses` row (titled Body) and the agent's
@@ -154,14 +153,22 @@ Inspect these together:
   body: …"), in every turn kind; a quiet body adds nothing. It is said at its
   start and again when its kind, onset or size changes; the
   said-memory (`mind/body_said.json`) is stamped only when the provider accepts
-  a context carrying the line. While a mind runs, `BodyNerve` re-reads the body on every beat: a
+  a context carrying the line. A told deviation's mark stays until its organ
+  completes a pass (`worked` or `nothing`) after the deviation began (for a
+  failure or hold, after it in beat order, even within its second); once it no
+  longer deviates, that pass gives the same line one sentence, "<organ> works
+  again (it passed at <time>)", said once, and that exact mark goes (a newer
+  fault's mark stays). A busy beat or a beat from before never says it. While a mind runs, `BodyNerve` re-reads the body on every beat: a
   deviation it has not felt becomes one `organDeviated` somatic signal, and a
-  `failed` or `stuck` organ owes repair (operation `organ:<id>`) once, settled
-  by that organ's next completed pass (`worked` or `nothing`); a repair owed for
-  being stuck (no `failed` beat among the organ's kept beats) is also settled by
-  a `busy` beat, since busy is not a hold. Its memory is
+  `failed` or `stuck` organ owes repair (operation `organ:<id>`) once, kept with
+  why it is owed and settled by that organ's next completed pass (settled
+  before new debts are read, so a pass and then a fresh fault in one read settle
+  the old repair and owe the new one); a repair owed
+  for being stuck is also settled by a `busy` beat, since busy is not a hold,
+  and one owed for failing only by a pass, however many beats follow (a stuck
+  organ that then fails is owed for its failure). Its memory is
   `mind/body_nerve.json`, so a relaunch neither signals an ongoing deviation
-  again nor forgets its debt.
+  again nor forgets its debt or its reason.
 
 A recent attempt is not proof of successful work. An idle lane's skip reason,
 enabled state and next deadline matter more than a blanket freshness threshold.
@@ -215,11 +222,11 @@ normal activation/privacy gates. The sampled idle-resume path remains available
 where physical-input observation is unavailable.
 
 `DoctorChecks/DoctorChecks.swift` defines `SwiftNativeDoctorChecks.defaultChecks`:
-17 checks covering storage, runtime JSON, run-ledger and turn-trace integrity,
+16 checks covering storage, runtime JSON, run-ledger and turn-trace integrity,
 sessions and identity, prompt-prefix health, subconscious vitals, model
 compensations, messages, persona, memory, embeddings, ability files, iCloud,
 operation logs and OAuth expiry. The app adds live checks, including
-background-loop health; the visible report is not a fixed 17-row checklist.
+background-loop health; the visible report is not a fixed 16-row checklist.
 `Model compensations` (`model.shims`) is a read-only count of `shim.fired`
 receipts by census ID in a bounded measurement window, excluded from heartbeat
 sweeps.
@@ -239,19 +246,8 @@ registered tick fail with the file path and cause; the bytes remain untouched.
 Incomplete disk accounting retains unreadable paths and causes in its outcome,
 preserves prior notices, and releases the daily reservation. A partial scan
 cannot claim disk clean or retire an existing finding.
-Weekly analysis distinguishes absent transcripts, error feeds and Doctor reports
-from unreadable or malformed evidence. Unavailable sources fail before synthesis
-and release the weekly reservation instead of supplying measured zeros. Its
-outcome evidence is their jobs that ended this week and last
-(`AgentJobs.weeklyOutcomes`); an unreadable job store fails the pass.
 Watchdog snapshots encode the live runtime lifecycle and running
 execution counts; retired daemon and LaunchAgent fields are absent.
-The weekly response requires a nonempty summary, complete typed findings and
-standing rows, including valid runtime operations. Invalid responses stage
-nothing, retain their returned bytes in the failed digest and release the week.
-Standing lessons require recurrence across two independent conversations,
-covering half their observed turns and two thirds of the week's conversations;
-eligibility has no fixed lifetime-use or installation-volume floor.
 
 Saved-provider read failures and failed native provider probes report `fail`;
 explicit connection checks probe the current saved credential, including OAuth,
@@ -458,8 +454,6 @@ question cannot wake this evaluation and its run accounting again; see the
 [unchanged experience law](EXPERIENCE.md#delivery-and-face). Its CPU-only proposal
 calls no action and changes no notebook, so a successful evaluation writes no
 run accounting under the [run evidence contract](skill_manifest_spec.md).
-The macOS background activity for the weekly sweep
-reads that runner's declared default period and refuses a change-woken entry.
 
 Telegram and Slack remain registered as disabled when unconfigured and perform
 no remote work. Saved-configuration or credential read failures register as
@@ -480,10 +474,9 @@ Their creation and execution share `ProactiveScanArguments`: `reason`,
 Missing optional arguments use their declared defaults; malformed or unknown
 arguments are refused. The retired numeric coercions, `surface_limit`,
 `stale_days` and unused `sources` input are removed.
-Notification release reads the immutable delivery ledger described in
-[Internal Workings](INTERNAL_WORKINGS.md). It does not rewrite its watched
-inbox. Channel suppression settles once; only destination acceptance is
-delivery, and unknown sends await evidence.
+Notification release reads owed experience obligations through `ForPerson`.
+Channel suppression settles once; only destination acceptance is delivery,
+and unknown sends await evidence. See [Internal Workings](INTERNAL_WORKINGS.md).
 
 Completed periodic work persists its admitted start for cadence across relaunch;
 successful work keeps its separate completion timestamp. A long-running tick
@@ -516,7 +509,11 @@ The `delegation_outcome` runner reads contact owner changes and the
 quiet-hours end. Failed settlement waits for a source or repair event.
 Its pass reads contact replies and returns settled Desk waits
 (`EngineComposition.reconcileAgentConversations`). Neither decides that the agent
-thinks: what comes back is a `returned` happening posted through `Attention.post`.
+thinks: what comes back is a `returned` happening written through Attention's
+intake. Desk completion requires a [checked return](EXPERIENCE.md#implemented-boundaries)
+with the same helper receipts, including material beyond the display limit.
+A matching return that is still owed is offered again on retry, and the post's
+repair debt settles before Desk completes.
 A return opens at once in the conversation that
 started the work (`MindStream.returnTo`) through `TurnAdmission` as a hidden
 arrival; a turn open there reads it and answers it, with no second delivery.
@@ -722,8 +719,7 @@ mark of the schedule entry it is (payload `made`); a read's keys are kept only o
 watch cancelled and made again under the same id never takes an earlier read's keys. A read that did not complete keeps the last keys,
 and a changed read advances those keys only after durable news acceptance
 (a failed news write fails the occurrence and retains its prior baseline),
-and nothing new posts nothing. The occurrence output names the count
-(`newRows`). The Mail, Calendar and Reminders recipes in
+and nothing new posts nothing. The Mail, Calendar and Reminders recipes in
 `Resources/abilities/mac-watch-catalog.js` are such watches (`mail.recent`,
 `calendar.upcoming`, and `reminders.query` over open reminders, dated or not, most recently made or edited first, 200 a read).
 A watch naming an action the door

@@ -115,7 +115,8 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
                 let text = safeDoctorDetail(receipt)
                 nativeLog("[Doctor repair] %@: %@; recheck=%@", id, text, verified.status)
                 checks[index].receipt = text
-                checks[index].repairApplied = actionCompleted
+                // A repair whose recheck turned the failing check green did change something, whatever its port could report.
+                checks[index].repairApplied = actionCompleted || (DoctorSafeRepairPolicy.isAdverse(before.status) && verified.status == "ok")
                 var repairReceipt = checks[index]
                 repairReceipt.title = before.title
                 repairReceipt.detail = text

@@ -191,16 +191,14 @@ extension ChatGPTTransport {
         do {
             (data, response) = try await OAuthGrantOperations.post(refreshEndpoint, body, session: session)
         } catch {
-            throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: refreshEndpoint, operation: "refresh"))
+            throw mapTransportError(error, fallback: transientNetworkError(error, provider: providerId, host: refreshEndpoint.host ?? "chatgpt.com", operation: "refresh"))
         }
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         let status = http.statusCode
         if !(200..<300).contains(status) {
             // 429/5xx are transient; preserve Retry-After for 429.
             if status == 429 {
-                throw LLMError.rateLimited(
-                    message: "openai_oauth_direct refresh HTTP 429 (temporary)",
-                    retryAfterSeconds: parseRetryAfterSeconds(from: response))
+                throw LLMError.rateLimited(retryAfterSeconds: parseRetryAfterSeconds(from: response))
             }
             if (500..<600).contains(status) {
                 throw LLMError.transient(

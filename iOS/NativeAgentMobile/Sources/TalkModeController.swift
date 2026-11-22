@@ -252,7 +252,7 @@ final class TalkModeController: NSObject {
         if let failure {
             reply.terminal = true; runs[run] = reply
             stopSpeech()
-            status = "Listening"; error = failure
+            status = isMuted ? "Muted" : "Listening"; error = failure
             updateActivity(); return
         }
         let consumedEnd: String.Index?
@@ -278,7 +278,7 @@ final class TalkModeController: NSObject {
             enqueueSpeech(sentence)
         }
         reply.terminal = terminal; runs[run] = reply
-        if terminal && utterances.isEmpty { status = "Listening"; updateActivity() }
+        if terminal && utterances.isEmpty { status = isMuted ? "Muted" : "Listening"; updateActivity() }
     }
 
     private static func consumedPrefixEnd(in text: String, matching consumed: String) -> String.Index? {
@@ -332,13 +332,14 @@ final class TalkModeController: NSObject {
         isSpeaking = false; speechPulse = 0
     }
 
-    func toggleMute() {
-        guard isActive else { return }
-        isMuted.toggle(); endpointThrough = nil
+    func toggleMute() { setMuted(!isMuted) }
+
+    func setMuted(_ muted: Bool) {
+        guard isActive, isMuted != muted else { return }
+        isMuted = muted; endpointThrough = nil
         isFinalizing = false; segments = [:]; heardSpeech = false; volatileRegions = []; sentThrough = audioTime
         status = isMuted ? "Muted" : "Listening"
-        let value = isMuted
-        audio.setMuted(value)
+        audio.setMuted(muted)
         updateActivity()
     }
 

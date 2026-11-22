@@ -378,16 +378,18 @@ enum QuietPages {
         return own(appModel, ids: [key]).first
     }
 
-    /// The page the window draws for a rail item, as the door names it (`ShellPageContent.doorPage`); nil for a page of the agent's own,
+    /// The page the window draws for a rail item, as the door names it (`SidebarItem.doorPage`); nil for a page of the agent's own,
     /// which the selection names by its id.
     @MainActor static func shown(_ item: SidebarItem) -> QuietPage? {
-        ShellPageContent.doorPage(item).flatMap(page(named:))
+        SidebarItem.doorPage(item).flatMap(page(named:))
     }
 
     /// Only the requested page titles are observed; the catalog supplies claim and inventory availability.
     @MainActor static func own(_ appModel: AppModel, ids: Set<String>) -> [QuietPage] {
         guard let catalog = appModel.face.slot(PageFaceKey.catalog).value(as: PartFaceCatalog.self) else { return [] }
-        return descriptions(catalog, ids: ids) { appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self) }
+        return QuietToolPage.descriptions(catalog, ids: ids) {
+            appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self)
+        }.map(QuietPage.init)
     }
 
     /// Agent discovery reads its owner directly, independently of the next display frame.
@@ -398,7 +400,7 @@ enum QuietPages {
         }
         if let failure = catalog.failure { throw failure }
         let snapshots = await pages.snapshots
-        return descriptions(catalog, ids: Set(catalog.claims.keys)) { snapshots[$0] }
+        return QuietToolPage.descriptions(catalog, ids: Set(catalog.claims.keys)) { snapshots[$0] }.map(QuietPage.init)
     }
 
     @MainActor static func ownerPage(named raw: String, appModel: AppModel) async -> QuietPage? {
@@ -407,7 +409,7 @@ enum QuietPages {
         if let page = QuietToolPage.page(named: raw) { return QuietPage(value: page) }
         guard let catalog = await appModel.engine.pages.catalog else { return nil }
         let snapshots = await appModel.engine.pages.snapshots
-        return descriptions(catalog, ids: [key]) { snapshots[$0] }.first
+        return QuietToolPage.descriptions(catalog, ids: [key]) { snapshots[$0] }.first.map(QuietPage.init)
     }
 
     /// Navigation and capture resolve inventory absence at its owner, before deciding whether a page exists.
@@ -419,21 +421,6 @@ enum QuietPages {
             return .init(code: "page_inventory_pending", message: "Waiting on the authored-page inventory; this page request is unconfirmed.")
         }
         return catalog.failure
-    }
-
-    private static func descriptions(_ catalog: PartFaceCatalog, ids: Set<String>,
-                                     snapshot: (String) -> PartFaceSnapshot?) -> [QuietPage] {
-        catalog.claims.filter { ids.contains($0.key) }.sorted { $0.key < $1.key }.map { id, claim in
-            let title = snapshot(id)?.face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? id
-            let summary: String
-            if let failure = catalog.failure { summary = failure.message } else {
-                switch claim {
-                case .success(let part): summary = "A page of the agent's own, drawn by its part \(part) from that part's notebook."
-                case .failure(let failure): summary = failure.message
-                }
-            }
-            return QuietPage(value: QuietToolPage(id: id, title: title, summary: summary))
-        }
     }
 }
 

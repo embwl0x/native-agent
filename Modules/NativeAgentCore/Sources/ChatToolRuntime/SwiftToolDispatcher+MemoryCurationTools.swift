@@ -66,12 +66,6 @@ public struct MemoryCuration: Sendable {
             + "change of trust can bring their steer back, and a telling from the same source on the same day is the root already held."
     }
 
-    func curationString(_ input: [String: JSONValue], _ key: String) -> String? {
-        guard case .string(let s)? = input[key] else { return nil }
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
     func curationInt(_ input: [String: JSONValue], _ key: String) -> Int? {
         switch input[key] {
         case .int(let i)?: return Int(i)
@@ -95,11 +89,6 @@ public struct MemoryCuration: Sendable {
         return (String(parts[0]), (String(parts[1]), String(parts[2])))
     }
 
-    func curationBool(_ input: [String: JSONValue], _ key: String) -> Bool? {
-        guard case .bool(let b)? = input[key] else { return nil }
-        return b
-    }
-
     func curationRefusal(_ reason: String) -> JSONValue {
         .object(["status": .string("refused"), "reason": .string(reason),
             "execution": .string("not_run"), "effects": .string("none")])
@@ -114,20 +103,20 @@ public struct MemoryCuration: Sendable {
                 }
             }
         }
-        if let value = input["pinned"], value != .null, curationBool(input, "pinned") == nil {
+        if let value = input["pinned"], value != .null, value.boolValue == nil {
             return curationRefusal("pinned must be true or false; omit it to list pinned and unpinned memories together.")
         }
         let offset = max(0, curationInt(input, "offset") ?? 0)
         let limit = min(100, max(1, curationInt(input, "limit") ?? 50))
-        let sort = curationString(input, "sort") ?? "newest_first"
+        let sort = input["sort"]?.trimmedString ?? "newest_first"
         guard ["newest_first", "oldest_first"].contains(sort) else {
             return curationRefusal("sort must be newest_first or oldest_first; keep the same sort when following next_after_id.")
         }
-        let status = curationString(input, "status") ?? "active"
+        let status = input["status"]?.trimmedString ?? "active"
         guard ["active", "archived"].contains(status) else {
             return curationRefusal("status must be active or archived.")
         }
-        let afterID = curationString(input, "after_id")
+        let afterID = input["after_id"]?.trimmedString
         let cursor = afterID.flatMap { Self.curationCursorKey($0) }
         if afterID != nil {
             guard let cursor else {
@@ -146,7 +135,7 @@ public struct MemoryCuration: Sendable {
         let listing: (records: [MemoryRecord], total: Int, nextOffset: Int)
         do {
             listing = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot).curationPage(
-                archived: status == "archived", kind: curationString(input, "kind"), pinned: curationBool(input, "pinned"),
+                archived: status == "archived", kind: input["kind"]?.trimmedString, pinned: input["pinned"]?.boolValue,
                 surface: surface, persona: persona,
                 newestFirst: sort == "newest_first", afterKey: cursor?.key, offset: offset, limit: limit
             )
@@ -206,14 +195,14 @@ public struct MemoryCuration: Sendable {
     }
 
     public func rewriteTarget(input: [String: JSONValue], surface: String, persona: String?) async throws -> MemoryRecord {
-        guard let id = curationString(input, "id") else {
+        guard let id = input["id"]?.trimmedString else {
             throw ToolFailureError("memory.rewrite needs a memory id.", argumentPath: "id", accepted: "an id from memory.list",
                 effects: .none, nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
                 code: "memory_id_required", status: .refused, instruction: "Choose the id to rewrite.", recovery: .correctArguments)
         }
-        let text = curationString(input, "text")
-        let pinned = curationBool(input, "pinned")
-        let restore = curationBool(input, "restore") == true
+        let text = input["text"]?.trimmedString
+        let pinned = input["pinned"]?.boolValue
+        let restore = input["restore"]?.boolValue == true
         let roots = try statedRoots(input)
         guard text != nil || pinned != nil || restore || roots != nil else {
             throw ToolFailureError("memory.rewrite needs a change.", argumentPath: "text / pinned / restore / roots",
@@ -281,9 +270,9 @@ public struct MemoryCuration: Sendable {
             failure["effects"] = .string("none")
             return .object(failure)
         }
-        let text = curationString(input, "text")
-        let pinned = curationBool(input, "pinned")
-        let restore = curationBool(input, "restore") == true
+        let text = input["text"]?.trimmedString
+        let pinned = input["pinned"]?.boolValue
+        let restore = input["restore"]?.boolValue == true
         let roots: [MemoryRoot.Telling]?
         do { roots = try statedRoots(input) } catch { return SwiftToolDispatcher.memoryFailure(error) }
         // The teller of words a peer steered is the door that carried them, the one rule memory.commit keeps; the agent's own turn names any teller.
@@ -358,7 +347,7 @@ extension SwiftToolDispatcher {
 
     /// Drop one memory for good. A tombstone keeps the same thing from being re-proposed.
     func impl_forget_memory(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let id = curation.curationString(input, "id") else {
+        guard let id = input["id"]?.trimmedString else {
             return curation.curationRefusal("forget_memory needs the memory 'id' from app memory.list or recall_memory.")
         }
         do {
@@ -378,7 +367,7 @@ extension SwiftToolDispatcher {
         if let failure = MemoryPolicyGate.knowledgeGraphFailure(dataRoot: dataRoot) {
             return ChatToolOutcome.failure(error: failure)
         }
-        let mode = curation.curationString(input, "mode") ?? "rebuild"
+        let mode = input["mode"]?.trimmedString ?? "rebuild"
         guard ["rebuild", "sweep_orphans"].contains(mode) else {
             return curation.curationRefusal("mode must be rebuild or sweep_orphans.")
         }

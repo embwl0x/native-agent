@@ -143,7 +143,7 @@ extension AppToolExecutor {
         paneText: (String, String) async -> String
     ) async -> JSONValue {
         let tabs = JSONValue.array(rooms.map { .string($0) })
-        let room = pageInputText(input["room"]).lowercased()
+        let room = JSONValue.trimmedStringOrEmpty(input["room"]).lowercased()
         guard !room.isEmpty else {
             return AppToolExecutor.pageReadResult(page: "agent_view", fields: ["status": .string("ok"), "title": .string("Agent view"), "tabs": tabs])
         }
@@ -152,7 +152,7 @@ extension AppToolExecutor {
                 remedy: "read_tabs", "Read the available tabs, then pass one as item on agent_view.",
                 next: ["page": .string("agent_view")], extra: ["requested": .string(room), "tabs": tabs])
         }
-        let named = pageInputText(input["session_id"])
+        let named = JSONValue.trimmedStringOrEmpty(input["session_id"])
         let scope = named.isEmpty ? activeSessionID : named
         return AppToolExecutor.pageReadResult(page: "agent_view", fields: [
             "status": .string("ok"), "title": .string("Agent view"), "room": .string(room), "session_id": .string(scope),
@@ -164,7 +164,7 @@ extension AppToolExecutor {
         input: [String: JSONValue], activeSessionID: String,
         read: (String) async -> [(id: String, label: String)]
     ) async -> JSONValue {
-        let sessionId = [pageInputText(input["session_id"]), pageInputText(input["__session_id"])]
+        let sessionId = [JSONValue.trimmedStringOrEmpty(input["session_id"]), JSONValue.trimmedStringOrEmpty(input["__session_id"])]
             .first { !$0.isEmpty } ?? activeSessionID
         let lines = await read(sessionId)
         return AppToolExecutor.pageReadResult(page: "context", fields: [
@@ -176,8 +176,4 @@ extension AppToolExecutor {
         ])
     }
 
-    private static func pageInputText(_ value: JSONValue?) -> String {
-        guard case .string(let raw)? = value else { return "" }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }

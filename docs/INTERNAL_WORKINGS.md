@@ -751,7 +751,7 @@ re-saving the slot's model with other Think or Fast always passes. Every place
 that accepts a model choice asks it and refuses with "No models to choose yet: "
 and the account's sentence: the selection check every save passes through,
 routing reconstruction, the Providers and minds pickers, the default-model
-setting and the account editor, the agent's `provider.set_default_model`,
+setting and the account editor, the agent's `provider.set_fallback_model`,
 `providers.*_model` and `chat.model`, Telegram's model menu, the image-model
 card, and a helper's pinned model (`bot.create`/`bot.update`, through
 `botModelRefusal` over the rows `bot.list include_models` lists for the very
@@ -790,12 +790,15 @@ has no list endpoint. ChatGPT, Codex, Moonshot and OpenRouter have separate cata
 owners. Every settings read checks the app's own ChatGPT sign-in's account list
 (`ChatGPTAccountModelRefresh.refresh`). It asks again when there is no bound list
 under a day old by file modification date with the full-list version, or with the
-checked version and a recorded full-list refusal. Refresh asks regardless of age.
+checked version and a recorded full-list refusal. A settings read with a fresh
+list can use it during an explicit Refresh. Refresh asks regardless of age.
 The first request uses models `client_version=99.0.0` to include models above
 the app's checked Codex wire version. The User-Agent carries the checked version.
 If the full-list request errors or returns an invalid catalog, the same refresh
-asks once at the checked version. Cancellation or a changed account stops the
-refresh. A checked-version list carries the reason in `nativeagent_full_list_refused`
+asks once at the checked version. Callers that need the same credential's
+in-flight request share it. Cancelling a caller ends its wait and stops the
+request when no callers remain. A changed account stops the refresh.
+A checked-version list carries the reason in `nativeagent_full_list_refused`
 and Providers shows it with the checked version. When both asks fail, the final
 error leaves the saved list in place and is memoized for that token until Refresh.
 A listed model above the checked wire version stays selectable. Its row says
@@ -913,11 +916,8 @@ caller; draft-key checks return their probe result without writing verification.
 No file timestamp can bind a check to a key.
 Provider preference responses use the saved `SurfacePreference` vocabulary:
 `surface`, `model`, `reasoningEffort`, `serviceTier`. Current phone selection
-uses `configure_surface_selection` with its complete tuple. The older
-`configure_provider`, `set_active_provider` and `set_surface_model` readers
-remain pending inspection of retained transaction bytes in the previous
-iCloud container; unavailable archive bytes cannot establish that no caller
-remains. Sealed credential setup stays separate from model selection.
+uses `configure_surface_selection` with its complete tuple. The sealed
+`interaction_action` handler rejects credential fields with `mac_required`.
 <a id="oauth-token-response-contract"></a>
 
 Anthropic and xAI own flat token sets; their readers and refresh writers use

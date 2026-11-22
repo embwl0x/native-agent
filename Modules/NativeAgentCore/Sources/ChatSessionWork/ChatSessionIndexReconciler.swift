@@ -27,8 +27,9 @@ public actor ChatSessionIndexReconciler {
         self.dataRoot = dataRoot
     }
 
-    /// Share exact version identity with transcript writers and retention through ChatSessionIndexFile.
-    static let transcriptStampKey = "reconciledTranscriptModifiedAt"
+    /// Revisit previews generated before reconciliation read the row's saved provenance.
+    private static let legacyTranscriptStampKey = "reconciledTranscriptModifiedAt"
+    private static let transcriptStampKey = "reconciledTranscriptPreviewAt"
 
     /// Recheck selected updatedAt/stamp values before writing a repair computed outside the index lock.
     private struct StaleCandidate: Sendable {
@@ -45,16 +46,9 @@ public actor ChatSessionIndexReconciler {
         let rows: [[String: JSONValue]]?
         let version: JSONValue?
 
-        /// Distinguish an absent conversational row from one with no readable preview.
         let preview: (text: String, stamp: TranscriptRowStamp)?
         let firstSpokenStamp: String?
         let lastSpokenStamp: String?
-    }
-
-    private nonisolated static func stamp(_ row: [String: JSONValue]?) -> TranscriptRowStamp {
-        let metadata: [String: JSONValue] = if case .object(let value)? = row?["metadata"] { value } else { [:] }
-        return TranscriptRowStamp.of(id: string(row?["id"]) ?? "", role: string(row?["role"])?.lowercased() ?? "",
-                                     metadata: metadata, rowSource: string(row?["source"]))
     }
 
     private struct StaleRepair: Sendable {
@@ -69,16 +63,28 @@ public actor ChatSessionIndexReconciler {
     }
 
     public func reconcile(
-        maximumFiles: Int = 256,
-        maximumBytes: Int64 = 32 * 1_024 * 1_024,
-        maximumStaleRepairs: Int = 50
+        maximumBytes: Int64 = 32 * 1_024 * 1_024
     ) async throws -> ChatSessionIndexReconciliationReport {
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
         let messagesDirectory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
         guard FileManager.default.fileExists(atPath: messagesDirectory.path) else { return .init() }
 
+        let selection = try await selectRepairs(sessionsPath: sessionsPath, messagesDirectory: messagesDirectory)
+        let (recovered, startingReport, consumedBytes) = try await readOrphanRepairs(selection, maximumBytes: maximumBytes)
+        let (repairs, readReport) = try await readStaleRepairs(
+            selection, maximumBytes: maximumBytes, startingBytes: consumedBytes, startingReport: startingReport
+        )
+        var report = readReport
+        guard !repairs.isEmpty || !recovered.isEmpty else { return report }
+        let writes = try await commitRepairs(sessionsPath: sessionsPath, pendingRepairs: repairs, pendingRecovered: recovered)
+        report.sessionsRecovered += writes.recovered
+        report.staleRowsRepaired += writes.repaired
+        return report
+    }
+
+    private func selectRepairs(sessionsPath: URL, messagesDirectory: URL) async throws -> SelectionPass {
         // Select by metadata under the index lock; acquire transcript locks and parse outside it.
-        let selection = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> SelectionPass in
+        return try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> SelectionPass in
             var report = ChatSessionIndexReconciliationReport()
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
             let knownIDs = Set(rows.compactMap { row -> String? in
@@ -115,49 +121,42 @@ public actor ChatSessionIndexReconciler {
                 return lhs.lastPathComponent < rhs.lastPathComponent
             }
 
-            let fileLimit = max(0, maximumFiles)
+            let fileLimit = 256
             let boundedCandidates = candidates.prefix(fileLimit)
             report.skippedForBounds += max(0, candidates.count - boundedCandidates.count)
 
-            // Bound stale reads by exact transcript version so orphan recovery cannot starve.
-            var staleCandidates: [StaleCandidate] = []
-            var staleRepairBudget = max(0, maximumStaleRepairs)
-            if staleRepairBudget > 0 {
-                var transcriptsByID: [String: (url: URL, modified: Date)] = [:]
-                for entry in directoryEntries {
-                    let raw = entry.deletingPathExtension().lastPathComponent
-                    guard NativeAgentChatSessionID.normalizedPathComponent(raw) == raw,
-                          let values = try? entry.resourceValues(forKeys: [
-                              .isRegularFileKey, .isSymbolicLinkKey,
-                              .contentModificationDateKey,
-                          ]),
-                          values.isRegularFile == true, values.isSymbolicLink != true,
-                          let modified = values.contentModificationDate else { continue }
-                    transcriptsByID[raw] = (entry, modified)
-                }
+            var transcriptsByID: [String: (url: URL, modified: Date)] = [:]
+            for entry in directoryEntries {
+                let raw = entry.deletingPathExtension().lastPathComponent
+                guard NativeAgentChatSessionID.normalizedPathComponent(raw) == raw,
+                      let values = try? entry.resourceValues(forKeys: [
+                          .isRegularFileKey, .isSymbolicLinkKey,
+                          .contentModificationDateKey,
+                      ]),
+                      values.isRegularFile == true, values.isSymbolicLink != true,
+                      let modified = values.contentModificationDate else { continue }
+                transcriptsByID[raw] = (entry, modified)
+            }
 
-                for row in rows {
-                    guard case .string(let sessionID)? = row["id"],
-                          let transcript = transcriptsByID[sessionID],
-                          let version = ChatSessionIndexFile.transcriptVersion(at: transcript.url),
-                          row[ChatSessionIndexFile.acknowledgedTranscriptKey] != version
-                              || row[TranscriptRowStamp.previewKey] == nil else { continue }
-                    guard staleRepairBudget > 0 else {
-                        report.skippedForBounds += 1
-                        continue
-                    }
-                    staleRepairBudget -= 1
-                    staleCandidates.append(
-                        StaleCandidate(
-                            sessionID: sessionID,
-                            url: transcript.url,
-                            modified: transcript.modified,
-                            updatedAt: row["updatedAt"],
-                            stamp: row[Self.transcriptStampKey],
-                            version: row[ChatSessionIndexFile.acknowledgedTranscriptKey]
-                        )
-                    )
-                }
+            // Bound transcript locks across all stale repairs, including legacy previews.
+            var staleCandidates: [StaleCandidate] = []
+            for row in rows {
+                let legacy = row[Self.legacyTranscriptStampKey] != nil
+                guard case .string(let sessionID)? = row["id"],
+                      let transcript = transcriptsByID[sessionID],
+                      let version = ChatSessionIndexFile.transcriptVersion(at: transcript.url),
+                      legacy || row[ChatSessionIndexFile.acknowledgedTranscriptKey] != version
+                          || row[TranscriptRowStamp.previewKey] == nil else { continue }
+                let candidate = StaleCandidate(
+                    sessionID: sessionID,
+                    url: transcript.url,
+                    modified: transcript.modified,
+                    updatedAt: row["updatedAt"],
+                    stamp: row[Self.transcriptStampKey],
+                    version: row[ChatSessionIndexFile.acknowledgedTranscriptKey]
+                )
+                if staleCandidates.count < 50 { staleCandidates.append(candidate) }
+                else { report.skippedForBounds += 1 }
             }
 
             return SelectionPass(
@@ -166,7 +165,11 @@ public actor ChatSessionIndexReconciler {
                 orphans: Array(boundedCandidates)
             )
         }
+    }
 
+    private func readOrphanRepairs(
+        _ selection: SelectionPass, maximumBytes: Int64
+    ) async throws -> (recovered: [[String: JSONValue]], report: ChatSessionIndexReconciliationReport, consumedBytes: Int64) {
         var report = selection.report
 
         // Release the index lock for transcript reads; a busy transcript cannot block its siblings' recovery.
@@ -210,25 +213,26 @@ public actor ChatSessionIndexReconciler {
             }
             guard !objectRows.isEmpty else { continue }
 
-            guard let createdAt = Self.string(objectRows.first?["createdAt"]) else {
+            guard let createdAt = (objectRows.first?["createdAt"])?.trimmedString else {
                 report.corruptTranscripts += 1
                 continue
             }
-            let updatedAt = Self.string(objectRows.last?["createdAt"]) ?? createdAt
+            let updatedAt = (objectRows.last?["createdAt"])?.trimmedString ?? createdAt
             let firstUserContent = objectRows.first(where: {
-                Self.string($0["role"])?.lowercased() == "user"
-            }).flatMap { Self.content($0) }
+                ($0["role"])?.trimmedString?.lowercased() == "user"
+            }).flatMap { Self.readableSpeech($0)?.text }
+            let title = Self.bounded(firstUserContent ?? "", to: 80)
             // Session origin comes from the first surface-authored row, excluding system rows.
             let creation = objectRows.first(where: { row in
-                guard Self.string(row["source"]) != nil else { return false }
-                return Self.string(row["role"])?.lowercased() != "system"
+                guard (row["source"])?.trimmedString != nil else { return false }
+                return (row["role"])?.trimmedString?.lowercased() != "system"
             })
-            let source = creation.flatMap { Self.string($0["source"]) } ?? "app"
-            let kind = SessionConversation.kind(threadKind: creation.flatMap { Self.string($0["threadKind"]) }, source: source,
-                                                sourceKey: creation.flatMap { Self.string($0["sourceKey"]) })
+            let source = creation.flatMap { ($0["source"])?.trimmedString } ?? "app"
+            let kind = SessionConversation.kind(threadKind: creation.flatMap { ($0["threadKind"])?.trimmedString }, source: source,
+                                                sourceKey: creation.flatMap { ($0["sourceKey"])?.trimmedString })
             var recoveredRow: [String: JSONValue] = [
                 "id": .string(sessionID),
-                "title": .string(Self.bounded(firstUserContent ?? "Recovered Chat", to: 80)),
+                "title": .string(title.isEmpty ? "Recovered Chat" : title),
                 "source": .string(source),
                 "threadKind": .string(kind.rawValue),
                 "createdAt": .string(createdAt),
@@ -240,7 +244,7 @@ public actor ChatSessionIndexReconciler {
             recoveredRow["firstMessageAt"] = read.firstSpokenStamp.map(JSONValue.string)
             recoveredRow["lastMessageAt"] = read.lastSpokenStamp.map(JSONValue.string)
             recoveredRow["lastMessagePreview"] = .string(read.preview?.text ?? "")
-            recoveredRow[TranscriptRowStamp.previewKey] = (read.preview?.stamp ?? Self.stamp(nil)).json
+            recoveredRow[TranscriptRowStamp.previewKey] = read.preview?.stamp.json ?? .null
             // Stamp the pre-read mtime so a concurrent change remains eligible for repair.
             if let modified = values.contentModificationDate {
                 recoveredRow[Self.transcriptStampKey] = .string(Self.iso8601(modified))
@@ -249,6 +253,15 @@ public actor ChatSessionIndexReconciler {
             recoveredRow[ChatSessionIndexFile.transcriptGenerationKey] = .int(1)
             recovered.append(recoveredRow)
         }
+        return (recovered, report, consumedBytes)
+    }
+
+    private func readStaleRepairs(
+        _ selection: SelectionPass, maximumBytes: Int64, startingBytes: Int64,
+        startingReport: ChatSessionIndexReconciliationReport
+    ) async throws -> (repairs: [StaleRepair], report: ChatSessionIndexReconciliationReport) {
+        var report = startingReport
+        var consumedBytes = startingBytes
         // Each transcript read holds its own lock through completion.
         var repairs: [StaleRepair] = []
         for candidate in selection.candidates {
@@ -268,7 +281,7 @@ public actor ChatSessionIndexReconciler {
             consumedBytes += read.bytes
 
             // Stale and orphan repairs require the same trusted transcript shape.
-            guard let objectRows = read.rows, !objectRows.isEmpty else {
+            guard read.rows != nil else {
                 // Leave damaged transcripts unstamped; repair the index only from trusted transcript evidence.
                 report.corruptTranscripts += 1
                 continue
@@ -276,12 +289,13 @@ public actor ChatSessionIndexReconciler {
 
             repairs.append(StaleRepair(candidate: candidate, read: read))
         }
+        return (repairs, report)
+    }
 
-        guard !repairs.isEmpty || !recovered.isEmpty else { return report }
-        let pendingRepairs = repairs
-        let pendingRecovered = recovered
-
-        let writes = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> (recovered: Int, repaired: Int) in
+    private func commitRepairs(
+        sessionsPath: URL, pendingRepairs: [StaleRepair], pendingRecovered: [[String: JSONValue]]
+    ) async throws -> (recovered: Int, repaired: Int) {
+        return try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> (recovered: Int, repaired: Int) in
             var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
             // A concurrent archive's durable claim takes precedence over orphan recovery.
             let archivedIDs = try Self.archivedSessionIDs(dataRoot: self.dataRoot)
@@ -301,18 +315,25 @@ public actor ChatSessionIndexReconciler {
                       row[Self.transcriptStampKey] == repair.candidate.stamp,
                       row[ChatSessionIndexFile.acknowledgedTranscriptKey] == repair.candidate.version else { continue }
                 var disagreed = false
-                if row["firstMessageAt"] == nil || row["firstMessageAt"] == .null {
-                    row["firstMessageAt"] = read.firstSpokenStamp.map(JSONValue.string)
+                let count = read.rows?.count ?? 0
+                let indexedCount = JSONValue.int(Int64(count))
+                // Only the clear operation can confirm that a previously nonempty chat was emptied.
+                let confirmsTranscript = count > 0 || row["messageCount"] == .int(0)
+                if confirmsTranscript {
+                    if count == 0 || row["firstMessageAt"] == nil || row["firstMessageAt"] == .null {
+                        row["firstMessageAt"] = read.firstSpokenStamp.map(JSONValue.string)
+                    }
+                    row["lastMessageAt"] = read.lastSpokenStamp.map(JSONValue.string)
+                    if row["messageCount"] != indexedCount {
+                        row["messageCount"] = indexedCount
+                        disagreed = true
+                    }
+                    row[Self.transcriptStampKey] = .string(Self.iso8601(repair.candidate.modified))
+                    row[ChatSessionIndexFile.acknowledgedTranscriptKey] = read.version
                 }
-                row["lastMessageAt"] = read.lastSpokenStamp.map(JSONValue.string)
-                let count = JSONValue.int(Int64(read.rows?.count ?? 0))
-                if row["messageCount"] != count {
-                    row["messageCount"] = count
-                    disagreed = true
-                }
-                // A transcript with no conversational row has no preview to quote.
+                // No preview can quote a missing or provenance-damaged row.
                 let preview = JSONValue.string(read.preview?.text ?? "")
-                let previewStamp = (read.preview?.stamp ?? Self.stamp(nil)).json
+                let previewStamp = read.preview?.stamp.json ?? .null
                 if row["lastMessagePreview"] != preview || row[TranscriptRowStamp.previewKey] != previewStamp {
                     row["lastMessagePreview"] = preview
                     row[TranscriptRowStamp.previewKey] = previewStamp
@@ -321,27 +342,27 @@ public actor ChatSessionIndexReconciler {
                 // Advance updatedAt only: an older appended row must not lower sidebar ordering.
                 if let lastStamp = read.lastSpokenStamp,
                    let lastDate = Self.date(lastStamp),
-                   let rowDate = Self.date(Self.string(row["updatedAt"])),
+                   let rowDate = Self.date((row["updatedAt"])?.trimmedString),
                    lastDate > rowDate {
                     row["updatedAt"] = .string(lastStamp)
                     disagreed = true
                 }
-                if disagreed {
-                    // Changed transcript metadata advances the phone's publication counter.
+                if disagreed && confirmsTranscript {
+                    // An unexplained empty read cannot authorize clearing the phone's transcript.
                     ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
                 }
-                row[Self.transcriptStampKey] = .string(Self.iso8601(repair.candidate.modified))
-                row[ChatSessionIndexFile.acknowledgedTranscriptKey] = read.version
+                row[Self.legacyTranscriptStampKey] = nil
+                guard row != rows[position] else { continue }
                 rows[position] = row
                 wroteRow = true
                 if disagreed { repaired += 1 }
             }
             // A concurrent writer's index row takes precedence over the launch snapshot.
             let insertions = pendingRecovered.filter {
-                guard let id = Self.string($0["id"]) else { return false }
+                guard let id = ($0["id"])?.trimmedString else { return false }
                 return positions[id] == nil && !archivedIDs.contains(id)
             }.sorted {
-                (Self.string($0["updatedAt"]) ?? "") > (Self.string($1["updatedAt"]) ?? "")
+                (($0["updatedAt"])?.trimmedString ?? "") > (($1["updatedAt"])?.trimmedString ?? "")
             }
             rows.insert(contentsOf: insertions, at: 0)
             if wroteRow || !insertions.isEmpty {
@@ -349,9 +370,6 @@ public actor ChatSessionIndexReconciler {
             }
             return (insertions.count, repaired)
         }
-        report.sessionsRecovered += writes.recovered
-        report.staleRowsRepaired += writes.repaired
-        return report
     }
 
     /// Archived transcripts remain on disk intentionally; their absence from the hot index must not trigger orphan recovery.
@@ -377,12 +395,12 @@ public actor ChatSessionIndexReconciler {
             }
             let valid = scan.report.malformedLineCount == 0 && !scan.report.trailingPartialLine
                 && rowsAreTrustworthy(rows, parsedRowCount: scan.rows.count, sessionID: sessionID)
-            let spoken = rows.filter { ["user", "assistant"].contains(string($0["role"])?.lowercased() ?? "") }
+            let spoken = rows.filter { ["user", "assistant"].contains($0["role"]?.trimmedString?.lowercased() ?? "") }
             return StaleRead(bytes: bytes, rows: valid ? rows : nil,
                              version: ChatSessionIndexFile.transcriptVersion(at: transcript),
-                             preview: spoken.last.map { (bounded(content($0) ?? "", to: 160), stamp($0)) },
-                             firstSpokenStamp: string(spoken.first?["createdAt"]),
-                             lastSpokenStamp: string(spoken.last?["createdAt"]))
+                             preview: spoken.last.flatMap(readableSpeech).map { (bounded($0.text, to: 160), $0.stamp) },
+                             firstSpokenStamp: spoken.first?["createdAt"]?.trimmedString,
+                             lastSpokenStamp: spoken.last?["createdAt"]?.trimmedString)
         } ?? nil
     }
 
@@ -420,14 +438,9 @@ public actor ChatSessionIndexReconciler {
         return nil
     }
 
-    private nonisolated static func content(_ object: [String: JSONValue]) -> String? {
-        string(contentValue(object))
-    }
-
-    private nonisolated static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let raw)? = value else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+    private nonisolated static func readableSpeech(_ row: [String: JSONValue]) -> ContactThread.Line? {
+        let line = ContactThread.Line(row)
+        return !line.id.isEmpty && line.provenanceFailure == nil ? line : nil
     }
 
     private nonisolated static func date(_ raw: String?) -> Date? {

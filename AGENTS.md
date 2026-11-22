@@ -64,6 +64,9 @@ is a defect to fix at once. First law: docs/NORTHSTAR.md.
   read; publication moves forward only (an older read never replaces a newer
   snapshot, a committed write publishes through `write`). Never hand-roll a
   generation counter for "which read may publish".
+- **Their identity lines are pinned (User, 2026-11-21).** `script/identity_pins.tsv`
+  lists them; the pre-commit hook fails a commit that rewrites one. Hunt and
+  improve freely; a change to those words comes to Claude and Agent.
 - **Least code, and don't break what works.** Check an item's premise
   against git log before building it — plans go stale.
 - The live runtime is `NativeAgent.app` in-process. `EngineRuntime` and

@@ -6,6 +6,14 @@ import CryptoKit
 // MARK: - Message model (shared wire format for outbox JSON files)
 
 public struct BridgeMessage: Codable, Identifiable, Sendable, Equatable {
+    public static let notificationPairingKey = "notificationPairingFingerprint"
+
+    /// The pairing identity shared by signed notifications and their phone replies.
+    public static func pairingFingerprint(_ secret: Data?) -> String? {
+        guard let secret, !secret.isEmpty else { return nil }
+        return SHA256.hash(data: secret).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
     public let id: String           // UUID string
     public let sender: String       // "mac" | "ios"
     public let timestamp: Date

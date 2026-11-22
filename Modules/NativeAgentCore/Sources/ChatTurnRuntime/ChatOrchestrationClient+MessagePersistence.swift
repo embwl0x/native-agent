@@ -395,6 +395,47 @@ extension SwiftNativeChatOrchestrationClient {
         let createdAt = role == "user"
             ? turn.rows.importedMessageCreatedAt ?? NativeTimestampFormat.fractionalZulu(persistedAt)
             : NativeTimestampFormat.fractionalZulu(persistedAt)
+        let call = TranscriptAppend(sessionId: sessionId, role: role, content: content, runId: runId,
+            attachments: attachments, persona: persona, source: source, recalledMemoryIds: recalledMemoryIds,
+            canonicalAssistantCompletion: canonicalAssistantCompletion, outcomeResult: outcomeResult,
+            outcomeContext: outcomeContext, outcomeTurnID: outcomeTurnID,
+            responseOutcomeStatus: responseOutcomeStatus, responseFailure: responseFailure,
+            providerRefusal: providerRefusal, providerRefusalDraft: providerRefusalDraft, failureWork: failureWork,
+            mechanicalRow: mechanicalRow, requestedResultIntent: requestedResultIntent,
+            agentConversationSendID: agentConversationSendID,
+            agentConversationSendByPerson: agentConversationSendByPerson, answerFor: answerFor,
+            proactiveSpeechIdempotencyKey: proactiveSpeechIdempotencyKey, awaitingConsumption: awaitingConsumption,
+            messageId: messageId, onNotice: onNotice, turn: turn, safeSessionId: safeSessionId, partial: partial,
+            messageSource: messageSource, messageSurface: messageSurface, sessionsPath: sessionsPath,
+            sessionKind: sessionKind, path: path, persistedAt: persistedAt, createdAt: createdAt)
+        try await composeTranscriptRow(call)
+        await stampTranscriptProvenance(call)
+        let record = call.record
+        // The owner lock protects appends against concurrent transcript rewrites.
+        let messageRow: JSONValue = .object(record)
+        ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
+        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
+        // The transcript lock makes the committed row count authoritative for index sync.
+        let (appended, replacedTurnTraceID, existingUserOrigin): (Bool, String?, AfterTurnOrigin?) = try await SwiftNativePersistenceCore.withFileLock(path) {
+            try await Self.lockedTranscriptWrite(messageRow, path: path, sessionId: sessionId, role: role, content: content,
+                runId: runId, agentConversationSendID: agentConversationSendID,
+                agentConversationSendByPerson: agentConversationSendByPerson, awaitingConsumption: awaitingConsumption,
+                answerFor: answerFor, expectedLastMessageID: expectedLastMessageID,
+                canonicalAssistantCompletion: canonicalAssistantCompletion, turn: turn)
+        }
+        guard appended else { return existingUserOrigin }
+        return await publishTranscriptRow(call, replacedTurnTraceID: replacedTurnTraceID)
+    }
+
+    /// The row's fields and base metadata: steering, partial ending, delivery bindings and attachment references.
+    private func composeTranscriptRow(_ call: TranscriptAppend) async throws {
+        let (sessionId, role, content, runId) = (call.sessionId, call.role, call.content, call.runId)
+        let (attachments, messageId, turn, responseOutcomeStatus) = (call.attachments, call.messageId, call.turn, call.responseOutcomeStatus)
+        let (responseFailure, canonicalAssistantCompletion, outcomeResult, outcomeContext) = (call.responseFailure, call.canonicalAssistantCompletion, call.outcomeResult, call.outcomeContext)
+        let (outcomeTurnID, awaitingConsumption, proactiveSpeechIdempotencyKey, agentConversationSendID) = (call.outcomeTurnID, call.awaitingConsumption, call.proactiveSpeechIdempotencyKey, call.agentConversationSendID)
+        let (agentConversationSendByPerson, answerFor, failureWork, requestedResultIntent) = (call.agentConversationSendByPerson, call.answerFor, call.failureWork, call.requestedResultIntent)
+        let (partial, messageSource, messageSurface, sessionKind) = (call.partial, call.messageSource, call.messageSurface, call.sessionKind)
+        let (persistedAt, createdAt) = (call.persistedAt, call.createdAt)
         // Encode immutable payload-free observations before the lock; appending and replacement must neither await nor read future state.
         let responseStatus = responseOutcomeStatus
             ?? (canonicalAssistantCompletion && role == "assistant" ? "persisted" : nil)
@@ -467,6 +508,21 @@ extension SwiftNativeChatOrchestrationClient {
             }
             metadata["attachments"] = .array(arr)
         }
+        call.record = record
+        call.metadata = metadata
+        call.outcomeObservation = outcomeObservation
+    }
+
+    /// The row's provenance: persona and writer, origin and envelope, completion binding and landed outcome.
+    private func stampTranscriptProvenance(_ call: TranscriptAppend) async {
+        var record = call.record
+        var metadata = call.metadata
+        let outcomeObservation = call.outcomeObservation
+        let (sessionId, role, content, runId) = (call.sessionId, call.role, call.content, call.runId)
+        let (attachments, persona, mechanicalRow, turn) = (call.attachments, call.persona, call.mechanicalRow, call.turn)
+        let (providerRefusal, providerRefusalDraft, canonicalAssistantCompletion, outcomeContext) = (call.providerRefusal, call.providerRefusalDraft, call.canonicalAssistantCompletion, call.outcomeContext)
+        let (outcomeResult, outcomeTurnID, safeSessionId, messageSurface) = (call.outcomeResult, call.outcomeTurnID, call.safeSessionId, call.messageSurface)
+        let persistedAt = call.persistedAt
         if let persona, !persona.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             metadata["persona"] = .string(persona)
         }
@@ -576,144 +632,155 @@ extension SwiftNativeChatOrchestrationClient {
         if !metadata.isEmpty {
             record["metadata"] = .object(metadata)
         }
-        // The owner lock protects appends against concurrent transcript rewrites.
-        let messageRow: JSONValue = .object(record)
-        ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
-        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
-        // The transcript lock makes the committed row count authoritative for index sync.
-        let (appended, replacedTurnTraceID, existingUserOrigin): (Bool, String?, AfterTurnOrigin?) = try await SwiftNativePersistenceCore.withFileLock(path) {
-            if let sendID = agentConversationSendID {
-                let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
-                guard report.isClean else { throw ChatOrchestrationError.underlying("The contact send's transcript needs repair.") }
-                let matches = rows.filter { row in
-                    guard case .object(let fields) = row, case .object(let metadata)? = fields["metadata"] else { return false }
-                    return metadata["dotClientUserMessageID"] == .string(sendID)
-                }
-                if !matches.isEmpty {
-                    guard matches.count == 1, case .object(let row) = matches[0], row["role"] == .string("assistant"),
-                          row["content"] == .string(content), case .object(let metadata)? = row["metadata"],
-                          (metadata["byPerson"] == .bool(true)) == agentConversationSendByPerson else {
-                        throw ChatOrchestrationError.underlying("This send identity already has different or repeated words; repair its transcript.")
-                    }
-                    return (false, nil, nil)
-                }
+        call.record = record
+        call.metadata = metadata
+        call.originProvenance = originProvenance
+    }
+
+    /// Under the transcript owner's lock: an already-saved send, run row or answer is the row; an expected tail must hold;
+    /// a regenerate replaces its answer in place, anything else appends.
+    private static func lockedTranscriptWrite(
+        _ messageRow: JSONValue, path: URL, sessionId: String, role: String, content: String, runId: String?,
+        agentConversationSendID: String?, agentConversationSendByPerson: Bool, awaitingConsumption: Bool,
+        answerFor: String?, expectedLastMessageID: String?, canonicalAssistantCompletion: Bool, turn: Turn
+    ) async throws -> (Bool, String?, AfterTurnOrigin?) {
+        if let sendID = agentConversationSendID {
+            let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
+            guard report.isClean else { throw ChatOrchestrationError.underlying("The contact send's transcript needs repair.") }
+            let matches = rows.filter { row in
+                guard case .object(let fields) = row, case .object(let metadata)? = fields["metadata"] else { return false }
+                return metadata["dotClientUserMessageID"] == .string(sendID)
             }
-            if role == "user", let runId {
-                let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
-                guard report.isClean else {
-                    throw ChatOrchestrationError.underlying("User input cannot be admitted until its transcript is repaired")
+            if !matches.isEmpty {
+                guard matches.count == 1, case .object(let row) = matches[0], row["role"] == .string("assistant"),
+                      row["content"] == .string(content), case .object(let metadata)? = row["metadata"],
+                      (metadata["byPerson"] == .bool(true)) == agentConversationSendByPerson else {
+                    throw ChatOrchestrationError.underlying("This send identity already has different or repeated words; repair its transcript.")
                 }
-                let submitted = rows.filter { row in
-                    guard case .object(let object) = row else { return false }
-                    return object["role"] == .string("user")
-                        && object["sessionId"] == .string(sessionId)
-                        && object["runId"] == .string(runId)
-                }
-                if !submitted.isEmpty {
-                    guard submitted.count == 1, case .object(var row) = submitted[0], row["content"] == .string(content) else {
-                        throw ChatOrchestrationError
-                            .underlying("This input run already has a different or repeated saved user row; repair its transcript before resuming")
-                    }
-                    // A run's user row is written once: writing it again as its turn consumes the row its door saved first.
-                    if !awaitingConsumption, case .object(var saved)? = row["metadata"], saved["awaitingConsumption"] != nil,
-                       let index = rows.firstIndex(of: .object(row)) {
-                        saved.removeValue(forKey: "awaitingConsumption")
-                        row["metadata"] = .object(saved)
-                        var consumed = rows
-                        consumed[index] = .object(row)
-                        try ContactThread.replace(consumed, to: path)
-                    }
-                    guard let origin = try Self.afterTurnOrigin(in: rows, sessionId: sessionId, runId: runId) else {
-                        throw ChatOrchestrationError.underlying("The saved input has no readable row identity; repair its transcript before resuming")
-                    }
-                    return (false, nil, origin)
-                }
-            }
-            if let answerFor, FileManager.default.fileExists(atPath: path.path) {
-                let bytes = try Data(contentsOf: path)
-                let rows = SwiftNativePersistenceCore.decodeJSONL(bytes) { value, _ in value }.rows
-                if rows.contains(where: { row in
-                    guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
-                    return metadata["answerFor"] == .string(answerFor)
-                }) { return (false, nil, nil) }
-            }
-            if let expectedLastMessageID {
-                // Match the recent conversation window under the append lock; a leading fragment cannot prove the last row's identity.
-                guard let tail = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: 2048, maxBytes: 1024 * 1024),
-                      let line = tail.lines.dropFirst(tail.leadingFragment ? 1 : 0).last(where: {
-                          String(data: $0, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != true
-                      }),
-                      String(data: line, encoding: .utf8) != nil,
-                      let last = try? JSONValue.parse(line),
-                      Self.messageID(in: last) == expectedLastMessageID else {
-                    throw ChatOrchestrationError.underlying("The conversation changed before the reply could be saved. Reopen it before replying.")
-                }
-            }
-            if canonicalAssistantCompletion,
-               role == "assistant",
-               let replacementID = turn.rows.replacementAssistantMessageID?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !replacementID.isEmpty {
-                let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
-                guard report.isClean else {
-                    throw ChatOrchestrationError.underlying("The conversation contains unreadable rows. Its reply was not replaced.")
-                }
-                let matching = rows.indices.filter { index in
-                    Self.messageID(in: rows[index]) == replacementID
-                }
-                guard matching.count == 1, let index = matching.first else {
-                    throw ChatOrchestrationError.underlying(
-                        "regenerate replacement target must identify exactly one persisted message"
-                    )
-                }
-                guard Self.messageRole(in: rows[index]) == "assistant" else {
-                    throw ChatOrchestrationError.underlying(
-                        "regenerate replacement target is not an assistant message"
-                    )
-                }
-                // Retry may already have persisted its own tool receipts. They
-                // are not a newer conversational turn, but must stay ahead of
-                // its final answer. No foreign or untyped trailing row qualifies.
-                let onlyOwnRetryReceipts = rows[(index + 1)...].allSatisfy { row in
-                    guard let runId, !runId.isEmpty,
-                          case .object(let object) = row,
-                          object["role"] == .string("tool"),
-                          object["runId"] == .string(runId),
-                          object["sessionId"] == .string(sessionId),
-                          case .string(let rowID)? = object["id"], !rowID.isEmpty,
-                          case .object(let metadata)? = object["metadata"],
-                          case .string(let toolName)? = metadata["toolName"], !toolName.isEmpty,
-                          case .string(let kind)? = metadata["kind"]
-                    else { return false }
-                    return kind == ChatTranscriptToolMessageKind.toolUse
-                        || kind == ChatTranscriptToolMessageKind.approvalPending
-                        || kind == InlineInteractionWire.transcriptKind
-                }
-                guard onlyOwnRetryReceipts else {
-                    throw ChatOrchestrationError.underlying(
-                        "regenerate replacement target is no longer the transcript tail"
-                    )
-                }
-                let priorTurnTraceID = Self.messageTurnTraceID(in: rows[index])
-                var replaced = rows
-                replaced.remove(at: index)
-                replaced.append(messageRow)
-                try ContactThread.replace(replaced, to: path)
-                // Exact replacement is row-count neutral; count the same nonblank JSONL lines emitted by `ContactThread.replace`.
-                ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
-                return (true, priorTurnTraceID, nil)
-            } else {
-                let priorCount = try ChatTranscriptLineCountCache.shared.count(
-                    at: path,
-                    recount: Self.countJSONLLines(at:)
-                )
-                // Every conversational row is durable under the transcript owner's lock.
-                try await ContactThread.append(messageRow, to: path)
-                ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
-                return (true, nil, nil)
+                return (false, nil, nil)
             }
         }
-        guard appended else { return existingUserOrigin }
+        if role == "user", let runId {
+            let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
+            guard report.isClean else {
+                throw ChatOrchestrationError.underlying("User input cannot be admitted until its transcript is repaired")
+            }
+            let submitted = rows.filter { row in
+                guard case .object(let object) = row else { return false }
+                return object["role"] == .string("user")
+                    && object["sessionId"] == .string(sessionId)
+                    && object["runId"] == .string(runId)
+            }
+            if !submitted.isEmpty {
+                guard submitted.count == 1, case .object(var row) = submitted[0], row["content"] == .string(content) else {
+                    throw ChatOrchestrationError
+                        .underlying("This input run already has a different or repeated saved user row; repair its transcript before resuming")
+                }
+                // A run's user row is written once: writing it again as its turn consumes the row its door saved first.
+                if !awaitingConsumption, case .object(var saved)? = row["metadata"], saved["awaitingConsumption"] != nil,
+                   let index = rows.firstIndex(of: .object(row)) {
+                    saved.removeValue(forKey: "awaitingConsumption")
+                    row["metadata"] = .object(saved)
+                    var consumed = rows
+                    consumed[index] = .object(row)
+                    try ContactThread.replace(consumed, to: path)
+                }
+                guard let origin = try Self.afterTurnOrigin(in: rows, sessionId: sessionId, runId: runId) else {
+                    throw ChatOrchestrationError.underlying("The saved input has no readable row identity; repair its transcript before resuming")
+                }
+                return (false, nil, origin)
+            }
+        }
+        if let answerFor, FileManager.default.fileExists(atPath: path.path) {
+            let bytes = try Data(contentsOf: path)
+            let rows = SwiftNativePersistenceCore.decodeJSONL(bytes) { value, _ in value }.rows
+            if rows.contains(where: { row in
+                guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
+                return metadata["answerFor"] == .string(answerFor)
+            }) { return (false, nil, nil) }
+        }
+        if let expectedLastMessageID {
+            // Match the recent conversation window under the append lock; a leading fragment cannot prove the last row's identity.
+            guard let tail = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: 2048, maxBytes: 1024 * 1024),
+                  let line = tail.lines.dropFirst(tail.leadingFragment ? 1 : 0).last(where: {
+                      String(data: $0, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != true
+                  }),
+                  String(data: line, encoding: .utf8) != nil,
+                  let last = try? JSONValue.parse(line),
+                  Self.messageID(in: last) == expectedLastMessageID else {
+                throw ChatOrchestrationError.underlying("The conversation changed before the reply could be saved. Reopen it before replying.")
+            }
+        }
+        if canonicalAssistantCompletion,
+           role == "assistant",
+           let replacementID = turn.rows.replacementAssistantMessageID?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !replacementID.isEmpty {
+            let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
+            guard report.isClean else {
+                throw ChatOrchestrationError.underlying("The conversation contains unreadable rows. Its reply was not replaced.")
+            }
+            let matching = rows.indices.filter { index in
+                Self.messageID(in: rows[index]) == replacementID
+            }
+            guard matching.count == 1, let index = matching.first else {
+                throw ChatOrchestrationError.underlying(
+                    "regenerate replacement target must identify exactly one persisted message"
+                )
+            }
+            guard rows[index].objectValue?["role"]?.stringValue == "assistant" else {
+                throw ChatOrchestrationError.underlying(
+                    "regenerate replacement target is not an assistant message"
+                )
+            }
+            // Retry may already have persisted its own tool receipts. They
+            // are not a newer conversational turn, but must stay ahead of
+            // its final answer. No foreign or untyped trailing row qualifies.
+            let ownRetryReceipt: (JSONValue) -> Bool = { row in
+                guard let runId, !runId.isEmpty,
+                      case .object(let object) = row,
+                      object["role"] == .string("tool"),
+                      object["runId"] == .string(runId),
+                      object["sessionId"] == .string(sessionId),
+                      case .string(let rowID)? = object["id"], !rowID.isEmpty,
+                      case .object(let metadata)? = object["metadata"],
+                      case .string(let toolName)? = metadata["toolName"], !toolName.isEmpty,
+                      case .string(let kind)? = metadata["kind"]
+                else { return false }
+                return kind == ChatTranscriptToolMessageKind.toolUse
+                    || kind == ChatTranscriptToolMessageKind.approvalPending
+                    || kind == InlineInteractionWire.transcriptKind
+            }
+            // The new answer takes the old one's place after the retry's own receipts; a message that arrived meanwhile
+            // stays after it, as its own turn, instead of making the replacement fail.
+            let place = rows[(index + 1)...].firstIndex { !ownRetryReceipt($0) } ?? rows.endIndex
+            let priorTurnTraceID = Self.messageTurnTraceID(in: rows[index])
+            var replaced = rows
+            replaced.insert(messageRow, at: place)
+            replaced.remove(at: index)
+            try ContactThread.replace(replaced, to: path)
+            // Exact replacement is row-count neutral; count the same nonblank JSONL lines emitted by `ContactThread.replace`.
+            ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
+            return (true, priorTurnTraceID, nil)
+        } else {
+            let priorCount = try ChatTranscriptLineCountCache.shared.count(
+                at: path,
+                recount: Self.countJSONLLines(at:)
+            )
+            // Every conversational row is durable under the transcript owner's lock.
+            try await ContactThread.append(messageRow, to: path)
+            ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
+            return (true, nil, nil)
+        }
+    }
+
+    /// After the row commits: history index, continuation receipt, retry reaction, session index, change signal and cognition.
+    private func publishTranscriptRow(_ call: TranscriptAppend, replacedTurnTraceID: String?) async -> AfterTurnOrigin? {
+        let (sessionId, role, content, runId) = (call.sessionId, call.role, call.content, call.runId)
+        let (source, messageId, turn, onNotice) = (call.source, call.messageId, call.turn, call.onNotice)
+        let (recalledMemoryIds, mechanicalRow, safeSessionId, partial) = (call.recalledMemoryIds, call.mechanicalRow, call.safeSessionId, call.partial)
+        let (messageSource, sessionsPath, path, persistedAt) = (call.messageSource, call.sessionsPath, call.path, call.persistedAt)
+        let (createdAt, metadata, originProvenance) = (call.createdAt, call.metadata, call.originProvenance)
         ChatHistoryIndex.absorb(path, dataRoot: dataRoot)
         if role == "user" {
             do {
@@ -787,17 +854,105 @@ extension SwiftNativeChatOrchestrationClient {
             messageId: messageId, occurredAt: persistedAt, userMessage: content) : nil
     }
 
+    /// One `appendMessage` call: its arguments, the row's identity, and the record its stages build before the lock.
+    final class TranscriptAppend {
+        let sessionId: String
+        let role: String
+        let content: String
+        let runId: String?
+        let attachments: [MultimodalAttachment]
+        let persona: String?
+        let source: String
+        let recalledMemoryIds: [String]
+        let canonicalAssistantCompletion: Bool
+        let outcomeResult: TurnEngineResult?
+        let outcomeContext: TurnContext?
+        let outcomeTurnID: String?
+        let responseOutcomeStatus: String?
+        let responseFailure: String?
+        let providerRefusal: Bool
+        let providerRefusalDraft: Bool
+        let failureWork: String?
+        let mechanicalRow: CognitiveMechanicalRowKind?
+        let requestedResultIntent: JSONValue?
+        let agentConversationSendID: String?
+        let agentConversationSendByPerson: Bool
+        let answerFor: String?
+        let proactiveSpeechIdempotencyKey: String?
+        let awaitingConsumption: Bool
+        let messageId: String
+        let onNotice: (@Sendable (String, String) async -> Void)?
+        let turn: Turn
+        let safeSessionId: String
+        let partial: Bool
+        let messageSource: String
+        let messageSurface: String
+        let sessionsPath: URL
+        let sessionKind: ChatThreadKind
+        let path: URL
+        let persistedAt: Date
+        let createdAt: String
+        var record: [String: JSONValue] = [:]
+        var metadata: [String: JSONValue] = [:]
+        var outcomeObservation: ResponseOutcomeObservationV2?
+        var originProvenance: ChatMessageOrigin?
+
+        init(
+            sessionId: String, role: String, content: String, runId: String?, attachments: [MultimodalAttachment],
+            persona: String?, source: String, recalledMemoryIds: [String], canonicalAssistantCompletion: Bool,
+            outcomeResult: TurnEngineResult?, outcomeContext: TurnContext?, outcomeTurnID: String?,
+            responseOutcomeStatus: String?, responseFailure: String?, providerRefusal: Bool,
+            providerRefusalDraft: Bool, failureWork: String?, mechanicalRow: CognitiveMechanicalRowKind?,
+            requestedResultIntent: JSONValue?, agentConversationSendID: String?, agentConversationSendByPerson: Bool,
+            answerFor: String?, proactiveSpeechIdempotencyKey: String?, awaitingConsumption: Bool, messageId: String,
+            onNotice: (@Sendable (String, String) async -> Void)?, turn: Turn, safeSessionId: String, partial: Bool,
+            messageSource: String, messageSurface: String, sessionsPath: URL, sessionKind: ChatThreadKind, path: URL,
+            persistedAt: Date, createdAt: String
+        ) {
+            self.sessionId = sessionId
+            self.role = role
+            self.content = content
+            self.runId = runId
+            self.attachments = attachments
+            self.persona = persona
+            self.source = source
+            self.recalledMemoryIds = recalledMemoryIds
+            self.canonicalAssistantCompletion = canonicalAssistantCompletion
+            self.outcomeResult = outcomeResult
+            self.outcomeContext = outcomeContext
+            self.outcomeTurnID = outcomeTurnID
+            self.responseOutcomeStatus = responseOutcomeStatus
+            self.responseFailure = responseFailure
+            self.providerRefusal = providerRefusal
+            self.providerRefusalDraft = providerRefusalDraft
+            self.failureWork = failureWork
+            self.mechanicalRow = mechanicalRow
+            self.requestedResultIntent = requestedResultIntent
+            self.agentConversationSendID = agentConversationSendID
+            self.agentConversationSendByPerson = agentConversationSendByPerson
+            self.answerFor = answerFor
+            self.proactiveSpeechIdempotencyKey = proactiveSpeechIdempotencyKey
+            self.awaitingConsumption = awaitingConsumption
+            self.messageId = messageId
+            self.onNotice = onNotice
+            self.turn = turn
+            self.safeSessionId = safeSessionId
+            self.partial = partial
+            self.messageSource = messageSource
+            self.messageSurface = messageSurface
+            self.sessionsPath = sessionsPath
+            self.sessionKind = sessionKind
+            self.path = path
+            self.persistedAt = persistedAt
+            self.createdAt = createdAt
+        }
+    }
+
     private static func messageID(in row: JSONValue) -> String? {
         guard case .object(let object) = row else { return nil }
         if case .string(let id)? = object["id"] { return id }
         if case .string(let id)? = object["message_id"] { return id }
         return nil
-    }
-
-    private static func messageRole(in row: JSONValue) -> String? {
-        guard case .object(let object) = row,
-              case .string(let role)? = object["role"] else { return nil }
-        return role
     }
 
     private static func messageTurnTraceID(in row: JSONValue) -> String? {
@@ -1014,7 +1169,8 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     private nonisolated static func previewText(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Redact the whole text before cutting it: a title or preview syncs to the phone apart from the redacted transcript.
+        let trimmed = TurnTraceRedactor.redactText(raw).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         let collapsed = trimmed
             .replacingOccurrences(of: "\n", with: " ")

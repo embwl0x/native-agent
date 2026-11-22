@@ -20,11 +20,7 @@ import TurnTrace
 
 public enum AppActions {
     /// Put-away reasons ride the receipt so the decision remains attributable.
-    public static var all: [AppAction] { get throws { try available(dataRoot: PersistenceCore.defaultDataRoot()) } }
-
-    static func available(dataRoot: URL) throws -> [AppAction] {
-        try seedActions
-    }
+    public static var all: [AppAction] { get throws { try seedActions } }
 
     public static func action(_ id: String, dataRoot: URL = PersistenceCore.defaultDataRoot(), turn: Turn?) throws -> AppAction? {
         guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
@@ -62,7 +58,7 @@ public enum AppActions {
     // Leave synchronous file-backed discovery off the MainActor app door.
     static func resolvedAction(_ id: String, dataRoot: URL, turn: Turn?) async throws -> (action: AppAction, discovery: [String: JSONValue])? {
         guard let action = try action(id, dataRoot: dataRoot, turn: turn) else { return nil }
-        return (action, try discovery(action, dataRoot: dataRoot).objectValue ?? [:])
+        return (action, try discovery(action).objectValue ?? [:])
     }
 
     static func pagePrefixedAction(_ id: String, dataRoot: URL = PersistenceCore.defaultDataRoot(), turn: Turn?) throws -> AppAction? {
@@ -88,8 +84,8 @@ public enum AppActions {
     /// One checked snapshot for synchronous policy/lookup and asynchronous discovery. No consumer can publish a successful partial catalog.
     static func checkedInventory(dataRoot: URL, turn: Turn?) throws -> (actions: [AppAction], authored: [AppAction]) {
         let records = try FileSenseRegistry(dataRoot: dataRoot).presentationRecords()
-        let own = try available(dataRoot: dataRoot), sense = try senses(records: records, catalog: own, dataRoot: dataRoot, turn: turn)
-        let authored = try authored(dataRoot: dataRoot, catalog: own + sense,
+        let own = try seedActions, sense = try senses(records: records, catalog: own, dataRoot: dataRoot, turn: turn)
+        let authored = try authored(catalog: own + sense,
             snapshot: try SwiftToolDispatcher.checkedAuthoredCatalog(dataRoot: dataRoot).get())
         // Built-in guidance resolves to ability.read, sharing the ability discovery route.
         guard let read = own.first(where: { $0.id == "ability.read" }) else {

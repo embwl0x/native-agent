@@ -185,19 +185,7 @@ struct MacSyncActionRouter {
             case "get_agent_thread", "send_agent_message": return observed(try await helpersAction(action))
             case "chat_history_page": return observed(try await chatHistoryPage(action))
             case "faceRead":
-                guard let raw = payload["request"], let rawCursor = payload["cursor"], let cursor = Int(rawCursor) else {
-                    throw PartCallError(code: "invalid_face_read", message: "faceRead requires a document request and cursor.")
-                }
-                let request = try JSONDecoder().decode(DocumentRequest.self, from: Data(raw.utf8))
-                let page = try await api.faceRead(request, cursor: cursor, revision: payload["revision"], device: action.clientId)
-                let response = ["status": "ok", "ok": "true", "page": String(decoding: try JSONEncoder().encode(page), as: UTF8.self)]
-                let body = try sync.engine.actionResponse(response, for: action)
-                let message = try sync.bridge.cloudKitActionResponseMessage(body, correlationID: action.msgId)
-                let bytes = try NAChatMessageCodec.recordValueBytes(NAChatMessageCodec.encode(message))
-                guard bytes <= Self.historyPageByteBudget else {
-                    throw DeviceSyncError.payloadTooLarge(actualBytes: bytes, maximumBytes: Self.historyPageByteBudget)
-                }
-                return response
+                return try await faceReadResponse(action)
             case "pairDevice":
                 // The answer names the acceptance it reports, so the phone's acknowledgement settles this pairing and no later one.
                 let acceptance = await sync.pairedPhones.checkedPhones()?.first { $0.id == action.clientId }?.acceptance ?? ""
@@ -236,129 +224,16 @@ struct MacSyncActionRouter {
 
             // The paired phone's tap answers the row's own action through the person's door.
             case "faceAction":
-                guard let page = payload["page"], !page.isEmpty,
-                      let row = payload["row"], !row.isEmpty,
-                      let faceAction = payload["action"], !faceAction.isEmpty else {
-                    return observed(["status": "error", "ok": "false", "code": "invalid_face_action",
-                                     "message": "faceAction requires page, row and action."])
-                }
-                do {
-                    if payload["answers"] == "true" {
-                        guard let encoded = payload["expectedCall"] else {
-                            throw PartCallError(code: "drawn_call_missing", message: "Read the page before acting.")
-                        }
-                        let call = try JSONDecoder().decode(PartFace.Call.self, from: Data(encoded.utf8))
-                        guard let operation = payload["operation"].flatMap(UUID.init(uuidString:)) else {
-                            throw PartCallError(code: "operation_missing", message: "The page act needs its operation identity.")
-                        }
-                        let undoOf = try payload["undoOf"].map { text in
-                            guard let id = UUID(uuidString: text) else {
-                                throw PartCallError(code: "undo_invalid", message: "The inverse needs its original operation identity.")
-                            }
-                            return id
-                        }
-                        let values = try payload["values"].map { encoded in
-                            do { return try JSONDecoder().decode([String: PartFace.Value].self, from: Data(encoded.utf8)) }
-                            catch { throw PartCallError(code: "invalid_form_values", message: "Form values must be a JSON object of named fields.") }
-                        }
-                        let outcome = try await api.faceOutcome(page: page, row: row, action: faceAction,
-                            value: payload["value"], values: values, formRevision: payload["formRevision"],
-                            device: action.clientId, expecting: call, operation: operation,
-                            undoOf: undoOf, checking: payload["checking"] == "true")
-                        var response = ["status": outcome.unresolved ? "outcome_unknown" : (outcome.accepted ? "ok" : "error"),
-                            "effects": outcome.effects.rawValue,
-                            "outcome": String(decoding: try JSONEncoder().encode(outcome), as: UTF8.self)]
-                        if !outcome.unresolved { response["ok"] = outcome.failure == nil && outcome.accepted ? "true" : "false" }
-                        if let words = outcome.failure?.localizedDescription ?? outcome.words { response["message"] = words }
-                        return observed(response)
-                    }
-                    guard payload["values"] == nil, payload["formRevision"] == nil else {
-                        throw PartCallError(code: "drawn_call_missing", message: "Submit forms through their drawn call and retained operation.")
-                    }
-                    let words = try await api.faceAction(page: page, row: row, action: faceAction, value: payload["value"], device: action.clientId)
-                    var response = ["status": "ok", "ok": "true"]
-                    if let words { response["message"] = words }
-                    return observed(response)
-                } catch let error as PartCallError {
-                    return observed(["status": "error", "ok": "false", "code": error.code, "message": error.message])
-                }
+                return observed(try await faceActionResponse(action))
 
             case "workActivityState":
-                guard let encoded = payload["workIds"] else {
-                    return ["status": "error", "ok": "false", "message": "Work state needs its exact work identities."]
-                }
-                let root = sync.dataRoot
-                return try await Task.detached {
-                    let ids = try JSONDecoder().decode([String].self, from: Data(encoded.utf8))
-                    guard !ids.isEmpty, ids.count <= 64, ids.allSatisfy({ $0.hasPrefix("turn:") && $0.count > 5 && $0.count <= 512 }) else {
-                        return ["status": "error", "ok": "false", "message": "Invalid work identities."]
-                    }
-                    var rows: [MobileWorkActivity] = []
-                    for id in Set(ids).sorted() {
-                        rows.append(try await MacSyncEngine.workActivity(id, dataRoot: root))
-                    }
-                    let encoder = JSONEncoder()
-                    encoder.dateEncodingStrategy = .iso8601
-                    return ["status": "ok", "ok": "true", "activities": String(decoding: try encoder.encode(rows), as: UTF8.self)]
-                }.value
+                return try await workActivityStateResponse(action)
 
             case "registerWorkActivity":
-                guard let deviceID = payload["deviceId"], !deviceID.isEmpty,
-                      let enabled = payload["enabled"], ["true", "false"].contains(enabled),
-                      let environment = payload["environment"],
-                      let bundleID = payload["bundleId"], !bundleID.isEmpty else {
-                    return ["status": "error", "message": "Invalid Live Activity registration"]
-                }
-                for key in ["startToken", "activityToken"] {
-                    if let token = payload[key], !token.isEmpty,
-                       (token.count > 512 || !token.allSatisfy(\.isHexDigit)) {
-                        return ["status": "error", "message": "Invalid Live Activity token"]
-                    }
-                }
-                let observedWorkIDs: Set<String>?
-                if let inventory = payload["observedWorkIds"] {
-                    let ids = try JSONDecoder().decode([String].self, from: Data(inventory.utf8))
-                    guard ids.count <= 64, ids.allSatisfy({ !$0.isEmpty && $0.count <= 512 }) else {
-                        return ["status": "error", "message": "Invalid Live Activity inventory"]
-                    }
-                    observedWorkIDs = Set(ids)
-                } else { observedWorkIDs = nil }
-                try await MacSyncMobileNotificationRelay.storeWorkActivityRegistration(
-                    deviceID: deviceID, enabled: enabled == "true", environment: environment, bundleID: bundleID,
-                    startToken: payload["startToken"], workID: payload["workId"],
-                    activityToken: payload["activityToken"].flatMap { $0.isEmpty ? nil : $0 },
-                    observedWorkIDs: observedWorkIDs, dataRoot: sync.dataRoot)
-                sync.engine.requestWorkActivityPublication()
-                return ["status": "ok", "ok": "true"]
+                return try await registerWorkActivityResponse(action)
 
             case "registerPushToken":
-                let token = (payload["token"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !token.isEmpty else {
-                    return ["status": "error", "message": "Missing push device token"]
-                }
-                guard let deviceId = payload["deviceId"], !deviceId.isEmpty,
-                      let environment = payload["environment"],
-                      let bundleId = payload["bundleId"], !bundleId.isEmpty else {
-                    return ["status": "error", "message": "Push registration requires deviceId, environment and bundleId"]
-                }
-                try await MacSyncMobileNotificationRelay.storePushToken(
-                    deviceId: deviceId,
-                    pairedDeviceID: action.clientId,
-                    token: token,
-                    environment: environment,
-                    bundleId: bundleId,
-                    dataRoot: sync.dataRoot
-                )
-                return [
-                    "status": "ok",
-                    "ok": "true",
-                    "stored": "true",
-                    "deviceId": deviceId,
-                    "environment": environment,
-                    "bundleId": bundleId,
-                    "tokenSuffix": String(token.suffix(8)),
-                    "tokenStore": "notifications/push_tokens.json",
-                ]
+                return try await registerPushTokenResponse(action)
 
             case "recordNotificationReceipt":
                 return observed(await Self.notificationReceiptResponse(
@@ -385,117 +260,13 @@ struct MacSyncActionRouter {
                 return observed(await steerChat(payload))
 
             case "cancelChat":
-                // A discarded target spelling cannot turn a missing run/session into Stop-current.
-                guard Set(payload.keys).isSubset(of: ["sessionId", "source", "sourceKey", "runId"]) else {
-                    return observed(["status": "error", "ok": "false", "code": "invalid_payload",
-                        "message": "cancelChat requires current sessionId, source, sourceKey and runId fields."])
-                }
-                var sessionId = payload["sessionId"] ?? ""
-                let sourceKey = payload["sourceKey"] ?? ""
-                if sessionId.isEmpty, !sourceKey.isEmpty {
-                    let sessions = try await api.getChatSessions()
-                    sessionId = sessions.first(where: { $0.sourceKey == sourceKey })?.id ?? ""
-                }
-                if !sessionId.isEmpty {
-                    guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-                        return observed([
-                            "status": "error",
-                            "ok": "false",
-                            "code": "invalid_session_id",
-                            "message": "cancelChat rejected an invalid sessionId.",
-                        ])
-                    }
-                    // Stop retains exact requested ids across the marker write; absent runs remain pending admission refusals, never claimed stops.
-                    let runIDs = Self.cancelChatRunIDs(from: payload)
-                    for runID in runIDs {
-                        try await iCloudBridge.recordChatStop(session: safeSessionId, runID: runID, dataRoot: sync.dataRoot)
-                    }
-                    let cancelOutcome = cancelChatTask(safeSessionId, runIDs)
-                    let stopsHere = runIDs.isEmpty
-                        ? cancelOutcome == .cancelled || cancelOutcome == .noActiveTask
-                        : !ChatCancelFlag.inFlightRunIDs().isDisjoint(with: runIDs)
-                    if stopsHere { _ = try await api.cancelChatSession(sessionId: safeSessionId, runIDs: runIDs) }
-                    guard stopsHere || cancelOutcome == .cancelled || runIDs.isEmpty else {
-                        return observed([
-                            "status": "pending",
-                            "ok": "false",
-                            "sessionId": safeSessionId,
-                            "message": "The Mac has not received that request yet; it stops the moment it arrives.",
-                        ])
-                    }
-                    return observed([
-                        "status": "ok",
-                        "ok": "true",
-                        "sessionId": safeSessionId,
-                        "taskCancelled": "true",
-                    ])
-                }
-                return observed([
-                    "status": "error",
-                    "ok": "false",
-                    "code": "not_implemented",
-                    "message": "source-key cancel not wired natively; provide sessionId.",
-                ])
+                return observed(try await cancelChatResponse(action))
 
             case "unpinChatSession":
-                guard let sessionId = Self.unpinChatSessionID(from: payload) else {
-                    return observed([
-                        "status": "error",
-                        "ok": "false",
-                        "code": "invalid_session_id",
-                        "message": "unpinChatSession requires a valid sessionId.",
-                    ])
-                }
-                let changed = try await sync.host.closePinnedChatSession(sessionId)
-                if changed {
-                    await MainActor.run {
-                        sync.engine.requestChatSnapshotPublication(
-                            includeTranscripts: false
-                        )
-                    }
-                }
-                return observed([
-                    "status": "ok",
-                    "ok": "true",
-                    "applied": "true",
-                    "changed": changed ? "true" : "false",
-                    "sessionId": sessionId,
-                    "pinned": "false",
-                ])
+                return observed(try await unpinChatSessionResponse(action))
 
             case "configure_surface_selection":
-                guard let request = Self.surfaceSelection(from: payload) else {
-                    return observed([
-                        "status": "error",
-                        "ok": "false",
-                        "message": "A complete valid provider/model/reasoning/tier tuple is required for a canonical surface",
-                    ])
-                }
-                let recovered = try await api.saveSurfaceSelection(
-                    surface: request.surface,
-                    model: request.model,
-                    reasoningEffort: request.reasoningEffort,
-                    serviceTier: request.serviceTier,
-                    providerID: request.providerID
-                )
-                guard let preference = ProviderRoutingSurfaceLookup.value(
-                          recovered.preferences, request.surface),
-                      let providerID = ProviderRoutingSurfaceLookup.value(
-                          recovered.activeProviders, request.surface),
-                      !providerID.isEmpty else {
-                    throw ProviderRoutingError.configurationFailed(
-                        "Surface selection did not recover a complete tuple"
-                    )
-                }
-                var response = Self.canonicalSurfaceSelectionResponse(
-                    surface: request.surface,
-                    providerID: providerID,
-                    model: preference.model,
-                    reasoningEffort: preference.reasoningEffort,
-                    serviceTier: preference.serviceTier
-                )
-                response["modelReadbackRevision"] = String(recovered.revision)
-                return observed(response)
+                return observed(try await surfaceSelectionResponse(action))
 
             case "mac_control":
                 // A signed phone action starts its own act on the phone's verified door.
@@ -612,7 +383,16 @@ extension MacSyncActionRouter {
                 return false
             }
         }
-        guard await ChatTurnSteering.shared.isTurnOpen(sessionId: sessionId) else {
+        let turnIsOpen = await ChatTurnSteering.shared.isTurnOpen(sessionId: sessionId)
+        do {
+            if try iCloudBridge.chatStopRequested(session: sessionId, runID: runId, dataRoot: sync.dataRoot) {
+                _ = await tell("steered", "Stopped before it was read")
+                return ["status": "ok", "ok": "true", "steered": "true"]
+            }
+        } catch {
+            return ["status": "error", "ok": "false", "message": "Steering was refused because the request's Stop record could not be read."]
+        }
+        guard turnIsOpen else {
             return ["status": "ok", "ok": "true", "steered": "false"]
         }
         let turn = TurnRequest(message: text, sessionID: sessionId, surface: "ios",
@@ -626,10 +406,11 @@ extension MacSyncActionRouter {
         engine.waitingSteers[sessionId, default: [:]][runId] = { wait.cancel() }
         Task {
             let result = await wait.result
-            engine.waitingSteers[sessionId]?[runId] = nil
+            let wasWaiting = engine.waitingSteers[sessionId]?.removeValue(forKey: runId) != nil
             switch result {
             case .success(.steered): _ = await tell("steered", "Read in the reply in progress")
             case .failure(let error) where error is CancellationError: _ = await tell("steered", "Stopped before it was read")
+            case .success(.ran) where !wasWaiting: _ = await tell("steered", "Stopped before it was read")
             case .success(.ran): _ = await tell("steer_returned", "Sending it as its own message")
             case .failure(let error):
                 _ = await tell("notice", "Steering admission failed: \(error.localizedDescription). "
@@ -637,5 +418,286 @@ extension MacSyncActionRouter {
             }
         }
         return ["status": "ok", "ok": "true", "steered": "true"]
+    }
+
+    /// A paired phone's page read, bounded to one CloudKit action response.
+    func faceReadResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        let api = sync.host
+        guard let raw = payload["request"], let rawCursor = payload["cursor"], let cursor = Int(rawCursor) else {
+            throw PartCallError(code: "invalid_face_read", message: "faceRead requires a document request and cursor.")
+        }
+        let request = try JSONDecoder().decode(DocumentRequest.self, from: Data(raw.utf8))
+        let page = try await api.faceRead(request, cursor: cursor, revision: payload["revision"], device: action.clientId)
+        let response = ["status": "ok", "ok": "true", "page": String(decoding: try JSONEncoder().encode(page), as: UTF8.self)]
+        let body = try sync.engine.actionResponse(response, for: action)
+        let message = try sync.bridge.cloudKitActionResponseMessage(body, correlationID: action.msgId)
+        let bytes = try NAChatMessageCodec.recordValueBytes(NAChatMessageCodec.encode(message))
+        guard bytes <= Self.historyPageByteBudget else {
+            throw DeviceSyncError.payloadTooLarge(actualBytes: bytes, maximumBytes: Self.historyPageByteBudget)
+        }
+        return response
+    }
+
+    /// The paired phone's tap on a page row, answered through the row's own drawn call.
+    func faceActionResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        let api = sync.host
+        guard let page = payload["page"], !page.isEmpty,
+              let row = payload["row"], !row.isEmpty,
+              let faceAction = payload["action"], !faceAction.isEmpty else {
+            return ["status": "error", "ok": "false", "code": "invalid_face_action",
+                    "message": "faceAction requires page, row and action."]
+        }
+        do {
+            if payload["answers"] == "true" {
+                guard let encoded = payload["expectedCall"] else {
+                    throw PartCallError(code: "drawn_call_missing", message: "Read the page before acting.")
+                }
+                let call = try JSONDecoder().decode(PartFace.Call.self, from: Data(encoded.utf8))
+                guard let operation = payload["operation"].flatMap(UUID.init(uuidString:)) else {
+                    throw PartCallError(code: "operation_missing", message: "The page act needs its operation identity.")
+                }
+                let undoOf = try payload["undoOf"].map { text in
+                    guard let id = UUID(uuidString: text) else {
+                        throw PartCallError(code: "undo_invalid", message: "The inverse needs its original operation identity.")
+                    }
+                    return id
+                }
+                let values = try payload["values"].map { encoded in
+                    do { return try JSONDecoder().decode([String: PartFace.Value].self, from: Data(encoded.utf8)) }
+                    catch { throw PartCallError(code: "invalid_form_values", message: "Form values must be a JSON object of named fields.") }
+                }
+                let outcome = try await api.faceOutcome(page: page, row: row, action: faceAction,
+                    value: payload["value"], values: values, formRevision: payload["formRevision"],
+                    device: action.clientId, expecting: call, operation: operation,
+                    undoOf: undoOf, checking: payload["checking"] == "true")
+                var response = ["status": outcome.unresolved ? "outcome_unknown" : (outcome.accepted ? "ok" : "error"),
+                    "effects": outcome.effects.rawValue,
+                    "outcome": String(decoding: try JSONEncoder().encode(outcome), as: UTF8.self)]
+                if !outcome.unresolved { response["ok"] = outcome.failure == nil && outcome.accepted ? "true" : "false" }
+                if let words = outcome.failure?.localizedDescription ?? outcome.words { response["message"] = words }
+                return response
+            }
+            guard payload["values"] == nil, payload["formRevision"] == nil else {
+                throw PartCallError(code: "drawn_call_missing", message: "Submit forms through their drawn call and retained operation.")
+            }
+            let words = try await api.faceAction(page: page, row: row, action: faceAction, value: payload["value"], device: action.clientId)
+            var response = ["status": "ok", "ok": "true"]
+            if let words { response["message"] = words }
+            return response
+        } catch let error as PartCallError {
+            return ["status": "error", "ok": "false", "code": error.code, "message": error.message]
+        }
+    }
+
+    /// Live Activity state for the phone's exact work identities.
+    func workActivityStateResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        guard let encoded = payload["workIds"] else {
+            return ["status": "error", "ok": "false", "message": "Work state needs its exact work identities."]
+        }
+        let root = sync.dataRoot
+        return try await Task.detached {
+            let ids = try JSONDecoder().decode([String].self, from: Data(encoded.utf8))
+            guard !ids.isEmpty, ids.count <= 64, ids.allSatisfy({ $0.hasPrefix("turn:") && $0.count > 5 && $0.count <= 512 }) else {
+                return ["status": "error", "ok": "false", "message": "Invalid work identities."]
+            }
+            var rows: [MobileWorkActivity] = []
+            for id in Set(ids).sorted() {
+                rows.append(try await MacSyncEngine.workActivity(id, dataRoot: root))
+            }
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            return ["status": "ok", "ok": "true", "activities": String(decoding: try encoder.encode(rows), as: UTF8.self)]
+        }.value
+    }
+
+    /// Stores the phone's Live Activity registration and inventory.
+    func registerWorkActivityResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        guard let deviceID = payload["deviceId"], !deviceID.isEmpty,
+              let enabled = payload["enabled"], ["true", "false"].contains(enabled),
+              let environment = payload["environment"],
+              let bundleID = payload["bundleId"], !bundleID.isEmpty else {
+            return ["status": "error", "message": "Invalid Live Activity registration"]
+        }
+        for key in ["startToken", "activityToken"] {
+            if let token = payload[key], !token.isEmpty,
+               (token.count > 512 || !token.allSatisfy(\.isHexDigit)) {
+                return ["status": "error", "message": "Invalid Live Activity token"]
+            }
+        }
+        let observedWorkIDs: Set<String>?
+        if let inventory = payload["observedWorkIds"] {
+            let ids = try JSONDecoder().decode([String].self, from: Data(inventory.utf8))
+            guard ids.count <= 64, ids.allSatisfy({ !$0.isEmpty && $0.count <= 512 }) else {
+                return ["status": "error", "message": "Invalid Live Activity inventory"]
+            }
+            observedWorkIDs = Set(ids)
+        } else { observedWorkIDs = nil }
+        try await MacSyncMobileNotificationRelay.storeWorkActivityRegistration(
+            deviceID: deviceID, enabled: enabled == "true", environment: environment, bundleID: bundleID,
+            startToken: payload["startToken"], workID: payload["workId"],
+            activityToken: payload["activityToken"].flatMap { $0.isEmpty ? nil : $0 },
+            observedWorkIDs: observedWorkIDs, dataRoot: sync.dataRoot)
+        sync.engine.requestWorkActivityPublication()
+        return ["status": "ok", "ok": "true"]
+    }
+
+    /// Stores the phone's push token under its paired device.
+    func registerPushTokenResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        let token = (payload["token"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            return ["status": "error", "message": "Missing push device token"]
+        }
+        guard let deviceId = payload["deviceId"], !deviceId.isEmpty,
+              let environment = payload["environment"],
+              let bundleId = payload["bundleId"], !bundleId.isEmpty else {
+            return ["status": "error", "message": "Push registration requires deviceId, environment and bundleId"]
+        }
+        try await MacSyncMobileNotificationRelay.storePushToken(
+            deviceId: deviceId,
+            pairedDeviceID: action.clientId,
+            token: token,
+            environment: environment,
+            bundleId: bundleId,
+            dataRoot: sync.dataRoot
+        )
+        return [
+            "status": "ok",
+            "ok": "true",
+            "stored": "true",
+            "deviceId": deviceId,
+            "environment": environment,
+            "bundleId": bundleId,
+            "tokenSuffix": String(token.suffix(8)),
+            "tokenStore": "notifications/push_tokens.json",
+        ]
+    }
+
+    /// Stop for a named session and its exact runs; absent runs stay pending, never claimed stopped.
+    func cancelChatResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        let api = sync.host
+        // A discarded target spelling cannot turn a missing run/session into Stop-current.
+        guard Set(payload.keys).isSubset(of: ["sessionId", "source", "sourceKey", "runId"]) else {
+            return ["status": "error", "ok": "false", "code": "invalid_payload",
+                "message": "cancelChat requires current sessionId, source, sourceKey and runId fields."]
+        }
+        var sessionId = payload["sessionId"] ?? ""
+        let sourceKey = payload["sourceKey"] ?? ""
+        if sessionId.isEmpty, !sourceKey.isEmpty {
+            let sessions = try await api.getChatSessions()
+            sessionId = sessions.first(where: { $0.sourceKey == sourceKey })?.id ?? ""
+        }
+        if !sessionId.isEmpty {
+            guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+                return [
+                    "status": "error",
+                    "ok": "false",
+                    "code": "invalid_session_id",
+                    "message": "cancelChat rejected an invalid sessionId.",
+                ]
+            }
+            // Stop retains exact requested ids across the marker write; absent runs remain pending admission refusals, never claimed stops.
+            let runIDs = Self.cancelChatRunIDs(from: payload)
+            for runID in runIDs {
+                try await iCloudBridge.recordChatStop(session: safeSessionId, runID: runID, dataRoot: sync.dataRoot)
+            }
+            let cancelOutcome = cancelChatTask(safeSessionId, runIDs)
+            let stopsHere = runIDs.isEmpty
+                ? cancelOutcome == .cancelled || cancelOutcome == .noActiveTask
+                : !ChatCancelFlag.inFlightRunIDs().isDisjoint(with: runIDs)
+            if stopsHere { _ = try await api.cancelChatSession(sessionId: safeSessionId, runIDs: runIDs) }
+            guard stopsHere || cancelOutcome == .cancelled || runIDs.isEmpty else {
+                return [
+                    "status": "pending",
+                    "ok": "false",
+                    "sessionId": safeSessionId,
+                    "message": "The Mac has not received that request yet; it stops the moment it arrives.",
+                ]
+            }
+            return [
+                "status": "ok",
+                "ok": "true",
+                "sessionId": safeSessionId,
+                "taskCancelled": "true",
+            ]
+        }
+        return [
+            "status": "error",
+            "ok": "false",
+            "code": "not_implemented",
+            "message": "source-key cancel not wired natively; provide sessionId.",
+        ]
+    }
+
+    /// Closes a pinned chat session and republishes the index when it changed.
+    func unpinChatSessionResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        guard let sessionId = Self.unpinChatSessionID(from: payload) else {
+            return [
+                "status": "error",
+                "ok": "false",
+                "code": "invalid_session_id",
+                "message": "unpinChatSession requires a valid sessionId.",
+            ]
+        }
+        let changed = try await sync.host.closePinnedChatSession(sessionId)
+        if changed {
+            await MainActor.run {
+                sync.engine.requestChatSnapshotPublication(
+                    includeTranscripts: false
+                )
+            }
+        }
+        return [
+            "status": "ok",
+            "ok": "true",
+            "applied": "true",
+            "changed": changed ? "true" : "false",
+            "sessionId": sessionId,
+            "pinned": "false",
+        ]
+    }
+
+    /// Saves a canonical surface tuple and answers with the Mac's recovered readback.
+    func surfaceSelectionResponse(_ action: InboxAction) async throws -> [String: String] {
+        let payload = action.payload
+        let api = sync.host
+        guard let request = Self.surfaceSelection(from: payload) else {
+            return [
+                "status": "error",
+                "ok": "false",
+                "message": "A complete valid provider/model/reasoning/tier tuple is required for a canonical surface",
+            ]
+        }
+        let recovered = try await api.saveSurfaceSelection(
+            surface: request.surface,
+            model: request.model,
+            reasoningEffort: request.reasoningEffort,
+            serviceTier: request.serviceTier,
+            providerID: request.providerID
+        )
+        guard let preference = ProviderRoutingSurfaceLookup.value(
+                  recovered.preferences, request.surface),
+              let providerID = ProviderRoutingSurfaceLookup.value(
+                  recovered.activeProviders, request.surface),
+              !providerID.isEmpty else {
+            throw ProviderRoutingError.configurationFailed(
+                "Surface selection did not recover a complete tuple"
+            )
+        }
+        var response = Self.canonicalSurfaceSelectionResponse(
+            surface: request.surface,
+            providerID: providerID,
+            model: preference.model,
+            reasoningEffort: preference.reasoningEffort,
+            serviceTier: preference.serviceTier
+        )
+        response["modelReadbackRevision"] = String(recovered.revision)
+        return response
     }
 }

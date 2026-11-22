@@ -48,8 +48,6 @@ extension iCloudBridge {
                 }
             })
             guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
-            await recordCloudKitPushEvidence()
-            guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
             // CloudKit can be entitled without CloudDocuments; validate its transport independently of the Drive mount.
             configureDeviceTransportIfAvailable()
             guard deviceTransport != nil else {
@@ -183,7 +181,7 @@ extension iCloudBridge {
         cloudKitPushUnavailable ? "push unavailable — repair APNs registration; incoming reads continue independently" : ""
     }
     /// Actual push receipt or APNs refusal owns wake evidence; silence has no verdict.
-    func recordCloudKitPushEvidence(received: Bool? = nil) async {
+    func recordCloudKitPushEvidence(received: Bool) async {
         let url = sync.dataRoot.appendingPathComponent("icloud/chat_push_proof.json")
         let generation = setupGeneration
         let observedAt = Date()
@@ -191,32 +189,15 @@ extension iCloudBridge {
         let task = Task {
             await previous?.value
             guard generation == setupGeneration, isSetUp else { return }
-            if let received {
-                let proof: Date? = received ? observedAt : nil
-                do {
-                    try await sync.storage.perform {
-                        let data = try JSONEncoder().encode(proof)
-                        do { if try Data(contentsOf: url) == data { return } }
-                        catch CocoaError.fileReadNoSuchFile { /* A first observation needs its own durable record. */ }
-                        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
-                    }
-                    guard generation == setupGeneration, isSetUp else { return }
-                    cloudKitPushProofRead.write { cloudKitPushProofAt = proof }
-                } catch { nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription) }
-            } else {
-                await cloudKitPushProofRead.read({
-                    await sync.storage.perform { Result<Date?, Error> {
-                        do { return try JSONDecoder().decode(Date?.self, from: Data(contentsOf: url)) }
-                        catch CocoaError.fileReadNoSuchFile { return nil }
-                    } }
-                }, publish: { outcome in
-                    guard generation == setupGeneration, isSetUp else { return }
-                    switch outcome {
-                    case .success(let proof): cloudKitPushProofAt = proof
-                    case .failure(let error): nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription)
-                    }
-                })
-            }
+            let proof: Date? = received ? observedAt : nil
+            do {
+                try await sync.storage.perform {
+                    let data = try JSONEncoder().encode(proof)
+                    do { if try Data(contentsOf: url) == data { return } }
+                    catch CocoaError.fileReadNoSuchFile { /* A first observation needs its own durable record. */ }
+                    try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
+                }
+            } catch { nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription) }
         }
         cloudKitPushEvidenceTask = task
         await task.value

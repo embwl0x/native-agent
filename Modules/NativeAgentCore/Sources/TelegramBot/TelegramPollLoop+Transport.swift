@@ -12,7 +12,7 @@ extension TelegramPollLoop {
         update: TelegramUpdate
     ) async {
         do {
-            try await answerCallbackQuery(token, callbackId, text)
+            try await Self.answerCallbackQuery(token, callbackId, text)
         } catch {
             await recordError(
                 context: context,
@@ -171,17 +171,20 @@ extension TelegramPollLoop {
     }
 
     public static let defaultDeleteMessage: @Sendable (String, Int, Int) async throws -> Void = { token, chatId, messageId in
-        try await _tgSendInChatLane(chatId: chatId) {
-            _ = try await _tgPostJSON(
-                token: token,
-                method: "deleteMessage",
-                resultType: Bool.self,
-                validateResult: { $0 }
-            ) {
-                let body: [String: Any] = ["chat_id": chatId, "message_id": messageId]
-                return try JSONSerialization.data(withJSONObject: body)
+        do {
+            try await _tgSendInChatLane(chatId: chatId) {
+                _ = try await _tgPostJSON(
+                    token: token,
+                    method: "deleteMessage",
+                    resultType: Bool.self,
+                    validateResult: { $0 }
+                ) {
+                    let body: [String: Any] = ["chat_id": chatId, "message_id": messageId]
+                    return try JSONSerialization.data(withJSONObject: body)
+                }
             }
-        }
+        } catch let failure as TelegramAPIFailure
+            where failure.telegramDescription?.localizedCaseInsensitiveContains("message to delete not found") == true {}
     }
 
     /// Clean raw plain-text replies once; the cleanup is not idempotent.
@@ -223,11 +226,6 @@ extension TelegramPollLoop {
                 }
             }
         }
-    }
-
-    public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, Data, String?) async throws -> Void = { token,
-        destination, imagePath, imageData, caption in
-        try await sendPhoto(token: token, destination: destination, imagePath: imagePath, imageData: imageData, caption: caption)
     }
 
     static func sendPhoto(
@@ -509,7 +507,7 @@ extension TelegramPollLoop {
         }
     }
 
-    public static let defaultAnswerCallbackQuery: @Sendable (String, String, String) async throws -> Void = { token, callbackId, text in
+    static func answerCallbackQuery(_ token: String, _ callbackId: String, _ text: String) async throws {
         try await _tgSendInChatLane {
             _ = try await _tgPostJSON(
                 token: token,
@@ -532,7 +530,7 @@ extension TelegramPollLoop {
         _ = try await defaultSendMessageWithReplyMarkupReturningId(token, destination, text, replyMarkup)
     }
 
-    public static let defaultSyncCommandMenu: TelegramCommandMenuSync = { token, commands in
+    static func syncCommandMenu(_ token: String, _ commands: [TelegramBotCommand]) async throws -> TelegramCommandMenuStatus {
         try await _tgSendInChatLane {
             _ = try await _tgPostJSON(
                 token: token,
@@ -554,7 +552,7 @@ extension TelegramPollLoop {
             return TelegramCommandMenuStatus(
                 commandCount: commands.count,
                 registryVersion: TelegramCommandRegistry.version,
-                syncedAt: _tgNowString()
+                syncedAt: NativeTimestampFormat.fractionalZulu(Date())
             )
         }
     }

@@ -70,7 +70,7 @@ public struct TranscriptAttachmentPreview: Codable, Hashable, Sendable {
 
 /// What KIND of conversation a chat session row is — recorded on the session index row by its creator. Readers use `SessionConversation` in
 /// Transcripts, never the ID's shape. Rows without a kind still read by their source. Only its owner may correct a session's conversation kind.
-/// Anchoring is a temporary role (`ChatAnchorPin`), not a conversation kind. A row whose kind nothing proves stays `unclassified` until an owner classifies it.
+/// Anchoring is a temporary role (`ConversationAnchorPin`), not a conversation kind. A row whose kind nothing proves stays `unclassified` until an owner classifies it.
 public enum ChatThreadKind: String, Sendable, Equatable, CaseIterable, Codable {
     case direct
     /// Other people may be present, so a Slack channel or thread is not a private conversation.
@@ -129,7 +129,7 @@ public enum ChatThreadKind: String, Sendable, Equatable, CaseIterable, Codable {
     /// A transcript source compared trimmed and lowercased. Each source has one spelling (`app` this Mac, `ios` the phone, hyphenated bridges), so an
     /// empty or unknown name stays itself and classifies as unclassified.
     public static func normalizedSource(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        TextNormalization.trimmedLowercased(raw)
     }
 
     /// The source a turn surface writes on its rows. Surfaces are a separate vocabulary: this Mac's chat surface is `chat` and its rows are `app`;

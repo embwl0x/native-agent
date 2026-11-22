@@ -174,7 +174,10 @@ extension NativeCognitionRuntime {
             switch admission.reason {
             case CognitiveSubstrate.reflectionRefusalDisabled: return Self.beatReflection(.off("reflection disabled"))
             // The daily ceiling or a reflection already in flight means not now: it stays owed as busy, never failed.
-            default: return Self.beatReflection(.busy(admission.detail))
+            case CognitiveSubstrate.reflectionRefusalCeilingReached, CognitiveSubstrate.reflectionRefusalInFlight:
+                return Self.beatReflection(.busy(admission.detail))
+            // Anything else (an unreadable policy or evidence) is a failure: waiting for another slot cannot repair it.
+            default: return Self.beatReflection(.failed(error: admission.detail))
             }
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm, retainForDream: retainForDream)

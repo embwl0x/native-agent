@@ -230,7 +230,7 @@ enum KGGraphCanvasLayout {
         let k = min(50.0, (area / Double(ids.count)).squareRoot())
         var positions: [String: CGPoint] = [:]
         for id in ids {
-            let hash = stableSeed(for: id)
+            let hash = StableHash.fnv1a64(id)
             let x = Double(hash & 0xFFFF) / 65535.0
             let y = Double((hash >> 16) & 0xFFFF) / 65535.0
             positions[id] = CGPoint(
@@ -307,11 +307,5 @@ enum KGGraphCanvasLayout {
             temperature *= 1 - Double(iteration + 1) / Double(iterations + 1)
         }
         return positions
-    }
-
-    static func stableSeed(for id: String) -> UInt64 {
-        id.utf8.reduce(14_695_981_039_346_656_037) { hash, byte in
-            (hash ^ UInt64(byte)) &* 1_099_511_628_211
-        }
     }
 }

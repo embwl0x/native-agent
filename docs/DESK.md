@@ -3,6 +3,16 @@
 The Desk is the agent's durable work. `ledger.list` reads the shared task
 ledger, a separate list; an empty ledger says nothing about the Desk.
 
+The Desk journal commits one or more operations under the store's lock.
+Operations receive ordered timestamps and are appended together to
+`desk/desk_ops.jsonl` as one payload with a full flush. A queue filing commits
+creation, status and step together. Validation that depends on an earlier
+operation reads the staged prefix before any journal write. A torn tail
+from storage failure or power loss still follows the journal's existing
+integrity handling. Archival works deepest first, saving each receipt on
+its separate shelf and committing that item's removal before moving on.
+A retry replaces a staged receipt for the item it archives.
+
 The Desk packet names failed contact and Inbox-answer reads as
 `unavailable.contacts` and `unavailable.inbox`; its face shows those causes
 under **Unavailable readings**. Needs you requests keep their open links and
@@ -16,8 +26,9 @@ row when it restates that work; it uses the same readiness and settlement as
 MY QUEUE. Its canonical `promiseCaptures` identities survive refiling, closure
 and archive so unfinished reflection cannot create the same source again.
 A reference refresh containing only other evidence retains the captured step.
-Attaching a captured step updates the row's title to the same words and peer
-provenance used for a newly filed step and its approval follow-up.
+Attaching a captured step commits the row's title update with the step, using
+the same words and peer provenance as a newly filed step and its approval
+follow-up.
 `queue.update` changes
 named fields; `queue.done` and `queue.drop` settle it by hand, by its exact handle
 or number. The after-turn judgment can also close a step with quoted evidence
@@ -25,13 +36,18 @@ of its deed, including in their own stream and lines
 ([Intentions](INTENTIONS.md#promises-they-makes)).
 Words never select a different step. A committed closure keeps its
 receipt if checkpoint cleanup fails, with the cleanup cause in
-`settlement_failures`. Repeating `queue.done` on a done step, or `queue.drop`
+`settlement_failures`. Queue closure first lands any saved habit or speech
+settlement for that step. When the checkpoint itself completes a once habit,
+the call reports `done` with `effects: occurred`, including when the requested
+action was `queue.drop`.
+Repeating `queue.done` on a done step, or `queue.drop`
 on a dropped one, is granted as `no_change` with its saved completion time and
 evidence. Any other call against a terminal step is refused as `already_done`
 or `already_dropped` with the same evidence, without changing it. Live steps supply
 their outcome, notes and refs; archived steps, looked up by exact handle,
-supply their outcome, retained refs, decisions and artifacts. The archive
-does not retain visible numbers or notes. An unknown id remains `not_found`;
+supply their outcome, carried deed notes, retained refs, decisions and
+artifacts. The archive omits visible numbers and ordinary notes. An unknown id
+remains `not_found`;
 absence is not completion evidence. An unreadable required archive remains a
 storage failure, never `not_found`.
 Each step's time is a `moment:<handle>` time on the one
@@ -113,7 +129,7 @@ Every coordinate, size, width and stroke point is a finite number within a milli
 closed in that instant; it then reads as closed. A contact's change that landed is reported as landed even when its lever or grant is
 turned off right after; only refusals are withheld from a contact that has left the table.
 A new shape or container requires `x`, `y`, `w`, `h`; text requires `x`, `y`; an arrow requires `from`, `to`;
-a stroke requires `x`, `y`, `points`. Missing fields are named in an `invalid_input` refusal, with nothing written.
+a stroke requires `x`, `y` and `points` (the points run from x,y). Missing fields are named in an `invalid_input` refusal, with nothing written.
 Fields include an arrow's `fromSide` and `toSide` (left, right, top or
 bottom). `item` resolves through `DeskState.matching` and keeps the stable
 handle. `piece` is a `make:<ref>` address holding a version of an ordinary Make piece. Cards keep their
@@ -320,9 +336,12 @@ An agent reads an item two ways, and neither changes the window's selection.
 `desk.read {handle}` gives the item's record, its steps and what is on the
 table. `app {page:"desk", item}` gives the Desk page as it draws with that item
 open: its rows and actions, its board, its pieces and tables as text
-(`deskItemFace`, `EngineRuntime/DeskFace.swift`). The item is named by desk.N,
-its handle or its exact title, the resolver every Desk call uses. Steps move by
-`desk.set_status` and `desk.close`.
+(`deskItemFace`, `EngineRuntime/DeskFace.swift`). Name the item by its stable
+handle, visible number (`2.1`, `desk.2.1` or `#2.1`), or exact title.
+The resolver checks the full title before interpreting a number followed by
+words. That numbered label resolves only if its words match the numbered
+item's title, with any whitespace allowed between the number and title.
+Steps move by `desk.set_status` and `desk.close`.
 
 The agent's own upkeep (items of the `body` project, the packet's `upkeep`)
 stands apart from the work. What closed today sits under **Done today**,
@@ -348,8 +367,10 @@ nothing of it.
 `desk.read` lists all live board items, including parts and recently closed
 items, with `limit` (default 25, 1–100), `offset` (default zero), `total`,
 `count`, and `has_more`. Copy `next_read` to continue. `query` searches the
-full live store; `handle` opens one exact record and pages its parts, notes
-and refs. Complete record text uses `detail_offset` and `detail_version`.
+full live store. `handle` opens one exact record with paged notes and refs.
+It includes list fields for parts when the item has them, and no board counts
+(those come with a board read). Complete record text
+uses `detail_offset` and `detail_version`.
 `sort:"recent"` is the default; `sort:"stale"` orders oldest first. Sorting
 changes neither the matching items nor the fields each row returns: handle,
 status, summary when present, notes, refs, dates and sequencing evidence.
@@ -409,7 +430,9 @@ empty `until` and leaves the scheduled moment where it is.
 `queue.done` and `queue.drop` take. For `desk.close`, reason names the owner's
 explicit instruction or the fresh canonical commit/receipt/observed result
 proving the tracked outcome; the instruction alone suffices without claiming
-the underlying work happened. `queue.done` uses reason for why the step is done.
+the underlying work happened. Closing an item that is already closed changes
+nothing: it answers ok with `already` naming its status, its recorded outcome
+stands, and a batch goes on. `queue.done` uses reason for why the step is done.
 The shared door records any unique declared interpretation of another supplied
 name. Wait explanations use `note`.
 Desk actions keep `handle`, queue actions keep `id`, and page reads keep `item`;
@@ -423,8 +446,10 @@ as a sentence (what has to happen, in the agent's words) is kept as written:
 plain name is refused, as an identifier that names nothing.
 `desk.set_status {handle, status:"waiting on User"}` reaches the same writer.
 Waiting status updates apply `remaining_work`, `progress`, `assignee`, and
-`lane_of` through the ordinary status path before confirming. Invalid fields
-are refused by name; an explicit `waiting_on` must agree with the status text.
+`lane_of` through the ordinary status path before confirming. Supply the
+coordinating item's stable handle or visible alias for `lane_of`. Invalid
+fields are refused by name. An explicit `waiting_on` must agree with the status
+text.
 The existing persisted blocked status and `waitingOn` field hold this state;
 readers present it as `waiting on <person>`. No stored items are rewritten.
 An owner wait contributes to the page's waiting-on-owner count through
@@ -441,6 +466,10 @@ the status token for a top-level item still at `watch`, so a new plan reads
 `on` also accepts an observed Desk handle/number or experience id (a card,
 including the `approval:<id>` its Home row shows, message, reply delivery or repair), or a nonempty list of those dependency
 ids. These waits retain automatic release when the named conditions settle.
+A parent can wait for several descendants. Each named descendant and the work
+beneath it can proceed according to its own dependencies. Unrelated descendant
+work waits for the parent to clear. The parent's waits outside its subtree still hold all
+descendants, as do its explicit blocks, person waits and deferrals.
 A send to a contact that still awaits its answer returns that condition as
 `thread.wait_on`: waiting on it holds the item until the contact answers (or the
 send fails or expires), which is the way to be told when someone replies. A send
@@ -494,13 +523,12 @@ For a four-call work record (using the handle returned by the first call):
 These are action argument shapes for `app {action:"desk.…", args:{…}}`.
 Recorded notes and summaries are records, not proof of external work.
 
-A task the person starts (the Mac's new-task sheet, the phone's
-`submitDeskTask`, the Shortcuts intent) creates a Desk item and starts a
-[line of theirs](agent-communication.md#jobs) with `desk:` set to that item
+On Mac, **New task** or the Shortcuts intent creates a Desk item and starts
+a [line of theirs](agent-communication.md#jobs) with `desk:` set to that item
 (`NativeAgentEngine.submitDeskTask`, `EngineRuntime/EngineDesk.swift`). The
 line's ending is a `returned` happening with no conversation route, so it opens a
 thought in the agent's mind stream, where the agent settles the item
-(`AgentJobStem.swift`).
+(`AgentJobStem.swift`). On iPhone, ask for a Desk task in Chat.
 A job that carries a Desk item is that item's movement: Desk activity, the live
 strip, the widget's **Working on…** line and the phone's `desk.json` evidence
 come from their jobs (`DeskMovementPresentation.evidence`,

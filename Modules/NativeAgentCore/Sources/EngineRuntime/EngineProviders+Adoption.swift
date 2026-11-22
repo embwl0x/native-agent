@@ -119,25 +119,6 @@ extension ProvidersFacade {
 }
 
 extension ProvidersFacade {
-    public func connectOAuthProvider(
-        platform: any NativeOAuthPlatformPort.Type, providerID: String,
-        present: (OAuthFlowResult) -> Void,
-        failure: (Error, String) -> Void
-    ) async -> OAuthFlowResult? {
-        let result = await NativeOAuthFlow.startOAuthFlow(
-            platform: platform, providerId: providerID, dataRoot: dataRoot
-        )
-        guard !Task.isCancelled else { return nil }
-        present(result)
-        if result.ok {
-            fetchModelListInBackground(after: providerID)
-            _ = await adoptProviderForBlankSurfaces(
-                providerID, dataRoot: dataRoot, failure: failure
-            )
-        }
-        return result
-    }
-
     public func acceptCodexCLISession(
         failure: (Error, String) -> Void
     ) async -> Bool {
@@ -148,28 +129,5 @@ extension ProvidersFacade {
             "openai_oauth_direct", dataRoot: dataRoot, failure: failure
         )
         return true
-    }
-}
-
-extension ProvidersFacade {
-    public func saveConnection(
-        _ providerID: String, apiKey: String?, authMode: String, defaultModel: String,
-        didSave: () -> Void,
-        failure: (Error, String) -> Void
-    ) async throws {
-        try await configureProvider(id: providerID, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
-        _ = await adoptProviderForBlankSurfaces(
-            providerID, dataRoot: dataRoot, failure: failure
-        )
-        // A save can be ineligible for adoption; it still owes its open editor a checked current baseline.
-        if case .failed(let detail) = await refreshSettings(refreshCatalog: false, cause: { error, _ in error.localizedDescription }) {
-            throw ProviderRoutingError.underlying("The account was saved, but its current settings could not be read: \(detail)")
-        }
-        // LatestRead returns this read even if a newer failure won publication and retained the old account baseline.
-        try Task.checkCancellation()
-        if let settingsError {
-            throw ProviderRoutingError.underlying("The account was saved, but its current settings are unavailable: \(settingsError)")
-        }
-        didSave()
     }
 }

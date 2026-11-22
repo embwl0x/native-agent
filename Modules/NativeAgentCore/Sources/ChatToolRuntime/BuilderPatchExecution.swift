@@ -12,7 +12,6 @@ import PersonaEngine
 import StandingBots
 import ProviderRouting
 import Darwin
-import CryptoKit
 import MemoryV2
 import Dispatcher
 import MacControl
@@ -196,7 +195,7 @@ extension SwiftToolDispatcher {
             var entry: [String: Any] = [
                 "toolName": "apply_patch", "runId": runId,
                 "createdAt": now, "completedAt": now, "status": "failed_pre_spawn",
-                "reason": builderResolveString(result, keys: ["reason"]) ?? "invalid_arguments",
+                "reason": JSONValue.firstTrimmedString(result, keys: ["reason"]) ?? "invalid_arguments",
                 "cwd": builderResolveCwd(input, dataRoot: dataRoot),
                 "sourcePayload": sourcePayload,
             ]

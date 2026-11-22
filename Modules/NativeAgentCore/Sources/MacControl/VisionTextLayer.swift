@@ -1,9 +1,7 @@
 import Foundation
 import CoreGraphics
-#if canImport(Vision)
 import Vision
 // Blueprint: | `VisionTextLayer.swift` | `VisionTextLayerResult`, `VisionTextLayer`, `VisionKitTextRecognizer` |
-#endif
 
 // Refine only observed tiny or sparse text to avoid unnecessary recognition work.
 
@@ -143,7 +141,6 @@ public enum VisionTextLayer {
     }
 
     /// Covered text cannot trigger expensive foreign-app refinement, but remains available for whole-frame secret-caption context.
-    #if canImport(Vision)
     public static func recognize(
         image: CGImage,
         using recognizer: VisionKitTextRecognizer,
@@ -198,12 +195,10 @@ public enum VisionTextLayer {
             tileFailures: tileFailures
         )
     }
-    #endif
 }
 
 // MARK: - The real engine
 
-#if canImport(Vision)
 /// Convert native normalized observations at the pixel boundary.
 public struct VisionKitTextRecognizer: Sendable {
     public init() {}
@@ -258,4 +253,3 @@ public struct VisionKitTextRecognizer: Sendable {
         }
     }
 }
-#endif

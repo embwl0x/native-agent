@@ -430,7 +430,7 @@ extension MacChatTurnCardApproval {
         switch outcome {
         case .pending: return "Needs approval"
         case .approved: return "Approved"
-        case .denied: return "Denied"
+        case .denied: return "Declined"
         case .expired: return "Approval expired"
         case .unresolved: return "Approval unresolved"
         }

@@ -1,6 +1,5 @@
 // Project accepted facts into canonical graph tables.
 
-import CryptoKit
 import Foundation
 import NativeAgentShared
 import GRDB
@@ -245,7 +244,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     memoryID: memoryID,
                     content: content,
                     contentHash: contentHash,
-                    now: Self.nowISO8601(),
+                    now: NativeTimestampFormat.fractionalZulu(Date()),
                     extracted: Self.resolvingAliases(found, in: content, aliases: aliases, knownPeople: identity.knownPeople,
                                                      knownAgents: identity.knownAgents),
                     primaryUserName: identity.primaryUserName,
@@ -349,7 +348,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         fact: KnowledgeGraphMemoryFact
     ) throws -> String {
         let id = memoryFactEntityID(for: memoryID)
-        let kind = metadataString(fact.metadata, "kind") ?? "fact"
+        let kind = fact.metadata?.objectValue?["kind"]?.trimmedString ?? "fact"
         let compact = compactWhitespace(content)
         let title = "\(factTitleLabel(kind)): \(clip(compact, limit: 96))"
         let summary = "Memory fact: \(clip(compact, limit: 700))"
@@ -400,7 +399,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     }
 
     private static func factRelationshipType(_ fact: KnowledgeGraphMemoryFact) -> String {
-        let kind = metadataString(fact.metadata, "kind")?.lowercased()
+        let kind = fact.metadata?.objectValue?["kind"]?.trimmedString?.lowercased()
         switch kind {
         case "preference": return "prefers"
         case "identity", "user_fact", "attribute": return "describes"
@@ -453,13 +452,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         case "schedule": return "Schedule"
         default: return "Fact"
         }
-    }
-
-    private static func metadataString(_ metadata: JSONValue?, _ key: String) -> String? {
-        guard case .object(let obj)? = metadata,
-              case .string(let value)? = obj[key] else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func compactWhitespace(_ text: String) -> String {
@@ -655,21 +647,16 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     }
 
     static func contentHash(_ text: String) -> String {
-        let digest = SHA256.hash(data: Data(text.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        SHA256Hex.of(utf8: text)
     }
 
     static func factFingerprint(_ fact: KnowledgeGraphMemoryFact, content: String, identity: ExtractionIdentity) -> String {
-        let kind = metadataString(fact.metadata, "kind") ?? "fact"
+        let kind = fact.metadata?.objectValue?["kind"]?.trimmedString ?? "fact"
         // The person's edge is derived from the memory's tellers (and the person's names, in identity), so a telling added later re-derives
         // it on the next pass.
         let fields = [indexVersion, "canonical-profile-hub-declared-kind-language-stated-alias-contact-link-v5", identity.fingerprint,
                       kind, fact.validFrom ?? "", fact.validTo ?? "", content, "tellers:" + tellers(fact).joined(separator: "\n")]
         return contentHash(fields.map { "\($0.utf8.count):\($0)" }.joined())
-    }
-
-    static func nowISO8601() -> String {
-        NativeTimestampFormat.fractionalZulu(Date())
     }
 
     static func clip(_ text: String, limit: Int) -> String {

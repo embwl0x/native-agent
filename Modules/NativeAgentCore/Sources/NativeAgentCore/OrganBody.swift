@@ -1,7 +1,7 @@
 import Foundation
 import Synchronization
 
-// Blueprint: | `OrganBody.swift` | `OrganBody`: the one body projection (each organ's line and deviation), the felt-memory rule and the body read hook |
+// Blueprint: | `OrganBody.swift` | `OrganBody`: the one body projection (each organ's line, deviation and last completed pass), the felt-memory rule, told faults a pass cleared, and the body read hook |
 
 /// The body as one projection: every organ's line (latest beat, why, next expected beat) and its deviation, derived from the organ records on every read and
 /// never stored. The agent's `mind.body` read, Doctor's Body view, the felt line in the agent's turns and the organism's signal are all drawn from it.
@@ -13,8 +13,10 @@ public struct OrganBody: Sendable, Equatable {
         public let deviation: OrganRecord.Deviation?
         /// When the next beat is due; nil for an organ run on events or switched off.
         public let next: Date?
-        /// Whether the organ's kept beats hold a failure. Without one, a repair owed for this organ was owed for its being stuck.
-        public let failedInRecord: Bool
+        /// When the newest completed pass (`worked` or `nothing`) in its kept beats landed; nil when none did.
+        public let passed: Date?
+        /// Whether that pass comes after the newest failed or held beat in beat order, which whole-second times cannot tell apart.
+        public let passedAfterFault: Bool
 
         /// The line both faces read, in plain words.
         public func words(now: Date) -> String {
@@ -40,8 +42,10 @@ public struct OrganBody: Sendable, Equatable {
         lines = records.map { record in
             let latest = record.latest
             let next = latest.isOff ? nil : latest.cadence.map { max(latest.at, launchedAt).addingTimeInterval($0) }
+            let pass = record.beats.lastIndex { $0.outcome == .worked || $0.outcome == .nothing }
+            let fault = record.beats.lastIndex { $0.outcome == .failed || ($0.outcome == .held && !$0.isOff) }
             return Line(organ: record.organ, latest: latest, deviation: record.deviation(now: now, launchedAt: launchedAt), next: next,
-                        failedInRecord: record.beats.contains { $0.outcome == .failed })
+                        passed: pass.map { record.beats[$0].at }, passedAfterFault: pass.map { $0 > (fault ?? -1) } ?? false)
         }.sorted { ($0.deviation == nil ? 1 : 0, $0.organ) < ($1.deviation == nil ? 1 : 0, $1.organ) }
     }
 
@@ -95,18 +99,32 @@ public struct OrganBody: Sendable, Equatable {
         }
     }
 
-    /// Deviations one felt line names; the rest are counted and stay owed.
+    /// Told deviations (`marks`) that have cleared with a completed pass since they began: a real pass, never a busy beat or a beat from before.
+    /// A failure or hold is cleared by a pass after it in beat order, even within its second; silence and an empty pass by a later pass.
+    public func recovered(_ marks: [String: Mark]) -> [Line] {
+        lines.filter { line in
+            guard line.deviation == nil, let mark = marks[line.organ], let passed = line.passed else { return false }
+            let second = passed.timeIntervalSince1970.rounded(.down), since = mark.since.timeIntervalSince1970
+            return mark.kind == .failed || mark.kind == .stuck ? line.passedAfterFault && second >= since : second > since
+        }
+    }
+
+    /// Organs one felt line names, deviations first; the rest are counted and stay owed.
     public static let feltLineLimit = 3
 
-    /// The one short line a turn carries for `lines`, in the agent's own voice; nil when there is nothing to feel.
-    public static func feltLine(_ lines: [Line]) -> String? {
-        guard !lines.isEmpty else { return nil }
+    /// The one short line a turn carries for `lines` and for told faults `recovered` (already within the limit), in the agent's own voice; nil when
+    /// there is nothing to feel.
+    public static func feltLine(_ lines: [Line], recovered: [Line] = [], now: Date = Date()) -> String? {
+        guard !lines.isEmpty || !recovered.isEmpty else { return nil }
         // One sentence per organ: an organ's own why may already hold a semicolon.
         let shown = lines.prefix(feltLineLimit).compactMap { line in
             line.deviation.map { name(line.organ) + " " + Self.bounded($0.why) }
         }
+        let back = recovered.compactMap { line in
+            line.passed.map { name(line.organ) + " works again (it passed at " + OrganRecord.clock($0, now: now) + ")" }
+        }
         let more = lines.count > shown.count ? ". \(lines.count - shown.count) more in mind.body" : ""
-        return "In my body: " + shown.joined(separator: ". ") + more + "."
+        return "In my body: " + (shown + back).joined(separator: ". ") + more + "."
     }
 
     /// One line of an organ's own words: whitespace collapsed, trailing stops dropped, at most 160 characters.

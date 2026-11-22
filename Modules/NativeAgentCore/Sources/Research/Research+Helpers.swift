@@ -21,10 +21,6 @@ extension SwiftNativeResearchClient {
         return comps?.url
     }
 
-    public nonisolated static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalUTCOffset(date)
-    }
-
     public nonisolated static func defaultDataRoot() -> URL {
         PersistenceCore.defaultDataRoot()
     }

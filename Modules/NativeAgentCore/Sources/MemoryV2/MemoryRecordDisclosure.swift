@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
@@ -28,18 +29,12 @@ public struct MemoryDisclosureClassification: Sendable, Codable, Equatable {
     public func permits(surface: String?, personaID requestedPersonaID: String?) -> Bool {
         if let requestedPersonaID,
            let personaID,
-           normalize(requestedPersonaID) != normalize(personaID) {
+           TextNormalization.trimmedLowercased(requestedPersonaID) != TextNormalization.trimmedLowercased(personaID) {
             return false
         }
         guard let surface else { return true }
         return permittedSurfaces.contains(MemoryRecordDisclosurePolicy.canonicalSurface(surface))
     }
-
-    private static func normalize(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    private func normalize(_ value: String) -> String { Self.normalize(value) }
 }
 
 /// Share record disclosure between automatic Context and explicit recall; TrustCenter independently authorizes the tool.
@@ -55,7 +50,7 @@ public enum MemoryRecordDisclosurePolicy {
 
     /// The disclosure scope of a turn surface: the agent-bridge surface shares the `bridge` scope; every other surface is its own scope.
     public static func canonicalSurface(_ value: String) -> String {
-        let normalized = normalize(value)
+        let normalized = TextNormalization.trimmedLowercased(value)
         // PeerTurnEffectPolicy fences effects; peer sessions retain ordinary bridge recall.
         return normalized == "agent-bridge" ? "bridge" : normalized
     }
@@ -67,19 +62,19 @@ public enum MemoryRecordDisclosurePolicy {
         tags: [String]?,
         metadata: JSONValue?
     ) -> MemoryDisclosureClassification? {
-        let normalizedStatus = normalize(status ?? "active")
+        let normalizedStatus = TextNormalization.trimmedLowercased(status ?? "active")
         guard normalizedStatus == "active" else { return nil }
         if let lifecycle,
            !MemoryLifecycle.isRecallEligible(lifecycle) {
             return nil
         }
 
-        let normalizedTags = (tags ?? []).map(normalize)
+        let normalizedTags = (tags ?? []).map(TextNormalization.trimmedLowercased)
         let rawPrivacy = metadata?.objectValue?["privacy"]?.stringValue
             ?? normalizedTags.first(where: { $0.hasPrefix("privacy:") })
                 .map { String($0.dropFirst("privacy:".count)) }
         let privacy: MemoryDisclosurePrivacy
-        switch normalize(rawPrivacy ?? "").replacingOccurrences(of: "-", with: "_") {
+        switch TextNormalization.trimmedLowercased(rawPrivacy ?? "").replacingOccurrences(of: "-", with: "_") {
         case "public", "public_safe": privacy = .publicSafe
         case "trusted", "trusted_remote": privacy = .trustedRemote
         default: privacy = .localPrivate
@@ -122,16 +117,7 @@ public enum MemoryRecordDisclosurePolicy {
         )
     }
 
-    private static func normalize(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
     private static func strings(_ value: JSONValue?, key: String) -> [String] {
-        guard case .object(let object)? = value,
-              case .array(let values)? = object[key] else { return [] }
-        return values.compactMap {
-            guard case .string(let result) = $0 else { return nil }
-            return result
-        }
+        JSONValue.stringArray(value?.objectValue?[key])
     }
 }

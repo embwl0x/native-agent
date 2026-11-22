@@ -19,7 +19,7 @@ public enum TurnApprovalRead {
 
         let candidates: [(row: ApprovalRecord, requestedAt: Date)] = approvals.compactMap { row in
             guard row.chatOriginSessionId == sessionId,
-                  let timestamp = nonEmpty(row.lastRequestedAt ?? row.createdAt),
+                  let timestamp = (row.lastRequestedAt ?? row.createdAt).trimmedNonEmpty,
                   let requestedAt = parseTimestamp(timestamp),
                   requestedAt >= turnStartedAt else { return nil }
             return (row, requestedAt)
@@ -45,7 +45,7 @@ public enum TurnApprovalRead {
         return MacChatTurnCardApproval(
             approvalId: chosen.candidate.row.id,
             act: displayAction(chosen.candidate.row),
-            reason: nonEmpty(chosen.candidate.row.reason).map {
+            reason: chosen.candidate.row.reason.trimmedNonEmpty.map {
                 ToolActivityPresentation.approvalText(
                     ApprovalActionText.reason($0, tool: chosen.candidate.row.action),
                     tool: chosen.candidate.row.action
@@ -69,7 +69,7 @@ public enum TurnApprovalRead {
 
     /// The inbox preview is caller-authored prose or serialized payload; only structured payloads can be unwrapped.
     private static func inputSummary(_ row: ApprovalRecord) -> String? {
-        guard let raw = nonEmpty(row.payloadPreview) else { return nil }
+        guard let raw = row.payloadPreview.trimmedNonEmpty else { return nil }
         guard let data = raw.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data),
               let parsed = object as? [String: Any]
@@ -90,7 +90,8 @@ public enum TurnApprovalRead {
             .sorted { $0.key < $1.key }
         for (key, value) in ordered + fallback {
             guard let scalar = scalarText(value) else { continue }
-            return redactedLine("\(key): \(scalar)")
+            // The value alone says what is asked; only a nested object needs its name, in words.
+            return redactedLine(value is [String: Any] ? "\(key.replacingOccurrences(of: "_", with: " ")): \(scalar)" : scalar)
         }
         return nil
     }
@@ -109,13 +110,13 @@ public enum TurnApprovalRead {
 
     private static func scalarText(_ value: Any) -> String? {
         switch value {
-        case let text as String: return nonEmpty(text)
+        case let text as String: return text.trimmedNonEmpty
         case let number as NSNumber: return number.stringValue
         case let nested as [String: Any]:
             // Nested values may contain credentials; show only safe key names.
-            return nonEmpty(nested.keys.filter {
+            return (nested.keys.filter {
                 !ApprovalActionText.isInternalField($0) && !isSecretKey($0)
-            }.sorted().joined(separator: ", "))
+            }.sorted().joined(separator: ", ")).trimmedNonEmpty
                 .map { "{\($0)}" }
         default: return nil
         }
@@ -146,12 +147,6 @@ public enum TurnApprovalRead {
     }
 
     private static func displayAction(_ row: ApprovalRecord) -> String {
-        row.call?.act ?? nonEmpty(row.action).map(ToolActivityPresentation.title) ?? nonEmpty(row.title) ?? "this action"
-    }
-
-    private static func nonEmpty(_ raw: String?) -> String? {
-        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty else { return nil }
-        return trimmed
+        row.call?.act ?? row.action.trimmedNonEmpty.map(ToolActivityPresentation.title) ?? row.title.trimmedNonEmpty ?? "this action"
     }
 }

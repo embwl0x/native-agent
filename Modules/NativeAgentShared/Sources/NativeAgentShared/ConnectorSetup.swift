@@ -6,7 +6,7 @@ public enum ConnectorSetup: String, Sendable, Equatable {
     case unavailable
 
     public static func canonicalID(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        TextNormalization.trimmedLowercased(raw)
     }
 
     public static func resolve(_ raw: String) -> Self {

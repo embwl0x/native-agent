@@ -25,17 +25,17 @@ extension ChatStore {
         if msg.metadata?["kind"] == "notice", msg.metadata?["steering"] == "true",
            let index = queuedSends.firstIndex(where: { $0.id.uuidString == msg.correlationID }) {
             let queued = queuedSends[index]
-            steeringQueuedIDs.remove(queued.id)
             pausedQueueSessionKeys.insert(queueSessionKey(queued.sessionID))
+            queuedSends[index].awaitingSteerOutcome = nil
             if queued.steeringFailure != msg.text { queuedSends[index].steeringFailure = msg.text }
             if queueSessionKey(queued.sessionID) == queueSessionKey(selectedSessionID) { errorBanner = msg.text }
             return
         }
         if let kind = msg.metadata?["kind"], kind == "steered" || kind == "steer_returned",
            let queued = queuedSends.first(where: { $0.id.uuidString == msg.correlationID }) {
-            steeringQueuedIDs.remove(queued.id)
             if kind == "steer_returned" {
-                if let client = pendingRetryClient {
+                clearPendingSteer(queued.id)
+                if !pausedQueueSessionKeys.contains(queueSessionKey(queued.sessionID)), let client = pendingRetryClient {
                     sendAsOwnMessage(queued.id, client: client)
                 }
                 return
@@ -44,7 +44,8 @@ extension ChatStore {
             // A different conversation's turn carries its own transcript; do not insert it here.
             guard queueSessionKey(queued.sessionID) == queueSessionKey(selectedSessionID) else { return }
             var note = ChatMessage(role: .assistant, text: msg.text, awaitingMacTranscript: true, runId: msg.correlationID)
-            note.completionState = "completed"
+            // A Steer notice is not a reply: it must never read as the end of the answer it joined.
+            note.completionState = "steered"
             messages.append(contentsOf: [ChatMessage(id: queued.id, role: .user, text: queued.text, awaitingMacTranscript: true, runId: msg.correlationID),
                 note])
             return
@@ -74,12 +75,24 @@ extension ChatStore {
                     message: rejection.userMessage
                 )
             } else {
+                // The refusal lands in its own conversation before the exchange retires, so going back there shows why, not a reply in progress.
+                if let session = record.sessionID, var cached = iCloudSyncEngine.shared.chatTranscripts[session],
+                   let index = cached.messages.firstIndex(where: { $0.id == record.placeholderID }) {
+                    cached.messages[index].isStreaming = false
+                    cached.messages[index].awaitingMacTranscript = false
+                    Self.end(&cached.messages[index], lifecycle: rejection.userMessage, state: "failed")
+                    iCloudSyncEngine.shared.chatTranscripts[session] = cached
+                }
                 closePendingExchange(correlationID)
             }
             markICloudReplyResolved(correlationID)
             return
         }
-        if let correlationID = msg.correlationID, resolvedICloudReplyIds.contains(correlationID) {
+        // Leaving a conversation marks its view resolved, but its exchange stays pending: a live ending for it still settles it.
+        // Only a switched-away conversation's exchange: in the open one a resolved reply is done, and a replayed ending must not rewrite it.
+        if let correlationID = msg.correlationID, resolvedICloudReplyIds.contains(correlationID),
+           !(msg.metadata?["live"] == "true" && MobileChatTerminal.classify(kind) != nil
+               && pendingExchanges[correlationID].map({ Self.cleanSessionID($0.sessionID) != Self.cleanSessionID(selectedSessionID) }) == true) {
             return
         }
         // Saved terminal evidence prevents replayed live records from reopening a completed turn.
@@ -158,11 +171,11 @@ extension ChatStore {
         if !offscreen {
             if let pendingId {
                 onTalkReply?(pendingId, msg.text, true, failed ? Self.errorExplanation(msg) : stopped ? "Reply stopped. Listening to you." : incomplete
-                    ? msg.metadata?["status"] ?? "Reply ending is unconfirmed." : nil)
+                    ? msg.metadata?["status"] ?? "The reply may have ended early." : nil)
             }
             if failed { errorBanner = msg.metadata?["errorDetail"].flatMap { $0.isEmpty ? nil : $0 } ?? msg.text }
             if stopped { errorBanner = "Stopped. Any partial reply has been kept." }
-            if incomplete { errorBanner = msg.metadata?["status"] ?? "Reply ending is unconfirmed." }
+            if incomplete { errorBanner = msg.metadata?["status"] ?? "The reply may have ended early." }
             if !failed && !stopped && !incomplete {
                 onReply?(msg.text, pendingId)
                 // A late reply is news, never a move: a reader away from the end sees Latest.
@@ -185,7 +198,7 @@ extension ChatStore {
             ?? .init(records: [], messages: [], generation: nil)
         var rows = visibleEffects ? messages : transcript.messages
         let failure = failed ? msg.metadata?["errorDetail"] ?? msg.text
-            : incomplete ? msg.metadata?["status"] ?? "Reply ending is unconfirmed." : live ? msg.metadata?["status"] : nil
+            : incomplete ? msg.metadata?["status"] ?? "The reply may have ended early." : live ? msg.metadata?["status"] : nil
         let state = failed ? "failed" : stopped || incomplete ? "incomplete" : "completed"
         let publishedIDs = live ? transcript.publishedIDs : []
         let saved = live ? rows.firstIndex {
@@ -213,7 +226,7 @@ extension ChatStore {
             } else if failed || stopped || incomplete {
                 // Apply terminal words before retiring the correlation: the terminal can precede every streamed snapshot.
                 if hasPartialReply || incomplete { reply.text = msg.text }
-                Self.end(&reply, lifecycle: failed ? Self.errorExplanation(msg) : stopped ? "Stopped" : failure ?? "Reply ending is unconfirmed.", state: state)
+                Self.end(&reply, lifecycle: failed ? Self.errorExplanation(msg) : stopped ? "Stopped" : failure ?? "The reply may have ended early.", state: state)
             } else {
                 reply.text = msg.text
                 reply.attachments = (msg.attachments ?? []).map {
@@ -296,21 +309,16 @@ extension ChatStore {
     /// Only the Mac can establish that history exists before the snapshot window.
     var canLoadOlderHistory: Bool {
         guard let session = Self.cleanSessionID(selectedSessionID) else { return false }
-        return (iCloudSyncEngine.shared.chatTranscripts[session]?.hasOlder ?? pagedSessionsWithOlder.contains(session))
-            && !historyExhaustedSessionIDs.contains(session)
+        return iCloudSyncEngine.shared.chatTranscripts[session]?.hasOlder == true
     }
 
     func loadOlderHistory() async {
         guard let session = Self.cleanSessionID(selectedSessionID), !isLoadingHistory else { return }
-        let transcript = iCloudSyncEngine.shared.chatTranscripts[session]
-        let historyIDs = (transcript?.publishedIDs ?? []).union(transcript?.historyIDs ?? [])
-        guard let oldest = messages.first(where: { historyIDs.contains($0.id) }) else { return }
+        guard let oldest = iCloudSyncEngine.shared.chatTranscripts[session]?.records.first else { return }
         isLoadingHistory = true
         defer { isLoadingHistory = false }
         do {
-            let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, beforeID: oldest.id.uuidString)
-            guard Self.cleanSessionID(selectedSessionID) == session else { return }
-            if !page.hasOlder { historyExhaustedSessionIDs.insert(session) }
+            _ = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: session, beforeID: oldest.id)
         } catch {
             errorBanner = "Earlier messages did not load: \(error.localizedDescription)"
         }

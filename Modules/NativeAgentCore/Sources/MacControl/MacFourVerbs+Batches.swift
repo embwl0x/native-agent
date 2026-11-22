@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Experiences
-import CryptoKit
+import NativeAgentShared
 // Blueprint: | `MacFourVerbs+Batches.swift` | `MacFourVerbs`: Live ordered selections, complete step digests and stop settlement |
 
 extension MacFourVerbs {
@@ -53,7 +53,8 @@ extension MacFourVerbs {
             let optional = asked.target.hasSuffix("?") && asked.target.count > 1
             let step = optional ? MacActStep(verb: asked.verb, target: String(asked.target.dropLast()), text: asked.text,
                                              mode: asked.mode, to: asked.to, place: asked.place,
-                                             holding: asked.holding, button: asked.button) : asked
+                                             holding: asked.holding, button: asked.button,
+                                             direction: asked.direction, scrollAmount: asked.scrollAmount) : asked
             // After step 1 the app's own sheet or dialog (a save sheet) may be what's in front: the same process is still required, not the same window rect.
             let stepExpect: FrontExpectation? = index == 0 ? expect : expect.map { (pid: $0.pid, frame: nil) }
             let commitFollows = index + 1 < steps.count && Self.pressesReturn(steps[index + 1])
@@ -72,11 +73,13 @@ extension MacFourVerbs {
                             detail: ["error": .string("selection_app_mismatch")])
                     }
                     return await actSelection(verb: step.verb, handle: handle, frameID: frameID,
-                        text: step.text, mode: step.mode, app: app, turn: turn, context: context)
+                        text: step.text, mode: step.mode, direction: step.direction, scrollAmount: step.scrollAmount,
+                        app: app, turn: turn, context: context)
                 }
                 return await actOnce(
-                    verb: step.verb, target: step.target, text: step.text, mode: step.mode, to: step.to, toApp: nil,
-                    seconds: nil, holding: step.holding, button: step.button, scrollAmount: nil, attention: nil,
+                    verb: step.direction.map { "scroll \($0)" } ?? step.verb,
+                    target: step.target, text: step.text, mode: step.mode, to: step.to, toApp: nil,
+                    seconds: nil, holding: step.holding, button: step.button, scrollAmount: step.scrollAmount, attention: nil,
                     app: app, expect: stepExpect, carry: carry, commitFollows: commitFollows, menus: !optional, place: step.place
                 , turn: turn, context: context)
             }
@@ -152,7 +155,7 @@ extension MacFourVerbs {
             let did = Array(landed.reversed().drop { $0.hasPrefix("?") }.reversed())
             return !did.isEmpty && digests.starts(with: did.map { $0.hasPrefix("?") || $0.hasPrefix("~") ? String($0.dropFirst()) : $0 })
         }
-        /// Landed ("<digest>") or may have ("~<digest>"); "?<digest>" was an absent optional step, looked for again.
+        /// Keep landed ("<digest>") or possibly landed ("~<digest>") steps. Recheck a step that sent no input ("?<digest>").
         func kept(_ index: Int) -> Bool { landed.indices.contains(index) && !landed[index].hasPrefix("?") }
         var keptCount: Int { landed.filter { !$0.hasPrefix("?") }.count }
     }
@@ -169,7 +172,7 @@ extension MacFourVerbs {
             func point(_ point: MacPointerPosition?) -> JSONValue {
                 point.map { .object(["x": .double($0.x), "y": .double($0.y)]) } ?? .null
             }
-            let value = JSONValue.object([
+            var fields: [String: JSONValue] = [
                 "app": app.map(JSONValue.string) ?? .null,
                 "verb": .string(step.verb),
                 "target": .string(step.target),
@@ -185,8 +188,13 @@ extension MacFourVerbs {
                 "button": step.button.map(JSONValue.string) ?? .null,
                 "handle": step.handle.map(JSONValue.string) ?? .null,
                 "frame_id": step.frameID.map(JSONValue.string) ?? .null,
-            ])
-            return try SHA256.hash(data: value.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
+            ]
+            // A scroll hashes the direction it runs (explicit, else the verb's, else down), so equal scrolls are one step and different ones never are.
+            if MacFourVerbs.isScrollVerb(step.verb) {
+                fields["direction"] = .string(step.direction ?? Self.parseVerb(step.verb).1.rawValue)
+            }
+            if let amount = step.scrollAmount, amount != 0 { fields["scroll_amount"] = .int(Int64(amount)) }
+            return try SHA256Hex.of(JSONValue.object(fields).serializedData(pretty: false))
         }
     }
 }

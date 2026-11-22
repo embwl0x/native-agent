@@ -32,10 +32,10 @@ public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
         ready: Bool = false
     ) {
         self.generatedAt = generatedAt
-        self.pressure = Self.clamp(pressure)
-        self.localRepairPressure = Self.clamp(localRepairPressure ?? pressure)
+        self.pressure = pressure.finiteClamped01()
+        self.localRepairPressure = (localRepairPressure ?? pressure).finiteClamped01()
         self.components = components
-        self.fieldUncertaintyResidual = Self.clamp(fieldUncertaintyResidual)
+        self.fieldUncertaintyResidual = fieldUncertaintyResidual.finiteClamped01()
         self.evidenceCount = max(0, evidenceCount)
         self.chargedNodeIDs = Array(chargedNodeIDs.prefix(4))
         self.noisyEdgeIDs = Array(noisyEdgeIDs.prefix(4))
@@ -46,10 +46,6 @@ public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     }
 
     public static func empty(at date: Date) -> Self { Self(generatedAt: date) }
-
-    private static func clamp(_ value: Double) -> Double {
-        (value.isFinite ? value : 0).clamped01()
-    }
 }
 
 public enum OrganismResidualRepair {

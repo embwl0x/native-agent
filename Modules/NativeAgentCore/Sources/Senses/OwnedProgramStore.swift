@@ -455,7 +455,7 @@ public struct OwnedProgramStore: Sendable {
     }
 
     public static func hash(_ value: JSONValue) throws -> String {
-        SHA256.hash(data: try value.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
+        try value.serializedSHA256()
     }
 
     private static func digest(program: OwnedProgram, manifest: JSONValue, fixtures: JSONValue,
@@ -564,6 +564,7 @@ public extension OwnedProgramToolHost {
 
 /// Captured replies are fixtures and must never admit live effects.
 public actor OwnedProgramFixtures: OwnedProgramHostProfile {
+    nonisolated let notebookID = UUID().uuidString
     private nonisolated let base: any OwnedProgramHostProfile
     private let calls: [JSONValue]?
     private let decisions: Bool

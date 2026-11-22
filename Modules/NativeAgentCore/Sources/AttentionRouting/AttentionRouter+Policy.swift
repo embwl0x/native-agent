@@ -48,12 +48,4 @@ extension AttentionRouter {
         }
         return end
     }
-
-    /// An unreadable window holds: no interruption is admitted on unknown preferences (checkedRead records the owner failure).
-    public static func inQuietHours(at date: Date, dataRoot: URL, calendar: Calendar = .current) -> Bool {
-        do {
-            guard let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot) else { return false }
-            return window.contains(hour: calendar.component(.hour, from: date))
-        } catch { return true }
-    }
 }

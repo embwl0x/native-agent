@@ -3,6 +3,7 @@
 // these rows outside memory rebuild, orphan GC and stale-entity deletion.
 
 import CryptoKit
+import NativeAgentShared
 import Foundation
 import GRDB
 import PersistenceCore
@@ -52,7 +53,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         } catch KnowledgeGraphPoolCache.PoolError.databaseMissing {
             return .unavailable
         }
-        let stamp = KnowledgeGraphStore.orderingTimestamp(now)
+        let stamp = NativeTimestampFormat.fractionalZulu(now)
         let works = derived.works
         let creators = derived.creators
         let edges = derived.edges

@@ -194,15 +194,10 @@ extension AliveSection where Trailing == EmptyView {
 
 struct AliveFootnote: View {
     let text: String
-    var systemImage: String?
-    init(_ text: String, systemImage: String? = nil) {
-        self.text = text
-        self.systemImage = systemImage
-    }
+    init(_ text: String) { self.text = text }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            if let systemImage { Image(systemName: systemImage).accessibilityHidden(true) }
             Text(text).fixedSize(horizontal: false, vertical: true)
         }
         .font(.footnote)

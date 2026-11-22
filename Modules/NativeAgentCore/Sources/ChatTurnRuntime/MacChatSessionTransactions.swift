@@ -8,7 +8,6 @@ import NativeAgentCore
 @MainActor
 public protocol MacChatSessionStore: AnyObject {
     var sessions: [NativeAgentShared.ChatSession] { get set }
-    var conversationAnchor: ConversationAnchorPin? { get }
     /// Called only inside the index owner's LatestRead publication closure.
     func publishSessionIndexRead(_ sessions: [NativeAgentShared.ChatSession])
     func hasCachedTranscript(for sessionID: String) -> Bool
@@ -123,7 +122,6 @@ public final class MacChatSessionTransactions {
         load: (String) async throws -> Void
     ) async {
         guard !requestedId.isEmpty else { return }
-        let anchorAtChoice = store.conversationAnchor?.sessionId
         // A user-selected session outranks the conversation anchor for the rest of this launch.
         if userInitiated {
             MacChatSelectionIntent.noteUserChoice()
@@ -134,7 +132,6 @@ public final class MacChatSessionTransactions {
 
         if hasCachedTranscript {
             port.commitChatSessionSelection(requestedId)
-            if userInitiated { MacChatSelectionIntent.lastSeenAnchorSessionId = anchorAtChoice }
         }
 
         do {
@@ -145,7 +142,6 @@ public final class MacChatSessionTransactions {
                 guard port.activeChatSessionId == requestedId else { return }
             }
             port.commitChatSessionSelection(requestedId)
-            if userInitiated && !hasCachedTranscript { MacChatSelectionIntent.lastSeenAnchorSessionId = anchorAtChoice }
         } catch {
             if port.chatSelectionGeneration == generation {
                 presentStatus("Chat session load failed: \(error.localizedDescription)")
@@ -195,39 +191,11 @@ private func isMainAppSourceKey(_ sourceKey: String?) -> Bool {
     return raw.hasSuffix("_app")
 }
 
-/// Resolve live routes through the current index, then one canonical refresh; transactional selection stays with AppModel.
-public enum MacChatRunningSessionNavigation {
-    @MainActor
-    public static func navigate(
-        sessionId: String,
-        sessions: () -> [NativeAgentShared.ChatSession],
-        refresh: () async -> Void,
-        select: (NativeAgentShared.ChatSession) async -> Bool,
-        isCurrentIntent: () -> Bool = { true }
-    ) async -> Bool {
-        guard isCurrentIntent() else { return false }
-        if let current = sessions().first(where: { $0.id == sessionId }) {
-            let selected = await select(current)
-            return isCurrentIntent() && selected
-        }
-        await refresh()
-        guard isCurrentIntent(),
-              let refreshed = sessions().first(where: { $0.id == sessionId }) else {
-            return false
-        }
-        let selected = await select(refreshed)
-        return isCurrentIntent() && selected
-    }
-}
-
 /// The conversation anchor may choose the launch default but cannot override a session the user explicitly picked.
 /// Keep this process-scoped so an old launch's choice cannot outrank the user's current conversation.
 @MainActor
 public enum MacChatSelectionIntent {
     public private(set) static var userChoseThisLaunch = false
-
-    /// Follow only anchors newer than the one Simple last followed or the user explicitly left.
-    public static var lastSeenAnchorSessionId: String?
 
     /// Record explicit user selection, including sidebar picks and newly created sessions.
     public static func noteUserChoice() {

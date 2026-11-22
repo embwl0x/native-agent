@@ -1,3 +1,4 @@
+import NativeAgentShared
 import AgentLinkTransport
 import AgentWorkspace
 import Foundation
@@ -641,9 +642,6 @@ public enum AgentHostConnection {
                 code: "agent_credential_generation_failed",
                     instruction: "Report the macOS random-generator failure to the person before connecting; no credential was created.", recovery: .repair)
         }
-        return Data(bytes).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        return Data(bytes).base64URLEncodedString()
     }
 }

@@ -106,5 +106,4 @@ public protocol DelegationBackgroundWorkPort: BackgroundWorkNotificationPort {
     func observeMotorActionState(_ model: MotorActionReadModel) async
     func reconcileAgentConversations() async throws
     func stopAgentConversations() async
-    func nextConversationDeadline(after now: Date) -> Date?
 }

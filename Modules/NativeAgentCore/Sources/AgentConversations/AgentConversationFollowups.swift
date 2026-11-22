@@ -33,7 +33,7 @@ extension AgentConversationSession {
         behind row: AgentConversationRecord, name: String, peer: AgentPeerContact?,
                               args: [String: JSONValue], expectsReply: JSONValue?, scope: String, surface: String, dataRoot: URL,
                               perform: @escaping Dispatch) throws -> JSONValue? {
-        guard let text = string(args["text"]) else { return nil }
+        guard let text = args["text"]?.nonblankString else { return nil }
         let store = AgentConversationStore(dataRoot: dataRoot)
         let transport = peer?.transport
         var arguments = args
@@ -167,7 +167,7 @@ extension AgentConversationSession {
                             surface: surface, scope: scope,
                                            dataRoot: dataRoot, reservation: taken.id, perform: perform)
                     }
-                    if case .object(let fields) = result, let detail = string(fields["detail"]) { why = detail }
+                    if case .object(let fields) = result, let detail = fields["detail"]?.nonblankString { why = detail }
                     else { why = "The call returned without a reason; this reservation's send never began." }
                 } catch { why = error.localizedDescription }
                 // The reservation proves this send never began; save its terminal reason and release its place together.
@@ -228,15 +228,15 @@ extension AgentConversationSession {
         var owner: [String: JSONValue] = ["agent": .string(latest.agent)]
         for key in ["session_id", "__session_id"] { owner[key] = args[key] }
         if flying {
-            if case .object(let receipt)? = latest.receipt, receipt["terminal"] != .bool(true), let task = string(receipt["task_id"]) {
+            if case .object(let receipt)? = latest.receipt, receipt["terminal"] != .bool(true), let task = receipt["task_id"]?.nonblankString {
                 owner["task_id"] = .string(task)
             }
-            if let message = string(latest.readInput?["message_id"]) { owner["message_id"] = .string(message) }
+            if let message = latest.readInput?["message_id"]?.nonblankString { owner["message_id"] = .string(message) }
             if let conversation = latest.conversationID { owner["conversation_id"] = .string(conversation) }
         }
         let result = try await perform("agent_cancel", owner, turn, conversation, mac)
         guard case .object(let fields) = result else { return result }
-        let state = string(fields["status"]) ?? "cannot_stop"
+        let state = fields["status"]?.nonblankString ?? "cannot_stop"
         guard ["stopped", "stopping", "cannot_stop", "not_here"].contains(state) else { return result } // refused by its gate
         // Withdraw before local cancellation can publish ready and wake queued sends. Keep its result so a failed withdrawal still lets accepted work settle.
         // A send held for the Mac is the conversation's current operation: a stop withdraws it even without clear_queue, and it never held the desktop.
@@ -246,7 +246,6 @@ extension AgentConversationSession {
         let settled: Result<JSONValue, Error> = await settle {
             let running = AgentConversationRunning.shared
             let stoppedSend = await running.stop(row: latest.id, operation: latest.operationID)
-            let retiredWatch = await running.retireWatches(row: latest.id, operation: latest.operationID)
             return Result {
                 let cleared = try withdrawal.get()
                 guard let current = try store.records().first(where: { $0.id == row.id }) else {
@@ -269,7 +268,7 @@ extension AgentConversationSession {
                     return .object(fields)
                 }
                 let acted = cleared > 0 ? "ok" : "no_change"
-                if stoppedSend || retiredWatch || stoppedOrReleased(current) {
+                if stoppedSend || stoppedOrReleased(current) {
                     return answer(current, ["stopped": .bool(current.stop?.state == "stopped"),
                         "detail": .string(current.stop?.detail ?? "The reply finished before the stop landed.")],
                         status: stoppedOrReleased(current) ? "ok" : acted)
@@ -290,7 +289,7 @@ extension AgentConversationSession {
                 }
                 let detail: String
                 let terminal: String
-                if state == "stopped" { terminal = "stopped"; detail = string(fields["detail"]) ?? "" }
+                if state == "stopped" { terminal = "stopped"; detail = fields["detail"]?.nonblankString ?? "" }
                 else if let ability = peer?.ability {
                     terminal = "released"; detail = """
                         Your ability \(ability) already took the message and has no stop from here; this conversation no longer waits on it, and if \
@@ -316,7 +315,7 @@ extension AgentConversationSession {
                         arrives in the chat that asked.
                         """
                 } else {
-                    terminal = "cannot_stop"; detail = string(fields["detail"])
+                    terminal = "cannot_stop"; detail = fields["detail"]?.nonblankString
                         ?? "\(name)'s route has no stop for a reply already handed over; it keeps working and its answer still arrives."
                 }
                 let saved = try store.update(id: current.id, operationID: latest.operationID) {

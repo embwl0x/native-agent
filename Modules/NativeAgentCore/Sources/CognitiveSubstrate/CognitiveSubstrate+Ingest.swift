@@ -19,9 +19,10 @@ extension CognitiveSubstrate {
         await ingest(event, defersPersistenceToMicrocycle: true)
     }
 
-    private func ingest(
+    func ingest(
         _ event: CognitiveEvent,
-        defersPersistenceToMicrocycle: Bool
+        defersPersistenceToMicrocycle: Bool,
+        onAdmission: () -> Void = {}
     ) async -> (accepted: Bool, semanticMetadata: [String: JSONValue]) {
         guard configuration.enabled, !field.hasSeenEvent(event) else { return (false, [:]) }
         let helper: Bool
@@ -84,6 +85,7 @@ extension CognitiveSubstrate {
             makeUUID: dependencies.makeUUID,
             configuration: configuration
         )
+        onAdmission()
         if event.turnKind == .verification {
             verificationNodeMayExist = true
         }
@@ -141,8 +143,7 @@ extension CognitiveSubstrate {
             field.stampEmotionTag(
                 key: ingestOutcome.key,
                 tag: tag,
-                isNewNode: ingestOutcome.isNewNode,
-                configuration: configuration
+                isNewNode: ingestOutcome.isNewNode
             )
         }
         // Completion matching, node reconsolidation and resident-slot updates share this await-free admission transition.
@@ -227,8 +228,7 @@ extension CognitiveSubstrate {
                 key: completion.nodeKey,
                 tag: (valence: (current.valence + reaction).clampedSigned(),
                       arousal: current.arousal, warmth: current.warmth),
-                isNewNode: false,
-                configuration: configuration
+                isNewNode: false
             )
         }
     }

@@ -10,7 +10,6 @@ import ProviderRouting
 extension RuntimeReadouts {
     @MainActor
     public final class Configuration {
-        public var searxngBaseURL: String { checkedSearchURL ?? "" }
         private let latest = LatestRead()
         private var settingsFeed: SettingsFeedProjection?
         private var checkedSearchURL: String?

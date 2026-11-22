@@ -1,6 +1,5 @@
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
@@ -317,7 +316,7 @@ public actor SwiftNativeProviderRouting: Sendable {
         } catch {
             throw ProviderRoutingError.underlying("provider selection bytes are unreadable")
         }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return SHA256Hex.of(data)
     }
     nonisolated static func updatedSurfaceRoot(
         _ root: [String: JSONValue],

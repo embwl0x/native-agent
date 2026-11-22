@@ -35,7 +35,7 @@ requests offer it alone. The schema is defined in
 | `app {"action":"find","args":{"what":"<words>"}}` | The same discovery reader; `query` is an alternative to `what`. |
 | `app {"action":"<id>","args":{…}}` | Run one registered action. |
 | `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
-| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a surprise, and nothing the person asked for waits on a step they did not: a step the gate refuses or files on a card is reported in its place and the steps after it still run, while after a step that fails, waits in place on the person, or does not come back as they said, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and what ran after it, with `stopped_at:{step, as, because}` (`because` is `failed`, `waiting` or `surprise`), `failed_step` when the step failed or waits, `not_run:[{step, as, action, because}]` (`because` is `stopped` for a change after the stop, `found_not_there` for a step whose `found` could not be resolved) and `steps_total`; each receipt carries its `step` and its `as` name (steps count from 1). `then_say` and `with` beside `actions` carry their closing words (below). An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
+| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a surprise, and nothing the person asked for waits on a step they did not: a step the gate refuses or files on a card is reported in its place and the steps after it still run, while after a step that fails, waits in place on the person, or does not come back as they said, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and what ran after it, with `stopped_at:{step, as, because}` (`because` is `failed`, `waiting` or `surprise`), `failed_step` when the step failed or waits, `not_run:[{step, as, action, because}]` (`because` is `stopped` for a change after the stop, `found_not_there` for a step whose `found` could not be resolved) and `steps_total`; each receipt carries its `step` and its `as` name (steps count from 1). `then_say` and `with` beside `actions` carry their closing words (below); beside a single `action` they make it a batch of one, and a `find` beside `actions` is one more step of it. An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
 
 `pane.show` takes `view:"steps"`, `"screen"`, `"make"` or `"table"`, with an
 optional Make `ref`. `view:"table"` opens the independent table window with its
@@ -86,28 +86,34 @@ as `preview`. An empty `find` returns `ok` with `reason: no_match` and does not
 stop later changes. Stop before the first step returns `canceled`; Stop after
 a step retains `partial` and the individual receipts.
 
-Their closing words stand when every step ran, was expected and held, nothing
-in it is beyond undoing, and nothing else arrived. `then_say` beside
-`actions` is those words, as text; `with` beside it maps each slot name to
-`{found: "<step>.<path>"}`. Both are keys of the `actions` form only; on any
-other form they are unknown keys. Before anything runs, the batch is refused
-(`invalid_actions`) when `then_say` is not non-empty text, when `with` comes
-without `then_say`, or when a `with` value is anything but one `found`. Given
-`then_say`, the result always carries `then_say`, set by the batch itself and
-never by a step's payload: `{stands: true, words}` with each `{name}` that
-`with` names replaced by its value, or `{stands: false, because}`, one plain
-sentence naming the first thing that failed. They stand only when the batch
-was not a preview and no step was only previewed; its status is `ok` (every
-step has a receipt and landed fully, nothing stopped, waited or was handed
-back); every step carried an `expect`; no receipt, nor any call a script step made, says `irreversible: true`;
-no message from the person is waiting at the end; and every slot resolves,
-through the same `found` as a step's argument, to a value: a number,
-true/false, or one line of text of at most 120 characters. A list, an
-object, null, longer or multi-line text, or a reference not there means the
-words do not stand. Braces naming nothing in `with` stay as written. The
-shipped turn says standing words and ends with no further model call when
-that one call was the round's only call and asked for them itself
-([turn anatomy](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool)).
+`then_say` holds their closing words as text. `with` maps each slot name to
+`{found: "<step>.<path>"}`. Put them beside `actions` and give each step an
+`expect`. For a single `action`, put `expect` and `then_say` beside it.
+The door runs the same check on step 1, whose result supplies any slots.
+
+At key validation, the door treats null `then_say` or `with` as omitted and
+returns `unknown_key` for either remaining key outside a batch. A
+`page: "visible"` call without `action` returns `app_window_unavailable` before
+key validation if no window is connected. Batch validation returns
+`invalid_actions` before any step runs if `then_say` is blank or non-text, or if
+`with` comes without `then_say` or lacks the required object shape of one
+`found` reference per slot.
+
+When closing words are requested, batch settlement supplies its own `then_say`
+as `{stands: true, words}` with each named slot filled, or `{stands: false, because}`
+with the first reason the words cannot stand. A batch grouped onto one approval
+card returns `needs_person` before settlement, with no `then_say` field.
+
+The words stand when every step ran, landed fully and met its `expect`.
+A preview, Stop or hand-back keeps them from standing. So does any receipt or
+script call marked `irreversible: true`, or a readable, untainted message from
+the person waiting at settlement. The words can stand while a peer's message
+waits. Each slot must resolve through `found` to a number, boolean or one line
+of text of at most 120 characters.
+Braces naming nothing in `with` stay as written. The shipped turn says standing
+words and ends with no further model call when the round's only call is the
+single action or batch that requested them. See the
+[turn anatomy](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool).
 
 A readable, untainted message from the person waiting in this conversation
 hands an `actions` batch back before its next step, including a read. The
@@ -198,7 +204,9 @@ address binding untouched. Authored calls use the same binding at inspection
 and execution, including expressions whose values are not yet known.
 Other unknown arguments bind only when one missing accepted argument fits its
 value and has the action's declared meaning, or is
-the single missing required argument of that type. Two possible targets, a
+the single missing required argument of that type; the declared spellings of one
+argument (`find`'s `what|query`) are one target, bound to its first spelling
+that fits. Two possible targets, a
 collision, null, an undeclared type or any unresolved name leaves the call
 unchanged for admission to refuse. The receipt says `understood message as text`;
 normal validation, Trust and effect gates still judge the bound call. Apart
@@ -218,11 +226,13 @@ The shared door stamps the returned receipt after call handling, so an outer-key
 refusal before argument admission carries the same form as an executed call.
 There is no per-turn copy of the catalog. Script data keeps its original value;
 the line and interpretation stay in its receipt. Invalid arguments carry
-`try_instead` and one proposed `next_call`: an exact call from supplied values
-when it fits, otherwise the closest declared form beside `supplied_args` and
-its schema. Missing values remain explicit placeholders to review before sending;
-discovery suggestions remain advice. The door's argument refusals also retain
-`args_schema` and the names it `accepted`. Suggested actions
+`try_instead` and one proposed call: an exact call from supplied values
+when it fits, as the remedy's `next_call`; otherwise the closest declared form
+as `try_instead`'s `proposed_call`, beside `supplied_args` and its schema. Missing values remain
+explicit placeholders to review before sending, so a form or a discovery
+suggestion is advice and never a remedy the body follows. The door's argument refusals also retain
+`args_schema` and the names it `accepted`. When accepted forms differ by
+required keys, the refusal names those keys in each form. Suggested actions
 list read-only ones first and each names its `effects`, so taking the first
 suggestion never posts, sends or changes anything by accident. Unknown actions
 read the unknown id as intent words (family and verb, such as "chat read" or
@@ -266,7 +276,8 @@ terminal results stay as returned. The model sees only results that leave a choi
 Inbox cards read through `app {page:"inbox", item:"<card id>"}` with their details
 and answers. Today and Inbox share one resolver: exact row ids, bare interaction
 ids, `interaction:<id>`, `card:<id>`, bare approval ids and `approval:<id>` reach
-the same Inbox card. Today opens that Inbox item directly.
+the same Inbox card. Today and Desk open that Inbox item directly; a Desk item of
+its own keeps its own read.
 Inbox's page description exposes this read in `find`.
 The page names `approvals`, `approval`, `pending approvals` and `today/approvals`
 all resolve to Inbox, whose owner shows the full cards and their answers. Today
@@ -332,7 +343,11 @@ and declared `learned`/`choices` are retained metadata with no enforced shape.
 Desk writes serialize under the store's lock; changed items retain their
 existing changed-state refusals. Conversations, turns, native operations and
 ability inputs acquire no holds. Only a stopped part-run with a retained
-checkpoint reserves its journaled Desk items until resumed or released.
+checkpoint reserves open Desk items identified by its journaled edit receipts.
+Those receipts carry stable handles, so a title change preserves the reservation's
+target. This includes `queue.add` rescheduling a matched step and `desk.add`
+deferring a reused item. Reused items are reserved only when the call edits them.
+Reservations last until the run is resumed or released.
 Queue edits and closure, Desk mutations, subtree closure and resume check those
 run reservations without acquiring any. A run refusal names its holder,
 `held_since`, `held_until:"resumed or released"`, and a `remedy.next_call`
@@ -340,9 +355,14 @@ previewing that run's resume. Session evidence is included when available.
 The single locked hold editor drops every non-run marker and reservations
 without an open item or retained checkpoint. No clock expires reservations.
 Resume releases its run's markers while keeping the claimed checkpoint through
-execution; a refused or busy resume restores reservations without displacing
-another stopped run. Hold reads and cleanup never discard checkpoint bytes;
-claimed bytes belong to the resuming call until its explicit settlement.
+execution. A pre-execution admission refusal or busy helper returns the same
+bytes to waiting, restores eligible reservations without displacing another
+stopped run, and keeps the Desk step open. A replay refusal's `resume.held`
+lists the reservations actually restored. Invalid checkpoint bytes stay
+claimed. An explicit drop of a resume step with a recorded run binding
+retires an ownerless claim to `.abandoned` for inspection and releases its
+reservations. The archive keeps that binding
+for a drop retry. A live claim owns its bytes through settlement.
 Reservation bookkeeping failures retain the produced result and owe Desk repair.
 
 The admitted ability entry assembles `native-morning-brief`'s checked source
@@ -489,18 +509,22 @@ unavailable with its cause and repair alongside any structural evidence.
 Structural evidence never substitutes for a successful visual observation.
 
 Mac hands accept the person's ordinary acts: point `type` clicks there then
-types into the editor that took focus; targetless `type` uses positively
-editable focus even when AX cannot read its text (unverified, with a pixel
-look offered). Unknown, noneditable or secure focus refuses, and append still
-requires readable contents/end. A contextual `frame_id` alone does not turn
+types into the editor that took focus; targetless `type` sends literal text,
+including whitespace-only text, to positively editable focus even when AX
+cannot read its text (unverified, with a pixel look offered). Unknown,
+noneditable or secure focus refuses, and append still requires readable
+contents/end. A contextual `frame_id` alone does not turn
 targetless typing into a handle selection. Key chords post keys directly.
-Batch `{verb,handle,frame_id}` steps re-resolve the recorded identity live,
-stop when it cannot be confirmed or the declared effect mismatches, and judge
-each effect from a fresh before-read. Editing a field's contents preserves its
-handle when its control identity is unchanged.
+An unnamed batch binds to the process in front at batch start, or to the app
+captured at ingress during a pending takeover. That process can change windows
+between steps. Batch `{verb,handle,frame_id}` steps re-resolve the recorded
+identity live, stop when it cannot be confirmed or the declared effect
+mismatches, and judge each effect from a fresh before-read. Editing a field's
+contents preserves its handle when its control identity is unchanged.
 A handle also takes `double_click`, `right_click`, `hover` and `focus` on that same
-live element, with the ordinary window/input gates. `focus` sets `AXFocused`
-and verifies that control's focus; a screen offers it only with that settable
+live element, with the ordinary window/input gates and any explicit `app`
+constraint. `focus` sets `AXFocused` and verifies that control's focus; a
+screen offers it only with that settable
 attribute. Screen offers and the `mac.act` schema share the executing hand's
 verb inventory. An unsupported handle
 verb names itself and the allowed verbs, including in a batch.
@@ -508,9 +532,16 @@ Semantic handle presses and opens use that control's advertised `AXPress` or
 `AXOpen` handler. Missing support refuses the operation; it never selects an
 ancestor, an Open chord, a click or a double-click. Dismiss requires the observed
 button in the same modal, and targeted scrolling requires its readable frame.
+A scroll by handle or by name takes `direction` (up, down, left or right) and
+`scroll_amount` (1–120 wheel lines) in a single act or a batch step. The
+default direction is down. Omission and 0 select the default amount and
+match the same stopped-batch step. A handle defaults to three lines and a
+handle step can also use `to` for direction. When both are given they must
+agree. Other handle verbs refuse these scroll options.
 An empty address never matches a supplemental target's empty handle.
-An absent enabled state stays unknown in the screen and offers no action. AX
-marks and transient menu items preserve that unknown state. Pointer verbs with
+An absent enabled state stays unknown in the screen and offers no action.
+Resolving an AX scroll target skips the enabled-state read. AX marks and
+transient menu items preserve the unknown state. Pointer verbs with
 unreadable target geometry report `target_geometry_unavailable`, without claiming
 the verb is unsupported.
 AX read failures carry their cause; they never establish enabled state, an empty
@@ -560,6 +591,8 @@ page or folded content; `next` carries its continuation when present, not the
 raw reader's byte window. Site snapshots retain their proof envelope, put the
 original byte count in `source_bytes`, the rendered count in `bytes`, and the
 sense continuation in `sense_more`; `has_more` also retains the source's flag.
+Each Mac screen page, including a continuation of a captured frame, carries its
+address in `sense_place` and the next cursor in `sense_more` when more remains.
 Native senses retain their original presentation; explicit raw file reads
 return the reader's JSON envelope, without consulting the sense registry. A
 failed sense returns as itself, never with a second read behind it: `ok:false`,
@@ -712,7 +745,7 @@ provider selection.
 - Skills are built-in guidance, found and read through `ability.list` and
   `ability.read`; they never run. Executable authored work is an ability.
 
-`web.search` searches SearXNG and returns its results or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
+`web.search` searches SearXNG and returns its results (with the engines' direct `answers` and up to three `infoboxes` knowledge panels, each a title, summary and page, when SearXNG has them) or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
 Cancellation stops the search.
 
 ## Where actions come from
@@ -893,7 +926,7 @@ Without `type`, it changes only supplied fields of an existing `id`: absent is `
 Refusals write nothing; an edit never recreates an element or changes its type. No shape or position defaults are invented.
 A typeless put carrying `item` or `piece` is `invalid_input`, with nothing written: the pointer is set only at creation.
 A new shape or container requires `x`, `y`, `w`, `h`; text requires `x`, `y`; an arrow requires `from`, `to`;
-a stroke requires `x`, `y`, `points`. Missing fields are named in an `invalid_input` refusal, with nothing written.
+a stroke requires `x`, `y` and `points` (the points run from x,y). Missing fields are named in an `invalid_input` refusal, with nothing written.
 An id must contain 1–40 letters, digits or hyphens, otherwise `invalid_input`. Cross and remove also refuse an id absent from
 the table as `not_found`, naming the id with `effects:none`.
 Item and piece cards keep type `shape`, place, pointer and signatures, with no copied title or state.
@@ -926,6 +959,9 @@ is `current_version`; its `run_totals` and `rounds_per_use` cover that scope.
 The ambiguous list `runs` field is removed. Retained-result recovery names
 searched, matching, displayed and remaining section counts separately;
 oversized structured sections expand through their named child paths.
+For a large retained action batch, the first answer includes a short row per returned
+step with its reported outcome, available findings, and the section page where
+its receipt starts. Read that page with the same result handle for more detail.
 
 `agent.introspect` separates `identity` (bundle id, build, data root) from
 `launch` (process/instance ids that change on relaunch). Its `context_window`
@@ -1127,10 +1163,9 @@ source dimensions, byte size and encoded type, `image_pixels:false`, and a note
 to read the pixels with `files.read` from a turn. This verifies the image bytes;
 it does not claim anyone saw pixels. Empty, oversized and unreadable images
 still fail. A program's receipt retains its own execution verdict and all its
-calls' aggregate effects, including writes before a later failed read. `files.look`
-returns a corrected `files.read` call with the supplied path; it does not read
-anything itself. A direct bridge result has no model continuation: its JSON
-cannot prove that a model saw the image.
+calls' aggregate effects, including writes before a later failed read. A direct
+bridge result has no model continuation, so its JSON cannot prove that a model
+saw the image.
 
 `queue.add`'s `until?:any` reads moment strings, including relative moments, and
 `{at:"<ISO time>"}` objects as times, alongside completion words and `standing`.

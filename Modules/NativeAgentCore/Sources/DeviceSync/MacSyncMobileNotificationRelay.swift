@@ -251,22 +251,18 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     }
 
     @discardableResult
-    /// Callers owning this event's prediction set predictDelivery false so a single notification cannot count twice.
     public func sendNotification(
         title: String,
         subtitle: String? = nil,
         body: String,
-        userInfo: [String: String] = [:],
-        predictDelivery: Bool = true
+        userInfo: [String: String] = [:]
     ) async throws -> MobileNotificationDeliveryReceipt {
         guard !Task.isCancelled else {
             throw NotificationDeliveryFailure(.notDelivered(reason: "cancelled before dispatch"), "cancelled before dispatch")
         }
         let notificationTitle = NativeAgentNotificationDefaults.title(title)
         let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
-        if predictDelivery {
-            await beginDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
-        }
+        await beginDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
         do {
             return try await sendSignedNotification(title: notificationTitle, subtitle: subtitle, body: body,
                                                     userInfo: userInfo, eventID: eventID)
@@ -281,9 +277,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             // Unreadable or conflicting retained intent may describe an earlier effect; preserve that uncertainty.
             throw NotificationDeliveryFailure(.unknown(sent: true, reason: failure.localizedDescription), failure.localizedDescription)
         } catch {
-            if predictDelivery {
-                await failDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
-            }
+            await failDeliveryPrediction(eventID: eventID, source: userInfo["source"] ?? "notification")
             throw NotificationDeliveryFailure(.notDelivered(reason: error.localizedDescription), error.localizedDescription)
         }
     }
@@ -300,7 +294,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         if let subtitle = publication.subtitle { metadata["subtitle"] = subtitle }
         for (key, value) in publication.userInfo { metadata["userInfo.\(key)"] = value }
         let message = try await sync.bridge.sendChatMessage(
-            text: publication.body, metadata: metadata, messageID: eventID, timestamp: publication.timestamp
+            text: publication.body, metadata: metadata, messageID: eventID, timestamp: publication.timestamp,
+            bindNotificationPairing: publication.bindsReplyPairing == true
         )
         let push = await sync.apns.sendNotificationWake(userInfo: publication.userInfo, dataRoot: sync.dataRoot)
         let signedResult = userInfo["source"] == "requested_result"
@@ -316,6 +311,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         let body: String
         let userInfo: [String: String]
         let timestamp: Date
+        // Existing events keep the signed payload shape used for exact replay.
+        let bindsReplyPairing: Bool?
     }
 
     /// Retain intent and time before sending; timeout, restart and concurrency must reuse them, while unreadable bytes remain failures.
@@ -327,7 +324,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 let data: Data
                 do { data = try Data(contentsOf: path) }
                 catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-                    let publication = NotificationPublication(title: title, subtitle: subtitle, body: body, userInfo: userInfo, timestamp: timestamp)
+                    let publication = NotificationPublication(title: title, subtitle: subtitle, body: body, userInfo: userInfo,
+                                                               timestamp: timestamp, bindsReplyPairing: true)
                     try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONEncoder().encode(publication), to: path)
                     return publication
                 }
@@ -444,9 +442,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         correlationID: String,
         kind: String
     ) -> ICloudReplyPushNotificationPreparation {
-        let cleanText = NativeAppSecretRedactor.redactText(
-            String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
-        )
+        // Redact before the cut, so a key split at 500 characters never reaches the phone as a fragment.
+        let cleanText = String(NativeAppSecretRedactor.redactText(text.trimmingCharacters(in: .whitespacesAndNewlines)).prefix(500))
         guard !cleanText.isEmpty else { return .rejected(reason: "empty_reply_text") }
         let cleanCorrelationID = correlationID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanCorrelationID.isEmpty else { return .rejected(reason: "missing_correlation_id") }

@@ -59,29 +59,18 @@ extension View {
 
     /// Owner reads run only in mounted pages; captures consume their prepared frame.
     func quietReadTask(
-        live: Bool = true,
         @_inheritActorContext _ action: @escaping @Sendable () async -> Void
     ) -> some View {
-        modifier(QuietReadTaskModifier(id: 0, live: live, action: action))
-    }
-
-    func quietReadTask<ID: Equatable>(
-        id: ID,
-        live: Bool = true,
-        @_inheritActorContext _ action: @escaping @Sendable () async -> Void
-    ) -> some View {
-        modifier(QuietReadTaskModifier(id: id, live: live, action: action))
+        modifier(QuietReadTaskModifier(action: action))
     }
 }
 
-private struct QuietReadTaskModifier<ID: Equatable>: ViewModifier {
+private struct QuietReadTaskModifier: ViewModifier {
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    let id: ID
-    let live: Bool
     let action: @Sendable () async -> Void
     func body(content: Content) -> some View {
-        content.task(id: id) {
-            guard !quietOffscreenRead, live else { return }
+        content.task(id: 0) {
+            guard !quietOffscreenRead else { return }
             await action()
         }
     }
@@ -148,7 +137,7 @@ enum QuietSelfAdminRender {
         }
         let capture = QuietCaptureSession(pane: drawsPane ? request.workPane : nil,
             session: page.item == .chat ? appModel.activeChatSessionId : nil, reader: request.reader,
-            page: page.item == .chat ? nil : ShellPageContent.doorPage(page.item) ?? page.id)
+            page: page.item == .chat ? nil : SidebarItem.doorPage(page.item) ?? page.id)
         defer { capture.close() }
         return try await withTaskCancellationHandler {
             try await capture.prepare(appModel: appModel, size: size)
@@ -221,7 +210,7 @@ enum QuietSelfAdminRender {
             present = present && appModel.face.slot(.sessions).value(as: SessionListFace.self) != nil
                 && appModel.face.slot(.sessionNavigation).value(as: SessionNavigationFace.self) != nil
         } else {
-            let owner = ShellPageContent.doorPage(page.item) ?? page.id
+            let owner = SidebarItem.doorPage(page.item) ?? page.id
             present = present && appModel.face.slot(.page(owner)).value(as: PartFaceSnapshot.self) != nil
         }
         switch (page.item, tab) {
@@ -331,30 +320,17 @@ enum QuietPages {
         return own(appModel, ids: [key]).first
     }
 
-    /// The page the window draws for a rail item, as the door names it (`ShellPageContent.doorPage`); nil for a page of the agent's own,
+    /// The page the window draws for a rail item, as the door names it (`SidebarItem.doorPage`); nil for a page of the agent's own,
     /// which the selection names by its id.
     @MainActor static func shown(_ item: SidebarItem) -> QuietPage? {
-        ShellPageContent.doorPage(item).flatMap(page(named:))
+        SidebarItem.doorPage(item).flatMap(page(named:))
     }
 
     /// Only the requested page titles are observed; the catalog supplies claim and inventory availability.
     @MainActor static func own(_ appModel: AppModel, ids: Set<String>) -> [QuietPage] {
         guard let catalog = appModel.face.slot(PageFaceKey.catalog).value(as: PartFaceCatalog.self) else { return [] }
-        return descriptions(catalog, ids: ids) { appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self) }
-    }
-
-    private static func descriptions(_ catalog: PartFaceCatalog, ids: Set<String>,
-                                     snapshot: (String) -> PartFaceSnapshot?) -> [QuietPage] {
-        catalog.claims.filter { ids.contains($0.key) }.sorted { $0.key < $1.key }.map { id, claim in
-            let title = snapshot(id)?.face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? id
-            let summary: String
-            if let failure = catalog.failure { summary = failure.message } else {
-                switch claim {
-                case .success(let part): summary = "A page of the agent's own, drawn by its part \(part) from that part's notebook."
-                case .failure(let failure): summary = failure.message
-                }
-            }
-            return QuietPage(value: QuietToolPage(id: id, title: title, summary: summary))
-        }
+        return QuietToolPage.descriptions(catalog, ids: ids) {
+            appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self)
+        }.map(QuietPage.init)
     }
 }

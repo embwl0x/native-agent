@@ -190,8 +190,8 @@ public struct ClockWork: Sendable {
     // MARK: - A proactive scan
 
     public func scan(id: String, payload: [String: JSONValue], seen: [String]) async throws -> [String] {
-        let scan = try await NativeAgentScheduledProactiveScan.evaluate(dataRoot: root, payload: payload, seen: seen)
-        for opportunity in scan.surfaced {
+        let surfaced = try await NativeAgentScheduledProactiveScan.evaluate(dataRoot: root, payload: payload, seen: seen)
+        for opportunity in surfaced {
             guard await SenseNewsBoard.shared.post(SenseNews(senseID: "proactive_scan", version: 1,
                 address: "Proactive scan (scheduled \(id))",
                 summary: "\(opportunity.title)\n\(opportunity.summary)\n\(opportunity.detail)",
@@ -202,7 +202,7 @@ public struct ClockWork: Sendable {
                 ])
             }
         }
-        return seen + scan.surfaced.map(\.id)
+        return seen + surfaced.map(\.id)
     }
 
     // MARK: - Telling

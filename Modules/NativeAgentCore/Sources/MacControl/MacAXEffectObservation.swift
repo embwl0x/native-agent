@@ -2,9 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
 
 // Blueprint: | `MacAXEffectObservation.swift` | `MacAXEffectObserverSource`: Payload-free signals; bounded waits and lane-owned cleanup |
 
@@ -127,7 +125,6 @@ public final class MacAXEffectCollector: @unchecked Sendable {
 
 // MARK: - The live observer
 
-#if canImport(ApplicationServices) && os(macOS)
 
 /// The registration retains the callback refcon until stop releases it exactly once.
 private final class MacAXEffectObserverBox {
@@ -225,22 +222,7 @@ public struct SystemMacAXEffectObserverSource: MacAXEffectObserverSource {
     }
 }
 
-#endif
-
-/// Return nil so unsupported platforms report observer_unavailable rather than claim no effect.
-public struct UnavailableMacAXEffectObserverSource: MacAXEffectObserverSource {
-    public init() {}
-    public func install(
-        pid: Int32,
-        kinds: [String],
-        onNotification: @escaping @Sendable (MacAXEffectNotification) -> Void
-    ) -> (any MacAXEffectObservation)? { nil }
-}
 
 public func defaultMacAXEffectObserverSource() -> any MacAXEffectObserverSource {
-    #if canImport(ApplicationServices) && os(macOS)
     return SystemMacAXEffectObserverSource()
-    #else
-    return UnavailableMacAXEffectObserverSource()
-    #endif
 }

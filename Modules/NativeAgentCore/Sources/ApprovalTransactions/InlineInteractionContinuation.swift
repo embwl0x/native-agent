@@ -138,6 +138,7 @@ extension InlineInteractionResolver {
                     $0.revision == interaction.revision
                         && ($0.continuation?.state == .claimed || $0.continuation?.state == .replaying)
                 })
+                await releaseAfterCardWithoutContinuation(terminal, dataRoot: dataRoot)
                 if let landedHandBack { handBacks[interaction.id] = landedHandBack }
                 return landedResult
             } catch {
@@ -311,86 +312,6 @@ extension InlineInteractionResolver {
             }
         }
         return settled
-    }
-    /// Reclaim only same-life work stranded by process exit. Cross-life reads are stopped, so conversation open cannot replay a restored card.
-    public static func reclaimStrandedContinuations(
-        sessionID: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
-        guard !reclaimedSessions.contains(sessionID) else { return }
-        // What launch could not read or settle is settled here, the same way; a card it settled is already stopped.
-        var reconciled = await settleInterrupted(sessionID: sessionID, dataRoot: dataRoot)
-        let read: (rows: [JSONValue], lifeID: String)
-        do {
-            read = try await checkedRows(sessionID, dataRoot)
-        } catch {
-            return
-        }
-        // Mark the session only after its checked read and mutations succeed.
-        let pairs = await Task.detached { interactionsByRow(in: read.rows, lifeID: read.lifeID) }.value
-        for (_, interaction) in pairs {
-            // A running control is its live owner's, or one the departed process left that `settleInterrupted` could not settle (retried on the
-            // next open). A card waiting on macOS held nothing there: this launch's GrantWatch resumes its walk at the item it recorded.
-            if case .running = interaction.state, interaction.waitingOn == nil { continue }
-            // Mid-dispatch/admission has an unknown outcome; only the person retries.
-            if interaction.continuation?.state == .replaying,
-               resumesInFlight[interaction.id] == nil {
-                var released = interaction
-                released.continuation?.state = .waiting
-                released.revision += 1
-                let continuation = interaction.continuation
-                let pendingCall: String? =
-                    continuation?.mode == .retryBlockedTool && continuation?.replayedAt == nil
-                    ? continuation?.toolName
-                    : nil
-                let reason = pendingCall.map {
-                        "The app closed while the \($0) call was running. "
-                            + "I can't tell whether that ran. Check, then Try again."
-                    } ?? "I can't tell whether that resumed. Try again."
-                released.continuation?.reason = reason
-                let stranded = released.state.outcome != nil || released.state == .declined ? released : released.failed(reason: reason)
-                do {
-                    try await persist(
-                        stranded, sessionID: sessionID, ifRevision: interaction.revision,
-                        dataRoot: dataRoot,
-                        expecting: { $0.continuation?.state == interaction.continuation?.state }
-                    )
-                } catch {
-                    reconciled = false
-                }
-                continue
-            }
-            if interaction.continuation?.state == .waiting {
-                switch interaction.state {
-                case .settled, .declined:
-                    if interaction.continuationFailure == nil {
-                        await resumeOnce(interaction, sessionID: sessionID, dataRoot: dataRoot, turn: nil)
-                    }
-                default:
-                    break
-                }
-                continue
-            }
-            guard interaction.continuation?.state == .claimed,
-                  resumesInFlight[interaction.id] == nil
-            else { continue }
-            var released = interaction
-            released.continuation?.state = .waiting
-            released.revision += 1
-            do {
-                try await persist(
-                    released, sessionID: sessionID, ifRevision: interaction.revision,
-                    dataRoot: dataRoot,
-                    expecting: { $0.continuation?.state == interaction.continuation?.state }
-                )
-            } catch {
-                // A release that did not land cannot resume.
-                reconciled = false
-                continue
-            }
-            await resumeOnce(released, sessionID: sessionID, dataRoot: dataRoot, turn: nil)
-        }
-        if reconciled { reclaimedSessions.insert(sessionID) }
     }
     /// Continuations quote the settled outcome as data so it cannot become instructions or another ask.
     public static func continuationPrompt(

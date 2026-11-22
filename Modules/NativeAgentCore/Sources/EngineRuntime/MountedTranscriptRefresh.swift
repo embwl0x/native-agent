@@ -23,14 +23,6 @@ import ChatTurnContracts
 import ChatToolParsing
 // Blueprint: | `MountedTranscriptRefresh.swift` | Mounted conversations read the store when it publishes; no turn refreshes a view |
 extension NativeAgentEngine {
-    /// Read on store publication, never a turn request; live rows overlay saved rows until the store accepts them.
-    @MainActor
-    public func readMountedTranscript(sessionId: String, failure: (Error) -> Void) async {
-        guard !sessionId.isEmpty else { return }
-        do { try await transcripts.refreshMessages(sessionId: sessionId) } catch { failure(error) }
-    }
-}
-extension NativeAgentEngine {
     @MainActor
     public func loadDetachedSessionMessages(
         _ sessionId: String, finished: ([String]) -> Void

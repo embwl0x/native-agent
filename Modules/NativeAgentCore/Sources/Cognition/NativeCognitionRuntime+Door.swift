@@ -467,10 +467,12 @@ extension NativeCognitionRuntime {
         let corrected = context.careWakes.isEmpty && context.event.sourceClass != .imported && interpretation.memories.contains(where: {
             $0.kind == "correction" && $0.action != .skip && $0.confidence >= MemoryManagerLane.confidenceFloor
         })
+        // A mind fold that did not save (an appraisal failed) folds no body either: the retry folds both, so the body never lives half a turn.
+        guard mind.saved else { return false }
         let bodySaved = await foldBody(OrganismTurnFold(
             seq: seq, epoch: context.bodyEpoch, caring: mind.caring, caringWindow: mind.caringWindow,
             caringWhy: mind.caringWhy, reaction: reaction, correctionConfidence: corrected ? 0.03 : 0))
-        guard mind.saved && bodySaved else { return false }
+        guard bodySaved else { return false }
         row.input?.folded = seq
         do {
             try await cognitiveStore.saveMoment(row)
@@ -507,7 +509,7 @@ extension NativeCognitionRuntime {
                                                        outcome: caring, tendernessAfter: await tenderness())
             }
         }
-        cachedBodyRead = nil
+        bodyReadOrder.write { cachedBodyRead = nil }
         let saved = await persistOrganismContinuity(reason: "lived moment")
         await substrate.adoptRecentDoses(await organismKernel.recentDoses())
         publishRuntimeChange(reason: "after_turn_interpretation")

@@ -62,7 +62,6 @@ public struct CodexCompletionLifecycle: Sendable {
         var retrySafe: Bool
         var phase: ArtifactPhase
         var ownerInstanceId: String
-        var attemptID: String? = nil
         var detail: String?
         var updatedAt: String
     }
@@ -318,16 +317,6 @@ public struct CodexCompletionLifecycle: Sendable {
         return reconciled.sorted()
     }
 
-    /// Verdict reads cannot reconcile or write projections.
-    public func savedDelivery(deliveryId: String, requestDigest: String) async throws -> AgentBridgeCompletionDelivery? {
-        let path = stateURL(deliveryId)
-        return try await SwiftNativePersistenceCore.withFileLock(path) {
-            guard let state = try await loadState(path) else { throw LifecycleError.claimMissing }
-            guard state.requestDigest == requestDigest else { throw LifecycleError.requestConflict }
-            return state.delivery
-        }
-    }
-
     /// Read/recover one accepted return without admitting work. A recovered partial remains stopped, never owed for delivery.
     func attentionReturnState(_ batch: Attention.Batch) async throws -> Attention.BatchEnd.Status? {
         let path = stateURL(batch.deliveryID)
@@ -383,19 +372,6 @@ public struct CodexCompletionLifecycle: Sendable {
             delivery: "transcript", artifactCount: state.artifacts.values.filter { $0.phase == .accepted }.count,
             attempts: state.delivery?.attempts ?? 0, reason: state.detail)
         state.updatedAt = Self.nowISO()
-    }
-
-    /// Older attention claims predate batch rows. The caller records their existing route grouping once; no claim is replayed.
-    func attentionReturns(in session: String, excluding recorded: Set<String>) async throws -> [(id: String, digest: String)] {
-        var claims: [(String, String)] = []
-        let recordedFiles = Set(recorded.map { stateURL($0).lastPathComponent })
-        for path in try stateURLs() where !recordedFiles.contains(path.lastPathComponent) {
-            guard let state = try await loadState(path), state.source == Attention.stream, state.sessionId == session,
-                  state.deliveryId.hasPrefix("return:happening:"),
-                  state.phase != .settled || !["completed", "let_go"].contains(state.delivery?.status ?? "") else { continue }
-            claims.append((state.deliveryId, state.requestDigest))
-        }
-        return claims
     }
 
     public func reconciliationRows() async throws -> [(id: String, digest: String, status: String, response: ChatResponse?,

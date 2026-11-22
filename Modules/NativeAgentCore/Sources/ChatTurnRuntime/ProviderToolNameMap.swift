@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 
@@ -61,7 +62,7 @@ struct ProviderToolNameMap: Sendable {
         name = name.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
         if name.isEmpty { name = "tool" }
         if name.count > 128 {
-            let suffix = String(fnv1a64(internalName), radix: 16)
+            let suffix = String(StableHash.fnv1a64(internalName), radix: 16)
             let prefixLength = max(1, 128 - suffix.count - 1)
             name = "\(String(name.prefix(prefixLength)))_\(suffix)"
         }
@@ -75,7 +76,7 @@ struct ProviderToolNameMap: Sendable {
             return base
         }
 
-        let suffix = String(fnv1a64(internalName), radix: 16)
+        let suffix = String(StableHash.fnv1a64(internalName), radix: 16)
         let prefixLength = max(1, 128 - suffix.count - 1)
         var candidate = "\(String(base.prefix(prefixLength)))_\(suffix)"
         var attempt = 2

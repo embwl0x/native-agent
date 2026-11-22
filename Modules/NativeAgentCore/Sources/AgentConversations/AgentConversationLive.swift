@@ -6,7 +6,7 @@ import PersistenceCore
 // Blueprint: | `AgentConversationLive.swift` | `AgentConversationLive`, `projection` |
 
 /// Progress is display-only, never reply or settlement evidence. Keep partials outside conversations.json: frequent writes there would repeatedly wake the
-/// runner and screen. Wake helpers know message IDs, so their keys differ from conversation record IDs.
+/// runner and screen. Retained wake-helper entries are keyed by message ID.
 public struct AgentConversationLive: Codable, Sendable, Equatable {
     public var key: String
     public var recordID: String?
@@ -34,17 +34,9 @@ public struct AgentConversationLiveTarget: Sendable, Hashable {
     public let recordID: String?
     public let operationID: String?
     public let agent: String
-    public let messageID: String?
 
     public static func record(_ row: AgentConversationRecord, dataRoot: URL) -> Self {
-        .init(dataRoot: dataRoot, key: row.id, recordID: row.id, operationID: row.operationID,
-              agent: row.agent, messageID: nil)
-    }
-
-    /// Wake helpers know the accepted message ID, not the conversation record.
-    public static func message(agent: String, messageID: String, dataRoot: URL) -> Self {
-        .init(dataRoot: dataRoot, key: messageKey(agent: agent, messageID: messageID), recordID: nil,
-              operationID: nil, agent: agent, messageID: messageID)
+        .init(dataRoot: dataRoot, key: row.id, recordID: row.id, operationID: row.operationID, agent: row.agent)
     }
 
     static func messageKey(agent: String, messageID: String) -> String { agent + ":" + messageID.lowercased() }
@@ -73,7 +65,7 @@ public actor AgentConversationLiveHub {
                       state: String = "working", note: String? = nil) {
         let now = Date()
         entries[target.key] = (AgentConversationLive(key: target.key, recordID: target.recordID,
-            operationID: target.operationID, agent: target.agent, messageID: target.messageID, lane: lane,
+            operationID: target.operationID, agent: target.agent, messageID: nil, lane: lane,
             state: state, streams: streams, startedAt: now, lastActivityAt: now, partial: nil, partialChars: 0,
             partialTruncated: false, note: note, finishedAt: nil), target.dataRoot)
         schedule(target.key, now: true)
@@ -211,7 +203,7 @@ public struct AgentConversationLiveStore: Sendable {
         return try decoder.decode([String: AgentConversationLive].self, from: data)
     }
 
-    /// Prefer the wake helper’s message-level entry because it observes the send more closely.
+    /// Prefer a retained message-level entry when one matches the send.
     public func current(for row: AgentConversationRecord) throws -> AgentConversationLive? {
         guard ["sending", "waiting"].contains(row.phase) else { return nil }
         return try Self.current(for: row, in: all())

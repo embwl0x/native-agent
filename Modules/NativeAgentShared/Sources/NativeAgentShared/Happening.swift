@@ -32,6 +32,8 @@ public struct Happening: Codable, Sendable, Equatable {
     public var elevated: [String]?
     /// Material the thought shows beside the line, quoted (a habit's receipt, an organ to grow). Never drawn on a face.
     public var shows: String?
+    /// The full material of a return at the display limit, where the excerpt alone cannot prove what it carried.
+    public private(set) var showsDigest: String?
     /// Identity of the watch that produced this news; absent when the source supplies none.
     public var watch: String?
 
@@ -43,7 +45,9 @@ public struct Happening: Codable, Sendable, Equatable {
         self.words = String(words.prefix(Self.wordsLimit)); self.once = once; self.signal = signal
         self.care = care; self.moved = moved.flatMap { $0.isFinite ? $0 : nil }; self.open = open; self.route = route; self.reply = reply
         self.peers = peers.flatMap { $0.isEmpty ? nil : $0 }; self.elevated = elevated.flatMap { $0.isEmpty ? nil : $0 }
-        self.shows = shows.map { String($0.prefix(Self.showsLimit)) }
+        let excerpt = shows.map { String($0.prefix(Self.showsLimit)) }
+        self.shows = excerpt
+        self.showsDigest = kind == .returned && excerpt?.count == Self.showsLimit ? shows.map(SHA256Hex.of(utf8:)) : nil
         self.watch = watch
     }
 

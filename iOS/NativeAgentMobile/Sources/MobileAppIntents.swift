@@ -36,13 +36,14 @@ struct MobileAskIntent: AppIntent {
     static var parameterSummary: some ParameterSummary { Summary("Ask \(\.$agent) \(\.$message)") }
 
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
+        let agent = self.agent
         try await MobileIntentRuntime.validate(agent)
         let reply: String
         if #available(iOS 27, *) {
             reply = try await performBackgroundTask {
-                try await MobileIntentRuntime.reply(to: message)
+                try await MobileIntentRuntime.reply(to: message, expectedPairing: agent.id)
             }
-        } else { reply = try await MobileIntentRuntime.reply(to: message) }
+        } else { reply = try await MobileIntentRuntime.reply(to: message, expectedPairing: agent.id) }
         return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }
 }
@@ -58,6 +59,7 @@ struct MobileRememberIntent: AppIntent {
     static var parameterSummary: some ParameterSummary { Summary("Tell \(\.$agent) to remember \(\.$note)") }
 
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
+        let agent = self.agent
         try await MobileIntentRuntime.validate(agent)
         guard !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw $note.needsValueError("Enter a memory note.")
@@ -66,9 +68,9 @@ struct MobileRememberIntent: AppIntent {
         let reply: String
         if #available(iOS 27, *) {
             reply = try await performBackgroundTask {
-                try await MobileIntentRuntime.reply(to: text)
+                try await MobileIntentRuntime.reply(to: text, expectedPairing: agent.id)
             }
-        } else { reply = try await MobileIntentRuntime.reply(to: text) }
+        } else { reply = try await MobileIntentRuntime.reply(to: text, expectedPairing: agent.id) }
         return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }
 }

@@ -99,8 +99,7 @@ enum ConversationPrefixSeeding {
         }
         var measurement: SessionContextRequest {
             get throws { try SessionContextRequest(messages: messages, system: system, tools: tools ?? [],
-                historyCharacters: LLMMessage.inputCharacters(seed.context.historyMessages, system: nil, tools: []),
-                rowCharacters: seed.context.historyRowCharacters) }
+                historyCharacters: LLMMessage.inputCharacters(seed.context.historyMessages, system: nil, tools: [])) }
         }
     }
 
@@ -118,7 +117,7 @@ enum ConversationPrefixSeeding {
     }
 
     /// The request and its count leave the same builder, after codec layout.
-    static func request(_ context: TurnContext, codec: ToolCallCodec, turn: Turn?) throws -> Request {
+    static func request(_ context: TurnContext, codec: ToolCallCodec) throws -> Request {
         let seed = seed(context, textToolCatalogAppendix: codec == .textMarkers
             ? try TextMarkerCodec.volatileCatalogAppendix(for: context) : nil)
         let layout = codec == .textMarkers

@@ -57,10 +57,6 @@ public struct InboxRelatedGroup: Identifiable, Codable, Hashable, Sendable {
         Set(item_ids ?? [])
     }
 
-    public var displayCount: Int {
-        max(count, item_ids?.count ?? 0)
-    }
-
     public func matches(itemID: String, title itemTitle: String) -> Bool {
         if itemID == id { return false }
         let ids = itemIDs

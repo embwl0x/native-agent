@@ -14,7 +14,6 @@ import PersonaEngine
 import StandingBots
 import ProviderRouting
 import Darwin
-import CryptoKit
 import MemoryV2
 import Dispatcher
 import MacControl
@@ -31,80 +30,147 @@ extension SwiftToolDispatcher {
         if let failure = row.installation.failure { throw failure }
         let recipe = AgentRecipeStore.recipe(row.id)
         if invocation.dryRun {
-            var result: [String: JSONValue] = ["status": .string("failed"), "dry_run": .bool(true),
-                "agent": .string("peer:" + contact.id), "transport": .string("mcpHost"), "host": .string(row.id),
-                "sent": .bool(false), "ran": .bool(false), "completed": .bool(false),
-                "command": .string(line.executable),
-                "arguments": .array((resuming ? line.continuation : line.arguments).map(JSONValue.string)),
-                "checked": .array([.string("commandLine.executable"), .string("commandLine.arguments")])]
-            guard let executable = row.resolveExecutable(line.executable) else {
-                result["detail"] = .string("""
-                    \(row.displayName)'s readiness check failed: \(line.executable) could not be resolved to a runnable file; no prompt was sent.
-                    """)
-                return .object(result)
-            }
-            result["executable"] = .string(executable)
-            if line.minimumVersion != nil, let tooOld = line.versionFailure(program: line.executable,
-                reported: try await AgentACPExecutable.capture(path: executable).reported(environment: row.installation.launchEnvironment())) {
-                result["detail"] = .string("\(row.displayName)'s readiness check failed: \(tooOld)")
-                return .object(result)
-            }
-            guard let recipe else {
-                result["detail"] = .string("\(row.displayName)'s recipe is unavailable; no prompt was sent.")
-                return .object(result)
-            }
-            do {
-                let learned = try (recipe.host == row ? recipe : AgentRecipeStore.learn(recipe, host: row))
-                result["recipe_version"] = .int(Int64(learned.recipeVersion))
-                result["status"] = .string("passed")
-                result["detail"] = .string("\(row.displayName) answered its readiness check: \(executable) is runnable; no prompt was sent.")
-            } catch {
-                result["detail"] = .string("\(row.displayName)'s readiness check could not be recorded in its recipe: \(error). No prompt was sent.")
-            }
-            return .object(result)
+            return try await hostCommandReadiness(row: row, contact: contact, line: line, recipe: recipe, resuming: resuming)
         }
         let access = try await fullMacToolAccess(turn: turn, surface: surface)
-        guard access.fileOpsAllowed else {
-            let refusal = builderFullMacRequired(invocation: invocation, tool: "agent_message")
-            let reply = ToolResult(refusal)
-            var value: [String: JSONValue] = [:]
-            if case .object(let fields) = refusal { value = fields }
-            if reply.said("failed"), reply.status == value["status"]?.stringValue {
-                value["status"] = .string("blocked_by_trust")
-            }
-            let mode = access.permissionLevel == "balanced" ? "Work mode" : "the current trust mode"
-            value["reason"] = .string("trust_center_full_mac_required")
-            value["sent"] = .bool(false)
-            value["ran"] = .bool(false)
-            value["completed"] = .bool(false)
-            value["detail"] = .string(probe
-                ? """
-                    The entry is written, but I couldn't check the link in \(mode) because running that agent here needs Builder or Full Mac; \
-                    switch in Trust or the composer and say connect again, or use the connection from the other agent's side.
-                    """
-                : """
-                    I didn't send the message in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer \
-                    and ask me to send it again, or use the connection from the other agent's side.
-                    """)
-            if probe {
-                value["connection_check"] = .bool(true)
-                value["connection_reply_received"] = .bool(false)
-            }
-            return .object(value)
+        guard access.fileOpsAllowed else { return hostCommandTrustRefusal(invocation: invocation, access: access, probe: probe) }
+        let run: HostCommandRun
+        switch try await prepareHostCommand(turn: turn, invocation: invocation, row: row, contact: contact, line: line, message: message,
+                                            session: session, resuming: resuming, store: store, surface: surface, probe: probe, recipe: recipe) {
+        case .refused(let refusal): return refusal
+        case .ready(let prepared): run = prepared
         }
+        let (outcome, streamed, linesIn) = await runHostCommand(turn: turn, invocation: invocation, run: run)
+        return await settle {
+            let commandReply = ToolResult(outcome)
+            defer {
+                try? FileManager.default.removeItem(at: run.replyDirectory)
+                if let probeNonce = run.probeNonce {
+                    do { _ = try run.store.finishConnectionProbe(peerID: run.contact.id, nonce: probeNonce, ran: false,
+                        workspace: run.workingDirectory.path) }
+                    catch { run.store.recordEvidenceFailure(peerID: run.contact.id, operation: "connection-probe", error: error) }
+                }
+            }
+            linesIn.finish()
+            let streamedStdout = await streamed?.value
+            guard case .object(var envelope) = outcome else { return outcome }
+            if let streamedStdout { envelope["stdout"] = .string(streamedStdout) }
+            let stdout = envelope["stdout"]?.stringValue
+            let parsed = run.line.interpretOutput(stdout: stdout ?? "", expected: run.resuming ? run.session : nil)
+            let (reply, truncated, replyFailure) = Self.readHostCommandReply(run, stdout: stdout, envelope: envelope, parsedReply: parsed.reply)
+            return Self.hostCommandReceipt(run, commandReply: commandReply, envelope: envelope, parsed: parsed,
+                                           reply: reply, truncated: truncated, replyFailure: replyFailure)
+        }
+    }
+
+    /// One prepared command run: who it reaches, the approved program and its launch, and the directories its settlement releases.
+    private struct HostCommandRun: Sendable {
+        let row: AgentHostRow
+        let contact: AgentPeerContact
+        let store: AgentPeerStore
+        let line: AgentHostCommandLine
+        let agent: String
+        let session: String?
+        let resuming: Bool
+        let probe: Bool
+        let recipe: AgentRecipeStore.Recipe?
+        let executable: String
+        let environment: [String: String]
+        let workingDirectory: URL
+        let replyDirectory: URL
+        let replyFile: String?
+        let probeNonce: String?
+        let argv: [String]
+    }
+
+    private enum HostCommandLaunch {
+        case refused(JSONValue)
+        case ready(HostCommandRun)
+    }
+
+    /// A dry run checks the executable, its version and the recipe; no prompt is sent.
+    private func hostCommandReadiness(row: AgentHostRow, contact: AgentPeerContact, line: AgentHostCommandLine,
+                                      recipe: AgentRecipeStore.Recipe?, resuming: Bool) async throws -> JSONValue {
+        var result: [String: JSONValue] = ["status": .string("failed"), "dry_run": .bool(true),
+            "agent": .string("peer:" + contact.id), "transport": .string("mcpHost"), "host": .string(row.id),
+            "sent": .bool(false), "ran": .bool(false), "completed": .bool(false),
+            "command": .string(line.executable),
+            "arguments": .array((resuming ? line.continuation : line.arguments).map(JSONValue.string)),
+            "checked": .array([.string("commandLine.executable"), .string("commandLine.arguments")])]
+        guard let executable = row.resolveExecutable(line.executable) else {
+            result["detail"] = .string("""
+                \(row.displayName)'s readiness check failed: \(line.executable) could not be resolved to a runnable file; no prompt was sent.
+                """)
+            return .object(result)
+        }
+        result["executable"] = .string(executable)
+        if line.minimumVersion != nil, let tooOld = line.versionFailure(program: line.executable,
+            reported: try await AgentACPExecutable.capture(path: executable).reported(environment: row.installation.launchEnvironment())) {
+            result["detail"] = .string("\(row.displayName)'s readiness check failed: \(tooOld)")
+            return .object(result)
+        }
+        guard let recipe else {
+            result["detail"] = .string("\(row.displayName)'s recipe is unavailable; no prompt was sent.")
+            return .object(result)
+        }
+        do {
+            let learned = try (recipe.host == row ? recipe : AgentRecipeStore.learn(recipe, host: row))
+            result["recipe_version"] = .int(Int64(learned.recipeVersion))
+            result["status"] = .string("passed")
+            result["detail"] = .string("\(row.displayName) answered its readiness check: \(executable) is runnable; no prompt was sent.")
+        } catch {
+            result["detail"] = .string("\(row.displayName)'s readiness check could not be recorded in its recipe: \(error). No prompt was sent.")
+        }
+        return .object(result)
+    }
+
+    /// Running another agent's command line needs Builder or Full Mac; nothing is sent or run without it.
+    private func hostCommandTrustRefusal(invocation: ChatToolInvocation, access: FullMacToolAccess, probe: Bool) -> JSONValue {
+        let refusal = builderFullMacRequired(invocation: invocation, tool: "agent_message")
+        let reply = ToolResult(refusal)
+        var value: [String: JSONValue] = [:]
+        if case .object(let fields) = refusal { value = fields }
+        if reply.said("failed"), reply.status == value["status"]?.stringValue {
+            value["status"] = .string("blocked_by_trust")
+        }
+        let mode = access.permissionLevel == "balanced" ? "Work mode" : "the current trust mode"
+        value["reason"] = .string("trust_center_full_mac_required")
+        value["sent"] = .bool(false)
+        value["ran"] = .bool(false)
+        value["completed"] = .bool(false)
+        value["detail"] = .string(probe
+            ? """
+                The entry is written, but I couldn't check the link in \(mode) because running that agent here needs Builder or Full Mac; \
+                switch in Trust or the composer and say connect again, or use the connection from the other agent's side.
+                """
+            : """
+                I didn't send the message in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer \
+                and ask me to send it again, or use the connection from the other agent's side.
+                """)
+        if probe {
+            value["connection_check"] = .bool(true)
+            value["connection_reply_received"] = .bool(false)
+        }
+        return .object(value)
+    }
+
+    /// The approved launch, its recorded version, the conversation's label, this run's workspace and reply directory, a probe's nonce and argv.
+    private func prepareHostCommand(turn: Turn, invocation: ChatToolInvocation, row: AgentHostRow, contact: AgentPeerContact,
+                                    line: AgentHostCommandLine, message: String, session: String?, resuming: Bool, store: AgentPeerStore,
+                                    surface: String, probe: Bool, recipe: AgentRecipeStore.Recipe?) async throws -> HostCommandLaunch {
         let agent = "peer:" + contact.id
-        func honest(_ status: String, _ detail: String) -> JSONValue {
+        func honest(_ status: String, _ detail: String) -> HostCommandLaunch {
             store.recordUnavailable(peerID: contact.id)
             var value: [String: JSONValue] = ["status": .string(status), "agent": .string(agent), "transport": .string("mcpHost"),
                      "host": .string(row.id), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail)]
             value.merge(Self.checkedPeerReadout(contact.id, store: store).fields) { _, current in current }
-            return .object(value)
+            return .refused(.object(value))
         }
         // Every command route reconciles its binding, including those without permission flags.
         let launch: DrivenAgentLaunch.Program
         switch await Self.drivenAgentLaunch(turn: turn, surface: surface, contact: contact,
                                            name: row.displayName, dataRoot: dataRoot) {
-        case .refused(let refusal): return refusal
+        case .refused(let refusal): return .refused(refusal)
         case .admitted(let program): launch = program
         }
         let executable = launch.executable
@@ -161,6 +227,15 @@ extension SwiftToolDispatcher {
             let agentName = PersonaCompiler.agentDisplayName(dataRoot: dataRoot)
             return (["NativeAgent"] + (agentName == "NativeAgent" ? [] : [agentName]) + [conversationLabel]).joined(separator: " · ")
         }
+        return .ready(HostCommandRun(row: row, contact: contact, store: store, line: line, agent: agent, session: session, resuming: resuming,
+            probe: probe, recipe: recipe, executable: executable, environment: environment, workingDirectory: workingDirectory,
+            replyDirectory: replyDirectory, replyFile: replyFile, probeNonce: probeNonce, argv: argv))
+    }
+
+    /// Runs the command once with closed stdin and a scrubbed environment, streaming its protocol lines to the live view as they arrive.
+    private func runHostCommand(turn: Turn, invocation: ChatToolInvocation, run: HostCommandRun) async
+        -> (outcome: JSONValue, streamed: Task<String, Never>?, linesIn: AsyncStream<String>.Continuation) {
+        let line = run.line
         // Retain bounded protocol output before the runner clips stdout for display; streaming events also reach the live view as they arrive.
         let (lines, linesIn) = AsyncStream<String>.makeStream()
         let streamed: Task<String, Never>? = line.stream != nil || line.jsonResultReply ? Task { [line, invocation] in
@@ -190,186 +265,186 @@ extension SwiftToolDispatcher {
         let onStdoutLine: (@Sendable (String) -> Void)? = streamed == nil ? nil : { @Sendable in _ = linesIn.yield($0) }
         let outcome = await Self.runShellLikeProcess(
             turn: turn,
-            toolName: "agent_message", executable: executable,
-            args: argv,
-            cwd: workingDirectory.path, timeoutSeconds: line.timeoutSeconds,
-            sourcePayloadForAudit: probe ? AgentHostDirectory.probeToken : nil, dataRoot: dataRoot,
+            toolName: "agent_message", executable: run.executable,
+            args: run.argv,
+            cwd: run.workingDirectory.path, timeoutSeconds: line.timeoutSeconds,
+            sourcePayloadForAudit: run.probe ? AgentHostDirectory.probeToken : nil, dataRoot: dataRoot,
             // Scrub peer environments to protect provider keys and bridge credentials; background work must not outlive its run or directory.
-            environmentOverride: environment,
+            environmentOverride: run.environment,
             closeStandardInput: true,
             reapDescendantsOnExit: true,
             onStdoutLine: onStdoutLine)
-        return await settle {
-            let commandReply = ToolResult(outcome)
-            defer {
-                try? FileManager.default.removeItem(at: replyDirectory)
-                if let probeNonce {
-                    do { _ = try store.finishConnectionProbe(peerID: contact.id, nonce: probeNonce, ran: false,
-                        workspace: workingDirectory.path) }
-                    catch { store.recordEvidenceFailure(peerID: contact.id, operation: "connection-probe", error: error) }
-                }
+        return (outcome, streamed, linesIn)
+    }
+
+    /// The reply the command declared: its JSON result, its reply file (bounded, whole UTF-8) or its stdout.
+    private static func readHostCommandReply(_ run: HostCommandRun, stdout: String?, envelope: [String: JSONValue], parsedReply: String?)
+        -> (reply: String, truncated: Bool, replyFailure: ToolFailureError?) {
+        let line = run.line, row = run.row, replyFile = run.replyFile
+        var reply = ""
+        var truncated = false
+        var replyFailure: ToolFailureError?
+        if line.jsonResultReply {
+            let response = parsedReply ?? ""
+            truncated = response.utf8.count > 64 * 1024
+            reply = String(decoding: response.utf8.prefix(64 * 1024), as: UTF8.self)
+            if stdout == nil {
+                replyFailure = ToolFailureError("""
+                    \(row.displayName)'s declared JSON reply output was not captured. Its process result is retained; do not resend \
+                    automatically.
+                    """,
+                    effects: envelope["ran"] == .bool(true) ? .unknown : .none, owner: row.displayName + " command line",
+                    code: "agent_reply_output_unavailable",
+                    instruction: "Repair the command's output capture and reconcile this run before another send.", recovery: .reconcile)
             }
-            linesIn.finish()
-            let streamedStdout = await streamed?.value
-            guard case .object(var envelope) = outcome else { return outcome }
-            if let streamedStdout { envelope["stdout"] = .string(streamedStdout) }
-            let stdout = envelope["stdout"]?.stringValue
-            let parsed = line.interpretOutput(stdout: stdout ?? "", expected: resuming ? session : nil)
-            var reply = ""
-            var truncated = false
-            var replyFailure: ToolFailureError?
-            if line.jsonResultReply {
-                let response = parsed.reply ?? ""
-                truncated = response.utf8.count > 64 * 1024
-                reply = String(decoding: response.utf8.prefix(64 * 1024), as: UTF8.self)
-                if stdout == nil {
-                    replyFailure = ToolFailureError("""
-                        \(row.displayName)'s declared JSON reply output was not captured. Its process result is retained; do not resend \
-                        automatically.
-                        """,
-                        effects: envelope["ran"] == .bool(true) ? .unknown : .none, owner: row.displayName + " command line",
-                        code: "agent_reply_output_unavailable",
-                        instruction: "Repair the command's output capture and reconcile this run before another send.", recovery: .reconcile)
-                }
-            } else if let replyFile {
-                do {
-                let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: replyFile))
-                defer { try? handle.close() }
-                // Bound peer-controlled reply files while reading, retaining one extra scalar so clipping cannot split UTF-8.
-                let data = try handle.read(upToCount: 64 * 1024 + 4) ?? Data()
-                truncated = data.count > 64 * 1024
-                var decoded: String?
-                if truncated {
-                    // Every candidate contains all bytes inside the retained bound. Invalid body bytes cannot disappear by clipping.
-                    for end in (64 * 1024)...min(data.count, 64 * 1024 + 3) where decoded == nil {
-                        decoded = String(data: data.prefix(end), encoding: .utf8)
-                    }
-                } else { decoded = String(data: data, encoding: .utf8) }
-                guard var decoded else {
-                    throw ToolFailureError("The command's reply file is not valid UTF-8.", effects: .unknown)
-                }
-                while decoded.utf8.count > 64 * 1024 { decoded.removeLast() }
-                reply = decoded
-                } catch {
-                    replyFailure = ToolFailureError("""
-                        \(row.displayName)'s declared reply file could not be read: \(error.localizedDescription). Its process result is retained; \
-                        do not resend automatically.
-                        """,
-                        effects: envelope["ran"] == .bool(true) ? .unknown : .none, owner: replyFile,
-                        code: "agent_reply_file_unavailable",
-                        instruction: "Repair the command recipe's reply-file output and reconcile this run before another send.", recovery: .reconcile)
-                }
-            } else if !line.capturesThreadID, let stdout {
-                reply = stdout
-                truncated = envelope["_truncated"] == .bool(true)
-            }
-            reply = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ran = envelope["ran"] == .bool(true)
-            let commandSucceeded = commandReply.said("completed") && commandReply.status == envelope["status"]?.stringValue
-            let stopped = commandReply.said("stopped") && commandReply.status == envelope["status"]?.stringValue
-            // Only an actual reply proves a command route. A connection probe proves the inbound entry only through a request carrying its key, never stdout.
-            let replied = commandSucceeded && parsed.failure == nil && replyFailure == nil && !reply.isEmpty
-            // A run the agent stopped says nothing about whether the contact works.
-            let arrived: Bool?
-            var evidenceFailure: String?
+        } else if let replyFile {
             do {
-                arrived = stopped ? false : try Self.recordHostConnectionOutcome(store: store, contact: contact, ran: ran,
-                    replied: replied, probe: probe, probeNonce: probeNonce,
-                    executable: executable, workspace: workingDirectory.path, recipe: recipe)
+            let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: replyFile))
+            defer { try? handle.close() }
+            // Bound peer-controlled reply files while reading, retaining one extra scalar so clipping cannot split UTF-8.
+            let data = try handle.read(upToCount: 64 * 1024 + 4) ?? Data()
+            truncated = data.count > 64 * 1024
+            var decoded: String?
+            if truncated {
+                // Every candidate contains all bytes inside the retained bound. Invalid body bytes cannot disappear by clipping.
+                for end in (64 * 1024)...min(data.count, 64 * 1024 + 3) where decoded == nil {
+                    decoded = String(data: data.prefix(end), encoding: .utf8)
+                }
+            } else { decoded = String(data: data, encoding: .utf8) }
+            guard var decoded else {
+                throw ToolFailureError("The command's reply file is not valid UTF-8.", effects: .unknown)
+            }
+            while decoded.utf8.count > 64 * 1024 { decoded.removeLast() }
+            reply = decoded
             } catch {
-                arrived = nil
-                evidenceFailure = error.localizedDescription
-                store.recordEvidenceFailure(peerID: contact.id, operation: "connection-probe", error: error)
+                replyFailure = ToolFailureError("""
+                    \(row.displayName)'s declared reply file could not be read: \(error.localizedDescription). Its process result is retained; \
+                    do not resend automatically.
+                    """,
+                    effects: envelope["ran"] == .bool(true) ? .unknown : .none, owner: replyFile,
+                    code: "agent_reply_file_unavailable",
+                    instruction: "Repair the command recipe's reply-file output and reconcile this run before another send.", recovery: .reconcile)
             }
-            var result: [String: JSONValue] = [
-                "status": .string(replied ? "replied" : "outcome_unknown"),
-                "agent": .string(agent), "transport": .string("mcpHost"), "host": .string(row.id),
-                "ran": .bool(ran), "command_succeeded": .bool(commandSucceeded),
-                "sent": replied || arrived == true ? .bool(true) : ran ? .null : .bool(false), "completed": .bool(replied),
-                "effects": .string(replied || arrived == true ? "occurred" : ran ? "unknown" : "none"),
-                "reply": .string(reply), "reply_truncated": .bool(truncated),
-                "untrusted_remote_data": .bool(!reply.isEmpty),
-                "exit_code": envelope["exit_code"] ?? .null, "timed_out": envelope["timed_out"] ?? .bool(false),
-                // The process has exited (or hit the recipe's timeout): nothing more arrives on this call.
-                "terminal": .bool(true),
-            ]
-            result.merge(Self.checkedPeerReadout(contact.id, store: store).fields) { _, current in current }
-            if line.capturesThreadID {
-                if let confirmed = parsed.threadID {
-                    result["conversation_id"] = .string(confirmed)
-                    result["continuation_available"] = .bool(true)
-                } else {
-                    result["continuation_available"] = .bool(false)
-                    result["continuation_detail"] = .string("""
-                        The command did not confirm the expected conversation identity. Its reply is retained, but continuity is unverified. Do not \
-                        resend automatically or silently start a replacement conversation.
-                        """)
-                }
-            } else if let session { result["conversation_id"] = .string(session) }
-            if probe {
-                // Omit probe reply content and taint so connection checks preserve the person's authority for later requests in this turn.
-                result["reply"] = nil
-                result["reply_truncated"] = nil
-                result["untrusted_remote_data"] = nil
-                result["connection_check"] = .bool(true)
-                result["connection_reply_received"] = arrived.map(JSONValue.bool) ?? .null
-                if arrived == false {
-                    result["detail"] = .string("No new answer arrived through the connection. The other app may need to restart before it can reply here.")
-                }
-            }
-            if stopped {
-                // A requested interruption is not evidence that the contact failed.
-                result["status"] = .string("stopped")
-                result["detail"] = .string("""
-                    Stopped at your request: \(row.displayName)'s run was interrupted. Anything it said before stopping is kept above; nothing was \
-                    resent.
+        } else if !line.capturesThreadID, let stdout {
+            reply = stdout
+            truncated = envelope["_truncated"] == .bool(true)
+        }
+        reply = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (reply, truncated, replyFailure)
+    }
+
+    /// The run's receipt: only an actual reply proves the route; connection evidence, continuity, a stop and any failure are said apart.
+    private static func hostCommandReceipt(_ run: HostCommandRun, commandReply: ToolResult, envelope: [String: JSONValue],
+                                           parsed: (reply: String?, failure: String?, threadID: String?),
+                                           reply: String, truncated: Bool, replyFailure: ToolFailureError?) -> JSONValue {
+        let row = run.row, contact = run.contact, store = run.store, line = run.line, agent = run.agent, session = run.session
+        let probe = run.probe, probeNonce = run.probeNonce, executable = run.executable, workingDirectory = run.workingDirectory
+        let recipe = run.recipe
+        let ran = envelope["ran"] == .bool(true)
+        let commandSucceeded = commandReply.said("completed") && commandReply.status == envelope["status"]?.stringValue
+        let stopped = commandReply.said("stopped") && commandReply.status == envelope["status"]?.stringValue
+        // Only an actual reply proves a command route. A connection probe proves the inbound entry only through a request carrying its key, never stdout.
+        let replied = commandSucceeded && parsed.failure == nil && replyFailure == nil && !reply.isEmpty
+        // A run the agent stopped says nothing about whether the contact works.
+        let arrived: Bool?
+        var evidenceFailure: String?
+        do {
+            arrived = stopped ? false : try Self.recordHostConnectionOutcome(store: store, contact: contact, ran: ran,
+                replied: replied, probe: probe, probeNonce: probeNonce,
+                executable: executable, workspace: workingDirectory.path, recipe: recipe)
+        } catch {
+            arrived = nil
+            evidenceFailure = error.localizedDescription
+            store.recordEvidenceFailure(peerID: contact.id, operation: "connection-probe", error: error)
+        }
+        var result: [String: JSONValue] = [
+            "status": .string(replied ? "replied" : "outcome_unknown"),
+            "agent": .string(agent), "transport": .string("mcpHost"), "host": .string(row.id),
+            "ran": .bool(ran), "command_succeeded": .bool(commandSucceeded),
+            "sent": replied || arrived == true ? .bool(true) : ran ? .null : .bool(false), "completed": .bool(replied),
+            "effects": .string(replied || arrived == true ? "occurred" : ran ? "unknown" : "none"),
+            "reply": .string(reply), "reply_truncated": .bool(truncated),
+            "untrusted_remote_data": .bool(!reply.isEmpty),
+            "exit_code": envelope["exit_code"] ?? .null, "timed_out": envelope["timed_out"] ?? .bool(false),
+            // The process has exited (or hit the recipe's timeout): nothing more arrives on this call.
+            "terminal": .bool(true),
+        ]
+        result.merge(Self.checkedPeerReadout(contact.id, store: store).fields) { _, current in current }
+        if line.capturesThreadID {
+            if let confirmed = parsed.threadID {
+                result["conversation_id"] = .string(confirmed)
+                result["continuation_available"] = .bool(true)
+            } else {
+                result["continuation_available"] = .bool(false)
+                result["continuation_detail"] = .string("""
+                    The command did not confirm the expected conversation identity. Its reply is retained, but continuity is unverified. Do not \
+                    resend automatically or silently start a replacement conversation.
                     """)
-            } else if let replyFailure {
-                if case .object(let fields) = ChatToolOutcome.failure(error: replyFailure) {
+            }
+        } else if let session { result["conversation_id"] = .string(session) }
+        if probe {
+            // Omit probe reply content and taint so connection checks preserve the person's authority for later requests in this turn.
+            result["reply"] = nil
+            result["reply_truncated"] = nil
+            result["untrusted_remote_data"] = nil
+            result["connection_check"] = .bool(true)
+            result["connection_reply_received"] = arrived.map(JSONValue.bool) ?? .null
+            if arrived == false {
+                result["detail"] = .string("No new answer arrived through the connection. The other app may need to restart before it can reply here.")
+            }
+        }
+        if stopped {
+            // A requested interruption is not evidence that the contact failed.
+            result["status"] = .string("stopped")
+            result["detail"] = .string("""
+                Stopped at your request: \(row.displayName)'s run was interrupted. Anything it said before stopping is kept above; nothing was \
+                resent.
+                """)
+        } else if let replyFailure {
+            if case .object(let fields) = ChatToolOutcome.failure(error: replyFailure) {
+                result.merge(fields) { _, failure in failure }
+            }
+            if arrived == true { result["effects"] = .string("occurred") }
+            result["detail"] = .string(replyFailure.message)
+            result["process_stdout"] = envelope["stdout"]
+            result["stderr"] = envelope["stderr"]
+        } else if !replied {
+            if let failure = parsed.failure {
+                // The normalized refusal repeats its cause; keep even JSON-escaped diagnostics within the receipt's 96 KiB limit.
+                let diagnostic = String(decoding: failure.utf8.prefix(3 * 1024), as: UTF8.self)
+                    + (failure.utf8.count > 3 * 1024 ? "\n[diagnostic truncated]" : "")
+                let refusal = ToolFailureError("\(row.displayName)'s command failed: \(diagnostic). Do not resend automatically.",
+                    effects: .unknown, owner: "\(row.displayName) command line",
+                    tap: """
+                        Terminal → run `\(line.executable)` once; sign in if requested and resolve its reported error before continuing this \
+                        conversation
+                        """)
+                if case .object(let fields) = ChatToolOutcome.failure(error: refusal) {
                     result.merge(fields) { _, failure in failure }
                 }
-                if arrived == true { result["effects"] = .string("occurred") }
-                result["detail"] = .string(replyFailure.message)
-                result["process_stdout"] = envelope["stdout"]
-                result["stderr"] = envelope["stderr"]
-            } else if !replied {
-                if let failure = parsed.failure {
-                    // The normalized refusal repeats its cause; keep even JSON-escaped diagnostics within the receipt's 96 KiB limit.
-                    let diagnostic = String(decoding: failure.utf8.prefix(3 * 1024), as: UTF8.self)
-                        + (failure.utf8.count > 3 * 1024 ? "\n[diagnostic truncated]" : "")
-                    let refusal = ToolFailureError("\(row.displayName)'s command failed: \(diagnostic). Do not resend automatically.",
-                        effects: .unknown, owner: "\(row.displayName) command line",
-                        tap: """
-                            Terminal → run `\(line.executable)` once; sign in if requested and resolve its reported error before continuing this \
-                            conversation
-                            """)
-                    if case .object(let fields) = ChatToolOutcome.failure(error: refusal) {
-                        result.merge(fields) { _, failure in failure }
-                    }
-                    result["detail"] = .string(ChatSecretRedactor.redactText(refusal.message))
-                } else {
-                    result["detail"] = .string(
-                        "\(row.displayName)'s command line did not come back with a reply, so nothing is proven. "
-                        + "Its own output is in stderr. Do not resend automatically.")
-                    if case .string(let text)? = envelope["stderr"] { result["stderr"] = .string(text) }
-                    if case .string(let text)? = envelope["stderr"] {
-                        let cause = ProviderFailure.wire(text, fallback: .malformedResponse)
-                        if cause != .malformedResponse {
-                            Self.peerFailure(.init(cause: cause, work: ran ? .outcomeUnknown : .nothingRan), into: &result)
-                        }
+                result["detail"] = .string(ChatSecretRedactor.redactText(refusal.message))
+            } else {
+                result["detail"] = .string(
+                    "\(row.displayName)'s command line did not come back with a reply, so nothing is proven. "
+                    + "Its own output is in stderr. Do not resend automatically.")
+                if case .string(let text)? = envelope["stderr"] { result["stderr"] = .string(text) }
+                if case .string(let text)? = envelope["stderr"] {
+                    let cause = ProviderFailure.wire(text, fallback: .malformedResponse)
+                    if cause != .malformedResponse {
+                        Self.peerFailure(.init(cause: cause, work: ran ? .outcomeUnknown : .nothingRan), into: &result)
                     }
                 }
             }
-            if let evidenceFailure {
-                result["durable_evidence_error"] = .string(evidenceFailure)
-                result["detail"] = .string("The command outcome above is retained, but connection evidence could not be saved: " + evidenceFailure
-                    + ". Repair agents/peers.json and reconcile this operation; do not resend it.")
-            }
-            result["untrusted_remote_data"] = .bool(parsed.failure != nil || PeerDataTaintDispatcher.containsPeerText(.object([
-                "reply": result["reply"] ?? .null, "stderr": result["stderr"] ?? .null, "stdout": result["process_stdout"] ?? .null,
-            ])))
-            return Self.peerRedact(.object(result), token: nil)
         }
+        if let evidenceFailure {
+            result["durable_evidence_error"] = .string(evidenceFailure)
+            result["detail"] = .string("The command outcome above is retained, but connection evidence could not be saved: " + evidenceFailure
+                + ". Repair agents/peers.json and reconcile this operation; do not resend it.")
+        }
+        result["untrusted_remote_data"] = .bool(parsed.failure != nil || PeerDataTaintDispatcher.containsPeerText(.object([
+            "reply": result["reply"] ?? .null, "stderr": result["stderr"] ?? .null, "stdout": result["process_stdout"] ?? .null,
+        ])))
+        return Self.peerRedact(.object(result), token: nil)
     }
     /// A CLI reply proves that route; the MCP return path has separate evidence.
 }

@@ -66,20 +66,6 @@ public enum DeskClock {
         return nil
     }
 
-    /// Stable normalized reservation IDs make replay idempotent and caps count distinct reservations.
-    public static func reservationId(handle: String, day: String, slot: String) -> String {
-        let bare = handle.hasPrefix("desk_") ? String(handle.dropFirst("desk_".count)) : handle
-        func clean(_ s: String) -> String {
-            String(s.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
-        }
-        return "wres_\(clean(bare))_\(clean(day))_\(clean(slot))"
-    }
-
-    public static func workAttemptId(handle: String, lane: DeskWorkAttempt.Lane, day: String, slot: String) -> String {
-        lane == .pursuit ? reservationId(handle: handle, day: day, slot: slot)
-            : "wattempt_\(lane.rawValue)_\(reservationId(handle: handle, day: day, slot: slot).dropFirst(5))"
-    }
-
     public static func dayStamp(_ date: Date) -> String {
         NativeTimestampFormat.calendarDay(date)
     }

@@ -9,6 +9,16 @@ enum SettingsMacHealthPresentation {
         version.components(separatedBy: "-dev.").first ?? version
     }
 
+    /// Doctor's rollup word in a person's words; a missing or unmeasured reading is "Not checked yet".
+    static func healthText(_ doctorStatus: String?) -> String {
+        switch doctorStatus {
+        case "ok": "OK"
+        case "warn": "Needs a look"
+        case "fail": "Needs fixing"
+        default: "Not checked yet"
+        }
+    }
+
     static func uptimeText(_ launchedAt: Date, now: Date = Date()) -> String {
         let formatted = UserDisplayFormatters.humanizeDuration(max(0, now.timeIntervalSince(launchedAt)))
         return formatted.isEmpty ? "Unknown" : formatted
@@ -103,7 +113,7 @@ struct SettingsViewFull: View {
     private var connectionFace: PartFace {
         var healthRows: [PartFace.Row] = []
         if let health = store.sync.health {
-            healthRows = [.init(id: "state", title: "Health", value: "Doctor: \(health.doctorStatus ?? "unmeasured")"),
+            healthRows = [.init(id: "state", title: "Mac health", value: SettingsMacHealthPresentation.healthText(health.doctorStatus)),
                 .init(id: "app", title: "App", value: health.app),
                 .init(id: "version", title: "Version", value: SettingsMacHealthPresentation.versionText(health.version)),
                 .init(id: "uptime", title: "Uptime", value: SettingsMacHealthPresentation.uptimeText(health.launchedAt))]
@@ -125,8 +135,7 @@ struct SettingsViewFull: View {
             .init(id: "pair", title: pairingStore.isICloudSigned ? "Pair with Mac" : "Set up Mac connection", actions: [
                 .init(id: "pair", label: "Pair with Mac", call: .init("phone.connection.pair"))]),
             .init(id: "repair", title: "Connection repair", actions: [.init(id: "repair", label: "Repair connection",
-                call: .init("phone.connection.repair"), unavailable: pairingStore.isRepairingConnection ? "Repair is already running." : nil)]),
-            .init(id: "pairing-version", title: "Pairing version", value: String(pairingStore.knownSecretVersion))]
+                call: .init("phone.connection.repair"), unavailable: pairingStore.isRepairingConnection ? "Repair is already running." : nil)])]
         return .init(sections: [.init(id: "mac", title: "Mac", rows: healthRows),
             .init(id: "connection", title: "Connection", footer: "Keep NativeAgent open on the Mac so a current report can reach this iPhone.", rows: rows),
             .init(id: "on-mac", title: "On your Mac", rows: [
@@ -195,12 +204,12 @@ struct SettingsViewFull: View {
 enum SettingsICloudRefreshPresentation {
     static func statusText(pairingMaterialChanged: Bool, snapshotError: String?) -> String {
         let pairingStatus = pairingMaterialChanged
-            ? "New pairing material installed."
-            : "No new pairing material was installed."
+            ? "Updated from your Mac."
+            : "Already up to date."
 
         guard let snapshotError,
               !snapshotError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return "\(pairingStatus) Settings snapshot reload completed."
+            return pairingStatus
         }
 
         return "\(pairingStatus) \(snapshotError)"

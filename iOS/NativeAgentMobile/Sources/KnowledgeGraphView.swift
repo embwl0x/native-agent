@@ -1,7 +1,6 @@
 import SwiftUI
 import Foundation
 import Accessibility
-import CryptoKit
 import NativeAgentShared
 // Blueprint: | `KnowledgeGraphView.swift` | Device-local graph pages, held queries and revision-bound collection/item reads |
 
@@ -236,7 +235,7 @@ private struct PhoneGraphReading {
             PartFace.Value.array([.string(edge.from), .string(edge.to), .string(edge.kind), edge.weight.map(PartFace.Value.double) ?? .null])
         }
         let data = try JSONEncoder().encode(PartFace.Value.array([.array(entities), .array(edges), .int(Int64(snapshot.total)), .string(query)]))
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return SHA256Hex.of(data)
     }
 }
 

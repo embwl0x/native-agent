@@ -141,19 +141,14 @@ public actor PersonaCompiler {
     }
 
     internal let engine: SwiftNativePersonaEngine
-    private let fileManager: FileManager
 
     /// Keep canonical ordering; optional MEMORY has no runtime writer and surface guidance follows AGENTS.
     private static let canonicalDocOrder: [String] = [
         "SOUL", "VOICE", "USER", "GROWTH", "MEMORY", "AGENTS",
     ]
 
-    public init(
-        engine: SwiftNativePersonaEngine = SwiftNativePersonaEngine(),
-        fileManager: FileManager = .default
-    ) {
+    public init(engine: SwiftNativePersonaEngine = SwiftNativePersonaEngine()) {
         self.engine = engine
-        self.fileManager = fileManager
     }
 
     // MARK: Public API
@@ -171,8 +166,8 @@ public actor PersonaCompiler {
         ).packet
     }
 
-    public static func selectedPersonaID(root: URL, personaOverride: String?, fileManager: FileManager = .default) throws -> String {
-        try resolveActivePersona(root: root, personaOverride: personaOverride, fileManager: fileManager).id
+    public static func selectedPersonaID(root: URL, personaOverride: String?) throws -> String {
+        try resolveActivePersona(root: root, personaOverride: personaOverride).id
     }
 
     private func resolvedCompilation(
@@ -183,7 +178,7 @@ public actor PersonaCompiler {
         let root = await engine.personaRoot
 
         let persona = try Self.resolveActivePersona(
-            root: root, personaOverride: personaOverride, fileManager: fileManager
+            root: root, personaOverride: personaOverride
         )
         let documents = try await canonicalDocuments(root: root, personaSubdir: persona.subdir)
         let identity = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
@@ -304,7 +299,7 @@ public actor PersonaCompiler {
                 persona = cached
             } else {
                 persona = try Self.resolveActivePersona(
-                    root: root, personaOverride: override, fileManager: fileManager
+                    root: root, personaOverride: override
                 )
                 resolvedByOverride[override] = persona
             }
@@ -396,15 +391,14 @@ public actor PersonaCompiler {
     /// Only absent selection uses the canonical root; a missing custom persona cannot select another.
     private static func resolveActivePersona(
         root: URL,
-        personaOverride: String?,
-        fileManager: FileManager
+        personaOverride: String?
     ) throws -> (kind: String, id: String, subdir: URL?) {
         if let raw = personaOverride ?? PersonaSelection.current() {
             let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !name.isEmpty {
                 if name == "canonical" { return ("Default", "canonical", nil) }
                 let candidate = try selectedPersonaDirectory(name: name, root: root)
-                if try subdirHasMarker(candidate, fileManager: fileManager) {
+                if try subdirHasMarker(candidate) {
                     return ("Custom", name, candidate)
                 }
                 throw PersonaEngineError.rootUnreadable(
@@ -429,7 +423,7 @@ public actor PersonaCompiler {
         return candidate
     }
 
-    private static func subdirHasMarker(_ dir: URL, fileManager: FileManager) throws -> Bool {
+    private static func subdirHasMarker(_ dir: URL) throws -> Bool {
         let isDirectory: Bool?
         do { isDirectory = try dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory }
         catch CocoaError.fileReadNoSuchFile { return false }

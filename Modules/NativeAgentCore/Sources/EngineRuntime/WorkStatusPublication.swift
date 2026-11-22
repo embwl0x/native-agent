@@ -36,7 +36,8 @@ public final class WorkStatusPublication {
                                      waiting: Int?, reload: @escaping @Sendable () -> Void) async {
         // Unknown identity publishes no name; profile refresh retries while Desk and attention evaluation proceed.
         guard !name.isEmpty else { return }
-        guard !widgetContainerUnavailableLogged else { return }
+        // The flag only quiets the repeat log: every status change retries the container, so a recovered one publishes again.
+        let alreadyLogged = widgetContainerUnavailableLogged
         let busy = engine.turns.visiblyWorkingSessionIDs
         let replying = engine.turns.replyingSessions
         let movements = Dictionary(uniqueKeysWithValues: busy.compactMap { id in
@@ -47,7 +48,7 @@ public final class WorkStatusPublication {
             do {
                 url = try NativeAgentWidgetSnapshot.fileURL()
             } catch {
-                Logger(subsystem: "NativeAgent", category: "Widget").notice("Widget status disabled: App Group container unavailable")
+                if !alreadyLogged { Logger(subsystem: "NativeAgent", category: "Widget").notice("Widget status unavailable: App Group container unavailable") }
                 return true
             }
             let status: String
@@ -123,6 +124,6 @@ public final class WorkStatusPublication {
             }
             return false
         }.value
-        if containerUnavailable { widgetContainerUnavailableLogged = true }
+        widgetContainerUnavailableLogged = containerUnavailable
     }
 }

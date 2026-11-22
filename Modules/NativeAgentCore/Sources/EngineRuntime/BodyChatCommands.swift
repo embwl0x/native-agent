@@ -141,6 +141,28 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
                 return .result(.object(["session": .string(identity.sessionId), "turn": .string(identity.turnId),
                     "phase": phase.map { .string($0.rawValue) } ?? .null]))
             }
+        case .revise(let session, let message, let from, let text):
+            let (target, _) = try await messageRow(message, session: session)
+            // Her side is the text the editor started from, so a difference the editor made (folds, spacing) is never the user's choice.
+            let hers = from.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard target.role == "assistant", !target.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !hers.isEmpty else {
+                throw EngineFaceActs.failure("revision_unavailable", "Only a message of hers with words can be revised.")
+            }
+            guard text.trimmingCharacters(in: .whitespacesAndNewlines) != hers else {
+                throw EngineFaceActs.failure("revision_unchanged", "The words are unchanged. Edit them, then send the revision.")
+            }
+            // Held before the send admits the turn, so the turn that carries the user's words is the one handed both versions.
+            let revision = UserEye.Revision(message: message, hers: hers, theirs: text)
+            try UserEye.hold(revision, dataRoot: engine.dataRoot, sessionID: session)
+            do {
+                let reply = try await send(SendRequest(session: session, text: text, attachments: [], composerRevision: 0,
+                    expectedSelection: nil, options: .init(hideUserBubble: false, choice: nil, continuationReference: nil)), renderer: renderer)
+                if case .refused = reply { UserEye.release(revision, dataRoot: engine.dataRoot, sessionID: session) }
+                return reply
+            } catch {
+                UserEye.release(revision, dataRoot: engine.dataRoot, sessionID: session)
+                throw error
+            }
         case .appendSlashHelp(let session):
             engine.transcripts.appendMessage(ChatMessage(sessionId: session, role: "assistant", content: ChatSlashCommandRegistry.helpText()), to: session)
             return .acknowledged
@@ -189,8 +211,10 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
             if value.mimeType.hasPrefix("image/") { kind = "image" }
             else if value.mimeType.hasPrefix("audio/") { kind = "audio" }
             else { kind = "file" }
-            return MultimodalAttachment(id: value.id, type: kind, base64: bytes.base64EncodedString(), mime: value.mimeType,
+            var made = MultimodalAttachment(id: value.id, type: kind, base64: bytes.base64EncodedString(), mime: value.mimeType,
                 name: value.name, byteSize: bytes.count)
+            made.utterance = value.utterance
+            return made
         }
     }
 

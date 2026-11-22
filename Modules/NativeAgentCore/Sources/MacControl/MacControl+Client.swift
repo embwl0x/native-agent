@@ -3,10 +3,8 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(CoreGraphics)
 import CoreGraphics
 // Blueprint: | `MacControl+Client.swift` | `SwiftNativeMacControl`, `dispatch`, `dispatchApprovedInjection`, `MacObservationMode` |
-#endif
 
 // MARK: - SwiftNative impl
 
@@ -59,8 +57,6 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// Driver authority plus bounded fused-view continuity. Acts automatically start passive observation; every tool client shares the physical Mac.
     let attentionEventSource: any MacAttentionEventSource
     let attentionStore: MacAttentionSessionStore
-    /// Keep login-session safety independent of the sink that emits input.
-    let sessionStateSource: any MacSessionStateSource
     /// Pasteboard access grants no tree, input or pixel-capture authority.
     let pasteboardSource: any MacPasteboardSource
     /// Production uses the live Swift TrustCenter policy. A nil provider lets direct library callers exercise handlers without policy preflight.
@@ -83,7 +79,6 @@ public actor SwiftNativeMacControl: MacControlClient {
         lookFrameStore: MacLookFrameStore = .shared,
         attentionEventSource: any MacAttentionEventSource = defaultMacAttentionEventSource(),
         attentionStore: MacAttentionSessionStore = .shared,
-        sessionStateSource: any MacSessionStateSource = defaultMacSessionStateSource(),
         pasteboardSource: any MacPasteboardSource = defaultMacPasteboardSource(),
         policyProvider: (any MacControlPolicyProvider)? = nil,
         auditDataRoot: URL? = nil,
@@ -102,7 +97,6 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.lookFrameStore = lookFrameStore
         self.attentionEventSource = attentionEventSource
         self.attentionStore = attentionStore
-        self.sessionStateSource = sessionStateSource
         self.pasteboardSource = pasteboardSource
         self.policyProvider = policyProvider
         self.auditDataRoot = auditDataRoot
@@ -138,7 +132,7 @@ public actor SwiftNativeMacControl: MacControlClient {
     }
 
     private static func isLooking(action: String, body: [String: JSONValue]) -> Bool {
-        ["look", "view", "read", "menu", "ax_tree", "ax_find", "scroll", "nudge", "wake", "focus_app", "open_target"].contains(action)
+        ["look", "view", "read", "menu", "focus_app", "open_target"].contains(action)
             || action == "act" && body["verb"]?.stringValue == "scroll"
             || action == "hand" && body["gesture"]?.stringValue == "scroll"
     }
@@ -159,15 +153,10 @@ public actor SwiftNativeMacControl: MacControlClient {
             }
         }
         if axSession(context: context) == nil {
-            #if canImport(ApplicationServices) && os(macOS)
             let read: any MacAXElementSource = suppliedAccessibilitySource is SystemMacAXElementSource
                 ? SystemMacAXElementSource() : suppliedAccessibilitySource
             let act: any MacAXActSource = suppliedAccessibilityActSource is SystemMacAXActSource
                 ? SystemMacAXActSource() : suppliedAccessibilityActSource
-            #else
-            let read = suppliedAccessibilitySource
-            let act = suppliedAccessibilityActSource
-            #endif
             let created = AXSession(owner: ObjectIdentifier(self), read: read, act: act)
             // Look and its pixel supplement are separate dispatches of one observation. Its binding owns their shared references until exit.
             let session = context.capture?.retainAXSession(created) ?? created
@@ -201,7 +190,8 @@ public actor SwiftNativeMacControl: MacControlClient {
         let background = normalized != "applescript"
             && (context.background || rawBody["background"] == .bool(true))
         return try await context.holding(\.background, background) { context in
-            try await context.holding(\.inputStartCount, context.driver?.inputCount ?? 0) { context in
+            let counts = (requested: context.driver?.inputCount ?? 0, recovery: context.driver?.recoveryEventCount ?? 0)
+            return try await context.holding(\.inputStartCounts, counts) { context in
                 driverCheckedResult(try await dispatchBound(action: action, body: rawBody, capability: capability, turn: turn, context: context),
                     action: normalized, context: context)
             }
@@ -216,7 +206,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         output["status"] = .string("yielded_to_user")
         output["error"] = .string(MacAttentionSessionStore.driverRefusal(context: context))
         output["verification"] = .string("unverified")
-        let emitted = max(0, (context.driver?.inputCount ?? 0) - context.inputStartCount)
+        let emitted = max(0, (context.driver?.inputCount ?? 0) - context.inputStartCounts.requested)
         output["posted_events"] = .int(Int64(emitted))
         if output["requested_events_emitted"] != nil { output["requested_events_emitted"] = .int(Int64(emitted)) }
         return MacControlResult(
@@ -246,6 +236,39 @@ public actor SwiftNativeMacControl: MacControlClient {
             return try await executeAction(normalized, body: body, turn: turn, context: context)
         }
 
+        if let refusal = try await authorizeBoundInjection(normalized, body: body, capability: capability, turn: turn) {
+            return refusal
+        }
+
+        // Live reads retain policy preflight but bypass durable motor replay so screen, clipboard and document state stays fresh.
+        if macControlLiveReadActions.contains(normalized) {
+            return try await executeAction(normalized, body: body, turn: turn, context: context)
+        }
+
+        guard let operationStore else {
+            return try await executeAction(normalized, body: body, turn: turn, context: context)
+        }
+        switch try await prepareStoredOperation(normalized, body: body, operationStore: operationStore, turn: turn, context: context) {
+        case .finished(let result):
+            return result
+        case .accepted(let operationId, let executionKey, let operationBody, let outcome):
+            let (startGate, task, execution) = registerStoredExecution(
+                normalized, operationId: operationId, executionKey: executionKey, operationBody: operationBody,
+                outcome: outcome, turn: turn, context: context
+            )
+            defer {
+                task.cancel()
+                startGate.resume(false)
+            }
+            return try await startStoredExecution(normalized, operationId: operationId, operationStore: operationStore,
+                startGate: startGate, task: task, execution: execution, context: context)
+        }
+    }
+
+    /// Check and spend an explicit injection capability before active dispatch.
+    private func authorizeBoundInjection(
+        _ normalized: String, body: [String: JSONValue], capability: MacInjectionCapability?, turn: Turn
+    ) async throws -> MacControlResult? {
         // Spend only explicit replay capabilities; ordinary calls still pass the same policy and driver gates.
         if macControlAccessibilityInjectionActions.contains(normalized), let capability {
             if let failure = capability.authorizationFailure(
@@ -275,15 +298,19 @@ public actor SwiftNativeMacControl: MacControlClient {
             // capability means.
             throw MacControlError.unknownAction(normalized)
         }
+        return nil
+    }
 
-        // Live reads retain policy preflight but bypass durable motor replay so screen, clipboard and document state stays fresh.
-        if macControlLiveReadActions.contains(normalized) {
-            return try await executeAction(normalized, body: body, turn: turn, context: context)
-        }
+    private enum StoredOperationAdmission {
+        case finished(MacControlResult)
+        case accepted(String, MacControlInFlightRegistry.Key, [String: JSONValue], GatePreflightOutcome)
+    }
 
-        guard let operationStore else {
-            return try await executeAction(normalized, body: body, turn: turn, context: context)
-        }
+    /// Open the durable record, returning replays and refusals before execution registers.
+    private func prepareStoredOperation(
+        _ normalized: String, body: [String: JSONValue], operationStore: MacControlOperationStore,
+        turn: Turn, context: MacOperationContext
+    ) async throws -> StoredOperationAdmission {
         let operationId = body["operationId"]?.stringValue
             ?? body["operation_id"]?.stringValue
             ?? UUID().uuidString
@@ -310,14 +337,14 @@ public actor SwiftNativeMacControl: MacControlClient {
         switch begin {
         case .replay(let record):
             if let retained = MacControlInFlightRegistry.shared.execution(key: executionKey)?.settledResult {
-                return retained
+                return .finished(retained)
             }
-            return Self.replayResult(record)
+            return .finished(Self.replayResult(record))
         case .duplicateActive(let record):
             if let retained = MacControlInFlightRegistry.shared.execution(key: executionKey)?.settledResult {
-                return retained
+                return .finished(retained)
             }
-            return MacControlResult(
+            return .finished(MacControlResult(
                 ok: false,
                 action: normalized,
                 output: .object([
@@ -330,7 +357,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 operationId: operationId,
                 operationState: record.state,
                 verification: record.verification
-            )
+            ))
         case .accepted:
             break
         }
@@ -356,13 +383,24 @@ public actor SwiftNativeMacControl: MacControlClient {
                 to: .refused,
                 verification: .notRequired,
                 expectedNextEvidence: nil,
-                outcomeCode: "policy_refused"
+                outcomeCode: "policy_refused",
+                acknowledgePreStartCancellation: true
                 )) } catch { return .failure(error) }
             }
             let record = try saved.get()
-            return Self.attachingOperation(refused, record: record)
+            if record.state == .cancelAcknowledged {
+                return .finished(Self.cancelledResult(action: normalized, record: record))
+            }
+            return .finished(Self.attachingOperation(refused, record: record))
         }
+        return .accepted(operationId, executionKey, operationBody, outcome)
+    }
 
+    /// Register the gated task and give its actual exit ownership of terminal settlement.
+    private func registerStoredExecution(
+        _ normalized: String, operationId: String, executionKey: MacControlInFlightRegistry.Key,
+        operationBody: [String: JSONValue], outcome: GatePreflightOutcome, turn: Turn, context: MacOperationContext
+    ) -> (ContinuationOnce<Bool>, Task<MacControlResult, Error>, MacControlInFlightExecution) {
         // Register before publishing started. The task cannot emit effects until the durable cancellation state has been reconciled below.
         let startGate = ContinuationOnce<Bool>()
         let task = Task<MacControlResult, Error> {
@@ -370,7 +408,9 @@ public actor SwiftNativeMacControl: MacControlClient {
             try Task.checkCancellation()
             guard case .proceed(let fullMacAdmitted) = outcome else { preconditionFailure("Refused operations return before execution") }
             return try await turn.holding(\.fullMacAdmitted, fullMacAdmitted) { turn in
-                try await self.executeAction(normalized, body: operationBody, gateAlreadyChecked: true, turn: turn, context: context)
+                try await context.holding(\.seesAsPerson, fullMacAdmitted) { context in
+                    try await self.executeAction(normalized, body: operationBody, gateAlreadyChecked: true, turn: turn, context: context)
+                }
             }
         }
         let execution = MacControlInFlightExecution(task: task)
@@ -387,10 +427,15 @@ public actor SwiftNativeMacControl: MacControlClient {
             execution.finish(settled)
             MacControlInFlightRegistry.shared.finished(key: executionKey)
         }
-        defer {
-            task.cancel()
-            startGate.resume(false)
-        }
+        return (startGate, task, execution)
+    }
+
+    /// Reconcile cancellation before opening the gate, then wait for the response.
+    private func startStoredExecution(
+        _ normalized: String, operationId: String, operationStore: MacControlOperationStore,
+        startGate: ContinuationOnce<Bool>, task: Task<MacControlResult, Error>, execution: MacControlInFlightExecution,
+        context: MacOperationContext
+    ) async throws -> MacControlResult {
         let startResult: Result<MacControlOperationRecord, Error> = await settle {
             do { return .success(try await operationStore.transition(
             operationId: operationId,
@@ -450,27 +495,26 @@ public actor SwiftNativeMacControl: MacControlClient {
                 """)
         }
         let executionKey = MacControlInFlightRegistry.Key(store: operationStore.registryIdentity, operationId: operationId)
-        guard let current = try await operationStore.record(operationId: operationId) else {
-            throw MacControlError.operation("""
-                mac_operation_not_found: No record exists for this operation_id. Check the original receipt's identity and inspect the affected app with \
-                mac.look before further action.
-                """)
-        }
-        if current.state.isTerminal, current.terminalAt != nil {
-            return MacControlCancellationResult(
-                operationId: operationId,
-                state: current.state,
-                acknowledged: current.state == .cancelAcknowledged
-            )
-        }
-        var pending = current
-        if !current.state.isTerminal, current.state != .cancelRequested {
+        let pending: MacControlOperationRecord
+        do {
             pending = try await operationStore.transition(
                 operationId: operationId,
                 to: .cancelRequested,
                 verification: .pending,
                 expectedNextEvidence: "Operation owner terminal settlement",
                 outcomeCode: "cancel_requested"
+            )
+        } catch MacControlOperationStoreError.operationNotFound {
+            throw MacControlError.operation("""
+                mac_operation_not_found: No record exists for this operation_id. Check the original receipt's identity and inspect the affected app with \
+                mac.look before further action.
+                """)
+        }
+        if pending.state.isTerminal, pending.terminalAt != nil {
+            return MacControlCancellationResult(
+                operationId: operationId,
+                state: pending.state,
+                acknowledged: pending.state == .cancelAcknowledged
             )
         }
         guard let execution = MacControlInFlightRegistry.shared.execution(key: executionKey) else {
@@ -538,7 +582,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         turn: Turn, context: MacOperationContext
     ) async throws -> MacControlResult {
         if context.observationMode == .passive,
-           !["look", "view", "read", "file/read", "spotlight", "ax_status", "ax_tree", "ax_find", "clipboard_read"].contains(normalized) {
+           !["look", "view", "read", "file/read", "spotlight", "clipboard_read"].contains(normalized) {
             return MacControlResult(ok: false, action: normalized,
                 output: .object(["message": .string("raw view · passive observation · desktop effects are unavailable")]),
                 error: "passive_observation", durationMs: 0)
@@ -551,7 +595,9 @@ public actor SwiftNativeMacControl: MacControlClient {
                 return result
             case .proceed(let fullMacAdmitted):
                 return try await turn.holding(\.fullMacAdmitted, fullMacAdmitted) { turn in
-                    try await executeAction(normalized, body: body, gateAlreadyChecked: true, turn: turn, context: context)
+                    try await context.holding(\.seesAsPerson, fullMacAdmitted) { context in
+                        try await executeAction(normalized, body: body, gateAlreadyChecked: true, turn: turn, context: context)
+                    }
                 }
             }
         }
@@ -565,7 +611,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // Perception, hands and any call that requires the front share the desktop-send wake: an inert nudge only while the saver covers the screen and the
         // person is idle.
         if context.observationMode == .passive,
-           ["look", "view", "ax_tree", "ax_find"].contains(normalized), try MacScreenLock.isCovered() {
+           ["look", "view"].contains(normalized), try MacScreenLock.isCovered() {
             return MacControlResult(ok: false, action: normalized,
                 output: .object(["status": .string("display_obstructed"), "message": .string(MacScreenLock.passiveReply)]),
                 error: "display_obstructed", durationMs: 0)
@@ -605,9 +651,6 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "open_target": return try await handleOpenTarget(body, context: context)
         case "spotlight":   return try await handleSpotlight(body)
         case "shell":       return try await handleShell(body)
-        case "ax_status":   return handleAXStatus(context: context)
-        case "ax_tree":     return handleAXTree(body, context: context)
-        case "ax_find":     return try handleAXFind(body, context: context)
         case "look":
             return await context.holding(\.readDeadline, Date().addingTimeInterval(MacAXLimits.readSeconds)) { context in
                 await handleLook(body, turn: turn, context: context)
@@ -618,14 +661,10 @@ public actor SwiftNativeMacControl: MacControlClient {
         // Reach handlers only after policy admission and consumption of any supplied replay capability.
         case "keystroke":   return await handleKeystroke(body, turn: turn, context: context)
         case "click":       return await handleClick(body, turn: turn, context: context)
-        case "scroll":      return await handleScroll(body, turn: turn, context: context)
         case "ax_act":      return await handleAXAct(body, turn: turn, context: context)
         // Returned perception is effect evidence; it cannot lower actuation from injection tier.
         case "act":         return await handleAct(body, turn: turn, context: context)
         case "hand":        return await handleHand(body, turn: turn, context: context)
-        // Wake nudges then recaptures; an obstructing saver/login layer refuses capture, not the nudge.
-        case "wake":        return await handleWake(body, turn: turn, context: context)
-        case "nudge":       return await handleNudge(body, turn: turn, context: context)
         // Clipboard writes need readback; set-call success alone cannot verify contents.
         case "clipboard_read":  return handleClipboardRead(body)
         case "clipboard_write": return handleClipboardWrite(body)
@@ -634,8 +673,6 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "menu_press":  return await handleMenuPress(body, turn: turn, context: context)
         // Retain document text through the existing spill pager so extraction adds no second owner.
         case "read":        return await handleRead(body, turn: turn, context: context)
-        case let action where macControlUnsupportedActions.contains(action):
-            return Self.unsupportedResult(action: action)
         default:
             // Guarded by macControlDispatchableActions at the entry point.
             throw MacControlError.unknownAction(normalized)
@@ -656,14 +693,11 @@ public actor SwiftNativeMacControl: MacControlClient {
             return max(1, min(timeout, 120))
         }
         switch action {
-        case "keystroke", "click", "scroll", "ax_act", "hand": return 15
+        case "keystroke", "click", "ax_act", "hand": return 15
         // Budget the effect wait plus the post-action AX walk, including any bounded renderer settle.
         case "act": return 30
-        case "nudge": return 15
         case "clipboard_write": return 10
         case "menu_press": return 15
-        // Wake needs both bounded settling and a fresh capture to report the resulting screen.
-        case "wake": return 30
         case "shell": return 60
         default: return 90
         }

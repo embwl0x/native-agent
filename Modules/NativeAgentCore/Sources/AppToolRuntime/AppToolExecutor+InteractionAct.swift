@@ -46,11 +46,6 @@ extension AppToolExecutor {
         }
     }
 
-    private static func interactionText(_ value: JSONValue?) -> String {
-        guard case .string(let raw)? = value else { return "" }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
     private struct CardPlan {
         let appModel: any QuietToolHost
         let dataRoot: URL
@@ -78,7 +73,7 @@ extension AppToolExecutor {
 
     /// Card ids may arrive bare or prefixed as their interaction inbox note.
     private static func cardID(_ input: [String: JSONValue]) -> String {
-        let id = interactionText(input["interaction_id"])
+        let id = JSONValue.trimmedStringOrEmpty(input["interaction_id"])
         return id.hasPrefix("interaction:") ? String(id.dropFirst("interaction:".count)) : id
     }
 
@@ -86,7 +81,7 @@ extension AppToolExecutor {
     private func cardGate(input: [String: JSONValue], surface: String, turn: Turn) async -> Result<CardPlan, GateRefusal> {
         func refuse(_ answer: JSONValue) -> Result<CardPlan, GateRefusal> { .failure(GateRefusal(answer: answer)) }
         let id = Self.cardID(input)
-        let rawAction = Self.interactionText(input["action"]).lowercased()
+        let rawAction = JSONValue.trimmedStringOrEmpty(input["action"]).lowercased()
         let action = rawAction.isEmpty ? "primary" : rawAction
         guard let appModel = quietHost() else {
             return refuse(Self.interactionFailure(
@@ -188,8 +183,8 @@ extension AppToolExecutor {
             ))
         }
 
-        let value = Self.interactionText(input["value"])
-        let choice = Self.interactionText(input["choice"])
+        let value = JSONValue.trimmedStringOrEmpty(input["value"])
+        let choice = JSONValue.trimmedStringOrEmpty(input["choice"])
         // Declining any card grants nothing, including user-only cards.
         if action == "decline" {
             return .success(CardPlan(appModel: appModel, dataRoot: dataRoot, sessionID: sessionID, current: current,
@@ -198,7 +193,7 @@ extension AppToolExecutor {
         let descriptor = await InlineInteractionResolver.descriptor(for: current, dataRoot: dataRoot)
         let route = Self.route(
             control: descriptor.control, interaction: current,
-            descriptor: descriptor, value: value, choice: choice
+            descriptor: descriptor, choice: choice
         )
         if case .needsGlass(let reason) = route {
             return refuse(await interactionReceipt(
@@ -248,7 +243,7 @@ extension AppToolExecutor {
         let (appModel, dataRoot, sessionID, current) = (plan.appModel, plan.dataRoot, plan.sessionID, plan.current)
         let (value, choice) = (plan.value, plan.choice)
         let id = Self.cardID(input)
-        let rawAction = Self.interactionText(input["action"]).lowercased()
+        let rawAction = JSONValue.trimmedStringOrEmpty(input["action"]).lowercased()
         let action = rawAction.isEmpty ? "primary" : rawAction
         var effective = plan.posture
         // An answer that changes the person's authority over the agent (a grant, a capability, a key) or picks a model is the person's at
@@ -404,8 +399,8 @@ extension AppToolExecutor {
     @MainActor
     private func runPersonCardAction(input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let id = Self.cardID(input)
-        let action = Self.interactionText(input["action"]).lowercased()
-        let choice = Self.interactionText(input["choice"])
+        let action = JSONValue.trimmedStringOrEmpty(input["action"]).lowercased()
+        let choice = JSONValue.trimmedStringOrEmpty(input["choice"])
         guard let host = quietHost() else {
             return Self.interactionFailure("app_window_unavailable", "The app's own controls are not available in this process.")
         }
@@ -452,7 +447,6 @@ extension AppToolExecutor {
         control: InlineInteractionDescriptor.Control,
         interaction: InlineInteraction,
         descriptor: InlineInteractionDescriptor,
-        value: String,
         choice: String
     ) -> InteractionControlRoute {
         switch control {
@@ -683,7 +677,7 @@ extension AppToolExecutor {
     func runComposerAction(
         verb: String, input: [String: JSONValue], surface: String, host appModel: any QuietToolHost, turn: Turn
     ) async -> JSONValue {
-        let sessionId = Self.interactionText(input["session_id"])
+        let sessionId = JSONValue.trimmedStringOrEmpty(input["session_id"])
         let posture: QuietPosture?
         let attachments: [URL]
         switch await composerGate(verb: verb, input: input, host: appModel, turn: turn) {
@@ -696,15 +690,15 @@ extension AppToolExecutor {
         catch { return ChatToolOutcome.failure(error: error, tool: "interaction_act", effects: ToolFailureError.Effects.none) }
         let outcome = await appModel.runComposer(
             verb: verb,
-            value: Self.interactionText(input["value"]),
-            choice: Self.interactionText(input["choice"]),
+            value: JSONValue.trimmedStringOrEmpty(input["value"]),
+            choice: JSONValue.trimmedStringOrEmpty(input["choice"]),
             sessionId: sessionId,
             attachments: attachments,
             reachesUser: reachesUser,
-            turnSessionId: Self.interactionText(input["__session_id"]), turn: turn
+            turnSessionId: JSONValue.trimmedStringOrEmpty(input["__session_id"]), turn: turn
         )
         if let refusal = Self.composerFailure(outcome, verb: verb) { return refusal }
-        if verb == "show_pane", Self.interactionText(input["value"]) == "table" {
+        if verb == "show_pane", JSONValue.trimmedStringOrEmpty(input["value"]) == "table" {
             return .object(["status": .string(outcome.status), "target": .string("table"), "verb": .string(verb),
                             "changed": .bool(outcome.changed), "detail": .string(outcome.detail)])
         }
@@ -774,9 +768,9 @@ extension AppToolExecutor {
                                                dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot(), turn: turn) }
         catch { return ChatToolOutcome.failure(error: error, tool: "interaction_act", effects: ToolFailureError.Effects.none) }
         return await host.composerFence(
-            verb: verb, value: Self.interactionText(input["value"]), sessionId: Self.interactionText(input["session_id"]),
+            verb: verb, value: JSONValue.trimmedStringOrEmpty(input["value"]), sessionId: JSONValue.trimmedStringOrEmpty(input["session_id"]),
             reachesUser: reachesUser,
-            turnSessionId: Self.interactionText(input["__session_id"]), turn: turn
+            turnSessionId: JSONValue.trimmedStringOrEmpty(input["__session_id"]), turn: turn
         ).flatMap { Self.composerFailure($0, verb: verb) }
     }
 
@@ -837,7 +831,7 @@ extension AppToolExecutor {
     private static func attachmentPaths(_ value: JSONValue?) -> [String] {
         switch value {
         case .string(let one)?: return [one].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        case .array(let many)?: return many.map(interactionText).filter { !$0.isEmpty }
+        case .array(let many)?: return many.map(JSONValue.trimmedStringOrEmpty).filter { !$0.isEmpty }
         default: return []
         }
     }

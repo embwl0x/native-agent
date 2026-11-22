@@ -4,22 +4,15 @@ import Senses
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-#if canImport(AppKit)
 import AppKit
-#endif
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(ApplicationServices)
 import ApplicationServices
 import UserNotifications
 import Experiences
-import CryptoKit
 import os
 import CoreText
 import ScreenCaptureKit
-#endif
-// Blueprint: | `MacFusedObservation.swift` | Exact-window fusion with complete pre/post secret masks, identity checks and explicit omissions |
+// Blueprint: | `MacFusedObservation.swift` | Exact-window fusion with complete pre/post secret masks, identity checks and explicit omissions; `MacViewCapture` carries one view from the anchored read through scene, pixels and masks to publication |
 extension SwiftNativeMacControl {
     /// Picture, marks and secret inspections share one window anchor to prevent stale pairings. Acquisition timings expose gaps the caller must judge. Pixels
     /// require Screen Recording and complete AX secret coverage.
@@ -28,6 +21,19 @@ extension SwiftNativeMacControl {
         let result = read.value
         guard !read.published, case .object(var output) = result.output,
               output["view_current"] == .bool(true) else { return result }
+        // A superseded look answers with what is still true: the text, the picture and the frame it captured stand as of when it was taken.
+        // Only its click targets are lost. It stays a success with no view id, so nothing can act on its marks.
+        if result.ok, body["semantic_raw_frame"] == .bool(true) {
+            output["view"] = .null
+            output["marks"] = .array([])
+            output["mark_count"] = .int(0)
+            output["view_current"] = .bool(false)
+            output["view_note"] = .string(output["image_withheld_reason"] != nil
+                ? "The picture was not included. The screen changed while it was read, so its controls were dropped; the text read stands."
+                : "A newer frame replaced this one while it was read, so its controls no longer apply; the picture and text are as of when it was taken.")
+            return MacControlResult(ok: true, action: result.action, output: .object(output),
+                error: nil, durationMs: result.durationMs)
+        }
         output["view"] = .null
         output["frame_id"] = .null
         output["image"] = .null
@@ -49,6 +55,25 @@ extension SwiftNativeMacControl {
         let viewStartedNs = DispatchTime.now().uptimeNanoseconds
         var anchorPid: Int32?
         let walked = context.capture?.walked
+        if let refused = anchorView(body, walked: walked, anchorPid: &anchorPid, context: context) { return refused }
+        let reply = MacViewReply(started: started, now: now)
+        guard !Task.isCancelled else { return reply.cancelledResult() }
+        guard !Task.isCancelled else { return reply.cancelledResult() }
+        let viewing: MacViewCapture
+        switch await readViewWindow(body, walked: walked, anchorPid: anchorPid, viewStartedNs: viewStartedNs, context: context) {
+        case .next(let read): viewing = read
+        case .done(let result): return result
+        }
+        if let ended = chooseViewCapture(viewing, body: body, reply: reply, context: context) { return ended }
+        if let ended = await captureViewPixels(viewing, reply: reply, context: context) { return ended }
+        if let ended = await viewOutput(viewing, body: body, reply: reply, context: context) { return ended }
+        if let ended = renderViewImage(viewing, reply: reply) { return ended }
+        return await publishView(viewing, reply: reply, context: context)
+    }
+    /// A named app anchors the view to its window, without activating it.
+    private func anchorView(
+        _ body: [String: JSONValue], walked: (read: MacAXRead, seam: [String: JSONValue])?, anchorPid: inout Int32?, context: MacOperationContext
+    ) -> (MacControlResult, MacScreenViewSnapshot?)? {
         if walked == nil, let requested = body["app"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
            !requested.isEmpty {
             guard accessibilitySource(context: context).isTrusted() else { return (axUntrustedResult(action: "view"), nil) }
@@ -62,22 +87,22 @@ extension SwiftNativeMacControl {
             }
             anchorPid = app.processIdentifier
         }
-        func cancelledResult() -> (MacControlResult, MacScreenViewSnapshot?) {
-            (MacControlResult(
-                ok: false, action: "view",
-                output: .object([
-                    "view": .null, "view_current": .bool(false), "image": .null,
-                    "view_note": .string("This screen request was cancelled; no new view was published."),
-                ]),
-                error: "view_capture_cancelled",
-                durationMs: Int(now().timeIntervalSince(started) * 1000)
-            ), nil)
-        }
-        guard !Task.isCancelled else { return cancelledResult() }
-        guard !Task.isCancelled else { return cancelledResult() }
-        func elapsedMilliseconds(from start: UInt64, to end: UInt64) -> Int64 {
-            Int64((end &- start) / 1_000_000)
-        }
+        return nil
+    }
+    private func elapsedMilliseconds(from start: UInt64, to end: UInt64) -> Int64 {
+        Int64((end &- start) / 1_000_000)
+    }
+    private func discardUnboundCapture() async -> (MacControlResult, MacScreenViewSnapshot?) {
+        return (MacControlResult(ok: false, action: "view", output: .object([
+            "view": .null, "image": .null, "view_current": .bool(false),
+            "message": .string("The observed window or look generation changed; the pixel supplement was discarded."),
+        ]), error: "observation_changed", durationMs: 0), nil)
+    }
+    /// Resolve the request's limits and trust, read the anchored window once, check it against the look frame it supplements, and read its open menus.
+    private func readViewWindow(
+        _ body: [String: JSONValue], walked: (read: MacAXRead, seam: [String: JSONValue])?, anchorPid: Int32?, viewStartedNs: UInt64,
+        context: MacOperationContext
+    ) async -> MacViewStep<MacViewCapture> {
         // Visual compilation needs the frozen world pixels before human-facing numbered ink is drawn over them.
         let semanticRawFrame = body["semantic_raw_frame"] == .bool(true)
         let semanticFocusVisualSurface = body["semantic_focus_visual_surface"] == .bool(true)
@@ -117,28 +142,22 @@ extension SwiftNativeMacControl {
             case .appGone, .windowGone, .windowDrifted:
                 break
             case .rendererUnavailable(let reason):
-                return (MacControlResult(ok: false, action: "view", output: .object([
+                return .done((MacControlResult(ok: false, action: "view", output: .object([
                     "message": .string(reason), "image": .null,
-                ]), error: "renderer_accessibility_unavailable", durationMs: 0), nil)
+                ]), error: "renderer_accessibility_unavailable", durationMs: 0), nil))
             }
         }
         guard anchorPid == nil || (windowRect != nil && windowIdentity != nil) else {
-            return (MacControlResult(ok: false, action: "view", output: .object([
+            return .done((MacControlResult(ok: false, action: "view", output: .object([
                 "error": .string("named_window_unavailable"),
                 "message": .string("The named app has no readable window frame; no desktop image was substituted."),
-            ]), error: "named_window_unavailable", durationMs: 0), nil)
-        }
-        func discardUnboundCapture() async -> (MacControlResult, MacScreenViewSnapshot?) {
-            return (MacControlResult(ok: false, action: "view", output: .object([
-                "view": .null, "image": .null, "view_current": .bool(false),
-                "message": .string("The observed window or look generation changed; the pixel supplement was discarded."),
-            ]), error: "observation_changed", durationMs: 0), nil)
+            ]), error: "named_window_unavailable", durationMs: 0), nil))
         }
         if let binding {
             guard let expected = await lookFrameStore.frame(frameId: binding.frameID, context: context),
                   let identity = expected.windowIdentity, identity == windowIdentity,
                   now().timeIntervalSince(expected.capturedAt) <= MacLookFrameStore.ttlSeconds else {
-                return await discardUnboundCapture()
+                return .done(await discardUnboundCapture())
             }
         }
         let isolatedWindow = anchorPid != nil || binding != nil
@@ -146,7 +165,24 @@ extension SwiftNativeMacControl {
             MacTransientMenus.read(source: accessibilitySource(context: context), pid: $0.processIdentifier, context: context)
         } ?? []
         let axSnapshotFinishedNs = DispatchTime.now().uptimeNanoseconds
-        guard !Task.isCancelled else { return cancelledResult() }
+        return .next(MacViewCapture(viewStartedNs: viewStartedNs, semanticRawFrame: semanticRawFrame,
+            semanticFocusVisualSurface: semanticFocusVisualSurface, scope: scope, limits: limits, maxMarks: maxMarks, maxImageBytes: maxImageBytes,
+            accessibilityTrusted: accessibilityTrusted, screenTrusted: screenTrusted, axSnapshotStartedNs: axSnapshotStartedNs, binding: binding,
+            windowRect: windowRect, app: app, windowTitle: windowTitle, snapshot: snapshot, redactionRoot: redactionRoot,
+            windowIdentity: windowIdentity, axSelfRefused: axSelfRefused, isolatedWindow: isolatedWindow, transientMenus: transientMenus,
+            axSnapshotFinishedNs: axSnapshotFinishedNs))
+    }
+    /// Select marks and text from the AX read, then decide whether this view needs pixels: thin accessibility, a visual surface, or a request.
+    private func chooseViewCapture(
+        _ viewing: MacViewCapture, body: [String: JSONValue], reply: MacViewReply, context: MacOperationContext
+    ) -> (MacControlResult, MacScreenViewSnapshot?)? {
+        let semanticRawFrame = viewing.semanticRawFrame
+        let semanticFocusVisualSurface = viewing.semanticFocusVisualSurface
+        let accessibilityTrusted = viewing.accessibilityTrusted
+        let windowRect = viewing.windowRect
+        let app = viewing.app
+        let snapshot = viewing.snapshot
+        guard !Task.isCancelled else { return reply.cancelledResult() }
         // Keep menus structural: a display-region screenshot could disclose other apps’ pixels.
         let captureRect = windowRect
         // Without pixels, the window rect still anchors a complete legend at one point per pixel.
@@ -162,39 +198,15 @@ extension SwiftNativeMacControl {
             )
         }()
         // Build controls and prose even without pixels so semantic actions remain usable.
-        var sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
-        var sceneSelectionFinishedNs = sceneSelectionStartedNs
-        var selection = MacScreenViewBuilder.Selection(marks: [], omitted: 0, offscreen: 0)
-        var text = MacScreenViewBuilder.TextSelection(items: [], omitted: 0)
-        var marks: [JSONValue] = []
-        var texts: [JSONValue] = []
-        func select(in geometry: MacScreenViewGeometry?) {
-            sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
-            defer { sceneSelectionFinishedNs = DispatchTime.now().uptimeNanoseconds }
-            guard let snapshot, let geometry else { return }
-            selection = MacScreenViewBuilder.select(
-                nodes: snapshot.nodes,
-                geometry: geometry,
-                maxMarks: maxMarks,
-                settableAttributes: { node in
-                    node.element.map { accessibilitySource(context: context).settableAttributes(of: $0, context: context) } ?? []
-                }
-            , context: context)
-            text = MacScreenViewBuilder.visibleText(
-                nodes: snapshot.nodes,
-                geometry: geometry,
-                limit: body["max_text_items"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacScreenViewBuilder.hardMaxTextItems
-            )
-            marks = selection.marks.map { $0.toJSON(valueChars: limits.valueChars) }
-            texts = text.items.map { $0.toJSON(valueChars: limits.valueChars) }
-        }
+        viewing.sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
+        viewing.sceneSelectionFinishedNs = viewing.sceneSelectionStartedNs
         // Choose capture from the AX read before numbering; thin views need pixels only for uncovered recognition or requested delivery.
         var thinReason: String?
         var recognizesPixels = false
         var semanticFocusFrame: MacAXFrame?
         var pictured = true
         if semanticRawFrame {
-            select(in: axGeometry)
+            selectScene(viewing, in: axGeometry, body: body, context: context)
             let words = (snapshot?.nodes ?? []).filter { MacPerceptionCompiler.readoutRoles.contains($0.attributes.role) }
                 .compactMap { $0.attributes.title ?? $0.attributes.value }
                 .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -202,13 +214,13 @@ extension SwiftNativeMacControl {
                 semanticFocusFrame = MacScreenViewBuilder.dominantVisualSurface(nodes: snapshot.nodes, geometry: axGeometry)
             }
             // Renderer AX owns Chromium content; pixels cannot conceal an incomplete or pending read.
-            let canvas = semanticFocusFrame ?? selection.marks
+            let canvas = semanticFocusFrame ?? viewing.selection.marks
                 .filter { MacScreenViewBuilder.visualSurfaceRoles.contains($0.role) }.map(\.frame)
                 .max { $0.w * $0.h < $1.w * $1.h }
             let windowArea = axGeometry.map { $0.bounds.w * $0.bounds.h } ?? 0
             let canvasFraction = canvas.flatMap { windowArea > 0 ? min(1, $0.w * $0.h / windowArea) : nil }
             let chromium: Bool
-            do { chromium = try MacChromiumAccessibility.looksChromium(bundleId: app?.bundleIdentifier, pid: app?.processIdentifier, snapshot: nil) }
+            do { chromium = try MacChromiumAccessibility.looksChromium(bundleId: app?.bundleIdentifier, pid: app?.processIdentifier) }
             catch {
                 return (MacControlResult(ok: false, action: "view",
                     output: .object(["message": .string(error.localizedDescription), "view_current": .bool(false)]),
@@ -216,18 +228,59 @@ extension SwiftNativeMacControl {
             }
             thinReason = chromium
                 || snapshot?.truncated == true ? nil : MacScreenViewBuilder.thinAccessibilityReason(
-                    accessibilityTrusted: accessibilityTrusted, marks: marks, texts: texts, windowArea: windowArea,
+                    accessibilityTrusted: accessibilityTrusted, marks: viewing.marks, texts: viewing.texts, windowArea: windowArea,
                     canvasFraction: canvasFraction,
                     sourceTextCount: words.count, sourceTextCharacters: words.reduce(0) { $0 + $1.count })
             // Recognition earns its latency only on sparse marks or real visual surfaces.
             recognizesPixels = thinReason != nil
-                && (!accessibilityTrusted || selection.marks.count <= 6 || (canvasFraction ?? 0) >= 0.03)
+                && (!accessibilityTrusted || viewing.selection.marks.count <= 6 || (canvasFraction ?? 0) >= 0.03)
             pictured = body["pixels"] == .string("always") || recognizesPixels
                 || thinReason != nil && body["pixels"] == .string("thin")
         }
         let recognizesText = semanticRawFrame && app?.bundleIdentifier != nil
             && context.appCapture != nil
-        guard !Task.isCancelled else { return cancelledResult() }
+        guard !Task.isCancelled else { return reply.cancelledResult() }
+        viewing.axGeometry = axGeometry
+        viewing.thinReason = thinReason
+        viewing.recognizesPixels = recognizesPixels
+        viewing.semanticFocusFrame = semanticFocusFrame
+        viewing.pictured = pictured
+        viewing.recognizesText = recognizesText
+        return nil
+    }
+    /// Number the marks and visible text within one geometry; the scene's selection clock brackets the work.
+    private func selectScene(_ viewing: MacViewCapture, in geometry: MacScreenViewGeometry?, body: [String: JSONValue], context: MacOperationContext) {
+        let snapshot = viewing.snapshot
+        let maxMarks = viewing.maxMarks
+        let limits = viewing.limits
+        viewing.sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
+        defer { viewing.sceneSelectionFinishedNs = DispatchTime.now().uptimeNanoseconds }
+        guard let snapshot, let geometry else { return }
+        viewing.selection = MacScreenViewBuilder.select(
+            nodes: snapshot.nodes,
+            geometry: geometry,
+            maxMarks: maxMarks,
+            settableAttributes: { node in
+                node.element.map { accessibilitySource(context: context).settableAttributes(of: $0, context: context) } ?? []
+            }
+        , context: context)
+        viewing.text = MacScreenViewBuilder.visibleText(
+            nodes: snapshot.nodes,
+            geometry: geometry,
+            limit: body["max_text_items"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacScreenViewBuilder.hardMaxTextItems
+        )
+        viewing.marks = viewing.selection.marks.map { $0.toJSON(valueChars: limits.valueChars) }
+        viewing.texts = viewing.text.items.map { $0.toJSON(valueChars: limits.valueChars) }
+    }
+    /// Inspect the pixel owner's secret fields, capture its window, and inspect again; the capture binds to that window and lifetime or is withheld.
+    private func captureViewPixels(_ viewing: MacViewCapture, reply: MacViewReply, context: MacOperationContext) async -> (MacControlResult, MacScreenViewSnapshot?)? {
+        let accessibilityTrusted = viewing.accessibilityTrusted
+        let app = viewing.app
+        let windowIdentity = viewing.windowIdentity
+        let redactionRoot = viewing.redactionRoot
+        let windowRect = viewing.windowRect
+        let pictured = viewing.pictured
+        let recognizesText = viewing.recognizesText
         // Both complete secret inspections and pixel release share one bounded transaction; presentation caps cannot limit disclosure coverage.
         let disclosureDeadline = now().addingTimeInterval(MacAXLimits.readSeconds)
         var redactionNodes: [MacAXNode] = []
@@ -252,9 +305,11 @@ extension SwiftNativeMacControl {
             }
         }
         var coverageFailure: String?
+        // Under Full Mac nothing is masked: an incomplete masking walk costs her marks, never her pixels.
         if pictured || recognizesText {
             do { redactionNodes = try inspectPixelOwner() }
-            catch { coverageFailure = (error as? SenseFailure)?.message ?? error.localizedDescription }
+            catch let error where !context.seesAsPerson { coverageFailure = (error as? SenseFailure)?.message ?? error.localizedDescription }
+            catch {}
         }
         let capturedAt = now()
         let screenCaptureStartedNs = DispatchTime.now().uptimeNanoseconds
@@ -271,11 +326,12 @@ extension SwiftNativeMacControl {
                 coverageFailure = "No anchored window is available for capture."
             }
         }
-        guard !Task.isCancelled else { return cancelledResult() }
+        guard !Task.isCancelled else { return reply.cancelledResult() }
         if pictured || recognizesText, coverageFailure == nil, let shot {
             do {
-                postRedactionNodes = try inspectPixelOwner()
-                guard now() < disclosureDeadline, MacAXWindowIdentity.rectsMatch(shot.bounds, windowRect),
+                do { postRedactionNodes = try inspectPixelOwner() }
+                catch { guard context.seesAsPerson else { throw error } }
+                guard context.seesAsPerson || now() < disclosureDeadline, MacAXWindowIdentity.rectsMatch(shot.bounds, windowRect),
                   let provenance = shot.capture, provenance.capturedAt >= capturedAt,
                   provenance.capturedAt <= now(), provenance.windows.count == 1,
                   let capturedWindow = provenance.windows.first,
@@ -291,6 +347,48 @@ extension SwiftNativeMacControl {
             }
         }
         let screenCaptureFinishedNs = DispatchTime.now().uptimeNanoseconds
+        // The deadline keeps masks and pixels one coherent disclosure; under Full Mac there are no masks to keep coherent.
+        viewing.disclosureDeadline = context.seesAsPerson ? .distantFuture : disclosureDeadline
+        viewing.redactionNodes = redactionNodes
+        viewing.postRedactionNodes = postRedactionNodes
+        viewing.imageTargets = imageTargets
+        viewing.coverageFailure = coverageFailure
+        viewing.capturedAt = capturedAt
+        viewing.screenCaptureStartedNs = screenCaptureStartedNs
+        viewing.shot = shot
+        viewing.imageFailure = imageFailure
+        viewing.screenCaptureFinishedNs = screenCaptureFinishedNs
+        return nil
+    }
+    /// Open the output with trust, timing and pointer facts; select against the picture's geometry; mask secrets; recognize the window's text.
+    private func viewOutput(
+        _ viewing: MacViewCapture, body: [String: JSONValue], reply: MacViewReply, context: MacOperationContext
+    ) async -> (MacControlResult, MacScreenViewSnapshot?)? {
+        let isolatedWindow = viewing.isolatedWindow
+        let capturedAt = viewing.capturedAt
+        let accessibilityTrusted = viewing.accessibilityTrusted
+        let screenTrusted = viewing.screenTrusted
+        let scope = viewing.scope
+        let app = viewing.app
+        let transientMenus = viewing.transientMenus
+        let windowTitle = viewing.windowTitle
+        let limits = viewing.limits
+        let axSnapshotStartedNs = viewing.axSnapshotStartedNs
+        let axSnapshotFinishedNs = viewing.axSnapshotFinishedNs
+        let screenCaptureStartedNs = viewing.screenCaptureStartedNs
+        let screenCaptureFinishedNs = viewing.screenCaptureFinishedNs
+        let thinReason = viewing.thinReason
+        let recognizesPixels = viewing.recognizesPixels
+        let axSelfRefused = viewing.axSelfRefused
+        let shot = viewing.shot
+        let axGeometry = viewing.axGeometry
+        let semanticRawFrame = viewing.semanticRawFrame
+        let pictured = viewing.pictured
+        let recognizesText = viewing.recognizesText
+        let redactionNodes = viewing.redactionNodes
+        let postRedactionNodes = viewing.postRedactionNodes
+        let disclosureDeadline = viewing.disclosureDeadline
+        var coverageFailure = viewing.coverageFailure
         let observedPointer = isolatedWindow ? nil : pointerPositionSource.currentPosition()
         let fusionGapMs = Int(abs(now().timeIntervalSince(capturedAt)) * 1000)
         var output: [String: JSONValue] = [
@@ -329,8 +427,8 @@ extension SwiftNativeMacControl {
         }
         // Use picture geometry when present; otherwise the window rect anchors fusion.
         let geometry = shot.map { MacScreenViewGeometry(shot: $0) } ?? axGeometry
-        if !semanticRawFrame { select(in: geometry) }
-        guard !Task.isCancelled else { return cancelledResult() }
+        if !semanticRawFrame { selectScene(viewing, in: geometry, body: body, context: context) }
+        guard !Task.isCancelled else { return reply.cancelledResult() }
         var secrets: [MacAXFrame] = []
         if pictured || recognizesText, coverageFailure == nil, let shot {
             let renderGeometry = MacScreenViewGeometry(shot: shot)
@@ -358,8 +456,34 @@ extension SwiftNativeMacControl {
             } catch {
                 windowTextFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
             }
-            guard !Task.isCancelled else { return cancelledResult() }
+            guard !Task.isCancelled else { return reply.cancelledResult() }
         }
+        viewing.output = output
+        viewing.geometry = geometry
+        viewing.secrets = secrets
+        viewing.coverageFailure = coverageFailure
+        viewing.recognizedWindowText = recognizedWindowText
+        viewing.windowTextFailure = windowTextFailure
+        return nil
+    }
+    /// Render and fit the picture with its masks (and marks, unless raw), release it only within the disclosure deadline, and state its geometry.
+    private func renderViewImage(_ viewing: MacViewCapture, reply: MacViewReply) -> (MacControlResult, MacScreenViewSnapshot?)? {
+        let pictured = viewing.pictured
+        let shot = viewing.shot
+        let semanticRawFrame = viewing.semanticRawFrame
+        let selection = viewing.selection
+        let secrets = viewing.secrets
+        let maxImageBytes = viewing.maxImageBytes
+        let disclosureDeadline = viewing.disclosureDeadline
+        let redactionNodes = viewing.redactionNodes
+        let postRedactionNodes = viewing.postRedactionNodes
+        let imageTargets = viewing.imageTargets
+        let semanticFocusFrame = viewing.semanticFocusFrame
+        let app = viewing.app
+        let geometry = viewing.geometry
+        var output = viewing.output
+        var imageFailure = viewing.imageFailure
+        var coverageFailure = viewing.coverageFailure
         // Perception retains the whole observation; delivery crops or fits only after recognition and selection.
         var imageDownscale: Double?
         var imageBytes: Int?
@@ -379,7 +503,7 @@ extension SwiftNativeMacControl {
                 let fitted = semanticRawFrame
                     ? encode(1).map { (data: $0, downscale: 1.0) }
                     : MacScreenViewBuilder.fitImage(maxBytes: maxImageBytes, encode: encode)
-                guard !Task.isCancelled else { return cancelledResult() }
+                guard !Task.isCancelled else { return reply.cancelledResult() }
                 if let fitted {
                     guard now() < disclosureDeadline else {
                         throw SenseFailure(code: "redaction_coverage_unavailable", message: "The disclosure deadline expired before image release.")
@@ -454,8 +578,45 @@ extension SwiftNativeMacControl {
                 ])
             }
         }
+        viewing.output = output
+        viewing.imageFailure = imageFailure
+        viewing.coverageFailure = coverageFailure
+        viewing.imageRenderFinishedNs = imageRenderFinishedNs
+        return nil
+    }
+    /// Bind the view to its look frame, withhold pixels whose coverage failed, retain recognized text, and publish the view with its coverage.
+    private func publishView(_ viewing: MacViewCapture, reply: MacViewReply, context: MacOperationContext) async -> (MacControlResult, MacScreenViewSnapshot?) {
+        let started = reply.started
+        let viewStartedNs = viewing.viewStartedNs
+        let capturedAt = viewing.capturedAt
+        let scope = viewing.scope
+        let geometry = viewing.geometry
+        let app = viewing.app
+        let windowTitle = viewing.windowTitle
+        let selection = viewing.selection
+        let windowIdentity = viewing.windowIdentity
+        let binding = viewing.binding
+        let pictured = viewing.pictured
+        let shot = viewing.shot
+        let disclosureDeadline = viewing.disclosureDeadline
+        let recognizesText = viewing.recognizesText
+        let recognizedWindowText = viewing.recognizedWindowText
+        let windowTextFailure = viewing.windowTextFailure
+        let marks = viewing.marks
+        let maxMarks = viewing.maxMarks
+        let texts = viewing.texts
+        let text = viewing.text
+        let snapshot = viewing.snapshot
+        let transientMenus = viewing.transientMenus
+        let sceneSelectionStartedNs = viewing.sceneSelectionStartedNs
+        let sceneSelectionFinishedNs = viewing.sceneSelectionFinishedNs
+        let imageRenderFinishedNs = viewing.imageRenderFinishedNs
+        let accessibilityTrusted = viewing.accessibilityTrusted
+        let imageFailure = viewing.imageFailure
+        var output = viewing.output
+        var coverageFailure = viewing.coverageFailure
         // Marks are bound to this view id; refuse another view’s id rather than reinterpret its numbers.
-        guard !Task.isCancelled else { return cancelledResult() }
+        guard !Task.isCancelled else { return reply.cancelledResult() }
         let viewId = UUID().uuidString
         let capturedView = MacScreenViewSnapshot(
             viewId: viewId,
@@ -573,5 +734,113 @@ extension SwiftNativeMacControl {
             error: ok ? nil : imageFailure?.rawValue ?? "no_perception_available",
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         ), capturedView)
+    }
+}
+
+/// A view stage either goes on with what it read or ends the view with its reply.
+private enum MacViewStep<Value> {
+    case next(Value)
+    case done((MacControlResult, MacScreenViewSnapshot?))
+}
+
+/// The view's clock: its cancelled reply is timed from when the view began.
+private struct MacViewReply {
+    let started: Date
+    let now: @Sendable () -> Date
+    func cancelledResult() -> (MacControlResult, MacScreenViewSnapshot?) {
+        (MacControlResult(
+            ok: false, action: "view",
+            output: .object([
+                "view": .null, "view_current": .bool(false), "image": .null,
+                "view_note": .string("This screen request was cancelled; no new view was published."),
+            ]),
+            error: "view_capture_cancelled",
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
+        ), nil)
+    }
+}
+
+/// One view's capture, from the anchored AX read through the scene, the pixels and their masks to publication. It lives for one call and never
+/// crosses isolation.
+private final class MacViewCapture {
+    let viewStartedNs: UInt64
+    let semanticRawFrame: Bool
+    let semanticFocusVisualSurface: Bool
+    let scope: MacScreenCaptureScope
+    let limits: MacAXLimits
+    let maxMarks: Int
+    let maxImageBytes: Int
+    let accessibilityTrusted: Bool
+    let screenTrusted: Bool
+    let axSnapshotStartedNs: UInt64
+    let binding: MacSightCaptureBinding?
+    let windowRect: MacAXFrame?
+    let app: MacAXAppInfo?
+    let windowTitle: String?
+    let snapshot: MacAXTreeSnapshot?
+    let redactionRoot: MacAXElementRef?
+    let windowIdentity: MacAXWindowIdentity?
+    let axSelfRefused: Bool
+    let isolatedWindow: Bool
+    let transientMenus: [MacTransientMenus.Menu]
+    let axSnapshotFinishedNs: UInt64
+    // The scene: set when the capture is chosen; the selection is renumbered against the picture's geometry.
+    var axGeometry: MacScreenViewGeometry?
+    var sceneSelectionStartedNs: UInt64 = 0
+    var sceneSelectionFinishedNs: UInt64 = 0
+    var selection = MacScreenViewBuilder.Selection(marks: [], omitted: 0, offscreen: 0)
+    var text = MacScreenViewBuilder.TextSelection(items: [], omitted: 0)
+    var marks: [JSONValue] = []
+    var texts: [JSONValue] = []
+    var thinReason: String?
+    var recognizesPixels = false
+    var semanticFocusFrame: MacAXFrame?
+    var pictured = true
+    var recognizesText = false
+    // The pixels: set when they are captured under the disclosure deadline.
+    var disclosureDeadline = Date.distantPast
+    var redactionNodes: [MacAXNode] = []
+    var postRedactionNodes: [MacAXNode] = []
+    var imageTargets: [MacImageCapture.PointTarget] = []
+    var coverageFailure: String?
+    var capturedAt = Date.distantPast
+    var screenCaptureStartedNs: UInt64 = 0
+    var shot: MacScreenShot?
+    var imageFailure: MacScreenCaptureFailure?
+    var screenCaptureFinishedNs: UInt64 = 0
+    // The output: opened after the capture, completed by the image and the publication.
+    var output: [String: JSONValue] = [:]
+    var geometry: MacScreenViewGeometry?
+    var secrets: [MacAXFrame] = []
+    var recognizedWindowText: (rows: JSONValue, text: String)?
+    var windowTextFailure: String?
+    var imageRenderFinishedNs: UInt64 = 0
+
+    init(viewStartedNs: UInt64, semanticRawFrame: Bool, semanticFocusVisualSurface: Bool, scope: MacScreenCaptureScope, limits: MacAXLimits,
+         maxMarks: Int, maxImageBytes: Int, accessibilityTrusted: Bool, screenTrusted: Bool, axSnapshotStartedNs: UInt64,
+         binding: MacSightCaptureBinding?, windowRect: MacAXFrame?, app: MacAXAppInfo?, windowTitle: String?, snapshot: MacAXTreeSnapshot?,
+         redactionRoot: MacAXElementRef?, windowIdentity: MacAXWindowIdentity?, axSelfRefused: Bool, isolatedWindow: Bool,
+         transientMenus: [MacTransientMenus.Menu], axSnapshotFinishedNs: UInt64) {
+        self.viewStartedNs = viewStartedNs
+        self.semanticRawFrame = semanticRawFrame
+        self.semanticFocusVisualSurface = semanticFocusVisualSurface
+        self.scope = scope
+        self.limits = limits
+        self.maxMarks = maxMarks
+        self.maxImageBytes = maxImageBytes
+        self.accessibilityTrusted = accessibilityTrusted
+        self.screenTrusted = screenTrusted
+        self.axSnapshotStartedNs = axSnapshotStartedNs
+        self.binding = binding
+        self.windowRect = windowRect
+        self.app = app
+        self.windowTitle = windowTitle
+        self.snapshot = snapshot
+        self.redactionRoot = redactionRoot
+        self.windowIdentity = windowIdentity
+        self.axSelfRefused = axSelfRefused
+        self.isolatedWindow = isolatedWindow
+        self.transientMenus = transientMenus
+        self.axSnapshotFinishedNs = axSnapshotFinishedNs
     }
 }

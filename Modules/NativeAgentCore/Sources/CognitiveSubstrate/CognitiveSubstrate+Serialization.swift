@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Serialization.swift` | `CognitiveArtifactCodec`, `cleanedSessionId`: checked evidence decoding |
@@ -127,6 +128,7 @@ enum CognitiveArtifactCodec {
             }
         case "dream_residue":
             try strings("claimKeys")
+            try strings("unconfirmedKeys")
             let residueKeys = ["valence", "mintedAt", "turnsRemaining"]
             if residueKeys.contains(where: { object[$0] != nil }) {
                 guard number(object, "valence", range: -1...1), number(object, "mintedAt"),
@@ -347,8 +349,7 @@ extension CognitiveDevelopmentalTimelineEvent {
 
 extension CognitiveSubstrate {
     nonisolated static func cleanedSessionId(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == true ? nil : trimmed
+        value.trimmedNonEmpty
     }
 }
 

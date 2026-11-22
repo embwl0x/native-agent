@@ -12,8 +12,7 @@ import ChatTurnContracts
 public struct NativeChatTurnOptions: Sendable, Equatable {
     /// The picker and Core share normalization so the displayed persona matches the compiled one.
     public static func normalizedPickerPersona(_ raw: String?, fallback: String = "canonical") -> String {
-        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? fallback : trimmed
+        raw.trimmedNonEmpty ?? fallback
     }
 }
 

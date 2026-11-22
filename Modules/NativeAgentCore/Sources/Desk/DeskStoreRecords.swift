@@ -145,11 +145,7 @@ struct DeskNonTerminalRecord: Sendable, Equatable {
               case .string(let raw)? = obj["status"],
               let status = DeskStatus(rawValue: raw), !status.isTerminal,
               DeskJSON.optionalStringsAreValid(obj, keys: ["blockedReason", "waitingOn"]) else { return nil }
-        func str(_ k: String) -> String? {
-            if case .string(let s)? = obj[k] { return s }
-            return nil
-        }
-        return DeskNonTerminalRecord(status: status, blockedReason: str("blockedReason"), waitingOn: str("waitingOn"))
+        return DeskNonTerminalRecord(status: status, blockedReason: obj["blockedReason"]?.stringValue, waitingOn: obj["waitingOn"]?.stringValue)
     }
 }
 

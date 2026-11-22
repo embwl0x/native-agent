@@ -2,17 +2,11 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import IOKit.hidsystem
-import CryptoKit
 import AppKit
 import IOKit.hidsystem
 // Blueprint: | `MacControl+SystemActions.swift` | Lossless file windows, checked mutations, scoped Spotlight, exact media and per-event app scripts |
-#endif
 
 extension SwiftNativeMacControl {
     // MARK: file/read
@@ -51,11 +45,7 @@ extension SwiftNativeMacControl {
             ]), error: failure.rawValue, durationMs: Int(now().timeIntervalSince(started) * 1000))
         }
         let sha256Hex: String
-        #if canImport(CryptoKit)
-        sha256Hex = SHA256.hash(data: window.data).map { String(format: "%02x", $0) }.joined()
-        #else
-        sha256Hex = ""
-        #endif
+        sha256Hex = SHA256Hex.of(window.data)
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
         return MacControlResult(
             ok: true,
@@ -338,7 +328,6 @@ extension SwiftNativeMacControl {
                 "message": .string("No idempotent playback action was sent. Use the player's own action; toggle explicitly requests a play/pause toggle.")
             ]), error: "playback_owner_unavailable", durationMs: 0)
         }
-        #if canImport(AppKit)
         let started = now()
         let key = ["next", "skip"].contains(action) ? NX_KEYTYPE_NEXT : action == "previous" ? NX_KEYTYPE_PREVIOUS : NX_KEYTYPE_PLAY
         let events = [0xA, 0xB].compactMap { state in
@@ -374,9 +363,6 @@ extension SwiftNativeMacControl {
                     change.
                     """)]),
             error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
-        #else
-        throw MacControlError.malformedResponse("system media keys require macOS")
-        #endif
     }
 
     // MARK: applescript
@@ -537,7 +523,6 @@ extension SwiftNativeMacControl {
                 durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
         }
-        #if canImport(AppKit)
         guard pid > 0, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
             return finish("app_gone")
         }
@@ -614,9 +599,6 @@ extension SwiftNativeMacControl {
             "focused_window_matches": .bool(true),
             "window_frame": chosen.identity.frame?.toJSON() ?? .null,
         ])
-        #else
-        return finish("unsupported")
-        #endif
     }
 
     /// Launch Services acceptance is transport evidence, not settlement. The result stays explicitly unverified; the four-verb surface follows this operation

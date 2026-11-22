@@ -65,7 +65,7 @@ public extension CognitiveSubstrate {
             throw CognitiveArtifactCodec.FieldFailure(path: "studio_journal:\(entry.id).recordedAt")
         }
         // A continuity node names the act and points to the journal; copying the judgment would create competing records.
-        let summary = "Journal entry on \(bounded(title, maxCharacters: 120)) "
+        let summary = "Journal entry on \(TextClipping.prefixOrWhole(title, maxCharacters: 120)) "
             + "— stance \(entry.stance.kind.rawValue)."
         return CognitiveEvent(
             id: "studio_journal:\(entry.id)",
@@ -73,7 +73,7 @@ public extension CognitiveSubstrate {
             subject: CognitiveSubjectReference(
                 type: "studio_entry",
                 id: entry.id,
-                label: bounded(title, maxCharacters: 120)
+                label: TextClipping.prefixOrWhole(title, maxCharacters: 120)
             ),
             sourceClass: .selfReported,
             occurredAt: occurredAt,

@@ -15,9 +15,6 @@ import Transcripts
 import TurnTrace
 // Blueprint: | `DreamBackgroundWork.swift` | Dream and REM settlement; care and growth approvals tell their one ForPerson face |
 
-/// The app's notification delivery, after the Core-owned REM card is durable.
-public typealias REMProposalNotificationPort = BackgroundWorkNotificationPort
-
 // MARK: - Dreams and Memory Loops
 
 public enum DreamBackgroundWork {
@@ -29,7 +26,6 @@ public enum DreamBackgroundWork {
         cognitionRuntime: NativeCognitionRuntime,
         force: Bool,
         trigger: DreamTrigger,
-        notifications: any REMProposalNotificationPort,
         parent: Turn,
         beganAt: Date
     ) async throws -> DreamReport {
@@ -37,7 +33,7 @@ public enum DreamBackgroundWork {
         let report: DreamReport
         do {
             report = try await dream(dataRoot: dataRoot, cycle: cycle, cognitionRuntime: cognitionRuntime, force: force,
-                                     trigger: trigger, notifications: notifications, parent: parent, beganAt: beganAt)
+                                     trigger: trigger, parent: parent, beganAt: beganAt)
         } catch {
             beatThrown(dreamOrgan, error, note: asked, cadence: dreamCadence)
             throw error
@@ -78,7 +74,6 @@ public enum DreamBackgroundWork {
         cognitionRuntime: NativeCognitionRuntime,
         force: Bool,
         trigger: DreamTrigger,
-        notifications: any REMProposalNotificationPort,
         parent: Turn,
         beganAt: Date
     ) async throws -> DreamReport {
@@ -111,8 +106,7 @@ public enum DreamBackgroundWork {
                     return .skipped("inner life off")
                 }
                 do {
-                    try await passCaresNight(night, dataRoot: dataRoot, cognitionRuntime: cognitionRuntime,
-                        notifications: notifications)
+                    try await passCaresNight(night, dataRoot: dataRoot, cognitionRuntime: cognitionRuntime)
                 } catch let error as CognitiveWriteDiscarded {
                     if let epoch = night.mindEpoch,
                        await cognitionRuntime.substrateForIntegration().forgettingEpochs().mind != epoch {
@@ -142,8 +136,7 @@ public enum DreamBackgroundWork {
 
     /// Apply approved life depth before the substrate pass; offer each newly eligible care only once.
     static func passCaresNight(
-        _ night: CognitiveCareNight, dataRoot: URL, cognitionRuntime: NativeCognitionRuntime,
-        notifications: any REMProposalNotificationPort
+        _ night: CognitiveCareNight, dataRoot: URL, cognitionRuntime: NativeCognitionRuntime
     ) async throws {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let action = CognitiveSubstrate.careLifeApprovalAction
@@ -257,12 +250,11 @@ public enum DreamBackgroundWork {
     public static func stagePendingREMProposalsAtLaunch(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         limit: Int = remStagingCatchUpLimit,
-        stager: REMApprovalStager? = nil,
-        notifications: any REMProposalNotificationPort
+        stager: REMApprovalStager? = nil
     ) async -> Int {
         guard limit > 0 else { return 0 }
         let store = REMProposalStore(dataRoot: dataRoot)
-        let inner = stager ?? makeREMProposalStager(dataRoot: dataRoot, notifications: notifications)
+        let inner = stager ?? makeREMProposalStager(dataRoot: dataRoot)
         do {
             return try await store.stagePendingApprovals(inner, limit: limit)
         } catch {
@@ -271,7 +263,7 @@ public enum DreamBackgroundWork {
         }
     }
 
-    public static func makeREMProposalStager(dataRoot: URL, notifications: any REMProposalNotificationPort) -> REMApprovalStager {
+    public static func makeREMProposalStager(dataRoot: URL) -> REMApprovalStager {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
         return { row, experiences in
@@ -393,7 +385,7 @@ public enum DreamBackgroundWork {
                 let text = rec.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if text.isEmpty { continue }
                 // Only absorption after the dream’s high-water mark is new material.
-                if let parsed = ConversationHistory.parseTimestamp(.string(rec.createdAt)),
+                if let parsed = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(rec.createdAt),
                    parsed < cutoff {
                     continue
                 }

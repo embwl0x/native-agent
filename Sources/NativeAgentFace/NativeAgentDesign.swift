@@ -1,7 +1,7 @@
 import NativeAgentShared
 import SwiftUI
 import AppKit
-// Blueprint: | `NativeAgentDesign.swift` | `View`: `settingsCardSurface`; centered shell layout and shared surfaces |
+// Blueprint: | `NativeAgentDesign.swift` | Centered shell layout and shared surfaces |
 
 extension View {
     func sheetCloseButton() -> some View {
@@ -9,13 +9,6 @@ extension View {
             .buttonBorderShape(.circle)
             .foregroundStyle(Color(nsColor: .controlTextColor))
             .accessibilityLabel("Close")
-    }
-
-    func settingsCardSurface() -> some View {
-        self
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .aliveCard()
-            .accessibilityElement(children: .contain)
     }
 
     func houseInset<S: Shape>(in shape: S) -> some View {
@@ -158,16 +151,16 @@ struct PulsingDot: View {
 // MARK: - The shell
 
 enum NativeAgentShell {
-    static let room       = dynamic(dark: 0x12161F, light: 0xF7F6F3)
-    static let rail       = dynamic(dark: 0x121315, light: 0xF3F2EF)
-    static let list       = dynamic(dark: 0x17181B, light: 0xF5F4F1)
+    static let room       = Color.adaptive(dark: 0x12161F, light: 0xF7F6F3)
+    static let rail       = Color.adaptive(dark: 0x121315, light: 0xF3F2EF)
+    static let list       = Color.adaptive(dark: 0x17181B, light: 0xF5F4F1)
     static let text       = Color(nsColor: .labelColor)
     static let secondary  = Color(nsColor: .secondaryLabelColor)
     static let tertiary   = Color(nsColor: .tertiaryLabelColor)
     // Clear 4.5:1 on every shell surface; reserve teal for approvals.
-    static let needsYou   = dynamic(dark: 0x06B6D4, light: 0x0B5F76)
-    static let trouble    = dynamic(dark: 0xFF9F0A, light: 0x864800)
-    static let calm       = dynamic(dark: 0x34C759, light: 0x136224)
+    static let needsYou   = Color.adaptive(dark: 0x06B6D4, light: 0x0B5F76)
+    static let trouble    = Color.adaptive(dark: 0xFF9F0A, light: 0x864800)
+    static let calm       = Color.adaptive(dark: 0x34C759, light: 0x136224)
 
     static let softFill   = primaryTint(dark: 0.08, light: 0.11)
     static let quietFill  = Color(nsColor: .quaternarySystemFill)
@@ -178,13 +171,6 @@ enum NativeAgentShell {
         Color(nsColor: NSColor(name: nil) { appearance in
             let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             return isDark ? NSColor.white.withAlphaComponent(dark) : NSColor.black.withAlphaComponent(light)
-        })
-    }
-
-    private static func dynamic(dark: UInt, light: UInt) -> Color {
-        Color(nsColor: NSColor(name: nil) { appearance in
-            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            return NSColor(Color(hex: isDark ? dark : light))
         })
     }
 }
@@ -308,9 +294,6 @@ enum NativeAgentShellLayout {
 struct NativeEmptyState: View {
     var title: String
     var detail: String
-    var actionTitle: String?
-    var actionIsDisabled = false
-    var action: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
@@ -324,12 +307,6 @@ struct NativeEmptyState: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            }
-
-            if let actionTitle, let action {
-                Button(actionTitle, action: action)
-                    .buttonStyle(.bordered)
-                    .disabled(actionIsDisabled)
             }
         }
         .padding(NativeAgentSpacing.xl)

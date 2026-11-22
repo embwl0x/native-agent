@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
@@ -33,6 +34,8 @@ struct TelegramUpdateClaim: Sendable, Codable, Equatable {
     /// An admitted retry retains its resolved request and conversation.
     var resolvedRetryText: String?
     var resolvedRetryMessage: TelegramMessage?
+    /// The source conversation was checked before the retry was pinned.
+    var resolvedRetrySourceSessionId: String? = nil
     var resolvedSessionId: String?
     let claimedAt: String
     var updatedAt: String
@@ -50,7 +53,7 @@ extension TelegramUpdateClaim {
     enum CodingKeys: String, CodingKey {
         case schemaVersion, lifeID, updateId, update, phase, assistantDelivery, assistantRunId, assistantSessionId,
             assistantOriginRunId, settledAssistantRuns, noRecoverableAnswer, failedBeforeAnswer, quarantineReason,
-            resolvedRetryText, resolvedRetryMessage, resolvedSessionId, claimedAt, updatedAt
+            resolvedRetryText, resolvedRetryMessage, resolvedRetrySourceSessionId, resolvedSessionId, claimedAt, updatedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -80,6 +83,7 @@ extension TelegramUpdateClaim {
         resolvedRetryText = try string(.resolvedRetryText)
         resolvedSessionId = try string(.resolvedSessionId)
         resolvedRetryMessage = try values.decodeIfPresent(TelegramMessage.self, forKey: .resolvedRetryMessage)
+        resolvedRetrySourceSessionId = try string(.resolvedRetrySourceSessionId)
         assistantDelivery = try values.decodeIfPresent(TelegramAssistantDeliveryState.self, forKey: .assistantDelivery)
         settledAssistantRuns = try values.decode([String: String].self, forKey: .settledAssistantRuns)
         noRecoverableAnswer = try values.decode(Bool.self, forKey: .noRecoverableAnswer)
@@ -103,6 +107,7 @@ extension TelegramUpdateClaim {
         try values.encode(quarantineReason, forKey: .quarantineReason)
         try values.encode(resolvedRetryText, forKey: .resolvedRetryText)
         try values.encode(resolvedRetryMessage, forKey: .resolvedRetryMessage)
+        try values.encodeIfPresent(resolvedRetrySourceSessionId, forKey: .resolvedRetrySourceSessionId)
         try values.encode(resolvedSessionId, forKey: .resolvedSessionId)
         try values.encode(claimedAt, forKey: .claimedAt)
         try values.encode(updatedAt, forKey: .updatedAt)
@@ -271,7 +276,7 @@ public struct TelegramUpdateInbox: Sendable {
             }
             var saved = delivery
             saved.outcomeUnknown = priorVerdict != nil
-            let now = _tgNowString()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             var claim = TelegramUpdateClaim(lifeID: try DataRootLife.current(in: dataRoot), updateId: updateId,
                 update: TelegramUpdate(updateId: updateId, message: TelegramMessage(messageId: updateId,
                     chatId: destination.chatId, messageThreadId: destination.threadId,
@@ -299,7 +304,7 @@ public struct TelegramUpdateInbox: Sendable {
                 try await upsertIndex(existing)
                 return existing
             }
-            let now = _tgNowString()
+            let now = NativeTimestampFormat.fractionalZulu(Date())
             let claim = TelegramUpdateClaim(
                 lifeID: try DataRootLife.current(in: dataRoot),
                 updateId: update.updateId,
@@ -327,6 +332,7 @@ public struct TelegramUpdateInbox: Sendable {
         assistantSessionId: String? = nil,
         resolvedRetryText: String? = nil,
         resolvedRetryMessage: TelegramMessage? = nil,
+        resolvedRetrySourceSessionId: String? = nil,
         resolvedSessionId: String? = nil,
         quarantineReason: String? = nil,
         noRecoverableAnswer: Bool? = nil
@@ -348,10 +354,11 @@ public struct TelegramUpdateInbox: Sendable {
             next.quarantineReason = quarantineReason ?? current.quarantineReason
             next.resolvedRetryText = resolvedRetryText ?? current.resolvedRetryText
             next.resolvedRetryMessage = resolvedRetryMessage ?? current.resolvedRetryMessage
+            next.resolvedRetrySourceSessionId = resolvedRetrySourceSessionId ?? current.resolvedRetrySourceSessionId
             next.resolvedSessionId = resolvedSessionId ?? current.resolvedSessionId
             if let noRecoverableAnswer { next.noRecoverableAnswer = noRecoverableAnswer }
             guard next != current else { return current }
-            next.updatedAt = _tgNowString()
+            next.updatedAt = NativeTimestampFormat.fractionalZulu(Date())
             try await write(next, to: path)
             try await upsertIndex(next)
             return next
@@ -391,7 +398,7 @@ public struct TelegramUpdateInbox: Sendable {
                 current.phase = .outcomeUnknown
             }
             if current != previous {
-                current.updatedAt = _tgNowString()
+                current.updatedAt = NativeTimestampFormat.fractionalZulu(Date())
                 // A crash must not hide an answer whose resend consent was saved.
                 if current.phase != previous.phase { try await upsertIndex(current) }
                 try await write(current, to: path)
@@ -424,7 +431,7 @@ public struct TelegramUpdateInbox: Sendable {
             claim.noRecoverableAnswer = false
             claim.failedBeforeAnswer = false
             claim.phase = .outcomeUnknown
-            claim.updatedAt = _tgNowString()
+            claim.updatedAt = NativeTimestampFormat.fractionalZulu(Date())
             // Publish recovery eligibility first. If the claim write fails, recovery reads the prior settled claim and repairs this index.
             try await upsertIndex(claim)
             try await write(claim, to: path)

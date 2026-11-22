@@ -28,23 +28,11 @@ private final class StreamingBubbleSlot {
 @MainActor
 @Observable
 public final class TurnsFacade {
-    public private(set) var capabilityTraceTimeline: CapabilityTraceFeed.State = .unread
-    @ObservationIgnored private let tracesRead = LatestRead()
-    @ObservationIgnored private var paneReads: [String: [String: LatestRead]] = [:]
-
-    public func refreshCapabilityTraces() async {
-        _ = await tracesRead.read({ await CapabilityTraceFeed.read(dataRoot: dataRoot) },
-            publish: { capabilityTraceTimeline = $0 })
-    }
-
     public nonisolated let dataRoot: URL
     public nonisolated let runtime: MacChatTurnRuntime
-    public private(set) var agentScreenPanes: [String: [String: String]] = [:]
 
     @discardableResult
     public func readAgentScreen(room: String, scope: String) async -> String {
-        let latest = paneReads[scope]?[room] ?? LatestRead()
-        paneReads[scope, default: [:]][room] = latest
         let invocation = ChatToolInvocation()
         let execution = AppActionExecution(invocation: invocation, deadlines: invocation.deadlines,
             turnWork: .init(toolInvocation: invocation))
@@ -52,15 +40,7 @@ public final class TurnsFacade {
             nil
         }
         let preview = invocation.with(\.programHost, host)
-        return await latest.read({ await AgentScreenPreview.paneText(room, root: dataRoot, scope: scope, invocation: preview) },
-            publish: { agentScreenPanes[scope, default: [:]][room] = $0 })
-    }
-
-    public func observeAgentScreen(room: String, scope: String) async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: AgentScreenPreview.watchedPaths.map { dataRoot.appendingPathComponent($0) },
-            notifications: [AgentScreenPreview.didChange, AbilityStore.didChange]) {
-            _ = await self.readAgentScreen(room: room, scope: scope)
-        }
+        return await AgentScreenPreview.paneText(room, root: dataRoot, scope: scope, invocation: preview)
     }
 
     // Keep state per session so conversations can run concurrently.

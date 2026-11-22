@@ -70,7 +70,7 @@ public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable 
         self.evidenceClass = evidenceClass
         self.observedAt = observedAt
         self.receivedAt = receivedAt
-        self.reliability = Self.clamp(reliability, fallback: 0)
+        self.reliability = reliability.finiteClamped01(fallback: 0)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -88,10 +88,7 @@ public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable 
         self.evidenceClass = try container.decode(BodyEvidenceClass.self, forKey: .evidenceClass)
         self.observedAt = try container.decode(Date.self, forKey: .observedAt)
         self.receivedAt = try container.decode(Date.self, forKey: .receivedAt)
-        self.reliability = Self.clamp(
-            try container.decode(Double.self, forKey: .reliability),
-            fallback: 0
-        )
+        self.reliability = try container.decode(Double.self, forKey: .reliability).finiteClamped01()
     }
 
     static func digest(_ value: String) -> String {
@@ -100,11 +97,6 @@ public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable 
         return SHA256.hash(data: Data(bounded.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-    }
-
-    fileprivate static func clamp(_ value: Double, fallback: Double) -> Double {
-        guard value.isFinite else { return fallback }
-        return (value).clamped01()
     }
 }
 
@@ -130,11 +122,11 @@ public struct BodyBeliefMetrics: Codable, Sendable, Equatable {
         nextMeaningfulExpiry: Date? = nil
     ) {
         self.generatedAt = generatedAt
-        self.estimate = BodyEvidenceReference.clamp(estimate, fallback: 0.5)
-        self.uncertainty = BodyEvidenceReference.clamp(uncertainty, fallback: 1)
+        self.estimate = estimate.finiteClamped01(fallback: 0.5)
+        self.uncertainty = uncertainty.finiteClamped01(fallback: 1)
         let bounded = Self.boundedEvidence(evidence, generatedAt: generatedAt)
         self.freshness = evidence.isEmpty || !bounded.isEmpty
-            ? BodyEvidenceReference.clamp(freshness, fallback: 0)
+            ? freshness.finiteClamped01(fallback: 0)
             : 0
         self.evidence = bounded
         self.observedAt = bounded.map(\.observedAt).max() ?? observedAt

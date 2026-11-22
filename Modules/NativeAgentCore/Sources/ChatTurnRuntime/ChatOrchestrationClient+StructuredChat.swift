@@ -1,7 +1,6 @@
 import AuthoredCapabilities
 import Foundation
 import Senses
-import CryptoKit
 import Desk
 import NativeAgentCore
 import PersistenceCore
@@ -68,22 +67,97 @@ extension SwiftNativeChatOrchestrationClient {
         let noticeSink: @Sendable (String, String) async -> Void = { kind, text in
             await progress(.notice(kind: kind, text: text))
         }
-        var partialContext: TurnContext?
-        var origin: AfterTurnOrigin?
-        var steeringToken: UUID?
         let heardID = suppressUserAppend ? turn.envelope?.answerExperienceID ?? boundTurnId : boundTurnId
         let cancelFlagPath = ChatCancelFlag.accept(
             dataRoot: dataRoot, sessionId: resolvedSession, runId: runId, turnId: boundTurnId)
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
         let loopObservation = ToolLoopTraceObservation()
         let replyChoices = ReplyChoices()
+        let structured = StructuredTurnCall(message: message, attachments: attachments, persona: persona,
+            surface: surface, suppressUserAppend: suppressUserAppend, fileAccess: fileAccess,
+            resolvedSession: resolvedSession, runId: runId, boundTurnId: boundTurnId, heardID: heardID,
+            cancelFlagPath: cancelFlagPath, outputMilestoneGate: outputMilestoneGate,
+            loopObservation: loopObservation, replyChoices: replyChoices, noticeSink: noticeSink, progress: progress)
         let outcome: Result<ProducedChatTurn, any Error>
         do {
         let admittedAt = clock()
         await ChatTurnSteering.shared.noteTurnActivity(for: dataRoot, at: admittedAt)
         // Reading intentions does not add their steering principals to the turn.
         let taint = turn.peerSteering
-        func executeTurn(turn: Turn, work: ChatTurnWork) async throws -> ProducedChatTurn {
+        var envelope = TurnEnvelope.current(turn: turn, surface: surface)
+        envelope.answerExperienceID = heardID
+        outcome = .success(try await holding(turn) { turn in
+            try await holding(turn.with(\.envelope, envelope)) { turn in
+                try await withSessionContextMeasurement(sessionId: resolvedSession, surface: surface,
+                    turn: turn, work: work) { work in
+                    try await executeStructuredTurn(structured, turn: turn.with(\.peerSteering, taint), work: work)
+
+                }
+            }
+        })
+        } catch {
+            if ChatCancelFlag.readFailure(cancelFlagPath) != nil { outcome = .failure(CancellationError()) }
+            else if case .streamCancelled = error as? TurnEngineError { outcome = .failure(CancellationError()) }
+            else { outcome = .failure(error) }
+        }
+        let (origin, partialContext, steeringToken) = (structured.origin, structured.partialContext,
+            structured.steeringToken)
+        // The effect has ended. Capture the settlement's identity explicitly: settle does not inherit task locals, and Stop cannot cancel this work.
+        var envelope = TurnEnvelope.current(turn: turn, surface: surface)
+        envelope.answerExperienceID = heardID
+        let settlementTurn = turn.with(\.envelope, envelope)
+            .with(\.afterTurnOrigin, origin).with(\.notices, noticeSink)
+        let closeSteering = turn.admissionToken == nil
+        let replyRowID = turn.replyRow?.messageId(turn: turn.id, session: resolvedSession)
+        let settled = await settle { [self, settlementTurn, work, origin, partialContext, steeringToken] in
+            await TurnTraceContext.$bus.withValue(turnTraceBus) {
+                await TurnTraceContext.$turnId.withValue(settlementTurn.id) {
+                    let saved = await self.settleStructuredChatTurn(
+                        outcome, observation: loopObservation, context: partialContext,
+                        message: message, sessionId: resolvedSession, runId: runId, turnId: boundTurnId, replyRowID: replyRowID,
+                        heardID: heardID, model: model, reasoningEffort: reasoningEffort, persona: persona,
+                        surface: surface, suppressUserAppend: suppressUserAppend, chosenPaths: replyChoices.paths,
+                        cancelFlagPath: cancelFlagPath,
+                        outputMilestoneGate: outputMilestoneGate, noticeSink: noticeSink,
+                        turn: settlementTurn, work: work)
+                    ChatCancelFlag.finish(cancelFlagPath)
+                    if closeSteering {
+                        await ChatTurnSteering.shared.closeTurn(sessionId: resolvedSession, token: steeringToken)
+                    }
+                    return saved
+                }
+            }
+        }
+        let result = try settled.get()
+        if case .success = result.turn, let suffix = TurnSettle.takeStreamSuffix(turn: turn) {
+            await progress(.delta(suffix))
+        }
+        return result
+        }
+        }
+        }
+    }
+
+    /// One structured turn's work: open it, prepare its context, then run its streaming tool loop.
+    private func executeStructuredTurn(_ structured: StructuredTurnCall, turn: Turn,
+                                       work: ChatTurnWork) async throws -> ProducedChatTurn {
+        let (attachmentInput, imageBlocks, modelMessage, ask) = try await openStructuredTurn(structured, turn: turn, work: work)
+        let (gated, providerCtx, threadedCtx, cognitiveProjection) = try await prepareStructuredContext(structured,
+            turn: turn, work: work, attachmentInput: attachmentInput, imageBlocks: imageBlocks, modelMessage: modelMessage)
+        return try await runStructuredTurn(structured, turn: turn, work: work, ask: ask, gated: gated,
+            providerCtx: providerCtx, threadedCtx: threadedCtx, cognitiveProjection: cognitiveProjection)
+    }
+
+    /// The turn's input: its saved row (or the consumed queued one), its heard experience, and its steering door.
+    private func openStructuredTurn(
+        _ structured: StructuredTurnCall, turn: Turn, work: ChatTurnWork
+    ) async throws -> (attachmentInput: TurnAttachmentInput, imageBlocks: [LLMContentBlock], modelMessage: String,
+                       ask: TurnAsk) {
+        let (message, attachments, persona, surface) = (structured.message, structured.attachments,
+            structured.persona, structured.surface)
+        let (suppressUserAppend, resolvedSession, runId, boundTurnId) = (structured.suppressUserAppend,
+            structured.resolvedSession, structured.runId, structured.boundTurnId)
+        let (heardID, noticeSink) = (structured.heardID, structured.noticeSink)
         // Trust gates image blocks; extracted PDF text enters modelMessage while the persisted user row keeps message.
         let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot,
@@ -96,7 +170,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
 
         if !suppressUserAppend {
-            origin = try await appendMessage(
+            structured.origin = try await appendMessage(
                 sessionId: resolvedSession,
                 role: "user",
                 content: message,
@@ -110,10 +184,10 @@ extension SwiftNativeChatOrchestrationClient {
                 messageId: turn.rows.pinnedUserMessageID ?? UUID().uuidString,
              turn: turn)
         } else {
-            origin = try await consumeEnqueuedMessage(sessionId: resolvedSession, runId: runId)
+            structured.origin = try await consumeEnqueuedMessage(sessionId: resolvedSession, runId: runId)
         }
         let heard = Experience(id: heardID, kind: .heard,
-            evidence: (origin.map { [Self.transcriptRef(resolvedSession, $0.messageId)] } ?? [])
+            evidence: (structured.origin.map { [Self.transcriptRef(resolvedSession, $0.messageId)] } ?? [])
                 + [.init(source: "door", id: turn.arrivalSurface(authorizing: surface))],
             addressedTo: ["her"], owes: ["answer": .init(to: "conversation:" + resolvedSession)],
             steeredBy: turn.steeringStamp())
@@ -175,9 +249,22 @@ extension SwiftNativeChatOrchestrationClient {
             }
             }
         }
-        steeringToken = try await ChatTurnSteering.shared.openTurn(
+        structured.steeringToken = try await ChatTurnSteering.shared.openTurn(
             sessionId: resolvedSession, turnId: turn.id, dataRoot: dataRoot,
             door: turn.replyRoute ?? TurnEnvelope.current(turn: turn, surface: surface).deliveryRoute, persist: steeringPersister,turn: turn)
+        return (attachmentInput, imageBlocks, modelMessage, ask)
+    }
+
+    /// The turn's context: acceptance checkpoint, history-threaded build beside cognition, and the one-door tool contract.
+    private func prepareStructuredContext(
+        _ structured: StructuredTurnCall, turn: Turn, work: ChatTurnWork, attachmentInput: TurnAttachmentInput,
+        imageBlocks: [LLMContentBlock], modelMessage: String
+    ) async throws -> (gated: any ToolDispatchClient, providerCtx: TurnContext, threadedCtx: TurnContext,
+                       cognitiveProjection: (request: CognitiveCapsuleRequest, projection: CognitionAtTurn)?) {
+        var modelMessage = modelMessage
+        let (message, persona, surface, fileAccess) = (structured.message, structured.persona, structured.surface,
+            structured.fileAccess)
+        let (resolvedSession, runId, boundTurnId) = (structured.resolvedSession, structured.runId, structured.boundTurnId)
         let gated = makeTracedGatedDispatcher(
             fileAccess: fileAccess, verifiedSessionId: resolvedSession,
         work: work)
@@ -252,20 +339,35 @@ extension SwiftNativeChatOrchestrationClient {
             projection: cognitiveProjection?.projection
         )
         // `app` is the agent's one door (docs/ONE_DOOR.md): the turn offers it alone.
-        let providerCtx = Self.applyLazyToolFilter(to: threadedCtxWithCognition, activeTools: [])
+        let providerCtx = Self.applyLazyToolFilter(to: threadedCtxWithCognition)
         preparationTrace.record(.cognitiveAppend, since: appendStart)
         _ = TurnTraceContext.$bus.withValue(turnTraceBus) {
             TurnTraceContext.$turnId.withValue(boundTurnId) {
                 preparationTrace.emit(kind: "turn.preparation.summary", surface: surface)
             }
         }
-        partialContext = providerCtx
+        structured.partialContext = providerCtx
         Self.traceFinalToolContract(
             turnId: boundTurnId,
             wire: providerCtx.toolSchemas,
             surface: surface,
             turn: turn, work: work)
+        return (gated, providerCtx, threadedCtx, cognitiveProjection)
+    }
 
+    /// The turn's streaming tool loop under its held parts, and what it produced.
+    private func runStructuredTurn(
+        _ structured: StructuredTurnCall, turn: Turn, work: ChatTurnWork, ask: TurnAsk, gated: any ToolDispatchClient,
+        providerCtx: TurnContext, threadedCtx: TurnContext,
+        cognitiveProjection: (request: CognitiveCapsuleRequest, projection: CognitionAtTurn)?
+    ) async throws -> ProducedChatTurn {
+        let (message, surface, fileAccess, resolvedSession) = (structured.message, structured.surface,
+            structured.fileAccess, structured.resolvedSession)
+        let (runId, boundTurnId, noticeSink, progress) = (structured.runId, structured.boundTurnId,
+            structured.noticeSink, structured.progress)
+        let (outputMilestoneGate, loopObservation, replyChoices) = (structured.outputMilestoneGate,
+            structured.loopObservation, structured.replyChoices)
+        let (cancelFlagPath, origin) = (structured.cancelFlagPath, structured.origin)
         let receiptWriter = ToolReceiptWriter(
             client: self, sessionId: resolvedSession, runId: runId, surface: surface,
             laneLabel: "", onNotice: noticeSink
@@ -345,66 +447,60 @@ extension SwiftNativeChatOrchestrationClient {
                 from: result.toolDispatches, chosen: replyChoices.paths, dataRoot: dataRoot),
             answerID: turn.replyRow?.messageId(turn: boundTurnId, session: resolvedSession) ?? UUID().uuidString,
             cognitiveProjection: cognitiveProjection)
-        }
-        var envelope = TurnEnvelope.current(turn: turn, surface: surface)
-        envelope.answerExperienceID = heardID
-        outcome = .success(try await holding(turn) { turn in
-            try await holding(turn.with(\.envelope, envelope)) { turn in
-                try await withSessionContextMeasurement(sessionId: resolvedSession, model: model,
-                    providerID: turn.admission?.provider, surface: surface, runId: runId, progress: progress,
-                    turn: turn, work: work) { work in
-                    try await executeTurn(turn: turn.with(\.peerSteering, taint), work: work)
+    }
 
-                }
-            }
-        })
-        } catch {
-            if ChatCancelFlag.readFailure(cancelFlagPath) != nil { outcome = .failure(CancellationError()) }
-            else if case .streamCancelled = error as? TurnEngineError { outcome = .failure(CancellationError()) }
-            else { outcome = .failure(error) }
-        }
-        // The effect has ended. Capture the settlement's identity explicitly: settle does not inherit task locals, and Stop cannot cancel this work.
-        var envelope = TurnEnvelope.current(turn: turn, surface: surface)
-        envelope.answerExperienceID = heardID
-        let settlementTurn = turn.with(\.envelope, envelope)
-            .with(\.afterTurnOrigin, origin).with(\.notices, noticeSink)
-        let closeSteering = turn.admissionToken == nil
-        let replyRowID = turn.replyRow?.messageId(turn: turn.id, session: resolvedSession)
-        let settled = await settle { [self, settlementTurn, work, origin, partialContext, steeringToken] in
-            await TurnTraceContext.$bus.withValue(turnTraceBus) {
-                await TurnTraceContext.$turnId.withValue(settlementTurn.id) {
-                    let saved = await self.settleStructuredChatTurn(
-                        outcome, observation: loopObservation, context: partialContext,
-                        message: message, sessionId: resolvedSession, runId: runId, turnId: boundTurnId, replyRowID: replyRowID,
-                        heardID: heardID, model: model, reasoningEffort: reasoningEffort, persona: persona,
-                        surface: surface, suppressUserAppend: suppressUserAppend, chosenPaths: replyChoices.paths,
-                        cancelFlagPath: cancelFlagPath,
-                        outputMilestoneGate: outputMilestoneGate, noticeSink: noticeSink,
-                        turn: settlementTurn, work: work)
-                    ChatCancelFlag.finish(cancelFlagPath)
-                    if closeSteering {
-                        await ChatTurnSteering.shared.closeTurn(sessionId: resolvedSession, token: steeringToken)
-                    }
-                    return saved
-                }
-            }
-        }
-        let result = try settled.get()
-        if case .success = result.turn, let suffix = TurnSettle.takeStreamSuffix(turn: turn) {
-            await progress(.delta(suffix))
-        }
-        return result
-        }
-        }
+    /// One structured chat turn: its fixed identity and gates, and what settlement reads however the work ended.
+    final class StructuredTurnCall {
+        let message: String
+        let attachments: [MultimodalAttachment]
+        let persona: String?
+        let surface: String
+        let suppressUserAppend: Bool
+        let fileAccess: String
+        let resolvedSession: String
+        let runId: String
+        let boundTurnId: String
+        let heardID: String
+        let cancelFlagPath: URL
+        let outputMilestoneGate: TurnLifecycleFirstOutputGate
+        let loopObservation: ToolLoopTraceObservation
+        let replyChoices: ReplyChoices
+        let noticeSink: @Sendable (String, String) async -> Void
+        let progress: TurnEventSink
+        /// Written the moment the turn makes each, so settlement reads them after a throw.
+        var origin: AfterTurnOrigin?
+        var partialContext: TurnContext?
+        var steeringToken: UUID?
+
+        init(message: String, attachments: [MultimodalAttachment], persona: String?, surface: String,
+             suppressUserAppend: Bool, fileAccess: String, resolvedSession: String, runId: String, boundTurnId: String,
+             heardID: String, cancelFlagPath: URL, outputMilestoneGate: TurnLifecycleFirstOutputGate,
+             loopObservation: ToolLoopTraceObservation, replyChoices: ReplyChoices,
+             noticeSink: @escaping @Sendable (String, String) async -> Void, progress: @escaping TurnEventSink) {
+            self.message = message
+            self.attachments = attachments
+            self.persona = persona
+            self.surface = surface
+            self.suppressUserAppend = suppressUserAppend
+            self.fileAccess = fileAccess
+            self.resolvedSession = resolvedSession
+            self.runId = runId
+            self.boundTurnId = boundTurnId
+            self.heardID = heardID
+            self.cancelFlagPath = cancelFlagPath
+            self.outputMilestoneGate = outputMilestoneGate
+            self.loopObservation = loopObservation
+            self.replyChoices = replyChoices
+            self.noticeSink = noticeSink
+            self.progress = progress
         }
     }
 
     /// Both protocols use canonical order so the always-on floor stays stable while remaining schemas retain incoming order.
     static func applyLazyToolFilter(
-        to context: TurnContext,
-        activeTools: Set<String>
+        to context: TurnContext
     ) -> TurnContext {
-        let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: activeTools)
+        let allowed = SwiftToolDispatcher.alwaysOnCoreNames
         var bySlot: [String: LLMToolSchema] = [:]
         for schema in context.toolSchemas where bySlot[schema.name] == nil && allowed.contains(schema.name) {
             bySlot[schema.name] = schema
@@ -514,15 +610,17 @@ extension SwiftNativeChatOrchestrationClient {
     /// may wrap the request with attribution). A tool result, a page, a file, a helper and the agent's own words are no message here.
     static func requestHeard(_ quote: String, setting: String?, message: String, surface: String, session: String, dataRoot: URL,
                              turn: Turn) async -> RequestHeard {
-        func normalized(_ text: String) -> String {
-            text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        }
         // Match quoted request text even when a transport wraps it with attribution.
         let marks = CharacterSet(charactersIn: "\"“”'‘’")
-        let segments = quote.components(separatedBy: marks).map { normalized($0).trimmingCharacters(in: .punctuationCharacters.union(.whitespaces)) }
+        let segments = quote.components(separatedBy: marks)
+            .map { TextNormalization.lowercasedWithCollapsedWhitespace($0)
+                .trimmingCharacters(in: .punctuationCharacters.union(.whitespaces)) }
             .filter { $0.split(separator: " ").count >= 3 }
-        let candidates = [normalized(quote)] + segments
-        func quotes(_ text: String) -> Bool { let t = normalized(text); return candidates.contains { t.contains($0) } }
+        let candidates = [TextNormalization.lowercasedWithCollapsedWhitespace(quote)] + segments
+        func quotes(_ text: String) -> Bool {
+            let normalized = TextNormalization.lowercasedWithCollapsedWhitespace(text)
+            return candidates.contains { normalized.contains($0) }
+        }
         let envelope = TurnEnvelope.current(turn: turn, surface: surface)
         let origin = turn.origin
         let lane = (origin?.agent ?? envelope.agent) == "agent" ? envelope.verifiedUserId.map { "peer:" + $0 } : origin?.agent ?? envelope.agent

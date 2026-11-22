@@ -275,12 +275,12 @@ public actor ProviderVitalsSensor {
             if let b = v.baselineLatencyMs { obj["baselineLatencyMs"] = .double(b) }
             if let t = v.emaTTFTMs { obj["emaTTFTMs"] = .double(t) }
             if let tps = v.emaTokensPerSec { obj["emaTokensPerSec"] = .double(tps) }
-            if let date = state.lastSampleAt { obj["lastSampleAt"] = .string(Self.formatDate(date)) }
+            if let date = state.lastSampleAt { obj["lastSampleAt"] = .string(NativeTimestampFormat.plainZulu(date)) }
             providers[v.providerId] = .object(obj)
         }
         return .object([
             "schema": .string("provider.vitals.v1"),
-            "generatedAt": .string(Self.formatDate(generatedAt)),
+            "generatedAt": .string(NativeTimestampFormat.plainZulu(generatedAt)),
             "providers": .object(providers),
         ])
     }
@@ -423,13 +423,9 @@ public actor ProviderVitalsSensor {
         String(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix(80))
     }
 
-    private static func formatDate(_ date: Date) -> String {
-        ISO8601DateFormatter().string(from: date)
-    }
-
     private static func date(_ value: JSONValue?) -> Date? {
         guard case .string(let raw)? = value else { return nil }
-        return ISO8601DateFormatter().date(from: raw)
+        return NativeTimestampFormat.parsePlainISO8601(raw)
     }
 
     private static func band(_ value: JSONValue?) -> ProviderVitalsBand? {

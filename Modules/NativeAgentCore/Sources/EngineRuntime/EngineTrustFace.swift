@@ -125,7 +125,9 @@ extension NativeAgentEngine {
             allows.append(.init(id: "trust.unattended_work", title: "Let me work unattended",
                 detail: "Choose a narrower standing to change it.", value: "On"))
         }
-        let standingRow = PartFace.Row(id: "trust.preset", title: "Standing", detail: (preset?.summary ?? "Custom access: " + mode)
+        let customWords: [String: String] = ["read_only": "read only", "workspace": "your workspace folders", "full": "full Mac"]
+        let standingRow = PartFace.Row(id: "trust.preset", title: "Standing",
+            detail: (preset?.summary ?? "Custom: " + (customWords[mode] ?? "asks before it changes things"))
             + (full ? ". Full Mac stays on until you change it. " + PermissionLaw.fullMacSteeredTurn : ""),
             control: .choice(MobileTrustAction.Preset.allCases.map { .init(id: $0.rawValue, label: $0.title) },
                 selected: preset?.rawValue, confirm: "Apply the selected standing? If you select Full Mac:\n" + MobileTrustAction.fullMacMessage,

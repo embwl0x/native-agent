@@ -10,7 +10,6 @@ enum AnthropicOAuthDirectPanelPresentation {
 }
 
 struct AnthropicOAuthDirectPanel: View {
-    var showConnectionTest = false
     @Environment(AppModel.self) private var appModel
     @State private var isTesting = false
     @State private var testStatus: String?
@@ -24,14 +23,12 @@ struct AnthropicOAuthDirectPanel: View {
             // Read sign-in from its canonical store so provider-list staleness cannot hide current state.
             OAuthSignInButton(provider: .anthropic)
             AnthropicSetupTokenInput()
-            if showConnectionTest {
-                Button(isTesting ? "Testing Claude…" : "Test Claude connection") {
-                    Task { await testConnection() }
-                }
-                .buttonStyle(.bordered)
-                .disabled(isTesting)
-                if let testStatus { ProviderNote(text: testStatus) }
+            Button(isTesting ? "Testing Claude…" : "Test Claude connection") {
+                Task { await testConnection() }
             }
+            .buttonStyle(.bordered)
+            .disabled(isTesting)
+            if let testStatus { ProviderNote(text: testStatus) }
         }
     }
 

@@ -42,7 +42,6 @@ import SwiftUI
     }
 
     private func select(_ handle: String) {
-        appModel.pendingDeskHandle = handle
         Task {
             do { sheets.actionMessage = try FaceWindowReply.message(await appModel.client.act(.deskCommand(.init(
                 command: "select", handle: handle, arguments: [:])))) }
@@ -130,8 +129,7 @@ private struct DeskFaceNoteSheet: View {
             throw PartCallError(code: "editor_in_use", message: "Close the current Desk sheet before opening another Desk editor.")
         }
         switch request {
-        case .select(let handle):
-            appModel.pendingDeskHandle = handle
+        case .select:
             return "Selected the Desk item on the Mac."
         case .findItem:
             finding = true

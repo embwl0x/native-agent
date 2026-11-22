@@ -235,12 +235,6 @@ public enum ToolNameAliases {
         return (binding.tool, binding.arguments(args))
     }
 
-    /// Batch app calls expose every underlying tool for policy and accounting.
-    public static func ranTools(_ name: String, input: [String: JSONValue]) -> [String] {
-        guard name == "app", case .array(let entries)? = input["actions"], !entries.isEmpty else { return [ranTool(name, input: input)] }
-        return entries.flatMap { if case .object(let call) = $0 { ranTools(name, input: call) } else { [name] } }
-    }
-
     /// Receipts project folded arguments back to the executor's own names.
     public static func ranInput(_ name: String, input: [String: JSONValue]) -> [String: JSONValue] {
         ranCall(name, input: input).input

@@ -174,6 +174,7 @@ private struct ChatTranscriptRoom: View {
     let clearance: ChatTurnCardClearance
     let handle: TranscriptDocumentHandle
     @Environment(AppModel.self) private var appModel
+    @Environment(\.chatPageIsVisible) private var chatPageIsVisible
     @State private var isRetrying = false
     private var inlineCards: CardControls { CardControls.shared }
     private var state: FaceReadState? {
@@ -242,7 +243,8 @@ private struct ChatTranscriptRoom: View {
                     case .loading: ProgressView("Checking providers…")
                     case .unavailable(let reason): NativeEmptyState(title: "Providers unavailable", detail: reason)
                     case .needsConnection:
-                        ChatProviderConnectEmptyState { inlineCards.openPage(.providers) }
+                        // Setup is open over Chat and already asks for the provider; one state, not two.
+                        if chatPageIsVisible { ChatProviderConnectEmptyState { inlineCards.openPage(.providers) } }
                     case .ready:
                         ShellEmptyRoom(personaName: appModel.agentDisplayName) { suggestion in
                             ChatEmptyStateSuggestionAction.apply(suggestion, model: appModel, activeSessionID: sessionID)

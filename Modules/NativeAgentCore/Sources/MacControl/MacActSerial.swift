@@ -2,7 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-import CryptoKit
 import ApplicationServices
 import CoreGraphics
 import AppKit

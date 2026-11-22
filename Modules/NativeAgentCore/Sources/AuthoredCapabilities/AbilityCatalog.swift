@@ -32,8 +32,7 @@ extension AbilityStore {
             if let revision { Self.redactedAccounting[root.path] = (revision, stats) }
         }
         // Typed registries select published records; all-kind reads expose unkept files without marking them active.
-        let selected = catalog.files.filter { (kind == nil || $0.kind == kind) && (kind == nil || $0.kind == .turn
-            || $0.metadata["record"]?.objectValue != nil) }
+        let selected = catalog.files.filter { kind == nil || ($0.kind == kind && Self.isPublished($0)) }
         return .array(try selected.map { file in
             var row = try record(file, previous: catalog.retained[.previous]?[file.id], redactedStatistics: stats[file.id])
             var versions: [JSONValue] = []
@@ -81,6 +80,10 @@ extension AbilityStore {
             return .object(row)
         })
     }
+    private static func isPublished(_ file: File) -> Bool {
+        file.kind == .turn || file.metadata["record"]?.objectValue != nil
+    }
+
     public func saveRegistry(_ value: JSONValue, kind: Kind, ownerAuthorized: Bool = false, enabling: Bool = false, turn: Turn?) throws {
         try Self.withLock {
             let catalog = try catalog()
@@ -100,9 +103,10 @@ extension AbilityStore {
             }
             var stats = catalog.states
             let ids = Set(publications.map(\.id))
-            for file in catalog.files where file.kind == kind && !ids.contains(file.id) { try remove(id: file.id, ownerAuthorized: ownerAuthorized,
-                turn: turn); stats
-                .removeValue(forKey: file.id) }
+            for file in catalog.files where file.kind == kind && Self.isPublished(file) && !ids.contains(file.id) {
+                try remove(id: file.id, ownerAuthorized: ownerAuthorized, turn: turn)
+                stats.removeValue(forKey: file.id)
+            }
             for (input, id, current, next, promote) in publications {
                 // Lifecycle projections may be redacted. Canonical run/trial evidence never comes back from that presentation.
                 // SenseRecord owns only these four accounting fields; all other accounting stays with catalog.states.

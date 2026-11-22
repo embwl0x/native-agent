@@ -1,3 +1,4 @@
+import AppKit
 import NativeAgentCore
 import Experiences
 import Foundation
@@ -28,7 +29,7 @@ extension MacFourVerbs {
 
     /// Exact references retain drift checks and ordinary admission; selection receipts preserve the chosen identity.
     public func actSelection(verb: String, handle: String, frameID: String,
-                             text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil,
+                             text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil, scrollAmount: Int? = nil,
                              app: String? = nil, turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply {
         let ownsSerial = !context.holdsActSerial
         if ownsSerial {
@@ -58,11 +59,12 @@ extension MacFourVerbs {
                 return .init(ok: false, text: "That handle does not identify the requested app. Nothing was sent; read its screen again.",
                     detail: ["error": .string("selection_app_mismatch")])
             }
-            body["background"] = .bool(true)
+            body["background"] = .bool(frame.pid != NSWorkspace.shared.frontmostApplication?.processIdentifier)
         }
         if let text { body["text"] = .string(text) }
         body["mode"] = .string(mode.rawValue)
         if let direction { body["direction"] = .string(direction) }
+        if let scrollAmount { body["scroll_amount"] = .int(Int64(scrollAmount)) }
         let postRead = MacSightCaptureBinding(frameID: UUID().uuidString)
         do {
             let result = try await context.holding(\.capture, postRead) {

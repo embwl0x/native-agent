@@ -82,10 +82,6 @@ public struct OnboardingCompleteResult: Sendable, Equatable {
     public let userName: String?
     public let error: String?
     public let detail: String?
-    public var requiresPersonaReset: Bool { error == "persona_already_exists" }
-    public var requiresProfileRepairRecheck: Bool {
-        error == "profile_already_present" || error == "onboarding_in_progress"
-    }
     public init(
         ok: Bool,
         agentName: String? = nil,

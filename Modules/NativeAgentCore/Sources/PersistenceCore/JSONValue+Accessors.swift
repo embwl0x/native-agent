@@ -1,13 +1,84 @@
 import Foundation
-import CryptoKit
-import Darwin
-// Blueprint: | `JSONValue+Accessors.swift` | Explicit numeric coercion and unknown-field handling. |
+// Blueprint: | `JSONValue+Accessors.swift` | Typed JSON extraction, explicit defaults and coercion, and unknown-field handling. |
 
 extension JSONValue {
     public var objectValue: [String: JSONValue]? { if case .object(let fields) = self { fields } else { nil } }
     public var arrayValue: [JSONValue]? { if case .array(let values) = self { values } else { nil } }
     public var stringValue: String? { if case .string(let text) = self { text } else { nil } }
     public var boolValue: Bool? { if case .bool(let value) = self { value } else { nil } }
+
+    package static func stringOrEmpty(_ value: JSONValue?) -> String {
+        value?.stringValue ?? ""
+    }
+
+    package var trimmedString: String? {
+        guard let text = stringValue else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    package static func trimmedStringOrEmpty(_ value: JSONValue?) -> String {
+        value?.trimmedString ?? ""
+    }
+
+    /// Reject whitespace-only strings and keep the original spelling and whitespace.
+    package var nonblankString: String? {
+        trimmedString == nil ? nil : stringValue
+    }
+
+    package var nonemptyString: String? {
+        guard let text = stringValue, !text.isEmpty else { return nil }
+        return text
+    }
+
+    package static func objectOrEmpty(_ value: JSONValue?) -> [String: JSONValue] {
+        value?.objectValue ?? [:]
+    }
+
+    package static func stringArray(_ value: JSONValue?) -> [String] {
+        value?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    package static func trimmedStringArray(_ value: JSONValue?) -> [String] {
+        value?.arrayValue?.compactMap(\.trimmedString) ?? []
+    }
+
+    package static func objectArray(_ value: JSONValue?) -> [[String: JSONValue]] {
+        value?.arrayValue?.compactMap(\.objectValue) ?? []
+    }
+
+    package var doubleValue: Double? {
+        numberValue(coercingStrings: false, finiteOnly: false)
+    }
+
+    package var finiteDoubleValue: Double? {
+        numberValue(coercingStrings: false, finiteOnly: true)
+    }
+
+    package var strictInt64: Int64? {
+        if case .int(let number) = self { number } else { nil }
+    }
+
+    package var nonnegativeInt64: Int64? {
+        guard let number = strictInt64, number >= 0 else { return nil }
+        return number
+    }
+
+    package var strictInt: Int? {
+        strictInt64.map { Int($0) }
+    }
+
+    package static func boolOrFalse(_ value: JSONValue?) -> Bool {
+        value?.boolValue ?? false
+    }
+
+    package static func firstTrimmedString(_ fields: [String: JSONValue], keys: [String]) -> String? {
+        for key in keys {
+            if let text = fields[key]?.trimmedString { return text }
+        }
+        return nil
+    }
+
     public var scalarText: String? {
         switch self {
         case .string(let value): return value
@@ -17,6 +88,15 @@ extension JSONValue {
         default: return nil
         }
     }
+
+    public static func trimmedScalarTextOrEmpty(_ value: JSONValue?) -> String {
+        value?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    package static func trimmedScalarTextArray(_ value: JSONValue?) -> [String] {
+        value?.arrayValue?.map { trimmedScalarTextOrEmpty($0) }.filter { !$0.isEmpty } ?? []
+    }
+
     public var integerValue: Int64? {
         switch self {
         case .int(let number): return number

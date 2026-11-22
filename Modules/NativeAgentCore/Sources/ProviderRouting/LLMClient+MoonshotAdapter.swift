@@ -24,7 +24,7 @@ public final class MoonshotTransport: LLMTransport {
     private let endpoint: URL?
     private let apiKeyOverride: String?
     private let dataRootOverride: URL?
-    private let telemetry: LLMCallTraceRecorder
+    public let telemetry: LLMCallTraceRecorder
     private let reasoningLedger = ToolCallReplayLedger<String>()
 
     private var credentialRoot: URL { dataRootOverride ?? PersistenceCore.defaultDataRoot() }
@@ -44,28 +44,6 @@ public final class MoonshotTransport: LLMTransport {
             dataRootOverride: telemetryDataRootOverride ?? dataRootOverride
         )
     }
-
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
-    }
-
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        // The stream carries the reasoning ledger for tool calls, as a turn's does.
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
-    }
-
-
 
     public func streamMessages(
         messages: [LLMMessage],

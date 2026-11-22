@@ -2,7 +2,6 @@ import Foundation
 import ChatToolParsing
 import ChatToolRuntime
 import CoreFoundation
-import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -88,170 +87,199 @@ enum NativeAgentMCPWire {
             do { return success(id, result: ["tools": try tools()]) }
             catch { return failure(id, code: -32603, message: "The tool list could not be built: \(error.localizedDescription)") }
         case "tools/call":
-            guard let name = params["name"] as? String,
-                  let args = params["arguments"] as? [String: Any] else {
-                return failure(id, code: -32602, message: "Tool name and arguments are required.")
-            }
-            if name == "agent_message" {
-                guard Set(args.keys).isSubset(of: ["text", "session_id", "request_id", "wait_seconds", "reply_to"]),
-                      let text = args["text"] as? String,
-                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      text.utf8.count <= 64000 else {
-                    return failure(id, code: -32602, message: "Provide nonempty text up to 64000 UTF-8 bytes and optional session/request IDs.")
-                }
-                // The id is the transport's replay locator. Omitted, it is the caller's own conversation; one naming another of this contact's
-                // conversations runs there (AgentBridgePrincipal.storedConversation).
-                let session: String
-                if let supplied = args["session_id"] {
-                    guard let value = supplied as? String, validSession(value) else {
-                        return failure(id, code: -32602, message: "Continue only the exact MCP session ID previously returned.")
-                    }
-                    session = value
-                } else { session = defaultSession ?? "mcp-" + UUID().uuidString.lowercased() }
-                // Only the caller can identify a retry with the same request_id.
-                guard let supplied = args["request_id"], let request = supplied as? String,
-                      exactUUID(request) else {
-                    return failure(id, code: -32602, message: """
-                        request_id is required and must be a canonical UUID. It is this message's replay key: retry the same message under the same \
-                        request_id, and use a new one only for new content.
-                        """)
-                }
-                guard let seconds = wholeNumber(args["wait_seconds"] ?? defaultWaitSeconds, in: 0...maximumWaitSeconds) else {
-                    return failure(id, code: -32602, message: "wait_seconds must be an integer from 0 through \(maximumWaitSeconds).")
-                }
-                let rawToken = (params["_meta"] as? [String: Any])?["progressToken"]
-                var token: ID?
-                if let text = rawToken as? String, text.utf8.count <= 256 { token = .string(text) }
-                else if let number = rawToken as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
-                        number.stringValue == String(number.int64Value) { token = .number(number.int64Value) }
-                // wait_seconds stays OUT of the message body: that body is the replay digest, and waiting longer is not different content.
-                var message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
-                if let supplied = args["reply_to"] {
-                    guard let named = supplied as? String, exactUUID(named) else {
-                        return failure(id, code: -32602, message: "reply_to is the reply_to of a held message you were given.")
-                    }
-                    message["reply_to"] = named
-                }
-                guard let data = try? JSONSerialization.data(withJSONObject: message, options: .sortedKeys) else {
-                    return failure(id, code: -32603, message: "Could not encode message.")
-                }
-                let agent = PeerFacingIdentity.agentName
-                return .message(body: message, replayBody: data, wait: (seconds, token), project: { status, receipt in
-                    let accepted = status == 200 && receipt["ack"] as? String == "enqueued"
-                        && receipt["sessionId"] as? String == session
-                        && receipt["requestId"] as? String == request
-                    var result: [String: Any] = [
-                        "status": accepted ? "enqueued" : "outcome_unknown",
-                        "session_id": session, "request_id": request,
-                        "read_with": ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request]],
-                        "detail": accepted ? "Durably queued for \(agent)'s full chat turn. Read the reply separately."
-                            : "No successful enqueue acknowledgement. Read retained evidence before considering another send."
-                    ]
-                    if status >= 400 && status < 500 { result["status"] = "rejected" }
-                    if !accepted, let detail = receipt["detail"] { result["detail"] = detail }
-                    // A waited response must project the task’s current retained state.
-                    var failed = !accepted
-                    if accepted, let state = receipt["original_status"] as? String {
-                        for key in ["reply", "attachments", "completionDelivery", "deliveryId", "has_more", "next_offset", "original_status", "run_id",
-                            "provider_failure", "work", "delegated_completions", "retrieval_result_class", "execution_result_class",
-                                "execution_terminal", "reply_recovery"] {
-                            result[key] = receipt[key]
-                        }
-                        let more = receipt["has_more"] as? Bool == true
-                        if more, let next = receipt["next_offset"] {
-                            result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request, "offset": next]]
-                        }
-                        let execution = ChatToolOutcome.ExactResultClass(rawValue: receipt["execution_result_class"] as? String ?? "")
-                        // A message the agent's turn in progress read has no answer of its own: that turn's reply answers it.
-                        if execution == .succeeded, let steered = receipt["result"] as? [String: Any], steered["status"] as? String == "steered" {
-                            result["status"] = "steered"
-                            result["detail"] = receipt["detail"]
-                            if let answer = steered["requestId"] as? String {
-                                result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": answer]]
-                            }
-                        } else if execution == .succeeded {
-                            result["status"] = "answered"
-                            result["detail"] = more ? "\(agent) answered. Follow read_with for the rest of the reply." : "\(agent) answered."
-                        } else if execution?.isFailure == true {
-                            result["status"] = state
-                            result["detail"] = receipt["detail"] ?? "The turn did not finish. Do not resend automatically."
-                            failed = true
-                        } else {
-                            result["detail"] = """
-                                Queued and still in progress (\(state)); reply holds what is written so far. Read the rest with agent_reply. Do not \
-                                resend.
-                                """
-                        }
-                    }
-                    // Acceptance and the requested observation are independent.
-                    if let retrieval = receipt["retrieval_result_class"] {
-                        result["retrieval_result_class"] = retrieval
-                    }
-                    if receipt["retrieval_result_class"] as? String == "failed" {
-                        if accepted { result["status"] = "enqueued" }
-                        result["detail"] = receipt["detail"]
-                        result["evidence"] = receipt["evidence"]
-                        failed = true
-                    }
-                    return toolResult(id, fields: result, failed: failed, held: held)
-                })
-            }
-            if name == "agent_reply" {
-                guard Set(args.keys).isSubset(of: ["session_id", "request_id", "offset", "wait_seconds", "artifact_id"]),
-                      let session = args["session_id"] as? String, validSession(session),
-                      let request = args["request_id"] as? String, exactUUID(request) else {
-                    return failure(id, code: -32602, message: "Use the exact returned MCP session and request IDs.")
-                }
-                let artifactID: String?
-                if let raw = args["artifact_id"] {
-                    guard let value = raw as? String, value.utf8.count == 64,
-                          value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
-                        return failure(id, code: -32602, message: "artifact_id must be the exact returned reply_artifact id.")
-                    }
-                    artifactID = value
-                } else { artifactID = nil }
-                var offset = 0
-                if let raw = args["offset"] {
-                    guard let value = wholeNumber(raw, in: 0...(artifactID == nil ? 1_048_576 : Int.max)) else {
-                        return failure(id, code: -32602, message: "offset must be a nonnegative integer; prose offsets are at most 1048576.")
-                    }
-                    offset = value
-                }
-                var waitSeconds = 0
-                if let raw = args["wait_seconds"] {
-                    guard let value = wholeNumber(raw, in: 0...maximumWaitSeconds) else {
-                        return failure(id, code: -32602, message: "wait_seconds must be an integer from 0 through \(maximumWaitSeconds).")
-                    }
-                    waitSeconds = value
-                }
-                let readOffset = offset
-                return .reply(requestID: request, sessionID: session, offset: readOffset, waitSeconds: waitSeconds, artifactID: artifactID,
-                              project: { receipt in
-                    if let artifactID {
-                        let chunk = artifactChunk(receipt, id: artifactID, offset: readOffset, session: session, request: request)
-                        return toolResult(id, fields: chunk, failed: chunk["retrieval_result_class"] as? String == "failed", held: held)
-                    }
-                    let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id",
-                        "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail",
-                            "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class",
-                                "execution_terminal", "reply_recovery"]
-                    return toolResult(id, fields: receipt.filter { allowed.contains($0.key) },
-                                      // "pending" is a reply still being written, not an error.
-                                      failed: ["retrieval_result_class", "execution_result_class"].contains {
-                                          ChatToolOutcome.ExactResultClass(rawValue: receipt[$0] as? String ?? "")?.isFailure == true
-                                      },
-                                      held: held)
-                })
-            }
-            if name == "agent_desk" {
-                // The Desk's own reader checks the arguments, so the contact gets the same refusals the agent does.
-                return .table(arguments: args.mapValues { JSONValue(fromFoundation: $0) }, project: { fields, failed in
-                    toolResult(id, fields: fields, failed: failed, held: held)
-                })
-            }
-            return failure(id, code: -32602, message: "Unknown tool. Use tools/list.")
+            return callTool(id, params: params, defaultSession: defaultSession, held: held)
         default: return failure(id, code: -32601, message: "Method not supported.")
         }
+    }
+
+    /// Validate the call envelope and select its tool.
+    private static func callTool(_ id: ID, params: [String: Any], defaultSession: String?, held: Held) -> Action {
+        guard let name = params["name"] as? String,
+              let args = params["arguments"] as? [String: Any] else {
+            return failure(id, code: -32602, message: "Tool name and arguments are required.")
+        }
+        if name == "agent_message" {
+            return parseMessage(id, args: args, params: params, defaultSession: defaultSession, held: held)
+        }
+        if name == "agent_reply" {
+            return parseReply(id, args: args, held: held)
+        }
+        if name == "agent_desk" {
+            // The Desk's own reader checks the arguments, so the contact gets the same refusals the agent does.
+            return .table(arguments: args.mapValues { JSONValue(fromFoundation: $0) }, project: { fields, failed in
+                toolResult(id, fields: fields, failed: failed, held: held)
+            })
+        }
+        return failure(id, code: -32602, message: "Unknown tool. Use tools/list.")
+    }
+
+    /// Build the message replay body and its response projection.
+    private static func parseMessage(_ id: ID, args: [String: Any], params: [String: Any],
+                                     defaultSession: String?, held: Held) -> Action {
+        guard Set(args.keys).isSubset(of: ["text", "session_id", "request_id", "wait_seconds", "reply_to"]),
+              let text = args["text"] as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              text.utf8.count <= 64000 else {
+            return failure(id, code: -32602, message: "Provide nonempty text up to 64000 UTF-8 bytes and optional session/request IDs.")
+        }
+        // The id is the transport's replay locator. Omitted, it is the caller's own conversation; one naming another of this contact's
+        // conversations runs there (AgentBridgePrincipal.storedConversation).
+        let session: String
+        if let supplied = args["session_id"] {
+            guard let value = supplied as? String, validSession(value) else {
+                return failure(id, code: -32602, message: "Continue only the exact MCP session ID previously returned.")
+            }
+            session = value
+        } else { session = defaultSession ?? "mcp-" + UUID().uuidString.lowercased() }
+        // Only the caller can identify a retry with the same request_id.
+        guard let supplied = args["request_id"], let request = supplied as? String,
+              exactUUID(request) else {
+            return failure(id, code: -32602, message: """
+                request_id is required and must be a canonical UUID. It is this message's replay key: retry the same message under the same \
+                request_id, and use a new one only for new content.
+                """)
+        }
+        guard let seconds = wholeNumber(args["wait_seconds"] ?? defaultWaitSeconds, in: 0...maximumWaitSeconds) else {
+            return failure(id, code: -32602, message: "wait_seconds must be an integer from 0 through \(maximumWaitSeconds).")
+        }
+        let rawToken = (params["_meta"] as? [String: Any])?["progressToken"]
+        var token: ID?
+        if let text = rawToken as? String, text.utf8.count <= 256 { token = .string(text) }
+        else if let number = rawToken as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                number.stringValue == String(number.int64Value) { token = .number(number.int64Value) }
+        // wait_seconds stays OUT of the message body: that body is the replay digest, and waiting longer is not different content.
+        var message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
+        if let supplied = args["reply_to"] {
+            guard let named = supplied as? String, exactUUID(named) else {
+                return failure(id, code: -32602, message: "reply_to is the reply_to of a held message you were given.")
+            }
+            message["reply_to"] = named
+        }
+        // The replay digest is what the caller sent: a session the bridge filled in (its current default) is not content, so a retry
+        // of the same request_id after the default moved is the same message.
+        var sent = message
+        if args["session_id"] == nil { sent.removeValue(forKey: "sessionId") }
+        guard let data = try? JSONSerialization.data(withJSONObject: sent, options: .sortedKeys) else {
+            return failure(id, code: -32603, message: "Could not encode message.")
+        }
+        let agent = PeerFacingIdentity.agentName
+        return .message(body: message, replayBody: data, wait: (seconds, token), project: { status, receipt in
+            let matched = status == 200
+                && receipt["sessionId"] as? String == session
+                && receipt["requestId"] as? String == request
+            if matched, receipt["ack"] as? String == "completed", let answered = receipt["reply_to"] as? String {
+                return toolResult(id, fields: ["status": "completed", "session_id": session, "request_id": request,
+                    "reply_to": answered, "detail": receipt["detail"] ?? "The held send was answered.",
+                    "execution_terminal": true, "execution_result_class": "succeeded"], failed: false, held: held)
+            }
+            let accepted = matched && receipt["ack"] as? String == "enqueued"
+            var result: [String: Any] = [
+                "status": accepted ? "enqueued" : "outcome_unknown",
+                "session_id": session, "request_id": request,
+                "read_with": ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request]],
+                "detail": accepted ? "Durably queued for \(agent)'s full chat turn. Read the reply separately."
+                    : "No successful enqueue acknowledgement. Read retained evidence before considering another send."
+            ]
+            if status >= 400 && status < 500 { result["status"] = "rejected" }
+            if !accepted, let detail = receipt["detail"] { result["detail"] = detail }
+            // A waited response must project the task’s current retained state.
+            var failed = !accepted
+            if accepted, let state = receipt["original_status"] as? String {
+                for key in ["reply", "attachments", "completionDelivery", "deliveryId", "offset", "has_more", "next_offset", "original_status", "run_id",
+                    "provider_failure", "work", "delegated_completions", "retrieval_result_class", "execution_result_class",
+                        "execution_terminal", "reply_recovery", "reply_payload_expired"] {
+                    result[key] = receipt[key]
+                }
+                let more = receipt["has_more"] as? Bool == true
+                if more, let next = receipt["next_offset"] {
+                    result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request, "offset": next]]
+                }
+                let execution = ChatToolOutcome.ExactResultClass(rawValue: receipt["execution_result_class"] as? String ?? "")
+                // A message the agent's turn in progress read has no answer of its own: that turn's reply answers it.
+                if execution == .succeeded, let steered = receipt["result"] as? [String: Any], steered["status"] as? String == "steered" {
+                    result["status"] = "steered"
+                    result["detail"] = receipt["detail"]
+                    if let answer = steered["requestId"] as? String {
+                        result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": answer]]
+                    }
+                } else if execution == .succeeded {
+                    result["status"] = "answered"
+                    result["detail"] = more ? "\(agent) answered. Follow read_with for the rest of the reply." : "\(agent) answered."
+                } else if execution?.isFailure == true {
+                    result["status"] = state
+                    result["detail"] = receipt["detail"] ?? "The turn did not finish. Do not resend automatically."
+                    failed = true
+                } else {
+                    result["detail"] = """
+                        Queued and still in progress (\(state)); reply holds what is written so far. Read the rest with agent_reply. Do not \
+                        resend.
+                        """
+                }
+            }
+            // Acceptance and the requested observation are independent.
+            if let retrieval = receipt["retrieval_result_class"] {
+                result["retrieval_result_class"] = retrieval
+            }
+            if receipt["retrieval_result_class"] as? String == "failed" {
+                if receipt["reply_payload_expired"] as? Bool == true {
+                    result["status"] = "expired"
+                    result["read_with"] = nil
+                } else if accepted { result["status"] = "enqueued" }
+                result["detail"] = receipt["detail"]
+                result["evidence"] = receipt["evidence"]
+                failed = true
+            }
+            return toolResult(id, fields: result, failed: failed, held: held)
+        })
+    }
+
+    /// Validate the reply locator and build its response projection.
+    private static func parseReply(_ id: ID, args: [String: Any], held: Held) -> Action {
+        guard Set(args.keys).isSubset(of: ["session_id", "request_id", "offset", "wait_seconds", "artifact_id"]),
+              let session = args["session_id"] as? String, validSession(session),
+              let request = args["request_id"] as? String, exactUUID(request) else {
+            return failure(id, code: -32602, message: "Use the exact returned MCP session and request IDs.")
+        }
+        let artifactID: String?
+        if let raw = args["artifact_id"] {
+            guard let value = raw as? String, value.utf8.count == 64,
+                  value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                return failure(id, code: -32602, message: "artifact_id must be the exact returned reply_artifact id.")
+            }
+            artifactID = value
+        } else { artifactID = nil }
+        var offset = 0
+        if let raw = args["offset"] {
+            guard let value = wholeNumber(raw, in: 0...(artifactID == nil ? 1_048_576 : Int.max)) else {
+                return failure(id, code: -32602, message: "offset must be a nonnegative integer; prose offsets are at most 1048576.")
+            }
+            offset = value
+        }
+        var waitSeconds = 0
+        if let raw = args["wait_seconds"] {
+            guard let value = wholeNumber(raw, in: 0...maximumWaitSeconds) else {
+                return failure(id, code: -32602, message: "wait_seconds must be an integer from 0 through \(maximumWaitSeconds).")
+            }
+            waitSeconds = value
+        }
+        let readOffset = offset
+        return .reply(requestID: request, sessionID: session, offset: readOffset, waitSeconds: waitSeconds, artifactID: artifactID,
+                      project: { receipt in
+            if let artifactID {
+                let chunk = artifactChunk(receipt, id: artifactID, offset: readOffset, session: session, request: request)
+                return toolResult(id, fields: chunk, failed: chunk["retrieval_result_class"] as? String == "failed", held: held)
+            }
+            let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id",
+                "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail",
+                    "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class",
+                        "execution_terminal", "reply_recovery", "reply_payload_expired"]
+            return toolResult(id, fields: receipt.filter { allowed.contains($0.key) },
+                              // "pending" is a reply still being written, not an error.
+                              failed: ["retrieval_result_class", "execution_result_class"].contains {
+                                  ChatToolOutcome.ExactResultClass(rawValue: receipt[$0] as? String ?? "")?.isFailure == true
+                              },
+                              held: held)
+        })
     }
 
     static func progress(_ token: ID, step: Int, message: String) -> [String: Any] {
@@ -297,15 +325,12 @@ enum NativeAgentMCPWire {
             options: [.sortedKeys])
     }
 
-    private static func artifactID(_ bytes: Data) -> String {
-        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-    }
-
     private static func artifactChunk(_ receipt: [String: Any], id: String, offset: Int, session: String, request: String) -> [String: Any] {
         do {
-            if receipt["retrieval_result_class"] as? String == "failed" { return receipt }
+            if receipt["retrieval_result_class"] as? String == "failed",
+               receipt["reply_payload_expired"] as? Bool != true || receipt["delegated_completions"] == nil { return receipt }
             let bytes = try artifactBytes(receipt)
-            guard artifactID(bytes) == id else {
+            guard SHA256Hex.of(bytes) == id else {
                 return ["status": "unavailable", "retrieval_result_class": "failed", "detail":
                     "This retained file payload no longer matches artifact_id. Read the reply's current evidence; no message was repeated."]
             }
@@ -323,11 +348,8 @@ enum NativeAgentMCPWire {
         }
     }
 
-    /// A reference alone does not acknowledge withheld files. The last artifact chunk acknowledges their retrieval.
-    static func carriesReply(_ response: [String: Any]) -> Bool {
-        guard let result = response["result"] as? [String: Any], let fields = result["structuredContent"] as? [String: Any] else { return false }
-        return (fields["reply"] as? String)?.isEmpty == false || (fields["attachments"] as? [[String: Any]])?.isEmpty == false
-            || (fields["artifact_id"] != nil && fields["has_more"] as? Bool == false && fields["base64"] != nil)
+    static func replyFields(_ response: [String: Any]) -> [String: Any]? {
+        (response["result"] as? [String: Any])?["structuredContent"] as? [String: Any]
     }
 
     private static func envelope(_ id: ID, fields: [String: Any], failed: Bool, held: Held) throws -> [String: Any] {
@@ -353,7 +375,7 @@ enum NativeAgentMCPWire {
                 guard let session = fields["session_id"] as? String, let request = fields["request_id"] as? String else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                let bytes = try artifactBytes(fields), digest = artifactID(bytes)
+                let bytes = try artifactBytes(fields), digest = SHA256Hex.of(bytes)
                 bounded["reply_artifact"] = ["id": digest, "mime": "application/json", "byte_size": bytes.count,
                     "contains": fields.keys.filter { ["attachments", "delegated_completions"].contains($0) }.sorted(),
                     "read_with": ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request,
@@ -409,7 +431,8 @@ enum NativeAgentMCPWire {
             ["name": "agent_message", "description": """
                 Talk with \(agent). This session of yours has its own conversation with \(agent): every message goes on in it, and its mcp- \
                 session_id comes back with each result. The call waits up to wait_seconds and returns the reply (status answered). If it is still \
-                in progress the status is enqueued: keep the returned IDs and read the reply with agent_reply. \(heldNote)
+                in progress, the status is enqueued. Keep the returned IDs and read the reply with agent_reply. A reply_to that settles a \
+                held message returns completed. \(heldNote)
                 """,
              "inputSchema": ["type": "object", "properties": [
                 "text": ["type": "string", "maxLength": 64000],
@@ -428,8 +451,7 @@ enum NativeAgentMCPWire {
                     """],
                 "wait_seconds": ["type": "integer", "minimum": 0, "maximum": maximumWaitSeconds, "default": defaultWaitSeconds,
                                  "description": """
-                                     How long this call waits for the reply. Keep the default unless your client allows longer tool calls; 0 \
-                                     returns as soon as the message is queued.
+                                     How long this call waits for the reply. With 0, it returns when the input is queued or the held message is answered.
                                      """]
              ], "required": ["text", "request_id"], "additionalProperties": false],
              "annotations": ["readOnlyHint": false, "idempotentHint": false, "openWorldHint": true]],

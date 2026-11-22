@@ -20,13 +20,51 @@ extension MacFourVerbs {
         // leave focus alone.
         let front = front || PersonOnlyWindows.isShowing
         let placement: [String: JSONValue] = front ? ["require_front": .bool(true)] : ["background": .bool(true)]
-        func opening(_ url: URL) -> [String: JSONValue] { placement.merging(["url": .string(url.absoluteString)]) { _, new in new } }
-        func covered(_ result: MacControlResult) -> MacFourVerbsReply? {
-            guard let code = result.error, ["display_obstructed", "mac_locked"].contains(code) else { return nil }
-            let why = Self.string(Self.object(result.output)["message"]) ?? MacScreenLock.reply
-            return MacFourVerbsReply(ok: false, text: "I can't see the screen right now. " + why,
-                                     detail: ["error": .string(code), "message": .string(why)])
+        let destination: GoDestination
+        switch await openGoDestination(trimmed, front: front, placement: placement, turn: turn, context: context) {
+        case .finished(let reply): return reply
+        case .accepted(let opening): destination = opening
         }
+        if let reply = prepareGoLanding(destination, trimmed: trimmed, front: front) { return reply }
+        let result = destination.result
+        let output = Self.object(result.output)
+        let landingPID = (output["process_identifier"]?.integerValue ?? output["pid"]?.integerValue).flatMap(Int32.init(exactly:))
+        let landingSignals = MacWaitSignals(effects: effectObserverSource, activation: appActivationSource, pid: landingPID)
+        defer { landingSignals.stop() }
+        let landing = await observeGoLanding(destination, signals: landingSignals, turn: turn, context: context)
+        return goLandingReply(landing, destination: destination, trimmed: trimmed, front: front)
+    }
+
+    private enum GoOpening {
+        case finished(MacFourVerbsReply)
+        case accepted(GoDestination)
+    }
+
+    private final class GoDestination {
+        let result: MacControlResult
+        var moved: String
+        var landingApp: String?
+        let landedOnSelf: Bool
+        let verificationDestination: String
+        let settlesAsynchronously: Bool
+        var opened = false
+
+        init(result: MacControlResult, moved: String, landingApp: String?, landedOnSelf: Bool,
+             verificationDestination: String, settlesAsynchronously: Bool) {
+            self.result = result
+            self.moved = moved
+            self.landingApp = landingApp
+            self.landedOnSelf = landedOnSelf
+            self.verificationDestination = verificationDestination
+            self.settlesAsynchronously = settlesAsynchronously
+        }
+    }
+
+    /// Open a web or file destination, or ask app control to focus or launch its resolved app.
+    private func openGoDestination(
+        _ trimmed: String, front: Bool, placement: [String: JSONValue], turn: Turn, context: MacOperationContext
+    ) async -> GoOpening {
+        func opening(_ url: URL) -> [String: JSONValue] { placement.merging(["url": .string(url.absoluteString)]) { _, new in new } }
         // Read the recipient even while foreground activation is settling.
         var landingApp: String?
         var landedOnSelf = false
@@ -39,7 +77,7 @@ extension MacFourVerbs {
             do {
                 result = try await host.dispatch(action: "open_target", body: opening(url), turn: turn, context: context)
             } catch {
-                return Self.unknownActionReply(error, operation: "opening \(trimmed)", app: landingApp)
+                return .finished(Self.unknownActionReply(error, operation: "opening \(trimmed)", app: landingApp))
             }
             moved = "The Mac accepted the request to open \(trimmed)."
             settlesAsynchronously = true
@@ -49,7 +87,7 @@ extension MacFourVerbs {
             do {
                 result = try await host.dispatch(action: "open_target", body: opening(path), turn: turn, context: context)
             } catch {
-                return Self.unknownActionReply(error, operation: "opening \(path.path)", app: landingApp)
+                return .finished(Self.unknownActionReply(error, operation: "opening \(path.path)", app: landingApp))
             }
             moved = "The Mac accepted the request to open \(path.path)."
             verificationDestination = path.path
@@ -59,7 +97,7 @@ extension MacFourVerbs {
                 // The app-control owner verifies requested foreground identity; background opens must not activate or raise.
                 let appResult = try await host.dispatch(
                     action: "focus_app", body: placement.merging(["app": .string(trimmed)]) { _, new in new }, turn: turn, context: context)
-                if let refusal = covered(appResult) { return refusal }
+                if let refusal = coveredGoRequest(appResult) { return .finished(refusal) }
                 if appResult.ok {
                     result = appResult
                     let out = Self.object(appResult.output)
@@ -74,17 +112,34 @@ extension MacFourVerbs {
                         : "\(trimmed) is already running; its windows were left as they were."
                     settlesAsynchronously = true
                 } else {
-                    return MacFourVerbsReply(ok: false,
+                    return .finished(MacFourVerbsReply(ok: false,
                         text: """
                             I couldn't open \(trimmed): \(appResult.error ?? "the app could not be resolved"). Use an exact installed app name, bundle \
                             identifier or .app path; address a folder by its path.
                             """,
-                        detail: Self.operationDetail(appResult))
+                        detail: Self.operationDetail(appResult)))
                 }
             } catch {
-                return Self.unknownActionReply(error, operation: "opening \(trimmed)", app: trimmed)
+                return .finished(Self.unknownActionReply(error, operation: "opening \(trimmed)", app: trimmed))
             }
         }
+        return .accepted(GoDestination(result: result, moved: moved, landingApp: landingApp, landedOnSelf: landedOnSelf,
+            verificationDestination: verificationDestination, settlesAsynchronously: settlesAsynchronously))
+    }
+
+    /// Report covered or locked displays using the navigation receipt.
+    private func coveredGoRequest(_ result: MacControlResult) -> MacFourVerbsReply? {
+        guard let code = result.error, ["display_obstructed", "mac_locked"].contains(code) else { return nil }
+        let why = Self.string(Self.object(result.output)["message"]) ?? MacScreenLock.reply
+        return MacFourVerbsReply(ok: false, text: "I can't see the screen right now. " + why,
+                                 detail: ["error": .string(code), "message": .string(why)])
+    }
+
+    /// Read the recipient from the open receipt and finish requests that need no landing sight.
+    private func prepareGoLanding(_ destination: GoDestination, trimmed: String, front: Bool) -> MacFourVerbsReply? {
+        let result = destination.result
+        var landingApp = destination.landingApp
+        var moved = destination.moved
         guard !Task.isCancelled else {
             var detail = Self.operationDetail(result)
             detail["status"] = .string("cancelled")
@@ -97,7 +152,7 @@ extension MacFourVerbs {
                     Waiting for the app was cancelled. The open or focus request may already have taken effect; inspect the receiving app before continuing.
                     """, detail: detail)
         }
-        if let refusal = covered(result) { return refusal }
+        if let refusal = coveredGoRequest(result) { return refusal }
         if result.action == "open_target" {
             let output = Self.object(result.output)
             landingApp = Self.string(output["bundle_identifier"]) ?? Self.string(output["matched_name"])
@@ -108,14 +163,11 @@ extension MacFourVerbs {
         // Launch Services owns opening the recipient; landing reads describe sight, not delivery. Missing Accessibility or a different window title cannot
         // disprove an accepted open.
         let opened = result.action == "open_target" && result.ok
-        func openedDetail(_ base: [String: JSONValue]) -> [String: JSONValue] {
-            var detail = base
-            detail["status"] = .string("opened")
-            if front { detail["front"] = .string("by Launch Services") }
-            return detail
-        }
+        destination.landingApp = landingApp
+        destination.moved = moved
+        destination.opened = opened
         // Arrival is navigation's receipt; person-only UI is never read through Accessibility.
-        if landedOnSelf {
+        if destination.landedOnSelf {
             var detail = Self.operationDetail(result)
             detail["status"] = .string(front ? "focused" : "running")
             detail["landing_read"] = .string("not read: this app's own window is never read; app (desk.read, mind.inner_state) shows its state")
@@ -126,12 +178,18 @@ extension MacFourVerbs {
         if !front, landingApp == nil {
             return MacFourVerbsReply(ok: result.ok, text: result.ok ? moved + " Nothing came to the front."
                 : "I couldn't complete the request to go to \(trimmed).",
-                detail: opened ? openedDetail(Self.operationDetail(result)) : Self.operationDetail(result))
+                detail: opened ? openedGoDetail(Self.operationDetail(result), front: front) : Self.operationDetail(result))
         }
-        let output = Self.object(result.output)
-        let landingPID = (output["process_identifier"]?.integerValue ?? output["pid"]?.integerValue).flatMap(Int32.init(exactly:))
-        let landingSignals = MacWaitSignals(effects: effectObserverSource, activation: appActivationSource, pid: landingPID)
-        defer { landingSignals.stop() }
+        return nil
+    }
+
+    /// Read the landing surface and let app or window events settle an unconfirmed arrival.
+    private func observeGoLanding(
+        _ destination: GoDestination, signals landingSignals: MacWaitSignals, turn: Turn, context: MacOperationContext
+    ) async -> Sighted {
+        let landingApp = destination.landingApp
+        let verificationDestination = destination.verificationDestination
+        let settlesAsynchronously = destination.settlesAsynchronously
         var landing = await sight(part: nil, app: landingApp, turn: turn, context: context)
         let needsSettlement: Bool
         switch landing {
@@ -147,12 +205,21 @@ extension MacFourVerbs {
                 return Self.destination(verificationDestination, matches: hit) == true
             }
         }
+        return landing
+    }
+
+    /// Preserve the open receipt and report what fresh sight established about the destination.
+    private func goLandingReply(_ landing: Sighted, destination: GoDestination, trimmed: String, front: Bool) -> MacFourVerbsReply {
+        let result = destination.result
+        let moved = destination.moved
+        let verificationDestination = destination.verificationDestination
+        let opened = destination.opened
         switch landing {
         case .blind(let reply):
             // A failed landing read cannot undo the navigation owner's completed work.
             if result.ok {
                 var detail = Self.operationDetail(result)
-                if opened { detail = openedDetail(detail) }
+                if opened { detail = openedGoDetail(detail, front: front) }
                 detail["landing_read"] = .string(reply.text)
                 return MacFourVerbsReply(ok: true, text: moved + " " + reply.text, detail: detail)
             }
@@ -180,7 +247,7 @@ extension MacFourVerbs {
                 return MacFourVerbsReply(
                     ok: true,
                     text: (result.ok ? receipt : "\(trimmed) is in front.") + " Now looking at " + hit.place + ".\n" + hit.render,
-                    detail: opened ? openedDetail(detail) : detail
+                    detail: opened ? openedGoDetail(detail, front: front) : detail
                 )
             }
             if opened || (landed == nil && result.ok) {
@@ -189,7 +256,7 @@ extension MacFourVerbs {
                     text: receipt + " The fresh screen is " + hit.place
                         + (landed == nil ? ", but it does not expose enough destination identity to prove the exact landing.\n" : ".\n")
                         + hit.render,
-                    detail: opened ? openedDetail(detail) : detail
+                    detail: opened ? openedGoDetail(detail, front: front) : detail
                 )
             }
             return MacFourVerbsReply(
@@ -199,6 +266,14 @@ extension MacFourVerbs {
                 detail: detail
             )
         }
+    }
+
+    /// Mark an accepted open as delivered by Launch Services.
+    private func openedGoDetail(_ base: [String: JSONValue], front: Bool) -> [String: JSONValue] {
+        var detail = base
+        detail["status"] = .string("opened")
+        if front { detail["front"] = .string("by Launch Services") }
+        return detail
     }
 
     // MARK: - Where "there" is

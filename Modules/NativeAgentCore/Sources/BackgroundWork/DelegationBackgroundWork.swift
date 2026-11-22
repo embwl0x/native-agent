@@ -103,7 +103,7 @@ public struct DelegationBackgroundWork: Sendable {
                 // Read all jobs with availability so unreadable stores hold the cursor.
                 // The resolved root keeps projection on the assembly’s bridge store.
                 let read = DelegationStatusProjector(configRoot: root, dataRoot: dataRoot)
-                    .allJobsWithAvailability(now: Date())
+                    .allJobsWithAvailability()
                 let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
                 let jobs = read.jobs.map { projection in
                     var job = projection
@@ -401,6 +401,7 @@ public struct DelegationBackgroundWork: Sendable {
 
 actor DelegationDeferralState {
     private var replyReconciliationPending = true
+    private(set) var deskWaitCheckStartedAt: Date?
     private var iosFailures: [URL: String] = [:]
     private var iosFailuresLoaded = false
     func updateIOSFailures(_ claims: [(path: URL, at: String)], changedPath: URL?) throws -> [(path: URL, at: String)] {
@@ -412,6 +413,7 @@ actor DelegationDeferralState {
         return iosFailures.map { (path: $0.key, at: $0.value) }
     }
     func requestReplyReconciliation() { replyReconciliationPending = true }
+    func beginDeskWaitCheck() { deskWaitCheckStartedAt = Date() }
     func takeReplyReconciliation() -> Bool {
         defer { replyReconciliationPending = false }
         return replyReconciliationPending
@@ -457,6 +459,7 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
         do { try await port.retryRequestedResults(dataRoot: dataRoot) }
         catch { return .failed(error: "Requested result notifications could not be reconciled: \(error.localizedDescription)") }
         do {
+            await deferral.beginDeskWaitCheck()
             try await port.reconcileAgentConversations()
         } catch is CancellationError {
             return .skipped(reason: "Delegation reply handling cancelled", healthNeutral: true)
@@ -565,6 +568,28 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                         """))
             }
         }
-        return quietEnd
+        do {
+            let items = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
+            let byHandle = Dictionary(uniqueKeysWithValues: items.map { ($0.handle, $0) })
+            let checkedAt = await deferral.deskWaitCheckStartedAt ?? now
+            let next = items.lazy.filter {
+                !$0.status.isTerminal && $0.continuation?.state == .ready && $0.continuation?.reason == DeskContinuation.parkedReason
+            }.compactMap { item -> Date? in
+                var seen: Set<String> = []
+                var current: DeskItem? = item
+                var latest = checkedAt
+                while let row = current, seen.insert(row.handle).inserted {
+                    if let until = row.deferUntil.flatMap(DeskSequencing.parseDeferStamp) { latest = max(latest, until) }
+                    current = row.parent.flatMap { byHandle[$0] }
+                }
+                return latest > checkedAt ? latest : nil
+            }.min()
+            // A defer that expired during the read still needs a return pass.
+            return [quietEnd, next.map { max($0, now.addingTimeInterval(0.001)) }].compactMap { $0 }.min()
+        } catch {
+            await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId,
+                outcome: .failed(error: "Desk continuation deadlines are unavailable: \(error.localizedDescription)"))
+            return quietEnd
+        }
     }
 }

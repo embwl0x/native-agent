@@ -174,7 +174,7 @@ public enum TurnCardReadout {
             }
             return "\(approval.act)?"
         case .approved: return "Approved: \(approval.act)"
-        case .denied: return "Denied: \(approval.act)"
+        case .denied: return "Declined: \(approval.act)"
         case .expired: return "Approval expired"
         case .unresolved: return "Approval outcome unknown"
         }
@@ -190,7 +190,7 @@ public enum TurnCardReadout {
         case .approved:
             return "You approved this. It runs through the usual safety checks."
         case .denied:
-            return "You denied this. The tool did not run."
+            return "You declined this. The tool did not run."
         case .expired:
             return "This request ended before anyone decided. The tool did not run."
         case .unresolved:

@@ -75,7 +75,7 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
             guard let support = atom.draft.entities.first(where: { $0.kind == Self.supportKind }),
                   support.id != "none" else { continue }
             guard let at = support.id.lastIndex(of: "@"),
-                  let version = MemoryContext.parseDate(String(support.id[support.id.index(after: at)...])) else {
+                  let version = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(String(support.id[support.id.index(after: at)...])) else {
                 exclusion.atomIDs.insert(atom.draft.id)
                 exclusion.unverified.append(ContextDegradedSourceNotice(sourceID: atom.draft.sourceID,
                     reason: "Graph supporting-memory version unavailable; repair its canonical source date."))
@@ -194,8 +194,8 @@ extension KnowledgeGraphContext {
         let predicate = NativeContextProjectionText.clean(relation.predicate)
         let object = NativeContextProjectionText.clean(relation.object)
         guard !subject.isEmpty, !predicate.isEmpty, !object.isEmpty else { return "" }
-        return "\(NativeContextProjectionText.bounded(subject, to: 120)) —\(NativeContextProjectionText.bounded(predicate, to: 60))→ "
-            + NativeContextProjectionText.bounded(object, to: 120)
+        return "\(TextClipping.prefix(subject, to: 120)) —\(TextClipping.prefix(predicate, to: 60))→ "
+            + TextClipping.prefix(object, to: 120)
     }
 
     static func atom(

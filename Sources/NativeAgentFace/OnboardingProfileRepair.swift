@@ -72,10 +72,10 @@ struct ProfileRepairStep: View {
                     .init(id: "user", label: "Your name", value: .string(state.userName), required: true),
                     .init(id: "agent", label: "Agent name", value: .string(state.agentName), required: true)
                 ], submit: [.init(id: "save", label: "Save names", role: .primary, call: .init("onboarding.repair"),
-                    unavailable: state.isLoading ? "Waiting on the profile owner." : nil)])),
+                    unavailable: state.isLoading ? "Saving your names…" : nil)])),
                 .init(id: "onboarding.recheck", rows: [.init(id: "onboarding.recheck", title: "Saved setup", actions: [
                     .init(id: "read", label: "Check again", call: .init("onboarding.recheck"),
-                        unavailable: state.isLoading ? "Waiting on the profile owner." : nil)])])
+                        unavailable: state.isLoading ? "Saving your names…" : nil)])])
             ]), door: ClosureFaceDoor(open: { _ in }) { input in
                 if input.action == "read" { await onRecheck(); return .init(effects: .none, accepted: true) }
                 guard case .string(let agent)? = input.values?["agent"], case .string(let user)? = input.values?["user"] else {

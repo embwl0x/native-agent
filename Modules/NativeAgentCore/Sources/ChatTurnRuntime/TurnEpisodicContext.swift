@@ -247,6 +247,7 @@ extension SwiftNativeTurnEngine {
 
     /// Receipt fields belong to their action; a fixed vocabulary cannot stand in for what it actually recorded.
     private static func lifeFacts(_ receipt: JSONValue) throws -> String {
+        let priority: Set<String> = ["status", "reason", "timed_out", "exit_code", "effects", "detail", "trash_path"]
         var pending: [(path: String, value: JSONValue)] = [("", receipt)]
         var facts: [String] = [], omitted = 0
         // Eight short facts per act keep the four-line packet compact; omitted facts remain explicitly counted.
@@ -254,6 +255,9 @@ extension SwiftNativeTurnEngine {
             switch field.value {
             case .object(let object) where !object.isEmpty:
                 let fields = object.sorted { lhs, rhs in
+                    // Keep evidence of an incomplete operation ahead of incidental envelope fields in the bounded recollection.
+                    let leftEvidence = priority.contains(lhs.key), rightEvidence = priority.contains(rhs.key)
+                    if leftEvidence != rightEvidence { return leftEvidence }
                     let leftNested = lifeNested(lhs.value), rightNested = lifeNested(rhs.value)
                     return leftNested == rightNested ? lhs.key < rhs.key : !leftNested
                 }

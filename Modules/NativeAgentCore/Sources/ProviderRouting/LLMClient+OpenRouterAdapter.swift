@@ -16,7 +16,7 @@ public final class OpenRouterTransport: LLMTransport {
     private let endpoint: URL?
     private let apiKeyOverride: String?
     private let dataRootOverride: URL?
-    private let telemetry: LLMCallTraceRecorder
+    public let telemetry: LLMCallTraceRecorder
 
     public init(
         session: URLSession = ProviderHTTP.session,
@@ -60,27 +60,6 @@ public final class OpenRouterTransport: LLMTransport {
             providerConfigFile: "openrouter.json",
             dataRoot: root
         )
-    }
-
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
-    }
-
-    /// Preserve images and assistant-tool/result turns on OpenRouter's OpenAI-compatible wire.
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
     public func streamMessages(

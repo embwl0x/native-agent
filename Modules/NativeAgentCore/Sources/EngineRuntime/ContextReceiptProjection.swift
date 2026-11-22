@@ -135,7 +135,7 @@ public enum ContextReceipts {
             if let shape = call["requestShape"], shape != .null {
                 guard case .string = shape else { return .unavailable("llm.call has no valid requestShape") }
             }
-            guard string(call, "requestShape") != "unmeasured",
+            guard call["requestShape"]?.nonemptyString != "unmeasured",
                   call["tools.wireSchemaBytes"] != nil || call["shapeVersion"] != nil else { continue }
             calls.append(call)
         }
@@ -149,7 +149,7 @@ public enum ContextReceipts {
             $0.kind == "context.tool_result.pointer"
                 && $0.turnId == turnId
         }
-        if let failure = string(payload, "toolCatalogMeasurementError") {
+        if let failure = payload["toolCatalogMeasurementError"]?.nonemptyString {
             return .unavailable("Tool catalog measurement is unavailable: " + failure)
         }
         do {
@@ -334,7 +334,7 @@ public enum ContextReceipts {
         }
 
         return ComposerContextReceipt(
-            model: string(payload, "model"),
+            model: payload["model"]?.nonemptyString,
             ranAt: ranAt,
             rows: rows,
             assembledBytes: assembled,
@@ -345,14 +345,14 @@ public enum ContextReceipts {
 
     /// Use `LLMUsage` logical input: Anthropic’s disjoint counters sum, while OpenAI already reports a total.
     private static func inputTokens(_ call: [String: JSONValue]) -> Int? {
-        guard let provider = string(call, "provider"),
+        guard let provider = call["provider"]?.nonemptyString,
               case .bool(let additive)? = call["additiveInputCounters"] else { return nil }
         return LLMUsage(
             inputTokens: int(call, "inputTokens"),
             cacheReadInputTokens: int(call, "cacheReadInputTokens"),
             cacheCreationInputTokens: int(call, "cacheCreationInputTokens"),
             additiveInputCounters: additive
-        ).logicalInputTokens(provider: provider)
+        ).logicalInputTokens()
     }
 
     // MARK: Details
@@ -385,7 +385,7 @@ public enum ContextReceipts {
     private static func recallDetail(_ payload: [String: JSONValue]) -> String? {
         guard case .object(let recall)? = payload["memoryRecall"] else { return nil }
         let injected = int(recall, "injectedHitCount")
-        switch string(recall, "outcome") {
+        switch recall["outcome"]?.nonemptyString {
         case "notConfigured": return "not configured"
         case "error": return "recall failed"
         case "unknown": return "not recorded"
@@ -413,7 +413,7 @@ public enum ContextReceipts {
     }
 
     private static func deliveryDetail(_ payload: [String: JSONValue]) -> String? {
-        switch string(payload, "historyDelivery") {
+        switch payload["historyDelivery"]?.nonemptyString {
         // This delivery embeds history in the system prompt, so a separate size would double count it.
         case "systemPrompt": "this lane carries history inside the system prompt"
         case "none": "no earlier turns"
@@ -451,11 +451,6 @@ public enum ContextReceipts {
     private static func difference(_ lhs: Int, _ rhs: Int) -> Int? {
         guard lhs >= rhs else { return nil }
         return lhs - rhs
-    }
-
-    private static func string(_ payload: [String: JSONValue], _ key: String) -> String? {
-        guard case .string(let value)? = payload[key], !value.isEmpty else { return nil }
-        return value
     }
 
     public static func formatTokens(_ count: Int, approximate: Bool) -> String {

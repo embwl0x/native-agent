@@ -90,11 +90,6 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
                 mime: "audio/x-caf", name: "voice.caf", byteSize: bytes.count, utterance: utterance)
         }
 
-        /// Borrow the closed original for compression without materializing raw PCM/base64 in memory. Keep this Recording alive until export settles.
-        public func closeForExport() -> URL {
-            lock.withLock { file = nil; return url }
-        }
-
         deinit { try? FileManager.default.removeItem(at: url) }
     }
 }

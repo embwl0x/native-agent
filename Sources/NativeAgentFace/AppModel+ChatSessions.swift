@@ -82,6 +82,9 @@ extension AppModel {
         let generation = chatSelectionGeneration
         // The chat shows as soon as it is chosen. Her side can take seconds re-reading it, and its transcript arrives by its own reader.
         let previous = activeChatSessionId
+        // What an unassigned composer holds moves with the selection; a refused selection gives it back.
+        let unassignedText = chatComposerDrafts[""]?.text ?? ""
+        let unassignedFiles = chatPendingAttachments[""] ?? []
         commitChatSessionSelection(id)
         do {
             let reply = try await chatAct(.selectConversation(session: id, userInitiated: userInitiated))
@@ -90,10 +93,24 @@ extension AppModel {
             }
             return chatSelectionGeneration == generation
         } catch {
-            if chatSelectionGeneration == generation { commitChatSessionSelection(previous) }
+            if chatSelectionGeneration == generation {
+                if previous.isEmpty { returnUnassignedDraft(text: unassignedText, files: unassignedFiles, from: id) }
+                commitChatSessionSelection(previous)
+            }
             setFailureStatus(error, action: "open your conversation")
             systemToasts.push(error: statusText)
             return false
+        }
+    }
+
+    private func returnUnassignedDraft(text: String, files: [FaceAttachment], from session: String) {
+        if !text.isEmpty, composerDraft(for: session).text == text, composerDraft(for: "").text.isEmpty {
+            composerDraft(for: "").edit(text)
+            composerDraft(for: session).edit("")
+        }
+        if !files.isEmpty, let held = chatPendingAttachments[session], held.suffix(files.count) == files[...] {
+            chatPendingAttachments[session] = Array(held.dropLast(files.count))
+            chatPendingAttachments[""] = files
         }
     }
 

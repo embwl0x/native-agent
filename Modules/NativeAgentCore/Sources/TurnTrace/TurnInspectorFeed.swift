@@ -23,13 +23,12 @@ public actor TurnInspectorFeed {
     private var replays: [Date: InspectorFace] = [:]
     private var replayReads: [Date: LatestRead] = [:]
     private let publication: AsyncStream<(FaceKey, InspectorFace)>.Continuation
-    private let publishing: Task<Void, Never>
 
     public init(dataRootOverride: URL? = nil, feed: FaceFeedSource) {
         lane = TurnTracePersistLane(dataRootOverride: dataRootOverride)
         let (stream, continuation) = AsyncStream.makeStream(of: (FaceKey, InspectorFace).self)
         publication = continuation
-        publishing = Task.detached {
+        Task.detached {
             for await (key, value) in stream { await feed.post(value, at: key) }
         }
     }

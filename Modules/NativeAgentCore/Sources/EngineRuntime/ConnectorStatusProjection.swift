@@ -110,7 +110,7 @@ public final class ConnectorReadiness: Sendable {
         platform: AppConnectorStatusPlatform,
         proof: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)]? = nil
     ) -> [String: JSONValue] {
-        guard let id = connectorString(row["id"]).map(normalizedConnectorID), !id.isEmpty else {
+        guard let id = row["id"]?.stringValue.map(normalizedConnectorID), !id.isEmpty else {
             return row
         }
         let proofs: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)]
@@ -125,13 +125,13 @@ public final class ConnectorReadiness: Sendable {
         out["id"] = .string(id)
         // Derive credential proof here: a hand-edited registry row cannot confer health decay eligibility.
         out.removeValue(forKey: ConnectorHealthDecay.proofSourceKey)
-        if connectorString(out["name"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+        if out["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
             out["name"] = .string(defaultConnectorName(id))
         }
-        if connectorString(out["kind"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+        if out["kind"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
             out["kind"] = .string("connector")
         }
-        if connectorString(out["description"]) == nil {
+        if out["description"]?.stringValue == nil {
             out["description"] = .string("")
         }
 
@@ -159,7 +159,7 @@ public final class ConnectorReadiness: Sendable {
         if id == "searxng" {
             do {
                 if !(try SwiftNativeResearchClient.checkedSearxngBaseURL(root: root) ?? "").isEmpty {
-                    if connectorBool(out["enabled"]) == nil { out["enabled"] = .bool(true) }
+                    if out["enabled"]?.boolValue == nil { out["enabled"] = .bool(true) }
                     out["authState"] = .string("not_required")
                     out["healthStatus"] = .string("unknown")
                 } else {
@@ -209,18 +209,18 @@ public final class ConnectorReadiness: Sendable {
             out["enabled"] = .bool(true)
             out["authState"] = .string("not_required")
             out["healthStatus"] = .string("unknown")
-            if connectorString(out["kind"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            if out["kind"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
                 out["kind"] = .string("browser")
             }
-            if connectorString(out["description"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            if out["description"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
                 out["description"] = .string("Visible browser research and inspection with receipts.")
             }
             return out
         }
 
         if id == "slack" {
-            let existingAuth = connectorString(out["authState"])?.lowercased()
-            let existingHealth = connectorString(out["healthStatus"])?.lowercased()
+            let existingAuth = out["authState"]?.stringValue?.lowercased()
+            let existingHealth = out["healthStatus"]?.stringValue?.lowercased()
             let token: Bool
             do {
                 _ = try SlackCredentials.metadata(dataRoot: root)
@@ -255,7 +255,7 @@ public final class ConnectorReadiness: Sendable {
     public static func markCredentialProof(_ row: inout [String: JSONValue], proof: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)]) {
         row[ConnectorHealthDecay.proofSourceKey] =
             .string(ConnectorHealthDecay.credentialProofSource)
-        let family = ConnectorProofLedger.canonicalID(connectorString(row["id"]) ?? "")
+        let family = ConnectorProofLedger.canonicalID(row["id"]?.stringValue ?? "")
         row = ConnectorHealthDecay.apply(to: row, outcome: proof[family], now: Date())
     }
 
@@ -290,24 +290,24 @@ public final class ConnectorReadiness: Sendable {
             if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root) {
                 if recovery.isAtCapacity {
                     row["runtimeStatus"] = .string("intake_paused")
-                    row["runtimeDetail"] = .string([connectorString(row["runtimeDetail"]), """
+                    row["runtimeDetail"] = .string([row["runtimeDetail"]?.stringValue, """
                         \(recovery.pendingCount) pending replies; new message intake is paused. \(recovery.unknownCount) need recovery. Ask \
                         \(platform.agentSubject) to inspect Slack delivery recovery before any manual retry; nothing is automatically discarded or resent.
                         """].compactMap { $0 }.joined(separator: " "))
                 } else if recovery.unknownCount > 0 {
                     row["runtimeStatus"] = .string("recovery_required")
-                    row["runtimeDetail"] = .string([connectorString(row["runtimeDetail"]), """
+                    row["runtimeDetail"] = .string([row["runtimeDetail"]?.stringValue, """
                         \(recovery.unknownCount) replies have an unknown outcome (\(recovery.pendingCount) pending). Ask \(platform.agentSubject) to inspect \
                         Slack delivery recovery before any manual retry; automatic resend is paused.
                         """].compactMap { $0 }.joined(separator: " "))
                 } else if recovery.pendingCount > 0 {
-                    let detail = connectorString(row["runtimeDetail"]) ?? ""
+                    let detail = row["runtimeDetail"]?.stringValue ?? ""
                     row["runtimeDetail"] = .string("\(detail) \(recovery.pendingCount) accepted replies are pending delivery.")
                 }
             }
         } catch {
             row["runtimeStatus"] = .string("recovery_unavailable")
-            row["runtimeDetail"] = .string([connectorString(row["runtimeDetail"]), """
+            row["runtimeDetail"] = .string([row["runtimeDetail"]?.stringValue, """
                 slack_recovery_unavailable: \(error.localizedDescription). New message intake may be paused; ask \(platform.agentSubject) to inspect \
                 Slack delivery recovery before resending.
                 """].compactMap { $0 }.joined(separator: " "))
@@ -321,17 +321,6 @@ public final class ConnectorReadiness: Sendable {
     public static func normalizedConnectorID(_ raw: String) -> String {
         ConnectorOAuthRegistry.normalizedConnectorID(raw)
     }
-
-    public static func connectorString(_ value: JSONValue?) -> String? {
-        ConnectorOAuthRegistry.connectorString(value)
-    }
-
-    public static func connectorBool(_ value: JSONValue?) -> Bool? {
-        guard let value else { return nil }
-        if case .bool(let bool) = value { return bool }
-        return nil
-    }
-
 
     public static func defaultConnectorName(_ id: String) -> String {
         switch id {

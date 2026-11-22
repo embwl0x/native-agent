@@ -8,7 +8,6 @@ import ToolExecution
 import AuthoredCapabilities
 import StandingBots
 import Research
-import CryptoKit
 import PersonaEngine
 import MemoryV2
 import ProviderRouting
@@ -32,7 +31,7 @@ extension SwiftToolDispatcher {
         let policy = NotifyPolicy(
             level: level,
             on: deskCSV(input, "on"),
-            cooldown: optionalString(input, "cooldown")
+            cooldown: input["cooldown"]?.nonblankString
         )
         let store = deskStore()
         _ = try await store.setNotify(handle, policy: policy)
@@ -43,14 +42,14 @@ extension SwiftToolDispatcher {
     func impl_desk_nag_control(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let action = try deskString(input, "action")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let kindRaw = (optionalString(input, "scope_kind") ?? "global")
+        let kindRaw = (input["scope_kind"]?.nonblankString ?? "global")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard ["global", "project", "item"].contains(kindRaw) else {
             throw deskInvalid("scope_kind",
                 reason: "desk_nag_control: unknown scope_kind '\(kindRaw)' (expected global|project|item)")
         }
-        let scopeIdRaw = optionalString(input, "scope_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let untilRaw = optionalString(input, "until")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let scopeIdRaw = input["scope_id"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let untilRaw = input["until"]?.nonblankString?.trimmingCharacters(in: .whitespacesAndNewlines)
         let configStore = DeskNagConfigStore(dataRoot: dataRoot)
 
         switch action {

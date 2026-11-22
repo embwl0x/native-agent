@@ -249,7 +249,6 @@ extension ChatMessageMetadata: ChatTurnFailureMetadata {}
 extension ChatMessage: ChatTurnFailureMessage {}
 
 extension ChatMessage: MacChatRenderedMessage {
-    public var macChatHasMetadata: Bool { metadata != nil }
     public var macChatPartial: Bool { metadata?.partial == true }
     public var macChatCancelled: Bool { metadata?.cancelled == true }
 }

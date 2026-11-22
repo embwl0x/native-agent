@@ -149,7 +149,7 @@ extension REMConsolidator {
             // Keep the canonical retained-passage pointer whole after the bounded summary so compressed nodes remain expandable.
             summary: String(summary.prefix(400)) + "\n\n" + REMGrowthEvictionHistory.pointer(id: id),
             sourceLines: text.split(separator: "\n").count,
-            createdAt: isoNow()
+            createdAt: NativeTimestampFormat.plainZulu(clock())
         )
     }
 
@@ -181,11 +181,5 @@ extension REMConsolidator {
             sourceLines: node.sourceLines,
             createdAt: node.createdAt
         )
-    }
-
-    private func isoNow() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.string(from: clock())
     }
 }

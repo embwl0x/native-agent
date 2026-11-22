@@ -1,7 +1,6 @@
 import AgentWorkspace
 import AgentConversations
 import ChatSessionWork
-import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -111,7 +110,7 @@ public enum HumanConversationReader {
                     unreadable.append(.object([
                         "physical_row_in_tail": .int(Int64(index + 1)),
                         "message_id": fields?["id"] ?? .null, "reason": .string(reason),
-                        "sha256": .string(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())]))
+                        "sha256": .string(SHA256Hex.of(data))]))
                 }
             }
         }

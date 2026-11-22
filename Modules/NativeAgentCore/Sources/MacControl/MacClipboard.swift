@@ -5,9 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-#if canImport(AppKit) && os(macOS)
 import AppKit
-#endif
 
 // Blueprint: | `MacClipboard.swift` | `MacClipboardRead`: Permission-bound pasteboard reads/writes; bounded redacted text and type metadata |
 
@@ -42,18 +40,18 @@ public struct MacPasteboardContents: Sendable, Equatable {
 }
 
 public protocol MacPasteboardSource: Sendable {
-    /// A missing pasteboard is unavailable, never evidence of an empty clipboard.
+    /// An unavailable or changing pasteboard yields no snapshot.
     func read() -> MacPasteboardContents?
     /// A failed replacement may already have cleared the previous contents; false cannot promise preservation.
     func write(text: String) -> Bool
 }
 
-#if canImport(AppKit) && os(macOS)
 public struct SystemMacPasteboardSource: MacPasteboardSource {
     public init() {}
 
     public func read() -> MacPasteboardContents? {
         let board = NSPasteboard.general
+        let changeCount = board.changeCount
         let boardTypes = board.types ?? []
         let concealed = boardTypes.contains {
             $0.rawValue == "org.nspasteboard.ConcealedType" || $0.rawValue == "org.nspasteboard.TransientType"
@@ -65,11 +63,12 @@ public struct SystemMacPasteboardSource: MacPasteboardSource {
                 bytes: type == .string ? text?.utf8.count : nil
             )
         }
+        guard board.changeCount == changeCount else { return nil }
         return MacPasteboardContents(
             text: text,
             concealed: concealed,
             types: types,
-            changeCount: board.changeCount
+            changeCount: changeCount
         )
     }
 
@@ -79,21 +78,9 @@ public struct SystemMacPasteboardSource: MacPasteboardSource {
         return board.setString(text, forType: .string)
     }
 }
-#endif
-
-/// Platforms without a window server report unavailability rather than an empty clipboard.
-public struct UnavailableMacPasteboardSource: MacPasteboardSource {
-    public init() {}
-    public func read() -> MacPasteboardContents? { nil }
-    public func write(text: String) -> Bool { false }
-}
 
 public func defaultMacPasteboardSource() -> any MacPasteboardSource {
-    #if canImport(AppKit) && os(macOS)
     return SystemMacPasteboardSource()
-    #else
-    return UnavailableMacPasteboardSource()
-    #endif
 }
 
 // MARK: - The redaction boundary

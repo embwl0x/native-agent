@@ -10,7 +10,6 @@ import TurnTrace
 enum ContextStageName: String, CaseIterable, Sendable {
     case contextFlowAttention = "contextFlow.attention"
     case contextFlowPrepare = "contextFlow.prepare"
-    case providerPreferences = "provider.preferences"
     case personaCompile = "persona.compile"
     case remPinsRead = "rem_pins.read"
     case memoryRecall = "memory.recall"

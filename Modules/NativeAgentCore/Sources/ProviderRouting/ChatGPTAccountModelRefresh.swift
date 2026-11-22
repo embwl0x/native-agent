@@ -10,11 +10,16 @@ import PersistenceCore
 public actor ChatGPTAccountModelRefresh {
     public static let shared = ChatGPTAccountModelRefresh()
     public static let didRefresh = Notification.Name("ChatGPTAccountModelRefresh.didRefresh")
-    private struct CredentialKey: Hashable {
+    private struct CredentialKey: Hashable, Sendable {
         let root: URL
         let accessToken: String
     }
-    private var flights: [CredentialKey: Task<Bool, Error>] = [:]
+    private struct Flight {
+        let id: UUID
+        let task: Task<Void, Never>
+        var waiters: [UUID: CheckedContinuation<Bool, any Error>]
+    }
+    private var flights: [CredentialKey: Flight] = [:]
     private var failures: [CredentialKey: any Error] = [:]
 
     public static func cacheURL(dataRoot: URL) -> URL {
@@ -43,37 +48,84 @@ public actor ChatGPTAccountModelRefresh {
         }
         guard let token = try ChatGPTTransport.storedAccessToken(at: authPath) else { return false }
         var key = CredentialKey(root: root, accessToken: token)
-        if !force, let failure = failures[key] { throw failure }
+        if !force, flights[key] == nil, let failure = failures[key] { throw failure }
+        let context: CodexOAuthAccessContext
         do {
+            try Task.checkCancellation()
             try Self.validateCachePath(dataRoot: root, authPath: authPath)
             if !force, try Self.isCurrent(dataRoot: root, authPath: authPath, token: token) { return false }
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = .infinity
-            config.timeoutIntervalForResource = .infinity
-            config.waitsForConnectivity = true
-            let session = URLSession(configuration: config)
+            let session = Self.makeSession()
             defer { session.invalidateAndCancel() }
-            let adapter = ChatGPTTransport(session: session, authPathOverride: authPath)
-            let context = try await adapter.codexAccessContext()
-            // Token renewal is serialized by the adapter; join discovery for the credential actually sent.
+            context = try await ChatGPTTransport(session: session, authPathOverride: authPath).codexAccessContext()
             key = CredentialKey(root: root, accessToken: context.accessToken)
-            if let flight = flights[key] {
-                return try await withTaskCancellationHandler { try await flight.value } onCancel: { flight.cancel() }
+            if !force {
+                if flights[key] == nil, let failure = failures[key] { throw failure }
+                if try Self.isCurrent(dataRoot: root, authPath: authPath, token: context.accessToken) { return false }
             }
-            if !force, let failure = failures[key] { throw failure }
-            if !force, try Self.isCurrent(dataRoot: root, authPath: authPath, token: context.accessToken) { return false }
-            let flight = Task {
-                try await Self.fetch(dataRoot: root, authPath: authPath, context: context, session: session)
-            }
-            flights[key] = flight
-            defer { flights[key] = nil }
-            let changed = try await withTaskCancellationHandler { try await flight.value } onCancel: { flight.cancel() }
-            failures.removeValue(forKey: key)
-            return changed
         } catch {
             if !(error is CancellationError), (error as? URLError)?.code != .cancelled, !Task.isCancelled { failures[key] = error }
             throw error
         }
+        // Token renewal is serialized by the adapter; join discovery for the credential actually sent.
+        return try await waitForFlight(key: key, authPath: authPath, context: context)
+    }
+
+    private static func makeSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = .infinity
+        config.timeoutIntervalForResource = .infinity
+        config.waitsForConnectivity = true
+        return URLSession(configuration: config)
+    }
+
+    private func waitForFlight(key: CredentialKey, authPath: URL, context: CodexOAuthAccessContext) async throws -> Bool {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            let changed: Bool = try await withCheckedThrowingContinuation { waiter in
+                if Task.isCancelled {
+                    waiter.resume(throwing: CancellationError())
+                    return
+                }
+                if flights[key] != nil {
+                    flights[key]?.waiters[id] = waiter
+                    return
+                }
+                let task = Task {
+                    // The request owns its session for as long as any caller is waiting.
+                    let session = Self.makeSession()
+                    defer { session.invalidateAndCancel() }
+                    let result: Result<Bool, any Error>
+                    do { result = .success(try await Self.fetch(dataRoot: key.root, authPath: authPath, context: context, session: session)) }
+                    catch { result = .failure(error) }
+                    finishFlight(key: key, id: id, result: result)
+                }
+                flights[key] = Flight(id: id, task: task, waiters: [id: waiter])
+            }
+            try Task.checkCancellation()
+            return changed
+        } onCancel: {
+            Task { await self.cancelWaiter(key: key, id: id) }
+        }
+    }
+
+    private func cancelWaiter(key: CredentialKey, id: UUID) {
+        guard let waiter = flights[key]?.waiters.removeValue(forKey: id) else { return }
+        if let flight = flights[key], flight.waiters.isEmpty {
+            flights[key] = nil
+            flight.task.cancel()
+        }
+        waiter.resume(throwing: CancellationError())
+    }
+
+    private func finishFlight(key: CredentialKey, id: UUID, result: Result<Bool, any Error>) {
+        guard let flight = flights[key], flight.id == id else { return }
+        flights[key] = nil
+        switch result {
+        case .success: failures.removeValue(forKey: key)
+        case .failure(let error):
+            if !(error is CancellationError), (error as? URLError)?.code != .cancelled { failures[key] = error }
+        }
+        for waiter in flight.waiters.values { waiter.resume(with: result) }
     }
 
     private static func isCurrent(dataRoot: URL, authPath: URL, token: String) throws -> Bool {

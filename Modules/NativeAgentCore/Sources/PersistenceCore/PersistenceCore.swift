@@ -147,7 +147,7 @@ public enum SwiftNativePersistenceCore {
         try appendRecords([record], to: path, durable: false)
     }
 
-    /// Commit multi-op transactions with one write and full flush under the caller's flock.
+    /// Append a batch as one payload and fully flush it under the caller's flock.
     public static func appendJSONLDurable(_ records: [JSONValue], to path: URL) async throws {
         try appendRecords(records, to: path, durable: true)
     }

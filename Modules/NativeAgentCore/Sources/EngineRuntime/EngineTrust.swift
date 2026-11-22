@@ -148,7 +148,6 @@ public final class TrustFacade {
         let forced = TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy)
         return FeatureVerdict(enabled: policy.enableAutonomy || forced, forced: forced)
     }
-    public var memoryPermissions: TrustMemoryPolicy? { policy?.memoryPolicy }
 
     public private(set) var securityStatus: SecurityCenterStatus?
     public private(set) var securityRefreshError: String?
@@ -215,7 +214,6 @@ public final class TrustFacade {
         return (result.0, result.1)
     }
 
-    public var backups: [BackupRecord] = []
     public private(set) var capabilityCatalogSources: [CapabilityCatalogSource] = []
     public private(set) var catalogRefresh: PanelRefreshStatus?
     public var autonomyKernel: AutonomyKernelSummary? { policy.map(Self.autonomyKernel(for:)) }
@@ -267,10 +265,6 @@ public final class TrustFacade {
         await capabilitiesDidChange?()
         return read.3
     }
-    public private(set) var inboxPolicyEnabled = false
-    public private(set) var inboxPolicyError: Error?
-    public private(set) var hasReadInboxPolicy = false
-    @ObservationIgnored private let inboxPolicyRead = LatestRead()
 
     public nonisolated init(
         dataRoot: URL,
@@ -410,11 +404,9 @@ public final class TrustFacade {
         try TrustBackupPersistence.readBackupRecords(root: dataRoot)
     }
 
-    @ObservationIgnored private let backupsRead = LatestRead()
-
     @discardableResult
     public func refreshBackups() async throws -> [BackupRecord] {
-        try await backupsRead.read({ try await listBackups() }, publish: { backups = $0 })
+        try await listBackups()
     }
 
     public nonisolated func loadCapabilityNetwork() async throws -> CapabilityTrustNetwork {
@@ -436,13 +428,6 @@ public final class TrustFacade {
 // MARK: - Capability catalog
 
 extension TrustFacade {
-    public func observeInboxPolicy() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)]) {
-            do { _ = try await self.inboxEnabled() }
-            catch { print("[inbox settings] \(error.localizedDescription)") }
-        }
-    }
-
     /// Missing catalog state has no saved rows; damaged bytes throw and remain unchanged.
     public nonisolated func catalogSources() async throws -> [CapabilityCatalogSource] {
         try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot).map { try CapabilityCatalogSource(row: .object($0)) }
@@ -451,32 +436,11 @@ extension TrustFacade {
 
 extension TrustFacade {
     public func inboxEnabled() async throws -> Bool {
-        let result: Result<Bool, Error> = await inboxPolicyRead.read({
-            do {
-                let object = try await rawPolicy()
-                let enabled: Bool
-                if case .object(let policy)? = object["inboxPolicy"], case .bool(let saved)? = policy["enabled"] {
-                    enabled = saved
-                } else { enabled = true }
-                return .success(enabled)
-            } catch { return .failure(error) }
-        }, publish: { result in
-            hasReadInboxPolicy = true
-            switch result {
-            case .success(let enabled): inboxPolicyEnabled = enabled; inboxPolicyError = nil
-            case .failure(let error): inboxPolicyError = error
-            }
-        })
-        return try result.get()
-    }
-    public func setInboxEnabled(_ enabled: Bool) async throws {
-        _ = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
-            body: ["inboxPolicy": ["enabled": enabled]], dataRoot: dataRoot)
-        inboxPolicyRead.write {
-            inboxPolicyEnabled = enabled
-            inboxPolicyError = nil
-            hasReadInboxPolicy = true
+        let object = try await rawPolicy()
+        if case .object(let policy)? = object["inboxPolicy"], case .bool(let saved)? = policy["enabled"] {
+            return saved
         }
+        return true
     }
 }
 

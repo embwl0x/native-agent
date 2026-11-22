@@ -1,5 +1,4 @@
 import AgentWorkspace
-import ChatTurnContracts
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -88,8 +87,7 @@ enum AgentConversationHistoryView {
             if let source = line.source { names[source] = names[PeerTrust.principal(source, dataRoot: dataRoot, peers: peers)] ?? source }
         }
         var untrusted = false
-        let messages: [JSONValue] = ContactThread.project(selected, person: "the person, from the contact's thread", names: names,
-            mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) }).map { line in
+        let messages: [JSONValue] = ContactThread.project(selected, person: "the person, from the contact's thread", names: names).map { line in
             let full = exchange != nil
             var value: [String: JSONValue] = [
                 "message": .string(line.id), "at": .string(NativeTimestampFormat.fractionalZulu(line.at)),
@@ -122,8 +120,10 @@ enum AgentConversationHistoryView {
                 let principals = speakers.map { PeerTrust.principal($0, dataRoot: dataRoot, peers: peers) }
                 let trusted = principals.allSatisfy { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }
                 if !line.mine { value["agent_id"] = .string(principals[0]) }
-                value["untrusted_remote_data"] = .bool(!trusted)
-                untrusted = untrusted || !trusted
+                // A contact's message is the peer's data whether or not the person trusts it; the trust is its own fact.
+                value["untrusted_remote_data"] = .bool(true)
+                value["trusted"] = .bool(trusted)
+                untrusted = true
             }
             return .object(value)
         }

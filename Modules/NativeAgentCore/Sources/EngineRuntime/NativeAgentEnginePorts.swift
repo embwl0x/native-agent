@@ -83,10 +83,6 @@ extension CognitionHost {
         await NativeAgentEngine.forRoot(dataRoot).tools.face(id: id, input: input, version: version)
     }
 
-    public func inQuietHours(at date: Date, dataRoot: URL) -> Bool {
-        AttentionRouter.inQuietHours(at: date, dataRoot: dataRoot)
-    }
-
     public func unattendedWorkAllowed(dataRoot: URL) async -> Bool {
         await UnattendedWork.allowed(dataRoot: dataRoot)
     }

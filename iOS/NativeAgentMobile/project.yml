@@ -19,8 +19,8 @@ settings:
   SWIFT_STRICT_CONCURRENCY: complete
   TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
   SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-  MARKETING_VERSION: "0.6.20"
-  CURRENT_PROJECT_VERSION: "78"
+  MARKETING_VERSION: "0.6.21"
+  CURRENT_PROJECT_VERSION: "96"
   # Set DEVELOPMENT_TEAM locally in Xcode or on the xcodebuild command line
   # for device builds. Do not commit a personal Apple Developer Team ID.
   CODE_SIGN_STYLE: "Automatic"
@@ -114,7 +114,7 @@ targets:
         PHPhotoLibraryPreventAutomaticLimitedAccessAlert: true
         NSLocationWhenInUseUsageDescription: "Save a place on this phone or share your current location when you accept a phone request."
         NSCameraUsageDescription: "Take a photo to share with your agent when you accept a camera request."
-        NSLocationAlwaysAndWhenInUseUsageDescription: "Share enabled place transitions and wake brief phone-presence readings when you move, even while NativeAgent is closed. Coordinates for these senses stay on this phone."
+        NSLocationAlwaysAndWhenInUseUsageDescription: "Share enabled place transitions and wake brief phone-presence readings when you move, even while NativeAgent is closed. Only the Location sense, if you turn it on, shares this phone's position with your Mac."
         NSMotionUsageDescription: "Share motion estimates (stationary, walking, running, cycling or driving) and confidence with your paired Mac and its selected AI provider when you enable Motion."
         NSFocusStatusUsageDescription: "Share whether Focus is on with your paired Mac when you enable Focus."
         NSSupportsLiveActivities: true

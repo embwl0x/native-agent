@@ -109,7 +109,7 @@ extension NativeAgentEngine {
                 return { [self] in
                     _ = try await saveProviderGroupSelection(group: ProviderSurfaceGroups.mind,
                         providerID: provider.provider_id, model: model.id,
-                        reasoningEffort: ProvidersFacade.normalizedReasoningEffort(from: providers.catalog, providers: connections,
+                        reasoningEffort: ProvidersFacade.normalizedReasoningEffort(providers: connections,
                             providerID: provider.provider_id, model: model.id, selected: preference?.reasoningEffort ?? ""),
                         serviceTier: preference?.serviceTier)
                     return "Memory and mind → \(model.id) saved"

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ToolDescriptor.swift` | `ToolDescriptor`, `ToolExecutor`, `AppActionBinding`: one call/effect declaration |
+// Blueprint: | `ToolDescriptor.swift` | `ToolDescriptor`, `AppActionBinding`: one call/effect declaration |
 
 // MARK: - Tool descriptors
 
@@ -58,16 +58,6 @@ public struct ToolDescriptor: Sendable {
     }
 
     public var name: String { schema.name }
-}
-
-/// External owners contribute to the same catalog so listing and execution cannot diverge.
-public protocol ToolExecutor: Sendable {
-    var descriptors: [ToolDescriptor] { get }
-    /// A body has one executor per overridden Core tool, using Core's schema and the body's own gates.
-    var replacesCoreTools: Set<String> { get }
-    func execute(
-        tool: String, input: [String: JSONValue], surface: String, turn: Turn
-    ) async throws -> JSONValue
 }
 
 /// Core reads declared app policy without importing its executor.

@@ -26,14 +26,10 @@ public final class CognitionViewFacade {
     public var detail: CognitiveObservatoryDetail?
     public var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
     public private(set) var contextFlowHealthCheckedAt: Date?
-    public var lastRefresh: Date?
     public var subconsciousRuntime: NativeSubconsciousRuntimeState?
     public var reflectionRoute: NativeReflectionRouteStatus?
     public private(set) var diary: DreamDiary?
-    public private(set) var diaryGate: DreamREMGatePolicy?
     public private(set) var diaryError: String?
-    public var diaryLoading: Bool { pendingDiaryReads > 0 }
-    private var pendingDiaryReads = 0
     @ObservationIgnored private var diaryLimit = 60
     @ObservationIgnored private let diaryRead = LatestRead()
     @ObservationIgnored private var diaryWatch: FileChangeWatcher?
@@ -42,8 +38,6 @@ public final class CognitionViewFacade {
     @ObservationIgnored private let observatoryLatest = LatestRead()
     @ObservationIgnored private let detailRead = LatestRead()
     @ObservationIgnored private let vitalsRead = LatestRead()
-    private var pendingObservatoryReads = 0
-    public var isRefreshing: Bool { pendingObservatoryReads > 0 }
 
     public nonisolated init(dataRoot: URL, mind: MindLifetime? = nil) {
         self.dataRoot = dataRoot
@@ -60,7 +54,6 @@ public final class CognitionViewFacade {
     public func refreshDetail() async {
         _ = await detailRead.read({ await runtime?.observatoryDetail() }, publish: { read in
             detail = read
-            lastRefresh = Date()
         })
     }
 
@@ -159,17 +152,12 @@ public final class CognitionViewFacade {
             }
             if diaryWatch == nil { diaryWatch = watcher } else { watcher.cancel() }
         }
-        pendingDiaryReads += 1
-        defer { pendingDiaryReads -= 1 }
-        let read: (DreamREMGatePolicy?, Result<DreamDiary, Error>) = await diaryRead.read({
-            var gate: DreamREMGatePolicy?
+        let read: Result<DreamDiary, Error> = await diaryRead.read({
             do {
                 let checked = try await dreamGateChecked()
-                gate = checked
-                return (gate, .success(try await readDreamDiary(limit: diaryLimit, enabled: checked.dreamEnabled)))
-            } catch { return (gate, .failure(error)) }
-        }, publish: { gate, result in
-            diaryGate = gate
+                return .success(try await readDreamDiary(limit: diaryLimit, enabled: checked.dreamEnabled))
+            } catch { return .failure(error) }
+        }, publish: { result in
             switch result {
             case .success(let next):
                 diary = next
@@ -178,7 +166,7 @@ public final class CognitionViewFacade {
                 diaryError = UserFacingError.message(error, action: "load the dream diary")
             }
         })
-        let next = try read.1.get()
+        let next = try read.get()
         return DreamDiary(entries: Array(next.entries.prefix(max(1, limit))), enabled: next.enabled,
                           totalEntries: next.totalEntries, unreadableEntries: next.unreadableEntries)
     }
@@ -260,8 +248,6 @@ extension CognitionViewFacade {
     public func refreshObservatory(
         contextFlowHealthRead: () async -> ContextFlowObservatoryHealthState
     ) async {
-        pendingObservatoryReads += 1
-        defer { pendingObservatoryReads -= 1 }
         await refreshDetail()
         await refreshContextFlowHealth(contextFlowHealthRead)
     }

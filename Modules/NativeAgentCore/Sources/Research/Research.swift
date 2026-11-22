@@ -104,14 +104,23 @@ public struct ResearchSearchResponse: Sendable, Equatable {
     public let unresponsiveEngines: [String]
     /// Unusable result rows, named by their position and failing field.
     public let gaps: [String]
+    /// The engines' direct answers (a calculation, a conversion, a definition), before any link.
+    public let answers: [String]
+    /// Knowledge panels: a subject's title, its summary and its own page.
+    public let infoboxes: [JSONValue]
 
-    public init(results: [ResearchSearchResult], unresponsiveEngines: [String] = [], gaps: [String] = []) {
+    public init(results: [ResearchSearchResult], unresponsiveEngines: [String] = [], gaps: [String] = [],
+                answers: [String] = [], infoboxes: [JSONValue] = []) {
         self.results = results
         self.unresponsiveEngines = unresponsiveEngines
         self.gaps = gaps
+        self.answers = answers
+        self.infoboxes = infoboxes
     }
 
-    public var enginesFailed: Bool { results.isEmpty && !unresponsiveEngines.isEmpty }
+    /// A direct answer or knowledge panel is what came back too, not only result links.
+    public var hasContent: Bool { !results.isEmpty || !answers.isEmpty || !infoboxes.isEmpty }
+    public var enginesFailed: Bool { !hasContent && !unresponsiveEngines.isEmpty }
 
     init(data: Data) throws {
         let parsed: JSONValue
@@ -119,7 +128,7 @@ public struct ResearchSearchResponse: Sendable, Equatable {
         catch { throw ResearchClientError.malformedResponse("SearXNG body is not JSON: \(error)") }
         guard case .object(let payload) = parsed else { throw ResearchClientError.malformedResponse("SearXNG body is not a JSON object") }
         guard case .array(let items)? = payload["results"] else { throw ResearchClientError.malformedResponse("SearXNG results is missing or is not an array") }
-        var results: [ResearchSearchResult] = []
+        var rows: [ResearchSearchResult] = []
         var gaps: [String] = []
         for (index, item) in items.enumerated() {
             try Task.checkCancellation()
@@ -157,10 +166,23 @@ public struct ResearchSearchResponse: Sendable, Equatable {
                         throw ResearchClientError.malformedResponse("SearXNG results[\(index)].engine must be a string when present")
                     }
                 }
-                if results.count < 10 { results.append(ResearchSearchResult(title: title, url: url, snippet: content, source: source)) }
+                rows.append(ResearchSearchResult(title: title, url: url, snippet: content, source: source))
             } catch let error as ResearchClientError {
                 gaps.append(error.localizedDescription)
             }
+        }
+        // Every usable result, taken in turn across the engines so one engine cannot lead the page; each keeps its own order.
+        var lanes: [(engine: String, rows: [ResearchSearchResult])] = []
+        for row in rows {
+            let engine = row.source?.split(separator: ",").first.map(String.init) ?? ""
+            if let lane = lanes.firstIndex(where: { $0.engine == engine }) { lanes[lane].rows.append(row) }
+            else { lanes.append((engine, [row])) }
+        }
+        var results: [ResearchSearchResult] = []
+        var round = 0
+        while lanes.contains(where: { round < $0.rows.count }) {
+            for lane in lanes where round < lane.rows.count { results.append(lane.rows[round]) }
+            round += 1
         }
         let engines: [JSONValue]
         switch payload["unresponsive_engines"] {
@@ -178,12 +200,37 @@ public struct ResearchSearchResponse: Sendable, Equatable {
             }
             failures.append(name + ": " + reason)
         }
-        self.init(results: results, unresponsiveEngines: failures, gaps: gaps)
+        // Answers arrive as plain strings or as {answer, url}; panels as {infobox, content, urls}. Each keeps a bounded summary.
+        var answers: [String] = []
+        if case .array(let values)? = payload["answers"] {
+            for value in values {
+                switch value {
+                case .string(let text) where !text.isEmpty: answers.append(text)
+                case .object(let fields): if case .string(let text)? = fields["answer"], !text.isEmpty { answers.append(text) }
+                default: break
+                }
+            }
+        }
+        var infoboxes: [JSONValue] = []
+        if case .array(let values)? = payload["infoboxes"] {
+            for case .object(let box) in values {
+                guard case .string(let title)? = box["infobox"], !title.isEmpty else { continue }
+                var panel: [String: JSONValue] = ["title": .string(title)]
+                if case .string(let content)? = box["content"], !content.isEmpty { panel["summary"] = .string(String(content.prefix(800))) }
+                if case .array(let urls)? = box["urls"], case .object(let first)? = urls.first, case .string(let url)? = first["url"] {
+                    panel["url"] = .string(url)
+                }
+                infoboxes.append(.object(panel))
+            }
+        }
+        self.init(results: results, unresponsiveEngines: failures, gaps: gaps, answers: answers, infoboxes: Array(infoboxes.prefix(3)))
     }
 
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = ["results": .array(results.map { $0.toJSON() })]
         obj["gaps"] = .array(gaps.map(JSONValue.string))
+        if !answers.isEmpty { obj["answers"] = .array(answers.map(JSONValue.string)) }
+        if !infoboxes.isEmpty { obj["infoboxes"] = .array(infoboxes) }
         if !unresponsiveEngines.isEmpty {
             obj["unresponsive_engines"] = .array(unresponsiveEngines.map(JSONValue.string))
         }

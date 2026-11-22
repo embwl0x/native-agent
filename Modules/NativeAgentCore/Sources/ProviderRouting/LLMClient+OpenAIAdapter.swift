@@ -21,7 +21,7 @@ public final class OpenAITransport: LLMTransport {
     private let apiKeyOverride: String?
     /// Injected roots confine credentials; secondary runtimes must supply their own root.
     private let dataRootOverride: URL?
-    private let telemetry: LLMCallTraceRecorder
+    public let telemetry: LLMCallTraceRecorder
 
     private var credentialRoot: URL {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -69,30 +69,6 @@ public final class OpenAITransport: LLMTransport {
         self.telemetry = LLMCallTraceRecorder(
             dataRootOverride: telemetryDataRootOverride ?? dataRootOverride
         )
-    }
-
-    /// Nil or empty tools must preserve the plain completion body.
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
-    }
-
-    // MARK: - Structured messages (native vision)
-
-    /// Every message retains its role on the selected OpenAI wire.
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?, call: LLMCall
-    ) async throws -> String {
-        return try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
     // MARK: - Structured streaming (tool calls)
@@ -230,7 +206,6 @@ public final class OpenAITransport: LLMTransport {
                         bytes: bytes, request: req, model: model,
                         providerId: providerId, telemetry: telemetry, requestStartNs: requestStartNs,
                         providerLabel: "openai", errorPrefix: "openai",
-                        transport: .publicAPI,
                         networkError: { _ in .underlying(message: "connection refused: \(req.url?.host ?? "openai")") },
                         continuation: continuation, call: call
                     )

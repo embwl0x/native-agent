@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import PersistenceCore
 
@@ -63,7 +64,7 @@ struct ContinuityField: Sendable {
         )
         let input = eventActivationInput(event.importance)
         let confidence = confidenceSeed(for: event.sourceClass)
-        let boundedSummary = Self.boundedString(event.summary, maxCharacters: configuration.maximumSummaryCharacters)
+        let boundedSummary = TextClipping.prefixOrWhole(event.summary, maxCharacters: configuration.maximumSummaryCharacters)
         let boundedMetadata = Self.boundedMetadata(event.metadata, configuration: configuration)
 
         let isNewNode = nodesByKey[key] == nil
@@ -138,7 +139,7 @@ struct ContinuityField: Sendable {
         let key = key(of: landing)
         applyDecay(at: now, matchingLivedState: true)
         let input = eventActivationInput(worth)
-        let summary = Self.boundedString(landing.summary, maxCharacters: configuration.maximumSummaryCharacters)
+        let summary = TextClipping.prefixOrWhole(landing.summary, maxCharacters: configuration.maximumSummaryCharacters)
         var node = nodesByKey[key] ?? CognitiveNode(id: makeUUID(), kind: landing.kind, subjectReference: landing.subject,
             activation: 0, salience: 0, confidence: confidenceSeed(for: .observed), sourceClass: .observed, createdAt: now,
             lastActivatedAt: now, decayHalfLife: landing.halfLife, summary: summary, metadata: [:])
@@ -208,8 +209,7 @@ struct ContinuityField: Sendable {
     mutating func stampEmotionTag(
         key: String,
         tag: (valence: Double, arousal: Double, warmth: Double),
-        isNewNode: Bool,
-        configuration: CognitiveConfiguration
+        isNewNode: Bool
     ) -> Bool {
         guard var node = nodesByKey[key] else { return false }
         if isNewNode {
@@ -285,9 +285,7 @@ struct ContinuityField: Sendable {
     }
 
     /// Consolidation changes arousal only: recurring felt nodes strengthen and stale strong charges soften.
-    mutating func consolidateEmotionalArousal(
-        at now: Date, configuration: CognitiveConfiguration
-    ) -> (reinforced: Int, calmed: Int) {
+    mutating func consolidateEmotionalArousal(at now: Date) -> (reinforced: Int, calmed: Int) {
         var reinforced = 0
         var calmed = 0
         // Snapshot keys before replacing values so iteration cannot change under mutation.
@@ -719,11 +717,6 @@ struct ContinuityField: Sendable {
                 )
         }
         return out
-    }
-
-    private static func boundedString(_ string: String, maxCharacters: Int) -> String {
-        guard maxCharacters >= 0, string.count > maxCharacters else { return string }
-        return String(string.prefix(maxCharacters))
     }
 
     private static func orderedMetadataKeys(_ metadata: [String: JSONValue]) -> [String] {

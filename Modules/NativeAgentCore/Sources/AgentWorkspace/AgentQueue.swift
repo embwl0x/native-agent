@@ -1,6 +1,7 @@
 import Foundation
 import ApprovalInbox
 import ChatToolParsing
+import ChatTurnContracts
 import ChatSessionWork
 import Desk
 import Experiences
@@ -81,7 +82,10 @@ public enum MyQueueReady {
     package static func time(_ handle: String) -> String { owner + ":" + handle }
 
     /// A moment's key. The same occurrence of a step always gets the same key, so it is posted once; a new occurrence gets a new key.
-    package static func once(_ handle: String, _ occurrence: Date) -> String { "queue:" + handle + ":" + String(occurrence.timeIntervalSince1970) }
+    package static func once(_ item: DeskItem, _ occurrence: Date) -> String {
+        "queue:" + item.handle + ":" + String(occurrence.timeIntervalSince1970)
+            + (item.step?.habitRevision.map { ":" + $0 } ?? "")
+    }
 
     /// Carried work whose condition came, and the occurrence that names it.
     package struct Moment: Sendable {
@@ -112,11 +116,13 @@ public enum MyQueueReady {
                     occurrence = freeOccurrence(item, filed: filed)
                 case .at(let date): occurrence = context.now >= date ? date : nil
                 case .every: occurrence = context.occurrence(entry.step, context.now)
-                case .afterCard: occurrence = entry.step.status == MyQueue.cardReleased ? filed : nil
+                case .afterCard(let card):
+                    occurrence = MyQueue.cardIsReleased(entry, card: card, completedCards: context.completedCards) ? filed : nil
                 case .userHere, .userAway:
                     guard let presence = context.presence(), presence.since > filed, presence.here == (when == .userHere) else { continue }
                     occurrence = presence.since
-                case .news, .signal: occurrence = MyQueue.releaseNotes(for: entry).compactMap { DeskClock.parseISO($0.ts) }.max()
+                // The earliest unhandled release runs first; its Ran note raises the floor only to it, so a second signal still runs.
+                case .news, .signal: occurrence = MyQueue.releaseNotes(for: entry).compactMap { DeskClock.parseISO($0.ts) }.min()
                 }
             } else {
                 guard let opened = DeskClock.parseISO(item.openedAt) else { continue }
@@ -196,26 +202,29 @@ public enum MyQueueReady {
 }
 
 extension AgentScreen {
-    package static func queueContext(dataRoot: URL, now: Date, ownTurn: Bool) throws -> MyQueue.Context {
-        let completed = try SwiftNativeApprovalInbox(root: dataRoot).resolvedUnlocked().filter { record in
-            guard record.decision == "approved", case .object(let result)? = record.executedAction else { return false }
-            if let resultClass = result["resultClass"] {
-                return resultClass == .string(ChatToolOutcome.ExactResultClass.succeeded.rawValue)
-            }
-            // These approval executors persist domain completion receipts. Normalize only their success evidence, retaining failure fields.
-            var evidence = result
-            if record.action == SwiftNativeApprovalInbox.skillScriptInstallAction,
-               result["installed"] == .bool(true), result["status"] == nil {
-                evidence["status"] = .string("completed")
-            }
-            let reply = ToolResult(.object(evidence))
-            return reply.outcome == .succeeded
+    private static func approvalCompleted(_ record: ApprovalRecord) -> Bool {
+        guard record.decision == "approved", let result = record.executedAction?.objectValue else { return false }
+        if let resultClass = result["resultClass"] {
+            return resultClass == .string(ChatToolOutcome.ExactResultClass.succeeded.rawValue)
+        }
+        if record.action == SwiftNativeApprovalInbox.skillScriptInstallAction,
+           result["status"] == nil {
+            return result["installed"] == .bool(true)
+        }
+        return record.executionResultClass == .succeeded
+    }
+
+    package static func queueContext(items: [DeskItem], dataRoot: URL, now: Date, ownTurn: Bool) async throws -> MyQueue.Context {
+        let legacyCards = Set(items.compactMap(MyQueue.entry).compactMap(MyQueue.cardNeedingReleaseEvidence))
+        var completed: Set<String> = []
+        for id in legacyCards {
+            if let card = try await queueCard(id, dataRoot: dataRoot), card.completed { completed.insert(id) }
         }
         // The index records each conversation's source; a door is the surface it arrives on.
         let rows = try HumanConversationIndex.rows(dataRoot: dataRoot).map { row -> (id: String?, door: String, updatedAt: Date) in
             guard let source = row["source"]?.stringValue else { throw CocoaError(.fileReadCorruptFile) }
             return (id: row["id"]?.stringValue, door: ChatThreadKind.surface(transcriptSource: source),
-                    updatedAt: row["updatedAt"]?.stringValue.flatMap(date) ?? .distantPast)
+                    updatedAt: row["updatedAt"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) ?? .distantPast)
         }
         // Read the three newest per actual door before creating a nonthrowing condition callback. A failed evidence read cannot become false.
         var counts: [String: Int] = [:], latest: [String: Date] = [:]
@@ -227,7 +236,7 @@ extension AgentScreen {
         }
         let observed = latest
         let presence = PersonPresence.read(dataRoot: dataRoot, now: now).transition
-        return MyQueue.Context(now: now, ownTurn: ownTurn, completedCards: Set(completed.map(\.id))) { door, since in
+        return MyQueue.Context(now: now, ownTurn: ownTurn, completedCards: completed) { door, since in
                 return rows.filter { row in
                     (door.map { $0.rawValue == row.door } ?? true) && row.updatedAt > since
                 }.prefix(3).contains { row in
@@ -239,9 +248,99 @@ extension AgentScreen {
           presence: { presence }
     }
 
-    /// Read approval follow-ups fresh; decline drops only unchanged steps, successful calls release them, and changed or failed work needs judgment.
-    /// The one owner of a card's after_card steps, called at the card's settle. `handOff`: the card continues a turn, which takes the steps
-    /// (they close here, and their words ride its input); otherwise they are released to run from MY QUEUE on their own.
+    package struct QueueCard: Sendable {
+        let decision: String?
+        let completed: Bool
+
+        static let waiting = Self(decision: nil, completed: false)
+    }
+
+    package static func queueApprovalSteering(_ record: ApprovalRecord) throws -> (sources: [String], elevated: [String]) {
+        try PeerDataTaint.steer(in: record.payload.objectValue?["peer"], scope: record.decision == "approved" ? record.scope : nil)
+    }
+
+    /// Read the durable decision and execution evidence from the owner of the named card.
+    package static func queueCard(_ card: String, dataRoot: URL) async throws -> QueueCard? {
+        do {
+            let approval = try await SwiftNativeApprovalInbox(root: dataRoot).get(card)
+            guard approval.status == "resolved", let decision = approval.decision,
+                  decision != "approved" || approval.executedAction != nil else {
+                return .waiting
+            }
+            if approval.payload.objectValue?["kind"] == .string("chat_tool_approval") {
+                _ = try queueApprovalSteering(approval)
+                if SwiftNativeApprovalInbox.continuationIsPending(approval) { return .waiting }
+            }
+            return QueueCard(decision: decision, completed: approvalCompleted(approval))
+        } catch ApprovalInboxError.notFound {
+            guard let matter = try await ExperienceStore.at(dataRoot).experience("interaction:" + card) else { return nil }
+            guard let ref = matter.evidence.first(where: { $0.id == card && $0.source.hasPrefix(Matter.conversations) }),
+                  let session = NativeAgentChatSessionID.normalizedPathComponent(String(ref.source.dropFirst(Matter.conversations.count))) else {
+                throw PersistenceCoreError.ioFailure("Interaction \(card) has no originating conversation evidence.")
+            }
+            let path = dataRoot.appendingPathComponent(Matter.messages(session) + ".jsonl")
+            let life = try DataRootLife.current(in: dataRoot)
+            let rows = try await SwiftNativePersistenceCore.readJSONL(path)
+            guard let row = rows.first(where: {
+                let metadata = $0.objectValue?["metadata"]?.objectValue
+                return metadata?["kind"] == .string(InlineInteractionWire.transcriptKind)
+                    && metadata?[InlineInteractionWire.metadataKey]?.objectValue?["id"] == .string(card)
+            }), let saved = try InlineInteractionWire.checkedCard(in: row, lifeID: life) else {
+                throw PersistenceCoreError.ioFailure("Interaction \(card) is missing from its originating conversation.")
+            }
+            if let state = saved.continuation?.state, [.waiting, .claimed, .replaying].contains(state) { return .waiting }
+            switch saved.state {
+            case .settled: return QueueCard(decision: "approved", completed: true)
+            case .declined, .superseded: return QueueCard(decision: "declined", completed: false)
+            default: return .waiting
+            }
+        }
+    }
+
+    package enum CardFollowUp: String, Sendable {
+        case waiting, released, dropped, taken, changed, finishedHabit
+    }
+
+    /// Re-read after filing so either the card's scan or this exact filing sees the other's committed write.
+    package static func reconcileFiledCard(_ entry: MyQueue.Entry, store: SwiftNativeDeskStore) async throws -> CardFollowUp? {
+        guard case .afterCard(let id)? = MyQueue.when(entry) else { return nil }
+        return try await SwiftNativePersistenceCore.withFileLock(store.opsPath) { () -> CardFollowUp in
+            guard let current = try await MyQueue.entry(entry.item.handle, store: store),
+                  MyQueue.when(current) == .afterCard(id), current.step.filedAt == entry.step.filedAt else { return .changed }
+            if MyQueue.cardIsReleased(current, card: id) { return .released }
+            guard let card = try await queueCard(id, dataRoot: store.dataRoot) else { throw ApprovalInboxError.notFound(id) }
+            guard let decision = card.decision else { return .waiting }
+            // A step a stopped run holds is that run's to settle; the card's own scan reaches it when the hold lets go.
+            if try await store.runHold(current.item.handle) != nil { return .waiting }
+            return try await settleCardStep(current, card: id, decision: decision, completed: card.completed,
+                                            handOff: false, store: store)
+        }
+    }
+
+    private static func droppedAfterCard(_ decision: String, dataRoot: URL) -> String {
+        decision == "denied" ? "dropped by \(names(dataRoot).person)" : "dropped: the card was \(decision)"
+    }
+
+    private static func settleCardStep(_ entry: MyQueue.Entry, card: String, decision: String, completed: Bool, handOff: Bool,
+                                       store: SwiftNativeDeskStore) async throws -> CardFollowUp {
+        if decision != "approved" {
+            let ending = try await MyQueue.finish(entry, dropped: true, why: droppedAfterCard(decision, dataRoot: store.dataRoot), store: store)
+            return ending == .finishedHabit ? .finishedHabit : .dropped
+        }
+        guard completed, entry.step.status != "stopped" else { return .waiting }
+        if MyQueue.cardIsReleased(entry, card: card) { return .released }
+        guard entry.peerBorn || entry.item.title == entry.step.title else { return .changed }
+        if handOff {
+            let ending = try await MyQueue.finish(entry, dropped: false, why: "Taken by the card's continued turn.", store: store)
+            return ending == .finishedHabit ? .finishedHabit : .taken
+        }
+        var released = entry.step
+        released.status = MyQueue.cardReleaseStatus(card)
+        _ = try await MyQueue.update(entry, step: released, store: store)
+        return .released
+    }
+
+    /// Settle the card's open follow-ups. If its turn continues, take the still-waiting steps into that turn.
     package static func resume(card: String, decision: String, completed: Bool, handOff: Bool, dataRoot: URL) async
         -> (text: String, sources: [String], elevated: [String]) {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
@@ -252,44 +351,33 @@ extension AgentScreen {
             before continuing it.
             """, [], []) }
         var lines: [String] = [], sources: [String] = [], elevated: [String] = []
-        for entry in MyQueue.entries(state) where entry.step.card == card {
+        for entry in MyQueue.entries(state) where MyQueue.when(entry) == .afterCard(card) {
             sources += entry.step.peers
             elevated += entry.step.elevated
             let queued = "\(entry.name) \"\(entry.step.words)\""
-            if decision != "approved" {
-                let why = decision == "denied" ? "dropped by \(names(dataRoot).person)" : "dropped: the card was \(decision)"
-                do {
-                    try await MyQueue.finish(entry, dropped: true, why: why, store: store)
+            do {
+                switch try await settleCardStep(entry, card: card, decision: decision, completed: completed, handOff: handOff, store: store) {
+                case .dropped:
+                    let why = droppedAfterCard(decision, dataRoot: dataRoot)
                     lines.append("The step you queued for after this card was \(why): \(queued).")
-                } catch is MyQueue.Superseded {
-                    lines.append("The step you queued for after this card, \(queued), changed or closed before the card settled. The newer state was kept.")
-                } catch {
-                    lines.append("The step you queued for after this card, \(queued), could not be dropped: "
-                        + error.localizedDescription + ". It is still in MY QUEUE.")
-                }
-            } else if !completed {
-                lines.append("The approved call did not confirm success, so the step you queued for after it was not run "
-                    + "and is still in MY QUEUE: \(queued).")
-            } else if !entry.peerBorn, entry.item.title != entry.step.title {
-                lines.append("You queued \(entry.name) for after this card as \"\(entry.step.words)\", but it reads "
-                    + "\"\(entry.item.title)\" now. It was not run; look at it and decide.")
-            } else if !handOff {
-                var released = entry.step
-                released.status = MyQueue.cardReleased
-                do { _ = try await MyQueue.update(entry, step: released, store: store) }
-                catch { lines.append("The step queued for after this card, \(queued), could not be released: " + error.localizedDescription + ".") }
-            } else {
-                do {
-                    try await MyQueue.finish(entry, dropped: false, why: "Taken by the card's continued turn.", store: store)
+                case .waiting:
+                    let cause = completed ? "The queued step is stopped" : "The approved call did not confirm success"
+                    lines.append(cause + ", so the step was not run and is still in MY QUEUE: \(queued).")
+                case .changed:
+                    lines.append("You queued \(entry.name) for after this card as \"\(entry.step.words)\", but it reads "
+                        + "\"\(entry.item.title)\" now. It was not run; look at it and decide.")
+                case .taken:
                     lines.append("Queued after this card (\(entry.name), now taken from MY QUEUE): \"\(entry.step.words)\""
                         + (entry.step.actionText.map { "\nHabit: " + $0 } ?? ""))
                     lines.append("Do it now with your usual actions, in this turn.")
-                } catch is MyQueue.Superseded {
-                    lines.append("The step you queued for after this card, \(queued), changed or closed before the card settled. The newer state was kept.")
-                } catch {
-                    lines.append("The step queued for after this card, \(queued), could not be taken: " + error.localizedDescription
-                        + ". It is still in MY QUEUE and waits; nothing runs it twice.")
+                case .released: break
+                case .finishedHabit:
+                    lines.append("The habit already finished and its queued step is now done: \(queued).")
                 }
+            } catch is MyQueue.Superseded {
+                lines.append("The step you queued for after this card, \(queued), changed or closed before the card settled. The newer state was kept.")
+            } catch {
+                lines.append("Settlement needs repair for the step queued after this card, \(queued): " + error.localizedDescription + ".")
             }
         }
         return (lines.joined(separator: "\n"), sources, elevated)

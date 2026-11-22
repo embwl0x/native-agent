@@ -82,7 +82,8 @@ struct MakeSheetView: View {
                             }
                             if row == 0, whole {
                                 Button { change { $0.addColumn() } } label: { Image(systemName: "plus") }
-                                    .buttonStyle(.borderless).disabled(!changeable).help("Add a column").padding(.horizontal, 6)
+                                    .buttonStyle(.borderless).disabled(!changeable || width >= Self.shownColumns)
+                                    .help(width >= Self.shownColumns ? "This window shows \(Self.shownColumns) columns at most" : "Add a column").padding(.horizontal, 6)
                             }
                         }
                     }
@@ -90,7 +91,9 @@ struct MakeSheetView: View {
             }
             if rows.isEmpty { Text("This table is empty.").foregroundStyle(.secondary) }
             if whole {
-                Button("Add a row") { change { $0.addRow() } }.buttonStyle(.borderless).disabled(!changeable)
+                // At the shown limit an added row would hide itself and make the whole sheet read-only.
+                Button("Add a row") { change { $0.addRow() } }.buttonStyle(.borderless).disabled(!changeable || rows.count >= Self.shownRows)
+                    .help(rows.count >= Self.shownRows ? "This window shows \(Self.shownRows) rows at most" : "Add a row")
             } else {
                 Text(Self.leftOut(rows: rows.count - shown.count, columns: width - columns)).font(ShellType.label).foregroundStyle(.secondary)
             }

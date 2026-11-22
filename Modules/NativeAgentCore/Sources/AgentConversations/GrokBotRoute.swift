@@ -1,4 +1,5 @@
 import AgentWorkspace
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -55,10 +56,10 @@ public struct GrokRequestStore: Sendable {
         return root.appendingPathComponent(id + ".json")
     }
     public func create(id: String, peer: String, askedIn: String, route: AgentBridgeCompletionRoute, quiet: Bool = false,
-                       now: Date = Date()) throws -> GrokPendingRequest {
+                       now: Date = Date()) async throws -> GrokPendingRequest {
         guard NativeAgentChatSessionID.normalizedPathComponent(askedIn) == askedIn else { throw GrokLinkCredential.Failure.invalid }
         let file = try url(id)
-        try pruneSettled(now: now)
+        try await pruneSettled(now: now)
         return try CredentialFileLock.withLock(file) {
             guard !FileManager.default.fileExists(atPath: file.path) else { throw GrokLinkCredential.Failure.invalid }
             let request = GrokPendingRequest(lifeID: try DataRootLife.current(in: root.deletingLastPathComponent().deletingLastPathComponent()),
@@ -68,10 +69,22 @@ public struct GrokRequestStore: Sendable {
             return request
         }
     }
+    /// A settled request is pruned; one no longer kept has no hand-over left to read.
+    public func kept(_ id: String, peer: String) throws -> GrokPendingRequest? {
+        guard UUID(uuidString: id)?.uuidString.lowercased() == id else { throw GrokLinkCredential.Failure.invalid }
+        guard FileManager.default.fileExists(atPath: root.appendingPathComponent(id + ".json").path) else { return nil }
+        return try read(id, peer: peer)
+    }
     public func read(_ id: String, peer: String) throws -> GrokPendingRequest {
+        let value = try readReceipt(id)
+        guard value.peerID == peer else { throw GrokLinkCredential.Failure.invalid }
+        return value
+    }
+
+    package func readReceipt(_ id: String) throws -> GrokPendingRequest {
         guard UUID(uuidString: id)?.uuidString.lowercased() == id else { throw GrokLinkCredential.Failure.invalid }
         let value = try load(root.appendingPathComponent(id + ".json"))
-        guard value.peerID == peer else { throw GrokLinkCredential.Failure.invalid }
+        guard value.messageID == id else { throw GrokLinkCredential.Failure.invalid }
         return value
     }
     private func load(_ file: URL) throws -> GrokPendingRequest {
@@ -98,7 +111,7 @@ public struct GrokRequestStore: Sendable {
             return value
         }
     }
-    public func claimReply(_ reply: GrokReplyInput, peer: String, now: Date = Date()) throws -> GrokPendingRequest {
+    public func claimReply(_ reply: GrokReplyInput, peer: String) throws -> GrokPendingRequest {
         try update(reply.message_id, peer: peer) { value in
             // A lost acknowledgment may redeliver the same webhook. Only the identical saved answer is repeatable, with its handover intact.
             if value.state == "answered", value.reply == reply.text { return }
@@ -137,8 +150,10 @@ public struct GrokRequestStore: Sendable {
             && !["pending", "running", "handing over"].contains(value.handOver ?? "")
     }
 
-    /// Keep seven days, at most 256 settled receipts. Pending sends and reply hand-overs have no expiry here: approvals and launch recovery need them.
-    public func pruneSettled(now: Date = Date()) throws {
+    package static func restorationOperation(for id: String) -> String { "grok.receipt.restore:" + id }
+
+    /// Keep seven days, at most 256 settled receipts. Pending work and open repair debt retain their evidence past those limits.
+    public func pruneSettled(now: Date = Date(), keeping: Set<URL> = []) async throws {
         guard FileManager.default.fileExists(atPath: root.path) else { return }
         let files = try FileManager.default.contentsOfDirectory(at: root,
             includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
@@ -154,7 +169,25 @@ public struct GrokRequestStore: Sendable {
         }
         settled.sort { $0.date > $1.date }
         let cutoff = now.addingTimeInterval(-7 * 86_400)
-        for (index, item) in settled.enumerated() where index >= 256 || item.date < cutoff {
+        let expired = settled.enumerated().filter { $0.offset >= 256 || $0.element.date < cutoff }
+            .map(\.element).filter { !keeping.contains($0.file) }
+        if expired.isEmpty { return }
+        let dataRoot = root.deletingLastPathComponent().deletingLastPathComponent()
+        let debts: [Experience]
+        do { debts = try await ExperienceStore.at(dataRoot).open() }
+        catch is CancellationError { throw CancellationError() }
+        catch {
+            nativeLog("Grok receipt retention could not read restoration debt: %@", error.localizedDescription)
+            return
+        }
+        let repairing = Set(debts.compactMap { debt -> String? in
+            let repair = RepairDebt(debt)
+            guard RepairOwed.isOwed(debt), let owner = repair.owner,
+                  repair.operation == Self.restorationOperation(for: URL(fileURLWithPath: owner).deletingPathExtension().lastPathComponent)
+            else { return nil }
+            return owner
+        })
+        for item in expired where !repairing.contains(item.file.path) {
             try CredentialFileLock.withLock(item.file) {
                 guard FileManager.default.fileExists(atPath: item.file.path) else { return }
                 let current = try load(item.file)
@@ -236,10 +269,6 @@ public enum GrokBotRoute {
                      """)])
     }
     public static func routineName(_ peer: String) -> String { "NativeAgent reply " + peer }
-    public static let securePasteBlocker = """
-        Grok Bot setup is unfinished. Connect gives the steps: send its one message in the Grok Bot chat, then copy the routine's webhook \
-        address and key with Grok Bot's own Copy and paste them here, together or one after the other.
-        """
     public static func instruction(peer: String, command: String) -> String {
         // Only app-owned fixed arguments form the command. Reply data is stdin.
         let quoted = "'" + command.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -291,7 +320,7 @@ public enum GrokBotRoute {
         // Sorted keys keep IDs before potentially truncated webhook text.
         request.httpBody = try JSONSerialization.data(withJSONObject: ["message_id": messageID, "conversation_id": conversation(peer: peer.id),
             "text": try withHistory(text, peer: peer.id, messageID: messageID, dataRoot: dataRoot)], options: [.sortedKeys])
-        _ = try store.create(id: messageID, peer: peer.id, askedIn: askedIn, route: route, quiet: quiet)
+        _ = try await store.create(id: messageID, peer: peer.id, askedIn: askedIn, route: route, quiet: quiet)
         let state: String
         do {
             let code = try await post(request)

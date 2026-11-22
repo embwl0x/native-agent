@@ -79,7 +79,7 @@ public struct LocalConnectorActions: Sendable {
             "trash_file":   { FileSystemActions.trashFile($0, $1) },
             "list_dir":     { FileSystemActions.listDir($0, $1) },
             "file_info":    { FileSystemActions.fileInfo($0, $1) },
-            "system_info":  { FileSystemActions.systemInfo($0, $1) },
+            "system_info":  { input, _ in FileSystemActions.systemInfo(input) },
             "grep":               { FileSystemActions.grep($0, $1) },
             "git_status":         { FileSystemActions.gitStatus($0, $1) },
             "git_diff":           { FileSystemActions.gitDiff($0, $1) },

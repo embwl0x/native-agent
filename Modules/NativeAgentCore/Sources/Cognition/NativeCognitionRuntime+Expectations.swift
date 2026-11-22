@@ -355,7 +355,7 @@ extension NativeCognitionRuntime {
             configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
             dataRoot: dataRoot
         )
-        let read = projector.recentJobsWithAvailability(now: now)
+        let read = projector.recentJobsWithAvailability()
         var seen: Set<String> = []
         var out: [(token: String, dueAt: Date)] = []
         for job in read.jobs {

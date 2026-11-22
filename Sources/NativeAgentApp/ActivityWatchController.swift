@@ -21,7 +21,7 @@ extension ActivityWatchController {
         criticalIssueNotifier: { issue in
             guard let notification = ActivityCaptureIssueNotificationPresentation.notification(for: issue) else { return }
             NativeAgentNotifications.post(title: notification.title, body: notification.body,
-                userInfo: ["eventId": issue.id.uuidString, NativeAgentNotificationRoute.pageKey: "trust/features"], deadline: nil)
+                userInfo: ["eventId": issue.id.uuidString, NativeAgentNotificationRoute.pageKey: "trust"], deadline: nil)
         }
     )
 }

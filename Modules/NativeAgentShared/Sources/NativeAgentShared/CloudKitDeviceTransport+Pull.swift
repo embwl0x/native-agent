@@ -1,7 +1,6 @@
 #if canImport(CloudKit) && !os(Linux)
 import Foundation
 import CloudKit
-import CryptoKit
 import OSLog
 // Blueprint: | `CloudKitDeviceTransport+Pull.swift` | Paginated record pulls with call-local traversal cursors up to the durable server-date watermark |
 
@@ -80,27 +79,7 @@ extension CloudKitDeviceTransport {
                     // Old records are paging evidence, not delivery candidates. A previous pairing key must not be needed to pass them.
                     if let since, let date = ck.modificationDate, date <= since { return }
                     do {
-                        guard let direction = ck["direction"] as? String,
-                              let text = ck["text"] as? String,
-                              let createdAt = ck["createdAt"] as? String,
-                              let sender = ck["senderDevice"] as? String else {
-                            throw DeviceSyncError.underlying(message:
-                                "CloudKit record \(ck.recordID.recordName) has unreadable message fields.")
-                        }
-                        let fields = NAChatMessageFields(
-                            recordName: ck.recordID.recordName,
-                            direction: direction,
-                            sessionId: ck["sessionId"] as? String,
-                            text: text,
-                            payloadJSON: try Self.payload(in: ck, secret: assetSecret),
-                            createdAt: createdAt,
-                            senderDevice: sender,
-                            kind: ck["kind"] as? String,
-                            notificationTitle: ck["notificationTitle"] as? String,
-                            notificationScreen: ck["notificationScreen"] as? String,
-                            notificationEventID: ck["notificationEventId"] as? String
-                        )
-                        holder.add(fields)
+                        holder.add(try Self.chatFields(in: ck, assetSecret: assetSecret))
                     } catch {
                         nativeLog("[ck-device] chat payload unavailable for %@: %@", ck.recordID.recordName, error.localizedDescription)
                         holder.failPayload(Self.mapError(error))
@@ -142,6 +121,30 @@ extension CloudKitDeviceTransport {
         } while nextCursor != nil
 
         return combined
+    }
+
+    /// The one decoding of a chat or notification record, whether the query or the bell found it.
+    static func chatFields(in ck: CKRecord, assetSecret: Data?) throws -> NAChatMessageFields {
+        guard let direction = ck["direction"] as? String,
+              let text = ck["text"] as? String,
+              let createdAt = ck["createdAt"] as? String,
+              let sender = ck["senderDevice"] as? String else {
+            throw DeviceSyncError.underlying(message:
+                "CloudKit record \(ck.recordID.recordName) has unreadable message fields.")
+        }
+        return NAChatMessageFields(
+            recordName: ck.recordID.recordName,
+            direction: direction,
+            sessionId: ck["sessionId"] as? String,
+            text: text,
+            payloadJSON: try payload(in: ck, secret: assetSecret),
+            createdAt: createdAt,
+            senderDevice: sender,
+            kind: ck["kind"] as? String,
+            notificationTitle: ck["notificationTitle"] as? String,
+            notificationScreen: ck["notificationScreen"] as? String,
+            notificationEventID: ck["notificationEventId"] as? String
+        )
     }
 
     static func pullPageCrossesWatermark(

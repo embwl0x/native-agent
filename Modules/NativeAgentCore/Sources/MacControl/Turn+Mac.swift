@@ -65,7 +65,7 @@ public struct MacOperationContext: Sendable {
     public var observationMode: MacObservationMode = .interactive
     public var driver: MacDriverBinding?
     public var background = false
-    var inputStartCount = 0
+    var inputStartCounts = (requested: 0, recovery: 0)
     var holdsAcrossCalls = false
     var axSession: SwiftNativeMacControl.AXSession?
     /// The apps this operation's Accessibility messages go to, noted as each message is prepared.
@@ -83,13 +83,13 @@ public struct MacOperationContext: Sendable {
     var restoring: MacForegroundSnapshot?
     public var dataRoot: URL
     var looking = false
+    /// Under Full Mac her eyes see what the person sees: pixels carry no secret masks. Her saved receipts keep their own redaction.
+    public internal(set) var seesAsPerson = false
     var readDeadline: Date?
     var preparingRenderer = false
     public var handsBack = false
-    #if canImport(ApplicationServices) && os(macOS)
     var evidence: MacAXAttributeRead.Evidence?
     var attributeGaps: MacAXAttributeRead.AttributeGaps?
-    #endif
 
     public init(dataRoot: URL = defaultDataRoot(), deadline: ContinuousClock.Instant? = nil,
                 observationMode: MacObservationMode = .interactive) {

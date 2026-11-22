@@ -125,16 +125,17 @@ extension AgentScreen {
     private static func world(workspace: WorkspaceOperation, _ dataRoot: URL, now: Date, observing: Bool, home: Bool) -> AgentWorld {
         let root = dataRoot.standardizedFileURL.path + "\u{0}"
         @Sendable func at(_ path: String) -> URL { dataRoot.appendingPathComponent(path) }
-        @Sendable func files(_ dir: URL, file: String? = nil) -> [URL] {
-            // Passive watch reach only. Keep the parent even if enumeration fails, so restoration invalidates the checked owner reading.
-            let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
-            return [dir] + names.compactMap { name in
-                let child = dir.appendingPathComponent(name)
-                guard let file else { return child }
-                // Only a folder holds a file of its own; a path under a plain file can never be watched.
-                return (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? child.appendingPathComponent(file) : nil
-            }
-        }
+        let reading = WorldReading(root: root, observing: observing)
+        readWorldPeople(workspace: workspace, dataRoot: dataRoot, at: at, reading: reading)
+        readWorldWork(workspace: workspace, dataRoot: dataRoot, now: now, at: at, reading: reading)
+        guard home else { return reading.world }
+        readWorldHome(dataRoot: dataRoot, at: at, reading: reading)
+        return reading.world
+    }
+
+    private final class WorldReading {
+        let root: String
+        let observing: Bool
         let memo = AgentMemo.shared
         var world = AgentWorld()
         func part<T>(_ key: String, _ paths: @autoclosure @escaping @Sendable () -> [URL], notifications: [Notification.Name] = [],
@@ -156,16 +157,36 @@ extension AgentScreen {
             }
         }
 
-        if let events: [PhonePlaceEvent] = part("phone places", [PhonePlaceHistory.url(dataRoot)], {
+        init(root: String, observing: Bool) {
+            self.root = root
+            self.observing = observing
+        }
+    }
+
+    private static func files(_ dir: URL, file: String? = nil) -> [URL] {
+        // Passive watch reach only. Keep the parent even if enumeration fails, so restoration invalidates the checked owner reading.
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
+        return [dir] + names.compactMap { name in
+            let child = dir.appendingPathComponent(name)
+            guard let file else { return child }
+            // Only a folder holds a file of its own; a path under a plain file can never be watched.
+            return (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? child.appendingPathComponent(file) : nil
+        }
+    }
+
+    /// Read arrivals, people and contact health.
+    private static func readWorldPeople(workspace: WorkspaceOperation, dataRoot: URL,
+                                        at: @escaping @Sendable (String) -> URL, reading: WorldReading) {
+        if let events: [PhonePlaceEvent] = reading.part("phone places", [PhonePlaceHistory.url(dataRoot)], {
             try PhonePlaceHistory.read(dataRoot)
-        }) { world.phonePlaces = events }
-        if let found: [String: AgentDiscoveryOffer] = part("found", [AgentDiscoveryOffer.url(dataRoot)], {
+        }) { reading.world.phonePlaces = events }
+        if let found: [String: AgentDiscoveryOffer] = reading.part("found", [AgentDiscoveryOffer.url(dataRoot)], {
             try AgentDiscoveryOffer.checkedRead(dataRoot).filter(\.value.open)
-        }) { world.found = found }
+        }) { reading.world.found = found }
 
         typealias People = (records: [AgentConversationRecord], chats: [BridgeChat], answered: [String: Date],
                             handed: Set<String>)
-        if let people: People = part("people", [at("agents/conversations.json"), at("chat/sessions.json")]
+        if let people: People = reading.part("people", [at("agents/conversations.json"), at("chat/sessions.json")]
                 + files(at("agents/grok-requests")), notifications: [.nativeAgentChatTranscriptDidChange], {
             let all = try workspace.ports.conversations.records(dataRoot: dataRoot, locked: false)
             let handed = Set(all.compactMap { row -> String? in
@@ -179,11 +200,11 @@ extension AgentScreen {
             }
             return (all, chats, answered, handed)
         }) {
-            world.records = people.records; world.chats = people.chats; world.answered = people.answered
-            world.handed = people.handed
+            reading.world.records = people.records; reading.world.chats = people.chats; reading.world.answered = people.answered
+            reading.world.handed = people.handed
         }
         @Sendable func bridges() -> URL { InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot) }
-        if let people: (AgentContactIdentity, [Contact], [Contact], [String: BridgeChat]) = part("contacts", [at("agents/peers.json"), bridges(),
+        if let people: (AgentContactIdentity, [Contact], [Contact], [String: BridgeChat]) = reading.part("contacts", [at("agents/peers.json"), bridges(),
                 bridges().appendingPathComponent("claude-bridge"), bridges().appendingPathComponent("claude-bridge/bridge.json"),
                 bridges().appendingPathComponent("claude-bridge/token"), at("chat/messages"), ContactReplyReads.url(dataRoot)],
                 notifications: [.nativeAgentChatTranscriptDidChange], {
@@ -195,28 +216,32 @@ extension AgentScreen {
             })
             return (identity, people, contacts(identity: identity, mergeIdentities: false), threads)
         }) {
-            (world.identity, world.contacts, world.routes, world.threads) = people
+            (reading.world.identity, reading.world.contacts, reading.world.routes, reading.world.threads) = people
         }
-        if let jobs: (jobs: [DelegationReadout], allStoresReadable: Bool) = part("delegations",
+        if let jobs: (jobs: [DelegationReadout], allStoresReadable: Bool) = reading.part("delegations",
                 DelegationStatusProjector(configRoot: bridges(), dataRoot: dataRoot).watchedPaths, {
-            DelegationStatusProjector(configRoot: bridges(), dataRoot: dataRoot).allJobsWithAvailability(now: Date())
+            DelegationStatusProjector(configRoot: bridges(), dataRoot: dataRoot).allJobsWithAvailability()
         }) {
-            world.jobs = jobs.jobs
+            reading.world.jobs = jobs.jobs
             if !jobs.allStoresReadable {
-                world.unread.append("delegations")
-                world.failures["delegations"] = """
+                reading.world.unread.append("delegations")
+                reading.world.failures["delegations"] = """
                     Delegation evidence unavailable: inspect the sources from app agent.jobs and repair the unreadable bridge records; retained jobs are only \
                     partial.
                     """
             }
         }
-        world.health = part("health", [AgentLocalHealth.url(dataRoot), at("agents/peers.json")],
+        reading.world.health = reading.part("health", [AgentLocalHealth.url(dataRoot), at("agents/peers.json")],
                 notifications: workspace.ports.conversations.healthNotifications, {
             try workspace.ports.conversations.liveHealth(dataRoot: dataRoot)
         }) ?? [:]
+    }
 
+    /// Read retained work, owner decisions and sense news.
+    private static func readWorldWork(workspace: WorkspaceOperation, dataRoot: URL, now: Date,
+                                      at: @escaping @Sendable (String) -> URL, reading: WorldReading) {
         // Parking is drawn from the owner's retained work and the jobs that carry its items.
-        if let desk: (state: DeskState?, live: Set<String>, failure: String?) = part("desk", [at("desk/desk_ops.jsonl"),
+        if let desk: (state: DeskState?, live: Set<String>, failure: String?) = reading.part("desk", [at("desk/desk_ops.jsonl"),
                 at("desk/desk_ops_base.json"), at("agents/jobs.json")], notifications: [HomeFace.jobsChanged], {
             let store = SwiftNativeDeskStore(dataRoot: dataRoot)
             let state: DeskState
@@ -241,71 +266,74 @@ extension AgentScreen {
             }
             return (state, live, nil)
         }) {
-            world.desk = desk.state; world.deskFailure = desk.failure
-            if let failure = desk.failure { world.failures["desk"] = failure; world.unread.append("desk") }
-            if let state = desk.state { world.split = deskSplit(state, live: desk.live, now: now) }
+            reading.world.desk = desk.state; reading.world.deskFailure = desk.failure
+            if let failure = desk.failure { reading.world.failures["desk"] = failure; reading.world.unread.append("desk") }
+            if let state = desk.state { reading.world.split = deskSplit(state, live: desk.live, now: now) }
         }
 
-        if let bots: ([BotDefinition], [UUID: ShelfEntry]) = part("bots",
+        if let bots: ([BotDefinition], [UUID: ShelfEntry]) = reading.part("bots",
                 files(at("bots/definitions")) + [at("bots/shelf-index.json")], {
             let definitions = BotDefinitionStore(dataRoot: dataRoot), shelf = ShelfStore(dataRoot: dataRoot)
             let bots = try definitions.listUnlocked()
             let entries = try (bots.isEmpty ? [] : shelf.latestEntriesUnlocked(botIDs: Set(bots.map(\.id))))
             return (bots, Dictionary(entries.map { ($0.botId, $0) }, uniquingKeysWith: { a, _ in a }))
-        }) { (world.bots, world.latest) = bots }
+        }) { (reading.world.bots, reading.world.latest) = bots }
 
-        world.approvals = part("approvals", [at("workflows/approvals/requests.json")]) {
+        reading.world.approvals = reading.part("approvals", [at("workflows/approvals/requests.json")]) {
             let inbox = SwiftNativeApprovalInbox(root: dataRoot)
             let rows = try inbox.pendingUnlocked()
             return rows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }
                 .sorted { ($0.lastRequestedAt ?? $0.createdAt) > ($1.lastRequestedAt ?? $1.createdAt) }
         } ?? []
         // The stem's trial record: one row per part with an open trial or a closed one; when a closed one still shows is the page's to judge.
-        world.trials = part("trials", [at("abilities/state.json")]) { try TrialLevers.read(dataRoot: dataRoot) } ?? []
-        world.abilityRuns = part("ability runs", [at("abilities/state.json")]) { try AbilityStore(dataRoot: dataRoot).states() } ?? [:]
+        reading.world.trials = reading.part("trials", [at("abilities/state.json")]) { try TrialLevers.read(dataRoot: dataRoot) } ?? []
+        reading.world.abilityRuns = reading.part("ability runs", [at("abilities/state.json")]) { try AbilityStore(dataRoot: dataRoot).states() } ?? [:]
         // Memory proposals for the owner's review, the Today page's rule, from the shared store only; kept until the memory database changes.
-        if let reviews: (count: Int, capped: Bool) = part("reviews",
+        if let reviews: (count: Int, capped: Bool) = reading.part("reviews",
                 [at("memory/memory.sqlite"), at("memory/memory.sqlite-wal")], {
             guard SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot) else { return (0, false) }
             let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             let pending = try await storage.listProposals(status: "pending", limit: 100)
-            return (pending.filter { SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }.count,
+            return (pending.filter { SwiftNativeMemoryV2.awaitsReview(content: $0.content, metadata: $0.metadata) }.count,
                     pending.count == 100)
-        }) { world.reviews = reviews }
+        }) { reading.world.reviews = reviews }
         // Asks read the inbox: its change rereads what it took; the record's change retries an inbox that could not load.
-        if let asks: [InboxItemRecord] = part("asks", [], notifications: [HomeFace.experiencesChanged, ForPerson.didChange], {
+        if let asks: [InboxItemRecord] = reading.part("asks", [], notifications: [HomeFace.experiencesChanged, ForPerson.didChange], {
             try await ForPerson.at(dataRoot).inbox().filter { $0.id != $0.related_approval_id && $0.requiresOwnerInput }
-        }) { world.asksToOpen = asks; world.asks = asks.count; world.newestAsk = asks.first?.title }
-        world.running = part("running helpers", [at("bots/run-queue.json")], notifications: [BotRunQueue.didChange]) {
+        }) { reading.world.asksToOpen = asks; reading.world.asks = asks.count; reading.world.newestAsk = asks.first?.title }
+        reading.world.running = reading.part("running helpers", [at("bots/run-queue.json")], notifications: [BotRunQueue.didChange]) {
             try BotRunQueue(dataRoot: dataRoot).activeOrQueuedIDs(locked: false)
         } ?? []
-        world.doors = part("elsewhere", [at("chat/messages"), at("trust/policy.json")],
+        reading.world.doors = reading.part("elsewhere", [at("chat/messages"), at("trust/policy.json")],
                 notifications: [.nativeAgentChatTranscriptDidChange], {
             try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) ? doorLines(dataRoot: dataRoot, now: Date()) : []
         }) ?? []
         // An ability's definition change posts AbilityStore.didChange; its run accounting (abilities/state.json) is not this reading.
-        if let senses: SenseReading = part("senses", [at("senses/news/unread.json")]
+        if let senses: SenseReading = reading.part("senses", [at("senses/news/unread.json")]
                 + files(at("senses"), file: "state.json") + files(at("tools"), file: "state.json")
                 + files(at("skills"), file: "state.json"),
                 notifications: [AbilityStore.didChange, SenseNewsBoard.presentationDidChange, SensesHub.didBecomeReady], {
             await sensesReading(workspace: workspace, dataRoot: dataRoot, now: Date())
-        }) { world.senses = senses.rows; world.senseFailures = senses.failures }
-        guard home else { return world }
-        world.profile = part("profile", [at("memory/profile.json")]) {
+        }) { reading.world.senses = senses.rows; reading.world.senseFailures = senses.failures }
+    }
+
+    /// Read the additional projections shown at Home.
+    private static func readWorldHome(dataRoot: URL, at: @escaping @Sendable (String) -> URL, reading: WorldReading) {
+        reading.world.profile = reading.part("profile", [at("memory/profile.json")]) {
             try await SwiftNativePersonaEngine.readPersonality(dataRoot: dataRoot)
         }
-        world.work = part("work", [at("agents/jobs.json")], notifications: [HomeFace.jobsChanged]) {
+        reading.world.work = reading.part("work", [at("agents/jobs.json")], notifications: [HomeFace.jobsChanged]) {
             guard let read = jobGlances.withLock({ $0 }) else {
                 throw NameFailure("Your jobs are not readable in this app yet; job ownership needs repair.")
             }
             return try read.read(dataRoot)
         } ?? []
-        world.touched = part("touched", [AgentTouched.path(dataRoot)]) { try touched(dataRoot: dataRoot, now: Date()) } ?? []
-        world.repairs = part("owed", [], notifications: [HomeFace.experiencesChanged]) {
+        reading.world.touched = reading.part("touched", [AgentTouched.path(dataRoot)]) { try touched(dataRoot: dataRoot, now: Date()) } ?? []
+        reading.world.repairs = reading.part("owed", [], notifications: [HomeFace.experiencesChanged]) {
             try await ExperienceStore.at(dataRoot).projection()
         } ?? []
         // The mind stream and what is owed are readings of the record, so they refresh with it like the owed rows.
-        world.thoughts = part("thoughts", [], notifications: [HomeFace.experiencesChanged]) {
+        reading.world.thoughts = reading.part("thoughts", [], notifications: [HomeFace.experiencesChanged]) {
             let store = ExperienceStore.at(dataRoot)
             var lines: [AgentWorld.MindLine] = []
             for thought in try await Attention.thoughts(dataRoot: dataRoot).suffix(6).reversed() {
@@ -317,22 +345,21 @@ extension AgentScreen {
             }
             return lines
         } ?? []
-        world.owedToMe = part("owed to me", [], notifications: [HomeFace.experiencesChanged]) {
+        reading.world.owedToMe = reading.part("owed to me", [], notifications: [HomeFace.experiencesChanged]) {
             try await Attention.owed(dataRoot: dataRoot).sorted { $0.at > $1.at }
         } ?? []
-        world.queueEvidence = part("queue evidence", [at("desk/desk_ops.jsonl"), at("desk/desk_ops_base.json"),
+        reading.world.queueEvidence = reading.part("queue evidence", [at("desk/desk_ops.jsonl"), at("desk/desk_ops_base.json"),
             at("workflows/approvals/requests.json"), at("chat/sessions.json"), at("chat/messages"),
             PhonePlaceHistory.url(dataRoot), PhoneSenseHistory.url(dataRoot)],
             notifications: [HomeFace.experiencesChanged, .nativeAgentChatTranscriptDidChange, MacPersonInput.presenceChanged]) {
             let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveStateUnlocked()
-            return (state.generatedTs, try queueContext(dataRoot: dataRoot, now: Date(), ownTurn: false),
+            return (state.generatedTs, try await queueContext(items: state.items, dataRoot: dataRoot, now: Date(), ownTurn: false),
                     try await MyQueueReady.conditions(items: state.items, dataRoot: dataRoot))
         }
-        world.mailPreviewAllowed = part("mail preview", [at("security/mac_integration_permissions.json")],
+        reading.world.mailPreviewAllowed = reading.part("mail preview", [at("security/mac_integration_permissions.json")],
             notifications: [MacIntegrationPermissionStore.didChange]) {
             !(try await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()).operatorReadOff.contains("mail")
         }
-        return world
     }
 
     /// What the app can vouch for, and no more: each part is read again when a source it watches signals a change, and a part that is
@@ -437,7 +464,7 @@ extension AgentScreen {
                 let name = "desk." + item.alias
                 let waits = OwnerAttentionPolicy.waitsOnOwner(item)
                 let label = waits ? "waiting on " + person : item.spokenStatus
-                let at = (date(item.updatedAt) ?? now).timeIntervalSince1970
+                let at = (NativeTimestampFormat.parseISO8601FractionalFirst(item.updatedAt) ?? now).timeIntervalSince1970
                 // What I do by my own hand I already know, so it is seen as it is made: my queue steps are filed by me and closed by my own
                 // work. A step the person closed from the Desk is theirs, and a wait on the person is always told.
                 if !waits, item.origin == .agent, item.project == MyQueue.project, item.summary != DeskQuickAction.deskCloseOutcome {
@@ -451,7 +478,7 @@ extension AgentScreen {
         for approval in world.approvals where current("approvals") {
             marks["approval:" + approval.id] = Mark(fp: "pending", line: "",
                 new: "approval: " + clip(approval.title, 40),
-                at: (date(approval.lastRequestedAt ?? approval.createdAt) ?? now).timeIntervalSince1970, waits: true)
+                at: (NativeTimestampFormat.parseISO8601FractionalFirst(approval.lastRequestedAt ?? approval.createdAt) ?? now).timeIntervalSince1970, waits: true)
         }
         let placeClock = DateFormatter()
         placeClock.locale = Locale(identifier: "en_US_POSIX")
@@ -619,7 +646,7 @@ extension AgentScreen {
     }
 
     /// A room's look: the names that room shows (a person's room includes their bridge chats).
-    static func markRoomSeen(workspace: WorkspaceOperation, _ location: AgentWorkspaceLocation, dataRoot: URL, scope: String,
+    static func markRoomSeen(workspace: WorkspaceOperation, _ location: AgentWorkspaceLocation, dataRoot: URL,
                              observation: (world: AgentWorld, at: Date, health: Set<String>)? = nil) async {
         do {
             if observation == nil, case .record("agent_read", let input, _) = location,

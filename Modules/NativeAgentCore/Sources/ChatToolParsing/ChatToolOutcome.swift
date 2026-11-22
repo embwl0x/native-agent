@@ -245,7 +245,7 @@ public enum ChatToolOutcome {
         let pathSafe = home.isEmpty ? redacted : redacted.replacingOccurrences(of: home, with: "~")
         return String(pathSafe.prefix(2_000))
     }
-    public enum ExactResultClass: String, Sendable, Equatable {
+    public enum ExactResultClass: String, Sendable, Equatable, Codable {
         case succeeded
         case failed
         /// Explicit denial, rejection and refusal count as failures for every reader.
@@ -391,22 +391,15 @@ public enum ChatToolOutcome {
         if case .bool(true)? = object["timeout"] { return .timeout }
         if let status, failureStatuses.contains(status) { return .failed }
         if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
-        if !completed, let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
+        if !completed, let exitCode = object["exit_code"]?.doubleValue, exitCode != 0 { return .failed }
         if saysOutcomeOpen(output) { return .unknown }
         // The door stamps execution "executed" only on a call it classed succeeded (AppDoorActions.actionResult); a wrapped plain value has no other
         // status.
         if completed || object["ok"] == .bool(true) || object["success"] == .bool(true)
             || object["outcome"] == .string("succeeded") || object["execution"] == .string("executed") { return .succeeded }
-        if numericExitCode(object["exit_code"]) == 0 { return .succeeded }
+        if object["exit_code"]?.doubleValue == 0 { return .succeeded }
         // Plain data with no ending named and no effect left unseen. An unfamiliar status word still proves nothing.
         let namesAnEnding = ["status", "state", "outcome", "verification", "original_result_class"].contains { object[$0] != nil }
         return namesAnEnding ? .unknown : .succeeded
     }
-
-    private static func numericExitCode(_ value: JSONValue?) -> Double? {
-        switch value {
-        case .int(let code): return Double(code)
-        case .double(let code): return code
-        default: return nil
-        }
-    }}
+}

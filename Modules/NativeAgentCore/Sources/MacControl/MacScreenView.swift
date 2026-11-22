@@ -4,19 +4,11 @@ import NativeAgentShared
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(CoreText)
 import CoreText
-#endif
-#if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
-#endif
-#if canImport(AppKit)
 import AppKit
 // Blueprint: | `MacScreenView.swift` | `MacScreenShot`, `MacScreenViewGeometry`, `MacScreenViewTextRedaction`, `MacImageFrames`, `MacImageCapture`: Capture |
-#endif
 // Fuse pixels and AX structure so marks address captured elements rather than guessed coordinates. Use the shared injection-free AX walker for
 // complete secret inspection; keep geometry and budgeting pure over value types. Marks provide references, never authority; dispatch policy, grants,
 // switches and driver admission still gate effects.
@@ -30,7 +22,6 @@ public struct MacScreenShot: @unchecked Sendable {
     public let bounds: MacAXFrame
     public let pixelWidth: Int
     public let pixelHeight: Int
-    #if canImport(CoreGraphics)
     /// Geometry, legend and storage must remain usable without captured pixels.
     public let cgImage: CGImage?
     public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int, cgImage: CGImage? = nil, capture: MacImageCapture? = nil) {
@@ -40,25 +31,16 @@ public struct MacScreenShot: @unchecked Sendable {
         self.pixelHeight = pixelHeight
         self.cgImage = cgImage
     }
-    #else
-    public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int, capture: MacImageCapture? = nil) {
-        self.capture = capture
-        self.bounds = bounds
-        self.pixelWidth = pixelWidth
-        self.pixelHeight = pixelHeight
-    }
-    #endif
 }
 /// Report why an image is absent so missing permission or capture failure stays actionable.
 public enum MacScreenCaptureFailure: Sendable, Equatable, Error, LocalizedError {
-    case screenRecordingNotTrusted, noDisplay, captureFailed, unavailableOnThisPlatform, encodeFailed, exceedsByteCap
+    case screenRecordingNotTrusted, noDisplay, captureFailed, encodeFailed, exceedsByteCap
     case operationFailed(String, String)
     public var rawValue: String {
         switch self {
         case .screenRecordingNotTrusted: "screen_recording_not_trusted"
         case .noDisplay: "no_display"
         case .captureFailed: "capture_failed"
-        case .unavailableOnThisPlatform: "screen_capture_unavailable_on_this_platform"
         case .encodeFailed: "image_encode_failed"
         case .exceedsByteCap: "image_exceeds_byte_cap"
         case .operationFailed: "capture_failed"
@@ -69,7 +51,6 @@ public enum MacScreenCaptureFailure: Sendable, Equatable, Error, LocalizedError 
         case .screenRecordingNotTrusted: "NativeAgent lacks the macOS Screen Recording grant."
         case .noDisplay: "No display is available to capture."
         case .captureFailed: "The screen capture source returned no usable image."
-        case .unavailableOnThisPlatform: "Screen capture is unavailable on this platform."
         case .encodeFailed: "The captured image could not be encoded."
         case .exceedsByteCap: "The image exceeds the delivery byte limit."
         case .operationFailed(let operation, let cause): "\(operation): \(cause)"
@@ -83,8 +64,6 @@ public enum MacScreenCaptureFailure: Sendable, Equatable, Error, LocalizedError 
         case .noDisplay:
             return Repair.why(owner: "Mac display availability", tap: "Mac > connected display",
                 instruction: "Connect or wake a display before requesting pixels; no display was available to capture.")
-        case .unavailableOnThisPlatform:
-            return Repair.terminal(instruction: "Screen capture is unavailable on this platform. Use a Mac with a graphical login session for pixels.")
         case .exceedsByteCap:
             return Repair.reconcile(
                 instruction: """
@@ -376,6 +355,11 @@ public final class MacScreenViewStore {
 
     public func invalidate() {
         publication.write { latest = nil }
+    }
+
+    func invalidate(viewId: String) {
+        // Revoke this capture's marks. Any pending read started after the published capture.
+        if latest?.viewId == viewId { latest = nil }
     }
 }
 /// A failed capture returns its own receipt without advancing LatestRead.

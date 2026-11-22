@@ -1,6 +1,5 @@
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import AppIntents
 import SwiftUI
 import Observation
@@ -16,7 +15,7 @@ extension iCloudSyncEngine {
         /// The Mac increments this on every clear/write; nil means an empty transcript cannot clear local rows.
         var generation: Int?
         var hasOlder = false
-        var historyIDs: Set<UUID> = []
+        var historyRecordIDs: Set<String> = []
         var readError: String? = nil
     }
 
@@ -30,20 +29,24 @@ extension iCloudSyncEngine {
                 } else { chatTranscripts[session] = published }
                 continue
             }
-            guard !published.messages.isEmpty || published.generation != nil else { continue }
+            let isEmpty = published.records.isEmpty && published.messages.isEmpty
+            guard !isEmpty || published.generation != nil else { continue }
             if let current = chatTranscripts[session] {
+                let unversionedToolOnly = published.generation == nil && published.messages.isEmpty
                 if let applied = current.generation {
                     guard let generation = published.generation, generation >= applied else { continue }
-                    if published.messages.isEmpty && generation == applied { continue }
+                    if isEmpty && generation == applied { continue }
+                } else if unversionedToolOnly, !current.messages.isEmpty, !current.records.isEmpty {
+                    // A legacy tail of only tool rows cannot replace an existing conversation.
+                    continue
                 }
                 let canonicalIDs = Set(published.messages.map(\.id))
                 let canonicalUsers = Set(published.messages.filter { $0.role == .user }.compactMap(\.runId))
                 let terminalRuns = Set(published.messages.filter {
                     $0.isTerminalReply
                 }.compactMap(\.runId))
-                let unfinished = ChatStore.shared.pendingExchanges.values.filter {
-                    $0.sessionID == session && !$0.isExpired
-                }
+                // An expired exchange keeps its placeholder too: it carries the Send now the person may still use.
+                let unfinished = ChatStore.shared.pendingExchanges.values.filter { $0.sessionID == session }
                 let unfinishedIDs = Set(unfinished.flatMap {
                     [$0.placeholderID, $0.request.appendedUserId].compactMap { $0 }
                 }).union(ChatStore.shared.queuedSends.filter { $0.sessionID == session }.flatMap {
@@ -51,7 +54,8 @@ extension iCloudSyncEngine {
                 })
                 let kept = current.messages.filter { row in
                     guard !canonicalIDs.contains(row.id) else { return false }
-                    if published.messages.isEmpty {
+                    if unversionedToolOnly { return true }
+                    if isEmpty {
                         return unfinishedIDs.contains(row.id) || row.isStreaming || row.awaitingMacTranscript
                     }
                     if let run = row.runId {
@@ -60,9 +64,17 @@ extension iCloudSyncEngine {
                     }
                     return unfinishedIDs.contains(row.id) || row.isStreaming || row.awaitingMacTranscript
                 }
-                let overlaps = !Set(current.records.compactMap { UUID(uuidString: $0.id) }).isDisjoint(with: canonicalIDs)
-                let history = published.messages.isEmpty || !overlaps ? [] : current.messages.filter {
-                    current.historyIDs.contains($0.id) && !canonicalIDs.contains($0.id)
+                let canonicalRecordIDs = Set(published.records.map { $0.id.lowercased() })
+                var historyRecords: [ChatMessageRecord] = []
+                // A paged transcript needs the whole prefix through the new tail window, including rows that just slid out.
+                if published.hasOlder, !current.historyRecordIDs.isEmpty, let first = published.records.first,
+                   let boundary = current.records.firstIndex(where: { $0.id.lowercased() == first.id.lowercased() }) {
+                    historyRecords = current.records[..<boundary].filter { !canonicalRecordIDs.contains($0.id.lowercased()) }
+                    published.hasOlder = current.hasOlder
+                }
+                let historyMessageIDs = Set(historyRecords.map(\.mobileMessageID))
+                let history = current.messages.filter {
+                    historyMessageIDs.contains($0.id) && !canonicalIDs.contains($0.id)
                 }
                 // Keep compatible full text despite snapshot truncation; retain phone-local non-image bytes while Mac previews own images.
                 let truncationSuffix = "\n" + ChatStore.snapshotTruncationMarker
@@ -91,14 +103,9 @@ extension iCloudSyncEngine {
                             attachments[id]?.base64
                     }
                 }
-                let canonicalRecordIDs = Set(published.records.map { $0.id.lowercased() })
-                let historyRecords = published.messages.isEmpty || !overlaps ? [] : current.records.filter {
-                    UUID(uuidString: $0.id).map { current.historyIDs.contains($0) } == true
-                        && !canonicalRecordIDs.contains($0.id.lowercased())
-                }
                 published.records = historyRecords + published.records
-                published.historyIDs = current.historyIDs.intersection(published.publishedIDs)
-                published.messages = history + published.messages + kept
+                published.historyRecordIDs = current.historyRecordIDs.intersection(published.records.map { $0.id.lowercased() })
+                published.messages = history + published.messages + kept.filter { !historyMessageIDs.contains($0.id) }
             }
             if chatTranscripts[session] != published { chatTranscripts[session] = published }
         }
@@ -148,7 +155,7 @@ extension iCloudSyncEngine {
     }
 
     func chatHistoryPage(sessionID: String, beforeID: String? = nil, throughID: String? = nil,
-                         limit: Int = 80) async throws -> (messages: [ChatMessage], hasOlder: Bool) {
+                         limit: Int = 80) async throws -> [ChatMessage] {
         let lifecycle = lifecycleGeneration
         var payload = ["sessionId": sessionID, "limit": String(limit)]
         payload["beforeId"] = beforeID
@@ -162,23 +169,33 @@ extension iCloudSyncEngine {
         }.value
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         let generation = result["transcriptGeneration"].flatMap(Int.init)
+        let hasOlder = result["hasOlder"] == "true"
         if let current = chatTranscripts[sessionID]?.generation, let generation, generation < current {
             throw CancellationError()
         }
-        if beforeID != nil || throughID != nil, var current = chatTranscripts[sessionID] {
+        if beforeID != nil || throughID != nil {
+            guard var current = chatTranscripts[sessionID] else { throw CancellationError() }
             // History contains rows the message projection deliberately leaves out (tools and their Mac faces).
             // Insert by the Mac's page order; identity replacement also refreshes a requested full row.
             let incomingRecordIDs = Set(records.map { $0.id.lowercased() })
-            let recordInsertion = beforeID.flatMap { anchor in
-                current.records.firstIndex { $0.id.lowercased() == anchor.lowercased() }
-            } ?? current.records.firstIndex { incomingRecordIDs.contains($0.id.lowercased()) } ?? current.records.endIndex
+            let recordInsertion: Int
+            if let beforeID {
+                guard let anchor = current.records.firstIndex(where: { $0.id.lowercased() == beforeID.lowercased() }) else {
+                    throw CancellationError()
+                }
+                recordInsertion = anchor
+            } else {
+                recordInsertion = current.records.firstIndex { incomingRecordIDs.contains($0.id.lowercased()) } ?? current.records.endIndex
+            }
             let preceding = current.records[..<recordInsertion].filter { !incomingRecordIDs.contains($0.id.lowercased()) }
             let following = current.records[recordInsertion...].filter { !incomingRecordIDs.contains($0.id.lowercased()) }
             current.records = preceding + records + following
             let firstIndex = Dictionary(current.messages.enumerated().map { ($0.element.id, $0.offset) },
                                         uniquingKeysWith: { first, _ in first })
-            let insertion = beforeID.flatMap(UUID.init(uuidString:)).flatMap { firstIndex[$0] } ?? current.messages.endIndex
             if beforeID != nil {
+                if preceding.isEmpty { current.hasOlder = hasOlder }
+                let insertion = preceding.reversed().lazy.compactMap { firstIndex[$0.mobileMessageID] }.first.map { $0 + 1 }
+                    ?? current.messages.startIndex
                 current.messages.insert(contentsOf: messages.filter { firstIndex[$0.id] == nil }, at: insertion)
             } else {
                 for row in messages {
@@ -186,14 +203,14 @@ extension iCloudSyncEngine {
                     current.messages[index] = row
                 }
             }
-            current.historyIDs.formUnion(records.compactMap { UUID(uuidString: $0.id) })
+            current.historyRecordIDs.formUnion(incomingRecordIDs)
             if let generation { current.generation = generation }
             chatTranscripts[sessionID] = current
         } else {
             adoptChatTranscripts([sessionID: .init(records: records, messages: messages,
-                generation: generation, hasOlder: result["hasOlder"] == "true")], completeSnapshot: false)
+                generation: generation, hasOlder: hasOlder)], completeSnapshot: false)
         }
-        return (messages, result["hasOlder"] == "true")
+        return messages
     }
 
 }

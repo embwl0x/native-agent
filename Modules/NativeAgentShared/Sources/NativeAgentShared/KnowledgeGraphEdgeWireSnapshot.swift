@@ -2,17 +2,6 @@ import Foundation
 
 // Blueprint: | `KnowledgeGraphEdgeWireSnapshot.swift` | `KnowledgeGraphEdgeWireSnapshot`: checked edge decoding; platforms own UI identity |
 
-public let knowledgeGraphTypeSymbols: [String: String] = [
-    "person": "person.circle",
-    "organization": "building.2",
-    "project": "folder",
-    "concept": "lightbulb",
-    "place": "mappin.circle",
-    "event": "calendar",
-    "tool": "wrench.and.screwdriver",
-    "fact": "text.quote",
-]
-
 /// Common edge snapshot decoding; platform presentation supplies UI identity.
 public struct KnowledgeGraphEdgeWireSnapshot: Decodable, Equatable, Sendable {
     public let from: String

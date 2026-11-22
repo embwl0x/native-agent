@@ -1,7 +1,8 @@
+import NativeAgentShared
 import CryptoKit
 import Foundation
 import Darwin
-// Blueprint: | `JSONValue.swift` | `JSONValue`, `decodeCompletion`, `fromEncodable`, `mapStrings`, `decodedExactly`, `digest`, `differences` |
+// Blueprint: | `JSONValue.swift` | `JSONValue`, `decodeCompletion`, `fromEncodable`, `mapStrings`, `decodedExactly`, `digest`, `serializedSHA256`, `differences` |
 
 // MARK: - JSONValue
 
@@ -39,23 +40,6 @@ extension JSONValue {
 
     package static func escapedPointerComponent(_ key: String) -> String {
         key.replacingOccurrences(of: "~", with: "~0").replacingOccurrences(of: "/", with: "~1")
-    }
-
-    package static func pointerComponents(_ path: String) -> [String] {
-        path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
-            .map { $0.replacingOccurrences(of: "~1", with: "/").replacingOccurrences(of: "~0", with: "~") }
-    }
-
-    package func value(atPointer path: String) -> JSONValue? {
-        var current = self
-        for part in Self.pointerComponents(path) {
-            switch current {
-            case .object(let fields): guard let next = fields[part] else { return nil }; current = next
-            case .array(let items): guard let index = Int(part), items.indices.contains(index) else { return nil }; current = items[index]
-            default: return nil
-            }
-        }
-        return current
     }
 
     package func replacing(at path: ArraySlice<String>, with leaf: JSONValue) -> JSONValue? {
@@ -212,6 +196,11 @@ extension JSONValue {
 
     public func serializedData(pretty: Bool) throws -> Data {
         try Data(serialize(pretty: pretty).utf8)
+    }
+
+    /// Full SHA-256 hex of the native compact serialization.
+    package func serializedSHA256() throws -> String {
+        SHA256Hex.of(try serializedData(pretty: false))
     }
 
     private func encode(into out: inout String, pretty: Bool, indentLevel: Int, path: String) throws {

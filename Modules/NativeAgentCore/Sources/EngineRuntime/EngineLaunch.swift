@@ -55,7 +55,6 @@ public protocol EngineBackgroundWorkHost: Sendable {
     @MainActor var activityWatch: ActivityWatchController { get }
     var approvals: ApprovalExecution { get }
     var attention: AttentionRouter { get }
-    func postMacNotification(title: String, body: String, userInfo: [String: String], soundName: String?) async -> NativeAgentNotificationPostResult
     func runAutoDoctor(checks: SwiftNativeDoctorChecks, dataRoot: URL) async throws -> DoctorReport
     func makeCompletionSender(dataRoot: URL, silentTelegram: Bool, requestedResultDeliveryID: String?, authorizeTelegramReply: @escaping @Sendable (
         TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending
@@ -173,6 +172,8 @@ extension NativeAgentEngine {
             let missing = await Task.detached { PersistenceCore.missingLaunchRoots(dataRoot: dataRoot) }.value
             if !missing.isEmpty, !(await confirmMissingRoots(missing)) { return false }
         }
+        // This root's life begins at launch, not at whichever owner first reads it: a phone message older than its birth is another life's.
+        do { _ = try DataRootLife.current(in: dataRoot) } catch { ModuleLog.app("[life] %@", error.localizedDescription) }
         do {
             try await Task.detached {
                 let directory = dataRoot.appendingPathComponent("skills/runs", isDirectory: true)
@@ -235,7 +236,7 @@ extension NativeAgentEngine {
             // Require a readable whole bundle before disabling untouched seeds.
             do {
                 let shipped = try seeds.map { try $0.1.get().id }
-                try fadeRetiredSeeds(abilities, shipped: Set(shipped), dataRoot: dataRoot)
+                try fadeRetiredSeeds(abilities, shipped: Set(shipped))
             } catch { failures.append("retired seeds: \(error.localizedDescription)") }
             // Bind peer trust before admitting bundled seeds.
             PeerTrust.install(dataRoot: dataRoot)
@@ -359,7 +360,7 @@ extension NativeAgentEngine {
     }
 
     // Disable only untouched unbundled seeds; edited or re-enabled parts belong to the agent.
-    private static func fadeRetiredSeeds(_ abilities: AbilityStore, shipped: Set<String>, dataRoot: URL) throws {
+    private static func fadeRetiredSeeds(_ abilities: AbilityStore, shipped: Set<String>) throws {
         try AbilityStore.withLock {
             let programs = OwnedProgramStore(root: abilities.root)
             let retired = Set(try abilities.files(kind: .part, includeProposals: false).filter { file in
@@ -476,7 +477,7 @@ extension NativeAgentEngine {
         retainLaunchWork { await AgentJobs.resume(dataRoot: dataRoot, register: AppToolExecutor.jobRegistrar(dataRoot: dataRoot)) }
         retainLaunchWork { await reconcileTranscriptsAtLaunch(dataRoot: dataRoot) }
         retainLaunchWork { _ = await ChatHistoryIndex.shared(dataRoot: dataRoot).absorbAll() }
-        // Read the user’s login PATH once at launch so later callers do not wait.
+        // Read the user’s login PATH at launch so later callers do not wait.
         retainLaunchWork { _ = AgentHostCommandLines.loginEnvironment }
         retainLaunchWork {
             guard !Task.isCancelled else { return }
@@ -645,7 +646,8 @@ extension NativeAgentEngine {
             memory: SwiftNativeMemoryV2.shared,
             memoryManager: MindMemoryJudgment(makeLLMClient: makeLLMClient),
             adaptivePromotionEnabled: { try MemoryPolicyGate.adaptivePromotionEnabled() },
-            personName: { try NativeCognitionRuntime.resolveUserName(dataRoot: dataRoot) }
+            personName: { try NativeCognitionRuntime.resolveUserName(dataRoot: dataRoot) },
+            reconcilePromiseCard: { entry, store in _ = try await AgentScreen.reconcileFiledCard(entry, store: store) }
         )
     }
 
@@ -710,7 +712,7 @@ extension NativeAgentEngine {
 
     /// Quit callers join the same retained operation.
     @MainActor
-    public static func beginQuitSleep(after producers: Task<Void, Never>, runs: Set<String>,
+    public static func beginQuitSleep(after producers: Task<Void, Never>,
                                       retireBrowser: @escaping @MainActor @Sendable () -> Void) -> Task<NativeCognitionSleepOutcome?, Never> {
         if let quitSettlement { return quitSettlement }
         let task = Task.detached { () -> NativeCognitionSleepOutcome? in

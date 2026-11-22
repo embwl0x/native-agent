@@ -1,6 +1,7 @@
 // Resolve without activation so missing, ambiguous and self-process targets can refuse without walking a guessed or unsafe tree.
 
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 
 // Blueprint: | `MacBackgroundSight.swift` | `MacBackgroundSight.resolve`: Exact identities precede partial names; preserve ambiguity and source failures |
@@ -36,13 +37,10 @@ public enum MacBackgroundSight {
         guard !needle.isEmpty else {
             return .notRunning(candidates: candidateNames(apps))
         }
-        func normalized(_ text: String) -> String {
-            text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
         // `.app` is how a person writes an app's name half the time, and it is never part of the localized name AppKit reports.
         let bare = needle.hasSuffix(".app") ? String(needle.dropLast(4)) : needle
 
-        func squashed(_ text: String) -> String { normalized(text).filter { $0.isLetter || $0.isNumber } }
+        func squashed(_ text: String) -> String { TextNormalization.trimmedLowercased(text).filter { $0.isLetter || $0.isNumber } }
         let flat = squashed(bare)
         func resolution(_ hits: [MacAXAppInfo]) -> Resolution? {
             let dockApps = hits.filter(\.isDockApp)
@@ -56,34 +54,34 @@ public enum MacBackgroundSight {
             return .matched(first)
         }
         if let exact = resolution(apps.filter {
-            normalized($0.name) == bare || normalized($0.bundleIdentifier ?? "") == bare
+            TextNormalization.trimmedLowercased($0.name) == bare || TextNormalization.trimmedLowercased($0.bundleIdentifier ?? "") == bare
         }) { return exact }
         // The hot path never waits for Spotlight, and never guesses a partial name before the installed identities are available.
         guard let indexed = MacAppIndex.shared.readyApps() else { return .indexUnavailable }
         // Incomplete matching identity cannot authorize a partial-name guess at another running app. Exact running identities above need no census.
         if indexed.contains(where: {
             $0.installationUncertain && (
-                normalized($0.bundleID ?? "") == needle || normalized($0.name) == bare
-                || normalized($0.url.deletingPathExtension().lastPathComponent) == bare
+                TextNormalization.trimmedLowercased($0.bundleID ?? "") == needle || TextNormalization.trimmedLowercased($0.name) == bare
+                || TextNormalization.trimmedLowercased($0.url.deletingPathExtension().lastPathComponent) == bare
                 || squashed($0.name) == flat || squashed($0.url.deletingPathExtension().lastPathComponent) == flat)
         }) { return .indexUnavailable }
         let installed = MacAppIndex.installed(indexed)
         let exact = installed.filter {
-            normalized($0.bundleID ?? "") == needle || normalized($0.name) == bare
-                || normalized($0.url.deletingPathExtension().lastPathComponent) == bare
+            TextNormalization.trimmedLowercased($0.bundleID ?? "") == needle || TextNormalization.trimmedLowercased($0.name) == bare
+                || TextNormalization.trimmedLowercased($0.url.deletingPathExtension().lastPathComponent) == bare
         }
         let known = exact.isEmpty ? installed.filter {
             squashed($0.name) == flat || squashed($0.url.deletingPathExtension().lastPathComponent) == flat
         } : exact
         if !known.isEmpty {
             let bundles = Set(known.compactMap { $0.bundleID?.lowercased() })
-            return resolution(apps.filter { bundles.contains(normalized($0.bundleIdentifier ?? "")) })
+            return resolution(apps.filter { bundles.contains(TextNormalization.trimmedLowercased($0.bundleIdentifier ?? "")) })
                 ?? .notRunning(candidates: candidateNames(apps))
         }
         let passes: [(MacAXAppInfo) -> Bool] = [
-            { normalized($0.name).hasPrefix(bare) },
-            { normalized($0.name).contains(bare) },
-            { normalized($0.bundleIdentifier ?? "").contains(bare) },
+            { TextNormalization.trimmedLowercased($0.name).hasPrefix(bare) },
+            { TextNormalization.trimmedLowercased($0.name).contains(bare) },
+            { TextNormalization.trimmedLowercased($0.bundleIdentifier ?? "").contains(bare) },
             { !flat.isEmpty && (squashed($0.name) == flat || squashed($0.bundleIdentifier ?? "").contains(flat)) },
         ]
         for pass in passes {

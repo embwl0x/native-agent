@@ -16,6 +16,10 @@ An intention is an open `DeskStep` in MY QUEUE or a captured promise on work
 assigned to the agent: `words`, the existing `when`,
 optional `rhythm`, `until`, `say` and `action: {action, args?}`, with its origin
 and reply route. Older action strings read as `{action: string}`.
+Equivalent filings match the open intention's words with case, accents and
+whitespace normalized. The match ignores trailing periods, question marks,
+exclamation marks and ellipses. Other punctuation remains significant,
+so “Review C++ bindings” and “Review C# bindings” file as distinct intentions.
 `queue.add` and `queue.update` accept `at <ISO time>`, a plain local date/time
 with optional weekday (for example `Sun Nov 1 at 06:00`), `every <five-field cron>`, `every N
 minutes|hours|days`, or a recurring schedule object as `when`. A relative
@@ -27,6 +31,7 @@ clock rhythm uses `IntentionClock`; it is not a new store or a `moments`
 array. An omitted rhythm end is `standing`; a single moment defaults to
 `once`. The after-turn judgment can close a step with a condition in words by
 quoting evidence that the condition was met.
+A submitted `every` condition must supply a rhythm the clock can schedule.
 The system date reader interprets local words in the Mac's zone; accepted
 moments persist as absolute ISO timestamps. An incomplete match, a range or
 a repeated local clock time refuses with the supplied text and its reading;
@@ -52,11 +57,14 @@ part lifecycle signals and do not release intentions.
 `EnginePartWake`'s existing signal observer releases matching open,
 unstopped, unexpired intentions through system Desk notes:
 `Released: <signal> <one-line payload summary>`, with the summary redacted
-and bounded to 160 characters. The Desk lock reads and appends together, so a
-closed or refiled intention cannot be released from an older snapshot. News
-and body signals share one readiness law: a system note carries the exact
+and bounded to 160 characters. The Desk lock revalidates the intentions and
+commits all notes for that signal together, so a closed or refiled intention
+cannot be released from an older snapshot. News and body signals share one
+readiness law: a system note carries the exact
 current condition in `releaseCondition`, newer than both its current `filedAt`
-and their last agent handling note. The `Released: ` text is presentation only;
+and the last handling boundary. A carried deed note handles releases through
+the occurrence that admitted the deed. Other handling notes use their own
+timestamps. The `Released: ` text is presentation only;
 ordinary notes never satisfy a condition. A changed topic or signal cannot
 reuse the previous condition's release. If no release arrives, the intention
 remains waiting. Each source edge then uses the same pursuit refresh
@@ -93,6 +101,8 @@ time or rhythm's occurrence, its released signal or news, the person arriving
 or leaving, its card succeeding, or free time) is taken once per occurrence,
 keyed `queue:<handle>:<occurrence>`. `next_turn` and `when_user_messages` steps
 join turns instead; the agent's own next turn is its next thought.
+Readiness and clock registration use the same time boundary. A deadline
+that passes before registration asks for an immediate read through the clock.
 The Desk's terminal state also owns a moment already posted to attention.
 Before carrying it into a thought or returning it to a conversation,
 `MindStream.currentQueueMoments` reads the Desk: done settles the moment with
@@ -169,9 +179,9 @@ commitment evidence, without a clock-based quota.
 `chat.speakProactively`, caller `.reachOut`, and the
 person's `ConversationAnchor` destination, with that conversation's own route as
 `chat.post` uses, while no conversation is live. It starts no thought or model
-call. The speech key combines the item handle and
-the moment's key, so a retry reconciles the original transcript destination and
-cannot post those words twice for that occurrence. A new post makes the neutral
+call. The speech key combines the item handle and the moment's key, including
+the revision of a rebound habit. A retry reconciles the original transcript
+destination and cannot post those words twice for that occurrence. A new post makes the neutral
 shoulder tap "Left you something in chat. No reply needed.", pointing at the
 destination conversation. The words land at their time; declared quiet hours
 hold only the tap, through the attention router's quiet-hour policy.
@@ -187,10 +197,14 @@ until-time still ends it.
 MY QUEUE's carried ledger (`desk/my-queue-carried.json`, `MyQueueCarried`)
 records the delivered occurrence and its owed notes/once-close in one write.
 Each pass finishes those debts with idempotent agent notes and a fresh
-unchanged-step close, then marks them settled. Recovery never speaks or runs
-the habit again; a changed or already closed step is left alone. Speech
-failures leave the intention due for the next read, never turned into a
-thought. Installed proof remains owed.
+unchanged-step close for a finished once habit, then marks them settled.
+Queue closure uses the same checkpoint before applying the requested ending.
+When the checkpoint closes the step, the call reports the committed ending.
+If delivery finishes after an edit or closure, its notes still land on the
+same Desk item or its archive receipt and its current status stands. If
+neither record is available, the settlement stays owed. Recovery never speaks
+or runs the habit again. Speech failures leave a still-eligible intention due
+for the next read. Installed proof remains owed.
 
 `mind.cross {line, watch}` posts real input as a `world` happening: it releases
 the news intentions it touches like any source's line, without fabricating a
@@ -208,9 +222,11 @@ through the same self door, Autonomy and Trust posture as a part wake, with
 the step's peer steering retained. A successful run that did something,
 without `needs_me`, gets its `Ran h:mm a: <one-line result>` note and the same
 until settlement as speech. A run that only looked (plain reads, no ability)
-wakes their with its receipt and the time it ran. If `say` is present it is spoken only after that success, then both
-notes and the one until settlement are kept. Conditions in words still post
-the moment for the agent to judge. Failed/refused/unfinished/person-waiting runs
+wakes their with its receipt and the time it ran. For eligible `say` words, a
+successful action saves its `Ran` note with the receipt before speech. A
+successful delivery settles both notes and the ending together. If closing
+or refiling prevents speech, the action's note settles on its own. Conditions
+in words still post the moment for the agent to judge. Failed/refused/unfinished/person-waiting runs
 and returned `needs_me` post the moment with the receipt beside it as
 `already_looked`; the run is already done, so the thought starts from its
 result. The carried ledger keeps each attempted run before its effects and
@@ -266,10 +282,18 @@ about how they works, never a queue step. No separate promise store exists.
 The supported moments are `next_turn`, `own_turn`, `when_user_messages`,
 `after_card <id>` only when their reply names that card's id (an approval or any card a call raised), and
 `at <ISO time>` only when they named a time, resolved on the exchange's Mac
-clock. A card's settle is the one owner of its `after_card` steps: a card that
-continues a turn hands them to that turn (they close there, their words in its
-input), and only a card with no continued turn releases them to run from MY QUEUE,
-so one card answer never wakes two turns. A commitment without a named supported moment uses `own_turn`.
+clock. A card that continues a turn hands its waiting follow-ups to that turn
+(they close there, their words in its input). Otherwise a successful card
+releases its waiting follow-ups from MY QUEUE. A declined card drops them.
+`queue.add`, `queue.update` and after-turn promise capture reconcile the
+exact filing against the card's saved outcome and provenance. A filing leaves
+follow-ups to a continuation that still owns the scan. After that scan, a late
+filing can release or close on the card's durable outcome. A released step
+keeps its own queue moment. Release evidence names the card, and changing the
+condition clears the prior release. Older unbound release markers use the
+retained transition on the same card and filing, or verified settlement of that
+card when the preceding step history has been trimmed. A commitment without a named
+supported moment uses `own_turn`.
 The native parser checks nonblank words, an exact reply source and a supported
 moment; a card id must also occur in their reply. No promises is `[]`;
 an absent section in a model reply also means none. A malformed present section
@@ -512,6 +536,7 @@ occurrences. A stored moment is never reinterpreted in another year.
 
 Elapsed inactivity does not close an intention. MY QUEUE expires only an explicit
 `until` time. They can mark it done with `queue.done` or let it go with `queue.drop`.
+Any saved settlement for that step lands first.
 
 ## Arrival and pacing
 

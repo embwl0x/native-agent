@@ -87,13 +87,10 @@ public enum ChatSessionIndexFile {
     }
 
     /// Compound transactions may commit before their next effect (retention, binding publication). The existing lock scope remains held across both.
-    public static func write(_ rows: [[String: JSONValue]], to path: URL, removeWhenEmpty: Bool = false) throws {
+    public static func write(_ rows: [[String: JSONValue]], to path: URL) throws {
         try CredentialFileLock.withLock(path) {
-            if removeWhenEmpty && rows.isEmpty { try FileManager.default.removeItem(at: path) }
-            else {
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                    JSONValue.array(rows.map(JSONValue.object)).serializedData(pretty: true), to: path)
-            }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                JSONValue.array(rows.map(JSONValue.object)).serializedData(pretty: true), to: path)
         }
     }
 
@@ -244,10 +241,12 @@ public enum ChatSessionIndexFile {
                     remaining.append(row)
                     continue
                 }
+                // If a later append already indexed this same file state (its count reached ours), its preview is the newer one.
+                let indexedLater: Bool = if case .int(let count)? = row["messageCount"] { count >= Int64(messageCount) } else { false }
                 row["updatedAt"] = .string(syncedAt)
                 ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
                 row["messageCount"] = .int(Int64(messageCount))
-                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
+                if !preview.isEmpty, !indexedLater { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
                 if let title,
                    shouldReplaceSessionTitle(row["title"]) {
                     row["title"] = .string(title)
@@ -368,13 +367,6 @@ public enum ChatSessionIndexFile {
         guard case .string(let raw)? = value else { return true }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty || trimmed == "New Chat"
-    }
-
-    public static func serializedData(
-        for rows: [[String: JSONValue]],
-        pretty: Bool = true
-    ) throws -> Data {
-        try JSONValue.array(rows.map(JSONValue.object)).serializedData(pretty: pretty)
     }
 
     /// Transcript generations advance on clears and writes; the phone never clears on an absent generation.

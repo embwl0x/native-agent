@@ -136,6 +136,8 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
     private var seenMessageIDs: Set<String> = []
     private var seenMessageIDsOrdered: [String] = []
     private let seenMessageIDsCap = 2000
+    // This side's bell: the record names it sent most recently, newest last.
+    var bellEntries: [DeviceBellEntry] = []
     private var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
     private var assetSecretProvider: (@Sendable () async -> Data?)?
     // A Mac may access phone records only after proving it holds the account's Mac pairing slot; an unread claim grants no access.
@@ -367,8 +369,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
 
     /// Transport acknowledgement applies to these bytes, never to an unauthenticated message identity. A corrected record remains eligible.
     static func deliveryClaimKey(_ fields: NAChatMessageFields) -> String {
-        let digest = SHA256.hash(data: Data(fields.payloadJSON.utf8))
-            .map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256Hex.of(utf8: fields.payloadJSON)
         return fields.recordName + ":" + digest
     }
 
@@ -399,6 +400,13 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
             seenMessageIDs.remove(oldest)
         }
         return true
+    }
+
+    /// The names among `names` whose record no delivery has claimed. A claim is keyed by name and payload digest; the bell knows names only.
+    func unclaimedRecordNames(_ names: [String]) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        let claimed = Set(seenMessageIDs.compactMap { id in id.lastIndex(of: ":").map { String(id[..<$0]) } })
+        return names.filter { !claimed.contains($0) }
     }
 
     /// Release a claim taken by `claimIfUnseen` when delivery is rejected, so the message is retried on the next drain.
@@ -513,6 +521,8 @@ enum PairingSlot: Sendable { case empty, holds(Data) }
 /// Where a Mac stands on the account's Mac pairing record.
 enum PairingClaim: Sendable { case unread, held, elsewhere }
 struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
+/// One sent record on a bell, with when its sender saw it saved (the sender's clock).
+struct DeviceBellEntry: Codable, Sendable { let name: String; let sentAt: Date }
 struct DeviceStatusObserver: Sendable {
     let pairingSecret: @Sendable () async -> Data?
     let apply: @Sendable (String, Date?, Data, DeviceSyncRecovery) async -> Bool

@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -24,7 +25,7 @@ extension CognitiveSubstrate {
             restoreInFlight = false
             releaseLifecycleHold()
         }
-        await waitForMaintenanceTransition()
+        await waitForMaintenanceTransition(includingReplay: true)
 
         let attemptAt = dependencies.now()
         guard let store else {
@@ -62,7 +63,7 @@ extension CognitiveSubstrate {
             decoded = try decodeRestoreBundle(bundle)
         } catch {
             let stage = restoreFailureStage(for: error)
-            let detail = bounded(String(describing: error), maxCharacters: 320)
+            let detail = TextClipping.prefixOrWhole(String(describing: error), maxCharacters: 320)
             persistenceHealth = CognitivePersistenceHealth(
                 status: .degraded,
                 writesBlocked: true,
@@ -88,7 +89,7 @@ extension CognitiveSubstrate {
 
         // Read resident state AFTER the suspended load. On recovery it is the complete current family, including removals; on the first load its accepted rows
         // overlay the persisted family.
-        await waitForMaintenanceTransition()
+        await waitForMaintenanceTransition(includingReplay: true)
         let resident = residentRestoreArtifacts(at: dependencies.now())
         var reconciled = bundle
         for (family, rows) in resident {
@@ -133,7 +134,7 @@ extension CognitiveSubstrate {
                 status: .degraded, writesBlocked: true,
                 lastRestoreAttemptAt: attemptAt, lastSuccessfulRestoreAt: previousSuccessAt,
                 failureStage: "restore_reconciliation",
-                failureDetail: bounded(String(describing: error), maxCharacters: 320)
+                failureDetail: TextClipping.prefixOrWhole(String(describing: error), maxCharacters: 320)
             )
             throw error
         }

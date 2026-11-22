@@ -148,11 +148,8 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         id: String,
         toolName: String,
         surface: String,
-        payload: JSONValue,
-        reason: String,
-        turn: Turn
+        reason: String
     ) async -> JSONValue {
-        _ = payload
         return ToolNotRunStatus.approvalFiled.reporting(.object([
             "status": .string("waiting_approval"),
             "approvalId": .string(id),
@@ -163,11 +160,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
     }
 
     private static func nonEmptyStringValue(_ raw: String?) -> JSONValue {
-        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
-            return .null
-        }
-        return .string(value)
+        raw.trimmedNonEmpty.map(JSONValue.string) ?? .null
     }
 }
 

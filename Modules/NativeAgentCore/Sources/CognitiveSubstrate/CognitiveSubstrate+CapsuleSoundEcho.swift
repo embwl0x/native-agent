@@ -109,7 +109,7 @@ extension CognitiveSubstrate {
         let agentTurns = fieldNodes.filter { node in
             // Owner conversations remain the agent's own sources. Peer replies may echo only in that conversation or after an explicit Trust grant.
             let sameSession = Self.cleanedSessionId(currentSessionId).map {
-                $0 == Self.cleanedSessionId(metadataString(node.metadata["sessionId"]))
+                $0 == Self.cleanedSessionId(node.metadata["sessionId"]?.trimmedString)
             } ?? false
             let peer = Self.peerIdentity(metadata: node.metadata, dataRoot: conversationDataRoot)
             let sourceAllowed = sameSession || crossesSessions && (peer.map {

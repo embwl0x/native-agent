@@ -41,7 +41,9 @@ extension DoctorFacade {
             let items = state.items
             let contradictions = SwiftNativeDeskStore.terminalParentsWithNonTerminalDescendants(in: state)
             let waiting = items.filter { $0.requiresOwnerInput }
-            let blocked = items.filter { $0.status == .blocked && !$0.requiresOwnerInput }
+            // An item deferred to a later time waits on the clock, not on the person: it is not blocked work for them.
+            let now = Date()
+            let blocked = items.filter { $0.status == .blocked && !$0.requiresOwnerInput && !DeskSequencing.isDeferred($0, now: now) }
             let pendingApprovals: Int
             do {
                 pendingApprovals = try await approvals.list()

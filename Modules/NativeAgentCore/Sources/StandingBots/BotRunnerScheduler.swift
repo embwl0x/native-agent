@@ -78,10 +78,12 @@ public actor BotRunnerScheduler {
         guard !attached else { return }
         attached = true
         await OneClock.at(dataRoot).handle(Self.clockOwner) { [weak self] time, occurrence in await self?.deliver(time, occurrence: occurrence) }
-        await changed()
+        // Listen before the first read: a request queued in between is heard, never left waiting for another event.
+        let changes = NotificationCenter.default.notifications(named: BotRunQueue.didChange)
         Task.detached { [weak self] in
-            for await _ in NotificationCenter.default.notifications(named: BotRunQueue.didChange) { await self?.changed() }
+            for await _ in changes { await self?.changed() }
         }
+        await changed()
     }
 
     /// A definition or the queue changed: the clock follows the definitions, and queued requests run.

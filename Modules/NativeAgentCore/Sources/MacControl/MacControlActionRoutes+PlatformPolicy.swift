@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `MacControlActionRoutes+PlatformPolicy.swift` | checked Trust policy provider and bounded process-result interpretation |
+// Blueprint: | `MacControlActionRoutes+PlatformPolicy.swift` | checked Trust policy provider |
 
 public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
     let dataRoot: URL
@@ -54,30 +54,4 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
         }
     }
 
-}
-
-extension ProcessExecution {
-    /// One process run bounded by `timeout`; a timeout reads as exit 124 with its stderr (or a line naming the command that timed out).
-    public static func runBounded(
-        executable: String,
-        arguments: [String],
-        currentDirectory: URL,
-        timeout: TimeInterval
-    ) async throws -> (status: Int32, stdout: String, stderr: String) {
-        let result = try await ProcessExecution().run(
-            executable: executable,
-            arguments: arguments,
-            currentDirectory: currentDirectory,
-            environment: nil,
-            standardInput: nil,
-            timeoutSeconds: timeout
-        )
-        if result.timedOut {
-            let stderr = result.stderr.isEmpty
-                ? "\(URL(fileURLWithPath: executable).lastPathComponent) command timed out"
-                : result.stderr
-            return (124, result.stdout, stderr)
-        }
-        return (result.exitCode, result.stdout, result.stderr)
-    }
 }

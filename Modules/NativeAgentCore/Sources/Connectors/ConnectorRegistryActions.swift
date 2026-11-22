@@ -59,7 +59,7 @@ public enum ConnectorRegistryActions {
         }
         if enabled {
             let runtime = projection.overlay(currentEntry, root)
-            let health = ConnectorOAuthRegistry.connectorString(runtime["healthStatus"])?.lowercased()
+            let health = runtime["healthStatus"]?.stringValue?.lowercased()
             let hasVerifiedReadiness = normalizedID == "local_files" || health == "ok"
             guard hasVerifiedReadiness else {
                 throw NSError(domain: "NativeAgentConnectorMutation", code: -409, userInfo: [

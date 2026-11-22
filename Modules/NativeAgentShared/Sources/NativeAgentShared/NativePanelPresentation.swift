@@ -1,18 +1,10 @@
-import EngineRuntime
-import Connectors
-import Foundation
-import SchedulerExecution
-import NativeAgentCore
-import PersistenceCore
-import MacControl
-import AttentionRouting
+#if os(macOS)
 import AppKit
-import NativeAgentShared
-import SwiftUI
-// Blueprint: | `BodyFolderPresentation.swift` | Cancellable native shared-folder selection for body presentation calls |
+import Foundation
+// Blueprint: | `NativePanelPresentation.swift` | macOS shared-folder picker, bookmark grants and cancellable save-panel presentation |
 
-@MainActor enum ConnectorPresentation {
-    static func chooseSharedFolder(operation: UUID) async throws -> FaceReply {
+@MainActor public enum ConnectorPresentation {
+    public static func chooseSharedFolder(operation: UUID) async throws -> FaceReply {
         let panel = NSOpenPanel()
         panel.title = "Share a folder"
         panel.prompt = "Share Folder"
@@ -38,12 +30,25 @@ import SwiftUI
             throw PartCallError(code: "folder_unavailable", message: "The picker did not return a folder.")
         }
         let label = name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let grant = try await resourceGrant(id: operation, folder: folder, writable: writable.state == .on)
+        let grant = try await FaceNativePanel.resourceGrant(id: operation, url: folder, writable: writable.state == .on)
         return .folder(.init(label: label.isEmpty ? folder.lastPathComponent : label, resource: grant, writable: writable.state == .on))
     }
+}
 
-    @concurrent nonisolated private static func resourceGrant(id: UUID, folder: URL, writable: Bool) async throws -> ResourceGrant {
-        .init(id: id, name: folder.lastPathComponent,
-            bookmark: try folder.bookmarkData(), writable: writable)
+@MainActor public enum FaceNativePanel {
+    public static func choose(_ panel: NSSavePanel) async throws -> NSApplication.ModalResponse {
+        // A question never holds Quit: the person can always quit the app while it is open.
+        panel.preventsApplicationTerminationWhenModal = false
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let result = await panel.begin()
+            try Task.checkCancellation()
+            return result
+        } onCancel: { Task { @MainActor in panel.cancel(nil) } }
+    }
+
+    @concurrent nonisolated public static func resourceGrant(id: UUID, url: URL, writable: Bool) async throws -> ResourceGrant {
+        .init(id: id, name: url.lastPathComponent, bookmark: try url.bookmarkData(), writable: writable)
     }
 }
+#endif

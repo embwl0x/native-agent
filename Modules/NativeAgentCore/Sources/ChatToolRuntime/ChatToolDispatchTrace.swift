@@ -7,7 +7,6 @@ import Experiences
 import ProviderRouting
 import Foundation
 import NativeAgentShared
-import CryptoKit
 import ToolRegistry
 import ToolExecution
 import MacControl
@@ -411,7 +410,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             fields["resultReceipt"] = (try? evidence.serializedData(pretty: false).count).map { $0 <= 6_144 } == true
                 ? evidence : .object(["_truncated": .bool(true)])
             if let data = try? TurnTraceRedactor.redactValue(result).serializedData(pretty: false) {
-                fields["resultDigest"] = .string(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
+                fields["resultDigest"] = .string(SHA256Hex.of(data))
             }
         }
         return fields
@@ -606,6 +605,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             act.owes["repair"] = .init(to: own.tap == nil ? "self" : "person")
             act.claims = RepairDebt(owner: own.owner, operation: own.operation, lever: own.lever,
                                     nextCall: own.nextCall, tap: own.tap).claims
+            // The debt says why it was owed, as a debt born through `RepairOwed.owe` does; Home and Doctor read these words.
+            if let errorDetail, !errorDetail.isEmpty { act.face = .init(words: errorDetail, artifacts: []) }
         } else {
             for (index, no) in surfaced.enumerated() {
                 RepairOwed.owe(dataRoot, id: receiptID + ":" + String(index), kind: .act, cause: [receiptID],

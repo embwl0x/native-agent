@@ -43,9 +43,9 @@ public struct AttentionOrigin: Sendable, Equatable, Codable {
         threadId: String? = nil
     ) {
         self.surface = surface
-        self.sessionId = Self.trimmed(sessionId)
-        self.destinationId = Self.trimmed(destinationId)
-        self.threadId = Self.trimmed(threadId)
+        self.sessionId = sessionId.trimmedNonEmpty
+        self.destinationId = destinationId.trimmedNonEmpty
+        self.threadId = threadId.trimmedNonEmpty
     }
 
     /// Use the asking turn's live reply route; unsupported surfaces have no return route.
@@ -87,12 +87,6 @@ public struct AttentionOrigin: Sendable, Equatable, Codable {
         case .telegram, .slack: return true
         case .chat, .ios: return false
         }
-    }
-
-    private static func trimmed(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

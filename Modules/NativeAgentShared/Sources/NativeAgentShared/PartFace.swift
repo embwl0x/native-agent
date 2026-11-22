@@ -50,6 +50,14 @@ public struct PartFace: Codable, Sendable, Equatable {
             if case .string(let value) = self { value } else { nil }
         }
 
+        public var doubleValue: Double? {
+            switch self {
+            case .int(let value): Double(value)
+            case .double(let value): value
+            default: nil
+            }
+        }
+
         public init(from decoder: Decoder) throws {
             let container = try decoder.singleValueContainer()
             if container.decodeNil() { self = .null }

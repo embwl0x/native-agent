@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacControl+MenusAndClipboard.swift` | `SwiftNativeMacControl`, `handleMenu`, `handleMenuPress`, `handleClipboardRead` |
+// Blueprint: | `MacControl+MenusAndClipboard.swift` | `SwiftNativeMacControl`, `handleMenu`, `handleMenuPress` (stages `menuPressCommand`, `menuPressValidated` over one `MenuPressState`), `handleClipboardRead` |
 
 extension SwiftNativeMacControl {
     // MARK: - Menu bar
@@ -196,33 +196,18 @@ extension SwiftNativeMacControl {
     func handleMenuPress(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
         guard accessibilitySource(context: context).isTrusted() else { return axUntrustedResult(action: "menu_press") }
-        func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
-            var output: [String: JSONValue] = [
-                "pressed": .bool(false),
-                "status": .string(code),
-                "error": .string(code),
-                "message": .string(words),
-            ]
-            for (key, value) in extra { output[key] = value }
-            return MacControlResult(
-                ok: false,
-                action: "menu_press",
-                output: .object(output),
-                error: code,
-                durationMs: Int(now().timeIntervalSince(started) * 1000)
-            )
-        }
+        let press = MenuPressState(started: started, now: now)
         // Treat each list member as one menu level; separator-like text within it remains literal.
         let requested: String
         if case .array(let parts)? = body["path"] {
             var levels: [String] = []
             for part in parts {
                 guard case .string(let text) = part else {
-                    return refuse("bad_path", "menu_press path as a list takes one menu title per entry, as text.")
+                    return press.refuse("bad_path", "menu_press path as a list takes one menu title per entry, as text.")
                 }
                 let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !title.isEmpty, title.rangeOfCharacter(from: CharacterSet(charactersIn: "›»→>/|")) == nil else {
-                    return refuse(
+                    return press.refuse(
                         "bad_path", "A listed menu title is empty or contains a level separator (› » → > / |); give each level as its own entry."
                     )
                 }
@@ -233,7 +218,7 @@ extension SwiftNativeMacControl {
             requested = body["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
         guard !requested.isEmpty else {
-            return refuse(
+            return press.refuse(
                 "missing_path",
                 "menu_press needs `path` — the menu path to press, like \"File › Export › PDF\" (a string, or its components as a list)."
             )
@@ -245,9 +230,54 @@ extension SwiftNativeMacControl {
         case .app(let hit): app = hit
         }
         if let continuation, continuation.app?.processIdentifier != app.processIdentifier {
-            return refuse("continuation_target_mismatch", continuation.modelContext(context: context))
+            return press.refuse("continuation_target_mismatch", continuation.modelContext(context: context))
         }
         if let refusal = await macAdmissionRefusal(pid: app.processIdentifier, action: "menu_press", reading: false, context: context) { return refusal }
+        let item: MacMenuBar.Item
+        let reading: MacMenuBar.Reading
+        let requireFront: Bool
+        let target: MacAXActTarget
+        switch menuPressCommand(body, requested: requested, app: app, continuation: continuation, press: press, context: context) {
+        case .refused(let refusal): return refusal
+        case .found(let hit, let read, let front, let resolved):
+            item = hit
+            reading = read
+            requireFront = front
+            target = resolved
+        }
+        let result = await menuPressValidated(press, target: target, item: item, app: app, requested: requested,
+            reading: reading, requireFront: requireFront, continuation: continuation, turn: turn, context: context)
+        guard press.validationOpened, !press.pressed else { return result }
+        let cleanupContext = context.settling().with(\.driver, context.driver?.settlementBinding())
+        let source = accessibilityActSource(context: cleanupContext)
+        let cleanup: [String: JSONValue] = await settle {
+            switch source.resolve(menuPath: Array(item.path.prefix(2)), inAppPid: app.processIdentifier,
+                titlePath: nil, context: cleanupContext) {
+            case .resolved(let menu):
+                return source.perform(menu, action: "AXCancel", turn: turn, context: cleanupContext).receipt
+            case .unavailable(let cause):
+                return ["ax_outcome": .string("unavailable"), "ax_emission_attempted": .bool(false), "ax_cause": .string(cause)]
+            case .appGone, .pathNotFound, .menuPathDrifted, .windowGone:
+                return MacAXActOutcome.invalidTarget.receipt
+            }
+        }
+        // Both menuPressValidated exits (refuse and success) construct object output.
+        var output = result.output.objectValue!
+        output["menu_cleanup"] = .object(cleanup)
+        return MacControlResult(ok: result.ok, action: result.action,
+            output: .object(output),
+            error: result.error, durationMs: result.durationMs)
+    }
+
+    private enum MenuPressCommand {
+        case refused(MacControlResult)
+        case found(MacMenuBar.Item, MacMenuBar.Reading, Bool, MacAXActTarget)
+    }
+
+    private func menuPressCommand(
+        _ body: [String: JSONValue], requested: String, app: MacAXAppInfo, continuation: MacWorkContinuation?,
+        press: MenuPressState, context: MacOperationContext
+    ) -> MenuPressCommand {
         // Descend only through the requested path, retaining siblings for a missing level.
         let reading = MacMenuBar.read(
             source: accessibilitySource(context: context), pid: app.processIdentifier,
@@ -255,17 +285,17 @@ extension SwiftNativeMacControl {
             depth: MacMenuBar.findPathDepth
         , context: context)
         if let unavailable = reading.unavailable {
-            return refuse(
+            return .refused(press.refuse(
                 unavailable,
                 "\(app.name)'s menu items could not be read: \(unavailable). No command was pressed."
-            )
+            ))
         }
         guard !reading.truncated else {
-            return refuse("menu_coverage_incomplete", """
+            return .refused(press.refuse("menu_coverage_incomplete", """
                 The requested menu branch's items could not be read completely; command absence or uniqueness is unknown. No command was pressed. \
                 Read that branch before continuing.
                 """,
-                          ["attribute_gaps": .array(reading.attributeGaps.map(JSONValue.string))])
+                          ["attribute_gaps": .array(reading.attributeGaps.map(JSONValue.string))]))
         }
         // A background app's enabled states are stale: let its own handler decide instead of refusing on them. A front:true press (just raised) judges enabled
         // below, after the app has revalidated.
@@ -312,70 +342,73 @@ extension SwiftNativeMacControl {
                     words += " Key chords: " + chords.joined(separator: "; ") + ". Use mac.act with verb:key and target:the chord."
                 }
             }
-            return refuse(
+            return .refused(press.refuse(
                 code,
                 words,
                 ["requested_path": .string(requested)]
-            )
+            ))
         }
         // Resolve from AXMenuBar because it is outside every window tree; a window-relative chain would target unrelated document content.
-        func driftRefusal() -> MacControlResult {
-            refuse("menu_path_drifted", "The menu changed, so the selected command was not pressed. Read the menu again.")
-        }
-        var target: MacAXActTarget
+        let target: MacAXActTarget
         switch accessibilityActSource(context: context).resolve(
             menuPath: item.path,
             inAppPid: app.processIdentifier, titlePath: item.titlePath
         , context: context) {
-        case .unavailable(let detail): return refuse("ax_evidence_unavailable", detail)
+        case .unavailable(let detail): return .refused(press.refuse("ax_evidence_unavailable", detail))
         case .resolved(let hit):
             target = hit
-        case .menuPathDrifted: return driftRefusal()
+        case .menuPathDrifted: return .refused(press.driftRefusal())
         case .pathNotFound:
-            return refuse(
+            return .refused(press.refuse(
                 "menu_path_unavailable",
                 "The selected menu path could not be revalidated at its observed AX address; its current items are unknown. "
                     + "No command was pressed. Read the menu again."
-            )
+            ))
         default:
-            return refuse(
+            return .refused(press.refuse(
                 "app_gone",
                 "\(app.name)'s menu bar is not reachable any more."
-            )
+            ))
         }
         // A front-only press (act with front:true): re-checked at the last moment, so a person who switched apps during the walk wins.
         if requireFront, accessibilitySource(context: context).frontmostApp()?.processIdentifier != app.processIdentifier {
-            return refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed.")
+            return .refused(press.refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed."))
         }
         if let refusal = continuation?.refusal(context: context) {
-            return refuse("continuation_unavailable", refusal)
+            return .refused(press.refuse("continuation_unavailable", refusal))
         }
-        var validationOpened = false
-        var pressed = false
-        func pressValidated() async -> MacControlResult {
+        return .found(item, reading, requireFront, target)
+    }
+
+    private func menuPressValidated(
+        _ press: MenuPressState, target: MacAXActTarget, item: MacMenuBar.Item, app: MacAXAppInfo, requested: String,
+        reading: MacMenuBar.Reading, requireFront: Bool, continuation: MacWorkContinuation?, turn: Turn,
+        context: MacOperationContext
+    ) async -> MacControlResult {
+        var target = target
         // After a raise, enabled states may still reflect background validation. Opening the menu revalidates them; reread before pressing and close on
         // refusal.
-        if requireFront, !target.enabled, let top = item.path.first,
+        if requireFront, target.enabled == false, let top = item.path.first,
            case .resolved(let bar) = accessibilityActSource(context: context).resolve(menuPath: [top], inAppPid: app.processIdentifier, titlePath: nil,
                context: context) {
             guard MacMenuBar.cleanTitle(bar.title ?? bar.value) == item.titlePath.first else {
-                return driftRefusal()
+                return press.driftRefusal()
             }
             let validation = MacWaitSignals(effects: effectObserverSource,
                 activation: defaultMacAppActivationObserverSource(), pid: app.processIdentifier)
             defer { validation.stop() }
-            validationOpened = accessibilityActSource(context: context).perform(bar, action: "AXPress", turn: turn, context: context).emissionAttempted
+            press.validationOpened = accessibilityActSource(context: context).perform(bar, action: "AXPress", turn: turn, context: context).emissionAttempted
             _ = await macSettle("menu_validation", signals: validation, patience: 0.15) {
                 guard case .resolved(let fresh) = self.accessibilityActSource(context: context).resolve(
                     menuPath: item.path, inAppPid: app.processIdentifier, titlePath: item.titlePath, context: context) else { return false }
-                return fresh.enabled
+                return fresh.enabled == true
             }
-            if Task.isCancelled || context.expired { return refuse("app_stopped", "Stopped while validating the menu; no command was pressed.") }
+            if Task.isCancelled || context.expired { return press.refuse("app_stopped", "Stopped while validating the menu; no command was pressed.") }
             guard case .resolved(let fresh) = accessibilityActSource(context: context).resolve(menuPath: item.path, inAppPid: app.processIdentifier,
-                titlePath: item.titlePath, context: context) else { return driftRefusal() }
+                titlePath: item.titlePath, context: context) else { return press.driftRefusal() }
             target = fresh
-            if !target.enabled {
-                return refuse(
+            if target.enabled != true {
+                return press.refuse(
                     "menu_item_disabled",
                     MacMenuBar.words(for: .disabled(item), requested: requested, among: reading.items) ?? "\"\(item.display)\" is greyed out.",
                     ["requested_path": .string(requested)]
@@ -383,10 +416,10 @@ extension SwiftNativeMacControl {
             }
         }
         guard case .resolved(let fresh) = accessibilityActSource(context: context).resolve(menuPath: item.path, inAppPid: app.processIdentifier,
-            titlePath: item.titlePath, context: context) else { return driftRefusal() }
+            titlePath: item.titlePath, context: context) else { return press.driftRefusal() }
         target = fresh
-        if requireFront, !target.enabled {
-            return refuse(
+        if requireFront, target.enabled != true {
+            return press.refuse(
                 "menu_item_disabled",
                 MacMenuBar.words(for: .disabled(item), requested: requested, among: reading.items) ?? "The menu item is greyed out.",
                 ["requested_path": .string(requested)]
@@ -394,15 +427,15 @@ extension SwiftNativeMacControl {
         }
         // Recheck the front app after revalidation suspends so a person's focus change wins.
         if requireFront, accessibilitySource(context: context).frontmostApp()?.processIdentifier != app.processIdentifier {
-            return refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed.")
+            return press.refuse("front_changed", "\(app.name) is no longer in front, so nothing was pressed.")
         }
         if let refusal = continuation?.refusal(context: context) {
-            return refuse("continuation_unavailable", refusal)
+            return press.refuse("continuation_unavailable", refusal)
         }
         let pid = app.processIdentifier
         let windowsBefore: [MacAXWindowRef]
         do { windowsBefore = try accessibilityActSource(context: context).windows(pid: pid, context: context) }
-        catch { return refuse("window_evidence_unavailable", error.localizedDescription) }
+        catch { return press.refuse("window_evidence_unavailable", error.localizedDescription) }
         let focusedBefore = accessibilityActSource(context: context).focusedElement(pid: pid, context: context)
         let shortcut = accessibilityActSource(context: context).menuShortcut(target, context: context)
             .flatMap { try? MacKeySyntax.parseChords($0.chord).first }
@@ -427,7 +460,7 @@ extension SwiftNativeMacControl {
                     MacActReceiptRendering.actedElementJSON($0, redactingValue: true)
                 } ?? .null
             }
-            return refuse(
+            return press.refuse(
                 outcome.emissionAttempted ? "menu_press_outcome_unknown" : "menu_press_refused",
                 (outcome.emissionAttempted
                     ? """
@@ -438,7 +471,7 @@ extension SwiftNativeMacControl {
                     + (outcome.cause ?? outcome.rawValue), evidence
             )
         }
-        pressed = true
+        press.pressed = true
         let surfaceCommand = if case .surface = declaration { true } else { false }
         func pass() -> MacActClosedLoop.ActClassification {
             let windowsAfter: [MacAXWindowRef]
@@ -461,7 +494,7 @@ extension SwiftNativeMacControl {
         let signals = MacWaitSignals(collector: collector, startedAt: performedAt)
         defer { signals.stop() }
         _ = await macSettle("menu_press", signals: signals, patience: Double(MacActClosedLoop.defaultWaitMs) / 1000,
-            until: surfaceCommand ? MacActClosedLoop.navigationNotificationKinds : []) {
+            until: surfaceCommand ? MacActClosedLoop.navigationNotificationKinds : ["AXSelectedTextChanged", "AXSelectedChildrenChanged"]) {
             verdict = pass()
             return verdict.status == "acted"
         }
@@ -482,30 +515,8 @@ extension SwiftNativeMacControl {
                 "effect": .object(["notifications": .array(wait.notifications.map(JSONValue.string))]),
             ].merging(verdict.receipt) { _, new in new }),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000)
+            durationMs: Int(now().timeIntervalSince(press.started) * 1000)
         )
-        }
-        let result = await pressValidated()
-        guard validationOpened, !pressed else { return result }
-        let cleanupContext = context.settling().with(\.driver, context.driver?.settlementBinding())
-        let source = accessibilityActSource(context: cleanupContext)
-        let cleanup: [String: JSONValue] = await settle {
-            switch source.resolve(menuPath: Array(item.path.prefix(2)), inAppPid: app.processIdentifier,
-                titlePath: nil, context: cleanupContext) {
-            case .resolved(let menu):
-                return source.perform(menu, action: "AXCancel", turn: turn, context: cleanupContext).receipt
-            case .unavailable(let cause):
-                return ["ax_outcome": .string("unavailable"), "ax_emission_attempted": .bool(false), "ax_cause": .string(cause)]
-            case .appGone, .pathNotFound, .menuPathDrifted, .windowGone:
-                return MacAXActOutcome.invalidTarget.receipt
-            }
-        }
-        // Both pressValidated exits (refuse and success) construct object output.
-        var output = result.output.objectValue!
-        output["menu_cleanup"] = .object(cleanup)
-        return MacControlResult(ok: result.ok, action: result.action,
-            output: .object(output),
-            error: result.error, durationMs: result.durationMs)
     }
 
     // MARK: - Clipboard
@@ -519,7 +530,7 @@ extension SwiftNativeMacControl {
                 action: "clipboard_read",
                 output: .object([
                     "available": .bool(false),
-                    "note": .string("There is no pasteboard on this system, so there is nothing to read."),
+                    "note": .string("The clipboard was unavailable or changed while it was being read."),
                 ]),
                 error: "clipboard_unavailable",
                 durationMs: Int(now().timeIntervalSince(started) * 1000)
@@ -618,5 +629,38 @@ extension SwiftNativeMacControl {
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
+    }
+}
+
+/// One menu press's living state: its refusal clock and what the press did, read again by the cleanup after it.
+private final class MenuPressState {
+    let started: Date
+    let now: @Sendable () -> Date
+    var validationOpened = false
+    var pressed = false
+
+    init(started: Date, now: @escaping @Sendable () -> Date) {
+        self.started = started
+        self.now = now
+    }
+
+    func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
+        var output: [String: JSONValue] = [
+            "pressed": .bool(false),
+            "status": .string(code),
+            "error": .string(code),
+            "message": .string(words),
+        ]
+        for (key, value) in extra { output[key] = value }
+        return MacControlResult(
+            ok: false,
+            action: "menu_press",
+            output: .object(output),
+            error: code,
+            durationMs: Int(now().timeIntervalSince(started) * 1000)
+        )
+    }
+    func driftRefusal() -> MacControlResult {
+        refuse("menu_path_drifted", "The menu changed, so the selected command was not pressed. Read the menu again.")
     }
 }

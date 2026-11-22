@@ -60,16 +60,11 @@ public enum PersonOnlyWindows {
     }
 
     private struct State {
-        var windows: [Window] = []
-        var keyHeld = false
         var rendererWindows: [UUID: [Window]] = [:]
         var rendererOverlays: [UUID: Int] = [:]
-        var allWindows: [Window] { windows + rendererWindows.values.flatMap { $0 } }
-        var localMotor: MotorHost?
+        var allWindows: [Window] { rendererWindows.values.flatMap { $0 } }
         var rendererMotors: [UUID: MotorHost] = [:]
         var lastPersonInputUptime = -Double.infinity
-        /// Decoration is excluded from captures, never a hand-back or click target.
-        var overlays: Set<Int> = []
         var motorObserver: (@Sendable () -> Void)?
         var lastMotorSignal = -Double.infinity
     }
@@ -85,12 +80,8 @@ public enum PersonOnlyWindows {
 
     /// From any surface's turn, wait for the agent's own windows to step aside before it looks at or acts on the screen.
     public static func stepAsideForScreen(turn: Turn?) async throws {
-        let hosts = state.withLock { ($0.localMotor.map { [$0] } ?? []) + Array($0.rendererMotors.values) }
+        let hosts = state.withLock { Array($0.rendererMotors.values) }
         for host in hosts { try await host.stepAside(turn?.windowDriver) }
-    }
-
-    public static func install(localMotor: MotorHost) {
-        state.withLock { $0.localMotor = localMotor }
     }
 
     public static func installRenderer(connection: UUID, motor: MotorHost) {
@@ -113,28 +104,10 @@ public enum PersonOnlyWindows {
         observer?()
     }
 
-    /// Age of the agent's last motor signal (to within half a second), `.infinity` when none.
-    public static func secondsSinceAgentHands() -> TimeInterval {
-        let uptime = ProcessInfo.processInfo.systemUptime
-        let last = state.withLock { $0.lastMotorSignal }
-        return last.isFinite ? uptime - last : .infinity
-    }
-
     /// The agent's pointer acted at `point` (CGEvent space); `pressed` for a click or drag.
     public static func noteAgentPointer(at point: CGPoint, pressed: Bool) {
-        let hosts = state.withLock { ($0.localMotor.map { [$0] } ?? []) + Array($0.rendererMotors.values) }
+        let hosts = state.withLock { Array($0.rendererMotors.values) }
         for host in hosts { host.pointer(point, pressed) }
-    }
-
-    public static func setOverlay(number: Int?) {
-        state.withLock { $0.overlays = number.map { [$0] } ?? [] }
-    }
-
-    /// What is on screen now. Empty when nothing of the person's is showing.
-    public static func update(_ current: [Window], keyHeld held: Bool) {
-        state.withLock {
-            $0.windows = current; $0.keyHeld = held && !current.isEmpty
-        }
     }
 
     /// A report's geometry only: whether the keyboard is held is asked live at each key (`requireKeyboardFree`), never read from a report.
@@ -156,20 +129,6 @@ public enum PersonOnlyWindows {
         motor?.disconnected?()
     }
 
-    public static func disconnect() {
-        let motors = state.withLock {
-            let motors = Array($0.rendererMotors.values)
-            $0.windows = []
-            $0.keyHeld = false
-            $0.overlays = []
-            $0.rendererWindows.removeAll()
-            $0.rendererOverlays.removeAll()
-            $0.rendererMotors.removeAll()
-            return motors
-        }
-        for motor in motors { motor.disconnected?() }
-    }
-
     /// While a person-only window is up, only Stop hands control back; person input elsewhere does not interrupt the agent.
     public static var isShowing: Bool {
         state.withLock { !$0.allWindows.isEmpty }
@@ -177,7 +136,7 @@ public enum PersonOnlyWindows {
 
     public static func contains(number: Int) -> Bool {
         state.withLock {
-            $0.allWindows.contains { $0.number == number } || $0.overlays.contains(number) || $0.rendererOverlays.values.contains(number)
+            $0.allWindows.contains { $0.number == number } || $0.rendererOverlays.values.contains(number)
         }
     }
 
@@ -188,7 +147,7 @@ public enum PersonOnlyWindows {
     /// Every host acknowledges its current geometry and passage before input. Settlement releases every attempted host, even after Stop.
     public static func withAgentPointer(at point: CGPoint, driver: Driver? = nil, emit: (Set<UUID>) async throws -> Void) async throws {
         let (hosts, connections) = state.withLock { state in
-            (Array(state.rendererMotors.values) + (state.localMotor.map { [$0] } ?? []), Set(state.rendererMotors.keys))
+            (Array(state.rendererMotors.values), Set(state.rendererMotors.keys))
         }
         let operation = UUID()
         var attempted: [MotorHost] = []
@@ -235,7 +194,6 @@ public enum PersonOnlyWindows {
     /// Answers at once: every window process says, live at the moment of the key (after the target app was activated), that its keyboard is free, or the
     /// key is refused. A protected-window report can lag an activation, so it never decides this. The agent never waits for the person to click away.
     public static func requireKeyboardFree() async throws {
-        if state.withLock({ $0.keyHeld }) { throw MotorFailure(detail: keyboardRefusal) }
         let renderers = state.withLock { Array($0.rendererMotors.values) }
         for host in renderers { try await host.keyboard?() }
     }

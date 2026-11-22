@@ -2,7 +2,6 @@ import Foundation
 import ChatTurnContracts
 import Experiences
 import SchedulerExecution
-import AttentionRouting
 import Cognition
 import NativeAgentCore
 import ProviderRouting
@@ -89,8 +88,7 @@ extension NativeAgentEngine {
         stager: REMApprovalStager? = nil
     ) async -> Int {
         await DreamBackgroundWork.stagePendingREMProposalsAtLaunch(
-            dataRoot: dataRoot, limit: limit, stager: stager,
-            notifications: EngineREMProposalNotifications()
+            dataRoot: dataRoot, limit: limit, stager: stager
         )
     }
 
@@ -111,7 +109,7 @@ extension NativeAgentEngine {
         let impl = try await dreamCycle(dataRoot: root)
         let report = try await DreamBackgroundWork.runDream(
             dataRoot: root, cycle: impl, cognitionRuntime: cognition,
-            force: force, trigger: trigger, notifications: EngineREMProposalNotifications(), parent: cause, beganAt: beganAt
+            force: force, trigger: trigger, parent: cause, beganAt: beganAt
         )
         var response: [String: Any] = [
             "ok": report.errors.isEmpty, "backend": "swift", "force": force,
@@ -144,7 +142,7 @@ extension NativeAgentEngine {
         let impl = try makeDreamREMCycle(
             root: root,
             gate: try await CognitionViewFacade(dataRoot: root).dreamGateChecked(),
-            remStageApproval: DreamBackgroundWork.makeREMProposalStager(dataRoot: root, notifications: EngineREMProposalNotifications()),
+            remStageApproval: DreamBackgroundWork.makeREMProposalStager(dataRoot: root),
             lifecycleObserver: cognition
         )
         if repair {
@@ -163,11 +161,5 @@ extension NativeAgentEngine {
         ]
         if let skipReason = report.skipReason { response["skipReason"] = skipReason }
         return response
-    }
-}
-
-private struct EngineREMProposalNotifications: REMProposalNotificationPort {
-    func tell(_ matter: Matter, dataRoot: URL, reach: AttentionRouter.Reach, turn: Turn?) async throws -> AttentionOutcome {
-        try await EngineBackgroundWorkPort().tell(matter, dataRoot: dataRoot, reach: reach, turn: turn)
     }
 }

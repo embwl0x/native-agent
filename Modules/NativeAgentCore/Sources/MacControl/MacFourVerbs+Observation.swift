@@ -115,7 +115,8 @@ extension MacFourVerbs {
             var detail = Self.operationDetail(result)
             detail["observed_after"] = .bool(true)
             // The fresh screen is a witness only. Verification comes from the declared effect's AX readback, never a render or pixel delta.
-            detail["screen_changed"] = before.map { .bool($0.effectRender != after.effectRender) } ?? .null
+            // What changed in her reading of the page (controls and text), not pixels: a selection highlight or a scroll can leave it the same.
+            detail["page_read_changed"] = before.map { .bool($0.effectRender != after.effectRender) } ?? .null
             var verdict: MacActClosedLoop.ActClassification?
             if let pointerTarget, let before {
                 let inside = before.pid != nil && before.pid == after.pid

@@ -113,7 +113,6 @@ extension CognitiveSubstrate {
         public var beliefReaction: BeliefReaction?
         public var chosenRegister: CognitiveRegisterChoice?
         var isActive: Bool { valence != 0 || warmth != 0 || tension != 0 || pressure != 0 || arousal != 0 }
-        public var isNoOp: Bool { !isActive && !affection && warmthBoost == 0 && beliefReaction == nil && chosenRegister == nil }
     }
 
     nonisolated func studioValence(in text: String) -> Double {

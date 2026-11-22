@@ -1,7 +1,6 @@
 import AuthoredCapabilities
 import Foundation
 import AppKit
-import CryptoKit
 import Darwin
 import Experiences
 import NativeAgentCore
@@ -31,7 +30,18 @@ public actor SenseNewsBoard {
     private static let maximumSummaryBytes = 2_048
     private static let maximumUpdateBytes = 240
     private var histories: [UUID: History] = [:]
-    private var view: SenseInteractiveView?
+    struct ViewRoute: Equatable, Sendable {
+        let selection: String
+        let slot: String
+        let address: String?
+        var siteSource: DoorSource? = nil
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.selection == rhs.selection && lhs.slot == rhs.slot && lhs.address == rhs.address && lhs.siteSource === rhs.siteSource
+        }
+    }
+    private var presentation: (view: SenseInteractiveView, revision: String, route: ViewRoute)?
+    private var lastPresented: [String: ViewRoute] = [:]
     private var storageURL: URL?
     private var dataRoot: URL?
     private var storageBlocked = false
@@ -104,12 +114,29 @@ public actor SenseNewsBoard {
             return false
         }
     }
-    public func present(_ view: SenseInteractiveView?) {
-        guard self.view != view else { return }
-        self.view = view
+    func present(_ view: SenseInteractiveView?, route: ViewRoute) {
+        guard presentation?.view != view || (view != nil && presentation?.route != route) else { return }
+        if view != nil {
+            // Wakes retain the route, while only the visible pane holds the captured reader.
+            lastPresented[route.selection] = ViewRoute(selection: route.selection, slot: route.slot, address: route.address)
+        }
+        presentation = view.map { ($0, UUID().uuidString, route) }
         NotificationCenter.default.post(name: Self.presentationDidChange, object: nil)
     }
-    public func interactiveView() -> SenseInteractiveView? { view }
+    package func interactivePresentation() -> (view: SenseInteractiveView, revision: String)? {
+        presentation.map { ($0.view, $0.revision) }
+    }
+
+    func viewRoute(selection: String, revision: String?) -> ViewRoute? {
+        guard let revision else { return lastPresented[selection] }
+        return presentation.flatMap { current in
+            current.route.selection == selection && current.revision == revision ? current.route : nil
+        }
+    }
+    func retirePresentation(selection: String) {
+        lastPresented.removeValue(forKey: selection)
+        if let route = presentation?.route, route.selection == selection { present(nil, route: route) }
+    }
     /// Keep news for the next turn; each new item is posted to attention as a world happening, weighed by the agent's turn program.
     @discardableResult
     public func post(_ news: SenseNews) async -> Bool {
@@ -133,7 +160,7 @@ public actor SenseNewsBoard {
         // Pruning alone changes retained state, but a repeat or expired item is no new occurrence.
         guard let fresh, let dataRoot else { return true }
         // What it is about is the watched address (its private identity); the door is the sense, so its yield gathers per sense.
-        let address = String((fresh.observationID ?? Self.identity(fresh.address)).prefix(16))
+        let address = String((fresh.observationID ?? SHA256Hex.of(utf8: fresh.address)).prefix(16))
         Attention.post(Happening(.world, subject: "sense:" + fresh.senseID + ":" + address, door: "sense:" + fresh.senseID,
             words: fresh.senseID + " at " + Self.updateLine(fresh.address) + ": " + Self.updateLine(fresh.summary),
             once: "sense:" + fresh.senseID + ":" + fresh.id.uuidString.lowercased(), watch: fresh.watch), dataRoot: dataRoot)
@@ -171,8 +198,8 @@ public actor SenseNewsBoard {
         // Sanitize visible fields before clipping while retaining exact private observation/change identities.
         var news = news
         // Use private hashes for exact source identities so deduplication and storage stay bounded.
-        news.observationID = Self.identity(news.observationID ?? news.address)
-        news.changeID = Self.identity(news.changeID ?? news.summary)
+        news.observationID = SHA256Hex.of(utf8: news.observationID ?? news.address)
+        news.changeID = SHA256Hex.of(utf8: news.changeID ?? news.summary)
         news.senseID = ContextSecretContentPolicy.redactedFragment(news.senseID)
         news.address = ContextSecretContentPolicy.redactedFragment(news.address)
         news.summary = Self.bounded(ContextSecretContentPolicy.redactedFragment(news.summary), bytes: Self.maximumSummaryBytes)
@@ -243,9 +270,6 @@ public actor SenseNewsBoard {
     private func retainHistories() {
         let ids = Set(items.map(\.id))
         histories = histories.filter { ids.contains($0.key) }
-    }
-    private static func identity(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
     private static func bounded(_ text: String, bytes: Int) -> String {
         guard text.utf8.count > bytes else { return text }

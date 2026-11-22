@@ -62,7 +62,9 @@ extension ContextPreparation {
         for (distance, words) in recentExchanges.reversed().enumerated() {
             for text in words {
                 let fingerprint = ContextStableID.digest(parts: [text])
-                if distances[fingerprint] == nil { distances[fingerprint] = distance }
+                // Repeated words ("Continue") cannot say which exchange a delivery rode: take the oldest, so rest never suppresses a
+                // memory on a later repeat it was not delivered in.
+                distances[fingerprint] = distance
             }
         }
         var result: [ContextAtomID: Int] = [:]

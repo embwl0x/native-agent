@@ -2,21 +2,16 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-#if canImport(ApplicationServices)
 import ApplicationServices
-#endif
-#if canImport(AppKit)
 import AppKit
 import TrustCenter
 import CoreGraphics
 import UserNotifications
 import Senses
 import Experiences
-import CryptoKit
 import os
 import CoreText
 import ScreenCaptureKit
-#endif
 // Blueprint: | `MacAXElementSource.swift` | Read-only AX contracts preserve gaps and observation-bound focus |
 /// Keep partially readable trees useful without treating gaps as absence.
 public protocol MacAXElementSource: Sendable {

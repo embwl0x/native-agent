@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `MacFourVerbs+ScreenFusion.swift` | Call-local AX/pixel fusion binds window identity, targets and read gaps; empty looks grant no act window |
+// Blueprint: | `MacFourVerbs+ScreenFusion.swift` | Call-local AX/pixel fusion binds window identity, targets and read gaps; empty looks grant no act window; `sight` runs in stages over one call's `SightState` |
 
 /// Call-local proof supplied by the canonical view capture, never by app-name matching. Pixels that cannot bind to this look are discarded.
 final class MacSightCaptureBinding: @unchecked Sendable {
@@ -63,6 +63,26 @@ extension MacFourVerbs {
         let captureBinding = observed ?? MacSightCaptureBinding(frameID: UUID().uuidString)
         let continuation = turn.macContinuation.flatMap { $0.isPending ? $0 : nil }
         let app = continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app
+        let sighting: SightState
+        switch await lookForSight(captureBinding: captureBinding, app: app, part: part, seek: seek, requiresWindow: requiresWindow,
+            turn: turn, context: context) {
+        case .next(let looked): sighting = looked
+        case .done(let sighted): return sighted
+        }
+        collectSightTargets(sighting)
+        if let sighted = await mergeSupplement(sighting, app: app, turn: turn, context: context) { return sighted }
+        focusSightTarget(sighting)
+        let scoped: SightPage
+        switch nativeSightPage(sighting, part: part) {
+        case .next(let read): scoped = read
+        case .done(let sighted): return sighted
+        }
+        return renderSighting(sighting, scoped: scoped)
+    }
+
+    /// Read the window through the look and accept it: a blind reply for a failed, empty, own-app, locked or front-unknown read; otherwise its percept.
+    private func lookForSight(captureBinding: MacSightCaptureBinding, app: String?, part: String?, seek: String?, requiresWindow: Bool,
+                              turn: Turn, context: MacOperationContext) async -> SightStep<SightState> {
         let result: MacControlResult
         do {
             // Named-app looks remain anchored without activation; the percept reports their actual front state.
@@ -74,11 +94,11 @@ extension MacFourVerbs {
                 try await host.dispatch(action: "look", body: body, turn: turn, context: context)
             }
         } catch {
-            return .blind(MacFourVerbsReply(
+            return .done(.blind(MacFourVerbsReply(
                 ok: false,
                 text: "I can't see the screen right now: \(error).",
                 detail: ["error": .string("\(error)")]
-            ))
+            )))
         }
         let output = Self.object(result.output)
         if result.ok, output["status"] == .string("ok"),
@@ -89,25 +109,25 @@ extension MacFourVerbs {
                 detail["status"] = .string("refused")
                 detail["error"] = .string(output["running"] == .bool(false) ? "app_not_running" : "no_window_in_app")
             }
-            return .blind(MacFourVerbsReply(
+            return .done(.blind(MacFourVerbsReply(
                 ok: !requiresWindow,
                 text: Self.string(output["message"]) ?? "There is no readable window.",
                 detail: detail
-            ))
+            )))
         }
         if result.error == "self_inspection_unsupported" {
             let route = Self.ownAppRoute()
-            return .blind(MacFourVerbsReply(ok: route.ok, text: route.text,
+            return .done(.blind(MacFourVerbsReply(ok: route.ok, text: route.text,
                 detail: route.detail.merging(["frontmost_app": output["frontmost_app"] ?? .null,
                     "running_apps": output["running_apps"] ?? .null,
-                    "running_apps_omitted": output["running_apps_omitted"] ?? .int(0)]) { current, _ in current }))
+                    "running_apps_omitted": output["running_apps_omitted"] ?? .int(0)]) { current, _ in current })))
         }
         guard result.ok, let frameId = Self.string(output["frame_id"]), let percept = captureBinding.percept else {
             let why = Self.string(output["message"])
                 ?? Self.string(output["note"])
                 ?? (result.ok ? "The look returned no typed percept for this call."
                     : Self.lookRefusalWords(result.error ?? Self.string(output["status"]) ?? "unknown"))
-            return .blind(MacFourVerbsReply(
+            return .done(.blind(MacFourVerbsReply(
                 ok: false,
                 text: Self.runningAppsLine(output) + "I can't see the screen right now. " + why,
                 // Keep refusal wording unwrapped so callers can supply their own lead without parsing prose.
@@ -116,22 +136,29 @@ extension MacFourVerbs {
                     "message": .string(why),
                 ]) { _, new in new }.merging(output["frontmost_app"].map { ["frontmost_app": $0] } ?? [:]) { current, _ in current }
                     .merging(output["requested_app"].map { ["requested_app": $0] } ?? [:]) { current, _ in current }
-            ))
+            )))
         }
 
         if percept.app?.bundleIdentifier == MacWakeGuard.loginWindowBundleID {
-            return .blind(MacFourVerbsReply(
+            return .done(.blind(MacFourVerbsReply(
                 ok: false,
                 text: MacScreenLock.reply,
                 detail: ["error": .string("display_obstructed")]
-            ))
+            )))
         }
 
         guard let isFront = Self.bool(output["front"]) else {
-            return .blind(MacFourVerbsReply(ok: false,
+            return .done(.blind(MacFourVerbsReply(ok: false,
                 text: "The screen read did not establish whether this window is in front. Read the app again before acting.",
-                detail: ["error": .string("foreground_evidence_unavailable")]))
+                detail: ["error": .string("foreground_evidence_unavailable")])))
         }
+        return .next(SightState(captureBinding: captureBinding, result: result, output: output, frameId: frameId, percept: percept,
+            isFront: isFront))
+    }
+
+    /// Every row, control and landmark of the percept as a natural target, before any render limit.
+    private func collectSightTargets(_ sighting: SightState) {
+        let percept = sighting.percept
         let (rows, controls) = Self.partition(percept)
         var targets: [ActTarget] = []
         var rowRoleOrdinals: [String: Int] = [:]
@@ -199,7 +226,16 @@ extension MacFourVerbs {
                 sourceAXPath: landmark.path
             ))
         }
+        sighting.rows = rows
+        sighting.targets = targets
+    }
 
+    /// Merge the canonical view capture's targets when it is this look's own window; otherwise keep only that its picture was held back.
+    private func mergeSupplement(_ sighting: SightState, app: String?, turn: Turn, context: MacOperationContext) async -> Sighted? {
+        let captureBinding = sighting.captureBinding
+        let percept = sighting.percept
+        let rows = sighting.rows
+        var targets = sighting.targets
         var visibleFrame: MacAXFrame?
         var pointer: MacPointerPosition?
         var pointerFrame: MacAXFrame?
@@ -286,11 +322,27 @@ extension MacFourVerbs {
                     settableAttributes: candidate.settableAttributes
                 ))
             }
-        } else if supplement != nil {
-            // Not this look's own window: nothing from that capture may leave.
+        } else if let supplement {
+            // Not this look's own window, or a capture the screen outran: nothing from it may leave but the fact that its picture was held back.
             supplementalSource?.rejected()
+            if Self.sameApp(percept: percept, supplement: supplement), let why = supplement.diagnostics["image_withheld_reason"] {
+                supplementalDiagnostics["image_withheld_reason"] = why
+            }
         }
+        sighting.targets = targets
+        sighting.visibleFrame = visibleFrame
+        sighting.pointer = pointer
+        sighting.pointerFrame = pointerFrame
+        sighting.supplementalDiagnostics = supplementalDiagnostics
+        sighting.nativeAXSupplement = nativeAXSupplement
+        sighting.mergedAXPaths = mergedAXPaths
+        return nil
+    }
 
+    /// The focused control keeps one address: its existing handle gains aliases, or it joins the targets.
+    private func focusSightTarget(_ sighting: SightState) {
+        let percept = sighting.percept
+        var targets = sighting.targets
         // Expose the existing focus handle for empty editors so they remain addressable without invented content.
         var focusedControl: (label: String, kind: String)?
         if let focus = percept.focus, let handle = focus.handle {
@@ -327,7 +379,22 @@ extension MacFourVerbs {
                 ))
             }
         }
+        sighting.targets = targets
+        sighting.focusedControl = focusedControl
+    }
 
+    /// The native page the look compiled, its names bound to the targets and scoped to the named part.
+    private func nativeSightPage(_ sighting: SightState, part: String?) -> SightStep<SightPage> {
+        let result = sighting.result
+        let output = sighting.output
+        let frameId = sighting.frameId
+        let percept = sighting.percept
+        let pointer = sighting.pointer
+        let pointerFrame = sighting.pointerFrame
+        let nativeAXSupplement = sighting.nativeAXSupplement
+        let mergedAXPaths = sighting.mergedAXPaths
+        let focusedControl = sighting.focusedControl
+        var targets = sighting.targets
         let zoom = Self.zoom(percept, supplement: nativeAXSupplement,
                              mergedAXPaths: mergedAXPaths, focusedControl: focusedControl, part: part)
         let pointerLine: String? = {
@@ -349,9 +416,9 @@ extension MacFourVerbs {
         let rendererNote = Self.string(Self.object(output["seam"])["renderer_wait_note"])
         // Native blocks own AX presentation; the pixel renderer adds only independently recognized regions and canvas evidence.
         guard var nativePage = result.nativePage else {
-            return .blind(MacFourVerbsReply(ok: false,
+            return .done(.blind(MacFourVerbsReply(ok: false,
                 text: "raw view · accessibility · The look reader did not return a native screen page.",
-                detail: ["error": .string("screen_page_unavailable")]))
+                detail: ["error": .string("screen_page_unavailable")])))
         }
         // Resolve the names and presses the native page actually offers, rather than a same-named decorative element from the raw percept.
         for thing in nativePage.things {
@@ -365,9 +432,9 @@ extension MacFourVerbs {
         if let nativeAXSupplement {
             do { try Self.addingNativeAX(nativeAXSupplement, to: &nativePage, blocks: &nativeBlocks, targets: targets, frameID: frameId) }
             catch {
-                return .blind(MacFourVerbsReply(ok: false,
+                return .done(.blind(MacFourVerbsReply(ok: false,
                     text: "raw view · accessibility · The supplemental native surfaces could not be compiled: \(error.localizedDescription)",
-                    detail: ["error": .string("screen_page_unavailable")]))
+                    detail: ["error": .string("screen_page_unavailable")])))
             }
         }
         let fullNativeText = nativePage.text
@@ -416,12 +483,37 @@ extension MacFourVerbs {
                     nativePage = page
                     nativeZoomNote = "Read the observed visual surface; its existing name and region targets are unchanged."
                 } else {
-                    return .blind(MacFourVerbsReply(ok: false,
+                    return .done(.blind(MacFourVerbsReply(ok: false,
                         text: "No readable native section is named \"\(part)\". Read mac.look without a section to discover its current names.",
-                        detail: ["error": .string("section_not_found"), "section": .string(part)]))
+                        detail: ["error": .string("section_not_found"), "section": .string(part)])))
                 }
             }
         }
+        sighting.targets = targets
+        return .next(SightPage(zoom: zoom, pointerLine: pointerLine, windowKind: windowKind, cutLine: cutLine, rendererNote: rendererNote,
+            nativePage: nativePage, fullNativeText: fullNativeText, nativeZoomNote: nativeZoomNote))
+    }
+
+    /// Render the sighting: notes, the page, withheld pixels and the cut, with every target, detail and secure fact the act needs.
+    private func renderSighting(_ sighting: SightState, scoped: SightPage) -> Sighted {
+        let captureBinding = sighting.captureBinding
+        let output = sighting.output
+        let frameId = sighting.frameId
+        let percept = sighting.percept
+        let isFront = sighting.isFront
+        let targets = sighting.targets
+        let visibleFrame = sighting.visibleFrame
+        let pointer = sighting.pointer
+        let supplementalDiagnostics = sighting.supplementalDiagnostics
+        let nativeAXSupplement = sighting.nativeAXSupplement
+        let zoom = scoped.zoom
+        let pointerLine = scoped.pointerLine
+        let windowKind = scoped.windowKind
+        let cutLine = scoped.cutLine
+        let rendererNote = scoped.rendererNote
+        let nativePage = scoped.nativePage
+        let fullNativeText = scoped.fullNativeText
+        let nativeZoomNote = scoped.nativeZoomNote
         let pixelText = zoom.pixelText
         let fullPixelText = zoom.fullPixelText
         let pageText = (nativeZoomNote.map { $0 + "\n" } ?? "") + nativePage.text + pixelText
@@ -538,4 +630,51 @@ extension MacFourVerbs {
         return normalize(lookName) == normalize(viewName)
     }
 
+
+    /// A sight stage either goes on with what it read or ends the sight with its reply.
+    private enum SightStep<Value> {
+        case next(Value)
+        case done(Sighted)
+    }
+
+    /// One sight's state, from the accepted look through the targets and native page to the rendering. It lives for one call.
+    private final class SightState {
+        let captureBinding: MacSightCaptureBinding
+        let result: MacControlResult
+        let output: [String: JSONValue]
+        let frameId: String
+        let percept: MacLookPercept
+        let isFront: Bool
+        var rows: [MacLookAffordance] = []
+        var targets: [ActTarget] = []
+        var visibleFrame: MacAXFrame?
+        var pointer: MacPointerPosition?
+        var pointerFrame: MacAXFrame?
+        var supplementalDiagnostics: [String: JSONValue] = [:]
+        var nativeAXSupplement: MacFourVerbsSupplement?
+        var mergedAXPaths: Set<[Int]> = []
+        var focusedControl: (label: String, kind: String)?
+
+        init(captureBinding: MacSightCaptureBinding, result: MacControlResult, output: [String: JSONValue], frameId: String,
+             percept: MacLookPercept, isFront: Bool) {
+            self.captureBinding = captureBinding
+            self.result = result
+            self.output = output
+            self.frameId = frameId
+            self.percept = percept
+            self.isFront = isFront
+        }
+    }
+
+    /// The native page a sight renders, scoped and bound to its targets, with the notes that frame it.
+    private struct SightPage {
+        let zoom: (paths: [[Int]], visual: Bool, pixelText: String, fullPixelText: String)
+        let pointerLine: String?
+        let windowKind: String?
+        let cutLine: String?
+        let rendererNote: String?
+        let nativePage: NativePage
+        let fullNativeText: String
+        let nativeZoomNote: String?
+    }
 }

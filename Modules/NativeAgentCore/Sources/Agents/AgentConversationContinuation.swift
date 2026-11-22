@@ -66,8 +66,6 @@ public struct AgentConversationContinuation: Sendable {
         ChatGPTDotIPCTransport.listen(dataRoot: dataRoot)
         try await dot.resumeAdmissions()
         try Task.checkCancellation()
-        AgentConversationWatches.start()
-        try Task.checkCancellation()
         let store = store
         await AgentA2APushReceiver.shared.installInvalidator(owner: pushOwner) { peer, task in
             do {
@@ -85,10 +83,12 @@ public struct AgentConversationContinuation: Sendable {
             }
         }
         try Task.checkCancellation()
-        guard !queuesResumed.withLock({ $0 }) else { return }
+        let restoreQueues = !queuesResumed.withLock { $0 }
         // Load and seed recipes before any contact row reads them.
-        AgentRecipeStore.load(dataRoot: dataRoot)
-        try grok.resumeHandOvers(dataRoot: dataRoot, continuation: self)
+        if restoreQueues { AgentRecipeStore.load(dataRoot: dataRoot) }
+        try await grok.resumeHandOvers(dataRoot: dataRoot, continuation: self)
+        try Task.checkCancellation()
+        guard restoreQueues else { return }
         // IPC conversation changes arrive by push, never polling.
         let peers = try AgentPeerStore(dataRoot: dataRoot).list()
         // Authored contact routes retain exchanges through the ordinary conversation owner.
@@ -131,7 +131,6 @@ public struct AgentConversationContinuation: Sendable {
             for task in tasks { task.cancel() }
             for task in tasks { await task.value }
             await OneClock.at(dataRoot).release("agent")
-            await AgentConversationWatches.stop()
             await grok.stop()
             await AgentA2APushReceiver.shared.removeInvalidator(owner: pushOwner)
             await dot.stopSubscriptions()
@@ -199,8 +198,13 @@ public struct AgentConversationContinuation: Sendable {
                 if state.tasks[contact] != nil { state.pending.insert(contact); return }
                 state.tasks[contact] = Task {
                     let read: Bool
-                    do { read = try await readDueReplies(contact: contact, noticesOnly: dotAgents.contains(contact)) }
+                    do {
+                        read = try await readDueReplies(contact: contact, noticesOnly: dotAgents.contains(contact))
+                        // A read that went through settles any earlier read debt for this contact.
+                        _ = RepairOwed.settle(dataRoot, operation: "contact.reply.read:" + contact, evidence: .init(source: "contact-read", id: contact))
+                    }
                     catch is CancellationError { read = false }
+                    catch let failure as AgentConversationStore.Failure where failure.isMovedOn { read = false }
                     catch {
                         read = false
                         let who = (try? AgentContactIdentity(dataRoot: dataRoot)).flatMap { AgentScreen.peerName(identity: $0)(contact) } ?? contact
@@ -306,7 +310,7 @@ public struct AgentConversationContinuation: Sendable {
                 _ = try store.update(id: row.id, operationID: row.operationID, touch: settled) {
                     $0.receipt = cached
                     if !settled, $0.phase == "waiting", $0.nextReadAt == nil { $0.nextReadAt = next }
-                    if $0.conversationID == nil, let conversation = string(fields["conversation_id"]) {
+                    if $0.conversationID == nil, let conversation = fields["conversation_id"]?.nonblankString {
                         $0.conversationID = conversation
                     }
                     if fields["needs_input"] == .bool(true), let task = fields["task_id"] {
@@ -543,10 +547,10 @@ public struct AgentConversationContinuation: Sendable {
     /// Only explicitly requested runs have bookmarks; scheduled history must not create unsolicited turns.
     private func handleBotRun(_ row: AgentConversationRecord) async throws -> Bool {
         guard NativeAgentChatSessionID.normalizedPathComponent(row.scopeSessionID) != nil,
-              let input = row.readInput, let agent = string(input["agent"]), agent.hasPrefix("bot:"),
+              let input = row.readInput, let agent = input["agent"]?.nonblankString, agent.hasPrefix("bot:"),
               let botID = UUID(uuidString: String(agent.dropFirst(4))),
               row.agent == "bot-run:" + botID.uuidString,
-              let request = string(input["message_id"]), let requestID = UUID(uuidString: request) else {
+              let request = input["message_id"]?.nonblankString, let requestID = UUID(uuidString: request) else {
             try attention(row, "This requested check has lost its exact return reference. No run was repeated.")
             return false
         }
@@ -613,7 +617,7 @@ public struct AgentConversationContinuation: Sendable {
         if artifacts.count > shown.count { fields["artifacts_truncated"] = .int(Int64(artifacts.count - shown.count)) }
         // Preserve useful exact references even for unusually large Unicode replies; the complete answer remains with the shelf owner.
         if (try? JSONEncoder().encode(JSONValue.object(fields)).count) ?? Int.max > 90 * 1024 {
-            if let reply = string(fields["reply"]) { fields["reply"] = .string(String(reply.prefix(4000))) }
+            if let reply = fields["reply"]?.nonblankString { fields["reply"] = .string(String(reply.prefix(4000))) }
             fields["reply_truncated"] = .bool(true)
         }
         let receipt = AgentConversationStore.cacheReceipt(.object(fields))
@@ -644,7 +648,7 @@ public struct AgentConversationContinuation: Sendable {
     private func deliverBotResult(_ row: AgentConversationRecord, receipt: JSONValue,
                                   bot: (id: UUID, name: String)) async throws {
         guard case .object(let fields) = receipt,
-              let request = string(fields["message_id"]), let requestID = UUID(uuidString: request) else {
+              let request = fields["message_id"]?.nonblankString, let requestID = UUID(uuidString: request) else {
             throw StandingBotsError.invalidValue("The requested result has no exact shelf entry.")
         }
         let status: String
@@ -759,7 +763,7 @@ public struct AgentConversationContinuation: Sendable {
         let first = try await tools.dispatch(tool: "agent_read", input: input, surface: "chat", turn: turn, invocation: invocation)
         guard peer.transport == .nativeAgent, case .object(var fields) = first,
               case .object(var evidence)? = fields["remote_evidence"],
-              var body = string(fields["reply"]) else { return first }
+              var body = fields["reply"]?.nonblankString else { return first }
         // Keep wire pagination below conversation presentation so the agent receives a complete reply.
         for _ in 0..<3 where evidence["has_more"] == .bool(true) {
             try Task.checkCancellation()
@@ -768,7 +772,7 @@ public struct AgentConversationContinuation: Sendable {
             let next = try await tools.dispatch(tool: "agent_read", input: page, surface: "chat", turn: turn, invocation: invocation)
             guard case .object(let nextFields) = next,
                   nextFields["status"] == fields["status"],
-                  let addition = string(nextFields["reply"]),
+                  let addition = nextFields["reply"]?.nonblankString,
                   case .object(let nextEvidence)? = nextFields["remote_evidence"],
                   nextEvidence["next_offset"] != offset else { break }
             body += addition; evidence = nextEvidence
@@ -780,10 +784,10 @@ public struct AgentConversationContinuation: Sendable {
 
     private func incomingText(_ receipt: JSONValue, peer: AgentPeerContact, label: String, retainedText: String? = nil) -> String {
         guard case .object(let fields) = receipt else { return "The contact's reply is unreadable." }
-        let body = (retainedText ?? string(fields["reply"]) ?? (fields["status"] == .string("failed") ? string(fields["detail"]) : nil))
+        let body = (retainedText ?? fields["reply"]?.nonblankString ?? (fields["status"] == .string("failed") ? fields["detail"]?.nonblankString : nil))
             .map(AgentBridgeSurface.quotingImpersonation)
         var message = AgentBridgeSurface.contactLines(name: peer.name, id: peer.id, conversation: label, answering: true)
-        message += body ?? "The contact reported \(string(fields["status"]) ?? "an unknown outcome") without reply text."
+        message += body ?? "The contact reported \(fields["status"]?.nonblankString ?? "an unknown outcome") without reply text."
         let remoteHasMore: Bool = if case .object(let evidence)? = fields["remote_evidence"] {
             evidence["has_more"] == .bool(true)
         } else { false }
@@ -793,10 +797,6 @@ public struct AgentConversationContinuation: Sendable {
         return message
     }
 
-    private func string(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return text
-    }
 }
 
 private extension AgentConversationRecord {

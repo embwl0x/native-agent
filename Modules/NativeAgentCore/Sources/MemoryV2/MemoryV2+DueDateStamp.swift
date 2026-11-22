@@ -15,12 +15,6 @@ public enum MemoryDueDateStamp {
         OrganismHorizonRegister.statedPlanLabel(for: dueAt, at: now, timeZone: timeZone)
     }
 
-    static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.string(from: date)
-    }
-
     /// Only writer-supplied instants establish a plan; unsupported stamps leave stored rows intact.
     public static func dueAt(in metadata: JSONValue?) -> Date? {
         guard case .object(let object)? = metadata,

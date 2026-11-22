@@ -407,9 +407,9 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             if let held { process = held.process }
             else if resident { process = try Self.residents.take(store, program: program, create: spawn) }
             else { process = try spawn() }
-            if host is OwnedProgramFixtures {
-                // Reset the notebook on each pass to preserve isolation while retaining transport.
-                journal.notebookRoot = process.scratch.appendingPathComponent(UUID().uuidString)
+            if let fixture = host as? OwnedProgramFixtures {
+                // All passes of one fixture share its notebook; other fixtures on this helper have their own.
+                journal.notebookRoot = process.scratch.appendingPathComponent(fixture.notebookID)
             } else if preview { journal.notebookRoot = process.scratch }
             var keep = false
             defer {
@@ -610,9 +610,9 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         for (depth, at) in resultChain(fields).enumerated() {
             let evidence = depth == 0 ? outer : host.evidence(.object(at))
             let outcome = evidence.resultClass
-            let status = text(at["status"]).lowercased()
-            let reason = text(at["reason"])
-            let effects = text(at["effects"])
+            let status = JSONValue.trimmedScalarTextOrEmpty(at["status"]).lowercased()
+            let reason = JSONValue.trimmedScalarTextOrEmpty(at["reason"])
+            let effects = JSONValue.trimmedScalarTextOrEmpty(at["effects"])
             if ["failed", "refused", "timeout", "cancelled"].contains(outcome) {
                 return reason.isEmpty || reason.contains(" ") ? "failed" : reason
             }
@@ -634,7 +634,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     }
     /// Aggregate nested effects with unknown over partial over occurred, regardless of the outer receipt.
     package static func effects(_ fields: [String: JSONValue]) -> JSONValue? {
-        let said = resultChain(fields).map { text($0["effects"]) }.filter { !$0.isEmpty }
+        let said = resultChain(fields).map { JSONValue.trimmedScalarTextOrEmpty($0["effects"]) }.filter { !$0.isEmpty }
         return (["unknown", "partial", "occurred"].first(where: said.contains) ?? said.first).map(JSONValue.string)
     }
     /// Retain real ids through nested objects regardless of result size; lists and input echoes do not supply them.

@@ -7,7 +7,7 @@ import os
 /// What takes a written happening into the agent's attention: the cognition runtime, installed at launch. A happening written before it is installed
 /// waits in the record and is taken when it opens.
 public protocol AttentionIntake: Sendable {
-    /// A happening was written for the first time.
+    /// A committed happening is offered to attention, including a checked return that is still owed.
     func took(_ experience: Experience) async
     /// A message or a return was admitted to one of the agent's conversations.
     func arrived() async
@@ -52,19 +52,49 @@ public enum Attention {
     @discardableResult
     public static func post(_ happening: Happening, dataRoot: URL) -> Task<Void, Never> {
         Task.detached {
-            let store = ExperienceStore.at(dataRoot)
-            let born = Experience(id: happening.id, kind: .happening, cause: [happening.door], addressedTo: [happening.destination],
-                owes: happening.owed ? [happening.destination: .init(to: happening.destination)] : [:], happening: happening, steeredBy: Array(Set((happening.peers ?? []) + (happening.elevated ?? []))).sorted())
-            do {
-                guard try await store.begin(born) else { return }
-                guard let taken = try await store.experience(happening.id) else { throw RecordError.missingHappening(happening.id) }
-                await installed?.took(taken)
-            } catch {
-                log("happening %@ handoff did not complete: %@", happening.id, error.localizedDescription)
-                await RepairOwed.owe(dataRoot, id: happening.id, kind: .act, operation: "attention.post:" + happening.id,
-                    owner: happening.id, words: "The happening was not handed to attention: " + error.localizedDescription,
-                    lever: "Repair the experience record, then have this happening's source publish its unresolved input.").value
+            _ = try? await commit(happening, dataRoot: dataRoot, checked: false)
+        }
+    }
+
+    /// Confirm the committed return and reoffer it while it is owed, including after a failed readback.
+    public static func postChecked(_ happening: Happening, dataRoot: URL) async throws {
+        try await commit(happening, dataRoot: dataRoot, checked: true)
+    }
+
+    private static func commit(_ happening: Happening, dataRoot: URL, checked: Bool) async throws {
+        let store = ExperienceStore.at(dataRoot)
+        let operation = "attention.post:" + happening.id
+        let born = Experience(id: happening.id, kind: .happening, cause: [happening.door], addressedTo: [happening.destination],
+            owes: happening.owed ? [happening.destination: .init(to: happening.destination)] : [:], happening: happening,
+            steeredBy: Array(Set((happening.peers ?? []) + (happening.elevated ?? []))).sorted())
+        do {
+            let inserted = try await store.begin(born, durable: checked)
+            guard inserted || checked else { return }
+            guard let saved = try await store.experience(happening.id), let committed = saved.happening else {
+                throw RecordError.missingHappening(happening.id)
             }
+            // The store checks the once key, destination and authority. A checked return also proves what it carried.
+            if checked {
+                guard committed.shows?.count != Happening.showsLimit || committed.showsDigest != nil else {
+                    throw RecordError.missingReturnDigest(happening.id)
+                }
+                guard committed.shows == happening.shows, committed.showsDigest == happening.showsDigest else {
+                    throw ExperienceStore.LawError.reused(happening.id)
+                }
+            }
+            if inserted || saved.owes[committed.destination]?.phase.isSettled == false {
+                await installed?.took(saved)
+            }
+        } catch {
+            log("happening %@ handoff did not complete: %@", happening.id, error.localizedDescription)
+            await RepairOwed.owe(dataRoot, id: happening.id, kind: .act, operation: operation,
+                owner: happening.id, words: "The happening was not handed to attention: " + error.localizedDescription,
+                lever: "Repair the experience record, then have this happening's source publish its unresolved input.").value
+            throw error
+        }
+        if checked {
+            try await RepairOwed.settleChecked(dataRoot, operation: operation, owner: happening.id,
+                evidence: .init(source: "experiences/experiences.sqlite", id: happening.id))
         }
     }
 
@@ -78,7 +108,7 @@ public enum Attention {
 
     /// Happenings still owed: to the agent (its stream) and to conversations (returns not yet delivered).
     public static func owed(dataRoot: URL) async throws -> [Experience] {
-        try await ExperienceStore.at(dataRoot).open().filter { $0.kind == .happening && $0.happening?.owed == true }
+        try await ExperienceStore.at(dataRoot).open(kind: .happening).filter { $0.happening?.owed == true }
     }
 
     /// A happening attended: its obligation is accepted, with the thought (or the conversation turn) that took it as evidence.
@@ -195,6 +225,7 @@ public enum Attention {
         case malformedNodeDetail(Int64, String, String)
         case missingNode(String)
         case missingHappening(String)
+        case missingReturnDigest(String)
         case missingMembership(String)
 
         public var errorDescription: String? {
@@ -204,6 +235,7 @@ public enum Attention {
                 "Attention detail \(seq) for \(node) is unreadable: \(cause). This node's drive remains unclaimed."
             case .missingNode(let node): "Attention node \(node) disappeared before its recorded crossing could be claimed."
             case .missingHappening(let id): "Attention's happening \(id) has no committed body; repair its experience record before attending it."
+            case .missingReturnDigest(let id): "Attention's return \(id) reached the display limit with no digest of its full material; its receipt cannot be verified."
             case .missingMembership(let node):
                 "Attention node \(node) has incomplete drive provenance; restore its named happenings before claiming its drive."
             }

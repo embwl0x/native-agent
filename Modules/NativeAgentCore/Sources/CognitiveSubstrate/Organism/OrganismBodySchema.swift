@@ -72,18 +72,13 @@ public struct ProviderPathEvidence: Codable, Sendable, Equatable {
         self.evidenceID = canonicalEvidenceID
         self.observedAt = observedAt
         self.outcome = outcome
-        self.sourceReliability = Self.clampFinite(sourceReliability)
+        self.sourceReliability = sourceReliability.finiteClamped01()
     }
 
     static func isCanonicalDigest(_ value: String) -> Bool {
         value.count == 64 && value.unicodeScalars.allSatisfy {
             (48...57).contains($0.value) || (97...102).contains($0.value)
         }
-    }
-
-    private static func clampFinite(_ value: Double) -> Double {
-        guard value.isFinite else { return 0 }
-        return (value).clamped01()
     }
 }
 
@@ -115,9 +110,9 @@ public struct ProviderPathEstimate: Codable, Sendable, Equatable {
         newestEvidenceAt: Date?
     ) {
         self.generatedAt = generatedAt
-        self.estimate = Self.clampFinite(estimate, fallback: 0.5)
-        self.freshness = Self.clampFinite(freshness, fallback: 0)
-        self.uncertainty = Self.clampFinite(uncertainty, fallback: 1)
+        self.estimate = estimate.finiteClamped01(fallback: 0.5)
+        self.freshness = freshness.finiteClamped01(fallback: 0)
+        self.uncertainty = uncertainty.finiteClamped01(fallback: 1)
         self.evidenceCount = min(10_000, max(0, evidenceCount))
         self.newestEvidenceAt = newestEvidenceAt
         let derived = Self.categorize(
@@ -147,11 +142,6 @@ public struct ProviderPathEstimate: Codable, Sendable, Equatable {
             newestEvidenceAt: try container.decodeIfPresent(Date.self, forKey: .newestEvidenceAt)
         )
         _ = try container.decode(ProviderPathBeliefState.self, forKey: .state)
-    }
-
-    private static func clampFinite(_ value: Double, fallback: Double) -> Double {
-        guard value.isFinite else { return fallback }
-        return (value).clamped01()
     }
 
     private static func categorize(

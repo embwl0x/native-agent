@@ -316,7 +316,7 @@ public let MODEL_SURFACES: [String] = ProviderSurfaceGroups.all.flatMap(\.surfac
 
 /// Normalize current surface spelling consistently; unsupported names fail admission.
 public func canonicalRoutingSurface(_ surface: String) -> String {
-    surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    TextNormalization.trimmedLowercased(surface)
 }
 
 public let REASONING_EFFORT_OPTIONS: [String] = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]

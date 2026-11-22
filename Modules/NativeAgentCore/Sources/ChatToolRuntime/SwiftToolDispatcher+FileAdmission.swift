@@ -22,14 +22,6 @@ import NativeAgentShared
 // Blueprint: | `SwiftToolDispatcher+FileAdmission.swift` | `SwiftToolDispatcher`; file admission; call-scoped connectors |
 
 extension SwiftToolDispatcher {
-    static func stringArray(_ value: JSONValue?) -> [String] {
-        guard case .array(let values)? = value else { return [] }
-        return values.compactMap { value in
-            guard case .string(let s) = value else { return nil }
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
-    }
     func trustedWorkspaceRoots() async throws -> [URL] {
         let policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked()
         return SwiftNativeSecurityCenter.trustedWorkspaceRoots(
@@ -113,11 +105,6 @@ extension SwiftToolDispatcher {
         throw AutonomyGateError.toolDenied(
             reason: "SwiftToolDispatcher: missing or non-string '\(key)'"
         )
-    }
-    func optionalString(_ input: [String: JSONValue], _ key: String) -> String? {
-        guard case .string(let s)? = input[key] else { return nil }
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : s
     }
     func canonicalPersonaKind(_ kind: String) -> String {
         SwiftNativePersonaEngine.canonicalizeKind(kind)

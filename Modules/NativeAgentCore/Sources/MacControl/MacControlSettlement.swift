@@ -4,9 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import Experiences
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
 // Blueprint: | `MacControlSettlement.swift` | Settlement retains output and unknown effects; refusal audit failures never invent acknowledgement |
 
 extension SwiftNativeMacControl {

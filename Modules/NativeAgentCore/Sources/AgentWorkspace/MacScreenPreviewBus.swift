@@ -55,34 +55,42 @@ public enum MacScreenPreviewCaption {
         case "screen":
             return nil
         case "act":
-            let verb = text(input["verb"])?.lowercased() ?? ""
-            let target = safeTarget(text(input["target"]))
+            let verb = input["verb"]?.stringValue?.lowercased() ?? ""
+            let target = safeTarget(input["target"]?.stringValue)
             return act(verb: verb, target: target)
         case "go":
-            let name = safeTarget(text(input["name"]) ?? text(input["target"]))
+            let name = safeTarget(input["name"]?.stringValue ?? input["target"]?.stringValue)
             return name.isEmpty ? "About to open something" : "About to open \(name)"
         case "wait":
             // `wait` only looks, so its caption has no settled form.
-            let until = safeTarget(text(input["until"]))
+            let until = safeTarget(input["until"]?.stringValue)
             return until.isEmpty ? "Waiting" : "Waiting for \(until)"
         default:
             return nil
         }
     }
 
-    /// Past-tense captions require the post-action frame and verified result; screen and wait do not act.
-    public static func settled(tool: String, input: [String: JSONValue], ok: Bool) -> String? {
+    /// Settled captions describe the action's returned outcome; screen and wait do not act.
+    public static func settled(tool: String, input: [String: JSONValue], reply: MacFourVerbsReply) -> String? {
         switch tool {
         case "act":
-            let verb = text(input["verb"])?.lowercased() ?? ""
-            let target = safeTarget(text(input["target"]))
+            let verb = input["verb"]?.stringValue?.lowercased() ?? ""
+            let target = safeTarget(input["target"]?.stringValue)
             let what = target.isEmpty ? "the screen" : target
             let forms = wordForms(verb)
-            return ok ? "\(forms.past) \(what)" : "Could not \(forms.plain) \(what)"
+            return reply.ok ? "\(forms.past) \(what)" : "Could not \(forms.plain) \(what)"
         case "go":
-            let name = safeTarget(text(input["name"]) ?? text(input["target"]))
+            let name = safeTarget(input["name"]?.stringValue ?? input["target"]?.stringValue)
             guard !name.isEmpty else { return nil }
-            return ok ? "Opened \(name)" : "Could not open \(name)"
+            switch reply.detail["status"]?.stringValue {
+            case "running": return "\(name) is already running"
+            case "launched": return "Launched \(name)"
+            case "focused": return "Focused \(name)"
+            case "opened": return "Open request accepted for \(name)"
+            default:
+                if reply.detail["observed_destination"] == .bool(true) { return "\(name) is in view" }
+                return reply.ok ? nil : "Could not confirm arrival at \(name)"
+            }
         default:
             return nil
         }
@@ -142,11 +150,6 @@ public enum MacScreenPreviewCaption {
         }
         guard collapsed.count > maxTargetChars else { return collapsed }
         return String(collapsed.prefix(maxTargetChars - 1)) + "\u{2026}"
-    }
-
-    private static func text(_ value: JSONValue?) -> String? {
-        guard case .string(let value)? = value else { return nil }
-        return value
     }
 }
 

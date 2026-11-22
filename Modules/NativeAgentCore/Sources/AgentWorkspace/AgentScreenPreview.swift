@@ -71,7 +71,7 @@ package enum AgentWorkspaceScreenPreview {
         if let text = await AgentScreen.room(workspace: workspace, location, dataRoot: dataRoot, scope: scope) { return text }
         var projection: WorkspacePage
         switch location {
-        case .arrivals: projection = await navigation.arrivalProjection(workspace: workspace, key: key)
+        case .arrivals: projection = await navigation.arrivalProjection(workspace: workspace, dataRoot: dataRoot, key: key)
         case .area(let id):
             guard let place = AgentWorkspaceEnvironment.destinations.first(where: { $0.id == id }) else { return room.uppercased() + " · no such place." }
             let reads = id == "today" || place.tool.map { tool in

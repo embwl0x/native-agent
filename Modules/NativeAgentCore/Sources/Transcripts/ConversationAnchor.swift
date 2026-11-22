@@ -78,7 +78,7 @@ public enum ConversationAnchor {
             // Preserve activity order even if an older publication was delayed. The numeric stamp retains precision lost by ISO display formatting.
             let committedStamp = NativeTimestampFormat.fractionalZulu(now)
             if let existing,
-               let existingAt = existing.activityAt ?? parseISO8601(existing.pin.updatedAt),
+               let existingAt = existing.activityAt ?? NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(existing.pin.updatedAt),
                existingAt > now {
                 return .refused(.supersededByNewerAnchor)
             }
@@ -196,12 +196,5 @@ public enum ConversationAnchor {
             The conversation anchor at \(path.path) is unavailable: \(reason) Conversations have been left in place; repair or restore access to the saved \
             anchor, preserving its bytes.
             """)
-    }
-
-    /// Current surfaces write valid ISO8601 timestamps; precision does not change ordering. Anything unparseable makes no recency claim.
-    private static func parseISO8601(_ raw: String) -> Date? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
     }
 }

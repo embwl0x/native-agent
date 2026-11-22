@@ -4,6 +4,7 @@ import Foundation
 import ChatTurnRuntime
 import ChatTurnContracts
 import AgentConversations
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
@@ -111,46 +112,107 @@ public struct GrokInboundReply: Sendable {
         }
     }
 
-    func resumeHandOvers(dataRoot: URL, continuation: AgentConversationContinuation) throws {
-        running.open()
+    func resumeHandOvers(dataRoot: URL, continuation: AgentConversationContinuation) async throws {
+        let previousFailures = try running.open()
         let store = GrokRequestStore(dataRoot: dataRoot)
-        try store.pruneSettled()
         let files: [URL]
-        do { files = try FileManager.default.contentsOfDirectory(at: store.root, includingPropertiesForKeys: nil) }
-        catch CocoaError.fileReadNoSuchFile { return }
+        if let previousFailures {
+            files = Array(previousFailures.keys)
+        } else {
+            do { files = try FileManager.default.contentsOfDirectory(at: store.root, includingPropertiesForKeys: nil) }
+            catch CocoaError.fileReadNoSuchFile { files = [] }
+        }
+        if files.isEmpty {
+            running.retainRestorationFailures([:])
+            return
+        }
         let contacts = try AgentPeerStore(dataRoot: dataRoot).list()
+        var failed: [URL: String] = [:]
+        var restored: [String: String] = [:]
+        var debtWrites: [Task<Void, Never>] = []
         for file in files where file.pathExtension == "json" {
-            let data = try Data(contentsOf: file)
-            guard data.count <= 96 * 1024 else { throw GrokLinkCredential.Failure.invalid }
-            let identity = try JSONDecoder().decode(GrokPendingRequest.self, from: data)
-            let saved = try store.read(identity.messageID, peer: identity.peerID)
-            guard let text = saved.reply else { continue }
-            try reconcile(saved, dataRoot: dataRoot)
-            guard ["pending", "running", "handing over"].contains(saved.handOver ?? "") else { continue }
-            if ["running", "handing over"].contains(saved.handOver ?? "") {
-                _ = try store.update(saved.messageID, peer: saved.peerID) {
+            try Task.checkCancellation()
+            let id = file.deletingPathExtension().lastPathComponent
+            let operation = GrokRequestStore.restorationOperation(for: id)
+            do {
+                try restoreHandOver(store.readReceipt(id), store: store, contacts: contacts, dataRoot: dataRoot, continuation: continuation)
+                restored[operation] = file.path
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                let reason = error.localizedDescription
+                failed[file] = reason
+                if reason != previousFailures?[file] {
+                    debtWrites.append(RepairOwed.owe(dataRoot, id: id, kind: .message, operation: operation, owner: file.path,
+                        words: "Grok receipt \(file.lastPathComponent) could not be restored: \(reason)",
+                        lever: "Repair the named receipt or conversation evidence so the next contact reconciliation can restore the saved answer."))
+                }
+            }
+        }
+        running.retainRestorationFailures(failed)
+        await settle { [debtWrites, restored] in
+            for write in debtWrites { await write.value }
+            if !restored.isEmpty {
+                await ExperienceStore.record(dataRoot, "grok.receipt.restore") { experiences in
+                    for debt in try await experiences.open() where RepairOwed.isOwed(debt) {
+                        let repair = RepairDebt(debt)
+                        guard let operation = repair.operation, let path = restored[operation], repair.owner == path else { continue }
+                        try await RepairOwed.settle(experiences, operation: operation, evidence: .init(source: path, id: "restored"))
+                    }
+                }.value
+            }
+        }
+        if previousFailures == nil || !restored.isEmpty {
+            do { try await store.pruneSettled(keeping: Set(failed.keys)) }
+            catch { nativeLog("Grok receipt retention failed: %@", error.localizedDescription) }
+        }
+    }
+
+    private func restoreHandOver(_ saved: GrokPendingRequest, store: GrokRequestStore, contacts: [AgentPeerContact],
+                                 dataRoot: URL, continuation: AgentConversationContinuation) throws {
+        guard let text = saved.reply else { return }
+        try reconcile(saved, dataRoot: dataRoot)
+        guard ["pending", "running", "handing over"].contains(saved.handOver ?? "") else { return }
+        if ["running", "handing over"].contains(saved.handOver ?? "") {
+            _ = try store.update(saved.messageID, peer: saved.peerID) {
+                if $0.handOver == saved.handOver, $0.runID == saved.runID, !running.contains(saved.messageID) {
                     $0.handOver = "interrupted: the answer is saved; the app stopped while handing it over, so it may not have reached the agent as a turn"
                 }
-                continue
             }
-            if saved.seen == true {
-                // A seen answer can remain pending if consumption was interrupted before its door was recorded.
-                _ = try store.update(saved.messageID, peer: saved.peerID) {
-                    if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait, read or room" }
-                }
-                continue
-            }
-            guard let contact = contacts.first(where: { $0.id == saved.peerID && $0.transport == .grokBot }) else { continue }
-            handOver(saved, text: text, peer: AgentBridgePrincipal(id: contact.id, peerID: contact.id, elevated: contact.elevationAllowed,
-                displayName: contact.name), dataRoot: dataRoot, continuation: continuation)
+            return
         }
+        if saved.seen == true {
+            // A seen answer can remain pending if consumption was interrupted before its door was recorded.
+            _ = try store.update(saved.messageID, peer: saved.peerID) {
+                if $0.seen == true, $0.handOver == "pending" { $0.handOver = "taken by wait, read or room" }
+            }
+            return
+        }
+        guard let contact = contacts.first(where: { $0.id == saved.peerID && $0.transport == .grokBot }) else { return }
+        handOver(saved, text: text, peer: AgentBridgePrincipal(id: contact.id, peerID: contact.id, elevated: contact.elevationAllowed,
+            displayName: contact.name), dataRoot: dataRoot, continuation: continuation)
     }
 
     private final class Running: @unchecked Sendable {
         private let lock = NSLock()
         private var tasks: [String: Task<Void, Never>] = [:]
+        // nil asks for the launch inventory. Subsequent ticks read only the receipts that still owe restoration.
+        private var restorationFailures: [URL: String]?
         private var closed = false
-        func open() { lock.withLock { closed = false } }
+        func open() throws -> [URL: String]? {
+            try lock.withLock {
+                try Task.checkCancellation()
+                closed = false
+                return restorationFailures
+            }
+        }
+
+        func retainRestorationFailures(_ failures: [URL: String]) {
+            lock.withLock {
+                if !closed { restorationFailures = failures }
+            }
+        }
+
+        func contains(_ id: String) -> Bool { lock.withLock { tasks[id] != nil } }
 
         func start(_ id: String, operation: @escaping @Sendable () async -> Void) {
             lock.withLock {
@@ -168,6 +230,7 @@ public struct GrokInboundReply: Sendable {
         func stop() async {
             let pending = lock.withLock {
                 closed = true
+                restorationFailures = nil
                 return Array(tasks.values)
             }
             pending.forEach { $0.cancel() }

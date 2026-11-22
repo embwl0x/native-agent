@@ -13,20 +13,6 @@ struct TelegramTurnProgressCardDriverSnapshot: Sendable, Equatable {
 
 /// One event-driven card writer; the ledger owns terminal delivery repair.
 actor TelegramTurnProgressCardDriver {
-    typealias SendCard = @Sendable (
-        _ token: String,
-        _ destination: TelegramDestination,
-        _ text: String,
-        _ replyMarkup: JSONValue
-    ) async throws -> Int
-    typealias EditCard = @Sendable (
-        _ token: String,
-        _ chatId: Int,
-        _ messageId: Int,
-        _ text: String,
-        _ replyMarkup: JSONValue
-    ) async throws -> Void
-    typealias DeleteCard = @Sendable (_ token: String, _ chatId: Int, _ messageId: Int) async throws -> Void
     typealias FailureRecorder = @Sendable (_ redactedError: String) async -> Void
     typealias PersistCard = @Sendable (_ record: TelegramPersistedTurnCard) async throws -> Void
     typealias RemovePersistedCard = @Sendable (_ turnId: UUID) async throws -> Void
@@ -35,9 +21,6 @@ actor TelegramTurnProgressCardDriver {
     private let destination: TelegramDestination
     private let turnId: UUID
     private let face: TelegramProgressFace
-    private let sendCard: SendCard
-    private let editCard: EditCard
-    private let deleteCard: DeleteCard
     private let recordFailure: FailureRecorder
     private let persistCard: PersistCard
     private let removePersistedCard: RemovePersistedCard
@@ -69,9 +52,6 @@ actor TelegramTurnProgressCardDriver {
         face: TelegramProgressFace,
         destination: TelegramDestination,
         turnId: UUID,
-        sendCard: @escaping SendCard,
-        editCard: @escaping EditCard,
-        deleteCard: @escaping DeleteCard,
         recordFailure: @escaping FailureRecorder = { _ in },
         persistCard: @escaping PersistCard = { _ in },
         removePersistedCard: @escaping RemovePersistedCard = { _ in }
@@ -80,9 +60,6 @@ actor TelegramTurnProgressCardDriver {
         self.face = face
         self.destination = destination
         self.turnId = turnId
-        self.sendCard = sendCard
-        self.editCard = editCard
-        self.deleteCard = deleteCard
         self.recordFailure = recordFailure
         self.persistCard = persistCard
         self.removePersistedCard = removePersistedCard
@@ -97,7 +74,7 @@ actor TelegramTurnProgressCardDriver {
         let rendered = await renderedText(at: now)
         do {
             try Task.checkCancellation()
-            let sentMessageId = try await sendCard(
+            let sentMessageId = try await TelegramPollLoop.defaultSendMessageWithReplyMarkupReturningId(
                 token,
                 destination,
                 rendered,
@@ -277,12 +254,9 @@ actor TelegramTurnProgressCardDriver {
         let deleting = renderedIsTerminal && renderedState.phase == .completed
         do {
             if deleting {
-                do {
-                    try await deleteCard(token, destination.chatId, messageId)
-                } catch let failure as TelegramAPIFailure
-                    where failure.telegramDescription?.localizedCaseInsensitiveContains("message to delete not found") == true {}
+                try await TelegramPollLoop.defaultDeleteMessage(token, destination.chatId, messageId)
             } else {
-                try await editCard(token, destination.chatId, messageId, rendered, markup)
+                try await TelegramPollLoop.defaultEditMessageTextWithReplyMarkup(token, destination.chatId, messageId, rendered, markup)
             }
             lastRenderedText = rendered
         } catch {
@@ -371,7 +345,7 @@ actor TelegramTurnProgressCardDriver {
         Reply work may continue, but this card can no longer report it durably.
         """
         do {
-            try await editCard(
+            try await TelegramPollLoop.defaultEditMessageTextWithReplyMarkup(
                 token,
                 destination.chatId,
                 messageId,

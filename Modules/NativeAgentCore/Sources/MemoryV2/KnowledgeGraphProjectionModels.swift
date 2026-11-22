@@ -1,18 +1,5 @@
 import Foundation
-// Blueprint: | `KnowledgeGraphProjectionModels.swift` | `AgentGraphNode` struct |
-
-public struct AgentGraphNode: Identifiable, Codable, Hashable, Sendable {
-    public var id: String
-    public var label: String?
-    public var kind: String?
-    public var status: String?
-    public init(id: String, label: String? = nil, kind: String? = nil, status: String? = nil) {
-        self.id = id
-        self.label = label
-        self.kind = kind
-        self.status = status
-    }
-}
+// Blueprint: | `KnowledgeGraphProjectionModels.swift` | `AgentGraphEdge`, `GraphEntity` structs |
 
 public struct AgentGraphEdge: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -34,50 +21,6 @@ public struct AgentGraphEdge: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-public struct GraphSearchResult: Identifiable, Codable, Hashable, Sendable {
-    public var id: String
-    public var node: AgentGraphNode
-    public var score: Double
-    public var matchedTerms: [String]?
-    public var matchedEntities: [String]?
-    public var relatedEdges: [AgentGraphEdge]?
-    public var explanation: String?
-    public init(id: String, node: AgentGraphNode, score: Double, matchedTerms: [String]? = nil, matchedEntities: [String]? = nil,
-        relatedEdges: [AgentGraphEdge]? = nil, explanation: String? = nil) {
-        self.id = id
-        self.node = node
-        self.score = score
-        self.matchedTerms = matchedTerms
-        self.matchedEntities = matchedEntities
-        self.relatedEdges = relatedEdges
-        self.explanation = explanation
-    }
-}
-
-public struct GraphSearchCounts: Codable, Hashable, Sendable {
-    public var resultCount: Int
-    public var nodeCount: Int?
-    public var edgeCount: Int?
-    public init(resultCount: Int, nodeCount: Int? = nil, edgeCount: Int? = nil) {
-        self.resultCount = resultCount
-        self.nodeCount = nodeCount
-        self.edgeCount = edgeCount
-    }
-}
-
-public struct GraphSearchResponse: Codable, Hashable, Sendable {
-    public var query: String
-    public var results: [GraphSearchResult]
-    public var summary: GraphSearchCounts?
-    public var createdAt: String?
-    public init(query: String, results: [GraphSearchResult], summary: GraphSearchCounts? = nil, createdAt: String? = nil) {
-        self.query = query
-        self.results = results
-        self.summary = summary
-        self.createdAt = createdAt
-    }
-}
-
 public struct GraphEntity: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var name: String
@@ -94,24 +37,6 @@ public struct GraphEntity: Identifiable, Codable, Hashable, Sendable {
         self.kind = kind
         self.confidence = confidence
         self.mentions = mentions
-        self.updatedAt = updatedAt
-    }
-}
-
-public struct GraphIndexStatus: Codable, Hashable, Sendable {
-    public var status: String
-    public var embeddingModel: String?
-    public var dimensions: Int?
-    public var nodeCount: Int?
-    public var entityCount: Int?
-    public var updatedAt: String?
-    public init(status: String, embeddingModel: String? = nil, dimensions: Int? = nil, nodeCount: Int? = nil, entityCount: Int? = nil,
-        updatedAt: String? = nil) {
-        self.status = status
-        self.embeddingModel = embeddingModel
-        self.dimensions = dimensions
-        self.nodeCount = nodeCount
-        self.entityCount = entityCount
         self.updatedAt = updatedAt
     }
 }

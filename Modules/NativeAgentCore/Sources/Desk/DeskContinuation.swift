@@ -8,6 +8,7 @@ private let nestedOpenLog = ModuleLog(category: "Receipts")
 
 public struct DeskContinuation: Codable, Sendable, Equatable {
     public enum State: String, Codable, Sendable { case running, ready, blocked, complete, canceled, stopped }
+    package static let parkedReason = "task_parked"
     /// Retain only bounded, redacted summaries and verifier references because raw calls can carry secrets.
     public struct Step: Codable, Sendable, Equatable {
         public var id: String
@@ -175,6 +176,7 @@ public actor DeskContinuationTurn {
     private var writing = false
     private var writers: [ScopedWaiter] = []
     private var fenced = false
+    private var parked = false
     /// A pending step not begun by this process has lost its receipt.
     private var begun: Set<String> = []
 
@@ -216,6 +218,7 @@ public actor DeskContinuationTurn {
         record.state = .running
         record.processID = DeskContinuationScope.processID
         try await save()
+        parked = false
     }
 
     /// Re-admit a receipt-less call as the same step so settlement resolves its original obligation.
@@ -235,16 +238,18 @@ public actor DeskContinuationTurn {
             throw DeskContinuationError.full
         }
         var inFlight = step
+        var admitted = record
         if let effect = step.effect,
-           let earlier = record.pending.first(where: { !begun.contains($0.id) && $0.tool == step.tool && $0.effect == effect }) {
+           let earlier = admitted.pending.first(where: { !begun.contains($0.id) && $0.tool == step.tool && $0.effect == effect }) {
             inFlight.id = earlier.id
-            record.pending.removeAll { $0.id == earlier.id }
+            admitted.pending.removeAll { $0.id == earlier.id }
         }
-        begun.insert(inFlight.id)
         inFlight.owner = "turn"
         inFlight.runID = record.runID
-        record.pending.append(inFlight)
-        try await save(requiresActive: true)
+        admitted.pending.append(inFlight)
+        try await save(admitting: admitted)
+        parked = false
+        begun.insert(inFlight.id)
         return inFlight
     }
 
@@ -282,8 +287,9 @@ public actor DeskContinuationTurn {
                 record.state = .blocked
                 record.reason = "effect_outcome_unknown"
             } else {
-                record.state = state == .complete && (!record.pending.isEmpty || record.resumeCount > 0) ? .ready : state
-                record.reason = reason
+                record.state = state == .complete && (parked || !record.pending.isEmpty || record.resumeCount > 0) ? .ready : state
+                // Only a turn that finished parks; an interrupted one keeps its reason, so recovery still checks its checkpoint.
+                record.reason = parked && state == .complete && record.state == .ready ? DeskContinuation.parkedReason : reason
             }
         }
         record.nextRunAt = Date().addingTimeInterval(30)
@@ -295,12 +301,12 @@ public actor DeskContinuationTurn {
         defer { releaseWriter() }
         guard !fenced, handle != nil, record.resumeCount > 0, record.state == .running,
               record.pending.isEmpty else { return }
-        record.response = response
+        record.response = parked ? nil : response
         record.lastReply = reply
         retainPeerSources(peerSources)
         record.state = .ready
-        record.reason = "reply_ready"
-        record.nextRunAt = Date()
+        record.reason = parked ? DeskContinuation.parkedReason : "reply_ready"
+        record.nextRunAt = Date().addingTimeInterval(parked ? 30 : 0)
         try await save()
     }
 
@@ -314,6 +320,7 @@ public actor DeskContinuationTurn {
         await acquireWriter()
         defer { releaseWriter() }
         guard record.pending.isEmpty else { throw DeskContinuationError.unsafe }
+        if parked { return }
         record.state = .complete
         record.reason = "reply_delivered"
         try await save()
@@ -348,17 +355,25 @@ public actor DeskContinuationTurn {
         else { writers.removeFirst().resume() }
     }
 
-    private func save(requiresActive: Bool = false) async throws {
+    private func save(admitting proposed: DeskContinuation? = nil) async throws {
         guard let handle else { return }
         let expected = record.revision
-        record.revision = UUID().uuidString
+        var next = proposed ?? record
+        next.revision = UUID().uuidString
         do {
-            try await store.setContinuation(handle, expectedRevision: expected, record: record, requiresActive: requiresActive)
+            try await store.setContinuation(handle, expectedRevision: expected, record: next, requiresActive: proposed != nil)
+            record = next
+        } catch DeskContinuationError.parked {
+            parked = true
+            throw DeskContinuationError.parked
         } catch {
             fenced = true
-            if let actual = try? await store.continuation(handle), actual.revision == record.revision {
-                record = actual
-            } else { record.revision = expected }
+            if let actual = try? await store.continuation(handle), actual.revision == next.revision {
+                // A committed append can precede a compaction failure. Settle against that revision, keeping the
+                // old pending list when dispatch refused the proposal.
+                if proposed == nil { record = actual }
+                else { record.revision = actual.revision }
+            }
             record.state = .blocked
             record.reason = "checkpoint_persistence_failed"
             throw error

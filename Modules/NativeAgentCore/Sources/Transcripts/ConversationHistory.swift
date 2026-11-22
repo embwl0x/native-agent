@@ -226,17 +226,9 @@ public enum ConversationHistory {
         do { parsed = try JSONValue.parse(data) }
         catch { throw PersistenceCoreError.ioFailure("dreamConsolidationMark could not decode \(path.path): \(error)") }
         guard case .object(let obj) = parsed,
-              let mark = parseTimestamp(obj["lastDreamedAt"]) else {
+              let mark = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(obj["lastDreamedAt"]?.stringValue) else {
             throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: path.path])
         }
         return mark
-    }
-
-    /// Read current ISO8601 timestamps without changing the saved observation time.
-    public static func parseTimestamp(_ value: JSONValue?) -> Date? {
-        guard case .string(let raw)? = value else { return nil }
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(text)
     }
 }

@@ -2,7 +2,6 @@ import Foundation
 import ChatToolParsing
 import PersistenceCore
 import ChatSessionWork
-import Transcripts
 // Blueprint: | `AgentScreenRooms+Life.swift` | `workspace-readout.js`, `lifeRoom`, `opening`, `AgentItemPages`: named owner actions and readback |
 
 enum AgentWorkspaceLife {
@@ -38,7 +37,7 @@ enum AgentWorkspaceLife {
         if ["music.now_playing", "music.control"].contains(tool), problem(native) == nil, native["error"] == nil {
             let playback = tool == "music.control" ? row["now_playing"]?.objectValue : result.objectValue
             let track = playback?["track"]
-            let explicitTrack = track == .null || text(track?.objectValue?["name"]) != nil
+            let explicitTrack = track == .null || track?.objectValue?["name"]?.trimmedString != nil
             if let failure = playback.flatMap(problem) {
                 native["status"] = .string("failed")
                 native["message"] = .string("Couldn't read what's playing: " + failure)
@@ -53,7 +52,7 @@ enum AgentWorkspaceLife {
         let tracks = array(row["results"]) + array(row["tracks"])
         for (index,value) in tracks.enumerated() {
             let track = object(value), key = "track:" + String(index)
-            if let name = text(track["name"]) {
+            if let name = track["name"]?.trimmedString {
                 items[key] = .init(title:name,content:.object(["who":track["artist"] ?? .null,"summary":track["album"] ?? .null]),actions:[])
                 actions[key+":play"] = effect("play",tool:"music.control",input:["action":.string("play"),"track":.string(name),"artist":track["artist"]
                     ?? .string("")])
@@ -61,7 +60,7 @@ enum AgentWorkspaceLife {
         }
         for (index,value) in array(row["playlists"]).enumerated() {
             let list = object(value), key = "playlist:" + String(index)
-            if let name = text(list["name"]) {
+            if let name = list["name"]?.trimmedString {
                 items[key] = .init(title:name,content:value,actions:[])
                 actions[key+":play"] = effect("play",tool:"music.control",input:["action":.string("play"),"playlist":.string(name)])
             }
@@ -97,11 +96,6 @@ enum AgentWorkspaceLife {
 
     static func object(_ value: JSONValue) -> [String: JSONValue] { value.objectValue ?? [:] }
     private static func array(_ value: JSONValue?) -> [JSONValue] { value?.arrayValue ?? [] }
-    private static func text(_ value: JSONValue?) -> String? {
-        guard let text = value?.stringValue else { return nil }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }
 
 extension AgentScreen {
@@ -184,22 +178,14 @@ extension AgentScreen {
 
 final class AgentItemPages: @unchecked Sendable {
     static let shared = AgentItemPages()
-    struct Page: Sendable { let text: String; let speech: [ContactThread.Line] }
-    private let cache = AgentRoomCache<Page>(lasting: true)
+    private let cache = AgentRoomCache<String>(lasting: true)
 
-    func keep(_ root: URL, _ pages: [String: String], room: String? = nil, scope: String? = nil,
-              speech: [String: [ContactThread.Line]] = [:]) {
-        cache.keep(root, Dictionary(uniqueKeysWithValues: pages.map {
-            ($0.key, Page(text: $0.value, speech: speech[$0.key] ?? []))
-        }), room: room, scope: scope)
+    func keep(_ root: URL, _ pages: [String: String], room: String? = nil, scope: String? = nil) {
+        cache.keep(root, pages, room: room, scope: scope)
     }
 
-    func page(workspace: WorkspaceOperation, _ root: URL, _ name: String) -> String? {
-        guard let page = cache.value(root, name) else { return nil }
-        if !workspace.previewing {
-            for row in page.speech { ContactThread.consume(row, mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) }) }
-        }
-        return page.text
+    func page(_ root: URL, _ name: String) -> String? {
+        cache.value(root, name)
     }
 
     func removeSession(_ key: String) { cache.removeSession(key) }

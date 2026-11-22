@@ -163,6 +163,12 @@ public extension MacChatTurnPresentationPort {
             return MacChatStartedTurn(acceptance: .accepted(sessionId: targetSessionId), task: task)
         }
         guard await beginMacChatTurn(identity: identity, generation: generation) else {
+            // A refused send leaves nothing a relaunch could run: its saved arrival checkpoint goes with the refusal.
+            if !hideUserBubble {
+                do { try TurnCheckpoint.read(dataRoot: macChatTurns.dataRoot, sessionId: targetSessionId, turnId: turn.id)?
+                        .remove(dataRoot: macChatTurns.dataRoot) }
+                catch { ModuleLog.app("[chat] refused send's checkpoint could not be removed: %@", error.localizedDescription) }
+            }
             let rejection = rejectMacChatTurn(
                 "Chat could not start safely because its lifecycle receipt was not persisted"
             )

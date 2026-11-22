@@ -4,23 +4,14 @@ import NativeAgentShared
 import PersistenceCore
 import Senses
 import TrustCenter
-#if canImport(CoreGraphics)
 import CoreGraphics
-#endif
-#if canImport(CoreText)
 import CoreText
-#endif
-#if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
-#endif
-#if canImport(AppKit)
 import AppKit
 import ApplicationServices
 import UserNotifications
 import Experiences
-import CryptoKit
 import os
-#endif
 // Blueprint: | `MacScreenViewTextRedaction.swift` | One secret-decision owner for text, pixels and enclosing captions |
 /// Displayed secrets include static text: apply shape and caption checks while preserving ordinary prose. Cover lone OTPs, opaque tokens, masks, inline labeled
 /// tokens and nearby secret values; caption evidence never assigns action identity.
@@ -318,8 +309,10 @@ public enum MacScreenViewTextRedaction {
             // Unreadable secrecy evidence cannot establish a non-secret value; withhold it.
             let editable = ["AXTextField", "AXTextArea", "AXComboBox"].contains(node.attributes.role)
             let secrecyUnread = node.attributes.attributeGaps.contains { gap in
-                [kAXTitleAttribute, kAXDescriptionAttribute, "caption read"].contains { gap.hasPrefix($0 + ":") }
+                [kAXTitleAttribute, "caption read"].contains { gap.hasPrefix($0 + ":") }
                     || (editable && gap.hasPrefix(kAXSubroleAttribute + ":"))
+                    // An unread description could only caption a secret that looks like one; prose cannot be a key.
+                    || (gap.hasPrefix(kAXDescriptionAttribute + ":") && couldBeCaptionedSecret(value))
             }
             object["value"] = secrecyUnread || MacScreenViewBuilder.isSecretField(
                 role: node.attributes.role,
@@ -343,18 +336,6 @@ public enum MacScreenViewTextRedaction {
     ) -> [JSONValue] {
         let context = nodeSecretContext(nodes)
         return nodes.map { .object(redactedNodeFields($0, valueChars: valueChars, context: context)) }
-    }
-    /// Find matches retain score and addressing even when their text is redacted.
-    public static func redactedMatchesJSON(
-        _ matches: [MacAXMatch],
-        valueChars: Int = MacAXLimits.hardValueChars,
-        context: NodeSecretContext
-    ) -> [JSONValue] {
-        matches.map { match in
-            var object = redactedNodeFields(match.node, valueChars: valueChars, context: context)
-            object["score"] = .double(match.score)
-            return .object(object)
-        }
     }
     /// Enclosing captions require secret words, not substrings, and a secret-shaped value; ordinary groups and buttons remain legible. Exclude the root window
     /// because it encloses everything; its title receives standalone redaction instead.
@@ -482,13 +463,14 @@ public enum MacScreenViewTextRedaction {
             let snapshot = MacAccessibilityReader.walk(source: source, root: root, limits: .whole,
                 read: { ref, context in try source.checkedMaskingAttributes(of: ref, context: context) }, deadline: deadline, stopAtCut: true,
                 skipping: { ref, context in bounds.map { source.liesWhollyOutside(ref, bounds: $0, context: context) } ?? false }, context: context)
-            guard !snapshot.truncated else {
+            // Under Full Mac nothing is masked, so a cut walk or an unframed element withholds no pixels.
+            guard !snapshot.truncated || context.seesAsPerson else {
                 throw SenseFailure(code: "redaction_coverage_unavailable",
                     message: "AX inspection was cut: \(snapshot.truncationReasons.joined(separator: ", ")). "
                     + snapshot.readFailures.joined(separator: "; "))
             }
             guard !snapshot.nodes.isEmpty else { throw SenseFailure(code: "redaction_coverage_unavailable", message: "AX inspection returned no nodes.") }
-            for node in snapshot.nodes {
+            for node in snapshot.nodes where !context.seesAsPerson {
                 let attributes = node.attributes
                 // Static prose and container captions can reveal secrets too.
                 guard MacScreenViewBuilder.isMarkable(attributes)
@@ -510,6 +492,8 @@ public enum MacScreenViewTextRedaction {
         geometry: MacScreenViewGeometry,
         deadline: Date
     , context: MacOperationContext) -> [MacAXFrame]? {
+        // Under Full Mac her eyes see what the person sees.
+        if context.seesAsPerson { return [] }
         let context = nodeSecretContext(nodes)
         let names = MacScreenViewBuilder.LabelIndex(nodes)
         // If indexing exceeds the share’s deadline, mask the whole window rather than disclose unchecked pixels.
@@ -518,7 +502,10 @@ public enum MacScreenViewTextRedaction {
         // what it does not have (a window's value, an image's description, a button's subrole): there are no words there to cover.
         // An unread title is unread words on any element: a group's title can caption all it holds.
         let unread = nodes.filter { node in
-            let gaps = node.attributes.attributeGaps
+            // An unread description over read prose hides nothing: only a code-shaped value could be the secret it would caption.
+            let gaps = node.attributes.attributeGaps.filter { gap in
+                !(gap.hasPrefix(kAXDescriptionAttribute + ":") && node.attributes.value.map { !couldBeCaptionedSecret($0) } == true)
+            }
             return !gaps.isEmpty && (MacAXAttributeRead.textValueRoles.contains(node.attributes.role)
                 || gaps.contains { $0.hasPrefix("AXTitle:") })
         }
@@ -571,6 +558,11 @@ public enum MacScreenViewTextRedaction {
         return nil
     }
     /// Nearby captions mask only code-shaped tokens, not ordinary prose such as a Cancel button.
+    /// A value an unread caption could name as secret: one unbroken run of at least four characters, of any length. Words with spaces are prose.
+    static func couldBeCaptionedSecret(_ raw: String) -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.count >= 4 && !text.contains(where: \.isWhitespace)
+    }
     static func looksLikeRedactableValue(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 4, text.count <= maxValueChars else { return false }

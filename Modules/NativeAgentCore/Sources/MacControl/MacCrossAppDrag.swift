@@ -5,7 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MacCrossAppDrag.swift` | `MacCrossAppDrag` `MacFourVerbs.performCrossAppDrag` |
+// Blueprint: | `MacCrossAppDrag.swift` | `MacCrossAppDrag` `MacFourVerbs.performCrossAppDrag` and its stages `crossAppDragDropEnd`, `crossAppDragRaise`, `crossAppDragReread` |
 
 public enum MacCrossAppDrag {
     // MARK: - The raise
@@ -281,88 +281,14 @@ extension MacFourVerbs {
                   let window = targets.first(where: { $0.kind == "window" }) else { return resolved }
             return .hit(window)
         }
-        // Use `MacCrossAppDrag`'s bounded refusals; disclosing `anchored.render` would expose the background window.
         let endTarget: ActTarget
-        switch resolveDrop(anchored.targets) {
-        case .hit(let hit): endTarget = hit
-        case .none(let nearest):
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.unresolvedDestinationWords(
-                    destination, in: destinationAppName, nearest: nearest
-                ),
-                detail: [
-                    "error": .string(MacCrossAppDrag.unresolvedDestinationReason),
-                    "destination_app": .string(destinationAppName),
-                ]
-            )
-        case .ambiguous(let candidates):
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.ambiguousDestinationWords(
-                    destination, in: destinationAppName,
-                    candidates: candidates.map(Self.recoveryName)
-                ),
-                detail: [
-                    "error": .string(MacCrossAppDrag.ambiguousDestinationReason),
-                    "destination_app": .string(destinationAppName),
-                ]
-            )
-        }
-        guard let endFrame = Self.visiblePortion(of: endTarget.frame, within: anchored.visibleFrame) else {
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.destinationNoPointWords(
-                    Self.spokenName(endTarget, requestedAs: destination), in: destinationAppName
-                ),
-                detail: [
-                    "error": .string(MacCrossAppDrag.destinationNoPointReason),
-                    "destination_app": .string(destinationAppName),
-                ]
-            )
-        }
-        guard let end = Self.safeAimPoint(for: endTarget, in: endFrame,
-            describedBy: destination) else {
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.destinationObstructedWords(in: destinationAppName),
-                detail: [
-                    "error": .string(MacCrossAppDrag.destinationObstructedReason),
-                    "destination_app": .string(destinationAppName),
-                ]
-            )
-        }
-
-        // A drag can spring-load a credential box it crosses; check both endpoints and the full path before raising.
-        if endTarget.secret {
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.destinationIsSecureWords(
-                    destination: Self.spokenName(endTarget, requestedAs: destination)
-                ),
-                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
-            )
-        }
-        let secureFrames = (before.targets + anchored.targets)
-            .filter(\.secret)
-            .compactMap(\.frame)
-        guard MacRegionAim.pathIsClear(from: start, to: end, excluding: secureFrames) else {
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName),
-                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
-            )
-        }
-        guard MacRegionAim.pathIsClear(from: start, to: end,
-            excluding: source.excludedFrames + endTarget.excludedFrames) else {
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.destinationObstructedWords(in: destinationAppName),
-                detail: [
-                    "error": .string(MacCrossAppDrag.destinationObstructedReason),
-                    "destination_app": .string(destinationAppName),
-                ]
-            )
+        let end: MacPointerPosition
+        switch crossAppDragDropEnd(source: source, start: start, destination: destination,
+            destinationAppName: destinationAppName, anchored: anchored, before: before, resolveDrop: resolveDrop) {
+        case .refused(let reply): return reply
+        case .resolved(let target, let point):
+            endTarget = target
+            end = point
         }
 
         // Use the anchored look's front state so a receipt never invents a raise.
@@ -384,165 +310,21 @@ extension MacFourVerbs {
         var dropTarget = endTarget
         var anchoredAfterRaise = anchored
         if raise.needed {
-            guard context.foregroundRequested else {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: "I need the screen because the drop needs \(destinationAppName) in front. Nothing was raised or dragged. "
-                        + "Only use front:true when the task explicitly asks to bring it forward.",
-                    detail: raiseDetail.merging([
-                        "error": .string("needs_front"), "status": .string("needs_front"),
-                        "needs_front_reason": .string(raise.reason),
-                        "raised": .bool(false), "owner_front_changed": .bool(false),
-                    ]) { _, new in new }
-                )
+            if let refusal = await crossAppDragRaise(start: start, spokenSource: spokenSource,
+                destinationAppName: destinationAppName, anchored: anchored, raise: raise, raiseDetail: raiseDetail,
+                turn: turn, context: context) {
+                return refusal
             }
-            // Check the window's own frame: its title bar or blank areas can cover the source without publishing a target.
-            guard !MacCrossAppDrag.raiseWouldCoverSource(
-                start,
-                destinationBounds: MacCrossAppDrag.coverageBounds(
-                    windowFrame: anchored.windowFrame,
-                    targetFrames: anchored.targets.compactMap(\.frame)
-                )
-            ) else {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.coveredSourceWords(
-                        source: spokenSource, destinationApp: destinationAppName
-                    ),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(false),
-                        "error": .string(MacCrossAppDrag.coveredSourceReason),
-                    ]) { current, _ in current }
-                )
+            switch await crossAppDragReread(start: start, spokenSource: spokenSource, destination: destination,
+                destinationAppName: destinationAppName, before: before, raiseDetail: raiseDetail, resolveDrop: resolveDrop,
+                turn: turn, context: context) {
+            case .refused(let reply): return reply
+            case .reread(let reread, let rereadTarget, let rereadPoint):
+                anchoredAfterRaise = reread
+                dropTarget = rereadTarget
+                dropPoint = rereadPoint
+                raiseDetail["reread_after_raise"] = .bool(true)
             }
-            let focused: MacControlResult
-            do {
-                focused = try await host.dispatch(
-                    action: "focus_app",
-                    body: ["app": .string(destinationAppName)]
-                , turn: turn, context: context)
-            } catch {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: "\(error)"),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(false),
-                        "error": .string(MacCrossAppDrag.raiseFailedReason),
-                    ]) { current, _ in current }
-                )
-            }
-            guard focused.ok else {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: focused.error),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(false),
-                        "error": .string(MacCrossAppDrag.raiseFailedReason),
-                    ]) { current, _ in current }
-                )
-            }
-
-            // Raising can change layout; reread once, resolve the endpoint and recheck coverage before mouse-down. A refusal after focus moved must say so.
-            let reread: Sighting
-            switch await sight(part: nil, app: destinationAppName, turn: turn, context: context) {
-            case .seen(let seen): reread = seen
-            case .blind(let reply):
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.destinationMovedWords(destination, in: destinationAppName),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(true),
-                        "raised_app": .string(destinationAppName),
-                        "reread_after_raise": .bool(true),
-                        "error": .string(MacCrossAppDrag.destinationMovedReason),
-                        "reread_error": reply.detail["error"] ?? .string("look_failed"),
-                    ]) { current, _ in current }
-                )
-            }
-            anchoredAfterRaise = reread
-
-            func movedRefusal() -> MacFourVerbsReply {
-                MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.destinationMovedWords(destination, in: destinationAppName),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(true),
-                        "raised_app": .string(destinationAppName),
-                        "reread_after_raise": .bool(true),
-                        "error": .string(MacCrossAppDrag.destinationMovedReason),
-                    ]) { current, _ in current }
-                )
-            }
-
-            guard case .hit(let rereadTarget) = resolveDrop(reread.targets) else {
-                return movedRefusal()
-            }
-            guard let rereadFrame = Self.visiblePortion(
-                of: rereadTarget.frame, within: reread.visibleFrame
-            ) else { return movedRefusal() }
-            guard let rereadPoint = Self.safeAimPoint(
-                for: rereadTarget, in: rereadFrame,
-                describedBy: destination
-            ) else { return movedRefusal() }
-
-            // Recheck real window coverage after raising; otherwise mouse-down could hit the newly foreground destination instead of the source.
-            guard !MacCrossAppDrag.raiseWouldCoverSource(
-                start,
-                destinationBounds: MacCrossAppDrag.coverageBounds(
-                    windowFrame: reread.windowFrame,
-                    targetFrames: reread.targets.compactMap(\.frame)
-                )
-            ) else {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.coveredSourceAfterRaiseWords(
-                        source: spokenSource, destinationApp: destinationAppName
-                    ),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(true),
-                        "raised_app": .string(destinationAppName),
-                        "reread_after_raise": .bool(true),
-                        "error": .string(MacCrossAppDrag.coveredSourceAfterRaiseReason),
-                    ]) { current, _ in current }
-                )
-            }
-
-            // The secure boundary is re-drawn on the line that will actually be travelled: a raise can bring a password field onto it.
-            let rereadSecureFrames = (before.targets + reread.targets)
-                .filter(\.secret)
-                .compactMap(\.frame)
-            if rereadTarget.secret {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.destinationIsSecureWords(
-                        destination: Self.spokenName(rereadTarget, requestedAs: destination), raised: destinationAppName
-                    ),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(true),
-                        "raised_app": .string(destinationAppName),
-                        "reread_after_raise": .bool(true),
-                        "error": .string(MacCrossAppDrag.secureCrossingReason),
-                    ]) { current, _ in current }
-                )
-            }
-            guard MacRegionAim.pathIsClear(
-                from: start, to: rereadPoint, excluding: rereadSecureFrames
-            ) else {
-                return MacFourVerbsReply(
-                    ok: false,
-                    text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName, raised: destinationAppName),
-                    detail: raiseDetail.merging([
-                        "raised": .bool(true),
-                        "raised_app": .string(destinationAppName),
-                        "reread_after_raise": .bool(true),
-                        "error": .string(MacCrossAppDrag.secureCrossingReason),
-                    ]) { current, _ in current }
-                )
-            }
-
-            dropTarget = rereadTarget
-            dropPoint = rereadPoint
-            raiseDetail["reread_after_raise"] = .bool(true)
         }
         raiseDetail["raised"] = .bool(raise.needed)
         if raise.needed { raiseDetail["raised_app"] = .string(destinationAppName) }
@@ -572,5 +354,273 @@ extension MacFourVerbs {
                 described: description
             , turn: turn, context: context)
         }
+    }
+
+    private enum CrossAppDropEnd {
+        case refused(MacFourVerbsReply)
+        case resolved(ActTarget, MacPointerPosition)
+    }
+
+    private func crossAppDragDropEnd(
+        source: ActTarget, start: MacPointerPosition, destination: String, destinationAppName: String,
+        anchored: Sighting, before: Sighting, resolveDrop: ([ActTarget]) -> Resolution
+    ) -> CrossAppDropEnd {
+        // Use `MacCrossAppDrag`'s bounded refusals; disclosing `anchored.render` would expose the background window.
+        let endTarget: ActTarget
+        switch resolveDrop(anchored.targets) {
+        case .hit(let hit): endTarget = hit
+        case .none(let nearest):
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.unresolvedDestinationWords(
+                    destination, in: destinationAppName, nearest: nearest
+                ),
+                detail: [
+                    "error": .string(MacCrossAppDrag.unresolvedDestinationReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            ))
+        case .ambiguous(let candidates):
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.ambiguousDestinationWords(
+                    destination, in: destinationAppName,
+                    candidates: candidates.map(Self.recoveryName)
+                ),
+                detail: [
+                    "error": .string(MacCrossAppDrag.ambiguousDestinationReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            ))
+        }
+        guard let endFrame = Self.visiblePortion(of: endTarget.frame, within: anchored.visibleFrame) else {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationNoPointWords(
+                    Self.spokenName(endTarget, requestedAs: destination), in: destinationAppName
+                ),
+                detail: [
+                    "error": .string(MacCrossAppDrag.destinationNoPointReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            ))
+        }
+        guard let end = Self.safeAimPoint(for: endTarget, in: endFrame,
+            describedBy: destination) else {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationObstructedWords(in: destinationAppName),
+                detail: [
+                    "error": .string(MacCrossAppDrag.destinationObstructedReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            ))
+        }
+
+        // A drag can spring-load a credential box it crosses; check both endpoints and the full path before raising.
+        if endTarget.secret {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationIsSecureWords(
+                    destination: Self.spokenName(endTarget, requestedAs: destination)
+                ),
+                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+            ))
+        }
+        let secureFrames = (before.targets + anchored.targets)
+            .filter(\.secret)
+            .compactMap(\.frame)
+        guard MacRegionAim.pathIsClear(from: start, to: end, excluding: secureFrames) else {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName),
+                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+            ))
+        }
+        guard MacRegionAim.pathIsClear(from: start, to: end,
+            excluding: source.excludedFrames + endTarget.excludedFrames) else {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationObstructedWords(in: destinationAppName),
+                detail: [
+                    "error": .string(MacCrossAppDrag.destinationObstructedReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            ))
+        }
+        return .resolved(endTarget, end)
+    }
+
+    private func crossAppDragRaise(
+        start: MacPointerPosition, spokenSource: String, destinationAppName: String, anchored: Sighting,
+        raise: MacCrossAppDrag.Raise, raiseDetail: [String: JSONValue], turn: Turn, context: MacOperationContext
+    ) async -> MacFourVerbsReply? {
+        guard context.foregroundRequested else {
+            return MacFourVerbsReply(
+                ok: false,
+                text: "I need the screen because the drop needs \(destinationAppName) in front. Nothing was raised or dragged. "
+                    + "Only use front:true when the task explicitly asks to bring it forward.",
+                detail: raiseDetail.merging([
+                    "error": .string("needs_front"), "status": .string("needs_front"),
+                    "needs_front_reason": .string(raise.reason),
+                    "raised": .bool(false), "owner_front_changed": .bool(false),
+                ]) { _, new in new }
+            )
+        }
+        // Check the window's own frame: its title bar or blank areas can cover the source without publishing a target.
+        guard !MacCrossAppDrag.raiseWouldCoverSource(
+            start,
+            destinationBounds: MacCrossAppDrag.coverageBounds(
+                windowFrame: anchored.windowFrame,
+                targetFrames: anchored.targets.compactMap(\.frame)
+            )
+        ) else {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.coveredSourceWords(
+                    source: spokenSource, destinationApp: destinationAppName
+                ),
+                detail: raiseDetail.merging([
+                    "raised": .bool(false),
+                    "error": .string(MacCrossAppDrag.coveredSourceReason),
+                ]) { current, _ in current }
+            )
+        }
+        let focused: MacControlResult
+        do {
+            focused = try await host.dispatch(
+                action: "focus_app",
+                body: ["app": .string(destinationAppName)]
+            , turn: turn, context: context)
+        } catch {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: "\(error)"),
+                detail: raiseDetail.merging([
+                    "raised": .bool(false),
+                    "error": .string(MacCrossAppDrag.raiseFailedReason),
+                ]) { current, _ in current }
+            )
+        }
+        guard focused.ok else {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: focused.error),
+                detail: raiseDetail.merging([
+                    "raised": .bool(false),
+                    "error": .string(MacCrossAppDrag.raiseFailedReason),
+                ]) { current, _ in current }
+            )
+        }
+        return nil
+    }
+
+    private enum CrossAppRaisedDrop {
+        case refused(MacFourVerbsReply)
+        case reread(Sighting, ActTarget, MacPointerPosition)
+    }
+
+    private func crossAppDragReread(
+        start: MacPointerPosition, spokenSource: String, destination: String, destinationAppName: String,
+        before: Sighting, raiseDetail: [String: JSONValue], resolveDrop: ([ActTarget]) -> Resolution,
+        turn: Turn, context: MacOperationContext
+    ) async -> CrossAppRaisedDrop {
+        // Raising can change layout; reread once, resolve the endpoint and recheck coverage before mouse-down. A refusal after focus moved must say so.
+        let reread: Sighting
+        switch await sight(part: nil, app: destinationAppName, turn: turn, context: context) {
+        case .seen(let seen): reread = seen
+        case .blind(let reply):
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationMovedWords(destination, in: destinationAppName),
+                detail: raiseDetail.merging([
+                    "raised": .bool(true),
+                    "raised_app": .string(destinationAppName),
+                    "reread_after_raise": .bool(true),
+                    "error": .string(MacCrossAppDrag.destinationMovedReason),
+                    "reread_error": reply.detail["error"] ?? .string("look_failed"),
+                ]) { current, _ in current }
+            ))
+        }
+
+        func movedRefusal() -> MacFourVerbsReply {
+            MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationMovedWords(destination, in: destinationAppName),
+                detail: raiseDetail.merging([
+                    "raised": .bool(true),
+                    "raised_app": .string(destinationAppName),
+                    "reread_after_raise": .bool(true),
+                    "error": .string(MacCrossAppDrag.destinationMovedReason),
+                ]) { current, _ in current }
+            )
+        }
+
+        guard case .hit(let rereadTarget) = resolveDrop(reread.targets) else {
+            return .refused(movedRefusal())
+        }
+        guard let rereadFrame = Self.visiblePortion(
+            of: rereadTarget.frame, within: reread.visibleFrame
+        ) else { return .refused(movedRefusal()) }
+        guard let rereadPoint = Self.safeAimPoint(
+            for: rereadTarget, in: rereadFrame,
+            describedBy: destination
+        ) else { return .refused(movedRefusal()) }
+
+        // Recheck real window coverage after raising; otherwise mouse-down could hit the newly foreground destination instead of the source.
+        guard !MacCrossAppDrag.raiseWouldCoverSource(
+            start,
+            destinationBounds: MacCrossAppDrag.coverageBounds(
+                windowFrame: reread.windowFrame,
+                targetFrames: reread.targets.compactMap(\.frame)
+            )
+        ) else {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.coveredSourceAfterRaiseWords(
+                    source: spokenSource, destinationApp: destinationAppName
+                ),
+                detail: raiseDetail.merging([
+                    "raised": .bool(true),
+                    "raised_app": .string(destinationAppName),
+                    "reread_after_raise": .bool(true),
+                    "error": .string(MacCrossAppDrag.coveredSourceAfterRaiseReason),
+                ]) { current, _ in current }
+            ))
+        }
+
+        // The secure boundary is re-drawn on the line that will actually be travelled: a raise can bring a password field onto it.
+        let rereadSecureFrames = (before.targets + reread.targets)
+            .filter(\.secret)
+            .compactMap(\.frame)
+        if rereadTarget.secret {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationIsSecureWords(
+                    destination: Self.spokenName(rereadTarget, requestedAs: destination), raised: destinationAppName
+                ),
+                detail: raiseDetail.merging([
+                    "raised": .bool(true),
+                    "raised_app": .string(destinationAppName),
+                    "reread_after_raise": .bool(true),
+                    "error": .string(MacCrossAppDrag.secureCrossingReason),
+                ]) { current, _ in current }
+            ))
+        }
+        guard MacRegionAim.pathIsClear(
+            from: start, to: rereadPoint, excluding: rereadSecureFrames
+        ) else {
+            return .refused(MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName, raised: destinationAppName),
+                detail: raiseDetail.merging([
+                    "raised": .bool(true),
+                    "raised_app": .string(destinationAppName),
+                    "reread_after_raise": .bool(true),
+                    "error": .string(MacCrossAppDrag.secureCrossingReason),
+                ]) { current, _ in current }
+            ))
+        }
+        return .reread(reread, rereadTarget, rereadPoint)
     }
 }

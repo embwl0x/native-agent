@@ -23,6 +23,8 @@ extension iCloudBridge {
         }
         var fields: [String: JSONValue] = [
             "at": .string(ISO8601DateFormatter().string(from: Date())),
+            // The sender's own clock: with the chat transaction's createdAt it times each leg of the trip.
+            "sentAt": .string(NativeTimestampFormat.fractionalZulu(message.timestamp)),
             "messageId": .string(message.id),
             "correlationId": message.correlationID.map { .string($0) } ?? .null,
             "sessionId": message.sessionID.map { .string($0) } ?? .null,

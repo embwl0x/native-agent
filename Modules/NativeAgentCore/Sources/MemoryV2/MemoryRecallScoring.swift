@@ -55,8 +55,7 @@ public enum MemoryRecallScoring {
 
     /// Kind values are literal: only a missing/non-string or empty value is absent.
     public static func kind(of metadata: JSONValue?) -> String? {
-        guard case .object(let obj)? = metadata, case .string(let k)? = obj["kind"] else { return nil }
-        return k.isEmpty ? nil : k
+        metadata?.objectValue?["kind"]?.nonemptyString
     }
 
     /// Mutation exceptions require explicit kind, never derived tags or correction metadata.

@@ -19,7 +19,7 @@ extension AgentWorkspace {
         }
     }
 
-    package static func attachReadReferences(workspace: WorkspaceOperation, tool: String, input: [String: JSONValue], result: JSONValue,
+    package static func attachReadReferences(workspace: WorkspaceOperation, input: [String: JSONValue], result: JSONValue,
         dataRoot: URL) -> JSONValue {
         guard case .object(var root) = result, case .array(let messages)? = root["messages"] else { return result }
         let items = AgentWorkspaceMail.project(input: input, result: result).items
@@ -80,7 +80,7 @@ extension WorkspacePage {
                 owned.title=title
                 return owned
             }
-            if tool == "work_context", let query = workspaceText(input["query"]) {
+            if tool == "work_context", let query = input["query"]?.nonblankString {
                 return workspaceWork(query: query, result: result, input: input)
             }
             if tool == "agent_contacts" {
@@ -108,8 +108,8 @@ extension WorkspacePage {
                 actions.append(button)
             } else if tool == "read_chat_message", let row = workspaceObject(result),
                       row["status"] == .string("ok"), row["has_more"] == .bool(true),
-                      let session = workspaceText(input["session_id"]),
-                      let message = workspaceText(input["message_id"]),
+                      let session = input["session_id"]?.nonblankString,
+                      let message = input["message_id"]?.nonblankString,
                       row["session_id"] == .string(session), row["message_id"] == .string(message),
                       let offset = row["next_offset"] {
                 var next: [String: JSONValue] = ["session_id": .string(session),
@@ -124,12 +124,12 @@ extension WorkspacePage {
                 actions.append(.init(label: "Open this conversation", action: .open(.record(
                     tool: "chat_conversations", input: ["conversation_session_id": .string(session)], title: "Conversation with you"))))
             }
-            if tool == "read_file", let path = workspaceText(input["path"]), evidence != nil {
+            if tool == "read_file", let path = input["path"]?.nonblankString, evidence != nil {
                 actions.append(.init(label: "Add to this file", action: .perform(tool: "write_file",
                     input: ["path": .string(path), "append": .bool(true)], title: "Add to " + title,
                     textField: "content", isEffect: true), needsText: true))
             }
-            if tool == "read_file", let path = workspaceText(input["path"]) {
+            if tool == "read_file", let path = input["path"]?.nonblankString {
                 actions.append(.init(label: "Revise this file", action: .open(.record(tool: "app",
                     input: ["find": .string("files.write"), "args": .object(["path": .string(path)])], title: title))))
             }
@@ -169,7 +169,7 @@ extension WorkspacePage {
            case .array(let records)? = lane["items"] {
             for record in records {
                 let row = workspaceObject(record) ?? [:]
-                let title = "Current work: " + (workspaceText(row["title"]) ?? "Recorded work")
+                let title = "Current work: " + (row["title"]?.nonblankString ?? "Recorded work")
                 let actions = workspaceReadButton(row["read_locator"], label: "Open work", title: title,
                                                  expectedTool: "desk_read").map { [$0] } ?? []
                 items.append(.init(title: title, content: record, actions: actions))
@@ -183,8 +183,8 @@ extension WorkspacePage {
            case .array(let records)? = lane["excerpts"] {
             for record in records {
                 let row = workspaceObject(record) ?? [:]
-                let name = workspaceText(row["session_title"]) ?? "Conversation excerpt"
-                let date = workspaceText(row["timestamp"]).map { " — " + $0 } ?? ""
+                let name = row["session_title"]?.nonblankString ?? "Conversation excerpt"
+                let date = row["timestamp"]?.nonblankString.map { " — " + $0 } ?? ""
                 let title = "History: " + name + date
                 let actions = workspaceReadButton(row["read_locator"], label: "Open source", title: title,
                                                  expectedTool: "read_chat_message").map { [$0] } ?? []
@@ -205,7 +205,7 @@ extension WorkspacePage {
         }
         let items = records.map { record -> AgentWorkspaceItem in
             let row = workspaceObject(record) ?? [:]
-            let title = workspaceText(row["name"]) ?? "Recorded document"
+            let title = row["name"]?.nonblankString ?? "Recorded document"
             var actions: [AgentWorkspaceButton] = []
             if let button = workspaceReadButton(row["open_current_file"], label: "Open current file", title: title,
                                                 expectedTool: "read_file") {
@@ -233,9 +233,9 @@ extension WorkspacePage {
         let offset = max(0, page ?? 0) * 8
         let items = contacts.dropFirst(offset).prefix(page == nil ? contacts.count : 8).map { contact -> AgentWorkspaceItem in
             let row = workspaceObject(contact) ?? [:]
-            let title = workspaceText(row["name"]) ?? workspaceText(row["agent"]) ?? "Contact"
+            let title = row["name"]?.nonblankString ?? row["agent"]?.nonblankString ?? "Contact"
             var actions: [AgentWorkspaceButton] = []
-            if let agent = workspaceText(row["agent"]), workspaceExactAgent(agent) {
+            if let agent = row["agent"]?.nonblankString, workspaceExactAgent(agent) {
                 actions.append(.init(label: "Open conversation", action: .open(.record(
                     tool: "agent_read", input: ["agent": .string(agent)], title: title))))
                 if case .array(let capabilities)? = row["capabilities"], capabilities.contains(.string("message")),
@@ -280,7 +280,7 @@ extension WorkspacePage {
                                              expectedTool: String? = nil) -> AgentWorkspaceButton? {
         guard let locator = workspaceObject(locator),
               Set(locator.keys).isSubset(of: ["tool", "arguments", "input"]),
-              let tool = workspaceText(locator["tool"]),
+              let tool = locator["tool"]?.nonblankString,
               expectedTool == nil || tool == expectedTool,
               (locator["arguments"] == nil) != (locator["input"] == nil),
               let arguments = workspaceObject(locator["arguments"] ?? locator["input"]) else { return nil }
@@ -292,12 +292,16 @@ extension WorkspacePage {
         let required: Set<String>
         let strings: Set<String>
         let numbers: Set<String>
+        // Each read mode's own continuation fields: a search, a line range, or bytes (raw included).
+        var flags: Set<String> = []
         switch tool {
         case "read_file" where arguments["query"] != nil:
             guard arguments["start_line"] != nil else { return nil }
             required = ["path", "query", "version"]; strings = required; numbers = ["start_line", "max_lines"]
+        case "read_file" where arguments["start_line"] != nil:
+            required = ["path", "version"]; strings = required; numbers = ["start_line", "max_lines"]
         case "read_file":
-            required = ["path"]; strings = ["path", "version"]; numbers = ["offset", "max_bytes"]
+            required = ["path"]; strings = ["path", "version"]; numbers = ["offset", "max_bytes"]; flags = ["raw"]
         case "read_chat_message":
             required = ["message_id", "session_id"]
             strings = required; numbers = ["offset", "limit"]
@@ -305,18 +309,20 @@ extension WorkspacePage {
             required = ["handle"]; strings = required; numbers = []
         default: return nil
         }
-        guard Set(arguments.keys).isSubset(of: strings.union(numbers)),
-              required.allSatisfy({ workspaceText(arguments[$0]) != nil }) else { return nil }
+        guard Set(arguments.keys).isSubset(of: strings.union(numbers).union(flags)),
+              required.allSatisfy({ arguments[$0]?.nonblankString != nil }) else { return nil }
         for (key, value) in arguments {
-            if strings.contains(key) {
-                guard workspaceText(value) != nil else { return nil }
+            if flags.contains(key) {
+                guard case .bool = value else { return nil }
+            } else if strings.contains(key) {
+                guard value.nonblankString != nil else { return nil }
             } else {
                 guard case .int(let number) = value, number >= 0 else { return nil }
                 if key != "offset", number == 0 { return nil }
             }
         }
         if tool == "read_file", case .int(let offset)? = arguments["offset"], offset > 0,
-           workspaceText(arguments["version"]) == nil { return nil }
+           arguments["version"]?.nonblankString == nil { return nil }
         var input = arguments
         if tool == "read_file", input["query"] == nil, input["max_bytes"] == nil { input["max_bytes"] = .int(12_000) }
         return .init(label: label, action: .open(.record(tool: tool, input: input, title: title)))
@@ -327,9 +333,4 @@ extension WorkspacePage {
         return object
     }
 
-    private static func workspaceText(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value,
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return text
-    }
 }

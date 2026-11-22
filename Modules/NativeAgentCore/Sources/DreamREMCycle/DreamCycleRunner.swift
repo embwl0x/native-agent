@@ -114,6 +114,20 @@ public actor DreamCycleRunner {
             guard !pending.discoveryUnavailable, !Task.isCancelled,
                   !force || !pending.pendingPaths.contains(outPath.path) else { return report }
         }
+        let (prepared, draft) = try await prepareNightlyDream(report, force: force, preview: preview, parent: parent, dateKey: dateKey)
+        guard let draft else { return prepared }
+        return try await publishNightlyDream(prepared, draft: draft, force: force, trigger: trigger, delivery: delivery,
+            dateKey: dateKey, outPath: outPath)
+    }
+
+    private typealias NightlyDreamDraft = (payload: DreamPayload, lessons: [DreamLesson],
+        careNight: CognitiveCareNight?, newestIncluded: Date, citedStudioEntryIDs: [String],
+        messageSources: [DreamSourceRef], sourceMaterial: [String: CognitiveReflectionCause],
+        sourcePeerIds: [String]?, feltSummary: String?)
+
+    private func prepareNightlyDream(_ initial: DreamReport, force: Bool, preview: Bool, parent: Turn?, dateKey: String) async throws
+        -> (DreamReport, NightlyDreamDraft?) {
+        var report = initial
         let mark: Date
         do {
             let committedMark = try ConversationHistory.dreamConsolidationMark(dataRoot: dataRoot)
@@ -122,14 +136,14 @@ public actor DreamCycleRunner {
                 : (committedMark ?? now().addingTimeInterval(-recencyWindow))
         } catch {
             report.errors.append("Dream cutoff could not be read at \(dreamMarkPath().path) (\(error)). Repair the saved cutoff before retrying.")
-            return report
+            return (report, nil)
         }
         let feltOrigins: [CognitiveFeltOrigin]
         do {
             feltOrigins = try await feltOriginProvider()
         } catch {
             report.errors.append("felt origin read failed: \(error)")
-            return report
+            return (report, nil)
         }
         let gathered: (messages: [(sessionId: String, role: String, content: String, source: String?)],
             newest: Date?,
@@ -142,7 +156,7 @@ public actor DreamCycleRunner {
             let message = "transcript read failed; dream will retry: \(error)"
             report.errors.append(message)
             FileHandle.standardError.write(Data("DreamCycleRunner: \(message)\n".utf8))
-            return report
+            return (report, nil)
         }
         let (messages, newestIncluded, messageSources, sourceMaterial, moreMessagesRemain) = gathered
         report.moreMessagesRemain = moreMessagesRemain
@@ -151,11 +165,11 @@ public actor DreamCycleRunner {
         // No new material means no empty entry and no mark change.
         if messages.isEmpty {
             report.skipReason = "no_new_material"
-            return report
+            return (report, nil)
         }
         guard let newestIncluded else {
             report.errors.append("message context had no high-water timestamp")
-            return report
+            return (report, nil)
         }
 
         // Resolve persona and memory deltas once so the run uses consistent inputs.
@@ -167,7 +181,7 @@ public actor DreamCycleRunner {
             memoryDeltas = try await memoryDeltaProvider(mark)
         } catch {
             report.errors.append("memory context read failed: \(error)")
-            return report
+            return (report, nil)
         }
         // Absent felt tone is silence; failed tone reads fail the run so the same window remains available for retry.
         let feltSummary: String?
@@ -175,13 +189,13 @@ public actor DreamCycleRunner {
             feltSummary = try await feltSummaryProvider()
         } catch {
             report.errors.append("felt context read failed: \(error)")
-            return report
+            return (report, nil)
         }
         let careNight: CognitiveCareNight?
         do { careNight = try await careNightProvider() }
         catch {
             report.errors.append("care night evidence unavailable; cutoff unchanged: \(error)")
-            return report
+            return (report, nil)
         }
         let surpriseBlock: String
         do {
@@ -191,7 +205,7 @@ public actor DreamCycleRunner {
                 "nightly-dream", section: "surprises", arguments: [String(surprises.prefix(2_400))])
         } catch {
             report.errors.append("surprise context read failed: \(error)")
-            return report
+            return (report, nil)
         }
         let citedStudioEntryIDs = Self.studioEntryCitations(
             from: feltOrigins, feltSummary: feltSummary)
@@ -218,12 +232,12 @@ public actor DreamCycleRunner {
         } catch {
             report.errors.append("llm error: \(error)")
             report.repair = (error as? ProviderFailure.Diagnostic)?.repair?.remedy()
-            return report
+            return (report, nil)
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
             report.errors.append("Dream payload is empty or not UTF-8; nothing was learned or written. Repair the nightly-dream output before retrying.")
-            return report
+            return (report, nil)
         }
         let payload: DreamPayload
         do {
@@ -234,7 +248,7 @@ public actor DreamCycleRunner {
                     Dream payload could not be decoded: \(String(describing: error)). Nothing was learned or written; repair the nightly-dream output before \
                     retrying.
                     """)
-            return report
+            return (report, nil)
         }
         let lessons = surpriseBlock.isEmpty ? [] : payload.lessons
         report.careNight = careNight.map {
@@ -249,8 +263,15 @@ public actor DreamCycleRunner {
                 "careAnswers": .array(payload.cares.map(JSONValue.string)),
                 "lessonsNotRecorded": .int(Int64(lessons.count)), "date": .string(dateKey),
                 "consumedThroughUnchanged": .string(NativeTimestampFormat.fractionalZulu(newestIncluded))])
-            return report
+            return (report, nil)
         }
+        return (report, (payload, lessons, careNight, newestIncluded, citedStudioEntryIDs, messageSources, sourceMaterial, prompt.peerIds, feltSummary))
+    }
+
+    private func publishNightlyDream(_ initial: DreamReport, draft: NightlyDreamDraft, force: Bool, trigger: DreamTrigger,
+                                     delivery: DreamEffectSink?, dateKey: String, outPath: URL) async throws -> DreamReport {
+        var report = initial
+        let (payload, lessons, careNight, newestIncluded, citedStudioEntryIDs, messageSources, sourceMaterial, sourcePeerIds, feltSummary) = draft
         // Ordinary runs append sections without changing prior writing; force replaces the day.
         let previousDiary: Data?
         if fm.fileExists(atPath: outPath.path) {
@@ -271,15 +292,15 @@ public actor DreamCycleRunner {
             lessons: lessons,
             studioEntryIDs: citedStudioEntryIDs,
             sources: messageSources,
-            sourcePeerIds: prompt.peerIds
+            sourcePeerIds: sourcePeerIds
         )
         let citedSources = Set(DreamEntryProvenance.readClaims(in: prose, as: DreamEntryProvenance.self)
             .flatMap { $0.claims.flatMap(\.sourceRefs) })
         var reflectionMaterial = sourceMaterial.filter { citedSources.contains($0.key) }
         reflectionMaterial["dream_diary/\(dateKey).md"] = CognitiveReflectionCause(
-            text: prose, sourcePeerIds: prompt.peerIds, sourceRefs: citedSources.sorted())
+            text: prose, sourcePeerIds: sourcePeerIds, sourceRefs: citedSources.sorted())
         var work = DreamPendingWork(id: UUID(), date: dateKey, trigger: trigger, force: force,
-            sessionsProcessed: report.sessionsProcessed, sourcePeerIds: prompt.peerIds,
+            sessionsProcessed: report.sessionsProcessed, sourcePeerIds: sourcePeerIds,
             lessons: lessons, reflection: reflectionMaterial, care: report.careNight.map(DreamPendingWork.Care.init),
             affect: payload.affect, studioEntries: citedStudioEntryIDs,
             completion: .init(occurredAt: now(), feltSummary: feltSummary),
