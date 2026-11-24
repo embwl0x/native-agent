@@ -1,0 +1,680 @@
+import Dispatch
+import Foundation
+import Synchronization
+import NativeAgentShared
+import Darwin
+import Network
+import MindCore
+import MacNerves
+import DeskCore
+import NativeAgentCore
+import PersistenceCore
+// Blueprint: | `ClaudeBridgeRuntime.swift` | Retain accepted work until exit; connections own passive reads. |
+
+/// Factories bind at launch; ingress and retained delivery remain with the runtime owner.
+public protocol ClaudeBridgeRuntimePort: ClaudeBridgeMessagePort {
+    var cognition: NativeCognitionRuntime? { get }
+    var contextFlow: NativeContextFlowRuntime { get }
+    var tasks: AgentContactTasks { get }
+    var preferredPersona: String? { get }
+    var preferredSessionID: String? { get }
+    func chatClient() -> SwiftNativeChatOrchestrationClient
+    func toolClient(verifiedSessionID: String?) -> any ToolDispatchClient
+    func completionSender(dataRoot: URL) -> any AgentBridgeCompletionSending
+    func receiveGrok(_ reply: GrokReplyInput, principal: AgentBridgePrincipal, dataRoot: URL) async throws
+    func publishChatTurnCompleted(sessionID: String?) async
+}
+
+public final class ClaudeBridgeRuntime: Sendable, BridgeHTTPServer, ClaudeBridgeStatePort {
+    let host: any ClaudeBridgeRuntimePort
+    var tasks: AgentContactTasks { host.tasks }
+
+    public init(port: any ClaudeBridgeRuntimePort) {
+        self.host = port
+    }
+
+    public static let port = InstallPaths.current.loopbackPorts().bridge
+    private static let maxRequestBodyBytes = 4 * 1024 * 1024
+
+    /// Admission, progress and settlement share one response claim.
+    public final class WorkLatch: Sendable {
+        public init() {}
+
+        private let claimed = Atomic(false)
+
+        public func claim() -> Bool {
+            !claimed.exchange(true, ordering: .acquiringAndReleasing)
+        }
+    }
+
+    private let bridgeListener = NativeLoopbackListener(
+        port: ClaudeBridgeRuntime.port,
+        label: "ClaudeBridge"
+    )
+    public var listenerHealth: (port: UInt16, boundPort: UInt16?, isActive: Bool, failure: String?) {
+        let listener = bridgeListener.health
+        return state.withLock { held in
+            (listener.port, held.activePort == 0 ? nil : listener.boundPort,
+             listener.isActive && held.discoveryPublicationFailure == nil,
+             held.discoveryPublicationFailure ?? listener.failure)
+        }
+    }
+    private struct State {
+        var token = ""
+        var activePort: UInt16 = 0
+        var discoveryPublicationFailure: String?
+        var contactLifecycleRevision: UInt64 = 0
+        var contactLifecycleWorkers: [UInt64: Task<Void, Never>] = [:]
+        var requestWorkers: [UUID: RequestWorker] = [:]
+        var startedAt = Date()
+        var connections: [ObjectIdentifier: ConnectionEntry] = [:]
+        var recentToolCalls: [BridgeEvent] = []
+        var eventSubscribers: [ObjectIdentifier: NWConnection] = [:]
+        var eventSeq: UInt64 = 0
+    }
+    private let state = Mutex(State())
+    private struct RequestWorker {
+        let connection: ObjectIdentifier
+        let token: String
+        let latch: WorkLatch
+        let accepted: Bool
+        var worker: Task<Void, Never>?
+        var operation: Task<JSONValue, Error>?
+        var operationAdmitted = false
+        var operationClosed = false
+    }
+    public var startedAt: Date { state.withLock { $0.startedAt } }
+    private struct ConnectionEntry {
+        let conn: NWConnection
+    }
+
+    private func updateContactLifecycle(_ held: inout State, active: Bool) {
+        held.contactLifecycleRevision += 1
+        let revision = held.contactLifecycleRevision
+        tasks.setBridgeAdmission(active, revision: revision)
+        held.contactLifecycleWorkers[revision] = Task { [self] in
+            await tasks.setBridgeActive(active, revision: revision)
+            _ = state.withLock { $0.contactLifecycleWorkers.removeValue(forKey: revision) }
+        }
+    }
+
+    /// Retain each request through actual exit. Accepted tool work survives
+    /// disconnect/stop; reads are canceled with their connection.
+    func startRequest(conn: NWConnection, latch: WorkLatch, priority: TaskPriority,
+                      accepted: Bool = false,
+                      operation: @escaping @Sendable (UUID) async -> Void) -> Task<Void, Never>? {
+        state.withLock { held in
+            guard !held.token.isEmpty, held.requestWorkers.count < 64,
+                  held.connections[ObjectIdentifier(conn)] != nil else { return nil }
+            let id = UUID()
+            held.requestWorkers[id] = RequestWorker(connection: ObjectIdentifier(conn), token: held.token, latch: latch, accepted: accepted)
+            let worker = Task.detached(priority: priority) { [self] in
+                defer { finishRequest(id, operation: false) }
+                guard !Task.isCancelled else { return }
+                await operation(id)
+            }
+            held.requestWorkers[id]?.worker = worker
+            return worker
+        }
+    }
+
+    private func finishRequest(_ id: UUID, operation: Bool) {
+        state.withLock { held in
+            if operation { held.requestWorkers[id]?.operation = nil }
+            else { held.requestWorkers[id]?.worker = nil }
+            if let entry = held.requestWorkers[id], entry.worker == nil, entry.operation == nil {
+                held.requestWorkers.removeValue(forKey: id)
+            }
+        }
+    }
+
+    func runToolOperation(_ id: UUID, operation: @escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue {
+        // Created inside TurnDeadline's scope so human waits still pause the existing active-work ceiling. Retain the actual dispatch, not just the wrapper
+        // that returns as soon as that ceiling fires.
+        let worker = try state.withLock { held in
+            guard held.requestWorkers[id]?.operationClosed == false, !Task.isCancelled else { throw CancellationError() }
+            held.requestWorkers[id]?.operationAdmitted = true
+            let worker = Task { [self] in
+                defer { finishRequest(id, operation: true) }
+                return try await operation()
+            }
+            held.requestWorkers[id]?.operation = worker
+            return worker
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: { worker.cancel() }
+    }
+
+    func closeUnstartedTool(_ id: UUID) -> Bool {
+        state.withLock { held in
+            guard held.requestWorkers[id]?.operationAdmitted == false else { return false }
+            held.requestWorkers[id]?.operationClosed = true
+            return true
+        }
+    }
+
+    private func retireRequests(connection: ObjectIdentifier? = nil, token: String? = nil) {
+        let entries = state.withLock { held in
+            held.requestWorkers.values.filter {
+                (connection == nil || $0.connection == connection) && (token == nil || $0.token == token)
+            }
+        }
+        for entry in entries {
+            _ = entry.latch.claim()
+            if !entry.accepted { entry.worker?.cancel(); entry.operation?.cancel() }
+        }
+    }
+
+    // One bounded event history feeds state readback and live subscribers; closing a connection removes its subscription.
+    private static let recentToolCallsCap = 50
+    private let eventDeliveryQueue = DispatchQueue(label: "com.nativeagent.bridge.events")
+
+    /// Pre-serialize JSON-compatible event payloads for strict-concurrency Sendable transport without losing structured access.
+    // The bridge forwards a Foundation JSON payload of [String: Any].
+    struct BridgeEvent: @unchecked Sendable {
+        let seq: UInt64
+        let timestamp: Date
+        let kind: String
+        let payload: [String: Any]
+
+        var asJSON: [String: Any] {
+            var obj: [String: Any] = [
+                "seq": seq,
+                "timestamp": NativeTimestampFormat.plainZulu(timestamp),
+                "kind": kind,
+            ]
+            for (k, v) in payload { obj[k] = v }
+            return obj
+        }
+    }
+
+    /// Live SSE and reconnect backfill must use identical framing.
+    static func eventStreamFrame(for event: BridgeEvent) throws -> Data {
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: event.asJSON), as: UTF8.self)
+        return Data("data: \(json)\n\n".utf8)
+    }
+
+    /// State callers receive bounded values, never mutable event-ring access.
+    public func recentEventPayloads() -> [[String: Any]] {
+        let recent = state.withLock { $0.recentToolCalls }
+        return recent.map { $0.asJSON }
+    }
+
+    /// A returned envelope proves dispatch completed, not that the requested operation succeeded. Share chat's exact classification; do not turn
+    /// queued/approval/unknown results into success or retain result content.
+    public func publishToolResultEvent(name: String, surface: String, result: JSONValue, durationMs: Int) {
+        let reply = ToolResult(result)
+        let outcome = reply.outcome
+        let ok: Any
+        switch outcome {
+        case .succeeded: ok = true
+        case .failed, .refused, .cancelled, .timeout: ok = false
+        case .unknown: ok = NSNull()
+        }
+        publishEvent(kind: "tool", payload: [
+            "name": name, "surface": surface, "ok": ok,
+            "resultClass": outcome.rawValue, "dispatchCompleted": true,
+            "durationMs": durationMs,
+        ])
+    }
+
+    /// Omit absent debug fields rather than encoding null so reset and clear events stay minimal.
+    public func publishOrganismDebugEvent(
+        status: String,
+        scenario: String? = nil,
+        ttlSeconds: Int? = nil
+    ) {
+        var payload: [String: Any] = ["status": status]
+        if let scenario { payload["scenario"] = scenario }
+        if let ttlSeconds { payload["ttlSeconds"] = ttlSeconds }
+        publishEvent(kind: "organism_debug", payload: payload)
+    }
+
+    public var token: String { state.withLock { $0.token } }
+    public var activePort: UInt16 { state.withLock { $0.activePort } }
+
+    // Build the Sendable turn client and dispatcher off the main actor on first use.
+    struct Clients {
+        var message: ClaudeBridgeMessageRuntime?
+        var tool: (any ToolDispatchClient)?
+    }
+    let clients = Mutex(Clients())
+
+    // MARK: - Token storage
+
+    private var configDir: URL {
+        AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: host.dataRoot)
+    }
+
+    private var tokenFileURL: URL {
+        configDir.appendingPathComponent("token")
+    }
+
+    private var descriptorFileURL: URL {
+        configDir.appendingPathComponent("bridge.json")
+    }
+
+    private func writeDiscoveryFiles(token: String, port: UInt16) throws {
+        func checked(_ url: URL, _ operation: () throws -> Void) throws {
+            do { try operation() }
+            catch {
+                throw NSError(domain: "NativeAgent.BridgeDiscovery", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "\(url.path): \(error.localizedDescription)", NSUnderlyingErrorKey: error])
+            }
+        }
+        try checked(configDir) {
+            try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: configDir.path)
+        }
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "host": "127.0.0.1",
+            "port": Int(port),
+            "url": "http://127.0.0.1:\(port)",
+            "token": token,
+            "processIdentifier": ProcessInfo.processInfo.processIdentifier,
+            "writtenAt": NativeTimestampFormat.plainZulu(Date()),
+        ]
+        let descriptor = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
+        try checked(tokenFileURL) { try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(token.utf8), to: tokenFileURL) }
+        try checked(descriptorFileURL) { try SwiftNativePersistenceCore.writeDataAtomicDurable(descriptor, to: descriptorFileURL) }
+        // Peers receive only the address and authenticate with their own contact secret.
+        let peerDir = AgentHostDirectory.peerDescriptorDirectory(dataRoot: host.dataRoot)
+        try checked(peerDir) {
+            try FileManager.default.createDirectory(at: peerDir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: peerDir.path)
+        }
+        let peerDescriptor = try JSONSerialization.data(
+            withJSONObject: ["schemaVersion": 1, "url": "http://127.0.0.1:\(port)"], options: [.prettyPrinted])
+        try checked(peerDescriptorFileURL) { try SwiftNativePersistenceCore.writeDataAtomicDurable(peerDescriptor, to: peerDescriptorFileURL) }
+    }
+
+    private var peerDescriptorFileURL: URL {
+        URL(fileURLWithPath: AgentHostDirectory.bridgeDescriptorPath(dataRoot: host.dataRoot))
+    }
+
+    private func removeDiscoveryFiles() {
+        _ = tokenFileURL.path.withCString { unsafe Darwin.unlink($0) }
+        _ = peerDescriptorFileURL.path.withCString { unsafe Darwin.unlink($0) }
+        _ = descriptorFileURL.path.withCString { unsafe Darwin.unlink($0) }
+    }
+
+    // MARK: - Lifecycle
+
+    /// Bind the install's fixed port; admit work only after its checked descriptors are published.
+    public func startServer() async {
+        await Task.detached(priority: .background) { [weak self] in
+            self?.startSync()
+        }.value
+    }
+
+    /// Bootstrap synchronously because a background cooperative task can remain unscheduled during cold launch.
+    public func startSyncForBootstrap() {
+        nativeLog("[claude-bootstrap] startSyncForBootstrap entered — invoking startSync")
+        startSync()
+    }
+
+    /// Retire listeners, connections and discovery files together; repeated stop is safe.
+    public func stop() {
+        teardown(token: nil)
+    }
+
+    /// A listener's token fences retirement; explicit stop also closes the listener.
+    private func teardown(token: String?) {
+        guard let (entries, retiringToken) = state.withLock({ held -> ([ConnectionEntry], String)? in
+            guard token == nil || held.token == token else { return nil }
+            let entries = Array(held.connections.values)
+            let retiringToken = held.token
+            held.connections.removeAll()
+            held.token = ""
+            held.activePort = 0
+            updateContactLifecycle(&held, active: false)
+            held.eventSubscribers.removeAll()
+            if token == nil { bridgeListener.stop() }
+            removeDiscoveryFiles()
+            return (entries, retiringToken)
+        }) else { return }
+        retireRequests(token: retiringToken)
+        for entry in entries {
+            entry.conn.cancel()
+        }
+    }
+
+    private func startSync() {
+        // Keep completion return infrastructure resident; loopback binding, a private launch bearer and ordinary Trust gates own authority.
+        let alreadyRunningOrStarting = state.withLock { bridgeListener.isActive || !$0.token.isEmpty }
+        nativeLog(
+            "[ClaudeBridge] startSync entered (state=%@)",
+            alreadyRunningOrStarting ? "already-running-or-starting" : "idle"
+        )
+        guard !alreadyRunningOrStarting else { return }
+        installAgentLivePublisher()
+
+        guard let tk = BridgeCore.generateToken() else {
+            nativeLog("[ClaudeBridge] failed to generate token")
+            return
+        }
+        let started = state.withLock { held -> Bool? in
+            guard !bridgeListener.isActive, held.token.isEmpty else { return nil }
+            held.token = tk
+            held.activePort = 0
+            held.discoveryPublicationFailure = nil
+            updateContactLifecycle(&held, active: false)
+            removeDiscoveryFiles()
+            return bridgeListener.start(
+                onReady: { [weak self] port in
+                    self?.handleListenerReady(token: tk, port: port)
+                },
+                onConnection: { [weak self] connection in
+                    guard let self else {
+                        connection.cancel()
+                        return
+                    }
+                    self.accept(connection)
+                },
+                onTerminated: { [weak self] in
+                    self?.teardown(token: tk)
+                }
+            )
+        }
+        if started == false {
+            teardown(token: tk)
+        }
+    }
+
+    private func handleListenerReady(token: String, port: UInt16) {
+        let publication = state.withLock { held -> (current: Bool, failure: String?) in
+            guard held.token == token else { return (false, nil) }
+            do { try writeDiscoveryFiles(token: token, port: port) }
+            catch {
+                let detail = """
+                    Bridge discovery publication failed at \(configDir.path): \(error.localizedDescription). Repair the named file error and start the \
+                    bridge again.
+                    """
+                held.discoveryPublicationFailure = detail
+                held.activePort = 0
+                updateContactLifecycle(&held, active: false)
+                removeDiscoveryFiles()
+                return (true, detail)
+            }
+            held.discoveryPublicationFailure = nil
+            held.activePort = port
+            held.startedAt = Date()
+            updateContactLifecycle(&held, active: true)
+            return (true, nil)
+        }
+        guard publication.current else { return }
+        if let failure = publication.failure {
+            nativeLog("[ClaudeBridge] %@", failure)
+            bridgeListener.stop()
+            teardown(token: token)
+            return
+        }
+        nativeLog("[ClaudeBridge] listening on 127.0.0.1:%d", Int(port))
+    }
+
+    private func accept(_ conn: NWConnection) {
+        guard BridgeCore.endpointIsLoopback(conn.endpoint) else { conn.cancel(); return }
+        guard state.withLock({ !$0.token.isEmpty && $0.activePort != 0 }) else { conn.cancel(); return }
+        let key = ObjectIdentifier(conn)
+        let admitted = state.withLock { held in
+            guard held.connections.count < 64, !held.token.isEmpty, held.activePort != 0 else { return false }
+            held.connections[key] = ConnectionEntry(conn: conn)
+            return true
+        }
+        guard admitted else { conn.cancel(); return }
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .cancelled, .failed:
+                self?.state.withLock { held in
+                    held.connections.removeValue(forKey: key)
+                    held.eventSubscribers.removeValue(forKey: key)
+                }
+                self?.retireRequests(connection: key)
+            default: break
+            }
+        }
+        conn.start(queue: .global(qos: .userInitiated))
+        BridgeCore.readRequest(conn, buffered: Data(), maxBodyBytes: Self.maxRequestBodyBytes, server: self)
+    }
+
+    // MARK: - Routing
+
+    public func route(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
+        let liveToken = token
+        if routeAgentContact(conn: conn, method: method, path: path, headers: headers, body: body) { return }
+        // Constant-time authorization rejects an empty live token.
+        switch BridgeCore.authorize(authorizationHeader: headers["authorization"], liveToken: liveToken) {
+        case .serverStopping:
+            writeJSON(conn, status: 503, obj: ["error": "server_stopping"])
+            return
+        case .unauthorized:
+            writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
+            return
+        case .authorized:
+            break
+        }
+
+        let components = path.dropFirst().split(separator: "/", maxSplits: 1).map(String.init)
+        let lane = components.first ?? ""
+        let operation = components.count == 2 ? "/" + components[1] : path
+        let principal: AgentBridgePrincipal?
+        do { principal = try bridgeCallerPrincipal(headers: headers) }
+        catch {
+            nativeLog("Bridge caller identity store could not be read: %@", error.localizedDescription)
+            writeJSON(conn, status: 503, obj: ["error": "contact_identity_unavailable",
+                "detail": "The saved contacts could not be read. Repair agents/peers.json before using the bridge."])
+            return
+        }
+        if let peerID = principal?.peerID { AgentPeerStore(dataRoot: host.dataRoot).recordProof(peerID: peerID, inbound: true) }
+
+        switch operation {
+        case "/state":
+            guard method == "GET" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleState(conn: conn)
+        case "/message":
+            guard method == "POST" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleMessage(conn: conn, body: body, defaultSender: lane, principal: principal)
+        case "/tool":
+            guard method == "POST" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleTool(conn: conn, body: body, principal: principal)
+        case "/reply":
+            guard method == "POST",
+                  let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let session = json["session_id"] as? String,
+                  let request = json["request_id"] as? String,
+                  let principal else {
+                writeJSON(conn, status: 400, obj: ["error": "invalid_caller_result_request"])
+                return
+            }
+            let offset = json["offset"] == nil ? 0 : AgentContactRoutes.peerInteger(json["offset"])
+            let maxChars = json["max_chars"] == nil ? 8000 : AgentContactRoutes.peerInteger(json["max_chars"])
+            guard let offset, (0...1_048_576).contains(offset), let maxChars, (1...16000).contains(maxChars) else {
+                writeJSON(conn, status: 400, obj: ["error": "invalid_pagination",
+                    "detail": "offset is an integer from 0 through 1048576; max_chars from 1 through 16000."])
+                return
+            }
+            let tasks = self.tasks
+            Task {
+                let reply = await AgentContactRoutes.retainedReply(requestID: request, sessionID: session,
+                    taskID: AgentContactRoutes.taskID(requestID: request, sessionID: session, principal: principal),
+                        offset: offset, maxChars: maxChars,
+                    principal: principal, tasks: tasks)
+                let held: AgentContactHeldResponse
+                do { held = try AgentContactHeldResponse(principal: principal, dataRoot: host.dataRoot, via: "/" + lane + "/reply") }
+                catch { writeJSON(conn, status: 503, obj: AgentContactHeldResponse.failure(error, dataRoot: host.dataRoot)); return }
+                let fetched = AgentContactRoutes.fetched(reply.receipt, task: reply.task, tasks: tasks)
+                func respond(_ status: Int, _ object: [String: Any]) {
+                    writeJSON(conn, status: status, obj: held.adding(to: object),
+                        onSent: { fetched?(); held.settle(true) }, onFailed: { held.settle(false) })
+                }
+                if reply.task == nil, reply.receipt["status"] as? String != "ok" {
+                    if reply.receipt["evidence"] as? String == "canonical_task_unreadable" {
+                        respond(503, reply.receipt)
+                    } else {
+                        respond(404, ["status": "unavailable",
+                            "detail": "No retained result is available for this caller and request. Absence does not authorize resending.",
+                            "evidence": reply.receipt["evidence"] ?? NSNull()])
+                    }
+                    return
+                }
+                respond(200, reply.receipt)
+            }
+        case "/organism/debug":
+            guard method == "POST" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleOrganismDebug(conn: conn, body: body)
+        case "/events":
+            guard method == "GET" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleEventsStream(conn: conn)
+        default:
+            writeJSON(conn, status: 404, obj: ["error": "unknown_path", "path": path])
+        }
+    }
+
+
+    // MARK: - Activity event publisher
+
+    public func publishEvent(kind: String, payload: [String: Any], retain: Bool = true) {
+        state.withLock { held in
+            held.eventSeq += 1
+            let event = BridgeEvent(seq: held.eventSeq, timestamp: Date(), kind: kind, payload: payload)
+            if retain { held.recentToolCalls.append(event) }
+            if held.recentToolCalls.count > Self.recentToolCallsCap {
+                held.recentToolCalls.removeFirst(held.recentToolCalls.count - Self.recentToolCallsCap)
+            }
+            let subs = Array(held.eventSubscribers.values)
+            if !subs.isEmpty {
+                eventDeliveryQueue.async {
+                    let chunk: Data
+                    do { chunk = try Self.eventStreamFrame(for: event) }
+                    catch {
+                        nativeLog("Bridge event %@ could not be encoded: %@", event.kind, error.localizedDescription)
+                        for sub in subs { sub.cancel() }
+                        return
+                    }
+                    for sub in subs {
+                        sub.send(content: chunk, completion: .contentProcessed { _ in })
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleEventsStream(conn: NWConnection) {
+        // SSE must remain open without Content-Length.
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+        let hello = "event: hello\ndata: {\"connected\":true,\"recentToolCallsCap\":\(Self.recentToolCallsCap)}\n\n"
+        let initial = Data((headers + hello).utf8)
+        let key = ObjectIdentifier(conn)
+
+        // Register and enqueue the backfill under the same lock as live events. A publisher can only enqueue this subscriber's live sends after it.
+        state.withLock { held in
+            guard held.connections[key] != nil else { return }
+            let backfill = held.recentToolCalls
+            held.eventSubscribers[key] = conn
+            eventDeliveryQueue.async {
+                conn.send(content: initial, completion: .contentProcessed { _ in })
+                for event in backfill {
+                    do { conn.send(content: try Self.eventStreamFrame(for: event), completion: .contentProcessed { _ in }) }
+                    catch { nativeLog("Bridge event backfill could not be encoded: %@", error.localizedDescription); conn.cancel(); return }
+                }
+            }
+        }
+    }
+
+    // MARK: - HTTP response
+
+    public func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any], onSent: (@Sendable () -> Void)? = nil,
+                          onFailed: (@Sendable () -> Void)? = nil) {
+        BridgeCore.writeJSON(conn, status: status, obj: obj, onSent: onSent, onFailed: onFailed)
+    }
+}
+
+extension ClaudeBridgeRuntime {
+    func installAgentLivePublisher() {
+        Task {
+            await AgentConversationLiveHub.shared.setPublisher { [weak self] live in
+                self?.publishEvent(kind: "agent_live", payload: Self.agentLivePayload(live), retain: false)
+            }
+        }
+    }
+
+    static func agentLivePayload(_ live: AgentConversationLive) -> [String: Any] {
+        return [
+            "key": live.key, "recordId": live.recordID ?? NSNull(), "operationId": live.operationID ?? NSNull(),
+            "agent": live.agent, "messageId": live.messageID ?? NSNull(), "lane": live.lane,
+            "state": live.state, "streams": live.streams,
+            "startedAt": NativeTimestampFormat.plainZulu(live.startedAt), "lastActivityAt": NativeTimestampFormat.plainZulu(live.lastActivityAt),
+            "partialText": live.partial.map { NativeAgentSecretRedactor.redactText($0) } ?? NSNull(),
+            "partialChars": live.partialChars, "partialTruncated": live.partialTruncated,
+            "note": live.note.map { NativeAgentSecretRedactor.redactText($0) } ?? NSNull(),
+            "finishedAt": live.finishedAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
+        ]
+    }
+
+}
+
+extension ClaudeBridgeRuntime {
+    func handleState(conn: NWConnection) {
+        let workLatch = WorkLatch()
+        let workTask = startRequest(conn: conn, latch: workLatch, priority: .userInitiated) { [weak self] _ in
+            guard let self else { return }
+            let payload = await ClaudeBridgeReadout.statePayload(
+                dataRoot: self.host.dataRoot,
+                port: self
+            )
+            guard !Task.isCancelled else { return }
+            guard workLatch.claim() else { return }
+            self.writeJSON(conn, status: 200, obj: payload)
+        }
+        guard workTask != nil else { writeJSON(conn, status: 503, obj: ["error": "server_stopping_or_busy"]); return }
+    }
+
+
+    public var preferredPersona: String? { host.preferredPersona }
+    public var preferredSessionID: String? { host.preferredSessionID }
+    public var cognition: NativeCognitionRuntime? { host.cognition }
+    public var contextFlow: NativeContextFlowRuntime { host.contextFlow }
+
+    public func toolClient(verifiedSessionID: String?) -> any ToolDispatchClient {
+        if let verifiedSessionID { return host.toolClient(verifiedSessionID: verifiedSessionID) }
+        return clients.withLock { clients in
+            if let client = clients.tool { return client }
+            let client = host.toolClient(verifiedSessionID: nil)
+            clients.tool = client
+            return client
+        }
+    }
+    private func routeAgentContact(conn: NWConnection, method: String, path: String,
+                                   headers: [String: String], body: Data) -> Bool {
+        AgentContactRoutes(token: { self.token }, port: { self.activePort },
+            tasks: { self.tasks }, receiveGrok: { reply, principal, root in
+                try await self.host.receiveGrok(reply, principal: principal, dataRoot: root)
+            }).route(conn: conn, method: method, path: path, headers: headers, body: body, dataRoot: host.dataRoot)
+    }
+}
+
+public extension ClaudeBridgeRuntimePort {
+    func activeSessionID(dataRoot: URL) throws -> String? {
+        try ClaudeBridgeReadout.readBridgeActiveSession(dataRoot: dataRoot, preferred: { self.preferredSessionID }).id
+    }
+    func activePersona(dataRoot: URL) throws -> String? {
+        try ClaudeBridgeReadout.readActivePersona(dataRoot: dataRoot, preferred: preferredPersona)
+    }
+}

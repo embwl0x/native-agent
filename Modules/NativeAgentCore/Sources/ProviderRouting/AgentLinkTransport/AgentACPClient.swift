@@ -1,0 +1,946 @@
+import Darwin
+import Dispatch
+import Foundation
+import SenseCore
+import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
+import Synchronization
+// Blueprint: | `AgentACPClient.swift` | ACP turns and retained connections; shared memory pressure releases idle resumable sessions first, preserving restoration outcomes |
+
+private let agentLinkLog = ModuleLog(category: "AgentLinkTransport")
+
+/// EOF cannot prove a prompt response; sends never retry, launch a shell or grant optional services or permissions.
+public actor AgentACPClient {
+    package typealias Permission = @Sendable (JSONValue) async throws -> Bool
+    package typealias Update = @Sendable (JSONValue) async -> Void
+    package struct Reply: Sendable {
+        package let sessionID: String
+        package let text: String
+        package let stopReason: String
+        package let continued: Bool
+        package var prompt: String? = nil
+        /// The model the agent said its session uses, when it says.
+        package var model: String? = nil
+        /// Said when the session runs in a mode other than the recipe's, because the recipe's is not offered.
+        package var modeNote: String? = nil
+        package var completed: Bool { stopReason == "end_turn" }
+    }
+    public enum Failure: String, Error, LocalizedError {
+        case unavailable, executableChanged, interrupted, appQuit, invalidResponse, timedOut, tooLarge, busy, sessionUnavailable, signInRequired
+        case initializationTimedOut, sessionStartupTimedOut, modeSetupTimedOut
+        public var errorDescription: String? {
+            switch self {
+            case .busy: "This conversation is already answering. Wait for that reply before sending another message."
+            case .sessionUnavailable: """
+                The earlier conversation could not be verified. No message was sent. Start a new conversation explicitly if you want to continue without \
+                its context.
+                """
+            case .unavailable: "The other agent could not start. Check its installation and sign-in."
+            case .signInRequired: """
+                The other agent is not signed in to its own service, so it would not go on. The person signs it in once in its own app or terminal \
+                (for a command-line agent, its login command); then the conversation continues where it was.
+                """
+            case .executableChanged: "The approved program changed or is missing. Review a fresh connection approval. Nothing ran."
+            case .interrupted: "The other agent stopped before finishing. Do not resend automatically."
+            case .appQuit: "The app quit before the other agent finished, which ended its turn. Nothing was resent."
+            case .invalidResponse: "The other agent sent an unreadable answer. Completion is not confirmed."
+            case .timedOut: "The other agent did not finish after prompt delivery began. Delivery and completion are unconfirmed. Do not resend automatically."
+            case .initializationTimedOut: """
+                The other agent timed out during connection initialization. Your message was not sent. Check that its CLI starts and is signed in before \
+                explicitly reconnecting.
+                """
+            case .sessionStartupTimedOut: """
+                The other agent timed out while opening or restoring its conversation. Your message was not sent. Check its session startup, model \
+                availability, and MCP connections before explicitly reconnecting.
+                """
+            case .modeSetupTimedOut: """
+                The other agent timed out while setting its approved conversation mode. Your message was not sent. Check its mode support before explicitly \
+                reconnecting.
+                """
+            case .tooLarge: "The other agent's answer exceeded the size limit. Completion is not confirmed."
+            }
+        }
+    }
+
+    /// Recipe disagreement before the prompt write proves nothing was sent.
+    package struct Mismatch: Error {
+        package let method: String
+        package let code: Int64?
+        package let detail: String
+    }
+
+    /// Unavailable permission evidence is not the person's refusal; preserve owner and cancellation-write errors.
+    package struct PermissionUnavailable: Error, LocalizedError {
+        package let cause: any Error
+        package var settlementFailure: String? = nil
+        package var errorDescription: String? {
+            "The permission decision was unavailable: \(cause.localizedDescription). Completion is unconfirmed; do not resend automatically."
+                + (settlementFailure.map { " Peer cancellation was not confirmed: " + $0 } ?? "")
+        }
+    }
+
+    /// Only startup timeouts can prove that no prompt write was attempted.
+    package static func startupTimeoutReceipt(_ error: any Error) -> [String: JSONValue]? {
+        guard let failure = error as? Failure else { return nil }
+        let phase: String
+        switch failure {
+        case .initializationTimedOut: phase = "initialization"
+        case .sessionStartupTimedOut: phase = "session_startup"
+        case .modeSetupTimedOut: phase = "mode_setup"
+        default: return nil
+        }
+        return ["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
+                "phase": .string(phase), "reason": .string("connection_startup_timeout"),
+                "detail": .string(failure.localizedDescription)]
+    }
+
+    private var startupTimeout: Failure = .initializationTimedOut
+    private var processID: pid_t = 0
+    private let input = Pipe()
+    private let output = Pipe()
+    private final class PendingRequest {
+        let done = ScopedWaiter()
+        var result: Result<JSONValue, Error>?
+    }
+    private var pending: [Int64: PendingRequest] = [:]
+
+    private func complete(_ request: PendingRequest, _ result: Result<JSONValue, Error>) {
+        request.result = result
+        request.done.resume()
+    }
+    private var permissions: [String: (JSONValue, Task<Void, Never>)] = [:]
+    private var nextID: Int64 = 0
+    private var sessionID: String?
+    package var currentSessionID: String? { sessionID }
+    private var newSessionRequestID: Int64?
+    private var failure: (any Error)?
+    private var text = ""
+    private var replayedPrompt: String?
+    private var peerCredential: String?
+    private var receivedBytes = 0
+    /// A bounded turn caps what it reads; a job's turn runs to its own end.
+    private var bounded = true
+    private var permission: Permission?
+    private var update: Update?
+    private var reader: Task<Void, Never>?
+    private var pipeReader: AgentACPPipeReader?
+    private var deadline: Task<Void, Never>?
+    private var deadlineGeneration = 0
+    /// The watch of the call the current turn serves, and the running program attached to it.
+    private var life: TurnDeadline?
+    private var lifeID: UUID?
+    private var started = false
+    private var closing = false
+    private nonisolated let endedFlag = Atomic<Bool>(false)
+
+    /// Whether this connection has ended: its program exited, its pipe failed, or it was closed. Readable without waiting on the connection.
+    package nonisolated var hasEnded: Bool { endedFlag.load(ordering: .acquiring) }
+    private var tree: ProcessTreeSnapshot?
+    private var cleanup: Task<String?, Never>?
+    private var terminationFailure: String?
+    private var requiredMode: String?
+    private var deniedPermission = false
+    private var prompting = false
+    /// A written prompt belongs to the peer's turn; callers must not treat its later failure as a failed send.
+    package private(set) var delivered = false
+    /// What the agent said in the current turn so far: a turn that ends in an error still shows the agent's own words.
+    package var said: String { text }
+    private var active = false
+    private var restoredHistory = false
+    private var replayingPrompt = false
+    private var initialized: JSONValue?
+    private var advertised: [String]?
+    /// The mode this session runs in, picked from the agent's own offer; nil when it offers none.
+    private var chosenMode: String?
+    private var modeNote: String?
+
+    /// How much a mode lets the agent do without asking, read from its name: 0 asks (ask, default, plan, chat), 1 edits on its own
+    /// (accept edits), 2 acts on its own (auto, yolo, bypass, don't ask).
+    static func latitude(_ mode: String) -> Int {
+        let name = mode.lowercased()
+        if ["yolo", "bypass", "dont_ask", "dontask", "don't", "never", "danger", "full", "auto"].contains(where: name.contains) { return 2 }
+        if ["accept", "edit", "write"].contains(where: name.contains) { return 1 }
+        return 0
+    }
+
+    package nonisolated let dataRoot: URL
+    package init(dataRoot: URL) { self.dataRoot = dataRoot.standardizedFileURL }
+
+    var canRestoreSession: Bool {
+        let capabilities = initialized?.objectValue?["agentCapabilities"]?.objectValue
+        return capabilities?["loadSession"] == .bool(true)
+            || capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
+    }
+
+    /// Without a message, learn the advertised handshake and mode without sending a prompt.
+    /// No clock ends a turn: `life` is the watch of the call the turn serves. The agent's running program is attached to it as what the call
+    /// waits on, and every line the agent writes is life of the call, so a quiet agent is shown waiting and only its exit, Stop or a protocol
+    /// fault ends the turn. `capped` limits what a turn reads; a job's turn runs to its own end.
+    package func turn(executable: String, arguments: [String], directory: URL,
+              environment: [String: String], message: String?, peerCredential: String, mcpServers: [JSONValue] = [],
+              line: AgentHostACP,
+              conversationID: String? = nil,
+              approvedExecutable: AgentACPExecutable? = nil,
+              requireVerifiedRestore: Bool = false,
+              capped: Bool = true, life: TurnDeadline? = nil, named: String = "the other agent",
+              permission: @escaping Permission,
+              update: @escaping Update = { _ in },
+              sessionOpened: @escaping @Sendable (String) async throws -> Void = { _ in }) async throws -> Reply {
+        guard !active else { throw Failure.busy }
+        guard !closing, failure == nil else { throw Failure.interrupted }
+        if started { guard conversationID == sessionID else { throw Failure.sessionUnavailable } }
+        active = true
+        defer {
+            active = false; prompting = false; self.permission = nil; self.update = nil; self.peerCredential = nil
+            if let lifeID { self.life?.detach(lifeID) }
+            self.life = nil; lifeID = nil
+        }
+        text = ""; replayedPrompt = nil; receivedBytes = 0; deniedPermission = false; restoredHistory = false; replayingPrompt = false
+        requiredMode = nil; chosenMode = nil; modeNote = nil; delivered = false
+        bounded = capped
+        startupTimeout = .initializationTimedOut
+        self.permission = permission
+        self.update = update
+        self.peerCredential = peerCredential
+        self.life = life
+        do {
+        let reply = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let initialized = try await handshake(executable: executable, arguments: arguments, directory: directory,
+                environment: environment, approvedExecutable: approvedExecutable, timeout: nil)
+            // What the call waits on from here is this running program: alive while its process group runs, dead once it has exited.
+            if let life, lifeID == nil, let group = OwnedProcessGroup.owner(processID) {
+                lifeID = life.attach(group.callLife(what: named))
+            }
+            startupTimeout = .sessionStartupTimedOut
+            let params: [String: JSONValue] = ["cwd": .string(directory.path), "mcpServers": .array(mcpServers)]
+            var restored: JSONValue? = sessionID != nil && conversationID == sessionID ? .object([:]) : nil
+            var opened = "session/new"
+            if let conversationID, restored == nil {
+                guard !conversationID.isEmpty, conversationID.utf8.count <= 1024 else { throw Failure.invalidResponse }
+                let capabilities = initialized.objectValue?["agentCapabilities"]?.objectValue
+                let method = requireVerifiedRestore && capabilities?["loadSession"] == .bool(true) ? "session/load"
+                    : capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
+                    ? "session/resume" : capabilities?["loadSession"] == .bool(true) ? "session/load" : nil
+                // Continuing requires restoration; a fresh session needs an explicit send without its id.
+                guard method != nil else { throw Failure.sessionUnavailable }
+                if let method {
+                    opened = method
+                    // History may arrive before the load/resume response.
+                    sessionID = conversationID
+                    do {
+                        let candidate = try await request(method, params.merging(["sessionId": .string(conversationID)]) { _, new in new })
+                        if let returnedID = candidate.objectValue?["sessionId"], returnedID != .string(conversationID) {
+                            throw Failure.sessionUnavailable
+                        }
+                        guard !requireVerifiedRestore || restoredHistory || candidate.objectValue?["sessionId"] == .string(conversationID) ||
+                            candidate.objectValue?["_meta"]?.objectValue?["hermes"]?.objectValue?[
+                                "sessionProvenance"]?.objectValue?["acpSessionId"] == .string(conversationID) else {
+                            throw Failure.sessionUnavailable
+                        }
+                        restored = candidate
+                    } catch {
+                        try Task.checkCancellation()
+                        if let failure { throw failure }
+                        // Signing in continues this conversation; it is never a reason to abandon it.
+                        if (error as? Failure) == .signInRequired { throw error }
+                        // Only -32601/-32602 prove recipe mismatch; other errors mean restoration failed.
+                        if let refused = error as? Mismatch, [-32601, -32602].contains(refused.code) { throw refused }
+                        throw Failure.sessionUnavailable
+                    }
+                }
+            }
+            let continued = restored != nil
+            let session: JSONValue
+            let id: String
+            if let restored, let conversationID {
+                session = restored
+                id = conversationID
+            } else {
+                sessionID = nil
+                session = try await request("session/new", params)
+                guard case .string(let newID)? = session.objectValue?["sessionId"] else { throw Failure.invalidResponse }
+                id = newID
+            }
+            guard !id.isEmpty, id.utf8.count <= 1024 else {
+                throw Failure.invalidResponse
+            }
+            sessionID = id
+            let model = session.objectValue?["models"]?.objectValue?["currentModelId"]?.stringValue
+            try await sessionOpened(id)
+            startupTimeout = .modeSetupTimedOut
+            let available = session.objectValue?["modes"]?.objectValue?["availableModes"]
+            // A continued session need not restate modes, so retain the approved recipe's.
+            let now: [String]? = continued && available == nil ? nil : {
+                guard case .array(let modes)? = available else { return [] }
+                return modes.compactMap { if case .string(let mode)? = $0.objectValue?["id"] { mode } else { nil } }
+            }()
+            // The mode is picked from what the agent offers: the recipe's when offered, else the offered mode that asks the most (the
+            // agent's current one among equals), never a more permissive one silently. An agent that offers none runs as it is; a mode it
+            // does not offer is never sent, and `learned` writes the pick to the recipe.
+            if let now {
+                advertised = now
+                let current = session.objectValue?["modes"]?.objectValue?["currentModeId"]?.stringValue
+                chosenMode = now.contains(line.permissionMode) ? line.permissionMode
+                    : now.min { (Self.latitude($0), $0 == current ? 0 : 1) < (Self.latitude($1), $1 == current ? 0 : 1) }
+                if let chosenMode, chosenMode != line.permissionMode {
+                    modeNote = "Ran in its \(chosenMode) mode: the recipe's \(line.permissionMode) is not one it offers ("
+                        + now.joined(separator: ", ") + ")."
+                        + (Self.latitude(chosenMode) > Self.latitude(line.permissionMode)
+                            ? " Every mode it offers lets it act on more without asking than \(line.permissionMode) would." : "")
+                }
+            } else {
+                // A continued session need not restate its modes: the recipe's verified ones stand.
+                chosenMode = line.modes?.contains(line.permissionMode) == true ? line.permissionMode : nil
+            }
+            if let chosenMode, message != nil || conversationID == nil {
+                requiredMode = chosenMode
+                _ = try await request("session/set_mode", ["sessionId": .string(id), "modeId": .string(chosenMode)])
+            }
+            guard let message else {
+                return Reply(sessionID: id, text: text, stopReason: "dry_run", continued: continued,
+                    prompt: replayedPrompt, modeNote: requiredMode == nil ? nil : modeNote)
+            }
+            text = ""
+            // Conservative boundary: any attempted prompt write makes delivery uncertain.
+            prompting = true; delivered = true
+            let response = try await request("session/prompt", ["sessionId": .string(id),
+                "prompt": .array([.object(["type": .string("text"), "text": .string(message)])])])
+            guard case .string(let reason)? = response.objectValue?["stopReason"],
+                  ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"].contains(reason) else { throw Failure.invalidResponse }
+            // An agent that ends its turn over a permission request it stopped waiting on has withdrawn it: its card goes, and it was not granted.
+            withdrawOpenPermissions()
+            try Task.checkCancellation()
+            return Reply(sessionID: id, text: text, stopReason: deniedPermission ? "permission_denied" : reason,
+                continued: continued, model: model, modeNote: modeNote)
+        } onCancel: { Task { await self.cancel(error: CancellationError()) } }
+        deadlineGeneration += 1
+        deadline?.cancel(); deadline = nil
+        return reply
+        } catch {
+            let reportedError: any Error = (error as? Failure == .timedOut && !prompting) ? startupTimeout : error
+            shutdown()
+            await retainCleanupResult()
+            reader?.cancel()
+            try? output.fileHandleForReading.close()
+            if let terminationFailure {
+                if var unavailable = reportedError as? PermissionUnavailable {
+                    unavailable.settlementFailure = [unavailable.settlementFailure, terminationFailure].compactMap { $0 }.joined(separator: "; ")
+                    throw unavailable
+                }
+                throw ToolFailureError(reportedError.localizedDescription + " " + terminationFailure, effects: .unknown,
+                    owner: "ACP process group", code: "process_termination_incomplete",
+                    instruction: "Reconcile the original run and repair its retained process group before sending again.", recovery: .repair)
+            }
+            throw reportedError
+        }
+    }
+
+    /// Fresh spawns and retained exchanges verify the program; initialize must prove JSON-RPC 2.0, request identity and ACP 1.
+    private func handshake(executable: String, arguments: [String], directory: URL, environment: [String: String],
+                           approvedExecutable: AgentACPExecutable?, timeout: Duration?) async throws -> JSONValue {
+        if started, let approvedExecutable {
+            do { try approvedExecutable.verify() } catch { throw Failure.executableChanged }
+        }
+        if !started {
+            started = true
+            // The sole supported wrapper must receive the approved path.
+            if let approvedExecutable {
+                guard executable == approvedExecutable.path ||
+                    (executable == "/usr/bin/sandbox-exec" && arguments.count >= 3 &&
+                     arguments[0] == "-p" && arguments[2] == approvedExecutable.path)
+                else { throw Failure.unavailable }
+            }
+            processID = try AgentACPProcess.spawn(executable: executable, arguments: arguments,
+                directory: directory, environment: environment, input: input, output: output,
+                approvedExecutable: approvedExecutable)
+            tree = ProcessTreeReaper.snapshot(rootPID: processID)
+            // Close parent copies of child ends so EOF is observable.
+            try? input.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+            let pipeReader = try AgentACPPipeReader(handle: output.fileHandleForReading)
+            self.pipeReader = pipeReader
+            try? output.fileHandleForReading.close()
+            reader = Task { [weak self] in
+                do {
+                    var line = Data()
+                    for try await chunk in pipeReader.chunks {
+                        pipeReader.consumed()
+                        try Task.checkCancellation()
+                        for byte in chunk {
+                            if byte == 10 {
+                                guard !line.isEmpty else { throw Failure.invalidResponse }
+                                let value = try JSONValue.parse(line)
+                                line.removeAll(keepingCapacity: true)
+                                await self?.receive(value)
+                            } else {
+                                guard line.count < 1_048_576 else { throw Failure.tooLarge }
+                                line.append(byte)
+                            }
+                        }
+                    }
+                    await self?.fail(Failure.interrupted)
+                } catch { await self?.fail(error) }
+            }
+        }
+        // Only discovery's probe of an unknown program bounds its handshake; a turn's handshake waits on the program's life.
+        if let timeout { arm(min(timeout, .seconds(30))) }
+        if initialized == nil { initialized = try await request("initialize", [
+            "protocolVersion": .int(1), "clientCapabilities": .object([:]),
+            "clientInfo": .object(["name": .string("nativeagent"), "version": .string("1")])]) }
+        guard let initialized else { throw Failure.invalidResponse }
+        guard initialized.objectValue?["protocolVersion"] == .int(1) else {
+            throw Mismatch(method: "initialize", code: nil, detail: "it speaks ACP version "
+                + ((try? initialized.objectValue?["protocolVersion"]?.serialize(pretty: false)) ?? "none") + "; this app speaks 1")
+        }
+        return initialized
+    }
+
+    /// Discovery runs only the handshake, then stops the program without sending a prompt.
+    package func initialize(executable: String, arguments: [String], directory: URL, environment: [String: String],
+                            approvedExecutable: AgentACPExecutable, timeout: Duration) async throws -> JSONValue {
+        guard !active, !started else { throw Failure.busy }
+        active = true
+        defer { active = false }
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await handshake(executable: executable, arguments: arguments, directory: directory,
+                                    environment: environment, approvedExecutable: approvedExecutable, timeout: timeout)
+            } onCancel: { Task { await self.cancel(error: CancellationError()) } }
+            await close()
+            if let terminationFailure {
+                throw ToolFailureError(terminationFailure, effects: .unknown, owner: "ACP process group",
+                    code: "process_termination_incomplete", instruction: "Repair the retained process group before reconnecting.", recovery: .repair)
+            }
+            return result
+        } catch { await close(); throw error }
+    }
+
+    private func arm(_ duration: Duration) {
+        deadlineGeneration += 1
+        let generation = deadlineGeneration
+        deadline?.cancel()
+        deadline = Task { [weak self] in
+            do { try await Task.sleep(for: duration) } catch { return }
+            await self?.expire(generation)
+        }
+    }
+
+    package func learned(_ line: AgentHostACP) -> AgentHostACP {
+        var line = line
+        let capabilities = initialized?.objectValue?["agentCapabilities"]?.objectValue
+        if case .int(let version)? = initialized?.objectValue?["protocolVersion"] { line.protocolVersion = Int(version) }
+        if let advertised, line.modes.map(Set.init) != Set(advertised) { line.modes = advertised }
+        if let chosenMode { line.permissionMode = chosenMode }
+        if initialized != nil {
+            line.supportsLoad = capabilities?["loadSession"] == .bool(true)
+            line.supportsResume = capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
+        }
+        return line
+    }
+
+    /// `appQuit` only from `closeAll`: the send it cuts off carries that origin.
+    package func close(_ error: Failure = .interrupted) async {
+        cancel(error: error)
+        shutdown()
+        await retainCleanupResult()
+        reader?.cancel()
+        try? output.fileHandleForReading.close()
+    }
+
+    private func retainCleanupResult() async {
+        guard let detail = await cleanup?.value else { return }
+        terminationFailure = detail
+        await RepairOwed.owe(dataRoot,
+            id: "acp-termination:" + String(processID), kind: .act,
+            operation: "agent.acp.termination:" + String(processID), owner: "ACP process group " + String(processID),
+            words: detail,
+            lever: "Reconcile the original agent run and repair the retained process group before reconnecting or repeating its work.").value
+    }
+
+    private func request(_ method: String, _ params: [String: JSONValue]) async throws -> JSONValue {
+        if let failure { throw failure }
+        try Task.checkCancellation()
+        nextID += 1
+        let id = nextID
+        if method == "session/new" { newSessionRequestID = id }
+        do {
+            let request = PendingRequest()
+            pending[id] = request
+            do { try write(.object(["jsonrpc": .string("2.0"), "id": .int(id),
+                                   "method": .string(method), "params": .object(params)])) }
+            catch { fail(error) }
+            let done = request.done
+            await Task { await done.park() }.value
+            return try request.result!.get()
+        } catch let refused as Mismatch { throw Mismatch(method: method, code: refused.code, detail: refused.detail) }
+    }
+
+    private func write(_ value: JSONValue) throws {
+        var bytes = try value.serializedData(pretty: false)
+        guard bytes.count <= 1_048_576 else { throw Failure.tooLarge }
+        bytes.append(10)
+        // A full pipe must not block timeout or cancellation handlers on this actor.
+        let fd = input.fileHandleForWriting.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0,
+              fcntl(fd, F_SETNOSIGPIPE, 1) == 0 else { throw Failure.interrupted }
+        let end = ContinuousClock.now.advanced(by: .seconds(1))
+        try unsafe bytes.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                guard ContinuousClock.now < end else { throw Failure.timedOut }
+                let count = unsafe Darwin.write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                if count > 0 { offset += count; continue }
+                if count < 0, errno == EINTR { continue }
+                guard count < 0, errno == EAGAIN else { throw Failure.interrupted }
+                var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                let ready = poll(&descriptor, 1, 20)
+                if ready < 0, errno != EINTR { throw Failure.interrupted }
+            }
+        }
+    }
+
+    private func receive(_ value: JSONValue) async {
+        guard failure == nil else { return }
+        // Every line the agent writes is life of the call its turn serves.
+        life?.moved()
+        do {
+            guard let object = value.objectValue, object["jsonrpc"] == .string("2.0") else { throw Failure.invalidResponse }
+            receivedBytes += (try value.serializedData(pretty: false)).count
+            guard !bounded || receivedBytes <= 8 * 1_048_576 else { throw Failure.tooLarge }
+            if case .string(let method)? = object["method"] {
+                let params = object["params"]?.objectValue ?? [:]
+                if method == "session/update" {
+                    guard object["id"] == nil, let event = params["update"] else { throw Failure.invalidResponse }
+                    let ours = sessionID != nil && params["sessionId"] == sessionID.map(JSONValue.string)
+                    guard prompting else {
+                        let user = ours && event.objectValue?["sessionUpdate"] == .string("user_message_chunk")
+                        defer { if ours { replayingPrompt = user } }
+                        if user {
+                            restoredHistory = true; text = ""
+                            let content = event.objectValue?["content"]?.objectValue
+                            let chunk = content?["type"] == .string("text") ? content?["text"]?.stringValue : nil
+                            replayedPrompt = replayingPrompt ? [replayedPrompt, chunk].compactMap { $0 }.joined() : chunk
+                        } else if ours, restoredHistory, event.objectValue?["sessionUpdate"] == .string("agent_message_chunk"),
+                                  let content = event.objectValue?["content"]?.objectValue,
+                                  content["type"] == .string("text"), case .string(let chunk)? = content["text"] {
+                            guard text.utf8.count + chunk.utf8.count <= 1_048_576 else { throw Failure.tooLarge }
+                            text += chunk
+                        }
+                        return
+                    }
+                    guard ours else { throw Failure.invalidResponse }
+                    if let requiredMode, event.objectValue?["sessionUpdate"] == .string("current_mode_update"),
+                       event.objectValue?["currentModeId"] != .string(requiredMode) {
+                        cancel(error: Failure.invalidResponse)
+                        return
+                    }
+                    if event.objectValue?["sessionUpdate"] == .string("agent_message_chunk"),
+                       let content = event.objectValue?["content"]?.objectValue,
+                       content["type"] == .string("text"), case .string(let chunk)? = content["text"] {
+                        guard text.utf8.count + chunk.utf8.count <= 1_048_576 else { throw Failure.tooLarge }
+                        text += chunk
+                    }
+                    await update?(liveEvent(event))
+                } else if let id = object["id"] {
+                    guard case .string = id else {
+                        if case .int = id { try handleRequest(method, id: id, params: params); return }
+                        throw Failure.invalidResponse
+                    }
+                    try handleRequest(method, id: id, params: params)
+                }
+                // A notification this client does not read (an agent's own extension, such as `_x.ai/…`) is not a fault.
+                return
+            }
+            guard case .int(let id)? = object["id"], let request = pending.removeValue(forKey: id) else {
+                throw Failure.invalidResponse
+            }
+            if let error = object["error"] {
+                let detail = (try? error.serialize(pretty: false)) ?? ""
+                if error.objectValue?["code"] == .int(-32000) {
+                    complete(request, .failure(Failure.signInRequired))
+                    return
+                }
+                if !prompting {
+                    let said: String = if case .string(let said)? = error.objectValue?["message"] { said } else { detail }
+                    if requiredMode != nil {
+                        complete(request, .failure(ToolFailureError(said, effects: .none, code: Failure.busy.rawValue, status: .refused)))
+                        return
+                    }
+                    let code: Int64? = if case .int(let code)? = error.objectValue?["code"] { code } else { nil }
+                    complete(request, .failure(Mismatch(method: "", code: code, detail: said + (code.map { " (\($0))" } ?? ""))))
+                    return
+                }
+                complete(request, .failure(ProviderFailure.Report(cause: .wire(detail), work: .outcomeUnknown)))
+            } else if let result = object["result"], result.objectValue != nil {
+                if id == newSessionRequestID, case .string(let session)? = result.objectValue?["sessionId"] {
+                    sessionID = session
+                }
+                complete(request, .success(result))
+            } else {
+                complete(request, .failure(Failure.invalidResponse))
+            }
+        } catch { fail(error) }
+    }
+
+    private func liveEvent(_ event: JSONValue) -> JSONValue {
+        guard case .object(var event) = event else { return event }
+        func redacted(_ value: JSONValue) -> JSONValue {
+            guard case .string(let value) = value else { return value }
+            return .string(AgentPeerHTTP.redactLiveText(value, token: peerCredential))
+        }
+        if event["sessionUpdate"] == .string("agent_message_chunk"),
+           case .object(var content)? = event["content"], content["type"] == .string("text") {
+            content["text"] = .string(AgentPeerHTTP.redactLiveText(text, token: peerCredential))
+            event["content"] = .object(content)
+        } else if event["sessionUpdate"] == .string("tool_call"), let title = event["title"] {
+            event["title"] = redacted(title)
+        } else if event["sessionUpdate"] == .string("plan"), case .array(let entries)? = event["entries"] {
+            event["entries"] = .array(entries.map { entry in
+                guard case .object(var entry) = entry, let content = entry["content"] else { return entry }
+                entry["content"] = redacted(content)
+                return .object(entry)
+            })
+        }
+        return .object(event)
+    }
+
+    private func handleRequest(_ method: String, id: JSONValue, params: [String: JSONValue]) throws {
+        guard method == "session/request_permission" else {
+            try write(.object(["jsonrpc": .string("2.0"), "id": id,
+                               "error": .object(["code": .int(-32601), "message": .string("This operation is not available.")])]))
+            return
+        }
+        guard prompting, params["sessionId"] == sessionID.map(JSONValue.string), sessionID != nil,
+              params["toolCall"]?.objectValue != nil, case .array(let options)? = params["options"],
+              permissions.count < 16 else { throw Failure.invalidResponse }
+        let key = String(decoding: try id.serializedData(pretty: false), as: UTF8.self)
+        guard permissions[key] == nil else { throw Failure.invalidResponse }
+        // Never choose allow_always, even if it is the agent's only allow option.
+        let allow = options.first { $0.objectValue?["kind"] == .string("allow_once") }?.objectValue?["optionId"]
+        let deny = options.first { $0.objectValue?["kind"] == .string("reject_once") }?.objectValue?["optionId"]
+        var preview = params
+        if let peerCredential, !peerCredential.isEmpty, var call = params["toolCall"]?.objectValue,
+           case .string(let title)? = call["title"] {
+            call["title"] = .string(title.replacingOccurrences(of: peerCredential, with: "[redacted]"))
+            preview["toolCall"] = .object(call)
+        }
+        let request = JSONValue.object(preview)
+        let task = Task { [weak self, permission] in
+            do {
+                guard let permission else {
+                    throw ToolFailureError("The ACP permission service is not mounted.", effects: .unknown,
+                        owner: "ACP permission service", tap: "Open NativeAgent", code: "agent_acp_permission_owner_unavailable",
+                        instruction: "Repair the permission service before starting another peer turn.")
+                }
+                let approved = try await permission(request)
+                guard !Task.isCancelled else { return }
+                await self?.permissionResult(key: key, selection: approved ? allow : deny, allowed: approved && allow != nil)
+            } catch {
+                guard !Task.isCancelled else { return }
+                await self?.permissionUnavailable(key: key, cause: error)
+            }
+        }
+        permissions[key] = (id, task)
+    }
+
+    private func withdrawOpenPermissions() {
+        guard !permissions.isEmpty else { return }
+        for (_, open) in permissions { open.1.cancel() }
+        permissions.removeAll()
+        deniedPermission = true
+    }
+
+    private func permissionResult(key: String, selection: JSONValue?, allowed: Bool) {
+        guard failure == nil, let (id, _) = permissions.removeValue(forKey: key) else { return }
+        if !allowed { deniedPermission = true }
+        do { try respondPermission(id: id, selection: selection) } catch { fail(error) }
+    }
+
+    private func permissionUnavailable(key: String, cause: any Error) {
+        guard failure == nil, permissions[key] != nil else { return }
+        cancel(error: PermissionUnavailable(cause: cause))
+    }
+
+    private func respondPermission(id: JSONValue, selection: JSONValue?) throws {
+        var outcome: [String: JSONValue] = ["outcome": .string("cancelled")]
+        if case .string(let option)? = selection { outcome = ["outcome": .string("selected"), "optionId": .string(option)] }
+        try write(.object(["jsonrpc": .string("2.0"), "id": id, "result": .object(["outcome": .object(outcome)])]))
+    }
+
+    /// ACP cancellation answers open permission requests as cancelled but keeps the session for the next message.
+    func requestCancel() -> Bool {
+        guard prompting, failure == nil, !closing, sessionID != nil else { return false }
+        do { try cancelSession(notify: write) } catch { return false }
+        return true
+    }
+
+    private func cancelSession(notify: (JSONValue) throws -> Void) throws {
+        var errors: [String] = []
+        if let sessionID {
+            do {
+                try notify(.object(["jsonrpc": .string("2.0"), "method": .string("session/cancel"),
+                                    "params": .object(["sessionId": .string(sessionID)])]))
+            } catch { errors.append("session/cancel: " + error.localizedDescription) }
+        }
+        for (_, (id, task)) in permissions {
+            task.cancel()
+            do { try respondPermission(id: id, selection: nil) }
+            catch { errors.append("permission cancellation: " + error.localizedDescription) }
+        }
+        permissions.removeAll()
+        guard errors.isEmpty else {
+            throw ToolFailureError(errors.joined(separator: "; "), effects: .unknown,
+                owner: "ACP connection", tap: "Agents → open the contact's conversation",
+                code: "agent_acp_cancellation_unconfirmed", instruction: "Inspect the original peer turn before sending again.", recovery: .reconcile)
+        }
+    }
+
+    /// A late timer must not kill a session that has advanced beyond the timed operation.
+    private func expire(_ generation: Int) {
+        guard generation == deadlineGeneration else { return }
+        cancel(error: Failure.timedOut)
+    }
+
+    private func cancel(error: any Error) {
+        guard failure == nil else { return }
+        do { if prompting { try cancelSession(notify: write) } }
+        catch let settlementError {
+            if var unavailable = error as? PermissionUnavailable {
+                unavailable.settlementFailure = settlementError.localizedDescription
+                fail(unavailable)
+            } else {
+                fail(ToolFailureError(error.localizedDescription + " Peer cancellation was not confirmed: " + settlementError.localizedDescription,
+                    effects: .unknown, owner: "ACP connection", tap: "Agents → open the contact's conversation",
+                    code: "agent_acp_cancellation_unconfirmed", instruction: "Inspect the original peer turn before sending again.", recovery: .reconcile))
+            }
+            return
+        }
+        fail(error)
+    }
+
+    private func fail(_ error: any Error) {
+        guard failure == nil else { return }
+        failure = error
+        let waiting = pending.values
+        pending.removeAll()
+        for request in waiting { complete(request, .failure(error)) }
+        shutdown()
+    }
+
+    private func shutdown() {
+        guard !closing else { return }
+        closing = true
+        endedFlag.store(true, ordering: .releasing)
+        deadline?.cancel(); deadline = nil
+        pipeReader?.cancel(); pipeReader = nil
+        reader?.cancel()
+        for (_, (_, task)) in permissions { task.cancel() }
+        permissions.removeAll()
+        try? input.fileHandleForWriting.close()
+        // Keep the leader waitable until group escalation ends so its PID/PGID cannot be reused.
+        let child = processID
+        let snapshot = tree.map { ProcessTreeReaper.snapshot(rootPID: $0.rootPID, retaining: $0) }
+        cleanup = Task.detached {
+            await AgentACPProcess.finish(child, snapshot: snapshot)
+        }
+    }
+}
+
+/// Per-process kernel readiness avoids an idle pipe starving other connections on Foundation's shared reader. One consumer preserves wire order and
+/// backpressure without blocking reads or per-chunk tasks.
+final class AgentACPPipeReader: Sendable {
+    let chunks: AsyncThrowingStream<Data, Error>
+    private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+    private let source: any DispatchSourceRead
+    private let fd: Int32
+    private let state = Mutex((bufferedChunks: 0, suspended: false))
+
+    init(handle: FileHandle) throws {
+        let owned = dup(handle.fileDescriptor)
+        guard owned >= 0 else { throw AgentACPClient.Failure.unavailable }
+        let flags = fcntl(owned, F_GETFL)
+        guard flags >= 0, fcntl(owned, F_SETFL, flags | O_NONBLOCK) == 0,
+              fcntl(owned, F_SETFD, FD_CLOEXEC) == 0 else {
+            Darwin.close(owned)
+            throw AgentACPClient.Failure.unavailable
+        }
+        fd = owned
+        let pair = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingOldest(16))
+        chunks = pair.stream; continuation = pair.continuation
+        source = DispatchSource.makeReadSource(fileDescriptor: owned,
+            queue: DispatchQueue(label: "nativeagent.acp.pipe.\(owned)", qos: .userInitiated))
+        source.setEventHandler { [weak self] in self?.drain() }
+        source.setCancelHandler { Darwin.close(owned) }
+        continuation.onTermination = { [weak self] _ in self?.cancel() }
+        source.resume()
+    }
+
+    func consumed() {
+        state.withLock {
+            $0.bufferedChunks -= 1
+            if $0.suspended { $0.suspended = false; source.resume() }
+        }
+    }
+
+    func cancel() {
+        state.withLock {
+            if $0.suspended { $0.suspended = false; source.resume() }
+            source.cancel()
+        }
+        continuation.finish()
+    }
+
+    deinit { cancel() }
+
+    private func drain() {
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let readable = state.withLock { state in
+                guard !source.isCancelled else { return false }
+                if state.bufferedChunks == 16 {
+                    state.suspended = true; source.suspend()
+                    return false
+                }
+                return true
+            }
+            guard readable else { return }
+            let count = buffer.withUnsafeMutableBytes { unsafe Darwin.read(fd, $0.baseAddress, $0.count) }
+            if count > 0 {
+                state.withLock { $0.bufferedChunks += 1 }
+                switch continuation.yield(Data(buffer.prefix(count))) {
+                case .enqueued: continue
+                case .dropped:
+                    continuation.finish(throwing: AgentACPClient.Failure.interrupted)
+                    cancel(); return
+                case .terminated: cancel(); return
+                @unknown default:
+                    continuation.finish(throwing: AgentACPClient.Failure.interrupted)
+                    cancel(); return
+                }
+            }
+            if count == 0 { cancel(); return }
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK { return }
+            continuation.finish(throwing: AgentACPClient.Failure.interrupted)
+            cancel(); return
+        }
+    }
+}
+
+/// Conversation processes stay owned until explicit release, replacement or idle memory-pressure release.
+package actor AgentACPConnections {
+    package static let shared = AgentACPConnections()
+    package struct Lease: Sendable { let key: String; let generation: UUID; package let client: AgentACPClient }
+    private struct Entry {
+        let client: AgentACPClient
+        let peer: String
+        let configuration: String
+        var generation: UUID = UUID()
+        var busy: Bool
+    }
+    private var entries: [String: Entry] = [:]
+    private var pressureObservation: Task<Void, Never>?
+
+    deinit { pressureObservation?.cancel() }
+
+    private func observePressure() {
+        guard pressureObservation == nil else { return }
+        let changes = MemoryPressureSense.changes
+        pressureObservation = Task { [weak self] in
+            for await level in changes {
+                guard !Task.isCancelled else { return }
+                await self?.releaseIdle(under: level)
+            }
+        }
+    }
+
+    private func releaseIdle(under level: MemoryPressureSense.Level) async {
+        guard level != .normal else { return }
+        let before = entries.count
+        defer { agentLinkLog("ACP memory pressure %@: %ld retained conversations before, %ld after", "\(level)", before, entries.count) }
+        var other: [(String, Entry)] = []
+        for (key, entry) in entries.filter({ !$0.value.busy }) {
+            if await entry.client.canRestoreSession {
+                await releaseIdle(key, generation: entry.generation, resumable: true)
+            } else if level == .critical {
+                other.append((key, entry))
+            }
+        }
+        for (key, entry) in other {
+            await releaseIdle(key, generation: entry.generation, resumable: false)
+        }
+    }
+
+    private func releaseIdle(_ key: String, generation: UUID, resumable: Bool) async {
+        // Capability reads and earlier closes suspend this actor: a newly leased or replaced entry is never ours to release.
+        guard let pressure = MemoryPressureSense.current,
+              pressure == .critical || (resumable && pressure == .warning),
+              let entry = entries[key], entry.generation == generation, !entry.busy else { return }
+        entries.removeValue(forKey: key)
+        agentLinkLog("ACP contact %@: released under memory pressure", entry.peer)
+        await entry.client.close()
+    }
+
+    package func acquire(peer: String, conversation: String?, configuration: String, dataRoot: URL) async throws -> Lease {
+        observePressure()
+        let key = peer + ":" + (conversation ?? UUID().uuidString)
+        if let entry = entries[key] {
+            guard !entry.busy else { throw AgentACPClient.Failure.busy }
+            // A program that exited on its own is closed here and replaced, so its next message restores the session where the agent can.
+            if entry.configuration == configuration, entry.client.dataRoot == dataRoot.standardizedFileURL, !entry.client.hasEnded {
+                let generation = UUID()
+                entries[key]?.busy = true
+                entries[key]?.generation = generation
+                return Lease(key: key, generation: generation, client: entry.client)
+            }
+            entries.removeValue(forKey: key)
+            await entry.client.close()
+            guard entries[key] == nil else { throw AgentACPClient.Failure.busy }
+        }
+        let client = AgentACPClient(dataRoot: dataRoot)
+        let entry = Entry(client: client, peer: peer, configuration: configuration, busy: true)
+        entries[key] = entry
+        return Lease(key: key, generation: entry.generation, client: client)
+    }
+
+    @discardableResult
+    package func finish(_ lease: Lease, peer: String, conversation: String?) async -> Bool {
+        guard let entry = entries[lease.key], entry.generation == lease.generation else { return false }
+        entries.removeValue(forKey: lease.key)
+        guard let conversation else { await entry.client.close(); return true }
+        let key = peer + ":" + conversation
+        guard entries[key] == nil else { await entry.client.close(); return false }
+        entries[key] = Entry(client: entry.client, peer: peer, configuration: entry.configuration, busy: false)
+        if let pressure = MemoryPressureSense.current { await releaseIdle(under: pressure) }
+        return true
+    }
+
+    /// A supplied id targets one turn; first sends without an id cancel through their own task/lease.
+    package func cancelTurn(peer: String, conversation: String?) async -> Bool {
+        let busy = entries.filter { $0.value.busy && $0.key.hasPrefix(peer + ":") }
+        guard let conversation, let entry = busy[peer + ":" + conversation] else { return false }
+        return await entry.client.requestCancel()
+    }
+
+    package func closeAll() async {
+        pressureObservation?.cancel()
+        pressureObservation = nil
+        let owned = entries.values
+        entries.removeAll()
+        await withTaskGroup(of: Void.self) { group in
+            for entry in owned { group.addTask { await entry.client.close(.appQuit) } }
+        }
+    }
+
+    package func revoke(peer: String) async {
+        let keys = entries.keys.filter { $0.hasPrefix(peer + ":") }
+        for key in keys {
+            guard let entry = entries.removeValue(forKey: key) else { continue }
+            await entry.client.close()
+        }
+    }
+
+}

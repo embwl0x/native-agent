@@ -13,16 +13,18 @@ struct ChatView: View {
 
     init(notifiedSessionID: Binding<String?> = .constant(nil)) { _notifiedSessionID = notifiedSessionID }
 
-    @EnvironmentObject var bridgeClient: MacBridgeClient
-    @EnvironmentObject var pairingStore: PairingStore
+    @Environment(MacBridgeClient.self) var bridgeClient
+    @Environment(PairingStore.self) var pairingStore
     @Environment(VoiceInputController.self) var voiceInput
-    @EnvironmentObject var voiceOutput: VoiceOutputController
+    @Environment(VoiceOutputController.self) var voiceOutput
     @Environment(\.scenePhase) var scenePhase
+    @Environment(\.colorScheme) var colorScheme
+    @Environment(\.accessibilityReduceTransparency) var reduceTransparency
     // Composer motion must respect Reduce Motion.
     @Environment(\.accessibilityReduceMotion) var reduceMotion
     @Environment(ChatStore.self) var store
     let sync = iCloudSyncEngine.shared
-    @ObservedObject var turnActivity = PhoneTurnActivity.shared
+    let turnActivity = PhoneTurnActivity.shared
     @AppStorage(HazeColor.key) var hazeColorRaw = HazeColor.defaultValue.rawValue
     @AppStorage("chatFileAccess") var selectedFileAccess = "auto"
     @State var draft = MobileChatDraft()
@@ -168,7 +170,7 @@ struct ChatView: View {
                         } label: {
                             HStack(spacing: 6) {
                                 Image(systemName: tab.systemImage)
-                                    .font(.system(size: 11, weight: .semibold))
+                                    .font(.caption2.weight(.semibold))
                                 Text(tab.title)
                                     .font(.footnote.weight(selected ? .semibold : .regular))
                                     .lineLimit(accessibilitySize ? 2 : 1)
@@ -179,7 +181,8 @@ struct ChatView: View {
                             .padding(.trailing, tab.closableSessionID == nil ? 12 : 48)
                             .frame(width: accessibilitySize ? sessionTabWidth * (tab.kind == .main ? 112.0 / 156.0 : 1) : (tab.kind == .main ? 112 : 156))
                             .frame(minWidth: tab.kind == .main ? 112 : 156, minHeight: 44)
-                            .background(selected ? AlivePalette.fill : Color.clear, in: Capsule())
+                            .background(selected ? (reduceTransparency ? NativeAgentMobileTheme.Colors.contentSurface : AlivePalette.fill) : Color.clear,
+                                        in: Capsule())
                             .overlay { if selected { Capsule().strokeBorder(AlivePalette.rim, lineWidth: 1) } }
                         }
                         .buttonStyle(.plain)
@@ -203,7 +206,7 @@ struct ChatView: View {
                                             .controlSize(.mini)
                                     } else {
                                         Image(systemName: "xmark")
-                                            .font(.system(size: 9, weight: .bold))
+                                            .font(.caption2.weight(.bold))
                                             .foregroundStyle(.secondary)
                                     }
                                 }

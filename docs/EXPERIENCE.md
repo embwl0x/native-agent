@@ -5,8 +5,8 @@ shared record of a happening; the domain that produced it owns its outcome.
 This document owns the current experience and repair laws, implemented
 boundaries and remaining gaps.
 
-The [original 2026-10-18 census and execution plan](history/EXPERIENCE_2026-10-18-census-and-plan.md)
-were archived on 2026-10-28; they are historical design, not current status.
+The original 2026-10-18 census and execution plan were archived in private
+maintainer history on 2026-10-28; they are historical design, not current status.
 
 ## One form: an experience
 
@@ -60,9 +60,11 @@ times, from the birth or subsequent events. Saved answers without that
 evidence, unresolved or let-go delivery, later non-delivery updates and replies
 in other conversations cannot move it. Older records lacking accepted delivery
 evidence leave this boundary unknown; they are not rewritten or guessed delivered.
-The boundary reads through the public `ExperienceStore.lastSpoken` owner API;
-the context reader does not inspect history renderer internals or load a second
-transcript snapshot. `TurnEpisodicContext` reads the existing store and closing dispatch
+The store indexes delivery acceptance when an answer is written or changed.
+The public `ExperienceStore.lastSpoken` owner API selects the latest eligible
+boundary for the conversation in one ordered query. The context reader does
+not inspect history renderer internals or load a second transcript snapshot.
+`TurnEpisodicContext` reads the existing store and closing dispatch
 receipts; authored purpose words and the dispatch's retained result accompany
 the owner's status and effects. The result's own fields supply what happened,
 including a send's recipient, subject and recorded action, without an action-name
@@ -119,7 +121,7 @@ also give `selected` and `gaps`: an invalid or over-cap row names its sequence,
 cause and the store's Doctor remedy while readable siblings return, with status `partial`. Valid detail rows
 are never shortened, up to `ExperienceStore.maxRowBytes` (8 MiB per row).
 
-This action uses the store's read-only connection and existing readers. It never
+This action uses the store's read-only pool and existing readers. It never
 opens the initializer, writes a record, prunes details or changes saved state.
 Missing or unreadable storage fails with its cause and Doctor remedy, rather than
 creating a store or returning an empty history. A readable query with no matches
@@ -129,7 +131,7 @@ filters in that snapshot. Missing attention provenance remains unknown.
 ## Implemented boundaries
 
 - **A happening is written once under its key.** Every change attention takes in is an experience of kind `happening`
-  (`Experiences/Attention.swift`), id `happening:<once>`, its cause the door it came through and its
+  (`SenseCore/Experiences/Attention.swift`), id `happening:<once>`, its cause the door it came through and its
   `happening` field the line itself. An ordinary repeat stops when the birth matches, without reading its later events.
   `Attention.postChecked` verifies the return's material from the committed row. At the display limit the row must carry the
   digest of the full material. On retry it offers an exact return to attention while still owed and durably settles any repair
@@ -162,6 +164,9 @@ filters in that snapshot. Missing attention provenance remains unknown.
 The experience store opens the current `experience`/`event` schema directly.
 Existing stores must have the current projection columns; unreadable or older
 schemas fail at this owner instead of running historical row conversions.
+The first writer opening a store without the addressee index fills it from
+recorded births and folds existing answers for their delivery boundaries.
+New births and answer changes maintain the index in their own transaction.
 Activity history follows the same rule for its current redacted-title schema,
 and a present activity policy must contain the complete current settings.
 
@@ -251,8 +256,9 @@ while OpenAI input includes cached tokens. They are not one spend total.
   [silent settlement law](ANATOMY_OF_A_TURN.md#6-the-answer-settles-once).
   Missing or unreadable silence evidence cannot prove completion.
   Synchronous task recovery reads committed experiences through the same store's
-  fold with a read-only connection and immediate SQLite busy errors; it creates
-  no store, cache or projection and propagates unreadable storage.
+  fold through a read-only pool with immediate SQLite busy errors. Each read
+  checks the database's device and inode before reusing the pool. Missing files
+  release the cached pool, and unreadable storage reaches the caller.
 - **Own work has no human delivery debt.** Without an explicit reply route or mounted recipient, a declared `builder`, `agent` or `ephemeral`
   conversation needs no human recipient. Missing ownership, unreadable destinations and unavailable human recipients remain unavailable,
   with exact-run repair owed; a missing route alone never proves own work. The session's trace records whether delivery is required
@@ -400,7 +406,7 @@ shows what is owed.
 
 The evidence: in Resolve they ran one seven-step render flow four times because it stopped on its last step, and every run did the six landed steps again; on a fresh install eight wakes spent 49 model rounds re-reading the same waiting work, because a wait was a note; and discovery rebuilt its action vectors in memory, so the first find after a launch paid for the whole inventory.
 
-- **A flow that stopped unfinished is an experience that owes `finish` to them** (`Experiences/Flow.swift`, RepairOwed's shape). Its claims record step outcomes in order as digests, backed by the owner's raw record. Asking for it again continues it: what landed, or may have, is answered from that record and never done again (an effect that stopped unknown gets its recorded outcome again, never a blind resend), and only what did nothing runs, on a fresh read, or what its owner keeps progress for itself. A flow that finished, asked again, is a new flow. `again: true` is their "start over". A stopped Mac batch creates a flow when at least one step landed or may have acted.
+- **A flow that stopped unfinished is an experience that owes `finish` to them** (`SenseCore/Experiences/Flow.swift`, RepairOwed's shape). Its claims record step outcomes in order as digests, backed by the owner's raw record. Asking for it again continues it: what landed, or may have, is answered from that record and never done again (an effect that stopped unknown gets its recorded outcome again, never a blind resend), and only what did nothing runs, on a fresh read, or what its owner keeps progress for itself. A flow that finished, asked again, is a new flow. `again: true` is their "start over". A stopped Mac batch creates a flow when at least one step landed or may have acted.
 - **Current owners:** `mac.act` owns stopped screen batches. It marks steps whose effects may have landed but remain unverified with `~` and counts them as unverified on resume. It marks steps known to have sent no input with `?`, so they are eligible to run on resume. `OwnedProgram.isStrict` selects journaled part runs; `AppToolExecutor+PartRun.swift` saves their stops and atomically claims a run for resume. Resume rechecks admission, code, dependencies and reads, and returns saved receipts for landed writes. The [manifest spec](skill_manifest_spec.md#execution-and-ownership) owns the full contract and the outside-world restriction. **History, 10-19:** an earlier strict-flow implementation was cut after review found resume and hand-back holes; that is not the current execution contract.
 - **Mac identities:** each batch step hashes one canonical object containing the app, verb, target, text, mode, destination, image place, held keys, mouse button, handle and frame id, including null optional values. Landed receipts match only that current representation. Before changing it, reconcile any unfinished `mac.act/<session>` flows; an unmatched old digest cannot establish that its effect did not happen. Mac operation rows separately require their canonical request digest: a missing or invalid digest makes `mac_control/operations.json` unreadable, preserving the bytes and refusing journaled work for reconciliation. Every in-memory screen frame carries its producer's compile caps, and effect comparison requires both cap records; there is no pre-cap frame representation.
 - **A wait names its condition** (`desk.wait {handle, on, note?}`; [Desk contract](DESK.md)): a person's name, a Desk item, or any experience the agent was
@@ -415,8 +421,8 @@ The evidence: in Resolve they ran one seven-step render flow four times because 
 
 On a fresh install they was told a reply to Claude Code was owed and could do nothing about it: their reply went back to a call that had already ended, the route check refused it before dispatch (`invalid_caller_result_route`), and its only record was the completion lifecycle, so `desk.wait` and `repair.let_go` could not name it.
 
-- **Whatever they owes or is owed is an experience under the id they are shown** (`Experiences/Owed.swift`). The completion lifecycle projects every write of a reply's state into one under its delivery id (owes `deliver` to the who; accepted when delivered, let go when let go). Inline cards do the same under `interaction:<id>` (owes `decide` to the person). Messages, approval cards and repair debts already were. `desk.wait` reads any of them with one primary-key lookup.
-- **An inline answer settles where it is saved.** `InlineInteractionResolver` accepts `decide` after a verified answer, or lets it go as cancelled on
+- **Whatever they owes or is owed is an experience under the id they are shown** (`SenseCore/Experiences/Owed.swift`). The completion lifecycle projects every write of a reply's state into one under its delivery id (owes `deliver` to the who; accepted when delivered, let go when let go). Inline cards do the same under `interaction:<id>` (owes `decide` to the person). Messages, approval cards and repair debts already were. `desk.wait` reads any of them with one primary-key lookup.
+- **An inline answer settles where it is saved.** `InlineInteractionCoordinator` accepts `decide` after a verified answer, or lets it go as cancelled on
   decline, before publishing the saved transcript change or resuming work. It records the experience if delivery has not filed it yet. Refresh files
   unanswered asks and reconciles existing debts from saved decisions, never from a live projection or a missing card. For an open setup,
   refresh asks the resolver to verify and commit completion, including its continuation, before filing committed readback; it never invents an answer.
@@ -452,7 +458,12 @@ On a fresh install they was told a reply to Claude Code was owed and could do no
 One SQLite database per root (`experiences/experiences.sqlite`), on the GRDB the app already uses for memory, context, cognition, the knowledge graph and activity. It holds the record's two grains:
 
 - **Experiences**: an `experience` row per birth and an `event` row per append, each birth or append one transaction. Reads by id, open/recent collections and `born(kinds:after:)` join births with ordered events in one snapshot and fold through the same transition law. Experiences have no retention horizon; how long they keeps their life is theirs to decide once they can see it.
-- **Details**: what the body noticed while a happening ran, one ordered `detail` row each (`Experiences/Detail.swift`). Each names its subject, kind, time and row; `once` prevents duplicate writes. Details never fold or copy substance. The store forgets ordinary details after two weeks, at most every six hours after a write. Attention weigh, ignition and return records remain retained as consumed/outstanding membership. Trace writes batch one transaction per flush and sync to disk.
+- **Details**: what the body noticed while a happening ran, one ordered `detail` row each (`SenseCore/Experiences/Detail.swift`). Each names its subject, kind, time and row; `once` prevents duplicate writes. Details never fold or copy substance. The store forgets ordinary details after two weeks, at most every six hours after a write. Attention weigh, ignition and return records remain retained as consumed/outstanding membership. Trace writes batch one transaction per flush and sync to disk.
+
+New two-week detail payloads use SQLite JSONB. Readers return JSON from both
+stored representations. Opening the store adds indexes without converting rows.
+The last-spoken read folds candidate answers and their delivery events in one
+ordered query and keeps the latest fully accepted delivery through the requested time.
 
 Domain stores stay where they are, and the experience references them.
 

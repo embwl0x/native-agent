@@ -6,7 +6,14 @@ import Foundation
 /// their length is part of the identity they name.
 public enum SHA256Hex {
     public static func of(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let digits: InlineArray<16, UInt8> = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102]
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(64)
+        for byte in SHA256.hash(data: data) {
+            bytes.append(digits[Int(byte >> 4)])
+            bytes.append(digits[Int(byte & 15)])
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func of(utf8 text: String) -> String {

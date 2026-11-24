@@ -67,11 +67,4 @@ extension AppModel {
             return true
         } catch { setFailureStatus(error, action: "read Providers"); return false }
     }
-
-    func testProviderConnection(_ request: ProviderTestRequest) async throws -> ProviderTestReply {
-        guard case .providerTest(let probe) = try await checkedFaceAct(.testProvider(request)) else {
-            throw FaceActionFeedback.unexpected("a provider-test result")
-        }
-        return probe
-    }
 }

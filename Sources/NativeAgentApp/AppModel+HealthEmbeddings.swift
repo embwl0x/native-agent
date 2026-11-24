@@ -1,7 +1,6 @@
 import Foundation
 import NativeAgentShared
-import EngineRuntime
-import DoctorChecks
+import BodyRuntime
 // Blueprint: | `AppModel+HealthEmbeddings.swift` | `AppModel`, `loadHealthCard`, `setHealthCardIfMeaningfullyChanged`, `LatestRead`: Health publication |
 
 @MainActor

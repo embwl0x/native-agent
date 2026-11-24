@@ -54,16 +54,7 @@ final class ShotgunPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-enum ShotgunShortcut: String, CaseIterable, Identifiable {
-    case optionSpace = "option-space"
-    case controlOptionSpace = "control-option-space"
-    case shiftCommandSpace = "shift-command-space"
-    case off
-
-    static let storageKey = "NativeAgent.shotgun.shortcut"
-    var id: String { rawValue }
-
-
+extension ShotgunShortcut {
     var menuModifiers: SwiftUI.EventModifiers? {
         switch self {
         case .optionSpace: .option
@@ -72,7 +63,6 @@ enum ShotgunShortcut: String, CaseIterable, Identifiable {
         case .off: nil
         }
     }
-
 }
 
 @MainActor
@@ -109,6 +99,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     private(set) var selectedSessionID: String?
     /// Ignore programmatic placement so only user drags become remembered positions.
     @ObservationIgnored private var placing = false
+    @ObservationIgnored private var turnChanges: Task<Void, Never>?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var clickAwayMonitor: Any?
     @ObservationIgnored private let agentPointer = AgentPointerOverlay()
@@ -247,18 +238,19 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     }
 
     private func observeTurns() {
-        guard appModel != nil else { return }
-        let busy = withObservationTracking {
-            _ = drivingTurnID()
-            guard let model = appModel, let turns = model.turnSessionsFace else { return nil as Bool? }
-            return turns.activeTurnIDs.keys.contains { model.turnPart("isBusy", for: $0) { $0?.isBusy == true } } as Bool?
-        } onChange: {
-            Task { @MainActor in
-                ShotgunController.shared.observeTurns()
+        turnChanges?.cancel()
+        let changes = Observations { [weak self] in
+            _ = self?.drivingTurnID()
+            guard let model = self?.appModel, let turns = model.turnSessionsFace else { return nil as Bool? }
+            return turns.activeTurnIDs.keys.contains { model.turnPart("isBusy", for: $0) { $0?.isBusy == true } }
+        }
+        turnChanges = Task { [weak self] in
+            for await busy in changes {
+                guard !Task.isCancelled, let self else { return }
+                if busy == false { agentPointer.fade() }
+                releaseDriverIfDone()
             }
         }
-        if busy == false { agentPointer.fade() }
-        releaseDriverIfDone()
     }
 
     /// Driver ownership must end when its turn leaves flight on this root.
@@ -508,6 +500,8 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     }
 
     func disconnect() {
+        turnChanges?.cancel()
+        turnChanges = nil
         RendererProtection.shared.disconnect()
         panel?.ignoresMouseEvents = false
         agentPointer.close()

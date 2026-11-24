@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 // Blueprint: | `TurnSecretRedactor.swift` | `TurnSecretRedactor`: shared credential recognition; callers own size bounds |
 
@@ -150,7 +151,25 @@ public enum TurnSecretRedactor {
     }
 
     public static func redactText(_ value: String) -> String {
-        redactText(value, patterns: secretPatterns) { kind, _ in "[REDACTED_\(kind)]" }
+        if let known = Redacted.memo.withLock({ $0.texts[value] }) { return known }
+        let redacted = redactText(value, patterns: secretPatterns) { kind, _ in "[REDACTED_\(kind)]" }
+        Redacted.memo.withLock { $0.keep(value, redacted) }
+        return redacted
+    }
+
+    /// The patterns are fixed, so a text's redaction is a fact of the text itself: display passes that re-project unchanged transcripts (phone sync,
+    /// faces, traces) pay the regexes once per distinct text. Bounded by bytes; past the bound it starts over.
+    private struct Redacted: Sendable {
+        static let memo = Mutex(Redacted())
+        static let byteBound = 48 << 20
+        var texts: [String: String] = [:]
+        var bytes = 0
+        mutating func keep(_ text: String, _ redacted: String) {
+            let size = text.utf8.count + redacted.utf8.count
+            guard size <= Self.byteBound / 8 else { return }
+            if bytes + size > Self.byteBound { texts.removeAll(keepingCapacity: true); bytes = 0 }
+            if texts.updateValue(redacted, forKey: text) == nil { bytes += size }
+        }
     }
 
     public static func redactText(_ value: String, replacement: (String, String) -> String) -> String {

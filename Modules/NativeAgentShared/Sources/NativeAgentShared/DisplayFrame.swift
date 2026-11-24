@@ -3,47 +3,47 @@ import AppKit
 import QuartzCore
 // Blueprint: | `DisplayFrame.swift` | `DisplayFrame`: the Mac window's display rhythm (macOS only); the face feed applies what arrived once per frame |
 
-/// The next frame of the screen the window is on. The link runs only while something waits for a frame, and pauses after it.
-/// `followsScreenChanges` rebuilds the link when the screen parameters change.
 @MainActor
 public final class DisplayFrame: NSObject {
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var link: CADisplayLink?
-    private var screenChanges: Task<Void, Never>?
+    private var screen: NSScreen?
 
-    public init(followsScreenChanges: Bool) {
+    public override init() {
         super.init()
-        guard followsScreenChanges else { return }
-        let changes = NotificationCenter.default.notifications(named: NSApplication.didChangeScreenParametersNotification).map { _ in () }
-        screenChanges = Task { [weak self] in
-            for await _ in changes {
-                guard let self else { return }
-                link?.invalidate()
-                link = NSScreen.main?.displayLink(target: self, selector: #selector(frame(_:)))
-                link?.add(to: .main, forMode: .common)
-                link?.isPaused = waiters.isEmpty
-                if link == nil { tick() }
-            }
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification,
+                     NSWindow.didChangeScreenNotification, NSWindow.didBecomeKeyNotification,
+                     NSWindow.didChangeOcclusionStateNotification, NSApplication.didChangeScreenParametersNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(windowsChanged(_:)), name: name, object: nil)
         }
     }
-
-    deinit { screenChanges?.cancel() }
 
     public func next() async {
         await withCheckedContinuation { waiter in
             waiters.append(waiter)
-            guard let screen = NSScreen.main else {
-                // A face with no screen has no frame to wait for: it applies now.
-                tick()
-                return
-            }
-            if link == nil {
-                let link = screen.displayLink(target: self, selector: #selector(frame(_:)))
-                link.add(to: .main, forMode: .common)
-                self.link = link
-            }
-            link?.isPaused = false
+            if link == nil { bindToVisibleScreen() }
+            if let link { link.isPaused = false } else { tick() }
         }
+    }
+
+    @objc private func windowsChanged(_ notification: Notification) {
+        if link != nil { bindToVisibleScreen() }
+    }
+
+    private func bindToVisibleScreen() {
+        let windows = NSApp?.windows.filter {
+            $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+        } ?? []
+        let fastest = NSScreen.screens
+            .filter { screen in windows.contains { NSIntersectsRect($0.frame, screen.frame) } }
+            .max { $0.maximumFramesPerSecond < $1.maximumFramesPerSecond }
+        guard fastest !== screen else { return }
+        link?.invalidate()
+        screen = fastest
+        link = fastest?.displayLink(target: self, selector: #selector(frame(_:)))
+        link?.isPaused = waiters.isEmpty
+        link?.add(to: .main, forMode: .common)
+        if link == nil { tick() }
     }
 
     @objc private func frame(_ link: CADisplayLink) { tick() }

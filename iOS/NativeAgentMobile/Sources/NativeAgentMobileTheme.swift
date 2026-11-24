@@ -5,7 +5,13 @@ import NativeAgentShared
 
 /// Keep content quiet; reserve Liquid Glass for floating controls and navigation.
 enum NativeAgentMobileTheme {
-    static var plateGlass: Glass { .clear.tint(.black.opacity(0.28)) }
+    private static let plateTint = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor.black.withAlphaComponent(0.28)
+            : UIColor.white.withAlphaComponent(0.58)
+    })
+
+    static var plateGlass: Glass { .clear.tint(plateTint) }
 
     enum Colors {
         static let canvas = Color.adaptive(dark: 0x211F1D, light: 0xF6F4F1)

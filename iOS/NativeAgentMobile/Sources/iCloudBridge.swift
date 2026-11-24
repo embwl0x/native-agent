@@ -1,7 +1,7 @@
 
 import Foundation
+import Observation
 import OSLog
-import SwiftUI
 import NativeAgentShared
 import UIKit
 import CloudKit
@@ -42,11 +42,12 @@ struct ICloudBridgeRejectedMessage: Sendable {
 }
 
 @MainActor
-final class iCloudBridge: ObservableObject {
+@Observable
+final class iCloudBridge {
     static let shared = iCloudBridge()
 
-    @Published var available: Bool = false
-    @Published private(set) var lastMacConfirmationAt: Date?
+    var available: Bool = false
+    private(set) var lastMacConfirmationAt: Date?
 
     func recordMacConfirmation(at timestamp: Date) {
         guard timestamp > (lastMacConfirmationAt ?? .distantPast) else { return }
@@ -67,23 +68,23 @@ final class iCloudBridge: ObservableObject {
         /// This phone holds the key the Mac publishes now.
         func isCurrent(_ held: Data?) -> Bool { failure == nil && recordKey != nil && recordKey == phoneKey && phoneKey == held }
     }
-    @Published var macPairingKey: MacPairingKeyReading?
+    var macPairingKey: MacPairingKeyReading?
     /// Whether iCloud holds this phone's wake subscriptions, as last registered; nil until registration ran.
-    @Published var pushSubscriptionsReady: Bool?
+    var pushSubscriptionsReady: Bool?
 
     func clearMacConfirmationForConnectionRepair() {
         lastMacConfirmationAt = nil
     }
-    @Published var lastSyncAt: Date? {
+    var lastSyncAt: Date? {
         didSet {
             PhoneRequests.shared.syncDidSucceed()
             Task { await PhonePlaces.shared.publish() }
             PhoneSenses.shared.publish()
         }
     }
-    @Published var syncStatus: String = "iCloud not checked"
-    @Published var accountFailure: DeviceSyncAccountFailure?
-    private(set) var accountFailureGeneration: UInt64 = 0
+    var syncStatus: String = "iCloud not checked"
+    var accountFailure: DeviceSyncAccountFailure?
+    @ObservationIgnored private(set) var accountFailureGeneration: UInt64 = 0
 
     func recordAccountFailure(_ failure: DeviceSyncAccountFailure) {
         accountFailureGeneration &+= 1
@@ -95,14 +96,14 @@ final class iCloudBridge: ObservableObject {
     // CloudKit requires checked selection and entitlement; nil means unavailable.
     var deviceTransport: CloudKitDeviceTransport?
     var usesCloudKitDeviceTransport: Bool { deviceTransport != nil }
-    var onTransportSucceeded: (() -> Void)?
-    var deviceDrainInFlight = false
-    var deviceDrainQueued = false
-    var foregroundReceiveTask: Task<Void, Never>?
-    var foregroundPresenceTask: Task<Void, Never>?
-    var foregroundCatchUpTask: Task<Void, Never>?
-    private var unacceptedDeliveries: [String: String] = [:]
-    private var deliveryPairingKey: String?
+    @ObservationIgnored var onTransportSucceeded: (() -> Void)?
+    @ObservationIgnored var deviceDrainInFlight = false
+    @ObservationIgnored var deviceDrainQueued = false
+    @ObservationIgnored var foregroundReceiveTask: Task<Void, Never>?
+    @ObservationIgnored var foregroundPresenceTask: Task<Void, Never>?
+    @ObservationIgnored var foregroundCatchUpTask: Task<Void, Never>?
+    @ObservationIgnored private var unacceptedDeliveries: [String: String] = [:]
+    @ObservationIgnored private var deliveryPairingKey: String?
     private static let missingPairingRefusal = "this phone has no pairing key"
     static let signatureRefusal = "its signature does not match this phone's pairing"
     private static let consumerRefusal = "nothing on this phone is listening for it yet"
@@ -163,8 +164,8 @@ final class iCloudBridge: ObservableObject {
     }
     private let userDefaults: UserDefaults
     private let unverifiedStorage: MobileLocalStorage
-    @Published private(set) var unverifiedRecords: [ICloudUnverifiedRecord] = []
-    @Published private(set) var unverifiedRecordsError: String?
+    private(set) var unverifiedRecords: [ICloudUnverifiedRecord] = []
+    private(set) var unverifiedRecordsError: String?
     private let unverifiedRecordsKey = "mobile.icloud.unverifiedRecords.v1"
 
     func retainUnverified(_ msg: BridgeMessage, secret: Data, version: Int64, reason: String) async {
@@ -206,41 +207,41 @@ final class iCloudBridge: ObservableObject {
                 """
         }
     }
-    private var messageHandlers: [UUID: (BridgeMessage) -> Void] = [:]
-    private var rejectionHandlers: [UUID: (ICloudBridgeRejectedMessage) -> Void] = [:]
+    @ObservationIgnored private var messageHandlers: [UUID: (BridgeMessage) -> Void] = [:]
+    @ObservationIgnored private var rejectionHandlers: [UUID: (ICloudBridgeRejectedMessage) -> Void] = [:]
     // Unsigned signature_invalid_resync hints authorize pairing refresh only.
-    private var resyncHintHandlers: [UUID: (BridgeMessage) -> Void] = [:]
+    @ObservationIgnored private var resyncHintHandlers: [UUID: (BridgeMessage) -> Void] = [:]
     /// Durable handled records are retained for the transport's retention window.
-    private var seenMacRecords: [String: Date] = [:]
+    @ObservationIgnored private var seenMacRecords: [String: Date] = [:]
     /// A drain saves what it handled once, when it ends; nothing is written per record.
-    private var seenMacRecordsDirty = false
+    @ObservationIgnored private var seenMacRecordsDirty = false
     /// Unresolved admission failures retain their exact message and cause.
     private(set) var failingMacRecords: [String: FailingMacRecord] = [:]
     /// Why the record being admitted was refused this time.
-    private var refusal: String?
+    @ObservationIgnored private var refusal: String?
     private nonisolated static let failingMacRecordsURL = URL.applicationSupportDirectory.appending(path: "failing-mac-records.json")
-    private var receiveLedgersLoaded = false
-    private var receiveLedgerRestoration: Task<Bool, Never>?
+    @ObservationIgnored private var receiveLedgersLoaded = false
+    @ObservationIgnored private var receiveLedgerRestoration: Task<Bool, Never>?
     private let receiveLedgerRead = LatestRead()
-    private var seenKVSProgressMessageIDs: Set<String> = []
-    private var seenKVSProgressMessageIDsOrdered: [String] = []
+    @ObservationIgnored private var seenKVSProgressMessageIDs: Set<String> = []
+    @ObservationIgnored private var seenKVSProgressMessageIDsOrdered: [String] = []
     /// Drains wait for incoming registration before reading the inbox.
-    var deviceIncomingSetupTask: Task<Void, Never>?
-    private(set) var setupGeneration = 0
+    @ObservationIgnored var deviceIncomingSetupTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var setupGeneration = 0
     private nonisolated static let seenMacRecordsURL = URL.applicationSupportDirectory.appending(path: "seen-mac-records.json")
     private let maxSeenKVSProgressMessageIDs = 200
 
-    weak var pairingStore: PairingStore?
+    @ObservationIgnored weak var pairingStore: PairingStore?
 
     init(
         deviceTransport: CloudKitDeviceTransport? = nil,
         pairingStore: PairingStore? = nil,
         userDefaults: UserDefaults = .standard
     ) {
-        self.deviceTransport = deviceTransport
-        self.pairingStore = pairingStore
         self.userDefaults = userDefaults
         self.unverifiedStorage = MobileLocalStorage(defaults: userDefaults)
+        self.deviceTransport = deviceTransport
+        self.pairingStore = pairingStore
         Task { await restoreReceiveLedgers() }
     }
 
@@ -299,7 +300,7 @@ final class iCloudBridge: ObservableObject {
         return true
     }
 
-    var isSetUp = false
+    @ObservationIgnored var isSetUp = false
 
     func setup() {
         guard !isSetUp else { return }

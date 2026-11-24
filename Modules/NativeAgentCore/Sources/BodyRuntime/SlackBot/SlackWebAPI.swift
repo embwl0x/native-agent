@@ -1,0 +1,424 @@
+import Foundation
+import NativeAgentShared
+import NativeAgentCore
+import PersistenceCore
+// Blueprint: | `SlackWebAPI.swift` | Canonical text sends; strict response envelopes and delivery evidence |
+
+/// Slack Web API HTTP mechanics, replies and uploads. Callers own token grants, setup validation, reconciliation sessions and connection-proof policy.
+public enum SlackWebAPI {
+    private static let replySession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+
+    public static func apiURL(_ method: String) -> URL {
+        if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_SLACK_LOOPBACK_API"],
+           let url = URL(string: raw), ["127.0.0.1", "localhost"].contains(url.host ?? "") {
+            return url.appendingPathComponent(method)
+        }
+        return URL(string: "https://slack.com/api/\(method)")!
+    }
+
+    /// Check credentials before recording dispatch so their absence stays a retryable pre-dispatch failure.
+    public static func requireConfiguredToken(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) throws {
+        _ = try loadToken(dataRoot: dataRoot)
+    }
+
+    public static func postMessage(
+        input: [String: JSONValue],
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        tokenOverride: String? = nil,
+        updatingMessageTs: String? = nil,
+        beforeDispatch: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> JSONValue {
+        let input = input.filter { $0.value != .null && $0.value != .string("") }
+        let channel = input["channel"]?.scalarText?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The send boundary: whatever reached here, saved replies and notices included, leaves without a secret.
+        let text = TurnSecretRedactor.redactText((input["text"] ?? input["message"])?.scalarText ?? "")
+        guard !channel.isEmpty else {
+            throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
+                NSLocalizedDescriptionKey: "slack.post_message requires channel"
+            ])
+        }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
+                NSLocalizedDescriptionKey: "slack.post_message requires text"
+            ])
+        }
+        guard input["threadTs"] == nil else {
+            throw ToolFailureError("Slack requires thread_ts for a reply thread. Update this call's argument before sending.",
+                argumentPath: "$.threadTs", accepted: "thread_ts", effects: .none)
+        }
+        let threadTs = input["thread_ts"]?.scalarText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var body: [String: Any] = [
+            "channel": channel,
+            "text": text,
+        ]
+        if let updatingMessageTs { body["ts"] = updatingMessageTs }
+        if updatingMessageTs == nil, let threadTs, !threadTs.isEmpty {
+            body["thread_ts"] = threadTs
+        }
+        if let metadata = try messageMetadata(input: input) {
+            body["metadata"] = metadata
+        }
+        if updatingMessageTs == nil, let idempotencyKey = input["client_msg_id"]?.scalarText?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !idempotencyKey.isEmpty {
+            body["client_msg_id"] = idempotencyKey
+        }
+        let token: String
+        do { token = try resolvedToken(override: tokenOverride, dataRoot: dataRoot) }
+        catch { throw NotificationDeliveryFailure(.notDelivered(reason: error.localizedDescription), error.localizedDescription) }
+        var request = URLRequest(url: apiURL(updatingMessageTs == nil ? "chat.postMessage" : "chat.update"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        // Slack accepts JSON without an explicit charset, but returns a `missing_charset` response warning.
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        do { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
+        catch { throw NotificationDeliveryFailure(.notDelivered(reason: error.localizedDescription), error.localizedDescription) }
+        try await beforeDispatch?()
+        return envelope(
+            action: updatingMessageTs == nil ? "slack.post_message" : "slack.update_message",
+            response: try await response(for: request, dataRoot: dataRoot, session: replySession)
+        )
+    }
+
+    /// Conservative UTF-16 bound also fits Slack's 40,000-character ceiling, including a single enormous grapheme.
+    static func messageParts(_ text: String) -> [String] {
+        var parts: [String] = [], part = ""
+        var units = 0
+        func append(_ piece: String, width: Int) {
+            if width > 35_000 - units {
+                if !part.isEmpty { parts.append(part) }
+                part = ""; units = 0
+            }
+            part += piece
+            units += width
+        }
+        for character in text {
+            let piece = String(character)
+            let width = piece.utf16.count
+            if width <= 35_000 { append(piece, width: width) }
+            else {
+                // A grapheme may itself exceed the whole message budget; scalar splits still guarantee progress.
+                for scalar in piece.unicodeScalars {
+                    append(String(scalar), width: scalar.value > 0xFFFF ? 2 : 1)
+                }
+            }
+        }
+        if !part.isEmpty { parts.append(part) }
+        return parts
+    }
+
+    private static func checkedResponse(_ envelope: JSONValue) throws -> [String: JSONValue] {
+        guard let response = envelope.objectValue?["response"]?.objectValue,
+              response["ok"]?.boolValue != nil else {
+            throw SlackSocketModeError.api("Slack response envelope is malformed; acceptance remains unknown. Inspect the saved delivery before resending.")
+        }
+        return response
+    }
+
+    static func hasTruncationWarning(_ envelope: JSONValue) throws -> Bool {
+        let response = try checkedResponse(envelope)
+        if response["warning"]?.stringValue == "message_truncated" { return true }
+        guard case .array(let warnings)? = response["response_metadata"]?.objectValue?["warnings"] else { return false }
+        return warnings.contains(.string("message_truncated"))
+    }
+
+    /// Only explicit non-acceptance permits replay. Slack's internal_error/fatal_error may follow partial success.
+    static func isProvenMessageRejection(_ envelope: JSONValue) throws -> Bool {
+        let response = try checkedResponse(envelope)
+        if let status = response["httpStatus"]?.exactIntegerValue, status >= 500 || status == 408 { return false }
+        guard response["ok"]?.boolValue == false, let error = response["error"]?.stringValue else { return false }
+        return Set([
+            "invalid_auth", "not_authed", "token_expired", "token_revoked",
+            "missing_scope", "no_permission", "not_in_channel", "channel_not_found",
+            "is_archived", "no_text", "msg_too_long", "invalid_arguments",
+            "invalid_metadata", "metadata_too_large", "ratelimited", "rate_limited",
+        ]).contains(error)
+    }
+
+    static func uploadFile(
+        _ upload: SlackPreparedUpload,
+        data: Data,
+        channel: String,
+        threadTs: String?,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        tokenOverride: String? = nil,
+        authorizeUpload: @Sendable () throws -> Void,
+        beforeShare: @escaping @Sendable () async throws -> Void
+    ) async throws -> JSONValue {
+        let channel = channel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !channel.isEmpty else {
+            throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
+                NSLocalizedDescriptionKey: "slack.upload_file requires channel"
+            ])
+        }
+        let name = upload.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filename = name.isEmpty ? URL(fileURLWithPath: upload.path).lastPathComponent : name
+
+        try authorizeUpload()
+        let uploadURLResponse = try await callForm(
+            method: "files.getUploadURLExternal",
+            form: [
+                "filename": filename,
+                "length": String(data.count),
+            ],
+            dataRoot: dataRoot,
+            tokenOverride: tokenOverride
+        )
+        guard (uploadURLResponse["ok"] as? Bool) == true else {
+            return envelope(action: "slack.upload_file", response: uploadURLResponse)
+        }
+        guard let rawUploadURL = uploadURLResponse["upload_url"] as? String, !rawUploadURL.isEmpty,
+              let fileId = uploadURLResponse["file_id"] as? String, !fileId.isEmpty else {
+            return envelope(action: "slack.upload_file", response: ["ok": false, "error": "upload_allocation_incomplete"])
+        }
+        guard let uploadURL = trustedFileURL(rawUploadURL) else {
+            return envelope(
+                action: "slack.upload_file",
+                response: ["ok": false, "error": "unsafe_upload_url"]
+            )
+        }
+
+        // The bytes go only while the destination and token are still authorized.
+        try authorizeUpload()
+        _ = try resolvedToken(override: tokenOverride, dataRoot: dataRoot)
+        var uploadReq = URLRequest(url: uploadURL)
+        uploadReq.httpMethod = "POST"
+        uploadReq.timeoutInterval = 60
+        uploadReq.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        uploadReq.httpBody = data
+        let (uploadData, uploadResp) = try await URLSession.shared.data(for: uploadReq)
+        let uploadStatus = (uploadResp as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200..<300).contains(uploadStatus) else {
+            return envelope(
+                action: "slack.upload_file",
+                response: [
+                    "ok": false,
+                    "error": "upload_http_\(uploadStatus)",
+                    "rawPreview": String(data: uploadData.prefix(300), encoding: .utf8) ?? "",
+                ]
+            )
+        }
+
+        let filesData = try JSONSerialization.data(
+            withJSONObject: [["id": fileId, "title": filename]],
+            options: []
+        )
+        let filesJSON = String(decoding: filesData, as: UTF8.self)
+        var completeForm: [String: String] = [
+            "files": filesJSON,
+            "channel_id": channel,
+        ]
+        if let threadTs = threadTs?.trimmingCharacters(in: .whitespacesAndNewlines), !threadTs.isEmpty {
+            completeForm["thread_ts"] = threadTs
+        }
+        let completeResponse = try await callForm(
+            method: "files.completeUploadExternal",
+            form: completeForm,
+            dataRoot: dataRoot,
+            tokenOverride: tokenOverride,
+            beforeDispatch: beforeShare
+        )
+        return envelope(
+            action: "slack.upload_file",
+            response: completeResponse
+        )
+    }
+
+    private static func callForm(
+        method: String,
+        form: [String: String],
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        tokenOverride: String? = nil,
+        beforeDispatch: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> [String: Any] {
+        let token = try resolvedToken(override: tokenOverride, dataRoot: dataRoot)
+        var req = URLRequest(url: apiURL(method))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 60
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        req.httpBody = formURLEncoded(form)
+
+        try await beforeDispatch?()
+        return try await response(for: req, dataRoot: dataRoot)
+    }
+
+    private static func response(for request: URLRequest, dataRoot: URL, session: URLSession = .shared) async throws -> [String: Any] {
+        do {
+            let parsed = try await response(for: request, session: session)
+            await recordConnectionProof(parsed, dataRoot: dataRoot)
+            return parsed
+        }
+        catch {
+            await recordConnectionProof(["ok": false, "error": "transport_failed"], dataRoot: dataRoot)
+            throw error
+        }
+    }
+
+    public static func response(for request: URLRequest, session: URLSession) async throws -> [String: Any] {
+        let (data, resp) = try await session.data(for: request)
+        guard var parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw SlackSocketModeError.api("Slack returned non-object JSON; inspect transport and delivery evidence before resending.")
+        }
+
+        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+            parsed["ok"] = false
+            parsed["error"] = (parsed["error"] as? String) ?? "http_\(http.statusCode)"
+            parsed["httpStatus"] = http.statusCode
+        }
+        guard parsed["ok"] as? Bool != nil else {
+            throw SlackSocketModeError.api("Slack response omitted its acceptance result; inspect delivery evidence before resending.")
+        }
+        return parsed
+    }
+
+    private static func recordConnectionProof(_ response: [String: Any], dataRoot: URL) async {
+        do {
+            _ = try await ConnectorActionReceipt.append(
+                actionId: "slack.http", connectorId: "slack", name: nil,
+                status: response["ok"] as? Bool == true ? "completed" : "failed",
+                ok: response["ok"] as? Bool == true,
+                dryRun: false, approvalId: nil, createdAt: ISO8601DateFormatter().string(from: Date()),
+                output: .object([
+                    "error": .string(response["error"] as? String ?? ""),
+                    "httpStatus": (response["httpStatus"] as? Int).map { .int(Int64($0)) } ?? .null,
+                ]), dataRoot: dataRoot)
+        } catch {
+            ModuleLog(category: "SlackBot")("Could not record transport proof: %@", error.localizedDescription)
+        }
+    }
+
+    static func messageMetadata(input: [String: JSONValue]) throws -> [String: Any]? {
+        guard case .object? = input["metadata"], let metadata = input["metadata"] else { return nil }
+        return try JSONSerialization.jsonObject(with: Data(metadata.serialize(pretty: false).utf8)) as? [String: Any]
+    }
+
+    static func resolvedToken(override: String?, dataRoot: URL) throws -> String {
+        if let override {
+            let token = override.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !token.isEmpty else {
+                throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
+                    NSLocalizedDescriptionKey: "Slack token snapshot is empty"
+                ])
+            }
+            // A snapshot a turn captured is used only while it is still the granted token: every request and upload step checks, so Disconnect stops them all.
+            guard try SlackCredentials.read(.bot, dataRoot: dataRoot) == token else {
+                throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
+                    NSLocalizedDescriptionKey: "Slack was disconnected; nothing more was sent"
+                ])
+            }
+            return token
+        }
+        return try loadToken(dataRoot: dataRoot)
+    }
+
+    private static func loadToken(dataRoot root: URL = PersistenceCore.defaultDataRoot()) throws -> String {
+        guard let token = try SlackCredentials.read(.bot, dataRoot: root) else {
+            throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
+                NSLocalizedDescriptionKey: "Slack token is not configured. Paste the Slack OAuth token in Connectors > Slack."
+            ])
+        }
+        return token
+    }
+
+    static func envelope(
+        action: String,
+        response: [String: Any]
+    ) -> JSONValue {
+        let ok = (response["ok"] as? Bool) == true
+        var obj: [String: JSONValue] = [
+            "actionId": .string(action),
+            "connectorId": .string("slack"),
+            "ok": .bool(ok),
+            "status": .string(ok ? "completed" : "failed"),
+            "response": JSONValue(fromFoundation: response),
+        ]
+        if let error = response["error"] as? String, !error.isEmpty {
+            obj["error"] = .string(error)
+            let fix: String? = switch error {
+            case "not_authed", "invalid_auth", "token_revoked", "account_inactive":
+                """
+                The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view.
+                """
+            case "missing_scope":
+                """
+                The owner must add \((response["needed"] as? String) ?? "the required scope") in the Slack app settings, \
+                then sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view.
+                """
+            case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
+            case "ratelimited": "Slack is rate limiting; wait a minute before trying again."
+            default: nil
+            }
+            if let fix { obj["fix"] = .string(fix) }
+        }
+        return redactReceipt(.object(obj))
+    }
+
+    static func redactReceipt(_ value: JSONValue) -> JSONValue {
+        SlackTokenRedactor.redactValue(value)
+    }
+
+    /// File bodies and download credentials belong only to Slack's HTTPS file domain.
+    static func trustedFileURL(_ raw: String) -> URL? {
+        guard let url = URL(string: raw),
+              url.scheme?.lowercased() == "https",
+              url.user == nil, url.password == nil,
+              let host = url.host?.lowercased(),
+              (host == "files.slack.com" || host.hasSuffix(".files.slack.com")),
+              url.port == nil || url.port == 443
+        else { return nil }
+        return url
+    }
+
+    private static func formURLEncoded(_ form: [String: String]) -> Data {
+        let encoded = form
+            .sorted { $0.key < $1.key }
+            .map { "\(urlEncode($0.key))=\(urlEncode($0.value))" }
+            .joined(separator: "&")
+        return Data(encoded.utf8)
+    }
+
+    private static func urlEncode(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+}
+
+private enum SlackTokenRedactor {
+    private static let slackToken = "\\b(?:xox[baprs]-[A-Za-z0-9-]{20,}|xapp-[A-Za-z0-9-]{20,}|xoxe(?:\\.xoxp)?-[A-Za-z0-9-]{20,})\\b"
+
+    static func redactText(_ raw: String) -> String {
+        raw.replacingOccurrences(of: slackToken, with: "[REDACTED_SLACK_TOKEN]", options: .regularExpression)
+    }
+
+    static func redactValue(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .string(let raw):
+            return .string(TurnSecretRedactor.redactText(redactText(raw)))
+        case .array(let items):
+            return .array(items.map { redactValue($0) })
+        case .object(let object):
+            return .object(object.reduce(into: [:]) { redacted, pair in
+                // Signed upload credentials can appear in malformed responses; redact by field even without token-shaped values.
+                if pair.key.lowercased() == "upload_url" {
+                    redacted[pair.key] = .string("[REDACTED_SLACK_UPLOAD_URL]")
+                } else {
+                    redacted[pair.key] = redactValue(pair.value)
+                }
+            })
+        default:
+            return value
+        }
+    }
+}

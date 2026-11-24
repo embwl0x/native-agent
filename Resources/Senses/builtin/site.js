@@ -1,99 +1,9 @@
-// Starter frame. ES2020 / JavaScriptCore; no modules, filesystem or network.
-// Keep this in front of the sense's own read(request) implementation.
-var NativeKit = (() => {
-    const maximumTextBytes = 40000; // NativePage.maximumTextBytes
-    const maximumItems = 100000;
-    function fail(message) { throw new Error(message); }
-    function utf8Length(s) {
-        let n = 0;
-        for (const c of String(s)) {
-            const v = c.codePointAt(0);
-            n += v < 128 ? 1 : v < 2048 ? 2 : v < 65536 ? 3 : 4;
-        }
-        return n;
+var SiteKit = (() => {
+    const {maximumItems, maximumTextBytes, fail, utf8Length, prefix} = NativeKit;
+    function siteThing(name, kind, address, text = "", verbs = []) {
+        return {name: String(name), kind, address, text: String(text), verbs};
     }
-    function prefix(s, budget) {
-        let out = "", n = 0;
-        for (const c of String(s)) {
-            const size = utf8Length(c);
-            if (n + size > budget) break;
-            out += c; n += size;
-        }
-        return out;
-    }
-    function utf8(bytes) {
-        let out = "";
-        for (let p = 0; p < bytes.length;) {
-            const first = bytes[p++];
-            let value, count, minimum;
-            if (first < 128) { out += String.fromCharCode(first); continue; }
-            if (first >= 194 && first <= 223) { value = first & 31; count = 1; minimum = 128; }
-            else if (first >= 224 && first <= 239) { value = first & 15; count = 2; minimum = 2048; }
-            else if (first >= 240 && first <= 244) { value = first & 7; count = 3; minimum = 65536; }
-            else fail("Invalid UTF-8 lead byte");
-            while (count--) {
-                if (p >= bytes.length || (bytes[p] & 192) !== 128) fail("Truncated or invalid UTF-8");
-                value = value * 64 + (bytes[p++] & 63);
-            }
-            if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) fail("Invalid UTF-8 scalar");
-            out += String.fromCodePoint(value);
-        }
-        return out.replace(/^\uFEFF/, "");
-    }
-    function textBytes(bytes) {
-        if (bytes.length >= 2 && ((bytes[0] === 255 && bytes[1] === 254) || (bytes[0] === 254 && bytes[1] === 255))) {
-            if (bytes.length % 2) fail("Truncated UTF-16");
-            let text = ""; const little = bytes[0] === 255;
-            for (let p = 2; p < bytes.length; p += 2) text += String.fromCharCode(little ? bytes[p] + 256 * bytes[p + 1] : 256 * bytes[p] + bytes[p + 1]);
-            return text;
-        }
-        return utf8(bytes);
-    }
-    function bytes(material) {
-        if (material.kind !== "file" || !material.data) fail("This sense needs file bytes from sense.source.read");
-        const data = material.data instanceof Uint8Array ? material.data : Uint8Array.from(material.data);
-        if (data.length > 128 * 1024 * 1024) fail("File exceeds the 128 MiB reader limit");
-        return data;
-    }
-    function root(material, corner) {
-        return material.kind === "file" ? "file:" + encodeURIComponent(material.path) + "#document" : corner + "#canvas";
-    }
-    function sourceAddress(address) {
-        if (!address) return undefined;
-        const base = address.split("#")[0];
-        if (base.startsWith("file:")) return decodeURIComponent(base.slice(5));
-        return address.startsWith("/") || address.startsWith("~") ? address : undefined;
-    }
-    function address(base, ...parts) { return base + "/" + parts.map(p => encodeURIComponent(String(p))).join("/"); }
-    function thing(name, kind, at, text = "", verbs = []) {
-        return { name: String(name), kind, address: at, text: String(text), verbs };
-    }
-    // Compare source-owned structural rows, not a clipped published page.
-    function deltaRows(before, after) {
-        const old = new Map(before.map(row => [row.address, row]));
-        const next = new Map(after.map(row => [row.address, row]));
-        let added = 0, removed = 0, changed = 0; const details = [];
-        const show = value => prefix(sense.redactText(String(value || "")).replace(/\s+/g, " ").trim(), 100);
-        function detail(text) { if (details.length < 3) details.push(text); }
-        for (const row of after) {
-            const prior = old.get(row.address);
-            if (!prior) { added++; detail("added " + show(row.kind) + " “" + show(row.name) + "”: " + show(row.text)); }
-            else if (prior.name !== row.name || prior.kind !== row.kind || prior.text !== row.text || prior.deltaKey !== row.deltaKey) {
-                changed++; detail("changed " + show(row.kind) + " “" + show(row.name) + "”: " + show(prior.text || prior.name) + " → " + show(row.text || row.name));
-            }
-        }
-        for (const row of before) if (!next.has(row.address)) { removed++; detail("removed " + show(row.kind) + " “" + show(row.name) + "”"); }
-        if (!added && !removed && !changed) return "";
-        return sense.redactText(added + " added, " + removed + " removed, " + changed + " changed" + (details.length ? "; " + details.join("; ") : ""));
-    }
-    function column(index) {
-        let name = "";
-        for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) name = String.fromCharCode(65 + (n - 1) % 26) + name;
-        return name;
-    }
-    // A request for a thing includes that thing and its descendants. A part
-    // cursor resumes both item and UTF-8-safe text offset; nothing disappears.
-    function publish(corner, base, title, items, request = {}, stableCursors = false, separator = "/") {
+    function publishRows(corner, base, title, items, request = {}, stableCursors = false, separator = "/") {
         if (items.length > maximumItems) fail("Document exceeds the 100,000 thing limit");
         const identities = new Set();
         for (const item of items) {
@@ -141,13 +51,7 @@ var NativeKit = (() => {
         // not encode Swift's associated-value SenseCorner enum.
         sense.publish(page);
     }
-    return { maximumTextBytes, maximumItems, fail, utf8Length, prefix, utf8, textBytes,
-        bytes, root, sourceAddress, address, thing, column, deltaRows, publish };
-})();
 
-// Live page example. This file is an authoring example, not a registered
-// wildcard sense: growth makes a reader for one host from its own evidence.
-var SiteKit = (() => {
     let baseline, baselineView, baselinePage;
     function fetched(page) { return !!page.coverage && typeof page.text === "string"; }
     function visible(page) { return ["browser.text", "browser.links"].includes(page.source_action) && typeof page.text === "string"; }
@@ -265,15 +169,15 @@ var SiteKit = (() => {
     function publish(material, request = {}) {
         const page = snapshot(material), root = base(page), rows = [];
         if (document(page)) {
-            rows.push(NativeKit.thing("Page text", "text", root + "#@text", page.text));
-            if (fetched(page)) rows.push(NativeKit.thing("Fetch coverage", "text", root + "#@coverage", JSON.stringify(page.coverage)));
-            else rows.push(NativeKit.thing("Browser read receipt", "text", root + "#@receipt", JSON.stringify(page.source_receipt)));
+            rows.push(siteThing("Page text", "text", root + "#@text", page.text));
+            if (fetched(page)) rows.push(siteThing("Fetch coverage", "text", root + "#@coverage", JSON.stringify(page.coverage)));
+            else rows.push(siteThing("Browser read receipt", "text", root + "#@receipt", JSON.stringify(page.source_receipt)));
             const asked = typeof request.address === "string" && request.address.startsWith("site:") ? request : {};
-            NativeKit.publish("site", root, page.url, rows, asked, true, "#");
+            publishRows("site", root, page.url, rows, asked, true, "#");
             return page;
         }
         // Source text is first so the independent view stays whole and ordered.
-        rows.push(NativeKit.thing("Page text", "text", root + "#@text", page.summary.text));
+        rows.push(siteThing("Page text", "text", root + "#@text", page.summary.text));
         for (const node of page.nodes) {
             const name = typeof node.name === "string" && node.name ? node.name
                 : typeof node.text === "string" && node.text ? node.text
@@ -287,11 +191,11 @@ var SiteKit = (() => {
                 node.select ? JSON.stringify(node.select) : "",
                 node.more ? "More: " + JSON.stringify({tab_id: page.tabId, scope: page.reading?.scope,
                     more: JSON.stringify(node.more)}) : ""].filter(v => typeof v === "string" && v).join("\n");
-            rows.push(NativeKit.thing(label, typeof node.role === "string" && node.role ? node.role : "element",
+            rows.push(siteThing(label, typeof node.role === "string" && node.role ? node.role : "element",
                 address(page, node), detail, verbs(node)));
         }
         const asked = typeof request.address === "string" && request.address.startsWith("site:") ? request : {};
-        NativeKit.publish("site", root, page.title || page.url, rows, asked, true, "#");
+        publishRows("site", root, page.title || page.url, rows, asked, true, "#");
         return page;
     }
     function act(request) {

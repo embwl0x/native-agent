@@ -1,0 +1,451 @@
+import Foundation
+
+// Blueprint: | `ActivityRollups.swift` | `ActivityRollups`: timezone-relative buckets, top apps and exemplars; span overlap is clipped to the requested range |
+
+// MARK: - Rollup shapes
+
+/// Epoch-second bounds avoid persisting timezone-dependent day strings.
+public struct ActivityBucket: Sendable, Equatable {
+    public let start: Double
+    public let end: Double
+    public let bundleId: String
+    public let appName: String
+    public let seconds: Double
+    /// A span crossing buckets counts in each because it was open in each.
+    public let spanCount: Int
+    /// Prorated events remain fractional until display so bucket splits conserve their total.
+    public let eventCount: Double
+
+    public init(
+        start: Double, end: Double, bundleId: String, appName: String,
+        seconds: Double, spanCount: Int, eventCount: Double
+    ) {
+        self.start = start
+        self.end = end
+        self.bundleId = bundleId
+        self.appName = appName
+        self.seconds = seconds
+        self.spanCount = spanCount
+        self.eventCount = eventCount
+    }
+}
+
+/// Report dropped rows and seconds so a bounded top-N result cannot masquerade as the whole history.
+public struct ActivityTopN: Sendable, Equatable {
+    public let rows: [ActivityAppTotal]
+    public let truncated: Bool
+    public let droppedRowCount: Int
+    public let droppedSeconds: Double
+    public let totalRowCount: Int
+
+    public init(
+        rows: [ActivityAppTotal], truncated: Bool,
+        droppedRowCount: Int, droppedSeconds: Double, totalRowCount: Int
+    ) {
+        self.rows = rows
+        self.truncated = truncated
+        self.droppedRowCount = droppedRowCount
+        self.droppedSeconds = droppedSeconds
+        self.totalRowCount = totalRowCount
+    }
+}
+
+public struct ActivityAppTotal: Sendable, Equatable {
+    public let bundleId: String
+    public let appName: String
+    public let seconds: Double
+    public let spanCount: Int
+    public let eventCount: Int
+
+    public init(
+        bundleId: String, appName: String, seconds: Double,
+        spanCount: Int, eventCount: Int
+    ) {
+        self.bundleId = bundleId
+        self.appName = appName
+        self.seconds = seconds
+        self.spanCount = spanCount
+        self.eventCount = eventCount
+    }
+}
+
+/// Cap the combined answer to fit the context window.
+public struct ActivityAnswerBundle: Sendable, Equatable {
+    public let from: Double
+    public let to: Double
+    public let timezoneIdentifier: String
+    public let totalSeconds: Double
+    public let topApps: ActivityTopN
+    public let buckets: [ActivityBucket]
+    public let exemplars: [ActivitySpan]
+    /// Report removed rows across every section so truncation is visible.
+    public let truncatedSections: [String]
+
+    public init(
+        from: Double, to: Double, timezoneIdentifier: String, totalSeconds: Double,
+        topApps: ActivityTopN, buckets: [ActivityBucket], exemplars: [ActivitySpan],
+        truncatedSections: [String]
+    ) {
+        self.from = from
+        self.to = to
+        self.timezoneIdentifier = timezoneIdentifier
+        self.totalSeconds = totalSeconds
+        self.topApps = topApps
+        self.buckets = buckets
+        self.exemplars = exemplars
+        self.truncatedSections = truncatedSections
+    }
+}
+
+// MARK: - The rollup tier
+
+/// Compute buckets at query time in the asking timezone, without inference or materialized tables.
+/// Stored offsets are provenance only; calendar boundaries preserve 23- and 25-hour DST days.
+public struct ActivityRollups: Sendable {
+    public enum RollupError: Error, LocalizedError, Equatable {
+        case sourceRowsExceeded(limit: Int)
+        case invalidEventCount(source: String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .sourceRowsExceeded(let limit):
+                return """
+                    More than \(limit) activity spans match this request. Ask for a shorter range or one bundle_id so NativeAgent \
+                    does not return an incomplete answer.
+                    """
+            case .invalidEventCount(let source):
+                return "Activity event counts are negative or exceed the supported integer range (\(source)); retained history was left unchanged."
+            }
+        }
+    }
+
+    public enum Grain: String, Sendable, CaseIterable {
+        case hourly
+        case daily
+
+        var component: Calendar.Component { self == .hourly ? .hour : .day }
+    }
+
+    /// Keep a single answer within roughly 50 rows of context.
+    public static let answerRowCap = 50
+    public static let sourceSpanLimit = 20_000
+
+    private let store: ActivitySpanStore
+    private let policy: ActivityPolicy
+
+    public init(store: ActivitySpanStore, policy: ActivityPolicy) {
+        self.store = store
+        self.policy = policy
+    }
+
+    // MARK: Bucketing
+
+    /// Bound hourly queries over long ranges without implying full coverage.
+    public static let maxBuckets = 24 * 400
+
+    /// Carry the actual coverage bound so a bucket cap cannot silently omit the requested years.
+    public static func boundedBuckets(
+        from: Double, to: Double, grain: Grain, timezone: TimeZone
+    ) -> (boundaries: [(start: Double, end: Double)], coveredTo: Double) {
+        guard to > from else { return ([], to) }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timezone
+
+        var boundaries: [(start: Double, end: Double)] = []
+        var cursor = calendar.dateInterval(
+            of: grain.component, for: Date(timeIntervalSince1970: from)
+        )?.start ?? Date(timeIntervalSince1970: from)
+
+        while cursor.timeIntervalSince1970 < to, boundaries.count < maxBuckets {
+            let interval = calendar.dateInterval(of: grain.component, for: cursor)
+            guard let interval, interval.duration > 0 else { break }
+            boundaries.append((interval.start.timeIntervalSince1970,
+                               interval.end.timeIntervalSince1970))
+            cursor = interval.end
+        }
+        return (boundaries, min(to, boundaries.last?.end ?? to))
+    }
+
+    /// Sweep each span into and out of the active set once to avoid bucketCount × spanCount work.
+    static func buckets(
+        spans: [ActivitySpan],
+        from: Double,
+        to: Double,
+        boundaries: [(start: Double, end: Double)]
+    ) -> [ActivityBucket] {
+        guard to > from, !boundaries.isEmpty, !spans.isEmpty else { return [] }
+        let ordered = spans.sorted {
+            if $0.startedAt != $1.startedAt { return $0.startedAt < $1.startedAt }
+            return $0.id < $1.id
+        }
+        var out: [ActivityBucket] = []
+        var cursor = 0
+        var active: [ActivitySpan] = []
+
+        for (bucketStart, bucketEnd) in boundaries {
+            let windowStart = max(bucketStart, from)
+            let windowEnd = min(bucketEnd, to)
+            guard windowEnd > windowStart else { continue }
+
+            active.removeAll { ($0.endedAt ?? $0.lastSeenAt) <= windowStart }
+            while cursor < ordered.count, ordered[cursor].startedAt < windowEnd {
+                let span = ordered[cursor]
+                if (span.endedAt ?? span.lastSeenAt) > windowStart {
+                    active.append(span)
+                }
+                cursor += 1
+            }
+
+            // Carry the most recent app name for each stable bundle id.
+            var seconds: [String: Double] = [:]
+            var names: [String: String] = [:]
+            var counts: [String: Int] = [:]
+            var events: [String: Double] = [:]
+
+            for span in active {
+                let spanEnd = span.endedAt ?? span.lastSeenAt
+                let overlapStart = max(span.startedAt, windowStart)
+                let overlapEnd = min(spanEnd, windowEnd)
+                let overlap = overlapEnd - overlapStart
+                guard overlap > 0 else { continue }
+                let total = max(spanEnd - span.startedAt, 0)
+                // Prorate overlap; zero-length spans contribute undivided events to their containing bucket.
+                let share = total > 0 ? overlap / total : 1
+                seconds[span.bundleId, default: 0] += overlap
+                names[span.bundleId] = span.appName
+                counts[span.bundleId, default: 0] += 1
+                events[span.bundleId, default: 0] += Double(span.eventCount) * share
+            }
+
+            for (bundleId, secs) in seconds.sorted(by: {
+                if $0.value != $1.value { return $0.value > $1.value }
+                return $0.key < $1.key
+            }) {
+                out.append(ActivityBucket(
+                    start: bucketStart,
+                    end: bucketEnd,
+                    bundleId: bundleId,
+                    appName: names[bundleId] ?? bundleId,
+                    seconds: secs,
+                    spanCount: counts[bundleId] ?? 0,
+                    eventCount: events[bundleId] ?? 0
+                ))
+            }
+        }
+        return out
+    }
+
+    // MARK: Top-N
+
+    public static func topApps(
+        spans: [ActivitySpan], from: Double, to: Double, limit: Int
+    ) throws -> ActivityTopN {
+        var seconds: [String: Double] = [:]
+        var names: [String: String] = [:]
+        var counts: [String: Int] = [:]
+        var events: [String: Double] = [:]
+
+        for span in spans {
+            let spanEnd = span.endedAt ?? span.lastSeenAt
+            let overlap = min(spanEnd, to) - max(span.startedAt, from)
+            guard overlap >= 0 else { continue }
+            seconds[span.bundleId, default: 0] += max(0, overlap)
+            names[span.bundleId] = span.appName
+            counts[span.bundleId, default: 0] += 1
+            let total = max(0, spanEnd - span.startedAt)
+            let share = total > 0 ? max(0, overlap) / total : 1
+            events[span.bundleId, default: 0] += Double(span.eventCount) * share
+        }
+
+        let all = try seconds
+            .map { bundleId, secs in
+                ActivityAppTotal(
+                    bundleId: bundleId,
+                    appName: names[bundleId] ?? bundleId,
+                    seconds: secs,
+                    spanCount: counts[bundleId] ?? 0,
+                    eventCount: try checkedEventCount(events[bundleId] ?? 0, source: "app \(bundleId)")
+                )
+            }
+            // Tie-break by bundle id so identical queries never depend on dictionary order.
+            .sorted { ($0.seconds, $1.bundleId) > ($1.seconds, $0.bundleId) }
+
+        let kept = Array(all.prefix(max(0, limit)))
+        let dropped = all.dropFirst(kept.count)
+        return ActivityTopN(
+            rows: kept,
+            truncated: !dropped.isEmpty,
+            droppedRowCount: dropped.count,
+            droppedSeconds: dropped.reduce(0) { $0 + $1.seconds },
+            totalRowCount: all.count
+        )
+    }
+
+    // MARK: Exemplars
+
+    public static func exemplars(
+        spans: [ActivitySpan], limit: Int
+    ) throws -> [ActivitySpan] {
+        let merged = try merge(spans: spans)
+        return Array(
+            merged
+                .sorted { ($0.duration, $1.startedAt) > ($1.duration, $0.startedAt) }
+                .prefix(max(0, limit))
+        )
+    }
+
+    /// Merge only matching app/title spans without gaps; retain a real row id for exemplar references.
+    public static func merge(spans: [ActivitySpan]) throws -> [ActivitySpan] {
+        let ordered = spans.sorted { $0.startedAt < $1.startedAt }
+        var out: [ActivitySpan] = []
+        for span in ordered {
+            guard let previous = out.last,
+                  previous.bundleId == span.bundleId,
+                  previous.titleRedacted == span.titleRedacted else {
+                out.append(span)
+                continue
+            }
+            let previousEnd = previous.endedAt ?? previous.lastSeenAt
+            guard span.startedAt <= previousEnd else {
+                out.append(span)
+                continue
+            }
+            let spanEnd = span.endedAt ?? span.lastSeenAt
+            let count = previous.eventCount.addingReportingOverflow(span.eventCount)
+            guard !count.overflow, previous.eventCount >= 0, span.eventCount >= 0 else {
+                throw RollupError.invalidEventCount(source: "spans \(previous.id), \(span.id)")
+            }
+            _ = out.popLast()
+            out.append(ActivitySpan(
+                id: previous.id,
+                startedAt: previous.startedAt,
+                endedAt: max(previousEnd, spanEnd),
+                lastSeenAt: max(previous.lastSeenAt, span.lastSeenAt),
+                bundleId: previous.bundleId,
+                appName: previous.appName,
+                titleRedacted: previous.titleRedacted,
+                eventCount: count.partialValue,
+                closeReason: span.closeReason,
+                tzOffsetMin: previous.tzOffsetMin
+            ))
+        }
+        return out
+    }
+
+    private static func checkedEventCount(_ value: Double, source: String) throws -> Int {
+        guard let count = Int(exactly: value.rounded()), count >= 0 else {
+            throw RollupError.invalidEventCount(source: source)
+        }
+        return count
+    }
+
+    // MARK: The single answer
+
+    /// Spend the cap on top apps, then buckets, then exemplars; name every section that loses rows.
+    @concurrent public func answerBundle(
+        from: Double,
+        to: Double,
+        timezone: TimeZone,
+        grain: Grain? = nil,
+        rowCap: Int = ActivityRollups.answerRowCap,
+        bundleID: String? = nil
+    ) async throws -> ActivityAnswerBundle {
+        let spans = try await store.spansOverlapping(
+            from: from,
+            to: to,
+            limit: Self.sourceSpanLimit + 1,
+            policy: policy,
+            bundleID: bundleID
+        )
+        guard spans.count <= Self.sourceSpanLimit else {
+            throw RollupError.sourceRowsExceeded(limit: Self.sourceSpanLimit)
+        }
+        // Use day buckets above roughly 36 hours, when hourly detail obscures the shape.
+        let chosenGrain = grain ?? ((to - from) > 36 * 3600 ? .daily : .hourly)
+
+        let cap = max(3, rowCap)
+        let topLimit = min(10, max(1, cap / 5))
+        let exemplarLimit = min(10, max(1, cap / 5))
+        let bucketLimit = max(0, cap - topLimit - exemplarLimit)
+
+        let top = try Self.topApps(spans: spans, from: from, to: to, limit: topLimit)
+
+        // Detect the generation cap first so the answer names incomplete coverage.
+        let coverage = Self.boundedBuckets(
+            from: from, to: to, grain: chosenGrain, timezone: timezone
+        )
+        let bucketedTo = coverage.coveredTo
+
+        let allBuckets = Self.buckets(
+            spans: spans, from: from, to: to, boundaries: coverage.boundaries
+        )
+        // Choose the heaviest buckets, then restore chronology for a readable timeline.
+        let keptBuckets = allBuckets
+            .sorted { $0.seconds > $1.seconds }
+            .prefix(bucketLimit)
+            .sorted { ($0.start, $0.seconds) < ($1.start, $1.seconds) }
+
+        let clipped = try spans.compactMap { span -> ActivitySpan? in
+            let spanEnd = span.endedAt ?? span.lastSeenAt
+            let start = max(span.startedAt, from)
+            let end = min(spanEnd, to)
+            guard end >= start else { return nil }
+            let total = max(0, spanEnd - span.startedAt)
+            let share = total > 0 ? (end - start) / total : 1
+            return ActivitySpan(
+                id: span.id, startedAt: start,
+                endedAt: span.endedAt == nil ? nil : end, lastSeenAt: end,
+                bundleId: span.bundleId, appName: span.appName,
+                titleRedacted: span.titleRedacted,
+                eventCount: try Self.checkedEventCount(Double(span.eventCount) * share, source: "span \(span.id)"),
+                closeReason: span.closeReason, tzOffsetMin: span.tzOffsetMin
+            )
+        }
+        let allExemplars = try Self.exemplars(spans: clipped, limit: Int.max)
+        let keptExemplars = Array(allExemplars.prefix(exemplarLimit))
+
+        var truncated: [String] = []
+        if bucketedTo < to {
+            let hours = Int(((to - bucketedTo) / 3600).rounded())
+            truncated.append(
+                "buckets: the \(chosenGrain.rawValue) grain covers only up to "
+                    + "\(Int(bucketedTo)) (epoch) — \(hours) h of the requested window "
+                    + "is beyond the \(Self.maxBuckets)-bucket limit. Ask a shorter "
+                    + "window, or the daily grain."
+            )
+        }
+        if top.truncated {
+            truncated.append(
+                "topApps: \(top.droppedRowCount) of \(top.totalRowCount) apps omitted "
+                    + "(\(Int(top.droppedSeconds.rounded())) s)"
+            )
+        }
+        if keptBuckets.count < allBuckets.count {
+            truncated.append(
+                "buckets: \(allBuckets.count - keptBuckets.count) of \(allBuckets.count) omitted"
+            )
+        }
+        if keptExemplars.count < allExemplars.count {
+            truncated.append(
+                "exemplars: \(allExemplars.count - keptExemplars.count) of "
+                    + "\(allExemplars.count) omitted"
+            )
+        }
+
+        let totalSeconds = spans.reduce(0.0) { sum, span in
+            let spanEnd = span.endedAt ?? span.lastSeenAt
+            return sum + max(0, min(spanEnd, to) - max(span.startedAt, from))
+        }
+
+        return ActivityAnswerBundle(
+            from: from,
+            to: to,
+            timezoneIdentifier: timezone.identifier,
+            totalSeconds: totalSeconds,
+            topApps: top,
+            buckets: Array(keptBuckets),
+            exemplars: keptExemplars,
+            truncatedSections: truncated
+        )
+    }
+}

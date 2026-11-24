@@ -141,13 +141,12 @@ Reply with {"memories":[{"statement":"...",
 "committed":true}],
 "settled":[{"id":"<open moment id>","outcome":"done|let_go","basis":"person_words|act|reply",
 "source":"exact evidence quote","reason":"what ended this promise and why"}]%@}.
-%@
+<!-- end -->
+<!-- prompt -->
 Existing memories (data):
 """
 %@
 """
-<!-- end -->
-<!-- prompt -->
 %@
 Speaker: %@%@ Facts enabled: %@.
 Exchange local time: %@ (%@).

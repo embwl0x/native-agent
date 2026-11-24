@@ -1,3 +1,4 @@
+import Synchronization
 import Foundation
 // Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser`: checked grammar; `ChatContentCache`: bounded FIFO |
 
@@ -184,33 +185,33 @@ public enum ChatLinkPolicy {
 }
 
 /// Process-local FIFO storage; callers own parsing and admission outside the lock.
-public final class ChatContentCache<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cache: [String: Value] = [:]
-    private var order: [String] = []
-    private var totalChars = 0
+public final class ChatContentCache<Value: Sendable>: Sendable {
+    private struct State {
+        var cache: [String: Value] = [:]
+        var order: [String] = []
+        var totalChars = 0
+    }
+    private let state = Mutex(State())
     private let capacity = 300
     private let charBudget = 4_000_000
 
     public init() {}
 
     public func lookup(_ content: String) -> Value? {
-        lock.lock()
-        defer { lock.unlock() }
-        return cache[content]
+        return state.withLock { $0.cache[content] }
     }
 
     public func insertIfAbsent(_ parsed: Value, for content: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        if cache[content] == nil {
-            cache[content] = parsed
-            order.append(content)
-            totalChars += content.count
-            while order.count > capacity || (totalChars > charBudget && order.count > 1) {
-                let evicted = order.removeFirst()
-                totalChars -= evicted.count
-                cache.removeValue(forKey: evicted)
+        state.withLock { state in
+            if state.cache[content] == nil {
+                state.cache[content] = parsed
+                state.order.append(content)
+                state.totalChars += content.count
+                while state.order.count > capacity || (state.totalChars > charBudget && state.order.count > 1) {
+                    let evicted = state.order.removeFirst()
+                    state.totalChars -= evicted.count
+                    state.cache.removeValue(forKey: evicted)
+                }
             }
         }
     }

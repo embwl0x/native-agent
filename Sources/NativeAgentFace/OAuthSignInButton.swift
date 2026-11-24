@@ -21,7 +21,6 @@ struct OAuthSignInButton: View {
     private var authStatusText: String? { authStatus?.detail }
     @State private var flowTask: Task<Void, Never>? = nil
     @State private var credentialOperationRunning = false
-    @State private var credentialTask: Task<Void, Never>?
     private var cliSessionOffer: CodexCLISessionOffer? {
         provider.id == "openai_oauth_direct"
             ? appModel.face.slot(.settings).select("providers.cliOffer", as: SettingsFace.self) { $0?.providers.snapshot?.codexCLISessionOffer }
@@ -34,7 +33,7 @@ struct OAuthSignInButton: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 Button {
-                    guard flowTask == nil else { return }
+                    guard flowTask == nil, !credentialOperationRunning else { return }
                     flowTask = Task { await runFlow() }
                 } label: {
                     HStack(spacing: 8) {
@@ -60,9 +59,10 @@ struct OAuthSignInButton: View {
 
                 if status == .complete {
                     Button("Sign out") {
-                        credentialTask = Task { defer { credentialTask = nil }; await signOut() }
+                        startCredentialAct(.signOutProvider(id: provider.id))
                     }
                     .buttonStyle(.bordered)
+                    .disabled(flowTask != nil || credentialOperationRunning)
                 }
 
                 Spacer()
@@ -92,13 +92,13 @@ struct OAuthSignInButton: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                         HStack(spacing: 8) {
                             Button("Use it") {
-                                credentialTask = Task { defer { credentialTask = nil }; await acceptCLISessionOffer() }
+                                startCredentialAct(.decideCodexCLIConsent(allow: true))
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                             if !alreadyDeclined {
                                 Button("Ignore") {
-                                    credentialTask = Task { defer { credentialTask = nil }; await declineCLISessionOffer() }
+                                    startCredentialAct(.decideCodexCLIConsent(allow: false))
                                 }
                                 .buttonStyle(.plain)
                                 .controlSize(.small)
@@ -123,10 +123,10 @@ struct OAuthSignInButton: View {
                         .controlSize(.small)
                     }
                     .padding(.top, 2)
-                    .disabled(status == .running)
+                    .disabled(status == .running || credentialOperationRunning)
                 }
             }
-            if credentialOperationRunning { Button("Cancel", role: .cancel) { credentialTask?.cancel() } }
+            if credentialOperationRunning { ProgressView("Updating sign-in…").controlSize(.small) }
             if let cliConsentRepairMessage {
                 Label(cliConsentRepairMessage, systemImage: "checkmark.circle")
                     .font(ShellType.caption)
@@ -135,7 +135,6 @@ struct OAuthSignInButton: View {
         }
         .onDisappear {
             flowTask?.cancel()
-            credentialTask?.cancel()
         }
         .confirmationDialog(
             "Repair saved Codex CLI consent?",
@@ -143,7 +142,9 @@ struct OAuthSignInButton: View {
             titleVisibility: .visible
         ) {
             Button("Back Up and Reset") {
-                credentialTask = Task { defer { credentialTask = nil }; await repairCLISessionConsent() }
+                startCredentialAct(.repairCodexCLIConsent) {
+                    cliConsentRepairMessage = "Saved consent was backed up and reset. Choose Use it or Ignore again."
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -177,21 +178,19 @@ struct OAuthSignInButton: View {
     }
 
     @MainActor
-    private func credentialAct(_ act: FaceAct) async {
-        guard !credentialOperationRunning else { return }
+    private func startCredentialAct(_ act: FaceAct, onSuccess: (@MainActor () -> Void)? = nil) {
+        guard !credentialOperationRunning, flowTask == nil else { return }
         credentialOperationRunning = true
-        defer { credentialOperationRunning = false }
-        lastError = nil
-        do { _ = try await appModel.committedFaceAct(act) }
-        catch { lastError = error.localizedDescription }
-    }
-
-    private func signOut() async { await credentialAct(.signOutProvider(id: provider.id)) }
-    private func acceptCLISessionOffer() async { await credentialAct(.decideCodexCLIConsent(allow: true)) }
-    private func declineCLISessionOffer() async { await credentialAct(.decideCodexCLIConsent(allow: false)) }
-    private func repairCLISessionConsent() async {
-        await credentialAct(.repairCodexCLIConsent)
-        if lastError == nil { cliConsentRepairMessage = "Saved consent was backed up and reset. Choose Use it or Ignore again." }
+        Task {
+            defer { credentialOperationRunning = false }
+            lastError = nil
+            do {
+                _ = try await appModel.committedFaceAct(act)
+                onSuccess?()
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
     }
 
 }

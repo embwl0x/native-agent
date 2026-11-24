@@ -1,50 +1,19 @@
-import Agents
-import ChatToolRuntime
-import ApprovalInbox
-import MacIntegration
-import Transcripts
-import DeviceSync
-import MemoryV2
+import BodyRuntime
+import MacNerves
+import SenseCore
+import MindCore
 import ProviderRouting
-import MacControl
-import Privacy
-import SchedulerExecution
+import PersistenceCore
 import Foundation
-import AttentionRouting
-import Experiences
-import ChromeControl
-import Cognition
-import CognitiveSubstrate
-import Context
-import ContextFlow
-import Desk
-import TrustCenter
-import ApprovalTransactions
-import ActivityWatch
-import AppToolRuntime
+import DeskCore
 import SwiftUI
 import UserNotifications
 import ServiceManagement
 import NativeAgentShared
 // Unwired runtime subsystems must fail closed.
 import NativeAgentCore
-import StandingBots
-import ChatTurnRuntime
-import ChatTurnContracts
-import ChatSessionWork
-import AgentConversations
-import BackgroundLoops
-import BackgroundWork
-import DreamREMCycle
-import PersistenceCore
-import PersonaEngine
-import TrustPersistence
 import OSLog
-@_exported import EngineRuntime
-import Connectors
-import Browser
-import DoctorChecks
-import TelegramBot
+@_exported import BodyRuntime
 // Blueprint: | `NativeAgentApp.swift` | App lifecycle, runtime composition and clean system delivery-repair births |
 
 @MainActor
@@ -132,6 +101,7 @@ final class NativeAgentHotkeyBootstrap {
 enum NativeAgentAppMain {
     @MainActor
     static func main() {
+        PeerTrust.install()
         if SystemPermissionPreflight.runGrantProbeIfRequested() { return }
         if AppRelaunch.runRelaunchHelperIfRequested() { return }
         if SwiftToolDispatcher.runScheduledInstallerHelperIfRequestedBlocking() { return }
@@ -143,7 +113,6 @@ enum NativeAgentAppMain {
 
         NativeAgentEnginePorts.installAppPorts(NativeAgentEnginePorts.mounted)
 
-        InlineInteractionResolver.platform = AppInlineInteractionPlatformPort()
         // Capture launch grants before initialization can change this process's permission state.
         _ = SystemPermissionPreflight.grantedAtLaunch
         _ = NSApplication.shared
@@ -236,10 +205,9 @@ struct NativeAgentApp: App {
             confirmMissingRoots: AppDelegate.confirmLaunchWithMissingRoots
         ) else { return false }
         SensesAssembly.install(dataRoot: dataRoot)
-        await NativeAgentEngine.installBotProviderCheck()
         let appModel = AppModel()
         let settingsActs = BodySettingsActHandler(appModel: appModel)
-        settingsActs.configure()
+        await settingsActs.configure()
         do { try await appModel.engine.faceActs.installPlatform(settingsActs) }
         catch {
             appModel.setFailureStatus(error, action: "install the body settings owner")
@@ -258,26 +226,6 @@ struct NativeAgentApp: App {
         MacWorkContinuation.capture = { text, taskReference in
             await appModel.captureMacWorkContinuation(text, taskReference: taskReference)
         }
-
-        // Resume through the window's AppModel and report admission refusal so a durable resumed claim cannot strand a card over a turn that never ran.
-        NativeAgentEngine.configureInlineInteractionsAtLaunch(startTurn: { prompt, sessionID, hideUserBubble, turn in
-            let envelope = turn.envelope
-            var origin = ChatMessageOrigin(surface: envelope?.surface ?? "chat", agent: envelope?.agent)
-            origin.peerSources = turn.peerSteering?.checkpointSources ?? []
-            origin.elevatedPeerSources = turn.peerSteering?.elevatedSources ?? []
-            // The admitted turn retains the continuation's origin through delivery.
-            let started = await appModel.startChatTurn(
-                prompt, attachments: [], sessionId: sessionID, hideUserBubble: hideUserBubble,
-                requireActiveSession: false, origin: origin, parent: turn
-            )
-            if !hideUserBubble { appModel.publishConversationAnchor(for: started.acceptance) }
-            switch started.acceptance {
-            case .accepted: return true
-            // The refusal's own reason is the card's: a deleted conversation says so, never "just now".
-            case .rejected(let message):
-                throw NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: message])
-            }
-        })
 
         ApplicationLifetime.shared.appModel = appModel
         return true
@@ -401,12 +349,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     )
 }
 
-// Qualify the runtime transcript type to disambiguate ChatOrchestration imports.
-typealias ChatMessage = EngineRuntime.ChatMessage
-// Use NativeAgentShared UI/decoding types because Core also exports MemoryRecord and ChatSession.
 typealias MemoryRecord = NativeAgentShared.MemoryRecord
 typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
-typealias ChatSession = NativeAgentShared.ChatSession
 
 extension NativeAgentEnginePorts {
     static func mounted(dataRoot: URL) -> Self {
@@ -423,8 +367,7 @@ extension NativeAgentEnginePorts {
         return Self(
             backgroundWork: AppBackgroundWorkHost(),
             connectorStatus: AppConnectorStatusPlatform(),
-            cognitionHost: EngineCognitionHost(attention: .shared),
-            deviceSyncHost: EngineDeviceSyncHost(engine: { .live }, router: { .shared }, platform: AppDeviceSyncPlatform()),
+            deviceSyncPlatform: AppDeviceSyncPlatform(),
             macIntegration: MacIntegrationDeliveryActions(),
             a2aPushConfiguration: { peer in
                 let port = await ClaudeBridgeRuntime.shared.activePort
@@ -442,11 +385,12 @@ extension NativeAgentEnginePorts {
                 return .object(["url": .string("http://127.0.0.1:\(port)/a2a/notifications"),
                     "authentication": .object(["scheme": .string("Bearer"), "credentials": .string(secret)])])
             },
-            completionSender: { EngineAgentBridgeCompletionSender(engine: { .live }, router: { .shared }, dataRoot: $0) },
+            completionSender: { EngineAgentBridgeCompletionSender(engine: $1, router: { .shared }, dataRoot: $0) },
             standingBotQueue: BotRunQueue(dataRoot: dataRoot),
-            appTools: { AppToolExecutor(securityCenter: $0, enforceAutonomySecurity: $1) },
+            appTools: { AppToolExecutor(interactions: $2.interactions, securityCenter: $0, enforceAutonomySecurity: $1, agentJobs: $2.agentJobs) },
             browserRoutes: .app,
             connectorActions: { AppConnectorActionPlatform(engine: $0) },
+            interactionPlatform: { AppInlineInteractionPlatformPort(engine: $0) },
             chatPlatform: ChatToolPlatformPort(
                 grok: { plan, root, surface, turn, parts in
                     await GrokBotConnection.perform(turn: turn, plan: plan, dataRoot: root, surface: surface, parts: parts)
@@ -472,11 +416,7 @@ private struct AppDeviceSyncPlatform: EngineDeviceSyncPlatform {
 }
 
 extension ClaudeBridgeRuntime {
-    static let shared: ClaudeBridgeRuntime = NativeAgentEngine.makeAgentBridge(engine: { .live },
-        grpcPort: { Agents.NativeAgentA2AGRPCListener.shared.port })
-}
-extension Agents.NativeAgentA2AGRPCListener {
-    static let shared: Agents.NativeAgentA2AGRPCListener = NativeAgentEngine.makeA2AListener(engine: { .live }, bridge: { .shared })
+    static let shared: ClaudeBridgeRuntime = NativeAgentEngine.makeAgentBridge(engine: { .live })
 }
 
 extension AttentionRouter {

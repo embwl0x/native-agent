@@ -19,12 +19,14 @@ Telegram, Slack and local agent bridges reach that same runtime.
 
 ## Three views
 
-- **Simple** — chat beside the agent, its contacts and helpers. Ask the agent
-  to set things up. The panel's gear offers appearance controls and
-  **More settings…**, which opens Settings in Advanced.
-- **Advanced** — the full rail of pages: Chat, Today, Memories, Desk,
-  Notifications, Helpers, Personality, Providers, Trust, Connectors,
-  Capabilities, Diagnostics and Settings.
+- **Simple** — chat beside the agent's card, four places (Chat, Desk, the
+  agent's place under its name, and Control) and folded Agents and Helpers
+  lists. Choosing a place opens its tabs and pages in place; Settings lives on
+  Control's Settings tab (and **Settings…**, ⌘,).
+- **Advanced** — all five grouped places on the rail: Chat; Desk (Today, Desk,
+  Notifications, Helpers); the agent's place (Memories, Personality,
+  Capabilities and any page of the agent's own); Control (Providers, Trust,
+  Connectors, Settings); and Diagnostics.
 - **Agent** — the agent's own home and rooms; a conversation opened there shows in Simple.
 
 A view preference that was never set starts in Simple, whatever chats exist. The [User and Agent Guide](docs/USER_GUIDE.md) covers setup and the
@@ -37,14 +39,14 @@ main pages.
 | Agent interface | The agent's one door, `app`, always on. `app {}` is home, “where I left off”; pages, items, search, actions and JavaScript reach the app's capabilities. |
 | Memory and context | MemoryV2 stores durable memory with lexical and semantic recall. Fluid Context prepares bounded context from the underlying stores. |
 | Work | Desk holds projects, dependencies, schedules, progress and outcomes; standing helpers have their own briefs, models and conversations. |
-| Mac and web | App actions reach files, shell, Mac apps, screen control, the built-in browser and the optional Chrome extension. `web.search` uses SearXNG (found on the Mac without setup) and searches in Chrome or their own browser when there is none; a failure says why. |
+| Mac and web | App actions reach files, shell, Mac apps, screen control, the built-in browser and the optional Chrome extension. `web.search` searches through SearXNG: set Search service (`research.search_url`) to its address, or to `auto` to find one running on this Mac. With none set it fails and names that setting; it never falls back to a browser. |
 | Connections | Connectors and agent contacts live under **Connectors**. An MCP server they wants is an ability they grows. |
-| Growth | What they works out they keeps as their own abilities: `ability.save`, kept by their under Full Mac or by the owner's card, runs as `authored.<id>`; `ability.read`, `ability.enable`, `ability.resume` and `ability.rollback` are its lifecycle. Parts grant no new authority; see the [manifest spec](docs/skill_manifest_spec.md). Skills are built-in guidance to read. |
+| Growth | What they works out they keeps as their own abilities: `ability.save`, kept by their under Full Mac or by the owner's card, runs as `authored.<id>`; `ability.read`, `ability.enable`, `ability.resume` and `ability.restore` are its lifecycle. Parts grant no new authority; see the [manifest spec](docs/skill_manifest_spec.md). Skills are built-in guidance to read. |
 | Trust | Safe, Work mode, Builder and Full Mac govern access. Full Mac grants autonomy; macOS privacy permission resets still ask the owner. Peer-steered turns retain extra approval boundaries, except for authenticated agents enabled in Trust → Connected agents; ordinary Trust and domain checks still apply. |
 | Inner life | Settings controls reflection, dreams and memory in replies; Diagnostics exposes cognition and organism state. |
 
 The action registry is
-[AppActionRegistry.swift](Modules/NativeAgentCore/Sources/AppToolRuntime/AppActionRegistry.swift).
+[AppActionRegistry.swift](Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppActionRegistry.swift).
 The [one-door contract](docs/ONE_DOOR.md) explains discovery and execution;
 the [capability map](docs/CAPABILITIES.md) covers boundaries and source owners.
 
@@ -71,8 +73,10 @@ See [Support](SUPPORT.md) for installation and updates.
 
 ### From source
 
-The package requires an Apple silicon Mac, macOS 26+ and Swift 6.1; app
-installation requires Xcode and XcodeGen.
+Building from source requires an Apple silicon Mac, macOS 26+, Xcode and
+XcodeGen. The manifests require Swift tools 6.2. The packages and Mac app
+enable strict memory safety, caller-isolated nonisolated async functions,
+isolated conformance inference and member import visibility.
 
 ```bash
 brew install xcodegen
@@ -82,7 +86,11 @@ cd native-agent
 ```
 
 The installer builds, signs, installs to `~/Applications`, and launches the
-app. See [Contributing](CONTRIBUTING.md) for the development workflow and
+app. Signing defaults to `development`, which needs an Apple Development
+identity, a matching provisioning profile and local entitlements; without them
+it stops. A clone with no Apple developer account runs
+`NATIVEAGENT_SIGNING_MODE=adhoc ./script/install_app.sh`: ad-hoc signed, with
+iCloud off, so there is no phone link. See [Contributing](CONTRIBUTING.md) for the development workflow and
 [Release setup](docs/release_setup.md) for distribution.
 
 ## Local data and privacy

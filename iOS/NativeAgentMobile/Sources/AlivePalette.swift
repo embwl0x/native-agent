@@ -6,8 +6,6 @@ import NativeAgentShared
 // MARK: - The colour setting
 
 extension HazeColor {
-    var swatch: Color { Color(hex: shades[0]) }
-
     /// Deep haze clears 5:1 for white labels; darken it 30% in light mode so tinted words also clear 5:1 over the brightest haze.
     func control(dark: Bool, labelled: Bool) -> Color {
         guard !dark else { return Color(hex: labelled ? shades[1] : shades[0]) }

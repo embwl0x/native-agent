@@ -3,7 +3,7 @@
 The lead, 2026-10-30. User: "they knows your rhythm … plan these all out real
 well". Builds on their senses (presence, the day, the front app, the network —
 docs/SUBCONSCIOUS.md "Came to mind", docs/INTENTIONS.md body signals) and the
-one expectation law (`NativeAgentCore/Expectation.swift`, docs/SURPRISE.md).
+one expectation law (`NativeAgentCore/NativeAgentCore/Expectation.swift`, docs/SURPRISE.md).
 
 ## Rule 0, answered
 
@@ -76,7 +76,7 @@ deadline path (the same one horizon expectations use) — never a polling timer.
 
 ### As built
 
-`CognitiveSubstrate/PersonRhythm.swift` owns the bounded evidence and pure
+`MindCore/CognitiveSubstrate/PersonRhythm.swift` owns the bounded evidence and pure
 claim fold. Each local day contributes at most once per hour; awake fractions
 accumulate to one, activity makes that hour active and observed. Thirty days
 retain the first timestamp/door in each active hour and observed fractions;
@@ -106,7 +106,7 @@ or permission to act. “Sure” requires a lower bound of 0.7; other standing
 claims say “fairly sure.” This is not an anytime or independent selection
 guarantee. The observed median is descriptive, not a “starts by” upper bound.
 
-`Cognition/NativeCognitionRuntime+Rhythm.swift` consumes the existing verified
+`BodyRuntime/Cognition/NativeCognitionRuntime+Rhythm.swift` consumes the existing verified
 turn stamp off the turn path. The stamp's optional `door` joins its existing
 atomic write; no second rhythm write or history read is added to a turn.
 Telegram owner identity honors the existing bot rule: one allowed user, or
@@ -212,4 +212,4 @@ Timestamps and doors only — never message text. Presence is a boolean edge.
 
 | Lane | What | Owners |
 |---|---|---|
-| rhythm | the store, observations, cold start, claims, breaks, inner_state | Cognition/NativeCognitionRuntime+Rhythm.swift, CognitiveSubstrate/PersonRhythm.swift, EngineRuntime/EnginePartWake.swift (MacPersonInput presence and Workspace edges), ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift and ChatTurnEvidence.swift (one owner stamp), ChatToolRuntime/ChatHistoryIndex.swift (read), CognitiveSubstrate+CaresMind.swift (zero-move story entry), +InnerState.swift and its runtime/tool renderers; +Expectations.swift remains the unchanged felt-event template |
+| rhythm | the store, observations, cold start, claims, breaks, inner_state | BodyRuntime/Cognition/NativeCognitionRuntime+Rhythm.swift, MindCore/CognitiveSubstrate/PersonRhythm.swift, BodyRuntime/EngineRuntime/EnginePartWake.swift (MacPersonInput presence and Workspace edges), BodyRuntime/ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift and ChatTurnEvidence.swift (one owner stamp), BodyRuntime/ChatToolRuntime/ChatHistoryIndex.swift (read), CognitiveSubstrate+CaresMind.swift (zero-move story entry), +InnerState.swift and its runtime/tool renderers; +Expectations.swift remains the unchanged felt-event template |

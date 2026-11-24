@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 import Foundation
 import UIKit
@@ -42,11 +43,19 @@ enum SettingsLegalLinksPresentation {
 }
 
 struct SettingsViewFull: View {
+    enum Presentation {
+        case root
+        case pushed
+        case sheet
+    }
+
+    let presentation: Presentation
     var opensConnection = false
-    @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @StateObject private var store = SettingsStore()
-    @ObservedObject private var turnActivity = PhoneTurnActivity.shared
+    @Environment(\.dismiss) private var dismiss
+    @Environment(PairingStore.self) private var pairingStore
+    @Environment(MacBridgeClient.self) private var bridgeClient
+    @State private var store = SettingsStore()
+    private let turnActivity = PhoneTurnActivity.shared
     @State private var showRePairSheet = false
     @State private var pushedFace: FaceDestination?
     // The wrappers invalidate the projection when either device preference changes.
@@ -54,12 +63,16 @@ struct SettingsViewFull: View {
     @AppStorage(HazeColor.key) private var hazeRawValue = HazeColor.defaultValue.rawValue
     private var session: FacePageSession { store.sync.pageSessions.page("phone-settings") }
     private var localControls: [PhoneLocalSetting] {
-        [NativeAgentAppearance.settingControl, HazeSwatches.settingControl, turnActivity.settingControl]
+        [NativeAgentAppearance.settingControl, HazeColor.settingControl, turnActivity.settingControl]
     }
 
     var body: some View {
         ScrollViewReader { proxy in
-            AlivePage(title: "Settings", line: "This iPhone, its link to the Mac, and the Mac's own settings.") {
+            AlivePage(
+                title: "Settings",
+                line: "This iPhone, its link to the Mac, and the Mac's own settings.",
+                style: presentation == .root ? .root : .pushed
+            ) {
                 FaceView(face: appearanceFace, door: localDoor, session: session)
                 FaceView(face: connectionFace, door: localDoor, session: session).id("connection")
                 MobileFaceRows(page: "settings") { pushedFace = $0 }
@@ -68,9 +81,15 @@ struct SettingsViewFull: View {
                 FaceView(face: aboutFace, door: localDoor, session: session)
             }
             .navigationDestination(item: $pushedFace) { $0.view }
+            .toolbar {
+                if presentation == .sheet {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+            }
             .onAppear { if opensConnection { proxy.scrollTo("connection", anchor: .top) } }
         }
-        .macSyncErrorBanner()
         .task { await store.refresh() }
         .refreshable { await store.refresh() }
         .fullScreenCover(isPresented: $showRePairSheet) {
@@ -81,9 +100,8 @@ struct SettingsViewFull: View {
                 iCloudBridge.shared.pairingStore = pairingStore
                 if pairingStore.usesICloudTransport { bridgeClient.configureICloud() }
                 else { bridgeClient.disconnect() }
-            })
-            .environmentObject(pairingStore)
-            .safeAreaInset(edge: .bottom) { iOSSystemToastBar(center: SystemToastCenter.shared) }
+            }, showsSystemToasts: true)
+            .environment(pairingStore)
         }
     }
 
@@ -217,11 +235,12 @@ enum SettingsICloudRefreshPresentation {
 }
 
 @MainActor
-final class SettingsStore: ObservableObject {
+@Observable
+final class SettingsStore {
     let sync: iCloudSyncEngine
-    @Published var isLoading = false
-    @Published private(set) var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
-    private var refreshTask: Task<SettingsSnapshotRefreshOutcome, Never>?
+    var isLoading = false
+    private(set) var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
+    @ObservationIgnored private var refreshTask: Task<SettingsSnapshotRefreshOutcome, Never>?
     init(sync: iCloudSyncEngine = .shared) {
         self.sync = sync
     }

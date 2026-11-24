@@ -163,6 +163,15 @@ public struct QuietToolPage: Sendable, Equatable {
         QuietToolPage(id: "context", title: "Context", summary: ""),
         QuietToolPage(id: "agent_view", title: "Agent view", summary: ""),
     ]
+    public static let simpleSettings = "simple_settings_menu"
+    public static let drawOnly: [QuietToolPage] = [
+        QuietToolPage(id: "home", title: "Home",
+                      summary: "Home (app {} and the Agent view): notable today, what changed, what waits, my queue, working, people, helpers and places."),
+        QuietToolPage(id: "simple", title: "Simple view",
+                      summary: "The Simple shell on Chat: my card, the places, the folded Agents and Helpers lists, and the chat."),
+        QuietToolPage(id: simpleSettings, title: "Simple view settings",
+                      summary: "The Simple shell on Control's Settings tab, where Simple's settings live."),
+    ]
 
     public static var ids: [String] { all.map(\.id) }
 

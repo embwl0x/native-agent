@@ -13,10 +13,11 @@ enum NativeAgentMotion {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
+    static let quickCurve = Animation.easeOut(duration: quickDuration)
     static let crossfade = Animation.easeOut(duration: standardDuration)
     static var standard: Animation? { respecting(crossfade, reduceMotion: reducesMotion) }
     static var quick: Animation? {
-        respecting(.easeOut(duration: quickDuration), reduceMotion: reducesMotion)
+        respecting(quickCurve, reduceMotion: reducesMotion)
     }
     static var spring: Animation? {
         respecting(.spring(response: springDuration, dampingFraction: 0.88), reduceMotion: reducesMotion)
@@ -26,11 +27,6 @@ enum NativeAgentMotion {
         respecting(.smooth(duration: springDuration), reduceMotion: reducesMotion)
     }
     static let arrivalCurve = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.18)
-    static var arrive: Animation? {
-        respecting(arrivalCurve, reduceMotion: reducesMotion)
-    }
-    /// Opacity stays animated when Reduce Motion removes layout interpolation.
-    static var arrivalFade: AnyTransition { .opacity.animation(arrivalCurve) }
     static let breatheDuration = standardDuration * 5
     /// Read the clock through TimelineView; repeatForever can crash during repeating motion.
     static func loopPhase(at date: Date, period: TimeInterval) -> CGFloat {

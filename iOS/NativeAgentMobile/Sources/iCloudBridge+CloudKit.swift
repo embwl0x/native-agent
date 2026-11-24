@@ -121,12 +121,15 @@ extension iCloudBridge {
 
         deliveryPairingDidChange()
         Task {
-            await transport.observePairing { [weak self = self] secret in
+            await transport.observePairing { [weak self = self] secret, publishedAt in
                 guard await self?.setupGeneration == generation else { return false }
-                return await self?.applyPairingMaterialFromTransport(secret) ?? false
+                return await self?.applyPairingMaterialFromTransport(secret, publishedAt: publishedAt) ?? false
             }
         }
         deviceIncomingSetupTask = Task {
+            defer {
+                if setupGeneration == generation { deviceIncomingSetupTask = nil }
+            }
             await iCloudSyncEngine.shared.enableCloudKitSnapshotCache()
             guard setupGeneration == generation else { return }
             let subscribed = await transport.observeIncoming { [weak self = self] msg in
@@ -288,8 +291,8 @@ extension iCloudBridge {
         await readMacPresence()
     }
 
-    private func applyPairingMaterialFromTransport(_ secret: Data) -> Bool {
-        takeMacPairingKey(secret, publishedAt: nil)
+    private func applyPairingMaterialFromTransport(_ secret: Data, publishedAt: Date?) -> Bool {
+        takeMacPairingKey(secret, publishedAt: publishedAt)
     }
 
     /// Pairing refresh may run inside initial message delivery; awaiting that setup drain would deadlock its caller.
@@ -413,13 +416,9 @@ extension iCloudBridge {
     @discardableResult
     func drainIfDeviceSyncPush(_ userInfo: [AnyHashable: Any], recovery: DeviceSyncRecovery = .init()) async -> Bool {
         guard deviceTransport != nil else { return false }
-        #if canImport(CloudKit)
         guard CloudKitDeviceTransport.isDeviceSyncNotification(userInfo)
                 || (userInfo["nativeAgentWake"] as? String) == "notification" else { return false }
         return await drainDeviceTransport(recovery: recovery)
-        #else
-        return false
-        #endif
     }
 
 }

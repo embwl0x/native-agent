@@ -20,4 +20,3 @@ function face(input) {
     if (!title) title = input.filename;
     return {sections:[{id:"preview",rows:[{id:"title",title}]}]};
 }
-function run(input) { return face(input); }

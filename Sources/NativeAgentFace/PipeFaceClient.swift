@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import NativeAgentShared
 import Observation
+import Synchronization
 // Blueprint: | `PipeFaceClient.swift` | Renderer act correlation, frame application and body-call dispatch over the inherited pipes |
 
 @MainActor
@@ -16,36 +17,46 @@ final class PipeFaceClient: FaceClient {
     func whenConnected(_ work: @escaping () -> Void) {
         if case .connected = state { work() } else { afterConnect.append(work) }
     }
-    @ObservationIgnored private let displayFrame = DisplayFrame(followsScreenChanges: true)
+    @ObservationIgnored private let displayFrame = DisplayFrame()
     @ObservationIgnored private var link: FaceLink.Connection?
     @ObservationIgnored private weak var router: FaceCallRouter?
     @ObservationIgnored private var ended = false
-    @ObservationIgnored private var waiting: [UUID: CheckedContinuation<FaceActReply, Error>] = [:]
-    @ObservationIgnored private var abandoned: Set<UUID> = []
-    @ObservationIgnored private var receipts: [UUID: FaceAct] = [:]
+    @ObservationIgnored private var waiting: [UInt64: CheckedContinuation<FaceActReply, Error>] = [:]
+    @ObservationIgnored private var abandoned: Set<UInt64> = []
+    @ObservationIgnored private var receipts: [UInt64: FaceAct] = [:]
     @ObservationIgnored var onReceiptFailure: ((WireFailure) -> Void)?
-    @ObservationIgnored private var calls: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var calls: [UInt64: Task<Void, Never>] = [:]
     @ObservationIgnored private var epoch: UUID?
     @ObservationIgnored private var appliedBarriers: Set<UUID> = []
     @ObservationIgnored private var batches: [FaceBatch] = []
     @ObservationIgnored private var frameTask: Task<Void, Never>?
     @ObservationIgnored private var log: FaceLinkLog?
-    @ObservationIgnored private var requestNames: [UUID: String] = [:]
+    @ObservationIgnored private var requestNames: [UInt64: String] = [:]
 
-    private func send(_ act: FaceAct, id: UUID, link: FaceLink.Connection) async throws {
-        let name = FaceLinkLog.act(act)
-        requestNames[id] = name
-        try await link.send(.act(id: id, act))
-        await record("sent request=\(id) act=\(name)")
+    @ObservationIgnored private var requests = FaceLink.Requests()
+    @ObservationIgnored private var lastCall: UInt64 = 0
+
+    private final class PendingAct: Sendable {
+        @MainActor var id: UInt64?
+        private let pending = Atomic(true)
+
+        nonisolated func claim() -> Bool {
+            pending.exchange(false, ordering: .relaxed)
+        }
     }
 
-    private func record(_ event: String) async {
-        do { try await log?.record(event) }
-        catch {
-            ModuleLog.app("[face] link record failed: %@", error.localizedDescription, level: .error)
-            onReceiptFailure?(WireFailure(code: "face_log_write_failed", message: "This window could not append its link record.",
-                cause: TurnSecretRedactor.redactText(error.localizedDescription), effects: .none))
-        }
+    private func enqueue(_ act: FaceAct, link: FaceLink.Connection, beginWrite: (@Sendable () -> Bool)? = nil) throws -> (id: UInt64, write: Task<Void, Error>) {
+        let request = try requests.enqueue(on: link, beginWrite: beginWrite) { .act(id: $0, act) }
+        let name = FaceLinkLog.act(act)
+        requestNames[request.id] = name
+        log?.record("queued request=\(request.id) act=\(name)")
+        return request
+    }
+
+    private func receipt(_ act: FaceAct, link: FaceLink.Connection) async throws {
+        let request = try enqueue(act, link: link)
+        receipts[request.id] = act
+        try await request.write.value
     }
 
     var connectionID: UUID? { epoch }
@@ -56,50 +67,65 @@ final class PipeFaceClient: FaceClient {
             throw WireFailure(code: "face_data_root_missing", message: "I did not supply this window's diagnostics root.",
                               cause: nil, effects: .none)
         }
-        log = try await FaceLinkLog.open(dataRoot: URL(fileURLWithPath: path, isDirectory: true), role: .face)
+        log = try await FaceLinkLog.open(dataRoot: URL(fileURLWithPath: path, isDirectory: true), role: .face) { [weak self] error in
+            await self?.recordFailed(error)
+        }
+    }
+
+    private func recordFailed(_ error: any Error) {
+        onReceiptFailure?(WireFailure(code: "face_log_write_failed", message: "This window could not append its link record.",
+            cause: TurnSecretRedactor.redactText(error.localizedDescription), effects: .none))
     }
 
     func connectionFailed(_ error: any Error) async { await end(error) }
 
     /// A cancelled caller retains its request identity; the body may already have performed the act.
     func act(_ act: FaceAct) async throws -> FaceActReply {
-        try await self.act(act, id: UUID(), retainingReply: false)
-    }
-
-    /// Page cancellation asks the body to stop and keeps its waiter for the body's actual terminal reply.
-    func pageAct(_ request: PageActRequest, id: UUID) async throws -> FaceActReply {
-        try await act(.pageAct(request), id: id, retainingReply: true)
+        try await self.act(act, retainingReply: false)
     }
 
     func protectedAct(_ act: FaceAct) async throws -> FaceActReply {
-        try await self.act(act, id: UUID(), retainingReply: true)
+        try await self.act(act, retainingReply: true)
     }
 
-    private func act(_ act: FaceAct, id: UUID, retainingReply: Bool) async throws -> FaceActReply {
-        try Task.checkCancellation()
-        guard !ended, let link else { throw FaceWireError.disconnected }
+    private func act(_ act: FaceAct, retainingReply: Bool) async throws -> FaceActReply {
+        let pending = PendingAct()
         return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
+                let id: UInt64, write: Task<Void, Error>
+                do {
+                    try Task.checkCancellation()
+                    guard !ended, let link else { throw FaceWireError.disconnected }
+                    (id, write) = try enqueue(act, link: link, beginWrite: pending.claim)
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                pending.id = id
                 waiting[id] = continuation
                 Task {
-                    guard !ended, waiting[id] != nil else { abandoned.remove(id); return }
-                    do { try await send(act, id: id, link: link) }
+                    do { try await write.value }
                     catch { await end(error) }
                 }
             }
         } onCancel: {
+            let withdrawn = pending.claim()
             Task { @MainActor in
-                guard self.waiting[id] != nil else { return }
+                guard let id = pending.id, self.waiting[id] != nil else { return }
+                if withdrawn {
+                    self.requestNames.removeValue(forKey: id)
+                    self.log?.record("withdrawn request=\(id)")
+                    self.waiting.removeValue(forKey: id)?.resume(throwing: WireFailure(code: "face_act_cancelled",
+                        message: "Cancelled before sending the request.", cause: "Request \(id).", effects: .none))
+                    return
+                }
                 if !retainingReply, let continuation = self.waiting.removeValue(forKey: id) {
                     self.abandoned.insert(id)
                     continuation.resume(throwing: WireFailure(code: "face_act_cancelled", message: "Stopped waiting for my reply.",
-                        cause: "Request \(id.uuidString); its effects are unknown. Reconcile before repeating it.", effects: .unknown))
+                        cause: "Request \(id); its effects are unknown. Reconcile before repeating it.", effects: .unknown))
                 }
                 guard !self.ended, let link = self.link else { return }
-                let cancellation = UUID()
-                self.receipts[cancellation] = .cancelRequest(id)
-                do { try await self.send(.cancelRequest(id), id: cancellation, link: link) }
+                do { try await self.receipt(.cancelRequest(id), link: link) }
                 catch { await self.end(error) }
             }
         }
@@ -116,19 +142,17 @@ final class PipeFaceClient: FaceClient {
         self.router = router
         var incoming = link.incoming.makeAsyncIterator()
         do {
-            let attach = UUID()
-            receipts[attach] = .attach(protocolVersion: FaceEnvelope.protocolVersion)
-            try await send(.attach(protocolVersion: FaceEnvelope.protocolVersion), id: attach, link: link)
+            try await receipt(.attach(protocolVersion: FaceEnvelope.protocolVersion), link: link)
             while let envelope = try await incoming.next() {
                 if await link.reachedEOF { continue }
                 switch envelope {
                 case .feed(let batch):
-                    await record(FaceLinkLog.feed(batch))
+                    log?.record(FaceLinkLog.feed(batch))
                     batches.append(batch)
                     if frameTask == nil { frameTask = Task { await draw(link: link) } }
                 case .actReply(let id, let reply):
                     let name = requestNames.removeValue(forKey: id) ?? "unknown"
-                    await record("reply request=\(id) act=\(name) result=\(FaceLinkLog.reply(reply))")
+                    log?.record("reply request=\(id) act=\(name) result=\(FaceLinkLog.reply(reply))")
                     if let continuation = waiting.removeValue(forKey: id) { continuation.resume(returning: reply) }
                     else if abandoned.remove(id) != nil { continue }
                     else if let receipt = receipts.removeValue(forKey: id) {
@@ -147,20 +171,23 @@ final class PipeFaceClient: FaceClient {
                         }
                     } else { throw FaceWireError.invalidFeedOrder }
                 case .call(let id, .cancelCall(let target)):
-                    await record("call request=\(id) name=cancelCall target=\(target)")
+                    log?.record("call request=\(id) name=cancelCall target=\(target)")
+                    guard id > lastCall else { throw FaceWireError.invalidFeedOrder }
+                    lastCall = id
                     calls[target]?.cancel()
                     try await link.send(.reply(id: id, .acknowledged))
-                    await record("replied request=\(id) result=acknowledged")
+                    log?.record("replied request=\(id) result=acknowledged")
                 case .call(let id, let call):
-                    await record("call request=\(id) name=\(FaceLinkLog.name(call))")
-                    guard calls[id] == nil else { throw FaceWireError.invalidFeedOrder }
+                    log?.record("call request=\(id) name=\(FaceLinkLog.name(call))")
+                    guard id > lastCall else { throw FaceWireError.invalidFeedOrder }
+                    lastCall = id
                     calls[id] = Task {
                         guard !ended, !(await link.reachedEOF) else { calls.removeValue(forKey: id); return }
                         let reply = await router.reply(to: call)
                         guard !ended, !(await link.reachedEOF) else { calls.removeValue(forKey: id); return }
                         do {
                             try await link.send(.reply(id: id, reply))
-                            await record("replied request=\(id) result=\(FaceLinkLog.reply(reply))")
+                            log?.record("replied request=\(id) result=\(FaceLinkLog.reply(reply))")
                             if case .closeRenderer = call {
                                 await end(FaceWireError.disconnected, bodyGone: true)
                             }
@@ -200,12 +227,9 @@ final class PipeFaceClient: FaceClient {
                     if batch.replacesAll { self.epoch = epoch; appliedBarriers.removeAll() }
                     appliedBarriers.formUnion(batch.barriers)
                 }
-                for batch in frame {
-                    guard !ended, let epoch = batch.epoch else { return }
-                    let id = UUID()
-                    receipts[id] = .frameApplied(epoch: epoch, sequence: batch.sequence, barriers: batch.barriers)
-                    try await send(.frameApplied(epoch: epoch, sequence: batch.sequence, barriers: batch.barriers), id: id, link: link)
-                }
+                guard let last = frame.last, let epoch = last.epoch else { throw FaceWireError.invalidFeedOrder }
+                try await receipt(.frameApplied(epoch: epoch, sequence: last.sequence,
+                                                barriers: frame.flatMap(\.barriers)), link: link)
             }
         } catch { await end(error) }
     }
@@ -220,8 +244,7 @@ final class PipeFaceClient: FaceClient {
         if let log {
             do {
                 let event = eof ? "EOF" : (bodyGone ? "closed " : "error ") + TurnSecretRedactor.redactText(detail)
-                try await log.record(event)
-                try await log.close()
+                try await log.close(finalLine: event)
             } catch { detail += "\nLink record: " + error.localizedDescription }
         }
         log = nil
@@ -237,7 +260,7 @@ final class PipeFaceClient: FaceClient {
         receipts.removeAll()
         for (id, continuation) in pending {
             continuation.resume(throwing: WireFailure(code: "face_reply_lost", message: "Lost connection while doing that. It may or may not have gone through.",
-                cause: "Request \(id.uuidString): \(error.localizedDescription). Its effects are unknown.", effects: .unknown))
+                cause: "Request \(id): \(error.localizedDescription). Its effects are unknown.", effects: .unknown))
         }
         for task in calls.values { task.cancel() }
         calls.removeAll()

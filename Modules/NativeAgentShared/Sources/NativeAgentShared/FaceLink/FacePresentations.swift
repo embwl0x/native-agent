@@ -150,32 +150,6 @@ public struct FaceGraphEdge: Codable, Sendable, Equatable {
     }
 }
 
-public struct FaceGraphNeighborhood: FaceValue {
-    public var entity: String
-    public var entities: [FaceGraphEntity]
-    public var edges: [FaceGraphEdge]
-    public var state: FaceReadState
-    public init(entity: String, entities: [FaceGraphEntity], edges: [FaceGraphEdge], state: FaceReadState) {
-        self.entity = entity
-        self.entities = entities
-        self.edges = edges
-        self.state = state
-    }
-}
-
-public struct FaceDreamEntry: Codable, Sendable, Equatable {
-    public var date: String
-    public var title: String
-    public var text: String?
-    public var state: FaceReadState
-    public init(date: String, title: String, text: String?, state: FaceReadState) {
-        self.date = date
-        self.title = title
-        self.text = text
-        self.state = state
-    }
-}
-
 public struct LayoutFace: FaceValue {
     public var availability: SurfaceLayoutAvailability
     public init(availability: SurfaceLayoutAvailability) { self.availability = availability }
@@ -485,7 +459,7 @@ public struct SenseViewFace: FaceValue {
     }
 }
 
-public struct MemoryDiagnosticsFace: FaceValue {
+public struct MemoryDiagnosticsFace: Sendable, Equatable {
     public var rows: [PartFace.Row]
     public var counts: [String: Int]
     public var dimensions: Int?
@@ -519,28 +493,6 @@ public struct KnowledgeGraphFace: FaceValue {
         self.totalEntities = totalEntities
         self.totalEdges = totalEdges
         self.state = state
-    }
-}
-
-public struct DreamDiaryFace: FaceValue {
-    public var entries: [FaceDreamEntry]
-    public var total: Int?
-    public var unreadableCount: Int?
-    public var gate: String?
-    public var state: FaceReadState
-    public init(entries: [FaceDreamEntry], total: Int?, unreadableCount: Int?, gate: String?, state: FaceReadState) {
-        self.entries = entries
-        self.total = total
-        self.unreadableCount = unreadableCount
-        self.gate = gate
-        self.state = state
-    }
-}
-
-public struct DreamEntryFace: FaceValue {
-    public var entry: FaceDreamEntry
-    public init(entry: FaceDreamEntry) {
-        self.entry = entry
     }
 }
 

@@ -1,6 +1,6 @@
 import CoreLocation
 import Foundation
-import Combine
+import Observation
 import NativeAgentShared
 import PhotosUI
 import SwiftUI
@@ -10,9 +10,10 @@ import AVFoundation
 
 /// Persist acceptance before ACK; separate execution/publication to prevent repeated pickers or fixes. Main-run-loop location callbacks stay there.
 @MainActor
-final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
+@Observable
+final class PhoneRequests: NSObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhoneRequests()
-    @Published private(set) var active: PhoneRequest?
+    private(set) var active: PhoneRequest?
     /// Read the durable executing record for settings execution/recovery; do not mirror consent-free work in another latch.
     var presented: PhoneRequest? {
         guard let active else { return nil }
@@ -20,7 +21,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
            records.first(where: { $0.request.id == active.id })?.executing == true { return nil }
         return active
     }
-    @Published var errorMessage: String?
+    var errorMessage: String?
     private struct Record: Codable, Sendable {
         var request: PhoneRequest
         var pairing: String
@@ -38,28 +39,25 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         var pending: [Record]
         var replay: [Replay]
     }
-    private var replay: [Replay] = [] { didSet { stateRevision = UUID() } }
-    private var stateRevision = UUID()
+    @ObservationIgnored private var replay: [Replay] = [] { didSet { stateRevision = UUID() } }
+    @ObservationIgnored private var stateRevision = UUID()
     private let storage = MobileLocalStorage()
-    private var loadTask: Task<History, Error>?
-    private var loaded = false
+    @ObservationIgnored private var loadTask: Task<History, Error>?
+    @ObservationIgnored private var loaded = false
     private var interrupted: Set<String> = []
-    private var publishing = false
-    private var connectivity: AnyCancellable?
-    private var recoveryQueued = false
-    private var locationManager: CLLocationManager?
-    private var locationRequestID: String?
-    private var locationStarted = false
+    @ObservationIgnored private var publishing = false
+    @ObservationIgnored private var connectivity: NotificationCenter.ObservationToken?
+    @ObservationIgnored private var recoveryQueued = false
+    @ObservationIgnored private var locationManager: CLLocationManager?
+    @ObservationIgnored private var locationRequestID: String?
+    @ObservationIgnored private var locationStarted = false
     private let file = URL.applicationSupportDirectory.appendingPathComponent("phone-requests.json")
 
     override private init() {
         super.init()
-        NetworkPathObserver.shared.start()
-        connectivity = NetworkPathObserver.shared.$isOffline.removeDuplicates()
-            .filter { $0 == false }
-            .sink { [weak self] _ in
-                Task { @MainActor [weak self] in self?.syncDidSucceed() }
-            }
+        connectivity = NetworkPathObserver.shared.onRestoration { [weak self] in
+            self?.syncDidSucceed()
+        }
     }
 
     private func load() async throws {
@@ -427,45 +425,102 @@ private struct PhoneCamera: UIViewControllerRepresentable {
 }
 
 struct PhoneRequestSheet: View {
+    private enum SettingTarget {
+        case loading
+        case named(String)
+        case unavailable
+    }
+
     let request: PhoneRequest
-    @ObservedObject var coordinator = PhoneRequests.shared
+    let coordinator = PhoneRequests.shared
     @State private var photo: PhotosPickerItem?
     @State private var working = false
     @State private var camera = false
-    @State private var settingQuestion = "Change this iPhone setting?"
+    @State private var settingTarget: SettingTarget = .loading
+
+    private var hasNamedSetting: Bool {
+        if case .named = settingTarget { true } else { false }
+    }
+
+    private var settingQuestion: String {
+        switch settingTarget {
+        case .loading: "Loading iPhone setting…"
+        case .named(let label): "Turn on \(label)?"
+        case .unavailable: "This iPhone setting is unavailable."
+        }
+    }
 
     var body: some View {
-        VStack(spacing: 24) {
-            Text(iCloudSyncEngine.shared.agentDisplayName).font(.title2)
-            Text(request.kind.isSettings ? settingQuestion
-                 : request.kind == .currentLocation ? "Share your current location?"
-                 : request.kind == .capturePhoto ? "Take a photo to share." : "Choose a photo to share.")
-            if coordinator.isInterrupted(request) {
-                Text("This request was running when the app closed, and it may not have finished. Cancel clears it without running it again.")
-            } else if request.kind.isSettings {
-                Text("This changes the setting on this iPhone. Any iOS permission prompt is still yours to answer.")
-                Button("Allow change") {
-                    working = true
-                    Task { await coordinator.applySetting(request, approved: true); working = false }
-                }.disabled(working)
-            } else if request.kind == .currentLocation {
-                Button("Share location") { working = true; Task { working = await coordinator.locate(request) } }.disabled(working)
-            } else if request.kind == .capturePhoto {
-                Button("Open camera") {
-                    working = true
-                    Task { camera = await coordinator.openCamera(request); working = camera }
-                }.disabled(working)
-            } else {
-                PhotosPicker("Choose photo", selection: $photo, matching: .images).disabled(working)
-                    .onChange(of: photo) { _, item in
-                        guard let item else { return }
-                        working = true
-                        Task { await coordinator.picked(item, request: request); working = false }
+        ScrollView {
+            VStack(spacing: 24) {
+                Text(iCloudSyncEngine.shared.agentDisplayName)
+                    .font(.system(.title, design: .serif))
+                    .foregroundStyle(AlivePalette.text)
+                    .accessibilityAddTraits(.isHeader)
+                Text(request.kind.isSettings ? settingQuestion
+                     : request.kind == .currentLocation ? "Share your current location?"
+                     : request.kind == .capturePhoto ? "Take a photo to share." : "Choose a photo to share.")
+                    .font(.body)
+                    .foregroundStyle(AlivePalette.text)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                if coordinator.isInterrupted(request) {
+                    Text("This request was running when the app closed, and it may not have finished. Cancel clears it without running it again.")
+                        .font(.callout)
+                        .foregroundStyle(AlivePalette.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    if request.kind.isSettings {
+                        Text("This changes the setting on this iPhone. Any iOS permission prompt is still yours to answer.")
+                            .font(.callout)
+                            .foregroundStyle(AlivePalette.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    Group {
+                        if request.kind.isSettings {
+                            Button {
+                                working = true
+                                Task { await coordinator.applySetting(request, approved: true); working = false }
+                            } label: { Self.consentLabel("Allow change") }
+                        } else if request.kind == .currentLocation {
+                            Button {
+                                working = true
+                                Task { working = await coordinator.locate(request) }
+                            } label: { Self.consentLabel("Share location") }
+                        } else if request.kind == .capturePhoto {
+                            Button {
+                                working = true
+                                Task { camera = await coordinator.openCamera(request); working = camera }
+                            } label: { Self.consentLabel("Open camera") }
+                        } else {
+                            PhotosPicker(selection: $photo, matching: .images) { Self.consentLabel("Choose photo") }
+                                .onChange(of: photo) { _, item in
+                                    guard let item else { return }
+                                    working = true
+                                    Task { await coordinator.picked(item, request: request); working = false }
+                                }
+                        }
+                    }
+                    .alivePrimaryButton()
+                    .disabled(working || (request.kind.isSettings && !hasNamedSetting))
+                }
+                if working { ProgressView() }
+                Button(role: .cancel) {
+                    Task { await coordinator.complete(request.id, status: .cancelled) }
+                } label: {
+                    Text("Cancel")
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
             }
-            if working { ProgressView() }
-            Button("Cancel", role: .cancel) { Task { await coordinator.complete(request.id, status: .cancelled) } }
+            .padding(32)
+            .frame(maxWidth: 480)
+            .frame(maxWidth: .infinity)
         }
+        .scrollBounceBehavior(.basedOnSize)
+        .mobileReadingScreen()
         .fullScreenCover(isPresented: $camera) {
             PhoneCamera { image in
                 camera = false
@@ -475,13 +530,24 @@ struct PhoneRequestSheet: View {
                 }
             }.ignoresSafeArea()
         }
-        .padding(32)
         .interactiveDismissDisabled()
-        .task {
-            if request.kind.isSettings, let id = request.params["id"],
-               let control = await PhoneLocalSettings.controls().first(where: { $0.id == id }) {
-                settingQuestion = "Turn on \(control.label)?"
+        .task(id: request.id) {
+            settingTarget = .loading
+            guard request.kind.isSettings else { return }
+            guard let id = request.params["id"] else {
+                settingTarget = .unavailable
+                return
             }
+            let control = await PhoneLocalSettings.controls().first(where: { $0.id == id })
+            guard !Task.isCancelled else { return }
+            settingTarget = control.map { .named($0.label) } ?? .unavailable
         }
+    }
+
+    nonisolated private static func consentLabel(_ title: LocalizedStringKey) -> some View {
+        Text(title)
+            .font(.body.weight(.semibold))
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
     }
 }

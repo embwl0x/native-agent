@@ -9,10 +9,10 @@ struct FacePageView: View {
     static let standaloneInset: CGFloat = 20
     let page: String
     var only: String? = nil
-    /// A tab inside a rail page: the rail already shows the page's title and line, so the face's header and top space are not drawn twice.
-    var asTab = false
+    var rowID: String? = nil
     var isReading = false
     @Environment(AppModel.self) private var appModel
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @State private var feedback: String?
     @State private var topRequest = UUID()
     @State private var activityTarget: ActivityTarget?
@@ -43,11 +43,30 @@ struct FacePageView: View {
     }
 
     var body: some View {
-        content.authoredSecretEntry(page: page).modifier(FaceObservation(demand: .key(.page(page)))).environment(\.boardPage, page)
+        content
+            .scrollEdgeEffectStyle(quietOffscreenRead ? nil : .soft, for: [.top, .bottom])
+            .authoredSecretEntry(page: page).modifier(FaceObservation(demand: .key(.page(page)))).environment(\.boardPage, page)
+            .sheet(item: $activityTarget) { target in
+                MacWorkOverviewDetail(reference: target.reference) { activityTarget = nil }
+            }
+            .sheet(item: $document) { document in
+                FaceDocumentSheet(request: DocumentRequest(id: document.id, subject: document.subject)) { self.document = nil }
+            }
     }
 
     @ViewBuilder private var content: some View {
-        if let only {
+        if let rowID {
+            ScrollView {
+                if let face = snapshot?.drawnFace {
+                    if let row = face.allRows.first(where: { $0.id == rowID }) {
+                        FaceView(face: PartFace(sections: [.init(id: rowID, style: .list, rows: [row])]),
+                                 door: door, session: session, leaf: { Self.leaf($0) })
+                    } else { Text("This item is absent from the current \(title) reading.") }
+                } else { Text(snapshot?.error?.message ?? "Waiting on \(title)…") }
+                if let feedback { linkFeedback(feedback) }
+            }
+            .padding(Self.standaloneInset)
+        } else if let only {
             VStack(alignment: .leading, spacing: 0) {
                 if let face = snapshot?.drawnFace {
                     FaceView(face: PartFace(sections: face.sections.filter { $0.id == only }),
@@ -80,23 +99,37 @@ struct FacePageView: View {
                                            reader: door, session: appModel.pageSessions.page(page + "/" + item), leaf: { Self.leaf($0) }))
             }
         } else {
-            List { FaceView(snapshot: snapshot, title: title, header: !asTab, door: door, session: session, leaf: { Self.leaf($0) })
-                .environment(\.faceInList, true) }
+            VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+                pinnedHeader
+                if let feedback {
+                    linkFeedback(feedback)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                        .frame(maxWidth: .infinity)
+                }
+                List {
+                    FaceView(snapshot: snapshot, title: title, header: false, door: door, session: session, leaf: { Self.leaf($0) })
+                }
+                .faceList()
                 .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .pageScrollColumn()
+                .environment(\.faceListColumnWidth, TodayMetrics.contentWidth)
+                .contentMargins(.bottom, quietOffscreenRead ? 32 : 48, for: .scrollContent)
+            }
+            .padding(.top, TodayMetrics.topPadding)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
     }
 
-    /// The page's own words stay put above what scrolls: its title and its one sentence, or the page's name until its face arrives.
-    /// A page says its name once and then its one sentence, held still above what scrolls. Under the rail's tabs the selected tab is the name,
-    /// so only the sentence follows it; a page on its own carries both in the house type.
     @ViewBuilder private var pinnedHeader: some View {
         let face = snapshot?.status == .ready ? snapshot?.face : nil
-        if !asTab {
-            AlivePageHeader(title: face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? title, line: face?.line)
-        } else if let line = face?.line, !line.isEmpty {
-            Text(line).font(ShellType.pageSentence).foregroundStyle(NativeAgentShell.secondary).lineLimit(1).truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
+        AlivePageHeader(title: face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? title, line: face?.line, wrapsLine: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var scrollingContent: some View {
@@ -111,16 +144,17 @@ struct FacePageView: View {
                 if isReading, snapshot == nil { PageReadStatus(isReading: true, text: "Reading " + title + "…") }
                 if let snapshot {
                     FaceView(snapshot: snapshot, title: title, header: false, door: door, session: session, leaf: { Self.leaf($0) }).id(page)
-                        .onAppear { session.notice = { [weak appModel] words in appModel?.systemToasts.push(success: words) } }
                 } else if let pageIssue {
                     Text(pageIssue).foregroundStyle(.secondary).textSelection(.enabled)
                 } else if !isReading {
                     Text("Waiting on " + title + "'s face.").foregroundStyle(.secondary)
                 }
-                if let feedback { Text(feedback).font(.callout).foregroundStyle(.secondary).textSelection(.enabled) }
+                if let feedback { linkFeedback(feedback) }
             }
-            .padding(.bottom, 32)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.bottom, quietOffscreenRead ? 32 : 48)
+            .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .top)
             .id("face-top")
         }
         .scrollPosition(id: Binding(get: { session.scrollAnchor }, set: { session.scrollAnchor = $0 }), anchor: .top)
@@ -129,16 +163,13 @@ struct FacePageView: View {
         }
         .pageScrollColumn()
         }
-        .padding(.top, asTab ? 0 : TodayMetrics.topPadding)
-        .padding(.horizontal, 20)
-        .frame(maxWidth: TodayMetrics.contentWidth, maxHeight: .infinity, alignment: .top)
+        .padding(.top, TodayMetrics.topPadding)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .sheet(item: $activityTarget) { target in
-            MacWorkOverviewDetail(reference: target.reference) { activityTarget = nil }
-        }
-        .sheet(item: $document) { document in
-            FaceDocumentSheet(request: DocumentRequest(id: document.id, subject: document.subject)) { self.document = nil }
-        }
+    }
+
+    private func linkFeedback(_ words: String) -> some View {
+        Text(words).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var door: ClosureFaceDoor {
@@ -225,11 +256,11 @@ extension AppModel {
         }, scope: { item in self.pageDoor(page: page + "/" + item, open: open) }, perform: { submission in
             let outcome: FaceActOutcome
             do {
-                outcome = try FaceActOutcome.reply(await client.pageAct(.init(
+                outcome = try FaceActOutcome.reply(await client.protectedAct(.pageAct(.init(
                     page: page, row: submission.row, action: submission.action,
                     value: submission.values.map(PartFace.Value.object) ?? submission.value.map(PartFace.Value.string),
                     expectedRevision: submission.formRevision, expectedCall: submission.expectedCall, answers: true,
-                    operation: submission.id, undoOf: submission.undoOf, checking: submission.checking), id: submission.id))
+                    operation: submission.id, undoOf: submission.undoOf, checking: submission.checking))))
             } catch { outcome = .interrupted(error) }
             return outcome
         })

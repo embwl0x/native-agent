@@ -1,12 +1,8 @@
-import Agents
-import MacControl
+import BodyRuntime
+import MacNerves
 import Foundation
 import AppKit
-import EngineRuntime
-import BackgroundLoops
-import BackgroundWork
-import DoctorChecks
-import DeviceSync
+import SenseCore
 import NativeAgentCore
 import NativeAgentShared
 // Blueprint: | `AppDelegate+BackgroundTasks.swift` | `AppDoctorPort`: Doctor platform, both Inspectors and discovery-admitted browser health |
@@ -17,7 +13,7 @@ struct AppDoctorPort: EngineDoctorPlatformPort {
 
     var runtime: EngineDoctorRuntime<AppDoctorPort> { EngineDoctorRuntime(dataRoot: dataRoot, port: self) }
     var doctorEngine: NativeAgentEngine { .live }
-    var doctorManager: BackgroundLoops.BackgroundLoopLifetimes { backgroundLoopsManager }
+    var doctorManager: SenseCore.BackgroundLoopLifetimes { backgroundLoopsManager }
 
     func doctorRestartLoop(id: String) async -> LoopRestartOutcome {
         await NativeAgentEngine.restartBackgroundLoop(id: id, manager: backgroundLoopsManager)

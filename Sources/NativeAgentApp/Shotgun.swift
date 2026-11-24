@@ -1,5 +1,5 @@
 import AppKit
-import AppToolRuntime
+import BodyRuntime
 import Carbon.HIToolbox
 import Foundation
 import NativeAgentCore
@@ -7,24 +7,7 @@ import NativeAgentShared
 import Observation
 // Blueprint: | `Shotgun.swift` | Body-owned global Shotgun shortcut and actual motor-event forwarding to the only window |
 
-enum ShotgunShortcut: String, CaseIterable, Identifiable {
-    case optionSpace = "option-space"
-    case controlOptionSpace = "control-option-space"
-    case shiftCommandSpace = "shift-command-space"
-    case off
-
-    static let storageKey = "NativeAgent.shotgun.shortcut"
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .optionSpace: "⌥Space"
-        case .controlOptionSpace: "⌃⌥Space"
-        case .shiftCommandSpace: "⇧⌘Space"
-        case .off: "Off"
-        }
-    }
-
+extension ShotgunShortcut {
     var carbonModifiers: UInt32? {
         switch self {
         case .optionSpace: UInt32(optionKey)

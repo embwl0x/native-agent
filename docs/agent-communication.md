@@ -80,10 +80,10 @@ Call an action with `app {"action":"agent.message","args":{...}}`.
 | Action | Use |
 | --- | --- |
 | `agent.contacts` | One short row per contact: name, state and `last_answered` from its thread, plus declared `capabilities` and `can_start_turn` for conversation actions. `details: true` includes doors, connection evidence and discovery details. `discover: true` or a name refreshes discovery when the person asks to find agents: by what speaks a protocol (A2A card, ACP program, MCP settings), with a `recipe_draft` for a find no recipe knows. |
-| `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route. Disconnect with `disconnect: true` and `agent: "peer:<id>"` from contacts. `ability: "<id>"` with a saved contact moves it to one of their abilities; `ability: false` moves it back to its built-in route. |
+| `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route; a desktop route to an app whose recipe drives its chat saves the desktop-chat contact, as connecting by its name does. Disconnect with `disconnect: true` and `agent: "peer:<id>"` from contacts. `ability: "<id>"` with a saved contact moves it to one of their abilities; `ability: false` moves it back to its built-in route. |
 | `agent.message` | Send `agent` and `text`, optionally `files: [{path}]` on A2A; continue this chat's current conversation with that contact. `wait_seconds` defaults to 20, accepts 0–120, and returns a live lane's answer inline. A known host can be connected in the same call through its setup gates. |
 | `agent.read` | Read the conversation and retained reply: a successful read says `execution: executed`, `effect: none`, independently of the send it shows. Reply owners publish `retrieval_result_class`, `execution_result_class` and `execution_terminal`; terminal task snapshots remain readable when execution failed or was cancelled. An unknown name is `unknown_contact` with nearest contacts; a known contact never messaged is `no_history`. `details: true` exposes receipts. `wait_seconds` waits 1–300 seconds on a conversation by name or its retained exact reply IDs; it cannot be combined with history or listing filters. |
-| `agent.cancel` | Request a stop through the route's cancellation mechanism. A thread's Stop retains its exact record and original chat scope; an absent or moved record cannot select another conversation by label. The result distinguishes stopping, stopped, released and unsupported stops. Its own `status` leads: `ok` (with `effects: occurred`) when something was stopped, released or withdrawn, `no_change` when nothing was there; the conversation's send keeps its words under `last_send_`, so a stop that worked never reads as a failed call. A send held for the Mac is withdrawn by the stop itself; `clear_queue: true` also withdraws queued follow-ups. |
+| `agent.cancel` | Request a stop through the route's cancellation mechanism. A thread's Stop retains its exact record and original chat scope; an absent or moved record cannot select another conversation by label. The result distinguishes stopping, stopped, released and unsupported stops. Its own `status` leads: `ok` (with `effects: occurred`) when something was stopped, released or withdrawn, `no_change` when nothing was there; the conversation's send keeps its words under `last_send_`, so a stop that worked never reads as a failed call. A send held for the Mac is withdrawn by the stop itself, whether the stop names its conversation or the send's own `message_id`; `clear_queue: true` also withdraws queued follow-ups. |
 | `agent.reply` | From the ability a contact is reached through, and only there: its answer lands in that contact's conversation and settles the exchange (the one named, else their newest message to it still unanswered); `done: false` shows progress. |
 | `agent.jobs` | List their jobs, their own lines (`agent: "self"`) among them, newest first, and read retained reply deliveries (owed, delivered, let go) for the chats and contacts that asked. Missing evidence does not prove no execution. |
 
@@ -162,7 +162,7 @@ choice. Optional `conversation` names a separate discussion on supported
 routes; `new_conversation: true` starts fresh. Bots keep one continuous session.
 A failed resume does not silently start another conversation.
 An unreadable saved-contact store fails bridge identity resolution with
-`contact_identity_unavailable` (HTTP 503), or gRPC `unavailable`, and a repair
+`contact_identity_unavailable` (HTTP 503) and a repair
 instruction. It cannot turn a claimed caller into an anonymous one.
 
 A waiting exchange remains pending; sending or accepting a message does not make
@@ -195,7 +195,8 @@ reason is current storage: only `waitingForMac: true` names a live pre-Return
 hold; without that flag the saved reason proves refusal, not pending delivery.
 No missing reply, missing row or missing owner supplies that proof.
 
-Contact decoding rejects unknown fields at every depth.
+Contact decoding checks fields at every depth as it reads the record. A declared
+optional key may be null. An unknown key invalidates the saved contact array.
 Bridge, human-reply and contact completion
 owners each reconcile independently under their existing delivery identities;
 one owner's failure is reported after the others have had their recovery pass.
@@ -247,7 +248,7 @@ send authority applies to the whole message and its file content.
 
 | Contact adapter | Outgoing files |
 | --- | --- |
-| A2A 1.0 JSON-RPC, HTTP+JSON, gRPC; A2A 0.3 JSON-RPC | Up to four regular files, 8 MiB total. Checked bytes travel inline as versioned file parts, never as a local path or a URL the peer must fetch. |
+| A2A 1.0 JSON-RPC and HTTP+JSON, A2A 0.3 JSON-RPC | Up to four regular files, 8 MiB total. Checked bytes travel inline as versioned file parts, never as a local path or a URL the peer must fetch. |
 | MCP bridge hosts, including command and pull hosts and Dot | Text only in this adapter. Existing reply attachments do not establish outgoing file support. |
 | NativeAgent bridge, ACP, helpers, contact abilities | Text only in these adapters. |
 | Desktop and desktop-chat apps; Grok Bot | Text only in these adapters; file paste/attach is not implemented by their contact-send route. |
@@ -334,9 +335,24 @@ held thread (`AgentConversationStore.ownThread`), never to another caller or a
 conversation of another door that was carried in; from any other chat an unnamed
 message continues the chat's own conversation or the contact's Main, and never
 lands on a held thread. A named conversation goes where it is named: every send
-in a held conversation carries that conversation's name (the contact and when
-its caller opened; the contact's name for its own), so another chat reaches it
-by that name.
+in a held conversation carries that conversation's name (the name its caller
+took; otherwise the contact and when its caller opened; the contact's name for
+its own), so another chat reaches it by that name.
+
+A caller can take a name: MCP `agent_message` with `as` (a short name, such as
+"Claude") names the caller's own conversation with the contact
+(`AgentConversationStore.take`, before that call's held messages drain). Only
+the caller names itself; a door send never assigns a name, and a call that names
+no caller cannot take one. One caller of a contact holds a name at a time: taking
+it moves every conversation the name labels, with what is still held in it, to
+the taker, and the earlier holder's conversation goes on unnamed. A name that
+already labels a conversation no caller took (such as "Main") is refused. A send
+that names it (`agent.message {agent, conversation: "Claude"}`) is held for its
+holder now; while its holder has ended it reaches no other caller and waits for
+the next caller that takes the name; a reconnect of the contact keeps a named
+conversation on its holder. A name exists from its first take: before
+any caller has taken it, a send to it is an ordinary new conversation by the
+contact's own route.
 
 `agent.message` waits on the existing conversation-change signal, without
 polling a file. `AgentConversationDelivery.answersLive` admits MCP hosts (including held messages), ACP, remote NativeAgent/A2A and desktop-chat
@@ -443,7 +459,7 @@ appending another contact message or replaying it again as prior context.
 
 ## Connecting by name
 
-The shipped `AgentConversations/Resources/agent-hosts.json` seeds each host's launch contract and discovery words.
+The shipped `BodyRuntime/AgentConversations/Resources/agent-hosts.json` seeds each host's launch contract and discovery words.
 Loaded editable recipes govern setup through the declared configuration,
 command line, ACP or desktop adapter; an arbitrary app name implies no protocol.
 The connection action presents a card when policy requires one.
@@ -536,7 +552,10 @@ the server is never started, nor a model loaded, from here. Its chat completions
 take no "only if loaded" option and report no load, so only a model unloaded in
 the gap between those two local requests could be loaded again by the send. Every
 receipt names the conversation (`conversation_id`: the id it was sent under, else
-its record's), so the next message continues it. An answer cut by the model's
+its record's), so the next message continues it. A `conversation_id` that is one
+of the agent's own conversations, by its contact's id, its record id or its
+visible label, continues that conversation; only an id none of them carry is
+sent as an exact new thread. An answer cut by the model's
 output limit is `status: incomplete` with `reply_truncated` and what it said, and
 proves no round trip; a completed one is stamped with the recipe it was sent under. A server that is off is `reason: local_chat_server_off`
 with the recipe's words for turning it on, and one with nothing loaded is
@@ -701,7 +720,9 @@ attempt sent nothing. A newer proven reply clears the older failures.
 A failed send returns its first outcome with the owning repair action. It
 never runs a repair and a second send automatically. `agent.verify` is an
 explicit dry operation; desktop verification checks the authored labels once,
-without selector guessing or rewriting the recipe.
+without selector guessing or rewriting the recipe. A name that matches more
+than one saved contact, or a contact and a different known host, is refused
+with its candidates named (`ambiguous_name`); nothing is checked.
 A send whose reply deadline passes reads **unanswered** ("No reply"), not
 failed: the deadline proves only that no answer came, never that the send was
 lost. Its owed accept and answer let go as `expired`; only `sent: false` makes it
@@ -741,7 +762,7 @@ and run locks, local health and reply reads), Dot changes, helper changes and
 `BotRunQueue` changes, the first read, a retry after failure and explicit
 `agent.refresh`. Experience-only changes reread threads and helper result previews
 against `ContactListFacade`'s published doors without rereading credentials.
-Trust face builds also use those published doors and rebuild when a successful door refresh publishes (`contactsDidChange`), as do phone snapshots' other-room
+Trust face builds also use those published doors and rebuild when a successful door refresh publishes (`ContactThreadReadouts.ContactsDidChange`), as do phone snapshots' other-room
 and helpers reads and the phone's agent thread reads, including the reread after a send.
 Thread reads freshly read conversation records. These paths refresh doors if the
 contact owner has not loaded or its last load failed.
@@ -760,14 +781,15 @@ the words of its `grok-bot-setup` ability), so they take no lane. An operation
 is the person's when its turn is the person's own message or the person's own
 contact send. The newest of the person's asks takes the lane from whatever holds
 it, the agent's own or an earlier ask of the person's: a holder posting a
-keystroke sequence (a paste or type, a Return and its confirmation) ends that
+keystroke sequence (a type, a Return and its confirmation) ends that
 sequence first; any other holder is cancelled and left to finish on its own,
 never waited for, never a whole model turn. An older ask still waiting is told
 it was superseded. A send of the agent's own set aside before any key goes back
 to being held; one set aside after typing says where it stopped and is never
 resent. An unfinished Grok Bot setup stays owed on its contact (`setup_owed`,
-`next_call`); nothing resumes it by itself. The agent's own operation drives the desktop only on positive
-away evidence; otherwise a send is held in its conversation's queue (`held`,
+`next_call`); nothing resumes it by itself. A desktop-chat send uses background hands only (below), so the
+person's input never holds it. The agent's own desktop contact send drives the screen only on positive
+away evidence; otherwise it is held in its conversation's queue (`held`,
 `mac_busy`), and a hold never claims the lane. The person's own send to that
 conversation does not queue behind the held one: it goes now, and the held one
 stays held, behind it. Observing a reply is passive reading and holds
@@ -778,7 +800,7 @@ activated, and is refused at once when a NativeAgent window is the key window.
 Every observed desktop step carries its own bound.
 
 If the person types, holds the keyboard or takes the foreground before Return,
-the desktop-chat send says they held off because the person is using the Mac,
+a desktop contact send says they held off because the person is using the Mac,
 nothing was sent, and it is waiting for the Mac to be free and will go then.
 Its full text and original send id stay in the conversation's existing queue,
 ahead of later follow-ups. Unknown input presence also waits, without claiming
@@ -789,7 +811,9 @@ away evidence and a permitted driver. The resumed send clears the driver on its
 explicit Mac operation and obtains a fresh binding at the desktop route,
 through the normal permission chain. Startup uses the same path. A person-typed
 queued send is terminal not sent after a restart because their original send
-act does not carry over.
+act does not carry over; so is a send queued inside another agent's request to
+their, because that request's admission does not carry over either. The refusal
+reaches the scope that queued it as news, so its sender knows to send again.
 Explicit handback is distinguished from physical input and says to return
 control; it does not enter automatic retry. A live hold has no expiry and
 retains its text; `agent.cancel` withdraws it (with `clear_queue: true`, its follow-ups too). A held
@@ -800,7 +824,9 @@ keeps submission uncertain until the outgoing row confirms it and never enters
 this queue automatically. This replaces the former “try again shortly” refusal.
 
 Muse 9's recipe selects its first `AXWebArea` as the chat's content region
-and names its `Side chats` navigation button. Region discovery can find
+and names its `Side chats` navigation button. Its composer is the control whose
+label holds `Attach file`, and its reply rows are the ones carrying a `React`
+control (`assistantMarker`); `Copy response` sits beside the agent's own row. Region discovery can find
 readable siblings past an unreadable element, reporting that element in the
 native diagnostic log; an incomplete search without a matching region is a
 read failure. Controls and transcript reads inside that region must still be
@@ -808,24 +834,48 @@ complete. Incomplete native reads report up to four unreadable element paths
 with their AXRole read errors, distinguishing a missing role from a native AX
 failure code. There is no alternate read or send path.
 
-The message box is whatever inside the composer takes typed text, whatever
-role the app gives it (a text role, an editable element, one holding a caret
-or one whose value can be written, so a box exposed as a button counts); the
-outermost such element is the box. `agent.verify` finds and reads the box as a
-send does, so a check and a send cannot disagree.
+The message box is the unique outermost part of the recipe's composer that
+takes typed text. A text role, an editable element, a caret or a writable
+value can identify it. The composer's parts are its Accessibility descendants
+and the elements its own text carries as attachments. WebKit hides a
+control's descendants when the control has button semantics, as Muse's
+composer card does, but its text still lists them, so the box is found
+without pressing or clicking anything. Without exactly one box, the send
+stops before any input. A dry run, including `agent.verify`, finds and reads
+the box as a send does, so a check and a send cannot disagree.
 
-Before desktop input, the exact selected composer's text must be readable
-and empty. A draft or unreadable value stops the send with the draft intact.
-The sender checks that binding again before paste and confirms the full
-composed message before Return. Clipboard settlement restores the saved contents
-only while no newer copy has replaced the paste. A rejected restore owes a
-clipboard repair with the recopy action, independently of the message's outcome;
-clipboard contents never enter that repair record. Its one answer observer accepts nonempty text
-after the exact outgoing row when the app's native read shows no generation
-control. It waits on Accessibility and workspace events, with cancellation;
-silence leaves the wait open. A moved chat or unreadable observation fails with
-its cause. The native idle signal does not prove that the app will append no
-more text. No second late-answer watcher is started. The courier offers and dispatches only its scoped screen, go,
+A desktop-chat send uses background hands only. It focuses the box through
+Accessibility, writes the message as the box's Accessibility value, reads it
+back exactly, and delivers Return to the app's own process. It never activates
+the app, clicks, or uses the person's screen, keyboard or clipboard, so the
+person can keep using the Mac and the send is never held for their input.
+Reopening the agent's own side chat focuses its list entry and delivers Return
+the same way. An app whose box ignores the Accessibility write fails closed at
+the readback with that reason, and nothing is sent; Antigravity's editor is
+one.
+
+Before the write, the exact selected composer's text must be readable and
+empty. A draft or unreadable value stops the send with the draft intact.
+Before Return the sender confirms that the box is still focused, still a child
+of the composer bound before the write, and that its own value holds the full
+composed message. It does not look the composer up again by its label, which
+an app may compute from the draft, or by its parts, which WebKit stops listing
+once a draft is in. The send returns `sent` once the exact outgoing row shows
+in the chat, with the chat's title as `conversation_id` and a `read_with` read;
+a new chat's send first waits, within a step's patience, for the app to name the
+chat, and binds that name only while the chat opens with their exact first message,
+since an unnamed chat cannot be read back. It does not wait for the answer. `agent_read` reads the answer passively from
+their own chat while it is the one showing: the rows after their latest message,
+once the app shows no generation control. A chat the app renamed (Muse names a
+new side chat by its first line, then by a summary) is theirs when it opens with
+their exact first message, and the new title is saved. Another chat showing, or
+an answer still coming, leaves the conversation waiting; nothing is driven to
+read it. A send prepares the app's renderer once and every read after it is
+passive. An element that vanishes while the walker reads, or a chat title that
+changes during one read, means the app changed under the read: the walker says
+so and the read transaction reads the changed app again within its budget, for
+every step, confirmation and read alike. Any other unreadable read fails with
+its cause. The courier offers and dispatches only its scoped screen, go,
 read, result paging and act operations, so another action door cannot perform
 effects outside its send-evidence fence.
 These native readers and native AX mutations use the same
@@ -871,7 +921,7 @@ returns its failure. A matching `reply_to` that answers a held send returns
 `completed` immediately with the held-send ID. The bridge
 reads the app's actual selected chat; recent activity cannot select a chat.
 Discovery publication must commit before readiness, admission and recovery begin;
-its file failure is exposed in listener health. HTTP JSON, SSE and gRPC record
+its file failure is exposed in listener health. HTTP JSON and SSE record
 reply acknowledgment through the same task operation after successful writes.
 Retained reply reads keep `attachments` at the top level: builder attachment
 descriptors retain their saved paths. Canonical file parts carry their bytes as
@@ -919,7 +969,9 @@ dispatch's failed or unknown execution verdict independently of retrieval.
 A queued builder turn recovered after restart consumes
 its exact saved session/run and framed input, then uses the same contact-reply
 settlement as live ingress: recording the incoming reply and routing their answer
-back to the asking chat. Settlement failures retain produced text/files and owe
+back to the asking chat. Claude reply delivery caches the completion and its route
+under the turn's bridge configuration root. Restart recovery reads that same
+cache for the data root it serves. Settlement failures retain produced text/files and owe
 repair on that task; they do not start another turn.
 
 | State | Meaning |
@@ -985,11 +1037,10 @@ not start a turn, call a model, or create another delivery path.
 ## Remote interoperability
 
 An A2A endpoint is the peer's agent-card URL. The client negotiates advertised
-A2A 1.0 JSON-RPC, HTTP+JSON or gRPC, or 0.3 JSON-RPC. The app serves its card at
-`/.well-known/agent-card.json` and HTTP bindings under `/a2a`; gRPC has a separate
-loopback port. Streaming, task listing/cancellation and push configuration are
-implemented. See [A2A gRPC integration](a2a-grpc-integration.md) for owners and
-the operation set. A2A `contextId` and `taskId` are different identities.
+A2A 1.0 JSON-RPC or HTTP+JSON, or 0.3 JSON-RPC. The app serves its card at
+`/.well-known/agent-card.json` and the A2A bindings under `/a2a` on the
+loopback bridge. It supports streaming, task listing and cancellation, and push
+configuration. A2A `contextId` and `taskId` are different identities.
 
 Present capability flags must be booleans; omitted optional flags are not
 offered. Task states must match their wire enum exactly (explicit 0.3 `unknown`
@@ -1036,14 +1087,15 @@ doors. Native HTTP `/agent/message` and `/agent/reply`, MCP calls, and the
 Claude/Codex/OMP bridge's message and reply results carry `held_messages` and
 `held_remaining`. Each message contains `at`, `text`, `conversation_id`,
 `conversation_name` and, when it awaits the contact's answer, `reply_to`. A caller takes what is held in its own conversation, in
-the contact's own, and in any caller's conversation whose process is gone
+the contact's own, and in any unnamed caller's conversation whose process is gone
 (`AgentConversationStore.reaches`: the pid no longer runs, or runs with another
-start time); a live caller's messages go only to it, and a caller whose process
-cannot be read keeps its messages until a later read decides.
+start time); a live caller's messages go only to it, a named conversation's go
+only to the caller holding its name, and a caller whose process cannot be read
+keeps its messages until a later read decides.
 A2A send/get responses carry `nativeagent.held_messages` and
 `nativeagent.held_remaining` in the returned task's `metadata`; streaming
 send/subscribe carries that metadata on its first event payload, across
-JSON-RPC, HTTP+JSON and gRPC. Empty batches omit these optional fields. A door
+JSON-RPC and HTTP+JSON. Empty batches omit these optional fields. A door
 without an authenticated principal peer ID drains nothing. A drain failure
 returns that call's error, leaving the messages held. Only a written JSON
 response or first stream event settles the batch as delivered. The response
@@ -1306,14 +1358,14 @@ Paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
 | Owner | Responsibility |
 | --- | --- |
-| `Transcripts/TranscriptRows.swift` | `ContactThread.project`: one stamped-row reading for session and thread displays; indexed previews return their validated saved text, and cached replies come from the receipt. Their own rows (assistant or source `self`) and human-authored bridge rows stay theirs and the person's, never contact evidence. Unattested speech may display its recorded route/routine name with ` (unattested)`. Its speaker provenance is still `another agent`. Recorded steering stays in the stamp. |
-| `AppToolRuntime/AppActions+Declarations.swift` | Agent actions exposed through `app`. |
-| `ChatToolRuntime/CanonicalToolNameDispatcher.swift` | Contact selection, conversation continuity and dispatch gates. |
-| `AgentConversations/AgentConversationStore.swift` | Scoped conversation bindings and retained exchange evidence in `agents/conversations.json`. |
-| `AgentConversations/AgentPeerStore.swift` | Saved contacts and connection proof. |
-| `ChatToolRuntime/SwiftToolDispatcher+AgentCommunication.swift`, `AgentContactConnection.swift`, `AgentContactACP.swift`, `AgentContactCommand.swift`, `AgentContactCancellation.swift`, `AgentContactPresentation.swift` | Contact interpretation, setup, transport execution, cancellation and retained presentation through one dispatcher. |
-| `AgentLinkTransport/AgentA2AWire.swift` | A2A negotiation and wire projection. |
-| `Agents/AgentContactRoutes.swift` | Inbound bridge, MCP and HTTP A2A routes. |
-| `Agents/NativeAgentA2AWire+Tasks.swift`, `AgentContactTasks+Bridge.swift`, `AgentContactTaskReceipts.swift` | One retained task owner for inbound contact and builder admission, work, produced output and receipts; HTTP waits do not own accepted work. |
-| `Agents/MindStream.swift`, `Agents/AgentContactHeldAnswer.swift` | Returns to the conversation that started the work; a contact's held answer. |
-| `Agents/AgentConversationContinuation.swift`, `EngineComposition.swift` | The contact doors' reply reads and deadlines, run by `delegation_outcome`. |
+| `SenseCore/Transcripts/TranscriptRows.swift` | `ContactThread.project`: one stamped-row reading for session and thread displays; indexed previews return their validated saved text, and cached replies come from the receipt. Their own rows (assistant or source `self`) and human-authored bridge rows stay theirs and the person's, never contact evidence. Unattested speech may display its recorded route/routine name with ` (unattested)`. Its speaker provenance is still `another agent`. Recorded steering stays in the stamp. |
+| `BodyRuntime/AppToolRuntime/AppActions+Declarations.swift` | Agent actions exposed through `app`. |
+| `BodyRuntime/ChatToolRuntime/CanonicalToolNameDispatcher.swift` | Contact selection, conversation continuity and dispatch gates. |
+| `BodyRuntime/AgentConversations/AgentConversationStore.swift` | Scoped conversation bindings and retained exchange evidence in `agents/conversations.json`. |
+| `BodyRuntime/AgentConversations/AgentPeerStore.swift` | Saved contacts and connection proof. |
+| `BodyRuntime/ChatToolRuntime/AgentCommsActions+AgentCommunication.swift`, `AgentContactConnection.swift`, `AgentContactACP.swift`, `AgentContactCommand.swift`, `AgentContactCancellation.swift`, `AgentContactPresentation.swift` | Contact interpretation, setup, transport execution, cancellation and retained presentation through one dispatcher. |
+| `ProviderRouting/AgentLinkTransport/AgentA2AWire.swift` | A2A negotiation and wire projection. |
+| `BodyRuntime/Agents/AgentContactRoutes.swift` | Inbound bridge, MCP and HTTP A2A routes. |
+| `BodyRuntime/Agents/NativeAgentA2AWire+Tasks.swift`, `AgentContactTasks+Bridge.swift`, `AgentContactTaskReceipts.swift` | One retained task owner for inbound contact and builder admission, work, produced output and receipts; HTTP waits do not own accepted work. |
+| `BodyRuntime/Agents/MindStream.swift`, `BodyRuntime/Agents/AgentContactHeldAnswer.swift` | Returns to the conversation that started the work; a contact's held answer. |
+| `BodyRuntime/Agents/AgentConversationContinuation.swift`, `EngineComposition.swift` | The contact doors' reply reads and deadlines, run by `delegation_outcome`. |

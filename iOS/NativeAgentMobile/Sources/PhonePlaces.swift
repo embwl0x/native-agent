@@ -1,3 +1,4 @@
+import Observation
 import CoreLocation
 import Foundation
 import NativeAgentShared
@@ -6,7 +7,8 @@ import UIKit
 // Blueprint: | `PhonePlaces.swift` | Opt-in places and pairing-bound outbox; per-observation admission errors and receipt-driven delivery |
 
 @MainActor
-final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
+@Observable
+final class PhonePlaces: NSObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhonePlaces()
     var settingControls: [PhoneLocalSetting] {
         let inventory = PhoneLocalSetting(id: "phone.places", label: "Saved iPhone places", type: "list", read: {
@@ -62,29 +64,29 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         var places: [Place] = []
         var pending: [Pending] = []
     }
-    @Published private(set) var places: [Place] = []
-    @Published var errorMessage: String?
-    @Published private(set) var locating = false
-    @Published private(set) var alwaysAllowed = false
+    private(set) var places: [Place] = []
+    var errorMessage: String?
+    private(set) var locating = false
+    private(set) var alwaysAllowed = false
     private var state = State()
     private let storage = MobileLocalStorage()
-    private var mutationTask: Task<State, Error>?
-    private var mutationGeneration = 0
-    private var appliedMutationGeneration = 0
+    @ObservationIgnored private var mutationTask: Task<State, Error>?
+    @ObservationIgnored private var mutationGeneration = 0
+    @ObservationIgnored private var appliedMutationGeneration = 0
     private var available = false
-    private(set) var restorationTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var restorationTask: Task<Void, Never>?
     private let file = URL.applicationSupportDirectory.appendingPathComponent("phone-places.json")
     private let location = CLLocationManager()
-    private var newName: String?
-    private var locationReply: CheckedContinuation<Place, any Error>?
-    private var locationRequest: UUID?
-    private var monitor: CLMonitor?
-    private var service: CLServiceSession?
-    private var eventsTask: Task<Void, Never>?
-    private var eventsGeneration = UUID()
-    private var reconcileTask: Task<Void, Never>?
-    private var reconcileAgain = false
-    private var publishing = false
+    @ObservationIgnored private var newName: String?
+    @ObservationIgnored private var locationReply: CheckedContinuation<Place, any Error>?
+    @ObservationIgnored private var locationRequest: UUID?
+    @ObservationIgnored private var monitor: CLMonitor?
+    @ObservationIgnored private var service: CLServiceSession?
+    @ObservationIgnored private var eventsTask: Task<Void, Never>?
+    @ObservationIgnored private var eventsGeneration = UUID()
+    @ObservationIgnored private var reconcileTask: Task<Void, Never>?
+    @ObservationIgnored private var reconcileAgain = false
+    @ObservationIgnored private var publishing = false
 
     /// Setup is read from the place owner, never a mirrored enabled/permission latch.
     var senseSetup: PhoneSenseEvent.Setup {
@@ -440,7 +442,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
 }
 
 struct PhonePlacesSettings: View {
-    @ObservedObject private var places = PhonePlaces.shared
+    private let places = PhonePlaces.shared
     private var session: FacePageSession { iCloudSyncEngine.shared.pageSessions.page("phone-places") }
     var body: some View {
         FaceView(face: face, door: door, session: session).task { places.resume() }

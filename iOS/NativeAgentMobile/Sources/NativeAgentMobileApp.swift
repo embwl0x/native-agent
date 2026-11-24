@@ -1,23 +1,19 @@
+import Foundation
 import SwiftUI
 import AppIntents
 import UserNotifications
 import UIKit
 import ActivityKit
 import NativeAgentShared
-#if canImport(CloudKit)
 import CloudKit
 // Blueprint: | `NativeAgentMobileApp.swift` | `NativeAgentMobileApp` struct |
-#endif
-
-extension Notification.Name {
-    /// Restrict launch injection to process arguments; no public URL scheme may post it.
-    static let nativeagentDeepLinkSend = Notification.Name("nativeagent.chat.send")
-    static let nativeagentOpenActivity = Notification.Name("nativeagent.open.activity")
-}
 
 /// Retain launch text in-process to close the observer-registration race; consume once, without persistence or public URL routing.
 @MainActor
 enum NativeAgentDeepLinkSendHook {
+    struct Staged: NotificationCenter.MainActorMessage {
+        typealias Subject = NSObject
+    }
     private static var pendingText: String?
     private static var acceptedLaunchArgument = false
 
@@ -41,7 +37,7 @@ enum NativeAgentDeepLinkSendHook {
     ) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         pendingText = text
-        notificationCenter.post(name: .nativeagentDeepLinkSend, object: nil)
+        notificationCenter.post(Staged())
     }
 
     static func deliverPending(
@@ -92,6 +88,9 @@ enum NativeAgentLaunchArgumentPresentation {
 }
 
 struct NativeAgentNotificationLaunchIntent: Codable, Identifiable, Hashable {
+    struct Staged: NotificationCenter.MainActorMessage {
+        typealias Subject = NSObject
+    }
     var id = UUID()
     let screen: String
     let sessionID: String?
@@ -157,11 +156,11 @@ enum ChatReplyNotificationPresentation {
 @main
 struct NativeAgentMobileApp: App {
     @UIApplicationDelegateAdaptor(NativeAgentMobilePushDelegate.self) private var pushDelegate
-    @StateObject private var pairingStore = PairingStore()
-    @StateObject private var bridgeClient = MacBridgeClient()
+    @State private var pairingStore: PairingStore
+    @State private var bridgeClient: MacBridgeClient
     @State private var chatStore = ChatStore.shared
     @State private var voiceInput = VoiceInputController()
-    @StateObject private var voiceOutput = VoiceOutputController()
+    @State private var voiceOutput = VoiceOutputController()
     private let notificationDelegate = NativeAgentNotificationDelegate()
     @State private var didApplyPairingSecretLaunchArgument = false
     @State private var didScheduleTestNotificationLaunchArgument = false
@@ -183,12 +182,13 @@ struct NativeAgentMobileApp: App {
         Task { await TalkModeController.endTalkActivities(callID: nil) }
         ChatRuntimeControls.primeDeviceSourceKey()
         MobileNotificationRouting.register()
-        UNUserNotificationCenter.current().delegate = notificationDelegate
         NativeAgentMobileShortcuts.updateAppShortcutParameters()
         let pairing = PairingStore()
-        _pairingStore = StateObject(wrappedValue: pairing)
+        _pairingStore = State(initialValue: pairing)
         iCloudBridge.shared.pairingStore = pairing
         iCloudSyncEngine.shared.pairingStore = pairing
+        _bridgeClient = State(initialValue: MacBridgeClient())
+        UNUserNotificationCenter.current().delegate = notificationDelegate
         // Install location observers even when relaunch has no visible scene.
         if pairing.usesICloudTransport { iCloudBridge.shared.setup() }
         PhonePlaces.shared.resume()
@@ -218,7 +218,13 @@ struct NativeAgentMobileApp: App {
         bridgeClient.refreshConnection()
         PhonePlaces.shared.resume()
         foregroundRefreshTask = Task { @MainActor in
-            defer { if foregroundRefreshID == generation { foregroundRefreshTask = nil } }
+            defer {
+                if foregroundRefreshID == generation {
+                    bridgeClient.isConnecting = false
+                    bridgeClient.refreshConnection()
+                    foregroundRefreshTask = nil
+                }
+            }
             await iCloudBridge.shared.deviceIncomingSetupTask?.value
             guard !Task.isCancelled, pairing == pairingStore.iCloudPairingSecret else { return }
             let sync = iCloudSyncEngine.shared
@@ -234,11 +240,11 @@ struct NativeAgentMobileApp: App {
             Group {
                 if shouldShowMainApp {
                     ContentView()
-                        .environmentObject(pairingStore)
-                        .environmentObject(bridgeClient)
+                        .environment(pairingStore)
+                        .environment(bridgeClient)
                         .environment(chatStore)
                         .environment(voiceInput)
-                        .environmentObject(voiceOutput)
+                        .environment(voiceOutput)
                         .onAppear {
                             bridgeClient.onNetworkPathRestored = { [weak chatStore = chatStore] in
                                 chatStore?.recoverQueuedSendTransport()
@@ -290,7 +296,7 @@ struct NativeAgentMobileApp: App {
                         // Retry deferred push registration once signing exists so the first pairing screen cannot prevent silent CloudKit delivery.
                         configureNotifications()
                     })
-                    .environmentObject(pairingStore)
+                    .environment(pairingStore)
                     .onAppear {
                         // Bind canonical consumers before pairing starts the bridge so immediately drained pairing records can commit through PairingStore.
                         iCloudSyncEngine.shared.pairingStore = pairingStore

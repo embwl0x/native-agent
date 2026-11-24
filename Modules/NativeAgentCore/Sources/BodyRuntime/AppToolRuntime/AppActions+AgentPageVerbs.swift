@@ -1,0 +1,53 @@
+import Foundation
+import NativeAgentCore
+// Blueprint: | `AppActions+AgentPageVerbs.swift` | Owner page commands for Desk, memory, Graph, identity and helpers |
+
+extension AppActions {
+    /// What a row of Desk, Memories, Personality or Helpers does when no existing verb does it, declared once beside every other verb: the
+    /// person's tap and the agent's call are the same call. Each runs its page owner's code through the page buttons' host (`upkeep`).
+    /// A control's new value arrives as `value`.
+    static var agentPageVerbs: [AppAction] {
+        get throws {
+            [
+                AppAction("desk.refresh", "desk", "Read every Desk source again; the page names any that stays unavailable",
+                          tool: "upkeep", input: verb("desk_refresh"), read: true),
+                AppAction("desk.remind", "desk", """
+                    Turn Desk reminders on or off: scope_kind global (every project), project (scope_id: the project's name) or item \
+                    (scope_id: the item's handle)
+                    """, [.required("scope_kind"), .optional("scope_id"), .required("value", .boolean)], subject: ["scope_kind", "scope_id"],
+                          tool: "upkeep", input: verb("desk_remind")),
+                AppAction("desk.veto", "desk", "Veto a pursuit: close it as the person's no", [.required("handle")], subject: ["handle"],
+                          owner: .person("a veto is the person's no to the agent's own pursuit",
+                                         instead: "desk.close {handle, reason} closes a pursuit of your own", name: "Vetoing one of my pursuits"),
+                          irreversible: true, tool: "upkeep", input: verb("desk_veto")),
+                AppAction("memories.search", "memories", "Search the Memories page (three letters or more; empty shows every memory)",
+                          [.required("value")], tool: "upkeep", input: verb("memories_search"), read: true),
+                AppAction("memories.bring_back", "memories", """
+                    Bring an old memory store's memories back into the agent's memory, each through her own memory write with the root its recorded \
+                    provenance names: from is an archive .zip, an old data folder, or its memory/memory.sqlite
+                    """, [.required("from")], subject: ["from"],
+                          owner: .person("an old store is the agent's past self; bringing it back is the person's say",
+                                         name: "Bringing back my old memories"),
+                          capabilities: [.memoryWrite, .toolCall], tool: "upkeep", input: verb("memories_bring_back")),
+                AppAction("memories.refresh", "memories", "Read the kept memories again", tool: "upkeep", input: verb("memories_refresh"),
+                          read: true),
+                AppAction("graph.refresh", "memories", "Read the canonical graph again", tool: "upkeep", input: verb("graph_refresh"), read: true),
+                AppAction("graph.apply", "memories", "Remove exactly the orphan identities in the reviewed Graph upkeep item",
+                          [.required("previewToken"), .required("expectedIDs", .strings)], irreversible: true, capabilities: [.memoryWrite, .toolCall],
+                          tool: "upkeep", input: verb("graph_apply")),
+                AppAction("personality.mind", "personality", """
+                    Choose the Memory and mind model: value is an option id the Personality page's mind row offers
+                    """, [.required("value")], owner: .person("the Memory and mind model is the person's choice of the agent's mind",
+                        name: "Choosing my Memory and mind model"),
+                          tool: "upkeep", input: verb("personality_mind")),
+                AppAction("personality.reset", "personality", "Reset identity: back up, then clear SOUL, VOICE, USER, GROWTH and AGENTS",
+                          owner: .person("resetting identity clears who the agent is; the person does it on the Mac", asks: false, name: "Resetting who I am"),
+                          irreversible: true, tool: "upkeep", input: verb("personality_reset")),
+                AppAction("bots.check", "bots", "Run a helper once; its reply stays in the helper's own conversation", [.required("id")], subject: ["id"],
+                          tool: "upkeep", input: verb("bots_check")),
+                AppAction("bots.paused", "bots", "Pause (value true) or resume a helper's scheduled and event work", [.required("id"), .required("value", .boolean)],
+                          subject: ["id"], tool: "upkeep", input: verb("bots_paused")),
+            ]
+        }
+    }
+}

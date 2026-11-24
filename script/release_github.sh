@@ -28,7 +28,6 @@ case "$PUBLIC_DEVICE_SYNC" in
 esac
 
 MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.nativeagent.mac}"
-BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
 ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.github.embwl0x.nativeagent}"
 MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 RELEASE_ENTITLEMENTS="${NATIVEAGENT_RELEASE_ENTITLEMENTS:-}"
@@ -43,9 +42,6 @@ fi
 if [[ -z "${NATIVEAGENT_LOCAL_IDENTITY_RE:-}" && -z "${NATIVEAGENT_PRIVACY_RE:-}" ]]; then
   [[ -r "$PRIVACY_DENYLIST_FILE" ]] \
     || note_failure "set NATIVEAGENT_PRIVACY_DENYLIST_FILE to the ignored maintainer privacy denylist."
-fi
-if [[ -z "$BACKGROUND_TASK_PREFIX" || "$BACKGROUND_TASK_PREFIX" == com.example.* ]]; then
-  note_failure "set NATIVEAGENT_BACKGROUND_TASK_PREFIX to the stable public background-task namespace."
 fi
 if [[ "$PUBLIC_DEVICE_SYNC" == "cloudkit" ]]; then
   if [[ -z "$ICLOUD_CONTAINER_ID" || "$ICLOUD_CONTAINER_ID" == iCloud.com.example.* ]]; then
@@ -157,7 +153,6 @@ export NATIVEAGENT_RELEASE_PAGE_URL="$RELEASE_PAGE_URL"
 # A caller that holds publication (go/abort) presets its own command; it is never replaced.
 export NATIVEAGENT_APPCAST_PUBLISH_CMD="${NATIVEAGENT_APPCAST_PUBLISH_CMD:-$PUBLISH_COMMAND}"
 export NATIVEAGENT_MAC_BUNDLE_ID="$MAC_BUNDLE_ID"
-export NATIVEAGENT_BACKGROUND_TASK_PREFIX="$BACKGROUND_TASK_PREFIX"
 export NATIVEAGENT_ICLOUD_CONTAINER_ID="$ICLOUD_CONTAINER_ID"
 export NATIVEAGENT_MOBILE_SOURCE_KEY="$MOBILE_SOURCE_KEY"
 export NATIVEAGENT_RELEASE_ENTITLEMENTS="$RELEASE_ENTITLEMENTS"

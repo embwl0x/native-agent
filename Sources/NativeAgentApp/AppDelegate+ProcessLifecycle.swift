@@ -1,5 +1,5 @@
 import NativeAgentCore
-import EngineRuntime
+import BodyRuntime
 import NativeAgentShared
 import Foundation
 import AppKit
@@ -82,7 +82,7 @@ extension AppDelegate {
         alert.alertStyle = .critical
         Task {
             NSApp.setActivationPolicy(.regular)
-            _ = try? await FaceNativePanel.confirm(alert)
+            _ = try? await FaceNativePanel.confirm(alert, activate: true)
             NSApp.setActivationPolicy(.accessory)
         }
     }
@@ -105,7 +105,7 @@ extension AppDelegate {
                 alert.messageText = "The NativeAgent window could not open."
                 alert.informativeText = error.localizedDescription
                 alert.alertStyle = .critical
-                _ = try? await FaceNativePanel.confirm(alert)
+                _ = try? await FaceNativePanel.confirm(alert, activate: true)
             }
         }
     }
@@ -162,7 +162,7 @@ extension AppDelegate {
         alert.messageText = "NativeAgent could not prepare a clean data directory."
         alert.informativeText = "For safety, NativeAgent will not start with existing pre-release data.\n\n\(detail)"
         alert.alertStyle = .critical
-        _ = try? await FaceNativePanel.confirm(alert)
+        _ = try? await FaceNativePanel.confirm(alert, activate: true)
     }
 
     @MainActor
@@ -176,7 +176,7 @@ extension AppDelegate {
             details are in the log.
             """
         alert.alertStyle = .critical
-        _ = try? await FaceNativePanel.confirm(alert)
+        _ = try? await FaceNativePanel.confirm(alert, activate: true)
     }
 
     /// Require a choice before continuing on the named root so missing data or SOUL.md cannot silently start an empty agent.
@@ -192,7 +192,7 @@ extension AppDelegate {
             + "\n\nContinuing starts with what is named above, and anything missing is created empty."
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Continue Anyway")
-        return (try? await FaceNativePanel.confirm(alert)) == .alertSecondButtonReturn
+        return (try? await FaceNativePanel.confirm(alert, activate: true)) == .alertSecondButtonReturn
     }
 
     // MARK: - Login item

@@ -2,25 +2,15 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 import NativeAgentCore
-import EngineRuntime
-import MemoryV2
+import BodyRuntime
+import MindCore
 import PersistenceCore
-import AttentionRouting
-import DoctorChecks
 import WidgetKit
 import AppIntents
 import Observation
 import ProviderRouting
-import BackgroundLoops
-import PersonaEngine
-import ChatTurnRuntime
-import ChatSessionWork
-import TrustCenter
-import MultimodalTTS
-import SystemOps
-import TelegramBot
-import DeviceSync
-import Privacy
+import SenseCore
+import DeskCore
 // Blueprint: | `AppModel+PanelRefresh.swift` | Panel commands and selected freshness reads; `PanelFreshnessOwner` admits receipts off main |
 
 @MainActor

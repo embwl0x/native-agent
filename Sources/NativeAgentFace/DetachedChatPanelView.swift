@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 import AppKit
+import UniformTypeIdentifiers
 // Blueprint: | `DetachedChatPanelView.swift` | `DetachedChatPanelView`: session transcript/composer through shared owners |
 
 
@@ -20,7 +21,7 @@ struct DetachedChatPanelView: View {
     private var inlineCards: CardControls { CardControls.shared }
     @State private var isCapturing = false
     @State private var isRetryingLoad = false
-    @State private var toastMessage: String?
+    @State private var toasts = ChatToastQueue()
     @State private var voiceInput = FaceVoiceInput()
     @State private var voiceDraftBeforeListening = ""
     @State private var voiceDraftRevision: UInt64 = 0
@@ -86,18 +87,19 @@ struct DetachedChatPanelView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            InboxStripContainer { notes in
-                notes
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .padding(.horizontal, 12)
+        GlassEffectContainer(spacing: 0) {
+            VStack(spacing: 0) {
+                InboxStripContainer { notes in
+                    notes
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .padding(.horizontal, 12)
+                }
+                messageScrollback
+                    .overlay(alignment: .bottom) { turnCard }
+                Divider()
+                inputBar
+                    .disabled(!sessionIsAvailable)
             }
-            messageScrollback
-                // The shared turn card floats over the document's end; its height is the document's bottom inset.
-                .overlay(alignment: .bottom) { turnCard }
-            Divider()
-            inputBar
-                .disabled(!sessionIsAvailable)
         }
         .frame(minWidth: 380, minHeight: 280)
         .modifier(ChatAttachmentDropTarget(isEnabled: sessionIsAvailable, onDrop: {
@@ -115,7 +117,7 @@ struct DetachedChatPanelView: View {
             inputFocused = true
         }
         .modifier(FaceObservation(demand: .key(.conversation(session: sessionId))))
-        .modifier(FaceDictationObservation(input: voiceInput))
+        .observeDictation(voiceInput, showToast: showToast)
         .onChange(of: sessionTitle, initial: true) { _, title in
             guard let title else { return }
             DetachedChatWindowController.shared.updateTitle(
@@ -252,8 +254,8 @@ struct DetachedChatPanelView: View {
                 }
             }
 
-            if let toastMessage {
-                NoticePill(text: toastMessage)
+            if let toast = toasts.current {
+                NoticePill(text: toast)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .transition(NativeAgentMotion.fade)
             }
@@ -458,14 +460,7 @@ struct DetachedChatPanelView: View {
     }
 
     private func showToast(_ message: String) {
-        toastMessage = message
-        Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: 2_000_000_000) }
-            catch { return }
-            if toastMessage == message {
-                toastMessage = nil
-            }
-        }
+        toasts.show(message)
     }
 
 }
@@ -496,7 +491,6 @@ private struct DetachedChatComposer: View {
     let isRunning: Bool
     let sendAllowed: Bool
     @FocusState.Binding var inputFocused: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let onToggleVoice: () -> Void
     let onDiscardVoice: () -> Void
     let onCaptureScreen: () -> Void
@@ -546,9 +540,5 @@ private struct DetachedChatComposer: View {
             .onPasteCommand(of: [.fileURL, .image], perform: onDrop)
             .onChange(of: voiceInput.transcript) { _, newVal in onTranscript(newVal) }
         }
-        .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
-            value: draft.text
-        )
     }
 }

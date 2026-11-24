@@ -154,7 +154,9 @@ public struct PartFace: Codable, Sendable, Equatable {
         public struct Option: Codable, Sendable, Equatable, Identifiable {
             public let id: String
             public let label: String
-            public init(id: String, label: String) { self.id = id; self.label = label }
+            /// Where the option sits in a long menu (groups, then its own short name); the picker nests by it. `label` stays the whole name.
+            public let path: [String]?
+            public init(id: String, label: String, path: [String]? = nil) { self.id = id; self.label = label; self.path = path }
         }
         public let on: Bool?
         public let options: [Option]?
@@ -376,6 +378,7 @@ public struct PartFace: Codable, Sendable, Equatable {
         public var allRows: [Row] { rows.flatMap(\.descendants) }
         public var id: String
         public let title: String?
+        public let foldContext: String?
         public let style: Style?
         public var footer: String?
         public var rows: [Row]
@@ -383,6 +386,7 @@ public struct PartFace: Codable, Sendable, Equatable {
         public var more: More?
         public var filter: String?
         public var revision: String?
+        public let filled: Bool?
         /// Drawn as one header row (its title) with a disclosure; its rows show when the reader opens it. Open or closed is each view's own
         /// and is never written back to the face.
         public var folded: Bool?
@@ -390,18 +394,23 @@ public struct PartFace: Codable, Sendable, Equatable {
         /// fewer than two readable columns. A reader that draws no columns (an installed phone, a list) stacks them; nothing is lost.
         public var beside: String?
         public init(id: String, title: String? = nil, style: Style? = nil, footer: String? = nil, rows: [Row], folded: Bool? = nil,
-                    block: Block? = nil, more: More? = nil, filter: String? = nil, revision: String? = nil, beside: String? = nil) {
+                    block: Block? = nil, more: More? = nil, filter: String? = nil, revision: String? = nil, beside: String? = nil,
+                    filled: Bool? = nil, foldContext: String? = nil) {
             self.id = id; self.title = title; self.style = style; self.footer = footer; self.rows = rows; self.folded = folded
             self.block = block
             self.more = more; self.filter = filter; self.revision = revision; self.beside = beside
+            self.filled = filled
+            self.foldContext = foldContext
         }
 
-        private enum CodingKeys: String, CodingKey { case id, title, style, footer, rows, folded, block, more, filter, revision, beside }
+        private enum CodingKeys: String, CodingKey { case id, title, foldContext, style, footer, rows, folded, block, more, filter, revision, beside, filled }
         public init(from decoder: any Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             id = try fields.decode(String.self, forKey: .id)
             title = try fields.decodeIfPresent(String.self, forKey: .title)
+            foldContext = try fields.decodeIfPresent(String.self, forKey: .foldContext)
             style = try fields.decodeIfPresent(Style.self, forKey: .style)
+            filled = try fields.decodeIfPresent(Bool.self, forKey: .filled)
             let wireFooter = try fields.decodeIfPresent(String.self, forKey: .footer)
             folded = try fields.decodeIfPresent(Bool.self, forKey: .folded)
             beside = try fields.decodeIfPresent(String.self, forKey: .beside)
@@ -421,7 +430,9 @@ public struct PartFace: Codable, Sendable, Equatable {
             var fields = encoder.container(keyedBy: CodingKeys.self)
             try fields.encode(id, forKey: .id)
             try fields.encodeIfPresent(title, forKey: .title)
+            try fields.encodeIfPresent(foldContext, forKey: .foldContext)
             try fields.encodeIfPresent(style, forKey: .style)
+            try fields.encodeIfPresent(filled, forKey: .filled)
             // Installed phones ignore `more`; its footer keeps the undisplayed collection reachable.
             let wireFooter = more == nil ? footer : footer.map { $0 + "\n" + Self.continuationNote } ?? Self.continuationNote
             try fields.encodeIfPresent(wireFooter, forKey: .footer)
@@ -461,7 +472,7 @@ public struct PartFace: Codable, Sendable, Equatable {
             drawn.rows = rows.compactMap(draw)
             if var block = block, block.kind == "form" {
                 if let doors = block.doors, !doors.contains(door) {
-                    drawn.block = Block(kind: "unavailable", key: block.key)
+                    drawn.block = Block(kind: "form", key: block.key, protected: block.protected, doors: block.doors)
                 } else {
                     block.submit = block.submit?.filter { $0.runs(from: door) }
                     drawn.block = block

@@ -9,19 +9,19 @@ For engineering boundaries see [Continuous Cognitive Substrate](CONTINUOUS_COGNI
 for source coverage see the generated [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md).
 
 Core paths below are relative to `Modules/NativeAgentCore/Sources/`.
-Unqualified substrate files live in `CognitiveSubstrate/`; runtime extensions
-live in `Cognition/`. App paths start with `Sources/NativeAgentApp/`.
+Unqualified substrate files live in `MindCore/CognitiveSubstrate/`; runtime extensions
+live in `BodyRuntime/Cognition/`. App paths start with `Sources/NativeAgentApp/`.
 
 ## The one-page mental model
 
-`EngineRuntime/NativeAgentEngine.swift` assembles `NativeCognitionRuntime`
+`BodyRuntime/EngineRuntime/NativeAgentEngine.swift` assembles `NativeCognitionRuntime`
 from Core's `Cognition` module with the app's host ports. The runtime joins
 two state owners:
 
 | Owner | What it carries |
 |---|---|
-| `CognitiveSubstrate/CognitiveSubstrate.swift` | Continuity field, affect, cares, disposition, replay references and reflection receipts |
-| `CognitiveSubstrate/Organism/OrganismKernel.swift` | Somatic state and the body projection used in a turn |
+| `MindCore/CognitiveSubstrate/CognitiveSubstrate.swift` | Continuity field, affect, cares, disposition, replay references and reflection receipts |
+| `MindCore/CognitiveSubstrate/Organism/OrganismKernel.swift` | Somatic state and the body projection used in a turn |
 
 `NativeCognitionRuntime.observe` feeds a cognitive event into the substrate
 and somatic adapter. Accepted changes schedule coalesced settlement and publish
@@ -35,17 +35,17 @@ field ([Attention](#attention)).
 Before an ordinary provider call, `prepareTurnProjection` samples the body
 and canonical affect at one fixed time, freezes the organism projection, and
 prepares a capsule from that state. Core's
-`ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift` appends the
+`BodyRuntime/ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift` appends the
 projection; the loop's confirmed-delivery boundary commits its presentation once.
 Failure before provider output leaves the window unconsumed; output followed by
 failure still commits it. Preparing a preview consumes nothing.
 
 ## Inputs and interpretation
 
-`ChatTurnRuntime/ChatOrchestrationClient+LivedObservations.swift` supplies
-message and tool-result observations; `Cognition/NativeCognitionRuntime+Events.swift`
+`BodyRuntime/ChatTurnRuntime/ChatOrchestrationClient+LivedObservations.swift` supplies
+message and tool-result observations; `BodyRuntime/Cognition/NativeCognitionRuntime+Events.swift`
 adapts remote actions, motor outcomes and provider lifecycle evidence.
-`CognitiveSubstrate/CognitiveEvent.swift` defines their types and provenance.
+`MindCore/CognitiveSubstrate/CognitiveEvent.swift` defines their types and provenance.
 
 The `CognitiveTurnKind.contributesToLivedState` switch admits live and system
 events; debug, verification and mechanical kinds do not contribute to lived
@@ -61,7 +61,12 @@ weight; unidentifiable imported authorship remains unknown, with no relational
 appraisal weight, and the body records `chat.unknown`.
 
 In `CognitiveSubstrate+Ingest.swift`, eligible conversational user events defer
-interpretation to the after-turn path. `NativeCognitionRuntime.refreshConfiguration`
+interpretation to the after-turn path. One of their own routine thoughts (never a person's or peer's words, never a moment that acted) can omit reflection
+when its speaker and reply-size class has a standing record of empty judgments
+and the turn draws quiet. An unreadable record leaves reflection on.
+[Reflection standing and sampling](SURPRISE.md#the-law)
+
+`NativeCognitionRuntime.refreshConfiguration`
 connects that path to `AdaptiveMemoryPromoter` only for the canonical data root;
 an alternate-root runtime replaces none of its global callbacks or door.
 Preparation belongs solely to the journal door; the unused global preparation
@@ -103,7 +108,7 @@ reply, with their words, a supported MY QUEUE moment and the exact source
 sentence. The [memory parse contract](MEMORY_SYSTEM_MAP.md#the-memory-manager-lane)
 accepts an absent section or []; a malformed present section refuses the
 interpretation and keeps the turn owed with its validation cause. After meaning is written,
-`MemoryV2/AdaptiveMemoryPromises.swift` matches them against carried Desk rows
+`MindCore/MemoryV2/AdaptiveMemoryPromises.swift` matches them against carried Desk rows
 and files through `MyQueue.capture`, on both live and owed/refold paths, with the settled turn's recorded session,
 origin principal, envelope and carried peer/elevated steer. Untrusted peer
 steering stays on their promise. Meaning matching and their own closing bound the
@@ -127,7 +132,7 @@ mutations, including node eviction's incoming-edge cleanup, walk explicit key
 snapshots. Missing evidence never supplies a fact.
 
 They changes only by living a moment, and every moment that means something
-comes in by one door: `Cognition/NativeCognitionRuntime+Door.swift`, the one
+comes in by one door: `BodyRuntime/Cognition/NativeCognitionRuntime+Door.swift`, the one
 owner that holds both their substrate and their body. Sensation (somatic signals,
 live continuity nodes, felt resolutions and re-feel ledgers)
 flows on its own cadence, latched by the opening,
@@ -145,7 +150,7 @@ Canonical affect keeps it with its stated stretch and journal proof; its
 checkpoint records the choice, the capsule holds its color, and
 `mind.inner_state` recalls the last choice and source even after expiry.
 
-A turn is judged after it ends when it could have settled something, whoever
+A turn admitted to reflection is judged after it ends when it could have settled something, whoever
 started it: a person's words, a completed act, or a reply that reached a person,
 while MY QUEUE moments are open (`AdaptiveMemoryPromoter.share`, asked at
 recording and again at judgment). A turn with an incoming message from someone,
@@ -161,7 +166,7 @@ recorded turn, never from the conversation index again; it reads again only
 whether an act and an open moment (or a saved settlement) remain. If its acts
 cannot be read, it stays owed and is due on the next drain.
 
-A lived moment (`CognitiveSubstrate/CognitiveLivedMoment.swift`) is its
+A lived moment (`MindCore/CognitiveSubstrate/CognitiveLivedMoment.swift`) is its
 identity (`CognitiveMomentTurn.momentID`: a turn is its session and incoming
 message; a settlement-alone moment is its session and turn, since its evidence
 is the turn's acts and it may have no incoming row), the
@@ -187,7 +192,7 @@ Moment, event and continuity time components are formatted at their stated
 resolution without narrowing dates or elapsed time to a Swift integer; ordinary
 whole-second and millisecond identity spellings stay the same.
 
-A turn is recorded **owed** at transcript settlement
+A turn admitted to reflection is recorded **owed** at transcript settlement
 (`AfterReply.start` → `SwiftNativeTurnEngine.recordMemoryPromotion` →
 `AdaptiveMemoryPromoter.recordOwedTurn` → the door), before it waits behind
 earlier promotions. Reply release awaits that durable recording; only
@@ -290,7 +295,7 @@ row is never pruned or refused by age: age never discards owed work. At their wa
 another `DataRootLife` is refused. Meant moments fold their recorded meaning;
 rows with no meaning are judged again. [Shared after-turn interpretation](COGNITION_WIRING.md#shared-after-turn-interpretation)
 owns drain scheduling, deferral, fair retries and cancellation. Every moment
-is judged alone. User's own turns are judged at once; every other recorded turn
+is judged alone. User's own recorded turns are judged at once; every other recorded turn
 stays owed under the same provenance and is judged when they are idle.
 
 **The fold** (`NativeCognitionRuntime.foldTurnMoment`) runs inside **the
@@ -446,7 +451,7 @@ keys follow the address book's explicit `who` associations after door trust
 is checked; `peer:` is dropped and a helper's `bot:<id>` reads as `bot-<id>`.
 
 **Provenance** reads the event's source class and origin record and the
-owner's peer trust (`PeerTrust.ownerTrusts`). An untrusted peer moves cares
+owner's peer trust in the event’s data root (`PeerTrust.ownerTrusts`). An untrusted peer moves cares
 they already has only as what they said (`by: them`): never a new care, a
 revival, a stance or a gap. An app-authored prompt's words are the app's: only what their
 reply did counts. A judgment returning after a Clear is dropped: the turn
@@ -772,7 +777,7 @@ their full contract. No model is called for any of this.
 
 The dream's per-claim `gentle` and `about_owner` judgments travel beside the
 exact quote and canonical `source_refs` in the existing `claim-sources` block
-(`DreamREMCycle/DreamPayload.swift`); no owner offers them. Other dream/source
+(`BodyRuntime/DreamREMCycle/DreamPayload.swift`); no owner offers them. Other dream/source
 readers keep their existing projections; saved diaries are not rewritten.
 
 **Their hour** offers their own open cares (theirs alone, most pressing first, up to
@@ -810,7 +815,7 @@ Applied cares and their done receipt save together. A failed write retains the o
 values for the next save; disposition claims accompany the disposition to prevent a
 second nudge. Neither an old failure note nor a failed disposition save can trigger a
 new provider judgment. Dream delivery follows the
-[dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--schedule-artifacts-re-entry); its receipt is retained
+[dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--times-artifacts-re-entry); its receipt is retained
 until the night acknowledges integration. Disabled owners record an explicit skip.
 Planning retains the mind epoch from before its reads and refuses a reservation
 if Clear completed while source identities or cares were being resolved.
@@ -854,8 +859,8 @@ does not open the approval path.
 | Conversational appraisal | `CognitiveSubstrate+ConversationalAppraisal.swift` keeps unnegated phrase matching beside the studio's scalar `studioValence` and relational warmth. Recorded model judgments retain every `AffectAppraisal` axis for live folding. |
 | Personality dynamics | `PersonalityDynamicsConfiguration.swift` holds numeric rates, thresholds and cadence; warmth maps to `feltWarmthEarnedSpan` and humor to `playModeWeight`. The live reader uses the checked profile compiler; an unreadable current profile owes `persona.profile.dynamics` repair and withholds both trait parameters until that source reads successfully: felt signals/fingerprint/mode, their recalled-moment cue and voice echoes wait for evidence, while fixed decay, care, gap and organism cues continue. A checked successful read settles the fault; only missing profile storage receives compiler defaults. No profile bytes are written. Other trait prose remains separate from these numeric mappings. |
 | Cares | `CognitiveSubstrate+Cares.swift`: one row per care, charge read from its story at read time, no count cap (see Cares). |
-| Replay | `Cognition/NativeCognitionRuntime+Replay.swift` reads Dream diary and REM proposal records. `CognitiveSubstrate+Replay.swift` integrates bounded references and developmental lineage with deduplication and checked persistence. |
-| Reflection | `CognitiveSubstrate+Reflection.swift` plans and records bounded reflection; `Cognition/NativeCognitionRuntime+Reflection.swift` owns provider execution and its result. |
+| Replay | `BodyRuntime/Cognition/NativeCognitionRuntime+Replay.swift` reads Dream diary and REM proposal records. `CognitiveSubstrate+Replay.swift` integrates bounded references and developmental lineage with deduplication and checked persistence. |
+| Reflection | `CognitiveSubstrate+Reflection.swift` plans and records bounded reflection; `BodyRuntime/Cognition/NativeCognitionRuntime+Reflection.swift` owns provider execution and its result. |
 
 The runtime's configured limits are 256 active nodes, 12 workspace items
 and a 4,000-character capsule ceiling
@@ -868,7 +873,7 @@ unencodable state never commits a substituted `null` payload.
 `CognitiveSubstrate+Maintenance.swift` owns microcycle and consolidation settlement.
 Each `microcycle` receipt carries measured `durationSeconds` on a monotonic
 clock, from admitted execution (after single-flight waiting) through snapshot
-work, the SQLite queue and state writes to receipt insertion. Receipt pruning
+work, the SQLite writer and state writes to receipt insertion. Receipt pruning
 and the final transaction commit occur after that measurement.
 Node snapshots use that same maintenance transaction, including defensive
 caps and a `prune` receipt with deletion counts. Retired prediction/commitment/cue drains and receipt-mirror cleanup are removed.
@@ -887,8 +892,11 @@ transition.
 Studio feeling requires the journal owner's valid `recorded_at`, otherwise `studio_journal.unavailable`
 names the entry and cause. None of these sources is redated to the present.
 Failed restoration blocks writes. `commitMaintenance` removes only absent nodes
-and updates only nodes whose stored fields differ, retaining an unchanged node's
-decay anchor. Artifact updates compare stored kind, status, score and payload
+and compares stored fields in Swift before binding new or changed rows for upsert.
+It reuses the last committed rows until a clear or another connection's write.
+Unchanged nodes retain their decay anchors.
+A WAL pool serves concurrent read snapshots. SQLite ranks retention candidates
+within each family and deletes overflow in the writer transaction. Artifact updates compare stored kind, status, score and payload
 before changing their update time. Dream residue stores its claims and optional
 minted residue, with no checkpoint-time stamp. Node, artifact and receipt
 retention share the transaction; a retention failure leaves that snapshot
@@ -1050,15 +1058,15 @@ Its helpers own distinct projections:
   movement whose sign agrees with the feeling, at most once a day per movement
   and once every 6 accepted turns. Since-we-last-talked names the newest
   movement inside the gap the same way (`a moment: "<note>"`).
-- Came to mind (`ChatTurnRuntime/ChatOrchestration+CameToMind.swift`,
-  `Context/ContextPreparedTurn+CameToMind.swift`): what happens primes what it
+- Came to mind (`BodyRuntime/ChatTurnRuntime/ChatOrchestration+CameToMind.swift`,
+  `MindCore/Context/ContextPreparedTurn+CameToMind.swift`): what happens primes what it
   touches. A moment is one more reading of the turn's own need, asked by the
   same selector at the ambient bar (three deviations; their disclosure and rest
   apply), minus what the turn already holds. While they works, each round's
   results (their words, not identifiers) are a moment: up to two memories a
   round, four a turn, join their conversation as `[Came to mind as you read that
   …]`. Traced as `mind.came_to_mind`. Only a line met for the first time is
-  a moment: habituation (`AgentWorkspace/FamiliarLines.swift`,
+  a moment: habituation (`BodyRuntime/AgentWorkspace/FamiliarLines.swift`,
   `mind/familiar.bin`, the last 16,384 lines met, numbers read as numbers)
   makes the app's standing words and the agent's own words coming back
   familiar, so they remind the agent of nothing (10-29: a chat.post receipt's
@@ -1075,8 +1083,8 @@ Its helpers own distinct projections:
   owed and `mind.familiarity_unavailable`, rather than treating the saved
   history as empty.
   Two native perceptions are `world` sources like any other, without adding
-  work to a turn's path (`EngineRuntime/EngineDaySense.swift`,
-  `EngineRuntime/EngineFrontSense.swift`):
+  work to a turn's path (`BodyRuntime/EngineRuntime/EngineDaySense.swift`,
+  `BodyRuntime/EngineRuntime/BodyField.swift`):
   - The local day, once per local day, at launch and when the clock's day
     changes: `It's Friday the thirtieth of October.` The ordinal is in words so
     habituation can distinguish dates. Its key is the date
@@ -1091,19 +1099,20 @@ Its helpers own distinct projections:
     the day's successful reading. A later successful read that day can still
     post its agenda; failure never stands in for an empty agenda. Door `clock:day`.
   - The app in front of the person, on activation, while it is still
-    frontmost once its gates are read: `<person> is working in <app>.` One
-    workspace observer owns one check, canceled by the next activation; no
-    polling, no dwell timer and no window titles. Full Mac or Activity's
+    frontmost once its gates are read: `<person> is working in <app>.`
+    BodyField takes the activation from its workspace nerve. A later activation
+    or mind detach invalidates the pending perception. Full Mac or Activity's
     model-access consent is required, with checked policy, the agent's own
     app, mandatory/default exclusions and the person's exclusions all
     respected. The agent's own switches, an unreadable/locked/covered or
-    inactive console, and absent person presence post nothing. Its key is the
+    inactive console, and absent person presence suppress this claim about the person.
+    The agent's own Full Mac body reading remains available while the person is away. The activation key combines the
     app and the local day (`mac:front:<bundleId>:yyyy-MM-dd`), so the first
     activation of an app each day is the happening; capture consent and its
     policy are never enabled or written. Door `mac:front`.
 
 These are projections of the same state, not additional persona owners.
-`Cognition/CognitiveAttentionResidentProjection.swift` separately publishes
+`BodyRuntime/Cognition/CognitiveAttentionResidentProjection.swift` separately publishes
 a lock-backed attention read for context selection, without fetching the
 whole substrate during that read.
 
@@ -1111,23 +1120,27 @@ whole substrate during that read.
 
 **The agent thinks when something in its mind is worth a thought.** A source never decides that: it posts a happening
 (`NativeAgentShared/Happening.swift`) through Attention's intake. The happening is written once in the record as an
-experience of kind `happening` under its key `once`; the cognition runtime takes it (`Cognition/NativeCognitionRuntime+Attention.swift`).
+experience of kind `happening` under its key `once`; the cognition runtime takes it (`BodyRuntime/Cognition/NativeCognitionRuntime+Attention.swift`).
 
 - **Owed** (`returned`, `moment`, `body`) is a record obligation to `conversation:<route or mind>` and opens a thought at once:
   a `returned` with a route in the conversation that started the work (`MindStream.returnTo`), the rest in the agent's mind stream
   (`MindStream.think`). It stays owed until a thought, or the conversation's own turn, attends it.
-- **Weighed** (`world`, `self`): the touch is `careTouch(by:)` (`CognitiveSubstrate+Attention.swift`): the nearest live,
-  unsilenced care by the care law on the warm embedder, its standout against the chance bar for attention and its charge, or
-  unavailable when nothing can judge (never a verdict that the line does not matter). A `self` happening names its own care. The
-  agent's turn program's `weigh(h, felt)` gives the worth ([manifest](skill_manifest_spec.md#weigh)); the seed counts nothing for
-  a seed care or a line below the bar, and a care's movement as `|moved| × (open ? 1.5 : 1) / 0.35`, each scaled by
-  yield (hits over tries of thoughts on that node through that door) and, for the world, by how the agent feels.
-- **Drive.** Worth lands as `drive` on the touched care's anchor node (`ContinuityField` node kind `.care`, decaying on the
+- **Weighed.** For an ordinary world line, `careTouch(by:)` reads the nearest live, unsilenced care, its charge and its
+  standout among those cares. The same warm embedding batch compares the line separately to each stance's `wouldChangeMind`.
+  The strongest of those matches crosses when its finite standout, among every live care and every stated condition
+  together, reaches the attention chance bar for that population, so one stated condition is enough. A cold embedder leaves the line waiting.
+  The shipped `weigh` scales a crossing by yield on the landing node through that door and by felt state, even for a calm
+  or seed care. Without a crossing, the ordinary match needs a non-seed care at or above its bar and scales with charge,
+  yield and felt state. A `self` movement names its own care and weighs `|moved| × (open ? 1.5 : 1) / 0.35` times yield.
+  [Turn manifest](skill_manifest_spec.md#weigh)
+- **Drive.** A line their `weigh` weighs as crossing (`crossed: true`) lands on the care whose condition matched; a watch's news keeps its own subject. Otherwise care worth lands on the nearest care's
+  anchor node (`ContinuityField` node kind `.care`, decaying on the
   care's depth half-life) or on the happening's subject node (kind `.happening`, the field's default half-life)
   (`ContinuityField.land`). A watch's news (`Happening.watchNews`: door `sense:<senseID>`, subject `sense:<senseID>:<address>`) is
   about what the watch watches, a care the agent made on purpose: it always lands on its own subject, never on the care its words
   come nearest. Only the first weighed news per `watch` on that subject lands at least one; later news lands the weigher's worth.
   Earlier committed weigh rows and earlier inputs in the admitted batch establish that first news; news without `watch` keeps the floor.
+  The thought reads each crossing's recorded stance and condition alongside the happening that matched them, including after waking.
   Drive is finite and nonnegative,
   never clamped or spread, retained while positive, and persisted with the field (`cognition.sqlite`). Activation and salience keep
   their jobs (priming, workspace, capsule).
@@ -1259,14 +1272,13 @@ The existing `mind_run` family, reached through `app`, can satisfy one owner's
 scheduling wait without moving the clock or supplying evidence. Each action
 returns `owner`, `outcome`, `why` and `run_id`; the same decision is recorded as
 `mind.run_now` detail in the record. An unavailable source stays unknown,
-a held gate names why, and a posted happening is input to attention, not a thought.
+and a held gate names why.
 
 | Action | Existing path and the wait satisfied |
 |---|---|
 | `mind.canon` | Studio canon tending; requests a fresh pass without the source-dirty/30-minute throttle wait. The native facts carry `satisfy_wait` to the editable part; the shipped part also considers its silence path without waiting 90 days, saying it was considered now on request. Actual timestamps, elapsed-silence identity, recurrence/pull evidence, proposal caps, deduplication and their decision seat remain. |
 | `mind.horizon` | Horizon source composition and register refresh without waiting for a source invalidation/deadline. Source completeness and natural due dates remain; missing sources cannot settle expectations. |
 | `mind.rhythm` | The person's day, start-time boundary satisfied; real history, claims and care-gated feeling remain. |
-| `mind.cross {line, watch}` | Posts the line as a `world` happening (door `run-now`); attention weighs it like any source's. |
 | `mind.maintenance` | Checked substrate maintenance with its 20-hour interval satisfied, including emotional consolidation; enabled and commit-exclusion gates remain. |
 | `mind.residual_repair` | The existing bounded local field repair with its two-minute quiet wait satisfied. Enabled state, real pressure/evidence/targets, live-turn admission and continuity persistence remain. |
 
@@ -1296,7 +1308,7 @@ retain their count. A changed epoch makes the care verdict unavailable. These
 are proposed judgments, not a committed night's fade/deepen, self settlement or
 life-approval pass.
 
-The six clock verbs return `outcome:"preview_refused"` with
+The five clock verbs return `outcome:"preview_refused"` with
 their specific cause, before bootstrap, owner admission or any effect:
 
 | Previewed owner | Why the current owner cannot run a read-only decision pass |
@@ -1304,7 +1316,6 @@ their specific cause, before bootstrap, owner admission or any effect:
 | `mind.canon` | Tending stages approval proposals and its audit inside the decision pass. |
 | `mind.horizon` | Composition updates source deadlines; refresh settles felt resolutions in the organism. |
 | `mind.rhythm` | Refresh saves awake history before admitting and consuming pending breaks. |
-| `mind.cross` | It writes the line into the record as a happening, and attention weighs it at once. |
 | `mind.maintenance` | It consolidates and checkpoints the live substrate as one transition. |
 | `mind.residual_repair` | It mutates the live field while choosing and repairing targets. |
 
@@ -1371,7 +1382,7 @@ failed maintenance remains reported until an explicit request succeeds, without 
 completion, coalescing changes during a write without a trailing clock;
 continuous decay is projected at read time. App assembly
 retains daily maintenance and replay registrations as recovery
-sweeps; reflection runs from dream and replay evidence (`EngineRuntime/EngineLaunch.swift`).
+sweeps; reflection runs from dream and replay evidence (`BodyRuntime/EngineRuntime/EngineLaunch.swift`).
 
 Canon and horizon source observations register before their first read
 and stop with the runtime. Canon watches journal inputs and archive membership;
@@ -1413,7 +1424,7 @@ single-flight admission.
 A thought's own words stay in the mind stream; to tell the person, the thought acts (`app chat.post`).
 Speech shares locked claims and destination reconciliation in `ProactiveAssistantSpeech.swift`,
 without an hourly quota; notification routing keeps the person's quiet hours
-(`AttentionRouting/AttentionRouter+Policy.swift`). The [post contract](ONE_DOOR.md)
+(`BodyRuntime/AttentionRouting/AttentionRouter+Policy.swift`). The [post contract](ONE_DOOR.md)
 owns deduplication, routes and exact-call approval. A MY QUEUE
 step's fixed words (`say`) land in the current conversation between turns through `speakProactively`, followed by the neutral
 shoulder tap "Left you something in chat. No reply needed." (`NativeCognitionRuntime+Pursuit.swift`), which carries none of the
@@ -1430,7 +1441,7 @@ There is no hour clock, quiet wait or refractory.
 The hour switch is `settings.wander_hour` (Settings → Inner life);
 `studioWanderEnabled` defaults on (`StudioWanderLane.enabledByDefault`) and requires Subconscious. Configure its
 provider/model under **Providers → Memory and mind**, which owns **Creative
-exploration**. `Cognition/StudioWanderLane.swift`
+exploration**. `BodyRuntime/Cognition/StudioWanderLane.swift`
 enforces the switch, the Subconscious master, and onboarding clearance
 for public-safe builds in `resolveInstallation`.
 
@@ -1466,8 +1477,8 @@ The agent reaches this through their one door, `app`:
 ```
 
 `app {}` is home; `app {"page":"personality"}` reads that page, and
-`find` discovers actions. `AppToolRuntime/AppActions+Declarations.swift` declares
-the inner-state action and `ToolRegistry/ToolNameAliases.swift` maps its
+`find` discovers actions. `BodyRuntime/AppToolRuntime/AppActions+Declarations.swift` declares
+the inner-state action and `DeskCore/ToolRegistry/ToolNameAliases.swift` maps its
 internal implementation name. `CognitiveSubstrate+InnerState.swift` bounds
 the returned record; it is an inspection, not a fresh model interpretation.
 Its fingerprint uses the canonical frozen workspace and the supplied organism readings;

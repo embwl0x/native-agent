@@ -1,39 +1,23 @@
-import MacControl
-import ActivityWatch
-import ApprovalTransactions
-import Agents
+import MacNerves
+import BodyRuntime
 import Foundation
 import AppKit
 import UserNotifications
 import AppIntents
 import NativeAgentCore
-import EngineRuntime
-import ChatTurnRuntime
-import ChatToolRuntime
-import ChromeControl
-import ContextFlow
-import BackgroundLoops
-import MemoryV2
-import NotificationInbox
+import SenseCore
+import MindCore
+import DeskCore
 import PersistenceCore
-import Desk
-import Transcripts
-import TurnTrace
-import PersonaEngine
-import Connectors
-import Browser
-import Cognition
 import OSLog
-import os
-import DeviceSync
-import AppToolRuntime
+import Synchronization
 import NativeAgentShared
 // Blueprint: | `AppDelegate+Launch.swift` | `AppDelegate`: Launch, turn-safe quit, ingress retirement and shared sleep settlement |
 
 extension AppDelegate {
     @MainActor private static var launchTask: Task<Void, Never>?
     @MainActor private static var bridgeLaunchWork: DispatchWorkItem?
-    nonisolated private static let launchStopping = OSAllocatedUnfairLock(initialState: false)
+    nonisolated private static let launchStopping = Atomic(false)
     @MainActor private static var launchDidStart = false
 
     @MainActor
@@ -50,7 +34,6 @@ extension AppDelegate {
         UNUserNotificationCenter.current().delegate = self
         NativeAgentEngine.installActionLabelsAtLaunch()
         NativeAgentNotificationActions.register()
-        TurnContinuationRuntime.installReplyMirror()
         Self.launchTask = Task {
             defer { Self.launchTask = nil }
             await finishLaunching()
@@ -131,7 +114,7 @@ extension AppDelegate {
                     memory store.
                     """
                 alert.addButton(withTitle: "OK")
-                Task { _ = try? await FaceNativePanel.confirm(alert) }
+                Task { _ = try? await FaceNativePanel.confirm(alert, activate: true) }
             },
             resumeMacTurn: { checkpoint, runtime in
                 guard let model = await ApplicationLifetime.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
@@ -168,12 +151,9 @@ extension AppDelegate {
     }
 
     nonisolated private static func startBridgesAtLaunch() {
-        guard !launchStopping.withLock({ $0 }) else { return }
+        guard !launchStopping.load(ordering: .acquiring) else { return }
         ClaudeBridgeRuntime.shared.startSyncForBootstrap()
-        guard !launchStopping.withLock({ $0 }) else { ClaudeBridgeRuntime.shared.stop(); return }
-        NativeAgentA2AGRPCListener.shared.start()
-        if launchStopping.withLock({ $0 }) {
-            NativeAgentA2AGRPCListener.shared.stop()
+        if launchStopping.load(ordering: .acquiring) {
             ClaudeBridgeRuntime.shared.stop()
         }
     }
@@ -220,23 +200,23 @@ extension AppDelegate {
         }
     }
 
-    /// A held quit may block the main queue, so its restart flag must be lock-protected rather than main-actor isolated.
-    nonisolated private static let restartQuit = OSAllocatedUnfairLock(initialState: false)
+    nonisolated private static let restartQuit = Atomic(false)
     @MainActor static var quitWaitingForTurns = false
 
-    /// Restart has already bounded its origin's settlement; skip the turn wait and release any held quit so the relauncher can reopen.
+    /// Restart has already bounded its origin's settlement; its quit still raises every in-flight turn's Stop, skips only the turn wait and
+    /// releases any held quit so the relauncher can reopen.
     @MainActor
     static func terminateForRestart() {
-        restartQuit.withLock { $0 = true }
-        NotificationCenter.default.post(name: NativeAgentEngine.quitRestartWake, object: nil)
+        restartQuit.store(true, ordering: .releasing)
+        NotificationCenter.default.post(NativeAgentEngine.QuitRestartWake())
         if quitWaitingForTurns { return }
         NSApp.terminate(nil)
         // Clear restart intent after a modal veto so an ordinary Quit still waits for turns.
-        restartQuit.withLock { $0 = false }
+        restartQuit.store(false, ordering: .releasing)
     }
 
-    /// Ordinary quit raises each captured turn's Stop and holds for settlement, then the retained sleep joins every tracked turn before its
-    /// final snapshot. The async hold and termination drain share one joinable settlement, with no clock.
+    /// Quit, a restart's included, raises each captured turn's Stop; ordinary quit holds for their settlement, then the retained sleep joins
+    /// every tracked turn before its final snapshot. The async hold and termination drain share one joinable settlement, with no clock.
     /// A quit asked again while one is held joins it: the pending termination is answered once, when that one settlement ends.
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -255,7 +235,7 @@ extension AppDelegate {
         let runs = NativeAgentEngine.live.turns.inFlightRunIDs()
         let settlement = NativeAgentEngine.beginQuitSleep(after: producerDrain,
             retireBrowser: { BrowserWindowController.shared.stopIPCServer() })
-        let waitsForTurns = !runs.isEmpty && !Self.restartQuit.withLock({ $0 })
+        let waitsForTurns = !runs.isEmpty
         Self.quitWaitingForTurns = true
         if waitsForTurns {
             ModuleLog.app("[quit] stopping %d in-flight turn(s) and holding quit for settlement", runs.count)
@@ -272,7 +252,7 @@ extension AppDelegate {
                     }
                 }
                 await NativeAgentEngine.waitForInFlightTurnsBeforeQuit(runs,
-                    isRestarting: { Self.restartQuit.withLock { $0 } })
+                    isRestarting: { Self.restartQuit.load(ordering: .acquiring) })
             }
             let slept = await NativeAgentEngine.sleepMind(after: settlement)
             ModuleLog.app("[quit] the agent's sleep: %@", slept)
@@ -292,14 +272,13 @@ extension AppDelegate {
     @MainActor
     private func closeQuitIngress() {
         Self.launchTask?.cancel()
-        Self.launchStopping.withLock { $0 = true }
+        Self.launchStopping.store(true, ordering: .releasing)
         Self.bridgeLaunchWork?.cancel()
         NativeAgentEngine.stopLaunchWork()
         approvalNotificationTask?.cancel()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         guard ApplicationLifetime.shared.appModel != nil else { return }
         // Close ingress now, but defer Browser IPC's full stop until admitted operations join the retained quit settlement.
-        NativeAgentA2AGRPCListener.shared.stop()
         ClaudeBridgeRuntime.shared.stop()
         NativeAgentEngine.liveDeviceSync.bridge.tearDown()
     }

@@ -1,5 +1,5 @@
+import Synchronization
 import Foundation
-import os
 
 // Blueprint: | `ToolActivityPresentation.swift` | `ToolActivityPresentation`: bounded display copy; execution stays unchanged |
 
@@ -61,7 +61,7 @@ public enum ToolActivityPresentation {
         actionLabels.withLock { $0 = labels }
     }
 
-    private static let actionLabels = OSAllocatedUnfairLock(initialState: [String: String]())
+    private static let actionLabels = Mutex([String: String]())
 
     /// An `app` action as an act in the app's own words: its label without the model's notes ("personality.mind" → "Choose the Memory and
     /// mind model"), else its id read as a title.

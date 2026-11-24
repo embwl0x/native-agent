@@ -9,13 +9,7 @@ import Observation
 /// Keep health with the read that produced it.
 enum SnapshotReadHealth: Equatable, Sendable {
     case fine
-    case unreadable
     case readFailed(reason: String)
-
-    var failed: Bool {
-        if case .readFailed = self { return true }
-        return false
-    }
 }
 
 /// Unfinished acquisition has nil health; retain accepted diagnostics.
@@ -30,13 +24,7 @@ extension Dictionary where Key == String, Value == SnapshotReadHealth {
             guard case .readFailed(let reason) = self[filename] else { return nil }
             return "\(NAMobileSnapshotGroup.snapshotPageName(filename)) couldn't be read: \(reason)"
         }
-        if !failures.isEmpty { return failures.joined(separator: ". ") }
-        let names = damaged.map(NAMobileSnapshotGroup.snapshotPageName)
-        let list = names.count == 1
-            ? names[0]
-            : names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
-        return "\(list) couldn't be read - that copy arrived damaged, not late. "
-            + "Refresh rereads the received copy. On the Mac, ask your agent to run doctor.repair for icloud_bridge_state to rebuild and publish phone views."
+        return failures.isEmpty ? nil : failures.joined(separator: ". ")
     }
 }
 

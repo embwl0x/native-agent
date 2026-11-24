@@ -1,0 +1,53 @@
+import Foundation
+import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
+import ProviderRouting
+// Blueprint: | `InlineInteractionPlatformPort.swift` | `InlineInteractionPlatformPort`; Platform effects, resolver authority. |
+
+/// App/platform facts and effects; card authority stays with the resolver.
+@MainActor
+public protocol InlineInteractionPlatformPort: Sendable {
+    func startLocalTurn(_ prompt: String, sessionID: String, hideUserBubble: Bool, turn: Turn) async throws -> Bool
+    /// The integration-status owner's permission AND checked read evidence. A projection reads it; explicit verification asks the owner to check.
+    func mailReadiness(check: Bool) async -> (status: String, word: String, next: String?)
+    func chromeConnectionStatus() async throws -> (enabled: Bool, connected: Bool)
+    var chromeSteps: String { get }
+    /// Nil when the paired-phone store can't be read.
+    func phoneStanding() async -> NAPhoneStanding?
+    func connectorRecords() async throws -> [InlineInteractionConnectorStatus]
+    func providers() async throws -> [InlineInteractionProviderStatus]
+    func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String?
+    func permissionChanges() -> AsyncStream<Void>
+    func openInteractionCards() async throws -> [(id: String, sessionID: String)]
+    /// The one walk: ask in place for every grant macOS can still ask, then open the pane of the first one still off that is not in `passed`.
+    /// Returns what it now waits on and any grant whose request failed.
+    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?, passed: Set<String>) async throws -> [String]
+    func writeInteractionSnapshots() async
+    func refreshInteractionInbox() async
+    func interactionControls() -> (any InlineInteractionControlPort)?
+}
+
+/// Capture admitted controls across suspension without coupling transactions to app assembly.
+@MainActor
+public protocol InlineInteractionControlPort {
+    var screenCaptureEnabled: Bool { get }
+    var chromeControlEnabled: Bool { get }
+    var fullMacGrantIsActive: Bool { get }
+    func enableChromeControl() async throws
+    func setUpChromeControl(turn: Turn) async -> String?
+    func saveConnectorCredentials(connector: String, values: [String: String], dataRoot: URL) async -> (error: String?, note: String?)
+    func openProviderEntry(provider: String, dataRoot: URL) async throws
+    func grantMacControlCategories(_ categories: [String], dataRoot: URL, logTag: String) async throws
+    func grantCapabilityFlag(policyKey: String, dataRoot: URL, logTag: String) async throws
+    func saveProviderGroupSelection(group: ProviderSurfaceGroup, providerID: String?, model: String) async throws
+}
+
+public typealias InlineInteractionConnectorStatus = (
+    id: String, authState: String?, healthStatus: String?
+)
+
+public typealias InlineInteractionProviderStatus = (
+    providerID: String, displayName: String, authState: String, eligible: Bool,
+    defaultModel: String?, firstModel: String?
+)

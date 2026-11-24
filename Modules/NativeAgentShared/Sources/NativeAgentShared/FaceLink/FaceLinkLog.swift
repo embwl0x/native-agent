@@ -1,46 +1,115 @@
 import Foundation
 import Darwin
+import Synchronization
+import os
 // Blueprint: | `FaceLinkLog.swift` | Body and face link record of the recent past, turned over at 32 MiB; identities and redacted failures, no payloads |
 
-public actor FaceLinkLog {
+public final class FaceLinkLog: Sendable {
     public enum Role: String, Sendable { case body, face }
-    /// The write that takes the record past this size turns it over.
-    private static let bound: off_t = 32 << 20
-    private let handle: FileHandle
-    private let url: URL
-    private let previous: URL
-    private let role: Role
-    private var closed = false
+    private let writer: FaceLogWriter
+    private let drain: Task<Void, Error>
 
-    private init(handle: FileHandle, url: URL, role: Role) {
+    private init(writer: FaceLogWriter, onError: @escaping @Sendable (any Error) async -> Void) {
+        self.writer = writer
+        drain = Task { try await writer.drain(onError: onError) }
+    }
+
+    deinit { writer.finish() }
+
+    public func record(_ line: String) { writer.enqueue(line) }
+
+    public func close(finalLine: String? = nil) async throws {
+        writer.finish(finalLine)
+        try await drain.value
+    }
+
+    @concurrent public static func open(dataRoot: URL, role: Role,
+                                       onError: @escaping @Sendable (any Error) async -> Void = { _ in }) async throws -> FaceLinkLog {
+        let directory = dataRoot.appendingPathComponent("diagnostics", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("FaceLink.log")
+        let descriptor = unsafe Darwin.open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, mode_t(0o600))
+        guard descriptor >= 0 else {
+            throw WireFailure(code: "face_log_open_failed", message: "The \(role.rawValue) could not open its link record.",
+                cause: "POSIX \(errno): \(url.path)", effects: .none)
+        }
+        let writer = FaceLogWriter(handle: FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), url: url, role: role)
+        return FaceLinkLog(writer: writer, onError: onError)
+    }
+}
+
+private actor FaceLogWriter {
+    private nonisolated let buffer = AsyncStream<(Date, String)>.makeStream(bufferingPolicy: .bufferingOldest(256))
+    private nonisolated let backlog = Mutex<(dropped: Int, final: (Date, String)?)>((0, nil))
+    private static let bound: off_t = 32 << 20
+    let handle: FileHandle
+    let url: URL
+    let previous: URL
+    let role: FaceLinkLog.Role
+
+    init(handle: FileHandle, url: URL, role: FaceLinkLog.Role) {
         self.handle = handle
         self.url = url
         previous = url.deletingLastPathComponent().appendingPathComponent("FaceLink.previous.log")
         self.role = role
     }
 
-    @concurrent public static func open(dataRoot: URL, role: Role) async throws -> FaceLinkLog {
-        let directory = dataRoot.appendingPathComponent("diagnostics", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let url = directory.appendingPathComponent("FaceLink.log")
-        let descriptor = Darwin.open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, mode_t(0o600))
-        guard descriptor >= 0 else {
-            throw WireFailure(code: "face_log_open_failed", message: "The \(role.rawValue) could not open its link record.",
-                cause: "POSIX \(errno): \(url.path)", effects: .none)
+    nonisolated func enqueue(_ line: String) {
+        backlog.withLock { state in
+            if state.dropped > 0 {
+                state.dropped += 1
+            } else if case .dropped = buffer.continuation.yield((Date(), line)) {
+                state.dropped = 1
+            }
         }
-        return FaceLinkLog(handle: FileHandle(fileDescriptor: descriptor, closeOnDealloc: true), url: url, role: role)
     }
 
-    /// Writes hold the shared lock and a turn-over holds the exclusive one, so no write lands between its copy and its truncate.
-    public func record(_ line: String) throws {
-        // A closed record takes no more lines: a closed handle raises instead of throwing, which would end the process.
-        guard !closed else { return }
+    nonisolated func finish(_ finalLine: String? = nil) {
+        backlog.withLock { state in
+            if let finalLine { state.final = (Date(), finalLine) }
+            buffer.continuation.finish()
+        }
+    }
+
+    func drain(onError: @Sendable (any Error) async -> Void) async throws {
+        for await (date, line) in buffer.stream {
+            backlog.withLock { state in
+                if state.dropped > 0,
+                   case .enqueued = buffer.continuation.yield((Date(), "dropped lines=\(state.dropped)")) {
+                    state.dropped = 0
+                }
+            }
+            do { try record(line, at: date) }
+            catch {
+                ModuleLog.app("[face] link record failed: %@", error.localizedDescription, level: .error)
+                await onError(error)
+            }
+        }
+        let state = backlog.withLock { $0 }
+        var appendError: (any Error)?
+        func append(_ line: String, at date: Date) {
+            do { try record(line, at: date) }
+            catch {
+                ModuleLog.app("[face] link record failed: %@", error.localizedDescription, level: .error)
+                appendError = error
+            }
+        }
+        if state.dropped > 0 { append("dropped lines=\(state.dropped)", at: Date()) }
+        if let (date, line) = state.final { append(line, at: date) }
+        do { try handle.close() }
+        catch where appendError != nil {
+            ModuleLog.app("[face] link record close failed: %@", error.localizedDescription, level: .error)
+        }
+        if let appendError { throw appendError }
+    }
+
+    private func record(_ line: String, at date: Date) throws {
         let line = TurnSecretRedactor.redactText(line).replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "\\r")
         let descriptor = handle.fileDescriptor
         try lock(LOCK_SH, "could not lock its link record to write")
         defer { flock(descriptor, LOCK_UN) }
-        try write(line)
+        try write(line, at: date)
         guard try size() > Self.bound else { return }
         // Converting to exclusive releases the shared lock first, so two writers past the bound queue instead of deadlocking.
         try lock(LOCK_EX, "wrote its line but could not lock its link record to turn it over")
@@ -73,19 +142,19 @@ public actor FaceLinkLog {
         return nil
     }
 
-    private func write(_ line: String) throws {
-        let stamp = Date().ISO8601Format(.init(includingFractionalSeconds: true))
+    private func write(_ line: String, at date: Date = Date()) throws {
+        let stamp = date.ISO8601Format(.init(includingFractionalSeconds: true))
         let prefix = "\(stamp) pid=\(ProcessInfo.processInfo.processIdentifier) role=\(role.rawValue) "
         try handle.write(contentsOf: Data((prefix + line + "\n").utf8))
     }
 
-    private func lock(_ operation: Int32, _ what: String) throws {
+    private func lock(_ operation: Int32, _ what: String) throws(WireFailure) {
         guard flock(handle.fileDescriptor, operation) == 0 else { throw wireFailure("face_log_lock_failed", what, errno) }
     }
 
-    private func size() throws -> off_t {
+    private func size() throws(WireFailure) -> off_t {
         var status = stat()
-        guard fstat(handle.fileDescriptor, &status) == 0 else {
+        guard unsafe fstat(handle.fileDescriptor, &status) == 0 else {
             throw wireFailure("face_log_size_failed", "wrote its line but could not read its link record's size", errno)
         }
         return status.st_size
@@ -94,13 +163,9 @@ public actor FaceLinkLog {
     private func wireFailure(_ code: String, _ what: String, _ number: Int32) -> WireFailure {
         WireFailure(code: code, message: "The \(role.rawValue) \(what).", cause: "POSIX \(number): \(url.path)", effects: .none)
     }
+}
 
-    public func close() throws {
-        guard !closed else { return }
-        closed = true
-        try handle.close()
-    }
-
+extension FaceLinkLog {
     nonisolated public static func name<T>(_ value: T) -> String {
         Mirror(reflecting: value).children.first?.label ?? String(describing: value)
     }

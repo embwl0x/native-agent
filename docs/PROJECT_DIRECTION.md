@@ -31,14 +31,14 @@ intent; [the documentation guide](README.md) routes readers to current details.
 **One brain, many doors.** `NativeAgent.app` owns the Swift runtime in-process.
 The Mac and remote conversation surfaces use the shared core:
 
-- [EngineRuntime/NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/EngineRuntime/NativeAgentEngine.swift)
+- [BodyRuntime/EngineRuntime/NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/EngineRuntime/NativeAgentEngine.swift)
   composes chat clients, tool chains and runtime services from one data root
   and the app's platform ports.
-- [ChatTurnRuntime](../Modules/NativeAgentCore/Sources/ChatTurnRuntime/)
+- [ChatTurnRuntime](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatTurnRuntime/)
   owns turn orchestration.
-- [AppActionRegistry.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppActionRegistry.swift)
+- [AppActionRegistry.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppActionRegistry.swift)
   defines the actions exposed through `app`.
-- [TrustCenter](../Modules/NativeAgentCore/Sources/TrustCenter/) owns policy;
+- [TrustCenter](../Modules/NativeAgentCore/Sources/DeskCore/TrustCenter/) owns policy;
   SecurityCenter checks each dispatch. The app supplies platform effects.
 
 See [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md) for source ownership.

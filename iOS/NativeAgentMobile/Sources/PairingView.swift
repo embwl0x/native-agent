@@ -38,9 +38,11 @@ enum IOSPairingPresentation {
 struct PairingView: View {
     var onSkip: (() -> Void)? = nil
     var onPaired: (() -> Void)? = nil
+    var showsSystemToasts = false
 
-    @EnvironmentObject private var pairingStore: PairingStore
-    @ObservedObject private var bridge = iCloudBridge.shared
+    @Environment(PairingStore.self) private var pairingStore
+    @Environment(\.colorScheme) private var colorScheme
+    private let bridge = iCloudBridge.shared
     @State private var errorMessage: String?
     @State private var iCloudSecretError: String?
     @State private var isCheckingForMac = false
@@ -104,23 +106,22 @@ struct PairingView: View {
                         Text(isConnecting ? "Waiting for Mac confirmation…" : isCheckingForMac ? "Checking for Mac…"
                             : canConnect ? "Connect" : "Check for Mac")
                             .font(.body.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity, minHeight: 52)
-                            .contentShape(Capsule())
-                            .aliveGlass(in: Capsule(), interactive: true,
-                                        tint: HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true))
+                            .frame(maxWidth: .infinity, minHeight: 40)
                     }
-                    .buttonStyle(.plain)
+                    .alivePrimaryButton()
                     .disabled(isConnecting || isCheckingForMac)
 
                     if isConnecting {
-                        Button("Cancel waiting") {
+                        Button {
                             connectionTask?.cancel()
                             connectionTask = nil
                             connectionID = nil
                             isConnecting = false
+                        } label: {
+                            Text("Cancel waiting")
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                                .contentShape(Rectangle())
                         }
-                        .frame(maxWidth: .infinity)
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -136,6 +137,11 @@ struct PairingView: View {
                 .padding(.bottom, 32)
                 .frame(maxWidth: 560)
                 .frame(maxWidth: .infinity)
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if showsSystemToasts, !SystemToastCenter.shared.queue.isEmpty {
+                    iOSSystemToastBar(center: SystemToastCenter.shared)
+                }
             }
             .alivePageChrome(title: "Pair with Mac", root: false)
             .toolbar {
@@ -204,7 +210,7 @@ struct PairingView: View {
                 } else {
                     Image(systemName: keyIsCurrent ? "checkmark.circle.fill" : bridge.available ? "clock" : "icloud.slash")
                         .foregroundStyle(keyIsCurrent
-                                         ? AnyShapeStyle(HazeColor(stored: hazeColorRaw).swatch)
+                                         ? AnyShapeStyle(HazeColor(stored: hazeColorRaw).control(dark: colorScheme == .dark, labelled: false))
                                          : AnyShapeStyle(AlivePalette.secondary))
                         .frame(width: 28)
                 }

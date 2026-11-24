@@ -95,10 +95,14 @@ the kind of that same task. `desk.open_pursuit` with no `project` files the
 pursuit under `workshop` (`DeskItem.workshopProject`), where the agent's own
 proposed pursuits go.
 
-**The table** is the Desk's one standing board, always present in the Desk tab:
-first on the board view and last in an opened item, after its pieces, even before
-its first change. **Pop out the table**, among the Desk's tools, opens it in its own window with its frame remembered.
-The table fills the pop-out's available space and resizes with the window, without a page scroller; the Desk tab keeps a 560-point board.
+**The table** is the Desk's one standing board. On the board view it follows
+Waiting and Needs you, with any **On the table** pieces listed just above it.
+In an opened item it comes last, after its pieces. The table is present even
+before its first change. **Pop out the table**, among the Desk's tools, opens it
+in its own window with its frame remembered.
+The table fills the pop-out's available space and resizes with the window, without a page scroller;
+in the Desk tab, a pristine and idle table (no elements, no note being made, and not loading)
+sits at 220 points and expands to 560 points as soon as anything is created.
 The Desk tab and the window are two readers of one board; closing or hiding the
 main window leaves the table window reading and acting; opening a piece from it
 uses the Work pane, which is in the main window. The agent opens it with
@@ -336,7 +340,7 @@ An agent reads an item two ways, and neither changes the window's selection.
 `desk.read {handle}` gives the item's record, its steps and what is on the
 table. `app {page:"desk", item}` gives the Desk page as it draws with that item
 open: its rows and actions, its board, its pieces and tables as text
-(`deskItemFace`, `EngineRuntime/DeskFace.swift`). Name the item by its stable
+(`deskItemFace`, `BodyRuntime/EngineRuntime/DeskFace.swift`). Name the item by its stable
 handle, visible number (`2.1`, `desk.2.1` or `#2.1`), or exact title.
 The resolver checks the full title before interpreting a number followed by
 words. That numbered label resolves only if its words match the numbered
@@ -439,21 +443,29 @@ Desk actions keep `handle`, queue actions keep `id`, and page reads keep `item`;
 the shared door binds a single alternative address word to the schema's sole
 declared one when that declared field is absent, before validation and Trust.
 
-`desk.wait {handle, on:"User", note?}` puts an item in **waiting on User** in
-one call. `on:"owner"` names the owner without needing their name. `on` given
-as a sentence (what has to happen, in the agent's words) is kept as written:
-**waiting on <those words>**; only one unbroken unknown token that is not a
-plain name is refused, as an identifier that names nothing.
-`desk.set_status {handle, status:"waiting on User"}` reaches the same writer.
+`desk.wait {handle, on:"owner", note?}` puts an item in **waiting on owner** in
+one call. Exact supported owner names (`"owner"`, `"user"`, `"human"`, or the
+owner's configured exact full or first name from `memory/profile.json`) resolve
+to canonical `"owner"` at the write boundary. `on` given as a descriptive
+sentence (what has to happen, in the agent's words — including sentences that
+begin with the owner's name) is kept as written: **waiting on <those words>**
+and does not enter owner attention; only one unbroken unknown token that is not
+a plain name is refused, as an identifier that names nothing. Passive presence
+and message triggers (`when_user_away`, `when_user_here`, `when_user_messages`)
+are typed `MyQueue.When` steps via `queue.add` and do not enter owner attention.
+`desk.set_status {handle, status:"waiting on owner"}` (and exact supported owner
+names) reaches the same writer.
 Waiting status updates apply `remaining_work`, `progress`, `assignee`, and
 `lane_of` through the ordinary status path before confirming. Supply the
 coordinating item's stable handle or visible alias for `lane_of`. Invalid
 fields are refused by name. An explicit `waiting_on` must agree with the status
 text.
 The existing persisted blocked status and `waitingOn` field hold this state;
-readers present it as `waiting on <person>`. No stored items are rewritten.
-An owner wait contributes to the page's waiting-on-owner count through
-`OwnerAttentionPolicy`. Changing the status clears that person wait.
+readers present it as `waiting on <person>`. No stored items are rewritten;
+`OwnerAttentionPolicy.waitsOnOwner` matches canonical `"owner"` and existing
+persisted exact owner-name waits (whole trimmed string, never a first-word
+prefix) to contribute to the page's waiting-on-owner count. Changing the status
+clears that person wait.
 
 Desk stores eight states: `watch`, `flag`, `now`, `next`, `todo`, `done`, `blocked`
 and `canceled`. Only `done` and `canceled` are terminal.
@@ -466,9 +478,11 @@ the status token for a top-level item still at `watch`, so a new plan reads
 `on` also accepts an observed Desk handle/number or experience id (a card,
 including the `approval:<id>` its Home row shows, message, reply delivery or repair), or a nonempty list of those dependency
 ids. These waits retain automatic release when the named conditions settle.
-A parent can wait for several descendants. Each named descendant and the work
-beneath it can proceed according to its own dependencies. Unrelated descendant
-work waits for the parent to clear. The parent's waits outside its subtree still hold all
+A parent can wait for several descendants. Each named descendant, the work
+beneath it and the work it waits on can proceed according to their own
+dependencies. Unrelated descendant work waits for the parent to clear. An item
+needs its waits and its unfinished children, so a wait that closes a cycle in
+what items need (a descendant waiting on its own ancestor) is refused. The parent's waits outside its subtree still hold all
 descendants, as do its explicit blocks, person waits and deferrals.
 A send to a contact that still awaits its answer returns that condition as
 `thread.wait_on`: waiting on it holds the item until the contact answers (or the
@@ -506,11 +520,11 @@ failed summary and refs.
 An ordinary step's `promiseCaptures` identify captured promises and its
 `replyRoute` preserves origin; neither identifies an outstanding reply delivery.
 
-The Desk page lists each item under one heading. It reads top to bottom: the
-standing table; Desk tools; Waiting and Needs you; On the table; Now, Watching, Queued and
-other work now; Parked; then the readings, Done today, recent work, lines,
-Finished history, the timers and the night; and last My own upkeep. `desk.wait` puts an
-item under Waiting. Input mistakes, including unknown handles, return `invalid_input`,
+The Desk page lists each item under one heading. It reads top to bottom: Desk tools;
+Waiting and Needs you; On the table; the standing table when it has elements; Now, Watching, Queued;
+an empty standing table folded below live work; Parked; then the readings, Done today, recent work, lines, Finished history,
+the timers and the night; and last My own upkeep. `desk.wait` puts an item under Waiting.
+Input mistakes, including unknown handles, return `invalid_input`,
 the argument path, and `effects:"none"` rather than a blocked dispatch error.
 
 For a four-call work record (using the handle returned by the first call):
@@ -525,14 +539,14 @@ Recorded notes and summaries are records, not proof of external work.
 
 On Mac, **New task** or the Shortcuts intent creates a Desk item and starts
 a [line of theirs](agent-communication.md#jobs) with `desk:` set to that item
-(`NativeAgentEngine.submitDeskTask`, `EngineRuntime/EngineDesk.swift`). The
+(`NativeAgentEngine.submitDeskTask`, `BodyRuntime/EngineRuntime/EngineDesk.swift`). The
 line's ending is a `returned` happening with no conversation route, so it opens a
 thought in the agent's mind stream, where the agent settles the item
 (`AgentJobStem.swift`). On iPhone, ask for a Desk task in Chat.
 A job that carries a Desk item is that item's movement: Desk activity, the live
 strip, the widget's **Working on…** line and the phone's `desk.json` evidence
 come from their jobs (`DeskMovementPresentation.evidence`,
-`EngineRuntime/DeskActivityPresentation.swift`), and the Work overview's
+`BodyRuntime/EngineRuntime/DeskActivityPresentation.swift`), and the Work overview's
 execution rows are their jobs.
 The widget's working line carries only the redacted job name, capped at 240
 characters, rather than its brief. Every Work overview row redacts title,

@@ -114,7 +114,6 @@ public struct TranscriptPressInput<Row: TranscriptRow>: Sendable {
     }
 }
 
-@available(macOS 15, iOS 18, *)
 public actor TranscriptPress<Row: TranscriptRow> {
     private struct Printed: Equatable {
         var paragraphs: [TranscriptRenderedParagraph] = []
@@ -123,6 +122,16 @@ public actor TranscriptPress<Row: TranscriptRow> {
         var failure: String?
         var unconfirmedReply = false
         var complete = false
+        var tail: (layout: UUID, range: Range<Int>)?
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            guard lhs.live == rhs.live, lhs.wordKeys == rhs.wordKeys, lhs.failure == rhs.failure,
+                  lhs.unconfirmedReply == rhs.unconfirmedReply, lhs.complete == rhs.complete else { return false }
+            if let a = lhs.tail, let b = rhs.tail, a.layout == b.layout {
+                return lhs.paragraphs[a.range].elementsEqual(rhs.paragraphs[b.range])
+            }
+            return lhs.paragraphs == rhs.paragraphs
+        }
 
         var issue: String? {
             var causes: [String] = []
@@ -277,10 +286,37 @@ public actor TranscriptPress<Row: TranscriptRow> {
         enqueue(id)
     }
 
-    public func live(reader id: UUID, rowID: String, text: String) async {
-        guard let reader = readers[id], reader.input.liveID == rowID, reader.input.liveText != text else { return }
+    public func live(reader id: UUID, rowID: String, text: String) -> Bool {
+        guard let reader = readers[id], !reader.openingStopped, reader.input.liveID == rowID,
+              let group = reader.input.groups.last, !group.isToolGroup, let row = group.messages.first,
+              row.role == "assistant", row.id == rowID, let shown = reader.input.liveText, !shown.isEmpty, text.hasPrefix(shown) else { return false }
+        if reader.input.liveText == text { return true }
         reader.input.liveText = text
-        enqueue(id)
+        schedule(id)
+        return true
+    }
+
+    private func printTail(_ reader: Reader, row: Row, text: String, tail: (layout: UUID, range: Range<Int>)) async -> Bool {
+        let input = reader.input
+        let readable = ChatRichContentParser.visibleText(TranscriptGrouping.readableText(text))
+        let pieces = reader.session.markdown.pieces(rowID: row.id, text: readable)
+        var blocks = TranscriptBuilder.rowBlocks(row, face: input.face(row), slots: [],
+            live: .init(rowID: row.id, waiting: input.door.live?.waiting ?? ""), prepared: pieces)
+        guard !blocks.isEmpty else { return false }
+        let previous = tail.range.lowerBound > 0 ? reader.current.paragraphs[tail.range.lowerBound - 1].block : nil
+        blocks[0].lead = TranscriptBuilder.lead(for: blocks[0], after: previous)
+        do {
+            let paragraphs = try blocks.map { block in try render(block, input: input, session: reader.session).paragraph }
+            reader.current.paragraphs.replaceSubrange(tail.range, with: paragraphs)
+            let start = tail.range.lowerBound
+            reader.current.tail = (tail.layout, start..<(start + paragraphs.count))
+            reader.current.live = TranscriptLiveMarkdown.line(paragraphs, rowID: row.id, text: readable, streaming: true)
+        } catch {
+            reader.current.tail = nil
+            reader.current.failure = "Transcript rendering failed: " + error.localizedDescription
+        }
+        await publish(reader)
+        return true
     }
 
     public func resize(reader id: UUID, width: Double, scale: Double, viewport: Set<String>) async {
@@ -351,6 +387,11 @@ public actor TranscriptPress<Row: TranscriptRow> {
 
     /// An arrival during printing is held as the reader's next input, independently of feed acknowledgements.
     private func enqueue(_ id: UUID) {
+        readers[id]?.current.tail = nil
+        schedule(id)
+    }
+
+    private func schedule(_ id: UUID) {
         pending.insert(id)
         guard !printing else { return }
         printing = true
@@ -370,6 +411,8 @@ public actor TranscriptPress<Row: TranscriptRow> {
         guard !reader.opening || reader.current.paragraphs.isEmpty else { return }
         let input = reader.input
         let session = reader.session
+        if !reader.opening, let tail = reader.current.tail, let row = input.groups.last?.messages.first, row.id == input.liveID,
+           let text = input.liveText, await printTail(reader, row: row, text: text, tail: tail) { return }
         if !reader.opening, let saved = session.ready(input), saved.complete, saved.words == reader.words {
             reader.current = saved.value
             await publish(reader)
@@ -436,16 +479,9 @@ public actor TranscriptPress<Row: TranscriptRow> {
         do {
             for position in priority + rest {
                 let block = document.blocks[position]
-                var format = Format(input)
-                if case .user = block.kind {} else { format.width = 0 }
-                if let cached = session.paragraphs[block.id]?[format], cached.block == block {
-                    values[block.id] = cached
-                } else {
-                    let paragraph = try input.render(block, input.width.rounded(.down), input.scale)
-                    session.paragraphs[block.id, default: [:]][format] = paragraph
-                    values[block.id] = paragraph
-                    renders += 1
-                }
+                let result = try render(block, input: input, session: session)
+                values[block.id] = result.paragraph
+                if result.rendered { renders += 1 }
                 if opening || restyling, position == priority.last {
                     var visible = opening ? Printed() : reader.current
                     for target in priority {
@@ -474,6 +510,11 @@ public actor TranscriptPress<Row: TranscriptRow> {
             let live = liveLine(reader, paragraphs: paragraphs, input: input, text: liveText)
             let keys = input.groups.flatMap { session.cache.entries[$0.id]?.wordKeys ?? [] }.sorted()
             reader.current = Printed(paragraphs: paragraphs, live: live, wordKeys: keys, complete: complete && !input.hasEarlierMessages)
+            if !pending.contains(id), let liveID = input.liveID,
+               let start = paragraphs.firstIndex(where: { $0.block.messageID == liveID }) {
+                let end = paragraphs[start...].firstIndex(where: { $0.block.messageID != liveID }) ?? paragraphs.endIndex
+                reader.current.tail = (UUID(), start..<end)
+            }
             session.keep(reader.current, input: input, words: words, complete: complete)
             if renders > 0 {
                 log("render session=%@ reader=%@ count=%ld paragraphs=%ld", input.session, id.uuidString, renders, paragraphs.count)
@@ -482,6 +523,16 @@ public actor TranscriptPress<Row: TranscriptRow> {
             reader.current.failure = "Transcript rendering failed: " + error.localizedDescription
         }
         await publish(reader)
+    }
+
+    private func render(_ block: TranscriptBlock, input: TranscriptPressInput<Row>, session: Session) throws
+        -> (paragraph: TranscriptRenderedParagraph, rendered: Bool) {
+        var format = Format(input)
+        if case .user = block.kind {} else { format.width = 0 }
+        if let cached = session.paragraphs[block.id]?[format], cached.block == block { return (cached, false) }
+        let paragraph = try input.render(block, input.width.rounded(.down), input.scale)
+        session.paragraphs[block.id, default: [:]][format] = paragraph
+        return (paragraph, true)
     }
 
     /// Where the opening page begins: the end of the chat, enough to fill the window about twice, nil if the blocks fall short. Folded
@@ -504,6 +555,7 @@ public actor TranscriptPress<Row: TranscriptRow> {
         var page = printed
         let start = openingStart(printed.paragraphs.map(\.block), lines: count) ?? 0
         page.paragraphs = Array(printed.paragraphs[start...])
+        page.tail = nil
         page.complete = printed.complete && page.paragraphs.count == printed.paragraphs.count
         if let live = printed.live {
             page.live = TranscriptLiveMarkdown.line(page.paragraphs.filter { $0.block.messageID == live.rowID },
@@ -530,8 +582,14 @@ public actor TranscriptPress<Row: TranscriptRow> {
         guard reader.current != reader.applied || (reader.appliedID == nil && reader.packet == nil) else { return }
         if let packet = reader.packet, packet.base == reader.appliedID, reader.sent[packet.id] == reader.current { return }
         let token = UUID()
+        let edits: [TranscriptParagraphEdit]
+        if let a = reader.applied.tail, let b = reader.current.tail, a.layout == b.layout {
+            edits = Self.edits(from: Array(reader.applied.paragraphs[a.range]), to: Array(reader.current.paragraphs[b.range])).map { edit in
+                TranscriptParagraphEdit(start: a.range.lowerBound + edit.start, removed: edit.removed, inserted: edit.inserted)
+            }
+        } else { edits = Self.edits(from: reader.applied.paragraphs, to: reader.current.paragraphs) }
         let packet = TranscriptPressEdits(base: reader.appliedID, id: token,
-            edits: Self.edits(from: reader.applied.paragraphs, to: reader.current.paragraphs), live: reader.current.live,
+            edits: edits, live: reader.current.live,
             wordKeys: reader.current.wordKeys, issue: reader.current.issue, complete: reader.current.complete)
         reader.sent[token] = reader.current
         reader.packet = packet

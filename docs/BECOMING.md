@@ -207,5 +207,5 @@ settled). Proof on them:
 
 | Lane | What | Owners |
 |---|---|---|
-| becoming-settle | P1 + P2 | CognitiveSubstrate/CognitiveSubstrate+Cares.swift (birth, stance), +CaresNight.swift (merge, dream stance confirmation), +CaresMind.swift (pressure: life cares through open gaps; `carePressure`, `caresPressing`), DreamREMCycle prompts/payload (clusters, stance pressure), docs/SUBCONSCIOUS.md |
+| becoming-settle | P1 + P2 | MindCore/CognitiveSubstrate/CognitiveSubstrate+Cares.swift (birth, stance), +CaresNight.swift (merge, dream stance confirmation), +CaresMind.swift (pressure: life cares through open gaps; `carePressure`, `caresPressing`), DreamREMCycle prompts/payload (clusters, stance pressure), docs/SUBCONSCIOUS.md |
 | becoming-self | P3 + P4 | +CaresNight.swift / dream payload (traits, story, people), CognitiveSelfKnowledge.swift (mind/self.json), +InnerState.swift / inner-state tool / PersonalityFace.swift and native-personality.js (self-reading), +CaresMind.swift / +Capsule.swift (care pull and per-turn self values), +Cares.swift personKey through AgentPeerStore / AgentContactIdentity aliases, SourceWakes (identity invalidation), docs/SUBCONSCIOUS.md |

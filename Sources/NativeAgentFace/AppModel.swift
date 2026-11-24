@@ -29,10 +29,11 @@ final class AppModel {
     /// Each page's ask bar, beside its draft: the words in flight, the last accepted send, or why the last one was refused.
     var askBar: [String: AskBarRecord] = [:]
     let pageSessions = FacePageSessions()
-    typealias PanelRefreshStatus = NativeAgentShared.PanelRefreshStatus
+    let inspectorStore = TurnInspectorStore()
 
     init(client: PipeFaceClient) {
         self.client = client
+        pageSessions.defaultNotice = { [weak self] words in self?.systemToasts.push(success: words) }
         client.onReceiptFailure = { [weak self] failure in
             self?.setFailureStatus(failure, action: "confirm this window's update")
             self?.faceLinkIssue = failure.localizedDescription

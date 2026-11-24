@@ -1,0 +1,204 @@
+import Foundation
+import CryptoKit
+import NativeAgentCore
+import PersistenceCore
+import Darwin
+import SenseCore
+
+// Blueprint: | `AgentPeerReplayClaimStore.swift` | `AgentPeerReplayClaimStore` |
+
+/// Claim principal, protocol, ID and digest before transcript admission; only identical bytes may reuse a receipt. Receipt-less claims resume only within their
+/// owning process life.
+public struct AgentPeerReplayClaimStore: Sendable {
+    public enum Outcome: Sendable, Equatable {
+        case claimed
+        case replay(String)
+        case conflict
+        case inFlight
+        case stopped
+    }
+
+    static let maximumClaimAgeSeconds: TimeInterval = 7 * 24 * 3600
+    /// Expired tombstones still protect replay identity even when absent from live claims.
+    static let maximumClaims = 4096
+    /// Capacity refuses new admission; it never evicts replay protection.
+    static let maximumTombstones = 1_000_000
+
+    let directory: URL
+
+    public init(dataRoot: URL) {
+        directory = dataRoot.appendingPathComponent("agents/peer-claims")
+    }
+
+    /// An authenticated principal cannot consume another peer's ids.
+    public static func key(principal: String, protocolName: String, messageID: String) -> String {
+        "\(principal)\u{1F}\(protocolName)\u{1F}\(messageID)"
+    }
+
+    private func fileURL(for key: String) -> URL {
+        let hashed = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("\(hashed).json")
+    }
+
+    public func claim(key: String, digest: String, admissionID: UUID? = nil) throws -> Outcome {
+        try prepareDirectory()
+        let url = fileURL(for: key)
+        return try withStoreLock {
+            if let existing = try read(url) {
+                guard existing.digest == digest else { return .conflict }
+                guard let receipt = existing.receipt else {
+                    return try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent())
+                        ? .inFlight : .stopped
+                }
+                return .replay(receipt)
+            }
+            try makeRoomForClaim()
+            try write(Record(lifeID: try DataRootLife.current(in: directory.deletingLastPathComponent().deletingLastPathComponent()),
+                             key: key, digest: digest, receipt: nil, at: Date(), admissionID: admissionID), to: url)
+            return .claimed
+        }
+    }
+
+    /// A failed receipt write leaves the claim closed to another execution.
+    @discardableResult public func recordReceipt(key: String, digest: String, receipt: [String: Any]) -> String? {
+        let url = fileURL(for: key)
+        let root = directory.deletingLastPathComponent().deletingLastPathComponent()
+        let operation = "agent.claim.receipt:" + url.lastPathComponent
+        do {
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]), as: UTF8.self)
+            try withStoreLock {
+                guard let existing = try read(url), existing.digest == digest else { throw CocoaError(.fileReadCorruptFile) }
+                try write(Record(lifeID: existing.lifeID, key: key, digest: digest, receipt: json, at: existing.at), to: url)
+            }
+            RepairOwed.settle(root, operation: operation, evidence: .init(source: url.path, id: digest))
+            return nil
+        } catch {
+            let detail = """
+                The task was retained, but its replay locator could not be saved: \(error.localizedDescription). Repair the claim receipt from its \
+                retained task; do not repeat the work.
+                """
+            RepairOwed.owe(root, id: UUID().uuidString.lowercased(), kind: .message,
+                operation: operation, owner: url.path, words: detail,
+                lever: "Repair the exact claim receipt from retained task evidence.")
+            return detail
+        }
+    }
+
+    /// Only failed admission before a task is retained may release its current-life claim.
+    @discardableResult public func release(key: String, admissionID: UUID? = nil) -> String? {
+        let url = fileURL(for: key)
+        do {
+            try withStoreLock {
+                guard let existing = try read(url, expiringReceipt: false), existing.receipt == nil,
+                      existing.admissionID == admissionID,
+                      Date().timeIntervalSince(existing.at) < Self.maximumClaimAgeSeconds,
+                      try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent())
+                else { return }
+                try FileManager.default.removeItem(at: url)
+                try SwiftNativePersistenceCore.syncDirectory(directory)
+            }
+            return nil
+        } catch {
+            nativeLog("Agent replay claim release failed: %@", error.localizedDescription)
+            return "The task could not be accepted and its replay claim release could not be confirmed."
+        }
+    }
+
+    // MARK: - Storage
+
+    private struct Record: Codable {
+        let lifeID: String?
+        let key: String
+        let digest: String
+        let receipt: String?
+        let at: Date
+        var admissionID: UUID? = nil
+    }
+
+    private func prepareDirectory() throws {
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+    }
+
+    /// Claim, receipt, release and pruning share the directory lock.
+    private func withStoreLock<T>(_ body: () throws -> T) throws -> T {
+        try CredentialFileLock.withLock(directory.appendingPathComponent("claims"), body)
+    }
+
+    private func read(_ url: URL, expiringReceipt: Bool = true) throws -> Record? {
+        let fd = unsafe Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            if errno == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var metadata = stat()
+        let maximumBytes = 1_048_576
+        guard unsafe fstat(fd, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_size <= maximumBytes else { throw POSIXError(.EIO) }
+        var data = Data()
+        while let chunk = try handle.read(upToCount: min(65_536, maximumBytes + 1 - data.count)),
+              !chunk.isEmpty {
+            data.append(chunk)
+            guard data.count <= maximumBytes else { throw POSIXError(.EFBIG) }
+        }
+        let record = try JSONDecoder().decode(Record.self, from: data)
+        guard fileURL(for: record.key) == url else { throw POSIXError(.EIO) }
+        // Expire only receipt bytes. The identity/digest tombstone still refuses replay.
+        if expiringReceipt, Date().timeIntervalSince(record.at) >= Self.maximumClaimAgeSeconds {
+            guard record.receipt != nil else { return record }
+            let tombstone = Record(lifeID: record.lifeID, key: record.key, digest: record.digest, receipt: nil, at: record.at)
+            try? write(tombstone, to: url)
+            return tombstone
+        }
+        return record
+    }
+
+    private func write(_ record: Record, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(record), to: url)
+    }
+
+    private func makeRoomForClaim() throws {
+        let names = try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey]
+        )
+        // Count records, never the live lock or a writer's temporary file.
+        let claims = names.filter { Self.isClaimRecordName($0.lastPathComponent) }
+        guard claims.count >= Self.maximumClaims else { return }
+        var live = 0
+        var tombstones = 0
+        for url in claims {
+            guard let record = try read(url) else { continue }
+            if record.receipt == nil,
+               Date().timeIntervalSince(record.at) >= Self.maximumClaimAgeSeconds {
+                tombstones += 1
+            } else {
+                live += 1
+            }
+        }
+        guard live < Self.maximumClaims else { throw POSIXError(.ENOSPC) }
+        guard tombstones < Self.maximumTombstones else { throw POSIXError(.ENOSPC) }
+    }
+
+    /// Storage scans accept exactly the lowercase-hex filenames produced by fileURL(for:).
+    static func isClaimRecordName(_ name: String) -> Bool {
+        guard name.hasSuffix(".json") else { return false }
+        let stem = name.dropLast(5)
+        return stem.count == 64 && stem.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }
+}
+
+extension AgentPeerReplayClaimStore.Outcome {
+    public var cachedReceipt: [String: Any]? {
+        guard case .replay(let json) = self,
+              let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object
+    }
+}

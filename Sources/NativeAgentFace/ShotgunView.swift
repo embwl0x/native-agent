@@ -12,13 +12,10 @@ struct ShotgunView: View {
     let onSize: (CGSize) -> Void
 
     @Environment(AppModel.self) private var appModel
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var watching = false
-    @State private var notice: String?
     @State private var sending = false
+    @State private var notice: String?
     private var inlineCards: CardControls { CardControls.shared }
-    @FocusState private var composerFocused: Bool
 
     var body: some View {
         let controller = ShotgunController.shared
@@ -39,7 +36,6 @@ struct ShotgunView: View {
         }
         .preferredColorScheme(AppearanceController.shared.colorScheme)
         .onChange(of: done && controller.isShown, initial: true) { _, now in controller.setDone(now) }
-        .onChange(of: appModel.chatDraft(for: sessionId)) { _, _ in notice = nil }
         .onChange(of: sessionId) { _, _ in notice = nil }
         .inlineCardSetup(inlineCards, sessionID: sessionId, active: controller.isShown)
         .modifier(FaceObservation(demand: sessionId.isEmpty ? nil : .key(.conversation(session: sessionId))))
@@ -70,7 +66,7 @@ struct ShotgunView: View {
                     .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
                     .frame(maxHeight: .infinity)
             }
-            composer(sessionId: sessionId, running: running)
+            ShotgunComposer(sessionId: sessionId, running: running, sending: $sending, notice: $notice)
         }
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -79,12 +75,9 @@ struct ShotgunView: View {
             Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture())
         }
         .background {
-            // Reduce Transparency asks for more opacity, never less.
-            if reduceTransparency { ConcentricRectangle().fill(NativeAgentShell.room) }
-            ThinkingGlow(kind: .shimmer, cornerRadius: Self.radius, wholeTurn: true)
+            ThinkingGlow(kind: .shimmer, cornerRadius: Self.radius, sessionId: sessionId, wholeTurn: true)
         }
-        // Fill the window corners so the glass has no inset seam.
-        .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: ConcentricRectangle())
+        .houseSurface(in: ConcentricRectangle(), opaqueFill: NativeAgentShell.room)
         .ignoresSafeArea()
     }
 
@@ -97,10 +90,7 @@ struct ShotgunView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .fixedSize()
-        .background {
-            if reduceTransparency { Capsule().fill(NativeAgentShell.room) }
-        }
-        .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: Capsule())
+        .houseSurface(in: Capsule(), opaqueFill: NativeAgentShell.room)
         .gesture(WindowDragGesture())
         .onGeometryChange(for: CGSize.self) { $0.size } action: { onSize($0) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -112,6 +102,8 @@ struct ShotgunView: View {
             Image(systemName: "xmark")
                 .font(ShellType.caption)
                 .foregroundStyle(NativeAgentShell.secondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help("Close Shotgun")
@@ -188,17 +180,29 @@ struct ShotgunView: View {
     }
 
     private func word(_ title: String, emphasis: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(title, action: action)
-            .buttonStyle(.plain)
-            .font(emphasis ? ShellType.labelSemibold : ShellType.label)
-            .foregroundStyle(emphasis ? NativeAgentShell.text : NativeAgentShell.secondary)
+        Button(action: action) {
+            Text(title)
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .font(emphasis ? ShellType.labelSemibold : ShellType.label)
+        .foregroundStyle(emphasis ? NativeAgentShell.text : NativeAgentShell.secondary)
     }
+}
 
-    // MARK: - Composer
+private struct ShotgunComposer: View {
+    let sessionId: String
+    let running: Bool
+    @Binding var sending: Bool
+    @Binding var notice: String?
 
-    private func composer(sessionId: String, running: Bool) -> some View {
+    @Environment(AppModel.self) private var appModel
+    @FocusState private var composerFocused: Bool
+
+    var body: some View {
         let draft = appModel.composerDraft(for: sessionId)
-        return VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 4) {
             MacChatOtherSessionsBanner(sessionID: sessionId)
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Message \(appModel.agentDisplayName)…", text: draft.textBinding, axis: .vertical)
@@ -206,39 +210,14 @@ struct ShotgunView: View {
                     .font(ShellType.body)
                     .lineLimit(1...4)
                     .focused($composerFocused)
-                    .onSubmit { send(sessionId: sessionId) }
-                let canSend = ChatTranscriptPresentation.hasVisibleText(draft.text) && !sending
-                let lit = running || canSend
-                Button {
-                    if running { appModel.stopChatStream(sessionId: sessionId) }
-                    else { send(sessionId: sessionId) }
-                } label: {
-                    ZStack {
-                        if running {
-                            Image(systemName: "stop.fill")
-                                .font(ShellType.label)
-                                .transition(glyphSwap)
-                        } else {
-                            Image(systemName: "arrow.right")
-                                .font(ShellType.body)
-                                .transition(glyphSwap)
-                        }
-                    }
-                    .frame(width: 36, height: 36)
-                    .background(lit ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill, in: Circle())
-                    .foregroundStyle(lit ? NativeAgentShell.text : NativeAgentShell.tertiary)
-                    .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .disabled(!lit)
-                .help(running ? "Stop what I am doing" : "Send")
-                .accessibilityLabel(running ? "Stop" : "Send")
-                .contextMenu {
-                    if running {
-                        Button("Send into reply in progress") { send(sessionId: sessionId) }
-                            .disabled(!canSend)
-                    }
-                }
+                    .onSubmit { send() }
+                ShotgunSendButton(
+                    draft: draft,
+                    running: running,
+                    sending: sending,
+                    onStop: { appModel.stopChatStream(sessionId: sessionId) },
+                    onSend: { send() }
+                )
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
@@ -251,23 +230,17 @@ struct ShotgunView: View {
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
+                    .onChange(of: draft.text) { _, _ in self.notice = nil }
             }
         }
     }
 
-    private var glyphSwap: AnyTransition {
-        reduceMotion ? .identity
-            : .scale(scale: 0.5).combined(with: .opacity).animation(NativeAgentMotion.arrivalCurve)
-    }
-
-    /// Every composer sends through the same conversation admission.
-    private func send(sessionId: String) {
+    private func send() {
         let draft = appModel.composerDraft(for: sessionId)
         let submitted = draft.text
         let editedAt = draft.editedAt
         let revision = draft.manualEditRevision
         let text = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
-        // The conversation's draft is its text and its attachments together, whichever composer sends it.
         let attachments = appModel.chatPendingAttachments[sessionId] ?? []
         guard !text.isEmpty || !attachments.isEmpty, !sending else { return }
         sending = true
@@ -278,7 +251,6 @@ struct ShotgunView: View {
                 let unchanged = draft.text == submitted && draft.editedAt == editedAt
                 appModel.clearChatDraftAfterSend(submitted, sessionId: sessionId, editedAt: editedAt)
                 if appModel.chatPendingAttachments[sessionId] == attachments { appModel.chatPendingAttachments[sessionId] = [] }
-                // Return keyboard ownership after acceptance so the drive can continue.
                 if ShotgunController.shared.selectedSessionID == sessionId, unchanged {
                     ShotgunController.shared.giveKeyboardBack()
                 }
@@ -286,5 +258,55 @@ struct ShotgunView: View {
                 if ShotgunController.shared.selectedSessionID == sessionId { notice = message }
             }
         }
+    }
+}
+
+private struct ShotgunSendButton: View {
+    let draft: ChatComposerDraft
+    let running: Bool
+    let sending: Bool
+    let onStop: () -> Void
+    let onSend: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let canSend = draft.hasVisibleText && !sending
+        let lit = running || canSend
+        Button {
+            if running { onStop() }
+            else { onSend() }
+        } label: {
+            ZStack {
+                if running {
+                    Image(systemName: "stop.fill")
+                        .font(ShellType.label)
+                        .transition(glyphSwap)
+                } else {
+                    Image(systemName: "arrow.right")
+                        .font(ShellType.body)
+                        .transition(glyphSwap)
+                }
+            }
+            .frame(width: 36, height: 36)
+            .background(lit ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill, in: Circle())
+            .foregroundStyle(lit ? NativeAgentShell.text : NativeAgentShell.tertiary)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!lit)
+        .help(running ? "Stop what I am doing" : "Send")
+        .accessibilityLabel(running ? "Stop" : "Send")
+        .contextMenu {
+            if running {
+                Button("Send into reply in progress", action: onSend)
+                    .disabled(!canSend)
+            }
+        }
+    }
+
+    private var glyphSwap: AnyTransition {
+        reduceMotion ? .identity
+            : .scale(scale: 0.5).combined(with: .opacity).animation(NativeAgentMotion.arrivalCurve)
     }
 }

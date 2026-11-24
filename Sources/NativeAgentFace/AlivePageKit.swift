@@ -1,7 +1,7 @@
 import NativeAgentShared
 
 // Blueprint: | `AlivePageKit.swift` | Shared page style, native header and accessibility-aware card surface |
-// Cards share glass over one haze; tertiary ink lacks sufficient contrast.
+// Cards share a fill over one haze; tertiary ink lacks sufficient contrast.
 
 import AppKit
 import SwiftUI
@@ -31,6 +31,7 @@ struct AlivePageHeader: View {
     let title: String
     var line: String? = nil
     var lineID: String? = nil
+    var wrapsLine = false
 
     var body: some View {
         let shown = line.flatMap { $0.isEmpty ? nil : $0 }
@@ -42,7 +43,8 @@ struct AlivePageHeader: View {
             Text(shown ?? " ")
                 .font(ShellType.pageSentence)
                 .foregroundStyle(NativeAgentShell.secondary)
-                .lineLimit(1)
+                .lineLimit(wrapsLine ? nil : 1)
+                .fixedSize(horizontal: false, vertical: wrapsLine)
                 .truncationMode(.tail)
                 .opacity(shown == nil ? 0 : 1)
                 .accessibilityHidden(shown == nil)
@@ -54,30 +56,8 @@ struct AlivePageHeader: View {
 // MARK: - Cards
 
 extension View {
-    func aliveCard(radius: CGFloat = AliveMetrics.cardRadius) -> some View {
-        modifier(AliveCardSurface(radius: radius))
-    }
-}
-
-private struct AliveCardSurface: ViewModifier {
-    let radius: CGFloat
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
-        content
-            .background {
-                // Reduce Transparency requires an opaque card.
-                if reduceTransparency || quietOffscreenRead { shape.fill(TodayPalette.cardFill) }
-            }
-            .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate, in: shape)
-            .overlay {
-                if reduceTransparency || quietOffscreenRead {
-                    shape.strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
-                }
-            }
-            .environment(\.houseGlassEnclosed, true)
+    func macContentCard() -> some View {
+        houseInset(in: RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous))
     }
 }
 
@@ -86,7 +66,7 @@ extension FaceStyle {
         insets: EdgeInsets(top: 6, leading: AliveMetrics.rowInsetH, bottom: 6, trailing: AliveMetrics.rowInsetH),
         minimumHeight: 30, title: .body.weight(.medium), detail: .callout, value: .callout.monospacedDigit(),
         elevation: AlivePalette.highlight, actionSurface: TodayPalette.cardFill, answer: NativeAgentBrand.accentDeep,
-        card: { AnyView($0.clipShape(RoundedRectangle(cornerRadius: AliveMetrics.cardRadius, style: .continuous)).aliveCard()) })
+        card: { AnyView($0.macContentCard()) })
 }
 
 extension View {

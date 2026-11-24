@@ -1,35 +1,33 @@
-import EngineRuntime
+import BodyRuntime
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-import ApprovalTransactions
-import NotificationInbox
-import ChatTurnRuntime
-import BackgroundWork
-import Experiences
-import ChatToolRuntime
-import ApprovalInbox
+import DeskCore
+import SenseCore
+import MacNerves
 // Blueprint: | `BodyInboxCardActions.swift` | Copied Inbox effects return through its pipe; draft receipts confirm the applied renderer edit |
 
 struct BodyInboxCardActionEffects: InboxCardActionEffects {
+    let engine: NativeAgentEngine
     let call: @MainActor @Sendable (FaceCall) async throws -> FaceReply
     let renderer: UUID
 
     func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool, turn: Turn) async throws {
-        try await answerRequest(id: id, action: action, dataRoot: dataRoot, quiet: quiet, turn: turn)
+        try await answerRequest(id: id, action: action, quiet: quiet, turn: turn)
     }
 
     /// Provider requests open the same protected entry as Providers; other requests open their conversation.
     @MainActor
-    private func answerRequest(id: String, action: String, dataRoot: URL, quiet: Bool, turn: Turn) async throws {
-        try await InlineInteractionDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet, turn: turn) { pointer in
-            guard let card = try await InlineInteractionResolver.interaction(id: pointer.interactionID,
-                sessionID: pointer.sessionID, dataRoot: dataRoot) else {
+    private func answerRequest(id: String, action: String, quiet: Bool, turn: Turn) async throws {
+        let interactions = engine.interactions
+        try await InlineInteractionDelivery.act(interactions: interactions, id: id, action: action, quiet: quiet, turn: turn) { pointer in
+            guard let card = try await interactions.interaction(id: pointer.interactionID,
+                sessionID: pointer.sessionID) else {
                 throw PartCallError(code: "request_unavailable", message: "This request is unavailable. Refresh Activity.")
             }
             if card.kind == .apiKey, card.secret == nil {
-                _ = try await NativeAgentEngine.forRoot(dataRoot).signInProviderFace(
+                _ = try await engine.signInProviderFace(
                     InlineInteractionRegistry.canonicalProviderID(card.target), renderer: renderer)
                 return
             }

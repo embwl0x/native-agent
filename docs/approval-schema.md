@@ -101,6 +101,8 @@ is the agent's judgment on the authenticated message, not proof of the person's 
 An approval coordinator resolves its data root once at construction. Resolution,
 execution fences, domain replay, browser recovery and result/report annotations
 use that root; an explicit store argument takes precedence for that operation.
+The inbox offers a Telegram door when that root's coordinator has a running
+Telegram receiver and a saved owner DM.
 
 Inline cards use the same resolver for verification and continuation. Phone
 answers translate into the canonical Inbox row's door calls with verified
@@ -253,7 +255,9 @@ policy path and owner repair instruction; it never appears as a saved Safe
 or Workspace posture. Cards cannot change the person's Trust posture.
 
 Approval payload `peer` and authored-run `steer` records require both `sources`
-and `elevated` arrays of nonempty principal strings. Valid empty arrays record
+and `elevated` arrays of nonempty principal strings. A peer trusted on arrival
+remains in `sources`. Only an explicit task approval puts a peer in `elevated`.
+Valid empty arrays record
 an unsteered run; absent or malformed records refuse restoration. Both peer-card answers save `decision: "approved"`.
 **Just this** runs one call; **For this task** saves `scope: "task"`, elevating only untrusted, unelevated carried peers when restored. Absent scope means Just this;
 Approve alone means Just this; after-card peers keep their floor. Inline
@@ -268,13 +272,13 @@ Current owners under `Modules/NativeAgentCore/Sources/`:
 
 | Responsibility | Source |
 | --- | --- |
-| Envelope identity validation | `DeviceSync/MacSyncInboxAction.swift` |
-| Transport, ledger and response handling | `DeviceSync/MacSyncEngine+Inbox.swift` |
-| HMAC and freshness | `DeviceSync/MacSyncEngine+Security.swift` |
-| Action dispatch | `DeviceSync/MacSyncActionRouter.swift` |
-| Phone authorization | `DeviceSync/PairedPhoneStore.swift` |
-| Durable approvals and execution | `ApprovalInbox/`, `ApprovalTransactions/` |
-| Remote Mac control | `EngineRuntime/EngineDeviceSync+Snapshots.swift` (`remoteMacControl`) |
+| Envelope identity validation | `BodyRuntime/DeviceSync/MacSyncInboxAction.swift` |
+| Transport, ledger and response handling | `BodyRuntime/DeviceSync/MacSyncEngine+Inbox.swift` |
+| HMAC and freshness | `BodyRuntime/DeviceSync/MacSyncEngine+Security.swift` |
+| Action dispatch | `BodyRuntime/DeviceSync/MacSyncActionRouter.swift` |
+| Phone authorization | `BodyRuntime/DeviceSync/PairedPhoneStore.swift` |
+| Durable approvals and execution | `MacNerves/ApprovalInbox/`, `BodyRuntime/ApprovalTransactions/` |
+| Remote Mac control | `BodyRuntime/EngineRuntime/EngineDeviceSync+Snapshots.swift` (`remoteMacControl`) |
 
 ## Approval receipts
 

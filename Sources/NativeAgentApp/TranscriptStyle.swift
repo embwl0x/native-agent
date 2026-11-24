@@ -22,7 +22,6 @@ extension TranscriptLook {
             quietLineSpacing: { role in role == "user" ? userLineSpacing : replyLineSpacing },
             listMarkerColumn: listMarkerColumn, listMarkerGap: listMarkerGap,
             listIndent: { depth in CGFloat(max(0, depth)) * (listMarkerColumn + listMarkerGap) },
-            // `ChatActivityRow.indent`: a fold's text sits past its chevron.
             quoteIndent: NativeAgentSpacing.md, foldIndent: 18, codePad: NativeAgentSpacing.sm,
             messageGap: NativeAgentShellLayout.transcriptGap,
             body: font(ShellType.bodySize), quiet: font(ShellType.labelSize), heading: font(ShellType.bodySize, .semibold),

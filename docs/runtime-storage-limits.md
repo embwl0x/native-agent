@@ -1,7 +1,7 @@
 # Runtime diagnostic storage limits
 
-`PersistenceCore/FeedPolicy.swift` defines shared feed limits;
-`PersistenceCore/JSONLRetention.swift` selects rows once under the append lock,
+`PersistenceCore/PersistenceCore/FeedPolicy.swift` defines shared feed limits;
+`PersistenceCore/PersistenceCore/JSONLRetention.swift` selects rows once under the append lock,
 applying the line policy before the byte policy and publishing the result once.
 
 | Feed | Row rotation | Byte rotation |
@@ -30,13 +30,13 @@ preview and 120-byte cue clipping. The retained field is identical on trace
 readback; an oversized detail write fails explicitly. Its measurement contract
 is in [Subconscious](SUBCONSCIOUS.md#what-reaches-the-model).
 
-`Browser/BrowserCaptureCache.swift` owns temporary page text, links and
+`MacNerves/Browser/BrowserCaptureCache.swift` owns temporary page text, links and
 screenshots. Captures share 128 MiB, 256 groups and seven days, enforced on
 writes. One artifact is limited to 16 MiB and one group to 32 MiB. Matching
 artifacts are evicted together. Unknown files and symlinks are excluded;
 downloads, generated images and user documents are outside this cache.
 
-`AppToolRuntime/AppToolExecutor+PagePresentation.swift` bounds offscreen page pictures in
+`BodyRuntime/AppToolRuntime/AppToolExecutor+PagePresentation.swift` bounds offscreen page pictures in
 `diagnostics/page_shots/` to seven days, 64 PNGs and 64 MiB on each write.
 The current delivery is protected; inline continuations own their pixel bytes.
 These are replaceable diagnostics, separate from authored images.
@@ -71,7 +71,7 @@ Source paths above are under `Modules/NativeAgentCore/Sources/`.
 
 ## Notification inbox
 
-The inbox is a reading of the experiences addressed to them (`Experiences/ForPerson.swift`), held in memory: open
+The inbox is a reading of the experiences addressed to them (`SenseCore/Experiences/ForPerson.swift`), held in memory: open
 matters plus those settled in the last 30 days, newest 500. Nothing is evicted from the record; the reading only
 forgets settled matters past its bound. There is no inbox file, archive shelf or delivery ledger. An unreadable
 record fails the read with its cause; the Mac keeps its previous published cards with the read error, and a phone

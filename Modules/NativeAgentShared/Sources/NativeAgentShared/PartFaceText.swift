@@ -35,7 +35,6 @@ public enum FaceLink: Equatable, Sendable {
 extension PartFace {
     public static func isLink(_ link: String) -> Bool { FaceLink(link) != nil }
 
-    /// Bounded page prose. The agent's door retains complete row references and action calls.
     public func text(lineLimit: Int? = nil, door: Bool = false, page: String? = nil) -> String {
         // The agent reads a row whole: a reason cut mid-sentence is a reason it cannot act on. A longer line still ends on a word.
         let limit = max(1, lineLimit ?? (door ? 1_200 : 240))
@@ -120,7 +119,7 @@ extension PartFace {
                 if let control = row.control {
                     if let on = control.on { parts.append(on ? "on" : "off") }
                     if let text = control.text { parts.append(text.isEmpty ? "(empty)" : "\u{201C}" + text + "\u{201D}") }
-                    if let number = control.number { parts.append(String(number.value)) }
+                    if let number = control.number { parts.append(Self.amount(number.value)) }
                     if let date = control.date { parts.append(date) }
                     if let selected = control.selected, let option = control.options?.first(where: { $0.id == selected }) {
                         parts.append(option.label)
@@ -179,8 +178,7 @@ extension PartFace {
         return String(word) + "…"
     }
 
-    /// A meter's number as words: a whole number without a decimal point.
-    private static func amount(_ number: Double) -> String {
+    static func amount(_ number: Double) -> String {
         number.rounded() == number && abs(number) < 1e15 ? String(Int64(number)) : String(number)
     }
 }
@@ -194,7 +192,9 @@ extension PartFaceSnapshot {
             .text(lineLimit: lineLimit, door: door).nonEmpty {
             blocks.append(header)
         }
-        if let levers, let words = PartFace(sections: levers).text(lineLimit: lineLimit, door: door).nonEmpty { blocks.append(words) }
+        let leversLast = door && page == "desk" && drawn != nil
+        let leverWords = levers.flatMap { PartFace(sections: $0).text(lineLimit: lineLimit, door: door, page: leversLast ? page : nil).nonEmpty }
+        if !leversLast, let leverWords { blocks.append(leverWords) }
         if let drawn {
             if let words = PartFace(sections: drawn.sections, detail: drawn.detail).text(lineLimit: lineLimit, door: door, page: page).nonEmpty {
                 blocks.append(words)
@@ -203,6 +203,7 @@ extension PartFaceSnapshot {
             blocks.append(error?.message ?? title + " is " + status.rawValue + ".")
             if let keyLevers, let words = PartFace(sections: keyLevers).text(lineLimit: lineLimit, door: door).nonEmpty { blocks.append(words) }
         }
+        if leversLast, let leverWords { blocks.append(leverWords) }
         return blocks.joined(separator: "\n\n")
     }
 }
@@ -211,11 +212,17 @@ private extension String {
     var nonEmpty: String? { isEmpty ? nil : self }
 }
 
-extension Notification.Name {
-    /// Engine-side discovery invalidation; a completed inventory settles pending action-index reads.
-    public static let pageCatalogPublished = Notification.Name("pageCatalogPublished")
+public struct PageFacePublished: NotificationCenter.AsyncMessage {
+    public typealias Subject = NSString
+    public let page: String
+    public init(page: String) { self.page = page }
 
-    /// A page's face changed (object: the page id). Doors that carry faces elsewhere (the phone) publish on it instead of waiting for an
-    /// unrelated pass.
-    public static let pageFacePublished = Notification.Name("pageFacePublished")
+    public static func makeMessage(_ notification: Notification) -> Self? {
+        (notification.object as? String).map(Self.init(page:))
+    }
+}
+
+public struct PageCatalogPublished: NotificationCenter.AsyncMessage {
+    public typealias Subject = NSObject
+    public init() {}
 }

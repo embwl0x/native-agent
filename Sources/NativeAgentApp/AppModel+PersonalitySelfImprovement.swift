@@ -2,11 +2,8 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 import NativeAgentCore
-import EngineRuntime
-import PersonaEngine
-import DoctorChecks
-import DreamREMCycle
-import Cognition
+import BodyRuntime
+import DeskCore
 // Blueprint: | `AppModel+PersonalitySelfImprovement.swift` | `engine.persona`: Profile/document writes through the persona owner; support and proposals |
 
 /// Derive the live identity outcome from the persisted profile returned by the writer, never the submitted name.

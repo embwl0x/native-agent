@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import SwiftUI
 import NativeAgentShared
+import UniformTypeIdentifiers
 // Blueprint: | `ChatClipboardAndAttachmentSupport.swift` | Picker, paste and drop transfers; body attachment validation, capture and voice acts |
 
 extension NativeAgentShared.ChatAttachmentTypeResolver {

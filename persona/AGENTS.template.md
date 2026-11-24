@@ -95,7 +95,7 @@ roots. They survive reinstalls.
 
 Conventions (true regardless of where roots resolve):
 - <data_root>/memory/memory.sqlite — canonical MemoryV2 records; use memory actions to read and change them
-- <data_root>/traces/events.jsonl — your dispatch history
+- <data_root>/experiences/experiences.sqlite — your record, including dispatch history
 - <persona_root>/SOUL.md, USER.md, VOICE.md, AGENTS.md, GROWTH.md
 - <workspace_root>/ — drafts, scratch, generated work product
 

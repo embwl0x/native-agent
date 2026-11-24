@@ -46,10 +46,14 @@ struct WorkPaneMakeView: View {
                     session: appModel.pageSessions.page("work-make/" + version.reference + "/" + version.version))
                     .id(version.kind == BoardDocument.type ? version.reference : version.reference + "/" + version.version)
             } else if shelf?.state == .ready {
-                Text("Nothing made yet.").foregroundStyle(.secondary).padding()
+                Text("Nothing made yet.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+                    .padding(.top, NativeAgentSpacing.xs)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onChange(of: versions) {
             if shelf?.state == .ready, let selectedVersion, !versions.contains(where: { $0.version == selectedVersion }) {
                 self.selectedVersion = nil
@@ -68,6 +72,7 @@ private struct MakeVersionPage: View {
     @Binding var selectedVersion: String?
     let session: FacePageSession
     @Environment(AppModel.self) private var appModel
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     private var key: FaceKey { .makePreview(reference: version.reference, version: version.version) }
     private var preview: MakePreviewFace? { appModel.face.slot(key).value(as: MakePreviewFace.self) }
     private var titleSnapshot: PartFaceSnapshot? {
@@ -87,8 +92,6 @@ private struct MakeVersionPage: View {
                 if let error = titleSnapshot?.error { Text(error.message).foregroundStyle(.red).textSelection(.enabled) }
                 FaceView(face: WorkPaneFace.make(version, versions: versions, title: title, preview: preview),
                          door: door, session: session, leaf: { block in
-                    // A board is drawn under the page, outside the per-version preview leaf.
-                    if version.kind == BoardDocument.type { return AnyView(EmptyView()) }
                     if let preview, block.key == "make-preview", block.ref == preview.reference, block.revision == preview.revision {
                         return AnyView(GrantedMakePreview(preview: preview).id(preview.revision).frame(minHeight: preview.isPicture ? nil : 240))
                     }
@@ -100,6 +103,7 @@ private struct MakeVersionPage: View {
         // A picture fitted to the width gets shorter as the page narrows. A scroll bar that takes width would then appear, narrow the
         // page, stop being needed, hide, and be needed again without end; this page scrolls without one.
         .scrollIndicators(.never)
+        .scrollEdgeEffectStyle(quietOffscreenRead ? nil : .soft, for: .top)
         .modifier(FaceObservation(demand: .key(key)))
     }
 

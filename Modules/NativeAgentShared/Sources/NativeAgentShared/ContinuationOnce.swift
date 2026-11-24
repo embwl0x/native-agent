@@ -1,53 +1,56 @@
 import Foundation
+import Synchronization
 // Blueprint: | `ContinuationOnce.swift` | `ContinuationOnce`: first outcome wins; typed Stop/deadline waits preserve writes |
 
 /// First outcome wins, including resolution before continuation installation.
-public final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
+public final class ContinuationOnce<T: Sendable>: Sendable {
     private enum State {
         case waiting(CheckedContinuation<T, Never>?)
         case resolving(T, CheckedContinuation<T, Never>?)
         case resolved(T)
     }
-    private var state: State = .waiting(nil)
+    private let state = Mutex<State>(.waiting(nil))
     public init() {}
 
     /// Whether no outcome has been admitted yet; callers can retire unissued work.
     public var isPending: Bool {
-        lock.withLock { if case .waiting = state { return true }; return false }
+        state.withLock {
+            if case .waiting = $0 { return true }
+            return false
+        }
     }
 
     @discardableResult
     public func install(_ continuation: CheckedContinuation<T, Never>) -> Bool {
-        lock.lock()
-        switch state {
-        case .resolved(let value):
-            lock.unlock()
-            continuation.resume(returning: value)
-            return false
-        case .resolving(let value, _):
-            state = .resolving(value, continuation)
-            lock.unlock()
-            return false
-        case .waiting:
-            state = .waiting(continuation)
-            lock.unlock()
-            return true
+        let prior = state.withLock { state in
+            let prior = state
+            switch prior {
+            case .waiting: state = .waiting(continuation)
+            case .resolving(let value, _): state = .resolving(value, continuation)
+            case .resolved: break
+            }
+            return prior
         }
+        if case .resolved(let value) = prior { continuation.resume(returning: value) }
+        if case .waiting = prior { return true }
+        return false
     }
 
     /// Returns whether this resolution won. Cancellation runs outside the lock, while installation still waits for it to finish before resuming.
     @discardableResult
     public func resume(_ value: T, beforeResume: @Sendable () -> Void = {}) -> Bool {
-        lock.lock()
-        guard case .waiting(let continuation) = state else { lock.unlock(); return false }
-        state = .resolving(value, continuation)
-        lock.unlock()
+        let won = state.withLock { state in
+            guard case .waiting(let continuation) = state else { return false }
+            state = .resolving(value, continuation)
+            return true
+        }
+        guard won else { return false }
         beforeResume()
-        lock.lock()
-        guard case .resolving(_, let waiter) = state else { preconditionFailure("Invalid continuation state") }
-        state = .resolved(value)
-        lock.unlock()
+        let waiter = state.withLock { state in
+            guard case .resolving(_, let waiter) = state else { preconditionFailure("Invalid continuation state") }
+            state = .resolved(value)
+            return waiter
+        }
         waiter?.resume(returning: value)
         return true
     }

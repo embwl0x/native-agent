@@ -138,7 +138,7 @@ struct ChatComposerSettings: View {
                 Button {
                     guard let presentation = routing.presentation else { return }
                     if presentation.contract != nil {
-                        NotificationCenter.default.post(name: .openCommandRouteRequest, object: "bots")
+                        NotificationCenter.default.post(OpenCommandRouteRequest(route: "bots"))
                         return
                     }
                     enqueue(.fast(false))
@@ -338,6 +338,7 @@ struct ChatComposerSettings: View {
             .frame(minWidth: minWidth)
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
+            .contentShape(Rectangle())
     }
 
     private func word(
@@ -345,7 +346,7 @@ struct ChatComposerSettings: View {
         accessibility: String, identifier: String
     ) -> some View {
         Button {
-            NotificationCenter.default.post(name: .openCommandRouteRequest, object: "bots")
+            NotificationCenter.default.post(OpenCommandRouteRequest(route: "bots"))
         } label: {
             menuWordLabel(text, minWidth: card == .effort ? widestEffortWordWidth : nil)
         }
@@ -407,7 +408,7 @@ struct ChatComposerSettings: View {
                 })
             }
             menu.addItem(composerMenuItem("more_models", "More models…") {
-                NotificationCenter.default.post(name: .openCommandRouteRequest, object: "providers")
+                NotificationCenter.default.post(OpenCommandRouteRequest(route: "providers"))
             })
             addScope("Saved default for Chat", to: menu)
         case .effort:

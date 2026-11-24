@@ -16,7 +16,6 @@ struct MemoryUpkeepPanel: View {
             } else { Text("Waiting on memory diagnostics…").foregroundStyle(.secondary) }
         }
         .faceObservation(.key(.page("memory-upkeep")))
-        .onAppear { session.notice = { [weak appModel] words in appModel?.systemToasts.push(success: words) } }
     }
 }
 

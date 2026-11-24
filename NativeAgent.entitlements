@@ -81,13 +81,6 @@
   <key>com.apple.developer.ubiquity-kvstore-identifier</key>
   <string>TEAMID.io.github.embwl0x.nativeagent</string>
 
-  <key>com.apple.developer.background-tasks</key>
-  <array>
-    <string>io.github.embwl0x.nativeagent.dream_cycle</string>
-    <string>io.github.embwl0x.nativeagent.rem_cycle</string>
-    <string>io.github.embwl0x.nativeagent.memory_consolidation</string>
-    <string>io.github.embwl0x.nativeagent.self_improvement_sweep</string>
-  </array>
   <key>com.apple.security.device.camera</key>
   <true/>
   <key>com.apple.security.personal-information.location</key>

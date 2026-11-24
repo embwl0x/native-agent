@@ -1,12 +1,9 @@
-import AppToolRuntime
-import Agents
-import Cognition
+import BodyRuntime
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-import ToolExecution
-import Senses
+import SenseCore
 // Blueprint: | `AppQuietToolHost+Mind.swift` | `AppQuietToolHost`: Separate real and inert dream calls; part management |
 
 extension AppQuietToolHost {
@@ -27,6 +24,10 @@ extension AppQuietToolHost {
                 return (true, "The night started. It runs the available dream and REM work, then reads your parts; "
                     + "a thought follows if that reading asks for one. mind.night shows the reading once it settles.",
                     ["admission": .string("started"), "beganAt": .double(began.timeIntervalSince1970)])
+            case .stopped(let began):
+                return (false, "The night was admitted and stopped before its dream and part reading ran.",
+                    ["status": .string("stopped"), "admission": .string("started"), "beganAt": .double(began.timeIntervalSince1970),
+                     "effects": .string("occurred")])
             case .alreadyRunning(let began):
                 return (false, "The night that began at \(NativeTimestampFormat.plainZulu(began)) is already running; "
                     + "mind.night shows its reading once it settles.",

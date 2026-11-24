@@ -1,9 +1,11 @@
 import UserNotifications
+import Synchronization
 import NativeAgentShared
 
 // Expiry races donation; one lock makes delivery exactly once and protects both retained fields.
+// The notification extension retains the framework content handler and UNNotificationContent until delivery.
 final class NotificationService: UNNotificationServiceExtension, @unchecked Sendable {
-    private let lock = NSLock()
+    private let lock = Mutex(())
     private var handler: ((UNNotificationContent) -> Void)?
     private var original: UNNotificationContent?
 
@@ -11,10 +13,10 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
                             withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
         // Immutable UNNotificationContent lacks ObjC Sendable annotation; keep the framework request out of the task.
         nonisolated(unsafe) let content = request.content
-        lock.lock()
-        handler = contentHandler
-        original = content
-        lock.unlock()
+        lock.withLock { _ in
+            handler = contentHandler
+            original = content
+        }
         Task {
             let alert: UNNotificationContent
             do {
@@ -40,9 +42,7 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
     }
 
     private func retainForExpiry(_ content: UNNotificationContent) {
-        lock.lock()
-        if handler != nil { original = content }
-        lock.unlock()
+        lock.withLock { _ in if handler != nil { original = content } }
     }
 
     private static func unavailable(_ retained: UNNotificationContent, reason: String) -> UNNotificationContent {
@@ -56,12 +56,14 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
 
     @discardableResult
     private func finish(_ content: UNNotificationContent?) -> Bool {
-        lock.lock()
-        let callback = handler
-        let result = content ?? original.map { Self.unavailable($0, reason: "Notification preparation did not finish before iOS's deadline") }
-        handler = nil
-        original = nil
-        lock.unlock()
+        var callback: ((UNNotificationContent) -> Void)?
+        var result: UNNotificationContent?
+        lock.withLock { _ in
+            callback = handler
+            result = content ?? original.map { Self.unavailable($0, reason: "Notification preparation did not finish before iOS's deadline") }
+            handler = nil
+            original = nil
+        }
         if let callback, let result {
             callback(result)
             return true

@@ -21,6 +21,7 @@ struct NativeSearchField: NSViewRepresentable {
     }
 
     func updateNSView(_ field: NSSearchField, context: Context) {
+        context.coordinator.text = $text
         if field.stringValue != text { field.stringValue = text }
         field.placeholderString = prompt
     }

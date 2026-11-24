@@ -350,6 +350,16 @@ change; it may accompany a positional continuation for a scrolled element.
 Every read reports `reading.fromViewport: true`. `rendering` reports visibility,
 readiness and `rendered_dom_only`.
 
+Click and double-click replies report `targetChanged` for the exact node after
+the full gesture. Detachment or a change to `checked`, `aria-checked`,
+`aria-expanded`, `aria-pressed` or `aria-selected` gives the receipt
+`verification: "verified"`. Otherwise the receipt says `page_acknowledged`.
+If Chrome has reported a changed top-level document ID or URL by the time the
+page replies, the result carries `documentId`, `url` and `transitionQualifiers`
+into readback. The note names any `client_redirect` or `server_redirect`.
+Without a redirect, the note reports the target change or observed navigation.
+When neither was observed, the click stays unverified even if other page text changed.
+
 Mutation receipts contain `id`, `action`, `tabId`, `userSequence`, snapshot/node
 identity, `outcome`, `verification`, `retry`, `startedAt`, `completedAt`.
 Outcome is succeeded, refused, partially_completed, or outcome_unknown. Lost
@@ -432,6 +442,16 @@ only when tab, URL, user sequence and requested host still agree. With no curren
 snapshot it waits for a real capture, ending on cancellation, ownership loss or
 channel shutdown; absence does not publish page content or a capture verdict.
 `page.change_unavailable` supplies tab/sequence and `{code, message}` error.
+
+`active_tab.changed` supplies `{windowId, tabId, title, url, audible}` for the
+active tab in the focused Chrome window. The first event follows the attach reply.
+Window focus, tab activation or replacement, and changes to the active tab's
+title, URL or audibility drive subsequent observations. Title and URL are
+nullable and both are null if their metadata would exceed the frame budget.
+The payload is `null` when the extension can see no focused tab, including
+`WINDOW_ID_NONE`, focus outside Chrome, or an incognito window. Incognito
+access is disabled. Disconnect clears the app's observation to `nil`.
+
 `tabs.changed` supplies a deduplicated current `tabs` group projection when
 group membership, tab metadata or user ownership changes. It queries only
 NativeAgent groups. `tab.yielded` supplies `tabId`, `userSequence`, `reason` and `url`; it invalidates
@@ -453,8 +473,9 @@ ownership, and introduces no model verb.
 The sole repeating Chrome alarm reconnects native messaging when the app is
 absent or the transport is disconnected. It holds no ownership state. A reload's
 single ten-second retry is bounded separately and is cleared by accepted attach;
-the relay's launch-time listener observation lasts at most twenty seconds and
-redials once through the same authenticated transport.
+the relay waits for the app's listener on socket-file events with no time limit,
+ending only when it connects or Chrome closes, and redials once through the same
+authenticated transport when the app relaunched during the greeting.
 An app request belongs to one channel. Disconnection returns that request's
 original outcome and connection remedy; it never resubmits on a replacement
 channel. A dispatched mutation with no confirmation remains outcome unknown.

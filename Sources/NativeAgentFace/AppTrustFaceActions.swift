@@ -36,8 +36,9 @@ import UniformTypeIdentifiers
     }
 }
 
-extension Notification.Name {
-    static let skillBuildRequest = Notification.Name("NativeAgent.skillBuildRequest")
+struct SkillBuildRequest: NotificationCenter.MainActorMessage {
+    typealias Subject = NSObject
+    let starter: String
 }
 
 private struct TrustFaceWorkbench: View {
@@ -60,13 +61,20 @@ private struct TrustFaceWorkbench: View {
 @MainActor enum TrustFaceWindows {
     static var controllers: [String: NSWindowController] = [:]
     private static var frames: [String: WindowFrame] = [:]
+    private static var closeObservers: [String: NSObjectProtocol] = [:]
 
     static func closeAll() {
+        for observer in closeObservers.values { NotificationCenter.default.removeObserver(observer) }
+        closeObservers.removeAll()
         for frame in frames.values { frame.end() }
         frames.removeAll()
         let shown = controllers.values
         controllers.removeAll()
-        for controller in shown { controller.close(); controller.window?.contentView = nil }
+        for controller in shown {
+            controller.close()
+            controller.window?.contentViewController = nil
+            controller.window?.contentView = nil
+        }
     }
 
     static func show<Content: View>(_ id: String, title: String, frame: (name: String, minimum: NSSize)? = nil, content: Content) {
@@ -75,10 +83,16 @@ private struct TrustFaceWorkbench: View {
             controller.window?.makeKeyAndOrderFront(nil)
             return
         }
+        if let priorObserver = closeObservers.removeValue(forKey: id) { NotificationCenter.default.removeObserver(priorObserver) }
+        frames.removeValue(forKey: id)?.end()
+        if let priorController = controllers.removeValue(forKey: id) {
+            priorController.close()
+            priorController.window?.contentViewController = nil
+            priorController.window?.contentView = nil
+        }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 640),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = title
-        frames.removeValue(forKey: id)?.end()
         var placed = false
         if let frame {
             let host = NSHostingView(rootView: content)
@@ -100,6 +114,21 @@ private struct TrustFaceWorkbench: View {
         if !placed { window.center() }
         let controller = NSWindowController(window: window)
         controllers[id] = controller
+        let target = ObjectIdentifier(window)
+        closeObservers[id] = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: window, queue: .main
+        ) { _ in
+            Task { @MainActor in
+                guard let current = controllers[id],
+                      let closing = current.window,
+                      ObjectIdentifier(closing) == target else { return }
+                if let observer = closeObservers.removeValue(forKey: id) { NotificationCenter.default.removeObserver(observer) }
+                frames.removeValue(forKey: id)?.end()
+                closing.contentViewController = nil
+                closing.contentView = nil
+                controllers.removeValue(forKey: id)
+            }
+        }
         controller.showWindow(nil)
         window.makeKeyAndOrderFront(nil)
     }

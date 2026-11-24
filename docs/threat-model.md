@@ -9,7 +9,7 @@ in core `EngineRuntime` / `ChatTurnRuntime`: one brain, many doors.
 
 The agent has one always-on door, `app`. Its home, pages, items, search, actions
 and JavaScriptCore scripts reach the registered capabilities.
-`AppToolRuntime/AppActions+Declarations.swift` defines those actions; their
+`BodyRuntime/AppToolRuntime/AppActions+Declarations.swift` defines those actions; their
 underlying Trust checks still apply.
 
 ## Trust Boundaries
@@ -39,6 +39,10 @@ can obtain its bearer token; the peer descriptor contains only the URL.
   effect, quoting what the agent asked. **Just this** runs one call; the next protected call asks again.
   **For this task** elevates the card's peers until the run ends. Reading any agent's words steers nothing. Agents enabled in
   Trust → Connected agents carry the owner's authority on authenticated turns.
+  App startup and engine port installation bind the same root-independent trust readers once, before any engine opens.
+  Only the body-backed engine installs the ability-keep policy reader. Each keep reads the policy in its own data root.
+  An ability write checks each peer's current grant in the turn's data root unless the person explicitly approved that peer for the task.
+  A revoked or unreadable grant refuses the peer's write.
   Lower Trust modes and ordinary domain checks retain their restrictions.
 - **Privacy reset without consent:** `SecurityCenter.swift` requires explicit
   approval for `system_permission_reset`, including under Full Mac.
@@ -62,13 +66,15 @@ can obtain its bearer token; the peer descriptor contains only the URL.
   app-owned credential, trust, pairing and token locations under the data root,
   including backup payloads; Full Mac does not bypass this fence
   (`FileSystemActions.isSensitiveDataPath`). Parts and certified read-only
-  commands also fence home credentials and the signing key. The agent's own
+  commands also fence home credentials and the signing key. Part file reads fence the data root's `oauth/` and `secrets/`. The agent's own
   file, search and Mac-control reads may reach home credential folders; raw
   file reads retain the app-data fence. File/Mac-control
   mutations retain the protected-system-path floor under Full Mac, enforced
   by `FileSystemActions.swift` and `MacControlSensitivePathFence`.
   Both raw file routes also preserve the dedicated owners of Mac-control
   state/audit, their screen, activity capture and experiences; reads keep their scope.
+  Their own backups are theirs to move or trash: security keeps others out, it does
+  not fence their inside their own Mac.
   TrustCenter interprets workspace-root aliases for every file route, retaining
   tilde and process-relative roots; resolved containment compares path bytes.
 - **Script bypass:** `AppScriptRunner.swift` gives JavaScript no direct file,
@@ -77,7 +83,7 @@ can obtain its bearer token; the peer descriptor contains only the URL.
 
 ## Shell Process Boundary
 
-`ChatToolRuntime/SwiftToolDispatcher+BuilderTools.swift` owns shell launch.
+`BodyRuntime/ChatToolRuntime/FileActions+BuilderTools.swift` owns shell launch.
 `bash` invokes `/bin/bash -c` through `runShellLikeProcess` and `builderLaunch`;
 literal reads certified by `AuthoredToolEffects.shellReadOnlyWords` execute
 their fixed system argv through the Git read boundary shared by the Code room.
@@ -165,12 +171,19 @@ changing memory or growth; disclosure and the keep gate are unchanged.
 | xAI OAuth credentials | `XAIOAuthCredentialStore.swift`, Keychain token bytes with references in provider metadata |
 | Service credentials | The keyring (`Keyring.swift`) for what abilities use; Slack's door tokens in Keychain (`SlackCredentials.swift`). Retired services' credential files and Keychain items stay untouched and unread. |
 | Codex OAuth credentials | App `codex_home/auth.json` and login-mode-dependent credential candidates in `LLMClient+OpenAIOAuthCredentials.swift` |
-| Operator bridge endpoint/bearer | `Agents/ClaudeBridgeRuntime.swift` publishes `bridge.json` and the separate `token` file under `AgentHostDirectory.bridgeDiscoveryDirectory` (normally `~/.config/claude-bridge/`) |
-| Connected-peer URL discovery | The same `ClaudeBridgeRuntime.writeDiscoveryFiles` publishes a URL-only `bridge.json`; `AgentConversations/AgentHostDirectory.swift` owns its path under `nativeagent-link/` beside the operator discovery directory. Peers use their own per-contact secret and never receive the operator bearer. `AgentBridgeRuntime.swift` checks legacy return-path readiness; it does not publish this descriptor. |
+| Operator bridge endpoint/bearer | `BodyRuntime/Agents/ClaudeBridgeRuntime.swift` publishes `bridge.json` and the separate `token` file under `AgentHostDirectory.bridgeDiscoveryDirectory` (normally `~/.config/claude-bridge/`) |
+| Connected-peer URL discovery | The same `ClaudeBridgeRuntime.writeDiscoveryFiles` publishes a URL-only `bridge.json`; `BodyRuntime/AgentConversations/AgentHostDirectory.swift` owns its path under `nativeagent-link/` beside the operator discovery directory. Peers use their own per-contact secret and never receive the operator bearer. `AgentBridgeRuntime.swift` checks legacy return-path readiness; it does not publish this descriptor. |
 | Browser IPC endpoint/token | `BrowserIPCServer.writeDiscovery` publishes `browser_ipc.json`, the single endpoint/token descriptor; the duplicate `browser_ipc_token` writer is retired |
 | iOS pairing material | `PairingSecretManager.swift` |
 
 Treat file-backed credential stores as sensitive in backups and diagnostics.
+`OAuthTokenManager` serializes renewals by credential path or keyring name.
+Inside that queue it re-reads the credential before spending a refresh grant.
+Provider writes compare the saved generation under the sign-in lock, and a
+superseding credential must still belong to the request's account. Keyring
+renewal rechecks the destination grant and commits against the entry it read.
+The Codex CLI owns rotation of its session. NativeAgent only reads that file.
+
 Bridge tokens, pairing secrets, OAuth tokens, APNS device tokens and provider
 credentials must not be logged. Use redaction, suffixes or hashes when correlation is
 needed; Shared's `TurnSecretRedactor.swift` owns text recognition and replacement;
@@ -206,8 +219,7 @@ withholds the whole string, including credentials under ordinary field names.
 Bridge descriptors use `NativePrivateFile` (mode `0600` at creation).
 `NativeLoopbackListenerParameters.swift` binds to loopback. The HTTP listeners
 use each install's fixed ports (`InstallPaths`); a collision fails rather than
-silently selecting another port. The A2A gRPC listener binds an ephemeral port
-that its agent card advertises.
+silently selecting another port.
 
 ## Out Of Scope
 
@@ -222,10 +234,10 @@ not protect against provider compromise or provider-side metadata exposure.
 ## Important Controls
 
 Source owners are under `Modules/NativeAgentCore/Sources/`:
-`TrustCenter/`, `ApprovalInbox/`, `DeviceSync/` and `AppToolRuntime/`.
-Loopback runtime owners are core's `Agents/ClaudeBridgeRuntime.swift`,
-`AgentConversations/AgentBridgeRuntime.swift` and `Browser/BrowserIPCServer.swift`;
-app presentation lives under `Sources/NativeAgentApp/`.
+`DeskCore/TrustCenter/`, `MacNerves/ApprovalInbox/`, `BodyRuntime/DeviceSync/` and `BodyRuntime/AppToolRuntime/`.
+Loopback runtime owners are core's `BodyRuntime/Agents/ClaudeBridgeRuntime.swift`,
+`BodyRuntime/AgentConversations/AgentBridgeRuntime.swift` and `MacNerves/Browser/BrowserIPCServer.swift`;
+app presentation lives under `Sources/NativeAgentFace/` (with the Mac body host under `Sources/NativeAgentApp/`).
 
 Public builds must not include live state, tokens, local identity, or retired
 runtime artifacts. Release checks live in [`script/release.sh`](../script/release.sh)

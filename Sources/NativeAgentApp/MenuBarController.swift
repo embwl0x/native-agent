@@ -89,7 +89,7 @@ final class GlobalHotkey: NSObject {
             EventTypeSpec(eventClass: UInt32(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
             EventTypeSpec(eventClass: UInt32(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
         ]
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        let selfPtr = unsafe Unmanaged.passUnretained(self).toOpaque()
         InstallEventHandler(
             GetApplicationEventTarget(),
             { _, event, userData -> OSStatus in
@@ -98,7 +98,7 @@ final class GlobalHotkey: NSObject {
                 guard let id = hotKeyID(of: event), id.signature == fourCharCode("NASP"), id.id == 1 else {
                     return OSStatus(eventNotHandledErr)
                 }
-                let manager = Unmanaged<GlobalHotkey>.fromOpaque(userData).takeUnretainedValue()
+                let manager = unsafe Unmanaged<GlobalHotkey>.fromOpaque(userData).takeUnretainedValue()
                 let eventKind = GetEventKind(event)
                 Task { @MainActor in
                     if eventKind == UInt32(kEventHotKeyPressed) {

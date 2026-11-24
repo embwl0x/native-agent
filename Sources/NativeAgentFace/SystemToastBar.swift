@@ -10,9 +10,11 @@ struct NoticeLane: View {
     let centers: [SystemToastCenter]
 
     var body: some View {
-        VStack(spacing: NativeAgentSpacing.sm) {
-            ForEach(centers, id: \.id) { center in
-                NoticeLaneColumn(center: center)
+        GlassEffectContainer(spacing: 0) {
+            VStack(spacing: NativeAgentSpacing.sm) {
+                ForEach(centers, id: \.id) { center in
+                    NoticeLaneColumn(center: center)
+                }
             }
         }
         .frame(maxWidth: 520)
@@ -25,6 +27,7 @@ private struct NoticeLaneColumn: View {
     private static let maxVisible = 3
     let center: SystemToastCenter
     @State private var notices: [SystemToast] = []
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         // Timers start on push, so show newest notices first.
@@ -34,7 +37,7 @@ private struct NoticeLaneColumn: View {
                     .transition(NativeAgentMotion.fade)
             }
         }
-        .animation(NativeAgentMotion.quick, value: notices.map(\.id))
+        .animation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: notices.map(\.id))
         .task(id: center.id) {
             for await queue in center.updates() { notices = Array(queue.suffix(Self.maxVisible)) }
         }

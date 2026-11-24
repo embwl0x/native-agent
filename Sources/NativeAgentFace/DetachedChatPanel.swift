@@ -155,7 +155,7 @@ final class DetachedChatWindowController: NSObject, NSWindowDelegate {
             sessionId: sessionId,
             contentRect: initialFrame
         )
-        let view = DetachedChatPanelView(sessionId: sessionId).environment(appModel)
+        let view = DetachedChatPanelView(sessionId: sessionId).environment(appModel).macFaceStyle()
         panel.title = title
         panel.appearance = AppearanceController.shared.appearance
         panel.contentViewController = NSHostingController(rootView: AnyView(view))

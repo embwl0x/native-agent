@@ -1,11 +1,9 @@
-import ChatTurnRuntime
-import ChatSessionWork
-import EngineRuntime
+import BodyRuntime
 import Foundation
-import MultimodalTTS
+import ProviderRouting
 import NativeAgentShared
 import Observation
-import ScreenVision
+import MacNerves
 // Blueprint: | `BodyFaceVoice.swift` | Body microphone, speech and attachment reads publish operation-bound values to the window |
 
 @MainActor
@@ -33,6 +31,7 @@ final class BodyFaceVoice {
         let playback = VoiceOutputController.sharedMessagePlayback
         if let owner = playback.speechOwnerID, spoken.keys.contains(where: { $0.uuidString == owner }) { playback.stop() }
         for capture in held.values { await capture.watch?.value }
+        for id in held.keys { await engine.face.remove(.voice(id)) }
         for task in spoken.values { await task.value }
     }
 
@@ -84,7 +83,11 @@ final class BodyFaceVoice {
             guard let capture = captures[id] else { throw BodyFaceServices.failure("voice_operation_missing", "This dictation operation is not open.") }
             let result = await capture.input.stopListeningResult()
             try Task.checkCancellation()
-            captures.removeValue(forKey: id)?.watch?.cancel()
+            // The finished value, recorded audio included, goes back in this reply; the feed lets the closed operation go.
+            let watch = captures.removeValue(forKey: id)?.watch
+            watch?.cancel()
+            await watch?.value
+            await engine.face.remove(.voice(id))
             var value = capture.value
             value.phase = .finished
             switch result {
@@ -94,13 +97,11 @@ final class BodyFaceVoice {
             case .failed(let cause): throw BodyFaceServices.failure("voice_capture_failed", cause)
             }
             if let attachment = capture.input.attachment { value.attachment = try await Self.faceAttachment(attachment) }
-            await engine.face.post(value, at: .voice(id))
             return .voice(value)
         case .discardDictation(let id):
             if startingDictations.remove(id) != nil {
                 let cancelled = VoiceFace(operation: id, session: nil, message: nil, composerRevision: nil,
                     phase: .cancelled, text: nil, attachment: nil, state: .ready)
-                await engine.face.post(cancelled, at: .voice(id))
                 return .voice(cancelled)
             }
             guard var capture = captures.removeValue(forKey: id) else {
@@ -108,9 +109,10 @@ final class BodyFaceVoice {
             }
             capture.watch?.cancel()
             capture.input.discardListening()
+            await capture.watch?.value
+            await engine.face.remove(.voice(id))
             capture.value.phase = .cancelled
             capture.value.text = nil
-            await engine.face.post(capture.value, at: .voice(id))
             return .voice(capture.value)
         case .speak(let id, let session, let message, let supplied):
             let text: String
@@ -148,46 +150,43 @@ final class BodyFaceVoice {
         case .stopSpeech(let id):
             let playback = VoiceOutputController.sharedMessagePlayback
             if playback.speechOwnerID == id.uuidString { playback.stop() }
-            speech.removeValue(forKey: id)?.cancel()
+            let watch = speech.removeValue(forKey: id)
+            watch?.cancel()
+            await watch?.value
+            // The stopped value goes back in this reply; the feed lets the operation go.
+            await engine.face.remove(.voice(id))
             let value = VoiceFace(operation: id, session: nil, message: nil, composerRevision: nil,
                 phase: .cancelled, text: nil, attachment: nil, state: .ready)
-            await engine.face.post(value, at: .voice(id))
             return .voice(value)
         }
     }
 
     private func watchCapture(_ id: UUID) async {
-        let (changes, signal) = AsyncStream<Void>.makeStream()
-        defer { signal.finish() }
-        var events = changes.makeAsyncIterator()
-        while !Task.isCancelled, var capture = captures[id] {
-            let read = withObservationTracking {
-                (capture.input.transcript, capture.input.isListening, capture.input.isStopping, capture.input.errorMessage)
-            } onChange: { signal.yield() }
+        guard let input = captures[id]?.input else { return }
+        let changes = Observations { (input.transcript, input.isListening, input.isStopping, input.errorMessage) }
+        for await read in changes {
+            guard !Task.isCancelled, var capture = captures[id] else { return }
             capture.value.text = read.0
             capture.value.phase = read.2 ? .recognizing : read.1 ? .listening : .finished
             if let issue = read.3 { capture.value.state = .unavailable(BodyFaceServices.failure("voice_capture_failed", issue)) }
             captures[id]?.value = capture.value
             await engine.face.post(capture.value, at: .voice(id))
-            guard await events.next() != nil else { return }
         }
     }
 
     private func watchSpeech(_ initial: VoiceFace) async {
         var value = initial
         let playback = VoiceOutputController.sharedMessagePlayback
-        let (changes, signal) = AsyncStream<Void>.makeStream()
-        defer { signal.finish() }
-        var events = changes.makeAsyncIterator()
-        while !Task.isCancelled {
-            let read = withObservationTracking { (playback.isSpeaking(ownerID: value.operation.uuidString), playback.errorMessage) }
-                onChange: { signal.yield() }
+        let owner = initial.operation.uuidString
+        let changes = Observations { (playback.isSpeaking(ownerID: owner), playback.errorMessage) }
+        for await read in changes {
+            guard !Task.isCancelled else { return }
             value.phase = read.0 ? .speaking : .finished
             if let issue = playback.consumeError(ownerID: value.operation.uuidString) {
                 value.state = .unavailable(BodyFaceServices.failure("speech_failed", issue))
             }
             await engine.face.post(value, at: .voice(value.operation))
-            guard read.0, await events.next() != nil else { return }
+            guard read.0 else { return }
         }
     }
 

@@ -118,13 +118,13 @@ never cap replay rows; nonpositive limits explicitly disable history.
 
 ## Older words are reached: leads
 
-Every composed request selects leads only from rows outside its held replay and
-recent receipts. `SessionReplaySpec` binds one transcript, raw query and checked
-relevance budget in memory. `ConversationPrefixSeeding.seed` applies the renderer's
-one ranking rule to that snapshot, excluding the identities in the request's
-actual replay bodies and recent-receipt strip. Each fitting cut therefore makes
-its dropped words eligible before the rebuilt request is measured; the measured
-size includes its leads. No transcript is reread and no lead selection is saved.
+For each candidate replay, `ConversationPrefixSeeding.seed` checks the newest
+eight tool rows in the transcript already held by `SessionReplaySpec`. Held rows
+carry their receipts in replay. Only rows outside that replay can enter the
+bounded recent-receipt strip. Lead selection excludes both the held row IDs and
+the IDs actually emitted in the strip. Each half-budget cut repeats that
+selection against the surviving rows before measuring the request, so a recent
+receipt can reappear as soon as its replay row is dropped.
 Up to four leads ride the now-block, each with its
 time, its role, at most 400 characters (`packetAtomExpandThresholdChars`) and
 `[context.expand history:<id>]`, which opens the saved row across conversations.
@@ -242,8 +242,10 @@ byte budget.
 
 Tool history renders receipt-aware evidence at its actual rendered length;
 the context budget has no separate per-tool-row cap. Replay and the bounded
-recent-receipt strip reconstruct saved evidence through
+recent-receipt strip for evicted rows reconstruct saved evidence through
 `ChatTranscriptEvidenceRendering`, retaining their separate presentation limits.
+Held pending-approval rows replay the reason saved in `resultSummary` with
+their receipt.
 
 Relevance preprocessing preserves message text, including leading bracketed
 headings. Punctuation does not establish ingress provenance; the text-only
@@ -316,8 +318,9 @@ array; action discovery travels through app results. Dormant tool-change
 declarations and deferred-loading carriers are removed.
 The turn part, persona, memory content and built paragraph text are unchanged.
 
-Source owners: `ChatSessionWork/SentTurnContext.swift`,
+Source owners: `BodyRuntime/ChatSessionWork/SentTurnContext.swift`,
 `SessionHistoryMessageProjection.swift`, `SessionHistoryTail.swift`,
-`SessionHistoryPromptRenderer.swift`, `ChatTurnRuntime/ConversationPrefixSeeding.swift`,
+`SessionHistoryPromptRenderer.swift`, `BodyRuntime/ChatTurnRuntime/ConversationPrefixSeeding.swift`,
 `ChatOrchestration+SessionHistory.swift`, `TurnStem.swift`, `TurnStem+Opening.swift`,
-`TurnStem+ModelRound.swift` and `StandingBotModel.swift`.
+`TurnStem+ModelRound.swift`, `LazyContextBox.swift`, `ModelRoundKernel.swift`,
+`StandingBotSession.swift` and `StandingBotModel.swift`.

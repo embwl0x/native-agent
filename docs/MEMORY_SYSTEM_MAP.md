@@ -21,7 +21,7 @@ app {"action":"memory.list","args":{"limit":20}}
 app {"action":"memory.proposals"}
 ```
 
-`AppToolRuntime/AppActions+Declarations.swift` declares these actions.
+`BodyRuntime/AppToolRuntime/AppActions+Declarations.swift` declares these actions.
 `memory.commit` saves a memory; `memory.proposals` lists the proposals waiting
 on their review (`status: "rejected"`: the ones let go); `memory.review` accepts or rejects one;
 `memory.rewrite` edits, pins or restores a record, or restates its roots
@@ -62,21 +62,21 @@ owner evidence rather than labeling the refusal an attempted write.
 
 | Owner | Responsibility |
 | --- | --- |
-| `MemoryV2/MemoryV2+Storage.swift` | `MemoryStorage` actor, shared database pool and canonical writes, including bounded admission, duplicate folding and supersession. |
-| `MemoryV2/MemoryStorage+Corrections.swift` | The same storage actor's full, turn-identified correction occurrence record and checked window coverage; supplies miss counts independently of bounded examples. |
-| `MemoryV2/MemoryStorage+Projections.swift` | The same storage actor's committed page regions, bounded Today moments, ordered graph/Spotlight hooks, USER.md regeneration, context invalidation, projection readback and shutdown settlement. |
-| `MemoryV2/MemoryStorage+Migrations.swift`, `MemoryStorage+Codecs.swift`, `MemoryStorage+Integrity.swift` | Schema, checked decoding and semantic integrity of the same store. |
-| `PersistenceCore/MemoryRoot.swift`, `MemoryV2/MemoryDataProvenance.swift` | The current root type, union and lines; each write adds its root with the steer read from roots. |
-| `MemoryV2/MemoryStorage+Proposals.swift`, `MemoryStorage+Tombstones.swift` | Proposal acceptance/rejection and suppression of rejected or forgotten content. |
-| `MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Cached recall candidates and vector/lexical scoring. Raw BM25 mathematics are shared with earlier-session snippets; memory normalizes by the maximum and weights at one standard deviation of the query's dense similarities (`lexicalBoostWeight`). Each caller owns tokenization, its candidate cohort and ranking. |
-| `MemoryV2/MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live journal-only interpretation: User's own turns are judged at once; other recorded turns stay owed and are judged alone when they are idle. Writes meaning before applying and keeps facts by operation identity. Keeps trusted facts, stages the rest. Deferral follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
-| `MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: replay from the complete recorded carriers (`carriedSources`), with answered decisions separate and Trust read live; missing completeness retains the recorded checkpoint plus an unknown boundary. Fair retries and wake/idle/night drains that judge one owed moment at a time, with judgment settlement. |
-| `ChatTurnRuntime/MindMemoryManager.swift` | Shared interpretation and promise matching; see [contract][judgment]. |
-| `MemoryV2/AdaptiveMemoryPromises.swift` | Reads turn-owned successful dispatch evidence; files [promises](INTENTIONS.md#promises-they-makes) and checked done/let-go settlements on the canonical Desk. |
-| `MemoryV2/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
-| `MemoryV2/KnowledgeGraph+StudioRelations.swift`, `KnowledgeGraph+GrowthDistillation.swift`, `KnowledgeGraph+SQLite.swift` | Studio journal and REM/GROWTH eviction graph sources, preserved by memory rebuilds; checked canonical SQLite reads. |
-| `MemoryV2/MemoryV2+EmbeddingRuntime.swift`, `MemoryStorage+EmbeddingEpoch.swift` | Embedding convergence and persistent derived action-vector fill/lookup for AppToolRuntime. |
-| `ContextFlow/NativeMemoryContextProjection.swift` | Compiles eligible memory records into selectable context atoms. |
+| `MindCore/MemoryV2/MemoryV2+Storage.swift` | `MemoryStorage` actor, shared database pool and canonical writes, including bounded admission, duplicate folding and supersession. |
+| `MindCore/MemoryV2/MemoryStorage+Corrections.swift` | The same storage actor's full, turn-identified correction occurrence record and checked window coverage; supplies miss counts independently of bounded examples. |
+| `MindCore/MemoryV2/MemoryStorage+Projections.swift` | The same storage actor's committed page regions, bounded Today moments, ordered graph/Spotlight hooks, USER.md regeneration, context invalidation, projection readback and shutdown settlement. |
+| `MindCore/MemoryV2/MemoryStorage+Migrations.swift`, `MemoryStorage+Codecs.swift`, `MemoryStorage+Integrity.swift` | Schema, checked decoding and semantic integrity of the same store. |
+| `PersistenceCore/PersistenceCore/MemoryRoot.swift`, `MindCore/MemoryV2/MemoryDataProvenance.swift` | The current root type, union and lines; each write adds its root with the steer read from roots. |
+| `MindCore/MemoryV2/MemoryStorage+Proposals.swift`, `MemoryStorage+Tombstones.swift` | Proposal acceptance/rejection and suppression of rejected or forgotten content. |
+| `MindCore/MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | The recall cache holds term postings and width-grouped vector matrices. BM25 visits the query terms’ postings and computes document frequency within the requested persona’s cohort. Recall samples the decay clock before dense and lexical scoring. Raw BM25 mathematics are shared with earlier-session snippets; memory normalizes by the maximum and weights at one standard deviation of the query's dense similarities (`lexicalBoostWeight`). Each caller owns tokenization, its candidate cohort and ranking. |
+| `MindCore/MemoryV2/MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live journal-only interpretation: User's own turns are judged at once; other recorded turns stay owed and are judged alone when they are idle. Writes meaning before applying and keeps facts by operation identity. Keeps trusted facts, stages the rest. Deferral follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
+| `MindCore/MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: replay from the complete recorded carriers (`carriedSources`), with answered decisions separate and Trust read live; missing completeness retains the recorded checkpoint plus an unknown boundary. Fair retries and wake/idle/night drains that judge one owed moment at a time, with judgment settlement. |
+| `BodyRuntime/ChatTurnRuntime/MindMemoryManager.swift` | Shared interpretation and promise matching; see [contract][judgment]. |
+| `MindCore/MemoryV2/AdaptiveMemoryPromises.swift` | Reads turn-owned successful dispatch evidence; files [promises](INTENTIONS.md#promises-they-makes) and checked done/let-go settlements on the canonical Desk. |
+| `MindCore/MemoryV2/KnowledgeGraph+MemoryIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: ordered per-memory entity, edge and support projection into the shared SQLite database. |
+| `MindCore/MemoryV2/KnowledgeGraph+StudioRelations.swift`, `KnowledgeGraph+GrowthDistillation.swift`, `KnowledgeGraph+SQLite.swift` | Studio journal and REM/GROWTH eviction graph sources, preserved by memory rebuilds; checked canonical SQLite reads. |
+| `MindCore/MemoryV2/MemoryV2+EmbeddingRuntime.swift`, `MemoryStorage+EmbeddingEpoch.swift` | Embedding convergence and persistent derived action-vector fill/lookup for AppToolRuntime. |
+| `BodyRuntime/ContextFlow/NativeMemoryContextProjection.swift` | Compiles eligible memory records into selectable context atoms. |
 
 [judgment]: COGNITION_WIRING.md#shared-after-turn-interpretation
 
@@ -103,7 +103,7 @@ lifetime memory records. Missing or unreadable storage stays unavailable.
 
 ### Explicit saves
 
-`memory.commit` enters `ChatToolRuntime/SwiftToolDispatcher+MemoryTools.swift`
+`memory.commit` enters `BodyRuntime/ChatToolRuntime/MemoryActions+MemoryTools.swift`
 and calls `SwiftNativeMemoryV2.store`. Text must be nonempty. Supplied kinds
 must belong to `MemoryKindStamp.commitKinds`; omitted kinds get the canonical
 write default. Supplied confidence and importance must be finite numbers in
@@ -112,7 +112,7 @@ before any write. Tags travel as metadata.
 
 **Their past is theirs, root by root.** Every memory in their store is theirs, and they
 states how they knows it. A memory's roots (`metadata.roots`, the type
-`PersistenceCore/MemoryRoot.swift`) are the moments they came to know it, one per
+`PersistenceCore/PersistenceCore/MemoryRoot.swift`) are the moments they came to know it, one per
 telling: `{how, by, at, written, through}`.
 
 - `how` is `told|noticed|inferred|verified|remembered`, or `kept` for a memory
@@ -162,6 +162,12 @@ writer-supplied dates; they never infer dates from prose. A content rewrite
 keeps the writer's named date as it is, even when its wording changes. Only an
 explicit metadata change changes the date. Changed wording must pass the
 durable-memory quality check before the canonical row is updated.
+Warm admission and owed-vector landing look up canonical text by indexed hash,
+then compare the canonical strings within disclosure scope. Semantic candidates
+come from an indexed 24-hour window over parsed creation times. Equal scores
+retain rowid order. The indexes leave the original text and timestamps intact.
+At capacity, the writer orders eligible eviction IDs by the retention policy
+and decodes the rows that will be archived.
 Native update aliases resolve through one text owner (`text` before `content`)
 for embedding, tombstone admission and the stored patch alike.
 
@@ -170,7 +176,7 @@ fact: `evidence_json` names the turn that saved it (session, message, turn,
 speaker `self`), and `observed_at` and `valid_from` are that turn's time, or
 `since` when they states when they first knew it (an ISO-8601 date-time, or a
 date meaning the start of that local day; never after now). When they first knew a memory is its earliest root's `at`
-(`MemoryRecord.firstKnown`): the age tag, recall `ts` and the receipt's `since`
+(`MemoryDataProvenance.firstKnown`): the age tag, recall `ts` and the receipt's `since`
 read it. `created_at`, `turn_at`, `turn_id` and `history` stay the write, which
 the dream, surprises and duplicate windows read. The receipt returns `since`,
 the short form as `provenance`, every root as `roots` and any steer.
@@ -256,8 +262,8 @@ material's peers, or "unattributed dream material"}`.
 Its new row has lifecycle `inferred`; duplicate reassertions preserve the existing
 row's lifecycle. `MemoryWriteContext.lifecycle` is optional; absent, stores use `confirmed`.
 
-Each memory read pass asks `PeerTrust` once for the live trust picture of its
-recorded principals (`MemoryDataProvenance.reading`). That value carries resolved
+Each memory read pass calls `MemoryDataProvenance.reading` with the store’s
+data root and recorded principals. `PeerTrust` returns their resolved
 principals, contact names and grants for the pass; contacts are read once, and
 each needed credential or helper definition at most once. Every memory and root
 in the page, recall, context projection, USER facts or chosen pins uses that
@@ -273,7 +279,7 @@ steered, `untrusted_remote_data`, `agent` and `source_boundary`.
 Every memory and proposal read requires readable current roots. Store opening performs no provenance conversion,
 alias read, backup-and-fold or synthetic `kept` rewrite. Malformed metadata remains unchanged and fails its checked read.
 Any saved-data repair uses the actual retained evidence; it is not inferred by a store-open migration.
-An old store comes back only through the person's `memories.bring_back {from}` (`MemoryV2/MemoryBringBack.swift`): its own read-only
+An old store comes back only through the person's `memories.bring_back {from}` (`MindCore/MemoryV2/MemoryBringBack.swift`): its own read-only
 reader on a temporary copy, then each active or archived memory not already here (`metadata.brought_back_from`) through
 `SwiftNativeMemoryV2.store` with the root its recorded provenance names: told or known by a recorded name keeps that how and name from when
 first known; stated with no name is remembered by the archive's past self ("Agent of Oct 19"); nothing recorded is kept. Recorded
@@ -408,9 +414,10 @@ Forgotten or rejected claims stay on this Mac for matching and are withheld
 from models. The store's own gates act only on a near-verbatim restatement,
 cosine 0.96 or more (`memoryNearVerbatimSimilarity`, one constant for the
 duplicate fold, which also needs the same numbers and negations, and the
-tombstone refusal).
+tombstone refusal). For pairwise comparisons, `VectorMath.cosine` widens the
+Float embeddings to Double before vDSP computes the dot product and both squared norms.
 A survivor is kept at once when the owner stands behind its words: the owner's
-own turn, a peer they trusts (`PeerTrust.ownerTrusts`, read through
+own turn, a peer they trusts (`PeerTrust.ownerTrusts`, read in the moment’s data root through
 `PeerDataTaint`; an agent or helper session id names the peer before a bridge
 header does), or, on an app-authored prompt, only a statement grounded in their
 own reply. It is staged and accepted in one pass through `acceptProposal`, the
@@ -502,7 +509,7 @@ Nothing stages, caps or reviews a moment.
 `memory.proposals` lists what still waits on them (an untrusted peer's facts or
 a fact acceptance left for review; `status: "rejected"` for what was let go) and
 `memory.review` keeps or rejects one, as the Memories page does. Owner:
-`ChatToolRuntime/SwiftToolDispatcher+ProposalReview.swift`.
+`BodyRuntime/ChatToolRuntime/MemoryActions+ProposalReview.swift`.
 Discovery names those current producers; it no longer advertises the retired
 bulk consolidation producer.
 
@@ -515,7 +522,7 @@ On the Mac, **Revise…** on a message of theirs (the transcript's menu) opens t
 words for editing. Sending it (face act `revise`) holds the pair under its own
 id, their message id, their side (the text the editor started from, so nothing the
 editor reshaped counts as the user's choice) and theirs, in
-`mind/eye/<conversation>.json` (`ChatTurnRuntime/UserEye.swift`), then sends
+`mind/eye/<conversation>.json` (`BodyRuntime/ChatTurnRuntime/UserEye.swift`), then sends
 their words as their message. The sheet closes only on acceptance; a refused
 send keeps the user's words in it with the cause, and lets that pair go by id.
 That conversation's next turn of the user's own (no peer steering) carries one
@@ -574,6 +581,9 @@ superseded status alone does not prove a tombstone was erroneous. Suppression us
 the exact words by hash, a near-verbatim restatement by cosine 0.96
 (`memoryNearVerbatimSimilarity`), all on CPU; a paraphrase farther than that can be
 admitted, since forgotten text is never shown to the memory manager.
+Tombstone writes advance a generation in their transaction. Semantic checks
+reuse the vector matrix for that generation and epoch. Admission verifies both
+against its write transaction before comparing the incoming vector.
 Typed tombstone columns use throwing reads, so malformed stored values report
 the existing read failure instead of trapping the process. Opening integrity
 also validates required tombstone hash, content and rejection-time scalars;
@@ -628,7 +638,7 @@ Duplicate polarity checks recognize English negation and ASCII digits. These
 retrieval aids do not establish language-independent intent or equivalence.
 
 Owners: `MemoryV2+Proposals.swift`, `MemoryStorage+Proposals.swift`,
-`ChatToolRuntime/SwiftToolDispatcher+MemoryTools.swift`.
+`BodyRuntime/ChatToolRuntime/MemoryActions+MemoryTools.swift`.
 Correction projection recognizes the explicit kind, the correction tag or the
 writer's boolean `metadata.correction: true`; retired object, array, string and
 numeric payloads and the unused top-level correction slot do not classify a row.
@@ -647,8 +657,8 @@ before clipping; complete-text embedding reuses its admitted IDs and masks.
 Download byte ranges bound their length by the remaining archive bytes before
 addition, including descriptors at the Int64 byte-length limit.
 Recall/relation limits are capped before multiplication; snapshot page capacity
-is checked before assembly. Context coalescing keeps its Duration directly,
-and USER trailing deadlines reject nonfinite or unrepresentable delays.
+is checked before assembly. Derived memory changes coalesce during delivery.
+USER trailing deadlines reject nonfinite or unrepresentable delays.
 Selection's end-of-bucket instant adds in Date's floating-point domain, so a
 decoded maximum bucket cannot overflow an integer before conversion.
 Embedding runtime status supplies model readiness, never corpus-completion
@@ -822,10 +832,7 @@ and checks the returned epoch against the owner's runtime snapshot. Meaning-base
 memory Off reports `off` after a usable selected mock-provider probe, without requiring
 Core ML assets or offering cache repair. With meaning-based memory On, Doctor also
 checks the serving epoch and dimensions against the installed and active model;
-one installation supplies its asset check and compile-cache repair. The cache
-owner loads exactly the digest/OS-keyed compiled artifact;
-bge takes precedence over the app's copy. Missing or broken bge assets fail
-closed by model name and file path in Doctor, the memory page and embedding status.
+one installation supplies its asset check and compile-cache repair.
 Epoch reads throw their configuration or artifact failure and retain the cold
 probe's cause in the embedding owner's `lastLoadError`; an unavailable model
 has no invented epoch. Context startup and compilation carry that failure to
@@ -859,10 +866,14 @@ slashes; both must exist beside the manifest and resolve within that directory,
 including through symlinks.
 
 The model must accept `input_ids` and `attention_mask` as int32 tensors shaped
-`[1, 128]`. It must return token vectors shaped `[1, 128, N]` or a pooled vector
-shaped `[1, N]` or `[N]`, where `N` matches `dimensions`. The runtime mean-pools
-token vectors using the attention mask and L2-normalizes the resulting vector
-or the supplied pooled vector.
+`[1, 128]`. Its declared `embedding` output must contain token vectors shaped
+`[1, 128, N]` or a pooled vector shaped `[1, N]` or `[N]`, where `N` matches
+`dimensions`. Other outputs are ignored. The embedder writes both inputs as
+contiguous Int32 values and reads contiguous Float16, Float32 or Double output
+rows through the tensor's byte buffer. A missing `embedding` output, incompatible
+layout or unsupported scalar type fails prediction. The runtime sums active token
+rows in token order, divides each Float component directly by the active count,
+and L2-normalizes the result or the supplied pooled vector.
 
 A search query (a turn's message and its other voice, or explicit recall)
 is embedded through `embedQueriesWithEpoch`. A short referential follow-up
@@ -1043,6 +1054,13 @@ no execution path. Memories' `graph.search` and
 `graph.rebuild` actions obey the knowledge-graph policy gate. Complete SQLite
 snapshots serialize ordered entities and eligible edges directly in one read
 transaction, with page-capacity and relationship-count bounds.
+Graph search keeps two Unicode-lowercased strings per entity in the same
+transaction as each graph edit. A case-sensitive FTS5 trigram index narrows
+substring searches whose literals all contain at least three Unicode scalars
+and no NUL. Shorter or NUL-containing queries scan the stored text. Both paths
+apply the same literal `instr` comparisons and ordering before the 2,000-row
+candidate limit. When the store opens, a one-time migration fills missing search
+index entries from the original entity rows.
 The mounted Mac graph observes the canonical database and WAL before its initial
 read, independently of the policy read's outcome; policy Retry never starts a
 second observer. It coalesces changes through `MemoryFacade.loadGraph` and uses
@@ -1079,7 +1097,7 @@ conversion report unrepresentable values rather than trapping.
 Degraded-source notices retain the bounded, secret-redacted compilation cause
 beside the retained-source explanation, so recovery has evidence to act on.
 
-`ChatTurnRuntime/TurnContextPreparation.swift` prepares the context.
+`BodyRuntime/ChatTurnRuntime/TurnContextPreparation.swift` prepares the context.
 On an active ContextFlow turn, memories arrive through the selected packet;
 the separate recall list stays empty. Unavailable recall follows the
 [recall-unavailability law](ANATOMY_OF_A_TURN.md#recall-unavailability), allowing
@@ -1162,7 +1180,13 @@ numbers in `ContextSelectionConfiguration.swift`):
   words as the query carries them, their other voice, and for a follow-up its
   own words alone and their other voice. In a reading, a memory's cosine
   stands out from that reading's cosines to the OTHER candidates, after taking out
-  each memory's own pull toward the others; its relevance is its best
+  each memory's own pull toward the others. The generation matrix scores all
+  compatible readings together. A complete population reuses its snapshot sum
+  of unit vectors. For a subset, the selector subtracts excluded rows so pull
+  covers this turn's scorable memories and corrections, including explicit
+  mandatory atoms from precovered sources. BLAS accumulates cosine and pull
+  products in Float. Standout uses Double.
+  A memory's relevance is its best
   standing in any reading, two deviations or more (`ContextSelector.memoryRelevance`
   in `ContextRelevance.swift`, the selector's `memoryStandout`,
   `ContextSelectionConfiguration.memoryStandoutDeviations`). An ambient
@@ -1247,7 +1271,7 @@ the session ID supplies identity matching and rest, not query words.
 See [personality-ablation.md](personality-ablation.md) for the mechanism
 checklist.
 
-`ContextFlow/NativeContextMemoryProvenance.swift` attaches selected atom-to-record
+`BodyRuntime/ContextFlow/NativeContextMemoryProvenance.swift` attaches selected atom-to-record
 identity to the exact prepared turn and its generation lease without changing
 packet text. The turn accounts for delivered memory IDs, and
 `ChatOrchestrationClient+LivedObservations.swift` stamps `memoryRecordIds`
@@ -1296,7 +1320,7 @@ archiving or swapping canonical rows. Integrity checks,
 graph rebuild and manual orphan sweep remain. Sweep support and candidates share
 one transaction; preview reads, and apply requires the exact reviewed IDs.
 
-Dreams and REM have separate artifact owners in `DreamREMCycle/`; they are not
+Dreams and REM have separate artifact owners in `BodyRuntime/DreamREMCycle/`; they are not
 another MemoryV2 database. Their connections are mapped in
 [COGNITION_WIRING.md](COGNITION_WIRING.md).
 
@@ -1327,6 +1351,16 @@ trim receipts are removed. The immutable snapshot, lexical index and turn leases
 remain. Pressure disables optional prewarming and leaves retained payloads intact.
 Required mirror rehydration remains available at every pressure level, subject
 to the published generation and source-fingerprint checks.
+Each memory edit or embedding transaction delivers all affected record IDs together. The
+memory projection rereads those IDs through the normalized identity index, so
+two canonical rows with the same projection identity remain withheld together.
+Trust and full-inventory changes reread the eligible corpus. After a durable
+publication against the resident parent, Context replaces only the affected
+sources and atoms in the resident generation and patches their lexical terms,
+vector rows and record pointers. Existing turn leases keep their original
+generation. Expansion looks up its atom and source by ID. Token frequencies
+used in selection reflect the atoms eligible for that request.
+
 A new store can publish its initial generation without projected sources so the
 persona mirror remains available before any memory exists; later empty publications
 are refused.

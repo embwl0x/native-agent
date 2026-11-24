@@ -36,8 +36,9 @@ another. The title/body already exist in the remote alert if no extension runs.
 CloudKit may truncate localization arguments over 100 characters. Ordinary
 CloudKit alerts use the system's default interruption level; the signed
 requested-result reader retains its existing urgency handling. The router writes
-`userInfo.urgency` only for requested results (CloudKit does not consume it on
-ordinary alerts), and adverse
+`userInfo.urgency: urgent` for a failed matter and for an error reply (CloudKit
+does not consume it on the visible alert; the phone's own renderer of the
+retained record reads it as time-sensitive), and adverse
 importance bypasses NativeAgent's quiet-hours hold without promising to bypass
 iPhone Focus. The chat,
 pairing and status subscriptions remain silent.
@@ -171,18 +172,16 @@ Boolean decode. The authenticated bridge emits JSON null for unknown.
 
 ## Delivery evidence
 
-Optional wake fan-out retains an `unknown` receipt for every target before any
-send, using the same event and APNs IDs as its eventual result, in
-`mobile_push/apns_outcomes.jsonl`. Admission checks cancellation; after admission
-one independent task owns all sends and final receipts. The caller joins that
-task through URLSession's five-second request-idle and thirty-second resource
-limits. The former five-second observation race, cancellation of outstanding
-writes and rejection of late HTTP answers are removed. HTTP responses remain
-`ok` or `failed`; a missing HTTP answer stays `unknown`, including a transport
-timeout. No automatic resend follows uncertainty. A final receipt-write failure
-returns an explicit unsettled-receipt error and leaves the retained unknown
-record; a failed initial receipt write prevents admission. The body reader never
-turns unknown/omitted receipts or diagnostic errors into a provider rejection.
+Optional wake fan-out sends to every registered target through one independent
+task that owns all sends and their receipts: admission checks cancellation, and
+after it caller cancellation ends no write. Each target's receipt carries its own
+APNs ID and returns to the caller with the event's delivery receipt; no separate
+outcomes file is kept. The caller joins that task through URLSession's
+five-second request-idle and thirty-second resource limits. HTTP responses
+remain `ok` or `failed`; a missing HTTP answer is an `unknown` receipt, including
+a transport timeout, and a lost answer does not prove Apple rejected the write.
+No automatic resend follows uncertainty. The body reader never turns
+unknown/omitted receipts or diagnostic errors into a provider rejection.
 
 Work-start reservation retirement remains gated by retained-format evidence:
 the pre-reservation reader is still required while saved registrations lack
@@ -207,11 +206,11 @@ and the signed receipt alone cannot establish the visible count.
 
 ## Source owners
 
-- `DeviceSync/MacSyncMobileNotificationRelay.swift` — immutable publications,
+- `BodyRuntime/DeviceSync/MacSyncMobileNotificationRelay.swift` — immutable publications,
   registration mutations and event receipts.
-- `DeviceSync/APNSNotificationDelivery.swift` and `APNSNotificationReadiness.swift`
+- `BodyRuntime/DeviceSync/APNSNotificationDelivery.swift` and `APNSNotificationReadiness.swift`
   — optional APNS wake effect, provider configuration and diagnostics.
-- `DeviceSync/MobileNotificationDeliveryReceipt.swift` — publication/wake receipts.
+- `BodyRuntime/DeviceSync/MobileNotificationDeliveryReceipt.swift` — publication/wake receipts.
 - Shared `CloudKitDeviceTransport+Messages.swift` and `+Subscriptions.swift` —
   record-family selection, exact replay and subscription registration/repair.
 - iOS `MobilePushNotifications.swift` and `NotificationService.swift` — signed

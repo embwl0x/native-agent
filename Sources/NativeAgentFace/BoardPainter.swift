@@ -121,17 +121,19 @@ enum BoardPainter {
         var step = 24 * camera.scale
         while step < 12 { step *= 2 }
         let dot = Color.primary.opacity(0.07)
+        var dots = Path()
         var x = camera.offset.x.truncatingRemainder(dividingBy: step)
         if x < 0 { x += step }
         while x < size.width {
             var y = camera.offset.y.truncatingRemainder(dividingBy: step)
             if y < 0 { y += step }
             while y < size.height {
-                context.fill(Path(ellipseIn: CGRect(x: x - 1, y: y - 1, width: 2, height: 2)), with: .color(dot))
+                dots.addEllipse(in: CGRect(x: x - 1, y: y - 1, width: 2, height: 2))
                 y += step
             }
             x += step
         }
+        context.fill(dots, with: .color(dot))
     }
 
     private static func container(_ context: inout GraphicsContext, _ element: BoardDocument.Element, _ frame: CGRect?) {

@@ -8,39 +8,7 @@
 */
 function face(input) {
     const keys = input.keys;
-    // A character is what Swift counts as one: the packet names every cluster that spans several code units, longest first.
-    function characters(text) {
-        const out = [];
-        for (let i = 0; i < text.length;) {
-            const found = input.clusters.find(c => text.startsWith(c, i));
-            const character = found === undefined ? String.fromCodePoint(text.codePointAt(i)) : found;
-            out.push(character); i += character.length;
-        }
-        return out;
-    }
-    // Markdown out, one line: link targets dropped, heading and quote marks folded into sentences, bullets and emphasis gone.
-    function plain(raw) {
-        const text = raw.trim();
-        if (!text) return "";
-        return text.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").split(/\r\n|[\n\r\v\f\u0085\u2028\u2029]/).map(rawLine => {
-            let line = rawLine.trim(), heading = false;
-            while (line[0] === "#" || line[0] === ">") { heading = heading || line[0] === "#"; line = line.slice(1).trimStart(); }
-            if (heading && line && !".!?:".includes(line[line.length - 1])) line += ".";
-            for (const bullet of ["- ", "* ", "+ "]) if (line.startsWith(bullet)) line = line.slice(bullet.length);
-            return line.replace(/[*`\\]/g, "").trim();
-        }).filter(Boolean).join(" ").trim();
-    }
-    // Cut at a sentence end past the middle, else at a word, never inside a word or character.
-    function bounded(text, limit) {
-        const chars = characters(text);
-        if (chars.length <= limit) return text;
-        const window = chars.slice(0, limit);
-        let stop = -1;
-        window.forEach((c, i) => { if (c === "." || c === "!" || c === "?") stop = i; });
-        if (stop >= limit / 2) return window.slice(0, stop + 1).join("");
-        const space = window.lastIndexOf(" "), head = space >= 0 ? window.slice(0, space).join("").trim() : "";
-        return (head || window.join("")) + "…";
-    }
+    const {graphemes, plain, bounded} = kit;
     const line = (text, limit) => bounded(plain(text), limit);
     // Where a memory came from, read from the run that wrote it: a few words for the row's value and the sentence its detail tells.
     function provenance(source) {
@@ -62,10 +30,10 @@ function face(input) {
             .slice(0, 160).join("")).filter(Boolean);
         return names.length ? text + " — from " + names.join(", ") : text;
     }
-    function memoryRow(memory) {
+    function memoryRow(memory, inPinned = false) {
         const meta = [];
         if (memory.warning !== null) meta.push(memory.warning);
-        if (memory.pinned) meta.push("Pinned");
+        if (memory.pinned && !inPinned) meta.push("Pinned");
         if (memory.lifecycle === "graduated") meta.push("graduated → GROWTH");
         if (!memory.atReadable) meta.push("when, I'm not sure");
         const from = provenance(memory.source);
@@ -108,7 +76,7 @@ function face(input) {
         return [["kept-today", "Today", "sun.max", "today"], ["kept-week", "This week", "calendar", "week"],
             ["kept-earlier", "Earlier", "clock.arrow.circlepath", null]].map(([id, title, symbol, when]) => {
             const held = memories.filter(memory => when === null ? memory.when !== "today" && memory.when !== "week" : memory.when === when);
-            return {id, title, symbol, value: String(held.length), rows: held.map(memoryRow)};
+            return {id, title, symbol, value: String(held.length), rows: held.map(memory => memoryRow(memory, false))};
         }).filter(span => span.rows.length);
     }
     const total = input.statusFailures.length === 0 && input.total !== null ? input.total : null;
@@ -117,14 +85,6 @@ function face(input) {
 
     const sections = [];
     if (input.kept.state === "unavailable") sections.push(issue("kept", "Saved memories unavailable", input.kept.reason));
-    else {
-        // How many I remember is the store's own count, unknown when its status could not be read; pinned and this week count the memories read here.
-        const memories = input.kept.memories, pinned = memories.filter(memory => memory.pinned).length;
-        const week = memories.filter(memory => memory.when === "today" || memory.when === "week").length;
-        if (!nothing) sections.push({id: "readout", style: "list", rows: [{id: "readout", symbol: "brain.head.profile",
-            title: total === null ? "I can't read how many things I remember" : "I remember " + total + (total === 1 ? " thing" : " things"),
-            detail: pinned + " pinned · " + week + " this week"}]});
-    }
     if (input.waiting.state === "unavailable") sections.push(issue("waiting", "Proposals unavailable", input.waiting.reason));
     else sections.push(...list("waiting", "Waiting for you", input.waiting.proposals.map(proposal => ({id: "proposal:" + proposal.id,
         title: proposal.content, detail: proposal.kind === "correction" ? "Correction" : "Fact", at: proposal.createdAt, tone: "attention"}))));
@@ -134,7 +94,7 @@ function face(input) {
         const search = input.search;
         let rows = [];
         if (search.records !== null) {
-            if (search.records.state === "available") rows = search.records.memories.map(memoryRow);
+            if (search.records.state === "available") rows = search.records.memories.map(memory => memoryRow(memory, false));
             else rows.push({id: "search-records-error", title: "Search records unavailable", detail: search.records.reason, tone: "failed"});
         }
         if (search.error !== null) rows.unshift({id: "search-error", title: "Search unavailable", detail: search.error, tone: "failed"});
@@ -149,7 +109,7 @@ function face(input) {
         const pinned = all.filter(memory => memory.pinned), recent = all.filter(memory => !memory.pinned);
         // Every pin is drawn: a section holds 256 rows, so more pins continue in the next one.
         for (let at = 0; at < pinned.length; at += 256) sections.push({id: at ? "pinned:" + at : "pinned",
-            title: at ? "Pinned, continued" : "Pinned", style: "list", rows: pinned.slice(at, at + 256).map(memoryRow)});
+            title: at ? "Pinned, continued" : "Pinned", style: "list", rows: pinned.slice(at, at + 256).map(memory => memoryRow(memory, true))});
         if (recent.length) sections.push({id: "recent", title: "What I've kept", style: "list", rows: spans(recent)});
         else if (!all.length && !nothing) sections.push({id: "empty", style: "note", rows: [{id: "empty", title: "It fills up as we talk."}]});
     }
@@ -161,6 +121,12 @@ function face(input) {
             title: line(proposal.content, 96), detail: "I didn't keep this", at: proposal.createdAt, tone: "quiet",
             open: keys["rejected:" + proposal.id].open})), false));
     }
+    function lessonTitle(raw) {
+        const text = plain(raw.replace(/[-_]+/g, " "));
+        if (!text) return "An unnamed lesson";
+        const chars = graphemes(text);
+        return bounded(chars[0].toUpperCase() + chars.slice(1).join(""), 96);
+    }
     // Corrections by lesson, this week against last; the newest correction's words ride its lesson. A ledger that could not be read says so.
     if (input.misses.state === "unavailable") sections.push(issue("misses", "Corrections unavailable", input.misses.reason));
     else if (!input.misses.lessons.length) {
@@ -168,7 +134,7 @@ function face(input) {
             rows: [{id: "misses-none", title: "No corrections this week or last.", tone: "quiet"}]});
     } else {
         sections.push(...list("misses", "Misses", input.misses.lessons.map(lesson => {
-            const row = {id: "miss:" + lesson.lesson, title: line(lesson.lesson, 96) || "An unnamed lesson",
+            const row = {id: "miss:" + lesson.lesson, title: lessonTitle(lesson.lesson),
                 value: lesson.thisWeek + " this week · " + lesson.lastWeek + " last week"};
             if (lesson.latest !== null) {
                 const words = line(lesson.latest.text, 160);
@@ -188,7 +154,13 @@ function face(input) {
     let pageLine = "Saved memories could not be read.";
     if (nothing) pageLine = "Nothing remembered yet; it fills up as we talk.";
     else if (input.kept.state === "available") {
-        pageLine = input.kept.memories.length + " memories loaded" + (total === null ? " · total unavailable" : " of " + total + " saved") + ".";
+        const memories = input.kept.memories, pinned = memories.filter(memory => memory.pinned).length;
+        const week = memories.filter(memory => memory.when === "today" || memory.when === "week").length;
+        const head = total === null
+            ? memories.length + (memories.length === 1 ? " memory" : " memories") + " loaded · total unavailable"
+            : "I remember " + total + (total === 1 ? " thing" : " things")
+                + (memories.length !== total ? " · " + memories.length + " loaded" : "");
+        pageLine = head + " · " + pinned + " pinned · " + week + " this week.";
     }
     return {title: "Memories", line: pageLine, sections};
 }

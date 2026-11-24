@@ -19,8 +19,7 @@ enum SettingsLink {
         try Task.checkCancellation()
         ApplicationLifetime.shared.request(.sidebar(item))
         if let tab {
-            let key = ShellRailTab.storageKey(item)
-            if UserDefaults.standard.string(forKey: key) != tab { UserDefaults.standard.set(tab, forKey: key) }
+            ShellRailTabStore.shared.set(tab, for: item)
         }
     }
 }
@@ -34,6 +33,10 @@ struct ShellPageFrame<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             AlivePageHeader(title: title, line: subtitle, lineID: "shell.page.subtitle")
+                .padding(.horizontal, NativeAgentSpacing.pageInset)
+                .padding(.top, TodayMetrics.topPadding)
+                .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity)
 
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -41,9 +44,6 @@ struct ShellPageFrame<Content: View>: View {
                 .aliveTopDissolve(20)
                 .pageScrollColumn()
         }
-        .padding(.horizontal, NativeAgentSpacing.pageInset)
-        .padding(.top, TodayMetrics.topPadding)
-        .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // Lists and Forms paint opaque backgrounds by default; expose the shared room.
         .scrollContentBackground(.hidden)

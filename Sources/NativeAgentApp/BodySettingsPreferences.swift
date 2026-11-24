@@ -1,12 +1,9 @@
 import AppKit
 import CoreFoundation
-import AppToolRuntime
-import ChatSessionWork
-import EngineRuntime
+import BodyRuntime
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-import Cognition
 import Observation
 import PersistenceCore
 // Blueprint: | `BodySettingsPreferences.swift` | Body dispatcher preference projection and declaration reads |
@@ -38,7 +35,7 @@ enum BodySettingsPreferences {
             guard reading != publishedPreferences else { return }
             publishedPreferences = reading
             feed.updatePreferences(reading.values, issues: reading.issues, declared: declared)
-            NotificationCenter.default.post(name: SettingsFaceChange.platform, object: nil)
+            NotificationCenter.default.post(SettingsFaceChange.PlatformDidChange())
         })
         try await feed.deliverFaces()
         return reading.values

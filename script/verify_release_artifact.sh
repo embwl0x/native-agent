@@ -169,6 +169,18 @@ verify_data_bounds_bundle_resource() {
   echo "[resources] verified bundled data-limits reference: $data_bounds"
 }
 
+verify_image_generation_bundle_resource() {
+  local contents_resources="$1" image_guide
+  [[ -d "$contents_resources" && ! -L "$contents_resources" ]] \
+    || fail "missing app Contents/Resources directory: $contents_resources"
+  image_guide="$contents_resources/docs/IMAGE_GENERATION.md"
+  [[ -f "$image_guide" && ! -L "$image_guide" ]] \
+    || fail "release resources missing image generation guide: $image_guide"
+  [[ -s "$image_guide" ]] \
+    || fail "release image generation guide is empty: $image_guide"
+  echo "[resources] verified bundled image generation guide: $image_guide"
+}
+
 # The shipped release notes are how the agent answers "what changed?" after
 # an update. A bundle without this version's note leaves it with nothing to say.
 verify_release_notes_bundle_resource() {
@@ -377,6 +389,7 @@ if [[ "$REQUIRE_CLEAN_SOURCE" == "true" && "$SOURCE_DIRTY" != "false" ]]; then
 fi
 ruby "$ROOT/script/sync_build_declarations.rb" --verify-resources "$ROOT" "$RESOURCES"
 verify_data_bounds_bundle_resource "$RESOURCES"
+verify_image_generation_bundle_resource "$RESOURCES"
 verify_release_notes_bundle_resource "$RESOURCES" "$VERSION"
 verify_no_derived_context_state "$RESOURCES" "release resources"
 release_assert_no_user_state_in_bundle "$BUNDLE" \

@@ -96,6 +96,8 @@ struct AttachmentChip: View {
             Button { onRemove() } label: {
                 Image(systemName: "xmark")
                     .font(.caption2)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
             .accessibilityLabel("Remove attachment")
@@ -335,6 +337,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     Button(action: onDiscardVoice) {
                         Image(systemName: "xmark")
                             .frame(width: 32, height: 32)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("Discard voice input")

@@ -9,7 +9,7 @@ extension ChatView {
     func pinSession(_ sessionId: String, selectAfterPin: Bool = true) {
         Task {
             let result = await appModel.performChatMutation(.pinConversation(session: sessionId), success: "Conversation pinned")
-            guard result.succeeded else { showToast(result.agentMessage); return }
+            guard result.succeeded else { showToast(result.userMessage); return }
             if selectAfterPin { await appModel.selectChatSession(id: sessionId) }
         }
     }
@@ -17,7 +17,7 @@ extension ChatView {
     func unpinSession(_ sessionId: String) {
         Task {
             let result = await appModel.performChatMutation(.unpinConversation(session: sessionId), success: "Conversation unpinned")
-            if !result.succeeded { showToast(result.agentMessage) }
+            if !result.succeeded { showToast(result.userMessage) }
         }
     }
 

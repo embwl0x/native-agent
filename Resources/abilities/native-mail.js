@@ -511,8 +511,9 @@ function indexPage(accounts, input, terms) {
 function workspaceRead(given, terms) {
     const input = Object.assign({}, given);
     if (input.message_id !== undefined && input.expected_message_id === undefined) input.expected_message_id = "";
-    // A list scope that is not a mailbox may name an account: that account's mailbox (mailbox, else inbox) is the list meant.
-    const named = input.message_id === undefined && typeof input.scope === "string" && input.scope.trim()
+    // A scope that is not a mailbox may name an account: that account's mailbox (mailbox, else inbox) is the list meant, and a body
+    // read keeps the same scope (the row's own account identifiers locate the message).
+    const named = typeof input.scope === "string" && input.scope.trim()
         && !["inbox", "sent", "drafts"].includes(input.scope) ? input.scope.trim() : null;
     if (named !== null) input.scope = input.mailbox !== undefined ? input.mailbox : "inbox";
     const scope = readScope(input);

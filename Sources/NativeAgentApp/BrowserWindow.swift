@@ -1,19 +1,14 @@
-import EngineRuntime
+import BodyRuntime
 import SwiftUI
+import Combine
 import WebKit
 import Network
 import AppKit
 import PersistenceCore
-import AppToolRuntime
-import Browser
-import Dispatcher
+import MacNerves
 import NativeAgentCore
 import NativeAgentShared
 // Blueprint: | `BrowserWindow.swift` | MainActor WebKit event waits; interruptions retire exact views, preserving unknown outcomes |
-
-// MARK: - Models
-
-typealias BrowserLink = EngineRuntime.BrowserLink
 
 // MARK: - Navigation delegate
 
@@ -335,6 +330,7 @@ final class BrowserWindowController: NSObject, ObservableObject, NSWindowDelegat
     func runJS(_ js: String) async throws -> Any? {
         guard let webView else { throw BrowserError.notReady }
         // Wrap untyped results in a Sendable box to satisfy Swift 6 concurrency.
+        // WebKit delivers the JavaScript result as Any on the callback.
         final class Box: @unchecked Sendable { let value: Any?; init(_ v: Any?) { value = v } }
         let box: Box = try await withWebKitCallback(in: webView) { finish in
             webView.evaluateJavaScript(js) { result, error in
@@ -364,6 +360,7 @@ final class BrowserWindowController: NSObject, ObservableObject, NSWindowDelegat
     /// Bound DOM waits natively because a blocked renderer cannot run its own timer; retire the view without a second JavaScript dispatch.
     private func runDOMRead(_ script: String) async throws -> Any? {
         guard let webView else { throw BrowserError.notReady }
+        // WebKit delivers the JavaScript result as Any on the callback.
         final class Box: @unchecked Sendable { let value: Any?; init(_ value: Any?) { self.value = value } }
         let box: Box = try await withWebKitCallback(in: webView) { finish in
             webView.callAsyncJavaScript(script, arguments: [:], in: nil, in: .defaultClient) { result in

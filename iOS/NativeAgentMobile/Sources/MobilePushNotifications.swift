@@ -1,11 +1,10 @@
+import Foundation
 import SwiftUI
 import UserNotifications
 import UIKit
 import NativeAgentShared
-#if canImport(CloudKit)
 import CloudKit
 // Blueprint: | `MobilePushNotifications.swift` | `NativeAgentPushTokenSyncCache` struct; `load`, `shouldSync` |
-#endif
 
 struct NativeAgentPushTokenSyncCache {
     struct PairingIdentity: Codable, Equatable, Sendable {
@@ -322,7 +321,7 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
         DispatchQueue.main.async {
             // Persist before posting navigation so cold-launch views cannot miss a tap before their observer attaches.
             NativeAgentNotificationLaunchIntent.stage(screen: screen, sessionID: sessionID, taskID: taskID)
-            NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil)
+            NotificationCenter.default.post(NativeAgentNotificationLaunchIntent.Staged())
             done()
         }
     }

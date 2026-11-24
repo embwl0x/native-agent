@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 import PhotosUI
 import NativeAgentShared
-import os
+import Synchronization
 // Blueprint: | `ChatModels.swift` | Chat values, runtime controls and Mac transcript projection onto ChatMessage |
 
 struct ChatRuntimeControls: Equatable, Sendable, Codable {
@@ -43,7 +43,7 @@ struct ChatRuntimeControls: Equatable, Sendable, Codable {
         return out
     }
 
-    private static let deviceSourceKeyCache = OSAllocatedUnfairLock<String?>(initialState: nil)
+    private static let deviceSourceKeyCache = Mutex<String?>(nil)
 
     static func makeDeviceSourceKey(deviceName: String) -> String {
         let name = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -52,11 +52,7 @@ struct ChatRuntimeControls: Equatable, Sendable, Codable {
 
     @MainActor
     static func primeDeviceSourceKey() {
-        #if canImport(UIKit)
         let value = makeDeviceSourceKey(deviceName: UIDevice.current.name)
-        #else
-        let value = "iphone"
-        #endif
         deviceSourceKeyCache.withLock { $0 = value }
     }
 

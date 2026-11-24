@@ -1,7 +1,7 @@
-#if canImport(CloudKit) && !os(Linux)
 import Foundation
 import CloudKit
 import OSLog
+import Synchronization
 // Blueprint: | `CloudKitDeviceTransport+Retention.swift` | Bounded oldest-page record retention; subsequent sweeps advance through confirmed deletions |
 
 extension CloudKitDeviceTransport {
@@ -143,19 +143,20 @@ extension CloudKitDeviceTransport {
 
     /// Claim the sweep slot under the lock. Doubles as the rate limiter and as the mutual exclusion between two concurrent drains.
     private func claimRetentionSweep(now: Date) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard Self.shouldSweepRetention(
-            role: role,
-            lastSweepAt: lastRetentionSweepAt,
-            backlog: retentionBacklog,
-            now: now
-        ) else { return false }
-        lastRetentionSweepAt = now
-        return true
+        return state.withLock { state in
+            guard Self.shouldSweepRetention(
+                role: role,
+                lastSweepAt: state.lastRetentionSweepAt,
+                backlog: state.retentionBacklog,
+                now: now
+            ) else { return false }
+            state.lastRetentionSweepAt = now
+            return true
+        }
     }
 
     private func setRetentionBacklog(_ backlog: Bool) {
-        lock.lock(); retentionBacklog = backlog; lock.unlock()
+        state.withLock { $0.retentionBacklog = backlog }
     }
 
     private func sweepExpiredRecords(recordType: String, cutoff: Date) async throws -> DeviceCKSweepOutcome {
@@ -226,4 +227,3 @@ extension CloudKitDeviceTransport {
     }
 
 }
-#endif

@@ -1,6 +1,6 @@
-import AppToolRuntime
-import Dispatcher
-import EngineRuntime
+import BodyRuntime
+import CoreFoundation
+import MacNerves
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -106,7 +106,14 @@ struct BodyFacePresentation: QuietToolPresentationPort {
         let requested = input["page"]?.scalarText ?? ""
         let resolved = AppDoorNames.resolve(requested)
         let target: QuietToolPage?
-        if resolved == "current" { target = currentPage }
+        if resolved == "current" {
+            if scene?.destination?.page == "agent_view",
+               scene?.destination?.item == nil || scene?.destination?.item == "home" {
+                target = QuietPages.drawOnly.first { $0.id == "home" }?.value
+            } else {
+                target = currentPage
+            }
+        }
         else { target = await page(named: resolved) ?? QuietPages.drawOnly.first { $0.id == resolved }?.value }
         guard let target else { return AppToolExecutor.failure("page_unavailable", "Name an available page to render.") }
         let tabKey = (input["tab"]?.scalarText ?? "").lowercased()
@@ -129,14 +136,15 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             }
             height = min(max(supplied, 400), 2400)
         }
-        // Picturing an item opens it first, as showing it does: the Desk's owner selects it, and the page is drawn open. The window stays on its page.
         let asked = (input["item"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         var selected: String?
+        var deskSelectionToRestore: (changed: Bool, prior: String?) = (false, nil)
         if !asked.isEmpty {
             let item = QuietPage(value: target).item
             guard (SidebarItem.shellHome(for: item)?.parent ?? item) == .desk else {
                 return AppToolExecutor.failure("page_item_unavailable", "Only a Desk item opens in a picture; for this page, name one of its tabs with tab.")
             }
+            let prior = model.engine.desk.faceItem
             do {
                 switch try await act(.deskCommand(.init(command: "select", handle: asked, arguments: [:]))) {
                 case .failed(let failure), .refused(let failure): throw failure
@@ -145,9 +153,12 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             } catch let failure as WireFailure {
                 return AppToolExecutor.failure(failure.code, failure.localizedDescription)
             } catch { return AppToolExecutor.failure("desk_item_unselected", error.localizedDescription) }
-            // Asking for the board lets the open item go, so there is none to name.
+            deskSelectionToRestore = (true, prior)
             if asked != "board" {
                 guard let handle = model.engine.desk.faceItem else {
+                    model.engine.desk.faceItem = prior
+                    _ = await model.engine.desk.refreshPage()
+                    await model.engine.pages.flush()
                     return AppToolExecutor.failure("desk_item_unselected", "The Desk answered the selection but holds no item open.")
                 }
                 selected = handle
@@ -192,7 +203,8 @@ struct BodyFacePresentation: QuietToolPresentationPort {
                 if choice.choice == nil, let issue = choice.error { throw PartCallError(code: "chat_choice_unavailable", message: issue) }
                 try await model.engine.providers.deliverFaces()
                 _ = try await transcripts.handle(.openTranscriptReader(.init(session: session, presentation: "chat",
-                    geometry: .init(reader: reader, width: 1280, scale: 1, viewportHeight: height), openingParagraphCount: 120)))
+                    geometry: .init(reader: reader, width: min(Double(NativeAgentSpacing.chatRoomWidth), 1280), scale: 1, viewportHeight: height),
+                    openingParagraphCount: 120)))
             } else {
                 let receipt = await model.refreshForSidebarItem(item)
                 try Task.checkCancellation()
@@ -232,23 +244,29 @@ struct BodyFacePresentation: QuietToolPresentationPort {
             if let failure = image.failure { throw failure }
             guard image.epoch == connection, image.appliedBarrier == barrier, let png = image.png,
                   image.pixelWidth > 0, image.pixelHeight > 0 else { throw FaceWireError.invalidFeedOrder }
-            // The page is drawn with whatever the Desk holds open: another item opened meanwhile is not the picture that was asked for.
             if let selected, model.engine.desk.faceItem != selected {
                 throw PartCallError(code: "desk_item_changed", message: "The Desk's open item changed while \(asked) was being drawn; ask again.")
             }
             result = await Self.save(target, tab: tabKey, root: model.engine.dataRoot, image: image, png: png, sink: imageSink)
-        } catch { result = AppToolExecutor.failure("render_failed", error.localizedDescription) }
-        await settle {
+        } catch {
+            result = AppToolExecutor.failure("render_failed", error.localizedDescription)
+        }
+        let restore = deskSelectionToRestore, opened = selected
+        await settle { @MainActor in
+            if restore.changed, model.engine.desk.faceItem == opened {
+                model.engine.desk.faceItem = restore.prior
+                _ = await model.engine.desk.refreshPage()
+                await model.engine.pages.flush()
+            }
             await model.engine.pages.release(reader: reader)
             await transcripts.close()
         }
         guard let selected, case .object(var fields) = result else { return result }
-        // The selection is the Desk's own and stays, so the reply names it, and a Desk on screen shows it open too.
         fields["item"] = .string(asked)
         fields["selected"] = .string(selected)
         if fields["note"] != nil {
             fields["note"] = .string("An offscreen drawing of this page with \(asked) open, not a capture of the screen. The app was not brought forward; "
-                + "\(asked) is now the Desk's open item, so a Desk on screen shows it open.")
+                + "the Desk's open item was restored.")
         }
         return .object(fields)
     }

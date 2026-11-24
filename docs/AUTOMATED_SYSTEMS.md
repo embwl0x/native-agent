@@ -11,7 +11,7 @@ installation. Checks should be small and tied to the system being diagnosed.
 Read `app {"action":"agent.introspect"}` and use its `data_root` when
 inspecting files. Do not assume the checkout's `data/` is the live root.
 
-`PersistenceCore/PersistenceDataRoot.swift` resolves the process root from
+`PersistenceCore/PersistenceCore/PersistenceDataRoot.swift` resolves the process root from
 `NATIVE_AGENT_DATA_ROOT`, then a development bundle's `REPO_PATH` stamp,
 otherwise Application Support. The root is fixed for that process.
 
@@ -21,17 +21,15 @@ Paths below are relative to that root unless identified as source paths.
 
 | Owner | Responsibility |
 |---|---|
-| `EngineRuntime/NativeAgentEngine.swift` | Root-scoped clients, stores and app ports. |
+| `BodyRuntime/EngineRuntime/NativeAgentEngine.swift` | Root-scoped clients, stores and app ports. |
 | `ChatTurnRuntime` | Conversation execution and after-turn work. |
-| `BackgroundLoops/BackgroundLoopsManager.swift`, `ManagedLoopRunner.swift`, `BackgroundLoopWakes.swift` | Registrations, lifecycle, execution gates, event/deadline wakes and status. |
-| `BackgroundLoops/BackgroundLoops.swift`, `LoopHistory.swift`, `LoopFailureReceipts.swift` | Scheduler timing, outcome accounting, durable clocks and failure receipts. |
-| `BackgroundLoops/LoopContracts.swift`, `LoopStatusEvidence.swift` | Runner contracts, outcomes, backoff and status evidence. |
-| `BackgroundWork` | Maintenance, work, heartbeat and connector runner bodies. |
-| `BackgroundLoops/LoopContracts.swift`, `LoopStatusEvidence.swift` | Runner contracts, outcomes, backoff, tick execution until completion or cancellation and status evidence; watchdog wire keys remain unchanged. |
+| `SenseCore/BackgroundLoops/BackgroundLoopsManager.swift`, `ManagedLoopRunner.swift`, `BackgroundLoopWakes.swift` | Registrations, lifecycle, execution gates, event/deadline wakes and status. |
+| `SenseCore/BackgroundLoops/BackgroundLoops.swift`, `LoopHistory.swift`, `LoopFailureReceipts.swift` | Scheduler timing, outcome accounting, durable clocks and failure receipts. |
+| `SenseCore/BackgroundLoops/LoopContracts.swift`, `LoopStatusEvidence.swift` | Runner contracts, outcomes, backoff, tick execution until completion or cancellation and status evidence; watchdog wire keys remain unchanged. |
 | `BackgroundWork` | Maintenance, work and connector runner bodies. |
-| `EngineRuntime/EngineLaunch.swift`, `EngineComposition.swift` | Launch ordering and concrete loop composition; `EngineChatSurfaces.swift`, `EngineDreams.swift` and `EngineScheduledWork.swift` compose chat surfaces, Dream/REM and scheduled work through installed host effects. |
-| `TriggerScheduler/OneClock.swift`, `EngineScheduledWork.swift` | The one clock: each declared time (`clock/times.json`), delivered once to its owner. |
-| `DeviceSync/MacSyncEngine*.swift` | Mobile command transport and snapshots. |
+| `BodyRuntime/EngineRuntime/EngineLaunch.swift`, `EngineComposition.swift` | Launch ordering and concrete loop composition; `EngineChatSurfaces.swift`, `EngineDreams.swift` and `EngineScheduledWork.swift` compose chat surfaces, Dream/REM and scheduled work through installed host effects. |
+| `DeskCore/TriggerScheduler/OneClock.swift`, `EngineScheduledWork.swift` | The one clock: each declared time (`clock/times.json`), delivered once to its owner. |
+| `BodyRuntime/DeviceSync/MacSyncEngine*.swift` | Mobile command transport and snapshots. |
 
 Core source paths are under `Modules/NativeAgentCore/Sources/`.
 `NativeAgent.app` owns the running system in-process.
@@ -75,7 +73,7 @@ the off-disk backup's own "setup is not complete" skip and the launch Doctor
 tick's separate onboarding guard.
 
 **The mind starts when the agent exists.** The body owns its mind's lifetime
-(`MindLifetime`, `EngineRuntime/EngineMind.swift`), not a mind: before the same
+(`MindLifetime`, `BodyRuntime/EngineRuntime/EngineMind.swift`), not a mind: before the same
 setup predicate holds there is no cognition runtime, no attention intake, no
 `BodyNerve` feeling beats, no mind stream, and none of the mind's sources or
 clock deliveries (part wake, front-app sense, the one clock's part, watch and scan
@@ -184,20 +182,20 @@ backfill; it emits no separate memory-repair or kind-backfill pulse.
 
 | Pulse | Source writer | What its pass records |
 |---|---|---|
-| `launch.chat_index` | `EngineRuntime/EngineLaunch.swift` | Recovered sessions, repaired index rows and corrupt transcripts found. |
-| `launch.browser_stranded` | `EngineRuntime/EngineLaunch.swift` | Successful recovery's stranded browser operations closed as outcome unknown before ingress under the [browser ownership contract](INTERNAL_WORKINGS.md#built-in-browser-operation-ownership). Failed recovery leaves browser starts unavailable while the app starts; it emits no success count. Doctor reads the retained cause. |
-| `launch.approval_executions` | `EngineRuntime/EngineLaunch.swift` | Unapplied approval executions settle before independent retained memory and REM catch-up branches. |
-| `launch.rem_staging` | `EngineRuntime/EngineDreams.swift` | Previously unstaged REM proposals staged. |
-| `abandoned_turns` | `TurnTrace/AbandonedTurnReconciliationHook.swift` | Launch-only resume, recovery obligations and failures. |
-| `history_index` | `ChatToolRuntime/ChatHistoryIndex.swift` | Transcripts/new lines absorbed and listing or persistence diagnostics; retained utility launch work independent of session-index repair. |
-| `chrome_relay` | `ChromeControl/ChromeControlRuntime.swift` | Relay listening state, transport-authority failure or deliberate off state. |
-| `embedding_warmup` | `MemoryV2/MemoryV2+EmbeddingRuntime.swift` | Launch embedder load, an already-loaded model or missing-store skip. |
-| `icloud_drain` | `DeviceSync/iCloudBridge.swift` | Incoming drain counts/skips and the transport's current receive cadence or rest/off state. |
-| `presence_beat` | `DeviceSync/MacSyncEngine+Lifecycle.swift`; `DeviceSync/iCloudBridge.swift` | Published Mac presence, starting cadence or transport off state. |
-| `desk_notify` | `BackgroundWork/DeskNotifyRunner.swift` | Each admitted pass records its actual outcome; no cadence. |
-| `snapshot_integrity` | `DeviceSync/MacSyncEngine+Lifecycle.swift`; `DeviceSync/iCloudBridge.swift` | Snapshot integrity findings/skipped groups, starting cadence or unavailable-iCloud off state. |
-| `studio_canon` | `Cognition/NativeCognitionRuntime+StudioCanon.swift` | Canon proposals staged and works evaluated on the tending pass. |
-| `horizon_expectations` | `Cognition/NativeCognitionRuntime+Expectations.swift` | Open/settled expectations and composed sources, or organism off state. |
+| `launch.chat_index` | `BodyRuntime/EngineRuntime/EngineLaunch.swift` | Recovered sessions, repaired index rows and corrupt transcripts found. |
+| `launch.browser_stranded` | `BodyRuntime/EngineRuntime/EngineLaunch.swift` | Successful recovery's stranded browser operations closed as outcome unknown before ingress under the [browser ownership contract](INTERNAL_WORKINGS.md#built-in-browser-operation-ownership). Failed recovery leaves browser starts unavailable while the app starts; it emits no success count. Doctor reads the retained cause. |
+| `launch.approval_executions` | `BodyRuntime/EngineRuntime/EngineLaunch.swift` | Unapplied approval executions settle before independent retained memory and REM catch-up branches. |
+| `launch.rem_staging` | `BodyRuntime/EngineRuntime/EngineDreams.swift` | Previously unstaged REM proposals staged. |
+| `abandoned_turns` | `SenseCore/TurnTrace/AbandonedTurnReconciliationHook.swift` | The engine resumes checkpoints and confirms settlement against in-flight turns and trace evidence for its own data root. |
+| `history_index` | `BodyRuntime/ChatToolRuntime/ChatHistoryIndex.swift` | Transcripts/new lines absorbed and listing or persistence diagnostics; retained utility launch work independent of session-index repair. |
+| `chrome_relay` | `MacNerves/ChromeControl/ChromeControlRuntime.swift` | Relay listening state, transport-authority failure or deliberate off state. |
+| `embedding_warmup` | `MindCore/MemoryV2/MemoryV2+EmbeddingRuntime.swift` | Launch embedder load, an already-loaded model or missing-store skip. |
+| `icloud_drain` | `BodyRuntime/DeviceSync/iCloudBridge.swift` | Incoming drain counts/skips and the transport's current receive cadence or rest/off state. |
+| `presence_beat` | `BodyRuntime/DeviceSync/MacSyncEngine+Lifecycle.swift`; `BodyRuntime/DeviceSync/iCloudBridge.swift` | Published Mac presence, starting cadence or transport off state. |
+| `desk_notify` | `BodyRuntime/BackgroundWork/DeskNotifyRunner.swift` | Each admitted pass records its actual outcome; no cadence. |
+| `snapshot_integrity` | `BodyRuntime/DeviceSync/MacSyncEngine+Lifecycle.swift`; `BodyRuntime/DeviceSync/iCloudBridge.swift` | Snapshot integrity findings/skipped groups, starting cadence or unavailable-iCloud off state. |
+| `studio_canon` | `BodyRuntime/Cognition/NativeCognitionRuntime+StudioCanon.swift` | Canon proposals staged and works evaluated on the tending pass. |
+| `horizon_expectations` | `BodyRuntime/Cognition/NativeCognitionRuntime+Expectations.swift` | Open/settled expectations and composed sources, or organism off state. |
 
 Use the [turn recovery map](TURN_RESILIENCE.md#9-process-continuation),
 [memory map](MEMORY_SYSTEM_MAP.md), [mobile transport](mobile_companion.md),
@@ -217,11 +215,15 @@ Activity history rejects negative retained event counts and reports unrepresenta
 rollup conversions or merged counts as source errors, leaving stored rows intact.
 Clearing history orders the current span's close, deletion and a fresh permitted
 span through the capture pump, so later capture never targets a deleted row.
-An idle-closed capture resumes on the canonical person-here event through the
-normal activation/privacy gates. The sampled idle-resume path remains available
-where physical-input observation is unavailable.
+After idle closes a span, the agent activates an app, or they raises a window
+in the foreground app, capture requires newer person input. A confirmed raise sets
+that cutoff at report time, even if the app leaves the foreground before capture
+handles it. Person input that interrupts a foreground act wakes capture without
+waiting for the act to finish. Presence, focus, activation and idle
+checks all reopen through the same privacy and input checks. Without Input
+Monitoring, capture uses hardware HID idle and excludes the agent's own posts.
 
-`DoctorChecks/DoctorChecks.swift` defines `SwiftNativeDoctorChecks.defaultChecks`:
+`BodyRuntime/DoctorChecks/DoctorChecks.swift` defines `SwiftNativeDoctorChecks.defaultChecks`:
 16 checks covering storage, runtime JSON, run-ledger and turn-trace integrity,
 sessions and identity, prompt-prefix health, subconscious vitals, model
 compensations, messages, persona, memory, embeddings, ability files, iCloud,
@@ -231,7 +233,6 @@ background-loop health; the visible report is not a fixed 16-row checklist.
 receipts by census ID in a bounded measurement window, excluded from heartbeat
 sweeps.
 Sound echo's ordinary quiet cadence emits no compensation receipt; it is not counted as a model correction.
-receipts by census ID in a bounded measurement window.
 Prompt-prefix token aggregation uses checked sums; an unrepresentable total is
 unmeasured with a failed row naming the provider, turn, session and timestamp.
 Prefix health, subconscious vitals and model compensations measure the running build:
@@ -375,34 +376,34 @@ Local file and snapshot reads still can fail. Repair remains a separate action.
 
 | Check | Source owner | What it measures | Does collection probe? |
 |---|---|---|---|
-| `live.providers` | `EngineRuntime/EngineDoctorMeasurements.swift`; `EngineRuntime/DoctorProviderPathReading.swift` | Saved authentication, active route and native connection-test reading. | No new connection test; reads the provider status feed. Explicit connection tests probe the saved credential. |
-| `live.memory` | `EngineRuntime/EngineDoctorMeasurements.swift` | Mounted canonical store attachment, query response, graph reconciliation failure and SQLite integrity. | Yes: queries the running store each time; `quick_check` is cached between integrity readings. |
-| `live.bridges` | `EngineRuntime/EngineDoctorMeasurements.swift` | Expected local listeners, bound ports and startup failures. | No; reads listener snapshots. |
-| `live.mac_operation_recovery` | `EngineRuntime/EngineDoctorRuntime.swift`; `MacControl/MacControlOperationStore.swift` | Mac owner's launch-recovery admission state, original failure and repair; unavailable refuses Mac effects while looking and other surfaces remain available. | No; reads owner state, never runs recovery. |
-| `live.browser_operation_recovery` | `EngineRuntime/EngineDoctorRuntime.swift`; `Browser/Browser+OperationStore.swift` | Browser owner's launch-recovery state and individual damaged run causes. Uncertain damaged runs refuse new effects; valid sibling rows remain readable and damaged row bytes stay intact. | No; reads owner state and canonical runs, never runs recovery. |
-| `live.agent_connections` | `EngineRuntime/EngineDoctorMeasurements.swift`; `AgentConversations/AgentContactHealth.swift` | Contact readiness, saved reply-path evidence and open connection repairs. | Refreshes readiness; definite unsent failures remain `not_reached` with current readable prerequisites, without reply-path repair. May schedule bounded connection verification for a possibly delivered failed path, without resending its message. |
-| `live.telegram` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configuration, credential availability, poller state and fresh successful-poll evidence. | No new Telegram request; reads the transport's evidence, separately from loop registration. |
-| `live.search` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configured SearXNG URL and bounded checked search response, retaining probe failures separately from refused listeners; no address set reads `off`. | Doctor runs probe; ordinary live refresh reads the retained result, valid for that URL for less than ten minutes. Repair checks/starts only that configured server; explicit setup owns discovery and endpoint selection. Only the Repair button may open Docker Desktop; background repair reports unavailable inventory when its daemon is down. |
-| `live.tools` | `EngineRuntime/EngineDoctorMeasurements.swift` | Unavailable rows fail; quarantined tools warn, naming each to repair or remove; an empty registry is ok. | No tool invoked; execution remains unmeasured. |
-| `live.autonomy` | `EngineRuntime/EngineDoctorMeasurements.swift` | Saved enable posture and reported autonomy runtime state. | No unattended work started. |
-| `install.data_root` | `EngineRuntime/EngineDoctorMeasurements.swift` | Installation move marker and any recorded backup location. | No; reads local installation evidence. |
-| `live.inspector_feed` | `DoctorChecks/DoctorRunsInspectorChecks.swift` (`InspectorFeedHealth`) | Whether an open Inspector observes persisted trace changes. A window with no connection to answer (`face_disconnected`, `face_reply_lost`, `renderer_unavailable`, a closed link) is the closed case. | No; reads observation state. |
-| `live.embedding_download` | `EngineRuntime/DoctorEmbeddingDownloadCheck.swift` | Runtime mode, distribution descriptor, installed release/epoch and retained transfer state. | No transfer or model-load check started; reads local owners and saved parts. |
-| `live.background_loops` | `BackgroundWork/DoctorLoopHealth.swift` | Aggregate manager execution, cadence and listener health. | No tick started; evaluates manager/receipt evidence. |
-| `live.background_loop.<loopId>` | `BackgroundWork/DoctorLoopRecovery.swift` | Each configured registration's health and any repair still awaiting a clean tick. | No tick or restart started. |
-| `live.pulses` | `EngineRuntime/EngineDoctorMeasurements.swift` | The Body view: each organ's `OrganBody` line, deviations first (the same lines as `mind.body`). | No organ pass started. |
-| `live.cognition.runtime` | `EngineRuntime/EngineDoctor+Cognition.swift` | Mounted cognition state is readable; each component row carries its own verdict; disabled cognition reads off. | No; reads mounted state after bootstrap. |
-| `live.cognition.persistence` | `EngineRuntime/EngineDoctor+Cognition.swift` | Persistence state, blocked writes and failure stage. | No restore attempted; reads the cognition snapshot. |
-| `live.cognition.receipts` | `EngineRuntime/EngineDoctor+Cognition.swift` | Availability of persisted cognition loop receipts. | Reads receipt evidence; no loop run. |
-| `live.cognition.readouts` | `EngineRuntime/EngineDoctor+Cognition.swift` | Enabled mood/body values and body-sample freshness. | No new body sample; validates retained readings. |
-| `live.cognition.body` | `EngineRuntime/EngineDoctor+Cognition.swift` | A due residual repair warns; other body observations are stated on an ok row. | No residual repair run. |
-| `live.cognition.capacity` | `EngineRuntime/EngineDoctor+Cognition.swift` | Node and workspace counts against configured caps. | No; reads snapshot counts. |
-| `live.cognition.associations` | `EngineRuntime/EngineDoctor+Cognition.swift` | Any link the association producer drops for missing endpoints warns. | No graph repair or second reader; the frozen read carries the producer's dropped count. |
-| `live.cognition.context_flow` | `EngineRuntime/EngineDoctor+Cognition.swift` | Context Flow registration, source errors and arena pressure. | No reconciliation; reads the owner's health state. |
-| `live.cognition.phone_pairing` | `EngineRuntime/EngineDoctor+Cognition.swift` | Checked pairing authority and the bridge's pairing/last-exchange assessment. | No phone message sent. |
-| `live.phone_notifications` | `EngineRuntime/EngineDoctor+Cognition.swift` | Checked paired-phone authority; optional APNS credentials and wake outcomes do not gate ordinary notifications. | No push sent; unreadable authority reports unavailable. |
-| `status.desk_attention` | `EngineRuntime/EngineDoctor+StatusChecks.swift` | Blocked work or parent/descendant contradictions warn; person decisions stay distinct. | Reads stores and diagnostic narration; reconciles parents only on repair. |
-| `status.activity` | `EngineRuntime/EngineDoctor+StatusChecks.swift` | Malformed rows, unreadable trace rows, or a failed turn whose experience still owes something fail; settled failures are stated (count, newest) on an ok row; unresolved effects stay unmeasured. | Reads activity and cross-launch trace details; no replay. |
+| `live.providers` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift`; `BodyRuntime/EngineRuntime/DoctorProviderPathReading.swift` | Saved authentication, active route and native connection-test reading. | No new connection test; reads the provider status feed. Explicit connection tests probe the saved credential. |
+| `live.memory` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Mounted canonical store attachment, query response, graph reconciliation failure and SQLite integrity. | Yes: queries the running store each time; `quick_check` is cached between integrity readings. |
+| `live.bridges` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Expected local listeners, bound ports and startup failures. | No; reads listener snapshots. |
+| `live.mac_operation_recovery` | `BodyRuntime/EngineRuntime/EngineDoctorRuntime.swift`; `MacNerves/MacControl/MacControlOperationStore.swift` | Mac owner's launch-recovery admission state, original failure and repair; unavailable refuses Mac effects while looking and other surfaces remain available. | No; reads owner state, never runs recovery. |
+| `live.browser_operation_recovery` | `BodyRuntime/EngineRuntime/EngineDoctorRuntime.swift`; `MacNerves/Browser/Browser+OperationStore.swift` | Browser owner's launch-recovery state and individual damaged run causes. Uncertain damaged runs refuse new effects; valid sibling rows remain readable and damaged row bytes stay intact. | No; reads owner state and canonical runs, never runs recovery. |
+| `live.agent_connections` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift`; `BodyRuntime/AgentConversations/AgentContactHealth.swift` | Contact readiness, saved reply-path evidence and open connection repairs. | Refreshes readiness; definite unsent failures remain `not_reached` with current readable prerequisites, without reply-path repair. May schedule bounded connection verification for a possibly delivered failed path, without resending its message. |
+| `live.telegram` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Configuration, credential availability, poller state and fresh successful-poll evidence. | No new Telegram request; reads the transport's evidence, separately from loop registration. |
+| `live.search` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Configured SearXNG URL and bounded checked search response, retaining probe failures separately from refused listeners; no address set reads `off`. | Doctor runs probe; ordinary live refresh reads the retained result, valid for that URL for less than ten minutes. Repair checks/starts only that configured server; explicit setup owns discovery and endpoint selection. Only the Repair button may open Docker Desktop; background repair reports unavailable inventory when its daemon is down. |
+| `live.tools` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Unavailable rows fail; quarantined tools warn, naming each to repair or remove; an empty registry is ok. | No tool invoked; execution remains unmeasured. |
+| `live.autonomy` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Saved enable posture and reported autonomy runtime state. | No unattended work started. |
+| `install.data_root` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Installation move marker and any recorded backup location. | No; reads local installation evidence. |
+| `live.inspector_feed` | `BodyRuntime/DoctorChecks/DoctorRunsInspectorChecks.swift` (`InspectorFeedHealth`) | Whether an open Inspector observes persisted trace changes. A window with no connection to answer (`face_disconnected`, `face_reply_lost`, `renderer_unavailable`, a closed link) is the closed case. | No; reads observation state. |
+| `live.embedding_download` | `BodyRuntime/EngineRuntime/DoctorEmbeddingDownloadCheck.swift` | Runtime mode, distribution descriptor, installed release/epoch and retained transfer state. | No transfer or model-load check started; reads local owners and saved parts. |
+| `live.background_loops` | `BodyRuntime/BackgroundWork/DoctorLoopHealth.swift` | Aggregate manager execution, cadence and listener health. | No tick started; evaluates manager/receipt evidence. |
+| `live.background_loop.<loopId>` | `BodyRuntime/BackgroundWork/DoctorLoopRecovery.swift` | Each configured registration's health and any repair still awaiting a clean tick. | No tick or restart started. |
+| `live.pulses` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | The Body view: each organ's `OrganBody` line, deviations first (the same lines as `mind.body`). | No organ pass started. |
+| `live.cognition.runtime` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Mounted cognition state is readable; each component row carries its own verdict; disabled cognition reads off. | No; reads mounted state after bootstrap. |
+| `live.cognition.persistence` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Persistence state, blocked writes and failure stage. | No restore attempted; reads the cognition snapshot. |
+| `live.cognition.receipts` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Availability of persisted cognition loop receipts. | Reads receipt evidence; no loop run. |
+| `live.cognition.readouts` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Enabled mood/body values and body-sample freshness. | No new body sample; validates retained readings. |
+| `live.cognition.body` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | A due residual repair warns; other body observations are stated on an ok row. | No residual repair run. |
+| `live.cognition.capacity` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Node and workspace counts against configured caps. | No; reads snapshot counts. |
+| `live.cognition.associations` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Any link the association producer drops for missing endpoints warns. | No graph repair or second reader; the frozen read carries the producer's dropped count. |
+| `live.cognition.context_flow` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Context Flow registration, source errors and arena pressure. | No reconciliation; reads the owner's health state. |
+| `live.cognition.phone_pairing` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Checked pairing authority and the bridge's pairing/last-exchange assessment. | No phone message sent. |
+| `live.phone_notifications` | `BodyRuntime/EngineRuntime/EngineDoctor+Cognition.swift` | Checked paired-phone authority; optional APNS credentials and wake outcomes do not gate ordinary notifications. | No push sent; unreadable authority reports unavailable. |
+| `status.desk_attention` | `BodyRuntime/EngineRuntime/EngineDoctor+StatusChecks.swift` | Blocked work or parent/descendant contradictions warn; person decisions stay distinct. | Reads stores and diagnostic narration; reconciles parents only on repair. |
+| `status.activity` | `BodyRuntime/EngineRuntime/EngineDoctor+StatusChecks.swift` | Malformed rows, unreadable trace rows, or a failed turn whose experience still owes something fail; settled failures are stated (count, newest) on an ok row; unresolved effects stay unmeasured. | Reads activity and cross-launch trace details; no replay. |
 
 Domain laws remain in the [memory map](MEMORY_SYSTEM_MAP.md),
 [authored-part manifest](skill_manifest_spec.md),
@@ -414,7 +415,7 @@ it does not grant a repair or infer delivery from setup.
 
 ## 4. The loop manifest — every registered lane
 
-`EngineRuntime/EngineLaunch.swift` registers the lanes. The table gives the
+`BodyRuntime/EngineRuntime/EngineLaunch.swift` registers the lanes. The table gives the
 lanes and their production defaults as of this writing; the installed set is
 `logs/background_loop_state.json` and Doctor's aggregate `live.background_loops`
 row, with individual readings at `live.background_loop.<loopId>`. Enabled state,
@@ -438,7 +439,6 @@ An explicit run of a stopped loop follows the same per-read rule. See
 | `cognition_replay` | Daily | Episodic replay. *Needs the agent.* |
 | `desk_notify` | Declared changes, next nag or quiet end, launch | Notify about eligible tracked Desk changes. |
 | `delegation_outcome` | Launch, owner changes, quiet-hours end | Reconcile jobs, notifications, contact replies and settled Desk waits. |
-| `desk_notify` | Events/deadlines; daily repair | Notify about eligible tracked Desk changes. |
 | `telegram_poll` | Long-poll transport | Admit configured Telegram messages. |
 | `slack_socket_mode` | Socket transport | Admit configured Slack messages; socket failure is reported and reconnects that same transport, with no Web API ingress/history polling. |
 | `presence_beat` | Mac activity edges + 240s renewal; 300s due-only reconciliation | Publish canonical presence on launch, activation/deactivation, wake, network regain and completed conversations. Renew inside the phone's 300s contact window; never renew unchanged snapshots. Independent transport-owned reads continue at 20s regardless of publication outcome. Ship the phone freshness reader first. |
@@ -452,8 +452,10 @@ watches Desk ops/base, nag config, the desk-notify part, live inbox and user
 preferences. `ForPerson` emits only changed matters, so an unchanged Desk
 question cannot wake this evaluation and its run accounting again; see the
 [unchanged experience law](EXPERIENCE.md#delivery-and-face). Its CPU-only proposal
-calls no action and changes no notebook, so a successful evaluation writes no
-run accounting under the [run evidence contract](skill_manifest_spec.md).
+calls no action and changes no notebook. A settled live evaluation records run
+accounting if its version is still current or previous at settlement. An
+explicit preview skips settlement and accounting. A missing count alone cannot
+establish whether an evaluation ran. See the [run evidence contract](skill_manifest_spec.md).
 
 Telegram and Slack remain registered as disabled when unconfigured and perform
 no remote work. Saved-configuration or credential read failures register as
@@ -488,7 +490,7 @@ verification.
 Queued helper runs retain their initiating turn's steering sources through claim and execution.
 Requested helper replies follow queue and shelf changes, without a thirty-second
 pending-result poll. A helper's cadence is its `helper:<id>` time on the one clock
-(`StandingBots/BotRunnerScheduler.swift`). The scheduler drains queued requests.
+(`BodyRuntime/StandingBots/BotRunnerScheduler.swift`). The scheduler drains queued requests.
 When recovery finds an interrupted claim that never admitted execution, it
 saves the request's refusal before retiring the claim and continues the drain.
 A helper's cron cadence declares its rhythm on that clock, including when an old
@@ -570,7 +572,7 @@ charged against a new helper.
 What the agent means to do later is a MY QUEUE intention, filed through
 `queue.add {text, when, until?, say?}`. Each step's next time is a `moment:<handle>`
 time on the one clock, and what comes due is posted once as a `moment` happening
-([Intentions](INTENTIONS.md)). Every declared time is a `TriggerScheduler/OneClock.swift`
+([Intentions](INTENTIONS.md)). Every declared time is a `DeskCore/TriggerScheduler/OneClock.swift`
 time (`clock/times.json`), its next occurrence saved before delivery, delivered once
 to whoever declared it (`EngineScheduledWork.registerClockOwners`): `part:<id>:<cron>` (a part header's `schedule:` wake; the
 clock posts its signal and the run is the part's), `watch:<id>` and `scan:<id>`,
@@ -578,7 +580,7 @@ clock posts its signal and the run is the part's), `watch:<id>` and `scan:<id>`,
 times without delivering them. Sleep and REM declare no times and have no handlers.
 
 `schedule.create` schedules only reads: `connector_action` (a watch) or
-`proactive_scan` (`TriggerScheduler/ScheduledReads.swift`). Any other kind is
+`proactive_scan` (`DeskCore/TriggerScheduler/ScheduledReads.swift`). Any other kind is
 refused as unsupported before timing normalization; the action's description
 points intentions, check-ins and reminders to `queue.add`. `schedule.list` lists the scheduled reads;
 `schedule.cancel` requires the canonical ID returned by listing. It and `schedule.delete` share `scheduler_cancel_job`, which
@@ -626,13 +628,12 @@ changes their; `app {action:"mind.dream", preview:true}` instead generates and
 decodes on current lived material, reporting care judgments through the same
 apply checks on a copy. It spends provider usage but writes no diary, cutoff,
 care, lesson, mood, Experience or wake, and leaves the schedule intact. Preview
-does not drain owed moments. The six clock verbs (`MindClockVerb`) refuse preview
+does not drain owed moments. The five clock verbs (`MindClockVerb`) refuse preview
 with a specific explanation before entering their effectful owners. Preview receipts
 remain only redacted `mind.run_now` traces with `preview:true`; dispatch, provider
 health/usage and repair evidence cannot turn an inspection into lived learning.
-Other cognition clocks have matching immediate verbs, and `mind.cross` posts a
-line as a world happening; [Subconscious](SUBCONSCIOUS.md#run-a-clock-owner-now)
-owns their contract.
+Other cognition clocks have matching immediate verbs;
+[Subconscious](SUBCONSCIOUS.md#run-a-clock-owner-now) owns their contract.
 
 The diary entry uses the night's start date in the local calendar. Inspect the admission row
 and dream outcome; absence of an entry alone is not evidence of failure. REM stages growth proposals through the approval
@@ -644,7 +645,7 @@ Each saved dream section carries its claim-source block and immutable `dream-id`
 Before publication or effects, one durable `dream_diary/work/<section UUID>.json`
 record holds the exact write, consumed-message cutoff, care/self input,
 reflection judgment and integration, mood, completion signal, lessons and citations.
-The [dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--schedule-artifacts-re-entry) owns their ordering:
+The [dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--times-artifacts-re-entry) owns their ordering:
 readable care evidence precedes the cutoff, the produced reflection receipt precedes
 care/mood effects, and each effect records done or explicitly skipped. Failure notes
 never gate retry. Every admitted real pass retries still-owed work across active and
@@ -678,13 +679,17 @@ work reaches their as a practice note inside the turn on its second meeting; no
 
 ### Scheduled reads are watches
 
-The rhythm grammar (`TriggerScheduler/SchedulerRecurrence.swift`) refuses timestamps
+The rhythm grammar (`DeskCore/TriggerScheduler/SchedulerRecurrence.swift`) refuses timestamps
 outside Gregorian years 1–9999 or the checked occurrence-millisecond domain;
 occurrence keys and next occurrences use the same checked conversions.
+Calendar rhythms walk the clock's civil minutes: a minute a spring-forward gap
+skips occurs at the first minute after the gap, a fall-back minute occurs once,
+and a rhythm with no occurrence in one 400-year Gregorian cycle has none. A
+stepped cron value (`5/15`) runs from that value through the field's maximum.
 
 A `connector_action` read's `actionId` is any action of the app door (the agent's
 parts as `authored.<id>`, the Mac's readers such as `mail.recent` or `mac.look`), and
-it runs through that one door like any of the agent's calls (`ToolsFacade.withPartDoor`,
+it runs through that one door like any of the agent's calls (`NativeAgentEngine.withPartDoor`,
 origin `scheduler:watch:<action>`), as a read. An action whose class, as the
 door judges it as it runs (`PermissionLaw.doorClass`), is not a read is refused
 when it is scheduled, with the sentence that a watch reads and that acting on a
@@ -732,7 +737,7 @@ that recipe unavailable with its cause, without hiding the other readings.
 
 ## 5. MacSync / iCloud bridge (Mac ⇄ iPhone)
 
-`DeviceSync/MacSyncEngine` receives signed commands, checks their identity,
+`BodyRuntime/DeviceSync/MacSyncEngine` receives signed commands, checks their identity,
 dispatches through the Mac and publishes responses and snapshots.
 
 Cognition events compare the phone-visible organism status with `generatedAt`
@@ -740,7 +745,7 @@ cleared and call plain `writeSnapshots()` only when it changes. Experience
 changes skip snapshot publication when their mobile projection is equal.
 
 The local bookkeeping under `icloud/` is distinct from the transport's
-container. `DeviceSync/State/ICloudSyncStatePaths.swift` defines:
+container. `PersistenceCore/DeviceSyncState/ICloudSyncStatePaths.swift` defines:
 
 | Evidence | Meaning |
 |---|---|
@@ -761,7 +766,7 @@ attempting a retry. A transport write is not Mac-owned completion.
 
 ## 6. MemoryV2 → USER.md generation (the identity doc)
 
-`MemoryV2/MemoryV2+UserMDGen.swift` regenerates `USER.md` in the active
+`MindCore/MemoryV2/MemoryV2+UserMDGen.swift` regenerates `USER.md` in the active
 persona root from eligible active memories. It respects onboarding and
 preserves a damaged existing document rather than silently replacing it.
 The generator owns one running projection and a dirty follow-up, without a trailing clock;
@@ -787,7 +792,7 @@ Synchronous saved-policy consumers and authorization share TrustCenter's checked
 reader; saved flag reads retain their declared defaults and report damaged state.
 MacControl reads posture through `PermissionLaw` from the retained policy.
 
-`ApprovalInbox/ApprovalInbox.swift` owns
+`MacNerves/ApprovalInbox/ApprovalInbox.swift` owns
 `workflows/approvals/requests.json`. A pending request is a decision waiting
 to be made, not automatically an automation failure. Read its origin, bound
 action, decision and execution outcome.
@@ -836,7 +841,7 @@ Start with the smallest evidence relevant to the reported problem:
    named repair while healthy siblings proceed; it is not ended or immediately rearmed as a clock retry. Clock read/save failures owe
    named repair through the experience owner.
    One deadline is armed at the earliest handled time; a clock or zone change
-   re-arms from what is saved (`TriggerScheduler/OneClock.swift`). A zone change while the clock is alive preserves each pending calendar
+   re-arms from what is saved (`DeskCore/TriggerScheduler/OneClock.swift`). A zone change while the clock is alive preserves each pending calendar
    occurrence's civil date and minute, resolves it in the new zone and saves before delivery. Intervals and explicit one-time instants stay absolute.
    A live Time carries its projection zone across declaration/listing suspensions; projection metadata alone never rewrites the saved time.
    An ended one-shot stays in the same clock as delivery evidence, outside pending listings and deadlines. Restore retains that evidence even for ids
@@ -882,27 +887,27 @@ in [Anatomy of a Turn](ANATOMY_OF_A_TURN.md),
 
 These mechanisms are not additional manager loop registrations. The final
 column distinguishes status reads from work on their owning trigger, including
-the artifact-listing exception. `EngineRuntime/EngineLaunch.swift` composes
+the artifact-listing exception. `BodyRuntime/EngineRuntime/EngineLaunch.swift` composes
 their launch and termination lifetimes.
 
 | Mechanism | Source owner | Trigger and evidence | Does a read probe or run work? |
 |---|---|---|---|
-| Part signals | `EngineRuntime/EnginePartWake.swift` | Source-owned signals and persisted turn terminals reach the wake index. | A part runs on its declared wake, not on a status read. [Wake contract](skill_manifest_spec.md#wake-signals). |
-| Part file wakes | `EngineRuntime/EnginePartWake.swift` | Declared file watches deliver changes and suppress self-write echoes. | Reading status does not emit a file-change wake. [Wake contract](skill_manifest_spec.md#wake-signals), [watcher settlement](STOP.md). |
-| Part presence wakes | `EngineRuntime/EnginePartWake.swift`; `MacControl/PersonPresence.swift`, `MacPersonInput.swift`; `PersistenceCore/PhoneSenseHistory.swift` | Mac-input transitions and durable phone-motion observations reach the same person presence owner; fresh walking/driving can signal away, later physical Mac input signals here. | No presence probe from a status read; silence/unknown is no phone verdict. [Wake contract](skill_manifest_spec.md#wake-signals), [phone evidence](mobile_companion.md#where-the-person-is). |
+| Part signals | `BodyRuntime/EngineRuntime/EnginePartWake.swift` | Source-owned signals and persisted turn terminals reach the wake index. | A part runs on its declared wake, not on a status read. [Wake contract](skill_manifest_spec.md#wake-signals). |
+| Part file wakes | `BodyRuntime/EngineRuntime/EnginePartWake.swift` | Declared file watches deliver changes and suppress self-write echoes. | Reading status does not emit a file-change wake. [Wake contract](skill_manifest_spec.md#wake-signals), [watcher settlement](STOP.md). |
+| Part presence wakes | `BodyRuntime/EngineRuntime/EnginePartWake.swift`; `MacNerves/MacControl/PersonPresence.swift`, `MacPersonInput.swift`; `PersistenceCore/PersistenceCore/PhoneSenseHistory.swift` | Mac-input transitions and durable phone-motion observations reach the same person presence owner; fresh walking/driving can signal away, later physical Mac input signals here. | No presence probe from a status read; silence/unknown is no phone verdict. [Wake contract](skill_manifest_spec.md#wake-signals), [phone evidence](mobile_companion.md#where-the-person-is). |
 | Network sense and wakes | `NetworkSense.swift` | Path edges and return wakes. | [Request lifetime][provider-liveness]. |
-| Part resume wakes | `EngineRuntime/EnginePartWake.swift` | The mind's start (launch once setup has finished, or setup finishing) delivers `resumed` after registering source observers. | Reading status does not resume a part. [Wake contract](skill_manifest_spec.md#wake-signals). |
-| First-terminal Doctor refresh | `EngineRuntime/EngineDoctor+FirstTurnRefresh.swift` | Once per launch, the first persisted terminal triggers a fresh Doctor pass under its configured gate. | The terminal event measures afresh; reading the saved report does not. See [Doctor](#3-doctor--the-health-authority). |
-| Approval / Desk waits | `ApprovalTransactions/ApprovalReconciliation.swift` (`settleDeskWaitsOnEveryResolve`) | Manager-owned observation subscribes before launch reconciliation, then settles Desk waits on approval resolution. | Observation performs reconciliation; reading a card grants nothing. [Approval law](approval-schema.md#resolution-and-execution). |
-| Grant observation | `ApprovalTransactions/InlineInteractionResolver+ChatLifecycle.swift` (`GrantWatch`) | Manager-owned permission-change observation (the agent's window coming to the front, a grant changed, System Settings quit) and card taps coalesce grant rechecks. The one walk (`SystemPermissionPreflight.requestMacOSAccess`) first asks every grant macOS can still ask in place, a failed request said in its result while the rest go on, then opens the pane of the first grant still off. On each wake a running permission card re-reads macOS; when that grant is on, or the person came back without it (the pane joins the card's shown panes and the walk moves past it), the walk goes on and the card records what it waits on (`waitingOn`) after that ask. The one restart is offered once, at the end, beside Go through again; Continue starts the walk over. Trust's "Ask for every prompt not yet answered" and the agent's ask on the person's word continue an open card holding those grants or file one. Launch-applied grants share that restart, performed only by the person's tap on the card. | Its observation reads grants; only a card the person tapped asks for the next one, and a saved health read requests none. [Authority](ONE_DOOR.md#authority-and-receipts). |
-| Interaction delivery | `ApprovalTransactions/InlineInteractionDelivery.swift` | Manager-owned launch recovery restores card delivery pointers, then exact session changes refresh delivery. | The observer performs delivery work; reading saved status does not. [Delivery obligations](EXPERIENCE.md). |
+| Part resume wakes | `BodyRuntime/EngineRuntime/EnginePartWake.swift` | The mind's start (launch once setup has finished, or setup finishing) delivers `resumed` after registering source observers. | Reading status does not resume a part. [Wake contract](skill_manifest_spec.md#wake-signals). |
+| First-terminal Doctor refresh | `BodyRuntime/EngineRuntime/EngineDoctor+FirstTurnRefresh.swift` | Once per launch, the first persisted terminal triggers a fresh Doctor pass under its configured gate. | The terminal event measures afresh; reading the saved report does not. See [Doctor](#3-doctor--the-health-authority). |
+| Approval / Desk waits | `BodyRuntime/ApprovalTransactions/ApprovalReconciliation.swift` (`settleDeskWaitsOnEveryResolve`) | Manager-owned observation subscribes before launch reconciliation, then settles Desk waits on approval resolution. | Observation performs reconciliation; reading a card grants nothing. [Approval law](approval-schema.md#resolution-and-execution). |
+| Grant observation | `BodyRuntime/ApprovalTransactions/InlineInteractionCoordinator+ChatLifecycle.swift` (`InlineInteractionCoordinator.observeGrants`) | Manager-owned permission-change observation (the agent's window coming to the front, a grant changed, System Settings quit) and card taps coalesce grant rechecks. The one walk (`SystemPermissionPreflight.requestMacOSAccess`) first asks every grant macOS can still ask in place, a failed request said in its result while the rest go on, then opens the pane of the first grant still off. On each wake a running permission card re-reads macOS; when that grant is on, or the person came back without it (the pane joins the card's shown panes and the walk moves past it), the walk goes on and the card records what it waits on (`waitingOn`) after that ask. The one restart is offered once, at the end, beside Go through again; Continue starts the walk over. Trust's "Ask for every prompt not yet answered" and the agent's ask on the person's word continue an open card holding those grants or file one. Launch-applied grants share that restart, performed only by the person's tap on the card. | Its observation reads grants; only a card the person tapped asks for the next one, and a saved health read requests none. [Authority](ONE_DOOR.md#authority-and-receipts). |
+| Interaction delivery | `BodyRuntime/ApprovalTransactions/InlineInteractionDelivery.swift` | Manager-owned launch recovery restores card delivery pointers, then exact session changes refresh delivery. | The observer performs delivery work; reading saved status does not. [Delivery obligations](EXPERIENCE.md). |
 
 The manager retains approval, grant and interaction observation together through
 its `residentObservation` lifecycle. Their ownership is in
-`BackgroundLoops/BackgroundLoopsManager.swift`, not a second scheduler.
+`SenseCore/BackgroundLoops/BackgroundLoopsManager.swift`, not a second scheduler.
 
-Network sense and wakes use `NativeAgentCore/NetworkSense.swift`,
-`EngineRuntime/EnginePartWake.swift` and `BackgroundWork/DelegationBackgroundWork.swift`.
+Network sense and wakes use `NativeAgentCore/NativeAgentCore/NetworkSense.swift`,
+`BodyRuntime/EngineRuntime/EnginePartWake.swift` and `BodyRuntime/BackgroundWork/DelegationBackgroundWork.swift`.
 One path monitor serves provider waits, iCloud drain-on-return and Dot recovery.
 `network.down` / `network.up` publish on path edges; return re-ticks delegation.
 Each edge after the initial path baseline also posts one `world` happening on door `mac`, keyed by edge and source callback time.

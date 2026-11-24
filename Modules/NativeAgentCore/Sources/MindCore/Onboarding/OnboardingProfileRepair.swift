@@ -1,0 +1,90 @@
+import Foundation
+import NativeAgentShared
+import Observation
+import NativeAgentCore
+import PersistenceCore
+import DeskCore
+// Blueprint: | `OnboardingProfileRepair.swift` | Missing-only profile repair under completion and profile locks; completed persona bytes stay intact |
+extension SwiftNativeOnboardingClient {
+    /// Missing-profile repair requires both names, a completion anchor and no pending completion; preserve completed persona bytes.
+    @concurrent public func repairProfile(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult {
+        let agentName = payload.agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let userName = payload.userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let personaType = payload.personaType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let refusal = Self.nameRefusal(agent: agentName, user: userName) { return refusal }
+        if !PersonaTemplates.validTypes.contains(personaType) {
+            return OnboardingCompleteResult(ok: false, error: "invalid_persona_type")
+        }
+        return try await SwiftNativePersistenceCore.withFileLock(transactionManifestPath) {
+            // Refuse before reconciliation can remove persona documents.
+            if let refusal = try profileRepairRefusalLocked() {
+                return refusal
+            }
+            try await reconcilePendingResetLocked()
+            // Reset reconciliation may remove the anchor; decide again over its resulting state.
+            if let refusal = try profileRepairRefusalLocked() {
+                return refusal
+            }
+            // Absence checking and writing share the profile-file lock.
+            return try await SwiftNativePersistenceCore.withFileLock(profileJSONPath) {
+                guard !FileManager.default.fileExists(atPath: profileJSONPath.path) else {
+                    return OnboardingCompleteResult(
+                        ok: false,
+                        error: "profile_already_present",
+                        detail: "profile.json is present; repair never overwrites existing bytes."
+                    )
+                }
+                let plan = try Self.makeProfileUpdatePlan(
+                    profilePath: profileJSONPath,
+                    agentName: agentName,
+                    personaType: personaType,
+                    userName: userName
+                )
+                // A nil base hash requires absence; ensureCommitted also verifies the written bytes.
+                let intent = OnboardingTargetIntent(
+                    role: "profile",
+                    content: plan.content,
+                    sha256: SHA256Hex.of(Data(plan.content.utf8)),
+                    baseSHA256: plan.baseSHA256
+                )
+                try Self.ensureCommitted(intent, to: profileJSONPath)
+                return OnboardingCompleteResult(
+                    ok: true,
+                    agentName: agentName,
+                    personaType: personaType,
+                    userName: userName
+                )
+            }
+        }
+    }
+    /// Caller holds the completion-manifest lock; nil permits repair. Recheck after reset reconciliation.
+    private func profileRepairRefusalLocked() throws -> OnboardingCompleteResult? {
+        if try Self.loadTransactionIfPresent(
+            at: transactionManifestPath,
+            personaRoot: personaRoot,
+            profilePath: profileJSONPath
+        ) != nil {
+            return OnboardingCompleteResult(
+                ok: false,
+                error: "onboarding_in_progress",
+                detail: "An interrupted onboarding transaction already owns profile.json. Resume it instead of repairing."
+            )
+        }
+        let fm = FileManager.default
+        guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) else {
+            return OnboardingCompleteResult(
+                ok: false,
+                error: "profile_repair_not_required",
+                detail: "No completed onboarding was found on this Mac, so there is no profile to repair."
+            )
+        }
+        guard !fm.fileExists(atPath: profileJSONPath.path) else {
+            return OnboardingCompleteResult(
+                ok: false,
+                error: "profile_already_present",
+                detail: "profile.json is present; repair never overwrites existing bytes."
+            )
+        }
+        return nil
+    }
+}

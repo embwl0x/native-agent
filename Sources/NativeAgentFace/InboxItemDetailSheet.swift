@@ -34,15 +34,26 @@ struct InboxItemDetailSheet: View {
     }
 
     var body: some View {
-        List {
-            FaceView(face: page, door: door, session: session)
+        VStack(alignment: .leading, spacing: 0) {
+            List {
+                FaceView(face: page, door: door, session: session)
+            }
+            .faceList()
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .macFaceStyle()
+            Divider()
+            HStack {
+                Spacer()
+                Button("Close", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
         }
-        .environment(\.faceInList, true)
-        .listStyle(.plain)
-        .macFaceStyle()
         .frame(minWidth: 320, idealWidth: 560, minHeight: 320, idealHeight: 480)
         .onAppear {
-            guard session.operations[item.id] == nil else { return }
+            guard session.operation(for: item.id) == nil else { return }
             session.submit(.init(section: "face:note", row: item.id), row: item.id, action: "read", value: nil,
                            call: actionCall("read"), door: door)
         }
@@ -77,9 +88,6 @@ struct InboxItemDetailSheet: View {
                     text: text.utf8.count <= PartFace.Block.inlineByteLimit ? text : nil, revision: SHA256Hex.of(utf8: text))))
             }
         }
-        sections.append(.init(id: "close", style: .flow, rows: [
-            .init(id: "close", title: "Close", actions: [.init(id: "close", label: "Close", open: "page:inbox")]),
-        ]))
         return PartFace(sections: sections)
     }
 
@@ -88,9 +96,7 @@ struct InboxItemDetailSheet: View {
     }
 
     private var door: ClosureFaceDoor {
-        ClosureFaceDoor(open: { link in
-            if link == "page:inbox" { onClose() }
-        }, waitingOn: "the note", read: { request in
+        ClosureFaceDoor(open: { _ in }, waitingOn: "the note", read: { request in
             guard let text = documents[request.key], request.revision == SHA256Hex.of(utf8: text) else {
                 throw PartCallError(code: "inbox_detail_changed", message: "The selected note's detail changed. Open it again.")
             }

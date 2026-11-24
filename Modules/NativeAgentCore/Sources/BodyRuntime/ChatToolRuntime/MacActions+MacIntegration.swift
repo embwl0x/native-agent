@@ -1,0 +1,279 @@
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+import DeskCore
+import MindCore
+import ProviderRouting
+import MacNerves
+import SenseCore
+import MapKit
+// Blueprint: | `MacActions+MacIntegration.swift` | `SwiftToolDispatcher`; declared integration admission; checked routes and maps |
+
+extension SwiftToolDispatcher {
+    @MainActor
+    private func place(_ text: String) async throws -> sending MKMapItem {
+        try Task.checkCancellation()
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = text
+        guard let item = try await MKLocalSearch(request: request).start().mapItems.first else {
+            throw AutonomyGateError.toolDenied(reason: "No map location matched '\(text)'. Use a more specific address or place name.")
+        }
+        return item
+    }
+
+    @MainActor
+    private func describe(_ item: MKMapItem) -> [String: JSONValue] {
+        ["name": item.name.map(JSONValue.string) ?? .null,
+            "address": item.addressRepresentations?.fullAddress(includingRegion: true, singleLine: true).map(JSONValue.string) ?? .null,
+            "latitude": .double(item.location.coordinate.latitude), "longitude": .double(item.location.coordinate.longitude),
+            // Arrival times can cross time zones.
+            "time_zone": item.timeZone.map { .string($0.identifier) } ?? .null]
+    }
+
+    @MainActor
+    func impl_maps_search(args: MapsSearchArgs) async throws -> JSONValue {
+        let originalQuery = args.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        var query = originalQuery
+        var near = args.near?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var querySplit: JSONValue = .null
+        if near.isEmpty, let separator = query.range(of: #"\s+(near|in|around)\s+"#, options: [.regularExpression, .caseInsensitive]) {
+            let separatorWord = String(query[separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            near = String(query[separator.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            query = String(query[..<separator.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            querySplit = .object(["original_query": .string(originalQuery), "query": .string(query), "near": .string(near),
+                "separator": .string(separatorWord),
+                "note": .string("Split the query at its first near/in/around because no separate near was supplied.")])
+        }
+        guard !query.isEmpty, !near.isEmpty else {
+            throw AutonomyGateError.toolDenied(reason: """
+                Place search needs search terms and a place: supply near or include it in query, for example 'coffee near Tampa airport'. \
+                Include city/region to disambiguate.
+                """)
+        }
+        let radius = args.radiusMiles ?? 25
+        guard radius.isFinite, radius > 0 else {
+            throw AutonomyGateError.toolDenied(reason: "radius_miles must be a positive number; capped at 100 miles.")
+        }
+        let center = try await place(near), radiusMiles = min(radius, 100), radiusMeters = radiusMiles * 1609.344
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        request.region = MKCoordinateRegion(center: center.location.coordinate,
+            latitudinalMeters: radiusMeters * 2, longitudinalMeters: radiusMeters * 2)
+        request.regionPriority = .required
+        try Task.checkCancellation()
+        let items: [MKMapItem]
+        do { items = try await MKLocalSearch(request: request).start().mapItems }
+        catch let error as MKError where error.code == .placemarkNotFound { items = [] }
+        let matches = items.map { ($0, $0.location.distance(from: center.location)) }
+            .filter { $0.1 <= radiusMeters }.sorted { $0.1 < $1.1 }
+        let miles = Locale.autoupdatingCurrent.measurementSystem != .metric
+        let rows: [JSONValue] = matches.prefix(args.limit).map { item, distance in
+            var row = describe(item)
+            row["phone"] = item.phoneNumber.map(JSONValue.string) ?? .null
+            row["url"] = item.url.map { .string($0.absoluteString) } ?? .null
+            row["category"] = item.pointOfInterestCategory.map { .string($0.rawValue) } ?? .null
+            row["distance"] = .double(distance / (miles ? 1609.344 : 1000))
+            return .object(row)
+        }
+        try Task.checkCancellation()
+        return .object(["status": .string("completed"), "source": .string("MapKit"),
+            "query": .string(query), "query_split": querySplit, "near": .object(describe(center)), "radius_miles": .double(radiusMiles),
+            "distance_unit": .string(miles ? "miles" : "km"), "distance_basis": .string(
+                "Straight-line distance from the resolved near location, not route distance."),
+            "places": .array(rows), "returned_count": .int(Int64(rows.count)),
+            "message": .string(rows.isEmpty ? "MapKit returned no matching places within \(radiusMiles) miles of the resolved near location."
+                : "Matching places within the radius, sorted by straight-line distance; MapKit results may not include every place.")])
+    }
+
+    @MainActor
+    func impl_maps_route(args: MapsRouteArgs) async throws -> JSONValue {
+        let origin = args.origin.trimmingCharacters(in: .whitespacesAndNewlines)
+        let destination = args.destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        let transport = args.transport ?? "automobile"
+        guard !origin.isEmpty, !destination.isEmpty, ["automobile", "walking"].contains(transport) else {
+            throw AutonomyGateError.toolDenied(reason: "Route needs origin and destination text, and transport automobile or walking.")
+        }
+        let fraction = args.fraction?.wire.finiteDoubleValue
+        if let fraction, !fraction.isFinite || !(0...1).contains(fraction) {
+            throw AutonomyGateError.toolDenied(reason: "fraction must be a number from 0 through 1, measured along the route distance.")
+        }
+        async let originPlace = place(origin)
+        async let destinationPlace = place(destination)
+        let source = try await originPlace
+        let target = try await destinationPlace
+        let request = MKDirections.Request()
+        request.source = source; request.destination = target
+        request.transportType = transport == "walking" ? .walking : .automobile
+        try Task.checkCancellation()
+        let response: MKDirections.Response
+        do { response = try await MKDirections(request: request).calculate() }
+        catch is CancellationError { throw CancellationError() }
+        catch {
+            throw ToolFailureError("MapKit returned no route: \(error.localizedDescription)", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("maps.route"), "args": .object(args.wire)]))
+        }
+        guard let route = response.routes.first else {
+            throw ToolFailureError("MapKit returned no route for these locations and transport.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("maps.route"), "args": .object(args.wire)]))
+        }
+        let steps = route.steps.enumerated()
+        var result: [String: JSONValue] = ["status": .string("completed"), "source": .string("MapKit"),
+            "origin": .object(describe(source)), "destination": .object(describe(target)), "transport": .string(transport),
+            "route_name": .string(route.name), "distance_meters": .double(route.distance),
+            "expected_travel_time_seconds": .double(route.expectedTravelTime),
+            "traffic": .string("not_included"),
+            "travel_time_basis": .string(
+                "MKRoute.expectedTravelTime estimates travel under ideal conditions, without live traffic. No traffic-aware ETA was requested."),
+            "step_distance_basis": .string(
+                "Each distance_meters is the route segment associated with that step, not the length of the turn or exit manoeuvre itself."),
+            "steps": .array(steps.map { .object(["index": .int(Int64($0.offset)), "instruction": .string($0.element.instructions),
+                "distance_meters": .double($0.element.distance)]) }),
+            "total_steps": .int(Int64(route.steps.count)), "steps_total": .int(Int64(route.steps.count)), "has_more": .bool(false)]
+        if let fraction {
+            let points = route.polyline.points(), count = route.polyline.pointCount
+            guard count > 1 else { throw AutonomyGateError.toolDenied(reason: "The route has no usable geometry for a fractional point.") }
+            let lengths = (1..<count).map { points[$0 - 1].distance(to: points[$0]) }
+            var remaining = lengths.reduce(0, +) * fraction
+            var point = points[count - 1]
+            for index in 1..<count {
+                let length = lengths[index - 1]
+                if remaining <= length, length > 0 {
+                    let ratio = remaining / length
+                    point = MKMapPoint(x: points[index - 1].x + (points[index].x - points[index - 1].x) * ratio,
+                        y: points[index - 1].y + (points[index].y - points[index - 1].y) * ratio)
+                    break
+                }
+                remaining -= length
+            }
+            try Task.checkCancellation()
+            guard let geocoder = MKReverseGeocodingRequest(location: CLLocation(latitude: point.coordinate.latitude, longitude: point.coordinate.longitude)),
+                  let place = try await geocoder.mapItems.first else {
+                throw AutonomyGateError.toolDenied(reason: "MapKit could not name the requested point along this route.")
+            }
+            result["point"] = .object(["fraction": .double(fraction), "latitude": .double(point.coordinate.latitude),
+                "longitude": .double(point.coordinate.longitude), "place": .object(describe(place)),
+                "basis": .string("Fraction of route distance, not travel time; reverse-geocoded place is near the route point.")])
+        }
+        try Task.checkCancellation()
+        return .object(result)
+    }
+
+    // MARK: - Mac integration dispatch
+
+    /// Check the user’s disabled switch at dispatch and before approval so a card never requests a refused action.
+    package static func switchRefusal(integration: String, mode: MacIntegrationPermissionMode,
+                                      store: MacIntegrationPermissionStore) async throws -> JSONValue? {
+        guard let refusal = try await store.readinessChecked().refusal(integration: integration, mode: mode) else { return nil }
+        return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("denied"), "reason": .string("operator_permission_off"),
+            "integration": .string(integration), "mode": .string(mode.rawValue), "message": .string(refusal),
+            "remedy": Repair.why(owner: "security/mac_integration_permissions.json \(integration).\(mode.rawValue)",
+                tap: "Trust > Mac > Apps and features > \(MacIntegrationID.displayName(for: integration)) > \(mode.rawValue.capitalized)",
+                instruction: "Only the owner can enable this switch.")]))
+    }
+
+    package static func macIntegrationDeniedEnvelope(invocation: ChatToolInvocation,
+        integration: String, mode: MacIntegrationPermissionMode, store: MacIntegrationPermissionStore
+    ) async throws -> JSONValue {
+        if let refusal = try await switchRefusal(integration: integration, mode: mode, store: store) {
+            return refusal
+        }
+        let fixHint = "Open Trust → Mac → \(MacIntegrationID.displayName(for: integration)) and enable \(mode.rawValue.capitalized)."
+        // Ask only for the axis the blocked call needs.
+        if let need = InlineInteractionRegistry.permission(
+            [integration], why: fixHint, mode: mode == .read ? .read : .write
+        ) {
+            return InlineInteractionNeed.envelope(invocation: invocation, need)
+        }
+        return ChatToolOutcome.refusedBeforeRunning(.object([
+            "status": .string("denied"),
+            "reason": .string("integration_permission_denied"),
+            "integration": .string(integration),
+            "mode": .string(mode.rawValue),
+            "fix": .string(fixHint),
+            "remedy": Repair.why(owner: "security/mac_integration_permissions.json \(integration).\(mode.rawValue)",
+                tap: "Trust > Mac > Apps and features > \(MacIntegrationID.displayName(for: integration)) > \(mode.rawValue.capitalized)",
+                instruction: "Ask the owner to enable this integration's \(mode.rawValue.capitalized) switch."),
+        ]))
+    }
+
+    func dispatchMacIntegrationTool(context: ActionContext, args: some PersonalIntegrationArgs) async throws -> JSONValue {
+        let (tool, turn, invocation, surface) = (context.tool, context.turn, context.invocation, context.surface)
+        let fields = args.wire
+        // Bind observed Mail identities before admission, without executing a backend.
+        let input = tool == "mail_save_attachment"
+            ? AgentWorkspace.bindMail(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation, jobs: jobStore), fields, dataRoot: dataRoot) : fields
+        guard let access = Self.macIntegrationAccess(forTool: tool) else {
+            throw ToolFailureError("Mac integration action has no permission declaration: \(tool)", effects: .none)
+        }
+        let (integration, mode) = (access.integration, access.mode)
+        let admitted = await fullMacYoloAdmitted(turn: turn, surface: surface)
+        let allowed = try await macIntegrationPermissionStore.allows(integration, mode: mode)
+        guard allowed else {
+            return try await Self.macIntegrationDeniedEnvelope(invocation: invocation, integration: integration, mode: mode,
+                store: macIntegrationPermissionStore)
+        }
+        guard let integrationBridge = macIntegrationBridge else {
+            return ChatToolOutcome.refusedBeforeRunning(.object([
+                "status": .string("failed"),
+                "reason": .string("bridge_not_wired"),
+                "integration": .string(integration),
+                "message": .string("""
+                    Mac integration is unavailable in this caller. Call app from inside a chat turn of the installed app; supplying a session \
+                    id cannot attach it.
+                    """),
+                "remedy": .object(["kind": .string("correct_arguments"),
+                    "instruction": .string("Call app from inside a chat turn of the installed app."), "next_call": .null]),
+            ]))
+        }
+        let bridge = integrationBridge.serving(turn: turn.with(\.fullMacAdmitted, admitted), context: invocation.macContext(dataRoot: dataRoot))
+        let result: JSONValue
+        switch tool {
+        case "mac_calendar_list_upcoming":
+            result = AgentScreen.notedLifeRead("calendar", try await bridge.calendarListUpcoming(input: input), dataRoot: dataRoot)
+        case "mac_calendar_calendars": result = try await bridge.calendarCalendars(input: input)
+        case "mac_calendar_free_busy": result = try await bridge.calendarFreeBusy(input: input)
+        case "mac_calendar_create_event": result = try await bridge.calendarCreateEvent(input: input)
+        case "mac_calendar_modify_event": result = try await bridge.calendarModifyEvent(input: input)
+        case "mac_calendar_delete_event": result = try await bridge.calendarDeleteEvent(input: input)
+        case "mac_reminders_lists": result = try await bridge.remindersLists(input: input)
+        case "mac_reminders_query": result = try await bridge.remindersQuery(input: input)
+        case "mac_reminders_read": result = try await bridge.remindersRead(input: input)
+        case "mac_reminders_update": result = try await bridge.remindersUpdate(input: input)
+        case "mac_reminders_list_due_today":
+            result = AgentScreen.notedLifeRead("reminders", try await bridge.remindersListDueToday(input: input, dataRoot: dataRoot), dataRoot: dataRoot)
+        case "mac_reminders_create": result = try await bridge.remindersCreate(input: input)
+        case "mac_reminders_list_rename": result = try await bridge.remindersListRename(input: input)
+        case "mac_reminders_list_create": result = try await bridge.remindersListCreate(input: input)
+        case "mac_reminders_complete": result = try await bridge.remindersComplete(input: input)
+        case "mac_reminders_delete": result = try await bridge.remindersDelete(input: input)
+        case "mac_notify": result = try await bridge.macNotify(input: input)
+        case "phone_request": result = try await bridge.phoneRequest(input: input)
+        case "mobile_notify": result = try await bridge.mobileNotify(input: input, surface: surface)
+        case "mac_spotlight_search": result = try await bridge.spotlightSearch(input: input)
+        case "contacts_search": result = try await bridge.contactsSearch(input: input)
+        case "contacts_create_or_update": result = try await bridge.contactsCreateOrUpdate(input: input)
+        case "contacts_delete": result = try await bridge.contactsDelete(input: input)
+        case "mail_save_attachment":
+            if let error = input["binding_error"] { return .object(["status": .string("failed"), "message": error]) }
+            let attachment = try MailAttachmentRead.attachment(input: input)
+            var fileInput = input
+            fileInput["path"] = input["destination"] ?? .string("~/Downloads")
+            if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+                return try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: fileInput, surface: surface,
+                    attachment: attachment)
+            }
+            return try await impl_trusted_file_mutation(turn: turn, invocation: invocation, tool: tool, input: fileInput, attachment: attachment)
+        // Scheduled reads have no read axis; every scheduler action gates on write.
+        case "scheduler_list_jobs": result = try await bridge.schedulerListJobs(input: input)
+        case "scheduler_create_job": result = try await bridge.schedulerCreateJob(input: input)
+        case "scheduler_cancel_job": result = try await bridge.schedulerCancelJob(input: input)
+        default: throw ToolFailureError("Mac integration action has no backend: \(tool)", effects: .none)
+        }
+        if integration == MacIntegrationID.messages, case .object(var fields) = result,
+           fields["reason"] == .string("database_unavailable") || fields["history_reason"] == .string("database_unavailable") {
+            fields["remedy"] = SystemPermissionPreflight.remedy("full_disk_access")
+            return .object(fields)
+        }
+        return result
+    }
+}

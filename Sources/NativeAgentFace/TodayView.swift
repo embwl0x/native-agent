@@ -43,7 +43,7 @@ enum ActivitySection: String, Sendable, Identifiable {
         switch self {
         case .approvals, .inbox: "Inbox"
         case .memoryProposals: "Memories to look at"
-        case .cognitionProposals: "REM Replay Lineage"
+        case .cognitionProposals: "Growth proposals"
         }
     }
 }
@@ -69,22 +69,22 @@ struct TodayView: View {
             .liveOnAppear {
                 if let raw = appModel.pendingActivitySectionRaw {
                     appModel.pendingActivitySectionRaw = nil
-                    openSection(raw)
+                    if let section = ActivitySection(rawValue: raw) { openSection(section) }
                 }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .openActivitySectionRequest)) { note in
+            .onMessage(OpenActivitySectionRequest.self) { message in
                 guard !quietOffscreenRead else { return }
                 appModel.pendingActivitySectionRaw = nil
-                openSection(note.object as? String)
+                openSection(message.section)
             }
-            .onReceive(NotificationCenter.default.publisher(for: .openActivityRootRequest)) { _ in
+            .onMessage(OpenActivityRootRequest.self) { _ in
                 guard !quietOffscreenRead else { return }
                 sheet = nil
             }
     }
 
-    private func openSection(_ raw: String?) {
-        guard let raw, let section = ActivitySection(rawValue: raw), section != .memoryProposals else { return }
+    private func openSection(_ section: ActivitySection) {
+        guard section != .memoryProposals else { return }
         sheet = section
     }
 }

@@ -1,0 +1,807 @@
+import NativeAgentCore
+import MindCore
+import Foundation
+import NativeAgentShared
+import ProviderRouting
+import SenseCore
+import PersistenceCore
+import DeskCore
+// Blueprint: | `MindMemoryManager.swift` | One judgment per moment, evidence-backed intention outcomes, promise matching and recall |
+
+public struct MindMemoryJudgment: MemoryManaging {
+    private let makeLLMClient: @Sendable (PrivateWorkContextAssembly) -> any LLMClient
+    private let relevanceCache = RecallJudgmentCache()
+
+    private struct RecallRoute: Sendable, Equatable {
+        let snapshot: ProviderRoutingSnapshot
+        let surface: String
+        let admission: TurnRouteAdmission
+        var model: String { admission.modelId }
+        let payloadByteCap: Int
+    }
+
+    private struct RecallCacheScope: Sendable, Equatable {
+        let generation: String
+        let route: RecallRoute
+    }
+
+    private struct RecallPage: Sendable {
+        let key: String
+        let id: String
+        let encodedRow: String
+    }
+
+    private actor RecallJudgmentCache {
+        private var scope: RecallCacheScope?
+        private var judgments: [String: Bool] = [:]
+
+        func read(scope: RecallCacheScope, keys: [String]) -> [String: Bool] {
+            if self.scope != scope {
+                self.scope = scope
+                judgments.removeAll(keepingCapacity: true)
+            }
+            return Dictionary(keys.compactMap { key in
+                judgments[key].map { (key, $0) }
+            }, uniquingKeysWith: { first, _ in first })
+        }
+
+        func store(scope: RecallCacheScope, judgments: [String: Bool]) {
+            guard self.scope == scope else { return }
+            if self.judgments.count + judgments.count > 4_096 {
+                self.judgments.removeAll(keepingCapacity: true)
+            }
+            for (key, value) in judgments.prefix(4_096) { self.judgments[key] = value }
+        }
+    }
+
+    public init(makeLLMClient: @escaping @Sendable (PrivateWorkContextAssembly) -> any LLMClient) {
+        self.makeLLMClient = makeLLMClient
+    }
+
+    private static func reason(_ error: Error, cause: ProviderFailure?) -> AfterTurnMemoryFailure.Reason {
+        if Task.isCancelled || error is CancellationError { return .cancelled }
+        if (error as? ProviderFailure.Diagnostic)?.deadlineExpired == true { return .deadline }
+        if let error = error as? URLError, error.code == .timedOut { return .deadline }
+        switch cause {
+        case .authExpired: return .authExpired
+        case .codexCLISessionExpired: return .codexCLISessionExpired
+        case .rateLimited: return .rateLimited
+        case .quotaExceeded, .billingNotConfigured: return .provider
+        case .overloaded: return .overloaded
+        case .contextTooLong: return .contextTooLong
+        case .network, .offline: return .network
+        case .noReply: return .deadline
+        case .outputLimit: return .outputLimit
+        case .refused: return .refused
+        case .requestRejected: return .requestRejected
+        case .malformedResponse: return .invalidProviderResponse
+        case .routingUnavailable: return .routingUnavailable
+        case .modelUnavailable: return .modelUnavailable
+        case nil: return .provider
+        }
+    }
+
+    /// Recovery follows the failed judgment, not a diagnosis inferred from its prose.
+    private static let recallEncodingRecovery = """
+        The recall query and evidence could not be encoded as JSON: a NativeAgent defect in this turn's input, not your memories or the model. This \
+        turn's recall judgment could not run; tell the person if it repeats. Changing the selected model cannot fix it.
+        """
+
+    private static func judgmentRecovery(_ reason: AfterTurnMemoryFailure.Reason, surface: String, detail: String? = nil) -> String {
+        let group = (ProviderSurfaceGroups.group(for: surface) ?? ProviderSurfaceGroups.chat).id
+        let model = "app {action:\"setting.get\",args:{setting:\"providers.\(group)_model\"}}"
+        let account = "app {action:\"setting.get\",args:{setting:\"providers.\(group)_account\"}}"
+        let fix: String
+        switch reason {
+        case .cancelled:
+            fix = "The judgment was cancelled. Leave it stopped; no settings repair is indicated."
+        case .invalidJSON, .missingSections, .invalidCaring, .invalidAffect, .invalidMemories, .invalidCares,
+             .invalidProviderResponse:
+            fix = """
+                The judgment did not return its required JSON shape (\(reason.rawValue)); do not treat it as an empty judgment. Inspect the selected \
+                model with \(model); repair its structured response before relying on another pass.
+                """
+        case .contextTooLong:
+            fix = """
+                The judgment input exceeds the selected model's window. Shorten the query or select a larger-window model through \(model); repeating \
+                the same input will not fix it.
+                """
+        case .authExpired, .codexCLISessionExpired:
+            fix = "The judgment account needs sign-in. Read \(account), then reconnect it in Providers → Accounts using Add key or Sign in."
+        case .routingUnavailable:
+            fix = "The saved judgment route is unavailable. Read \(account) and repair the reported routing error before another pass."
+        case .modelUnavailable:
+            fix = "The selected judgment model is unavailable. Read \(model) and select a model served by its account."
+        case .trustUnavailable:
+            fix = """
+                The saved Trust policy could not be read or validated. Preserve its bytes and repair Trust before another judgment; a model change \
+                cannot repair authority storage.
+                """
+        case .network:
+            fix = "The judgment connection failed. Restore network access before requesting another pass; \(account) identifies its provider."
+        case .rateLimited, .overloaded, .deadline:
+            fix = """
+                The provider could not complete this judgment (\(reason.rawValue)). Leave the result unresolved; \(model) shows the model choice if a \
+                different supported route is needed.
+                """
+        case .refused:
+            fix = """
+                The provider refused this judgment. Leave it unresolved; offer an allowed alternative or stop, without rephrasing or splitting to \
+                bypass refusal.
+                """
+        case .outputLimit:
+            fix = """
+                The judgment reached its output limit. Leave it unresolved; reduce the judgment input or use a model with a larger output allowance \
+                before another pass.
+                """
+        case .requestRejected:
+            fix = "The provider rejected this judgment request. Leave it unresolved; correct the reported request error before another pass."
+        case .provider:
+            fix = "The judgment provider failed. Read \(account), then resolve the reported provider cause before another pass."
+        }
+        return detail.map { $0 + " " + fix } ?? fix
+    }
+
+    public func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String? = nil, topK: Int? = nil, turn: Turn?) async
+        -> Result<Set<String>, AfterTurnMemoryFailure> {
+        let started = ProcessInfo.processInfo.systemUptime
+        // Judge the embedding's bounded ranking prefix; lower rows already lost relevance.
+        let candidates = topK.map { requested in
+            let limit = MemoryRecallScoring.relevanceCandidateLimit(topK: requested, count: candidates.count)
+            return Array(candidates.prefix(limit))
+        } ?? candidates
+        let route: RecallRoute
+        switch await recallJudgmentRoute() {
+        case .failure(let failure): return .failure(failure)
+        case .success(let selected): route = selected
+        }
+        let surface = route.surface
+        let payloadByteCap = route.payloadByteCap
+        let routeFinished = ProcessInfo.processInfo.systemUptime
+        guard payloadByteCap > 0 else { return .failure(Self.recallJudgmentFailure(.contextTooLong, route: route)) }
+        guard let encodedQuery = try? JSONSerialization.data(withJSONObject: query, options: [.fragmentsAllowed]) else {
+            return .failure(Self.recallJudgmentFailure(.invalidJSON, route: route))
+        }
+        let queryJSON = String(decoding: encodedQuery, as: UTF8.self)
+        let envelopeBytes = "{\"memories\":[],\"query\":\(queryJSON)}".utf8.count
+        let progress = RecallJudgmentProgress()
+        let scope = generation.map { RecallCacheScope(generation: $0, route: route) }
+        let result = await collectRecallJudgments(query: query, queryJSON: queryJSON, candidates: candidates, topK: topK,
+            envelopeBytes: envelopeBytes, route: route, scope: scope, turn: turn, progress: progress)
+        reportRecallJudgment(progress.metrics, started: started, routeFinished: routeFinished, surface: surface, payloadByteCap: payloadByteCap)
+        switch result {
+        case .failure(let failure): return .failure(failure)
+        case .success(let completed):
+            guard !Task.isCancelled else { return .failure(Self.recallJudgmentFailure(.cancelled, route: route)) }
+            if let scope { await relevanceCache.store(scope: scope, judgments: completed) }
+            return .success(Set(completed.filter(\.value).compactMap { progress.recordIDs[$0.key] }))
+        }
+    }
+
+    private struct RecallJudgmentMetrics {
+        var preparedPages = 0
+        var cachedPages = 0
+        var pagingMilliseconds = 0.0
+        var cacheMilliseconds = 0.0
+        var batchingMilliseconds = 0.0
+        var providerBatches = 0
+        var providerStarted: Double?
+        var providerFinished: Double?
+        var providerTotalMilliseconds = 0.0
+        var judgedPages = 0
+    }
+
+    private final class RecallJudgmentProgress {
+        var metrics = RecallJudgmentMetrics()
+        var recordIDs: [String: String] = [:]
+        // Only a completely judged ranking prefix can settle the result. A
+        // lower-ranked hit cannot hide unresolved evidence in a higher row.
+        var rankingCursor = 0, admittedPrefixCount = 0
+        var next = 0
+        var pageStart: String.UnicodeScalarView.Index?
+        var pendingPage: RecallPage?
+        var inFlight: Set<String> = []
+        var admitted: Set<String> = []
+        var resolved: Set<String> = []
+        var exhausted: Set<String> = []
+        var uncheckedCounts: [String: Int] = [:]
+        var completed: [String: Bool] = [:]
+
+        func enough(topK: Int?, candidates: [MemoryManagerExistingMemory]) -> Bool {
+            guard let topK, topK > 0 else { return false }
+            while rankingCursor < candidates.count, admittedPrefixCount < topK {
+                let id = candidates[rankingCursor].id
+                guard admitted.contains(id) || resolved.contains(id) else { return false }
+                if admitted.contains(id) { admittedPrefixCount += 1 }
+                rankingCursor += 1
+            }
+            return admittedPrefixCount >= topK
+        }
+    }
+
+    private func recallJudgmentRoute() async -> Result<RecallRoute, AfterTurnMemoryFailure> {
+        let router = SwiftNativeProviderRouting()
+        let snapshot: ProviderRoutingSnapshot
+        do { snapshot = try await router.checkedRoutingSnapshot() }
+        catch { return .failure(.init(reason: .routingUnavailable,
+            recovery: Self.judgmentRecovery(.routingUnavailable, surface: "memory", detail: error.localizedDescription), model: nil, surface: "memory")) }
+        let surface = snapshot.pinnedModels["memory"] != nil || snapshot.activeProviders["memory"] != nil ? "memory" : "chat"
+        let admission: TurnRouteAdmission
+        do { admission = try snapshot.routeAdmission(for: surface, choice: nil) }
+        catch { return .failure(.init(reason: .modelUnavailable,
+            recovery: Self.judgmentRecovery(.modelUnavailable, surface: surface), model: nil, surface: surface)) }
+        let model = admission.modelId
+        guard let provider = admission.providerId else {
+            return .failure(.init(reason: .modelUnavailable,
+                recovery: Self.judgmentRecovery(.modelUnavailable, surface: surface), model: model, surface: surface))
+        }
+        let catalog = await router.catalogContextLength(forModel: model, providerID: provider)
+        guard let contextLength = catalog.contextLength else {
+            return .failure(.init(reason: catalog.catalogFailure == nil ? .modelUnavailable : .provider,
+                recovery: catalog.catalogFailure.map {
+                    "The \(provider) catalog request failed: \($0). Refresh that provider's models in Settings, then retry this query."
+                } ?? """
+                    \(provider)'s model list has no context window for \(model). Refresh that provider's models in Settings or choose a listed model, \
+                    then retry this query.
+                    """,
+                model: model, surface: surface))
+        }
+        // UTF-8 bytes conservatively bound tokens; reserve framing and instructions and leave half the window for reasoning and output.
+        let payloadByteCap = contextLength / 2 - Self.relevanceEnvelopeByteReserve
+        let route = RecallRoute(snapshot: snapshot, surface: surface,
+            admission: admission, payloadByteCap: payloadByteCap)
+        return .success(route)
+    }
+
+    private static func recallJudgmentFailure(_ reason: AfterTurnMemoryFailure.Reason, route: RecallRoute) -> AfterTurnMemoryFailure {
+        let surface = route.surface
+        return .init(reason: reason, recovery: reason == .invalidJSON ? Self.recallEncodingRecovery : Self.judgmentRecovery(reason, surface: surface),
+              model: route.model, surface: surface)
+    }
+
+    private func collectRecallJudgments(query: String, queryJSON: String, candidates: [MemoryManagerExistingMemory], topK: Int?,
+                                        envelopeBytes: Int, route: RecallRoute, scope: RecallCacheScope?, turn: Turn?,
+                                        progress: RecallJudgmentProgress) async -> Result<[String: Bool], AfterTurnMemoryFailure> {
+        // Parallelize independent records; wait for a record's judgment before
+        // dispatching more of its pages, and stop once it is admitted.
+        return await withTaskGroup(
+            of: ([RecallPage], Result<Set<String>, AfterTurnMemoryFailure>, Double).self
+        ) { group in
+            var running = 0
+            // Bound speculative work even for a very large context window.
+            let pageLimit = max(1, min(topK ?? candidates.count, candidates.count)) * 8
+            while true {
+                guard !Task.isCancelled else { group.cancelAll(); return .failure(Self.recallJudgmentFailure(.cancelled, route: route)) }
+                while running < 2, !progress.enough(topK: topK, candidates: candidates) {
+                    var batch: [RecallPage]
+                    switch await prepareRecallBatch(query: query, candidates: candidates, topK: topK, envelopeBytes: envelopeBytes,
+                        pageLimit: pageLimit, route: route, scope: scope, progress: progress) {
+                    case .failed(let reason): group.cancelAll(); return .failure(Self.recallJudgmentFailure(reason, route: route))
+                    case .ready(let prepared): batch = prepared
+                    }
+                    if progress.enough(topK: topK, candidates: candidates) { break }
+                    for page in batch where progress.admitted.contains(page.id) {
+                        progress.uncheckedCounts[page.id, default: 0] -= 1
+                    }
+                    batch.removeAll { progress.admitted.contains($0.id) }
+                    if batch.isEmpty { break }
+                    let ids = Set(batch.map(\.id))
+                    progress.inFlight.formUnion(ids)
+                    running += 1
+                    progress.metrics.providerBatches += 1
+                    if progress.metrics.providerStarted == nil { progress.metrics.providerStarted = ProcessInfo.processInfo.systemUptime }
+                    let rows = batch.enumerated().map { index, page in
+                        page.encodedRow.replacingOccurrences(of: #""id":"0""#, with: "\"id\":\"\(index)\"")
+                    }.joined(separator: ",")
+                    let prompt = "{\"memories\":[\(rows)],\"query\":\(queryJSON)}"
+                    let dispatched = batch
+                    group.addTask {
+                        let started = ProcessInfo.processInfo.systemUptime
+                        let result = await relevantRecallBatch(prompt: prompt, candidates: dispatched, route: route, turn: turn)
+                        return (dispatched, result, (ProcessInfo.processInfo.systemUptime - started) * 1_000)
+                    }
+                }
+                if progress.enough(topK: topK, candidates: candidates) { group.cancelAll(); break }
+                guard let (batch, result, duration) = await group.next() else { break }
+                progress.metrics.providerFinished = ProcessInfo.processInfo.systemUptime
+                progress.metrics.providerTotalMilliseconds += duration
+                progress.metrics.judgedPages += batch.count
+                nativeLog("Memory recall batch: duration_ms=\(Int(duration)) pages=\(batch.count)")
+                running -= 1
+                progress.inFlight.subtract(batch.map(\.id))
+                switch result {
+                case .success(let keys):
+                    for page in batch {
+                        progress.completed[page.key] = keys.contains(page.key)
+                        if keys.contains(page.key) { progress.admitted.insert(page.id) }
+                        progress.uncheckedCounts[page.id, default: 0] -= 1
+                        if progress.exhausted.contains(page.id), progress.uncheckedCounts[page.id, default: 0] == 0 {
+                            progress.resolved.insert(page.id)
+                        }
+                    }
+                case .failure(let failure): group.cancelAll(); return .failure(failure)
+                }
+            }
+            return .success(progress.completed)
+        }
+    }
+
+    private enum RecallBatchPreparation {
+        case ready([RecallPage])
+        case failed(AfterTurnMemoryFailure.Reason)
+    }
+
+    private func prepareRecallBatch(query: String, candidates: [MemoryManagerExistingMemory], topK: Int?, envelopeBytes: Int,
+                                    pageLimit: Int, route: RecallRoute, scope: RecallCacheScope?, progress: RecallJudgmentProgress) async
+        -> RecallBatchPreparation {
+        let payloadByteCap = route.payloadByteCap
+        var batch: [RecallPage] = []
+        var batchBytes = envelopeBytes
+        while batch.count < pageLimit, !progress.enough(topK: topK, candidates: candidates) {
+            if let page = progress.pendingPage {
+                if progress.admitted.contains(page.id) {
+                    progress.uncheckedCounts[page.id, default: 0] -= 1
+                    progress.pendingPage = nil
+                    continue
+                }
+                guard !progress.inFlight.contains(page.id) else { break }
+                let packingStarted = ProcessInfo.processInfo.systemUptime
+                let rowBytes = page.encodedRow.utf8.count + String(batch.count).utf8.count - 1 + (batch.isEmpty ? 0 : 1)
+                progress.metrics.batchingMilliseconds += (ProcessInfo.processInfo.systemUptime - packingStarted) * 1_000
+                if batchBytes + rowBytes > payloadByteCap { break }
+                batchBytes += rowBytes
+                batch.append(page)
+                progress.pendingPage = nil
+                continue
+            }
+            guard progress.next < candidates.count else { break }
+            let candidate = candidates[progress.next]
+            if progress.admitted.contains(candidate.id) || progress.resolved.contains(candidate.id) {
+                progress.next += 1
+                progress.pageStart = nil
+                continue
+            }
+            guard !progress.inFlight.contains(candidate.id) else { break }
+            let pagingStarted = ProcessInfo.processInfo.systemUptime
+            let scalars = candidate.content.unicodeScalars
+            let start = progress.pageStart ?? scalars.startIndex
+            var length = scalars.distance(from: start,
+                to: scalars.index(start, offsetBy: memoryRecallContentCap, limitedBy: scalars.endIndex) ?? scalars.endIndex)
+            var end = scalars.index(start, offsetBy: length)
+            var content = String(scalars[start..<end])
+            var encodedRow = Data()
+            // A single page must fit too, including escaped JSON and
+            // the query. Shrink pages without dropping any evidence.
+            while true {
+                guard let data = try? JSONSerialization.data(withJSONObject:
+                    ["id": "0", "memory_id": candidate.id, "content": content], options: [.sortedKeys]) else {
+                    return .failed(.invalidJSON)
+                }
+                encodedRow = data
+                if envelopeBytes + data.count <= payloadByteCap { break }
+                guard length > 1 else {
+                    return .failed(.contextTooLong)
+                }
+                length /= 2
+                end = scalars.index(start, offsetBy: length)
+                content = String(scalars[start..<end])
+            }
+            let identity = ["query": query, "id": candidate.id, "content": content, "kind": candidate.kind ?? ""]
+            guard let data = try? JSONSerialization.data(withJSONObject: identity, options: [.sortedKeys]) else {
+                return .failed(.invalidJSON)
+            }
+            let key = SHA256Hex.of(data)
+            let page = RecallPage(key: key, id: candidate.id, encodedRow: String(decoding: encodedRow, as: UTF8.self))
+            progress.recordIDs[key] = candidate.id
+            progress.metrics.preparedPages += 1
+            if end == scalars.endIndex {
+                progress.exhausted.insert(candidate.id)
+                progress.next += 1
+                progress.pageStart = nil
+            } else {
+                progress.pageStart = scalars.index(end, offsetBy: -min(200, length / 2))
+            }
+            progress.metrics.pagingMilliseconds += (ProcessInfo.processInfo.systemUptime - pagingStarted) * 1_000
+            let cacheStarted = ProcessInfo.processInfo.systemUptime
+            let cached = if let scope { await relevanceCache.read(scope: scope, keys: [key])[key] } else { nil as Bool? }
+            progress.metrics.cacheMilliseconds += (ProcessInfo.processInfo.systemUptime - cacheStarted) * 1_000
+            if let cached {
+                progress.metrics.cachedPages += 1
+                progress.completed[key] = cached
+                if cached { progress.admitted.insert(candidate.id) }
+                if progress.exhausted.contains(candidate.id), progress.uncheckedCounts[candidate.id, default: 0] == 0 {
+                    progress.resolved.insert(candidate.id)
+                }
+            } else {
+                progress.uncheckedCounts[candidate.id, default: 0] += 1
+                progress.pendingPage = page
+            }
+            guard !Task.isCancelled else { break }
+        }
+        return .ready(batch)
+    }
+
+    private func reportRecallJudgment(_ metrics: RecallJudgmentMetrics, started: Double, routeFinished: Double,
+                                      surface: String, payloadByteCap: Int) {
+        let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+        let timings: [String: JSONValue] = [
+            "duration_ms": .double(elapsed), "pages": .int(Int64(metrics.preparedPages)),
+            "cached_pages": .int(Int64(metrics.cachedPages)), "provider_batches": .int(Int64(metrics.providerBatches)),
+            "route_ms": .double((routeFinished - started) * 1_000),
+            "paging_ms": .double(metrics.pagingMilliseconds),
+            "cache_ms": .double(metrics.cacheMilliseconds),
+            "batching_ms": .double(metrics.batchingMilliseconds),
+            "provider_wall_ms": .double(metrics.providerStarted.flatMap { start in
+                metrics.providerFinished.map { ($0 - start) * 1_000 }
+            } ?? 0),
+            "payload_byte_cap": .int(Int64(payloadByteCap)),
+            "provider_total_ms": .double(metrics.providerTotalMilliseconds), "judged_pages": .int(Int64(metrics.judgedPages)),
+        ]
+        TurnTraceBus.fireFromContext(kind: "memory.recall.relevance", surface: surface, payload: .object(timings), turn: nil)
+        let detail = timings.sorted { $0.key < $1.key }.map { key, value in
+            switch value {
+            case .double(let value): return "\(key)=\(Int(value))"
+            case .int(let value): return "\(key)=\(value)"
+            default: return key
+            }
+        }.joined(separator: " ")
+        nativeLog("Memory recall relevance: \(detail)")
+    }
+
+    // Preserve the 819-byte instruction and 128-byte framing allowances independently of prompt wording.
+    private static let relevanceEnvelopeByteReserve = 947
+
+    private static var relevanceSystem: String {
+        get throws { try completionPolicy("recall-selection", section: "system") }
+    }
+
+    private func relevantRecallBatch(prompt: String, candidates: [RecallPage], route: RecallRoute, turn: Turn?) async
+        -> Result<Set<String>, AfterTurnMemoryFailure> {
+        let surface = route.surface
+        let model = route.model
+        func failed(_ reason: AfterTurnMemoryFailure.Reason) -> Result<Set<String>, AfterTurnMemoryFailure> {
+            .failure(.init(reason: reason, recovery: Self.judgmentRecovery(reason, surface: surface),
+                           model: model, surface: surface))
+        }
+        guard !Task.isCancelled else { return failed(.cancelled) }
+        guard prompt.utf8.count <= route.payloadByteCap else { return failed(.contextTooLong) }
+        let response: String
+        do {
+            var call = LLMCall(turn: turn, surface: surface, purpose: "recall_judge")
+            call.admission = try route.admission.modelAdmission
+            let system = try Self.relevanceSystem
+            call.systemSegments = SystemPromptSegments(stable: system, dynamic: "")
+            call.memoryPolicyScope = .recallJudge
+            response = try await makeLLMClient(.taskOnly).complete(
+                prompt: prompt, system: system, model: model, tools: nil,
+                call: call)
+        } catch {
+            let failure = ProviderFailure.classify(error)
+            return .failure(.init(reason: Self.reason(error, cause: failure),
+                recovery: Self.judgmentRecovery(Self.reason(error, cause: failure), surface: surface, detail: ProviderFailure.diagnosticDescription(error)),
+                model: model, surface: surface))
+        }
+        guard !Task.isCancelled else { return failed(.cancelled) }
+        guard let object = try? JSONValue.decodeCompletion(response, as: [String: JSONValue].self),
+              let ids = object["relevant_ids"]?.foundationObject as? [String],
+              Set(ids).isSubset(of: Set(candidates.indices.map { String($0) }))
+        else { return failed(.invalidJSON) }
+        return .success(Set(ids.compactMap { Int($0).map { candidates[$0].key } }))
+    }
+
+    /// Use the Memory provider row for every after-turn judgment.
+    private struct JudgmentRoute: Sendable {
+        let surface: String
+        let admission: TurnRouteAdmission
+        var model: String { admission.modelId }
+
+        func failed(_ reason: AfterTurnMemoryFailure.Reason, recovery: String? = nil) -> AfterTurnMemoryFailure {
+            .init(reason: reason, recovery: MindMemoryJudgment.judgmentRecovery(reason, surface: surface, detail: recovery),
+                  model: model, surface: surface)
+        }
+    }
+
+    /// The account is the route's provider id, so switching accounts for the same model changes the key.
+    public func judgmentRouteKey() async -> String? {
+        guard let route = try? await Self.judgmentRoute() else { return nil }
+        return MemoryManagerLane.fingerprint([route.surface, route.admission.providerId ?? "", route.model])
+    }
+
+    private static func judgmentRoute() async throws -> JudgmentRoute {
+        let snapshot = try await SwiftNativeProviderRouting().checkedRoutingSnapshot()
+        let surface = snapshot.pinnedModels["memory"] != nil || snapshot.activeProviders["memory"] != nil ? "memory" : "chat"
+        // Use Memory's saved provider choice independently of the active chat turn.
+        return try JudgmentRoute(surface: surface, admission: snapshot.routeAdmission(
+            for: surface, choice: nil, inheritChat: surface == "chat"))
+    }
+
+    /// Stop interrupts unfinished provider work. A returned reply belongs to
+    /// settlement, even when cancellation arrives with that reply.
+    private func judgedText(prompt: String, system: SystemPromptSegments, purpose: String,
+                            policyScope: LLMCall.MemoryPolicyScope, route: JudgmentRoute,
+                            call heldCall: LLMCall? = nil) async throws -> String {
+        let text: String
+        do {
+            try Task.checkCancellation()
+            var call = heldCall ?? LLMCall(turn: nil, surface: route.surface, purpose: purpose)
+            call.surface = route.surface
+            call.purpose = purpose
+            call.admission = try route.admission.modelAdmission
+            call.systemSegments = system
+            call.memoryPolicyScope = policyScope
+            text = try await makeLLMClient(.taskOnly).complete(
+                prompt: prompt, system: system.combined, model: route.model, tools: nil,
+                call: call)
+        } catch {
+            let cause = ProviderFailure.classify(error)
+            throw route.failed(Self.reason(error, cause: cause), recovery: ProviderFailure.diagnosticDescription(error))
+        }
+        return text
+    }
+
+    /// Settlement parses JSON and returns the produced typed result, even after Stop.
+    private static func settledObject<T: Sendable>(text: String, route: JudgmentRoute, call: LLMCall,
+        parse: @escaping @Sendable ([String: Any]) throws -> T) async throws -> T {
+        let result: Result<T, AfterTurnMemoryFailure> = await settle {
+            do {
+                let fields = try JSONValue.decodeCompletion(text, as: [String: JSONValue].self)
+                return .success(try parse(fields.mapValues(\.foundationObject)))
+            } catch {
+                let complaint = (error as? AfterTurnMemoryFailure)?.recovery ?? String(describing: error)
+                let failure = (error as? AfterTurnMemoryFailure) ?? route.failed(.invalidJSON, recovery: complaint)
+                TurnTraceBus.fire(TurnTraceEvent(turnId: call.turn?.id ?? TurnTraceContext.turnId ?? "unknown",
+                    kind: "memory.rejected", sessionId: call.session, surface: route.surface,
+                    payload: .object(["purpose": .string(call.purpose), "reason": .string(failure.reason.rawValue),
+                        "complaint": .string(TurnTraceRedactor.redactText(complaint)),
+                        "text": .string(TurnTraceRedactor.redactText(text))]), turn: call.turn))
+                return .failure(failure)
+            }
+        }
+        return try result.get()
+    }
+
+    public func interpret(_ request: MemoryManagerRequest, context: AfterTurnContext?,
+                          factsEnabled: Bool, call: LLMCall) async throws -> AfterTurnInterpretation? {
+        // Whether a turn is judged is decided before this call; empty incoming words are judged like any other.
+        let route = try await Self.judgmentRoute()
+        let existing = request.existing.map {
+            "[\($0.id)] \($0.content)" + ($0.kind == "correction" ? " (correction)" : "")
+                + ($0.correctionSubject.map { " (subject: \($0))" } ?? "")
+        }
+        let prompt = try Self.prompt(request, context: context, factsEnabled: factsEnabled, existing: existing)
+        let fixed = try completionPolicy("turn-interpretation", section: "system", arguments: [
+            completionPolicy("turn-interpretation", section: "rules"),
+            MemoryKindStamp.writerKinds.joined(separator: "|"),
+            "," + Self.caresShape,
+        ])
+        let form = try request.settlesOnly ? completionPolicy("turn-interpretation", section: "settlement-alone")
+            : context?.cares.isEmpty == false ? completionPolicy("turn-interpretation",
+                section: context?.careWakes.isEmpty == false ? "care-wake-cares" : "cares") : ""
+        let text = try await judgedText(prompt: prompt, system: SystemPromptSegments(stable: fixed, dynamic: form),
+            purpose: call.purpose == "memory_held" ? "memory_held" : "memory_interpret",
+            policyScope: .interpretation, route: route, call: call)
+        return try await Self.settledObject(text: text, route: route, call: call) { object in
+            try Self.parseInterpretation(object, request: request, context: context, route: route)
+        }
+    }
+
+    /// Match at filing time so deferred exchanges and refolds see work that earlier captures actually landed.
+    public func capturePromises(_ promises: [MemoryManagerPromise], reply: String,
+                                open: [DeskItem], call: LLMCall) async throws
+        -> [MemoryManagerPromiseCapture] {
+        guard !promises.isEmpty else { return [] }
+        let route = try await Self.judgmentRoute()
+        let candidates: [JSONValue] = promises.enumerated().map { index, promise in
+            .object(["id": .int(Int64(index)), "words": .string(promise.words), "when": .string(promise.when), "source": .string(promise.source)])
+        }
+        let input = try JSONValue.object(["candidates": .array(candidates), "open": .array(Self.deskRows(open)),
+            "reply": .string(reply)]).serialize(pretty: false)
+        let text = try await judgedText(prompt: completionPolicy("turn-interpretation", section: "promise-capture", arguments: [input]),
+            system: SystemPromptSegments(stable: completionPolicy("turn-interpretation", section: "promise-capture-system"), dynamic: ""),
+            purpose: "memory_promise", policyScope: .promiseCapture, route: route, call: call)
+        var captureCall = call
+        captureCall.purpose = "memory_promise"
+        return try await Self.settledObject(text: text, route: route, call: captureCall) { object in
+            func invalid(_ words: String) -> AfterTurnMemoryFailure {
+                route.failed(.invalidMemories, recovery: "Invalid promise capture: " + words)
+            }
+            guard let groups = object["captures"] as? [[String: Any]] else { throw invalid("captures must be an array of groups.") }
+            var covered: Set<Int> = [], targets: Set<String> = []
+            var captures: [MemoryManagerPromiseCapture] = []
+            for group in groups {
+                guard let ids = group["candidates"] as? [Int], !ids.isEmpty,
+                      Set(ids).count == ids.count, ids.allSatisfy({ promises.indices.contains($0) && !covered.contains($0) }),
+                      let target = group["target"] as? String else { throw invalid("Each candidate must belong to exactly one named group.") }
+                covered.formUnion(ids)
+                if target == "ignore" { captures.append(.ignore); continue }
+                let item = open.first { $0.handle == target }
+                guard target == "new" || item != nil else { throw invalid("The target is not an open Desk id: " + target) }
+                if target != "new", !targets.insert(target).inserted { throw invalid("A restatement must be grouped on its one target: " + target) }
+                let members = ids.compactMap { id in promises.indices.contains(id) ? promises[id] : nil }
+                guard let words = group["words"] as? String, !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let source = group["source"] as? String, members.contains(where: { $0.source == source }), reply.contains(source),
+                      let namedWhen = group["when"] as? String else { throw invalid("Kept groups need words, when and exact candidate evidence.") }
+                let when: String
+                if namedWhen == "keep" {
+                    guard let step = item?.step else { throw invalid("Only an existing step has a condition to keep.") }
+                    if step.when == "after_card" {
+                        guard let card = step.card else { throw invalid("The target's approval condition has no card.") }
+                        when = "after_card " + card
+                    } else { when = step.when }
+                } else {
+                    guard members.contains(where: { $0.when == namedWhen }) else { throw invalid("The group invented a time its candidates never named.") }
+                    when = namedWhen
+                }
+                let evidence = members.map(\.source).reduce(into: [String]()) { result, source in
+                    if !result.contains(source) { result.append(source) }
+                }.joined(separator: "\n")
+                captures.append(.keep(MemoryManagerPromise(words: words.trimmingCharacters(in: .whitespacesAndNewlines), when: when, source: evidence),
+                                      target: target == "new" ? nil : target, candidates: ids))
+            }
+            guard covered == Set(promises.indices) else { throw invalid("The judgment left candidates unclassified.") }
+            return captures
+        }
+    }
+
+    /// Required sections form a complete interpretation or name their failure.
+    /// Optional promises may be absent/empty; malformed present promises keep the turn owed.
+    private static func parseInterpretation(_ object: [String: Any], request: MemoryManagerRequest,
+                                            context: AfterTurnContext?, route: JudgmentRoute) throws -> AfterTurnInterpretation {
+        func failed(_ reason: AfterTurnMemoryFailure.Reason, _ complaint: String) -> AfterTurnMemoryFailure {
+            route.failed(reason, recovery: complaint)
+        }
+        guard let memoriesValue = object["memories"] as? [Any],
+              object.keys.contains("caring"), object.keys.contains("affect") else {
+            throw failed(.missingSections, "memories must be an array; caring and affect must be present.")
+        }
+        guard let caringObject = object["caring"] as? [String: Any],
+              let caring = CaringAppraisalLane.parse(caringObject) else { throw failed(.invalidCaring, "caring must be a valid caring appraisal.") }
+        guard let affectObject = object["affect"] as? [String: Any] else { throw failed(.invalidAffect, "affect must be an object.") }
+        let affect: CognitiveSubstrate.AffectAppraisal
+        do {
+            let affectData = try JSONSerialization.data(withJSONObject: affectObject)
+            affect = try JSONDecoder().decode(CognitiveSubstrate.AffectAppraisal.self, from: affectData)
+        } catch { throw route.failed(.invalidAffect, recovery: String(describing: error)) }
+        if let choice = affect.chosenRegister {
+            guard request.assistantMessage.contains(choice.source) else {
+                throw failed(.invalidAffect, "affect.chosenRegister.source must quote the assistant reply.")
+            }
+        }
+        // A turn judged for settlement alone keeps only what it settled.
+        var memories: [MemoryManagerDecision] = []
+        if !request.settlesOnly {
+            do { memories = try MemoryManagerLane.parse(memoriesValue) }
+            catch { throw route.failed(.invalidMemories, recovery: String(describing: error)) }
+        }
+        var cares: [CognitiveCareJudgment] = []
+        var careFaults: [String] = []
+        if !request.settlesOnly, let shown = context?.cares, !shown.isEmpty {
+            guard let parsed = CognitiveCareJudgment.parse(object["cares"], shown: shown) else {
+                throw failed(.invalidCares, "cares must be an array.")
+            }
+            careFaults = parsed.faults
+            cares = context?.careWakes.isEmpty == false ? parsed.judgments.filter {
+                guard $0.by == .her, case .existing = $0.target else { return false }
+                return true
+            } : parsed.judgments
+        }
+        var promises: [MemoryManagerPromise] = []
+        if !request.settlesOnly {
+            do { promises = try MemoryManagerPromise.parse(object["promises"], reply: request.assistantMessage) }
+            catch { throw route.failed(.invalidMemories, recovery: "Invalid promises section: \(error)") }
+        }
+        guard let rows = object["settled"] as? [[String: Any]] else {
+            throw route.failed(.missingSections, recovery: "settled must be an array of evidence-backed outcomes.")
+        }
+        var settled: [MemoryManagerSettlement] = []
+        var settledIDs: Set<String> = []
+        for row in rows {
+            guard let id = row["id"] as? String, let item = request.openMoments.first(where: { $0.handle == id }),
+                  MyQueue.entry(item) != nil, settledIDs.insert(id).inserted,
+                  let source = row["source"] as? String, !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let outcomeText = row["outcome"] as? String,
+                  let outcome = MemoryManagerSettlement.Outcome(rawValue: outcomeText),
+                  let reason = row["reason"] as? String, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw route.failed(.invalidMemories,
+                    recovery: "Settlement requires one shown open moment id, done or let_go, a reason and exact evidence from this turn.")
+            }
+            let evidence: MemoryManagerSettlement.Evidence
+            switch row["basis"] as? String {
+            case "person_words":
+                guard request.personWords.contains(source), row["act_id"] == nil else {
+                    throw route.failed(.invalidMemories, recovery: "Person settlement requires an exact person_words quote and no act_id.")
+                }
+                evidence = .personWords(source)
+            case "act":
+                guard outcome == .done, let actID = row["act_id"] as? String,
+                      let act = request.completedActs.first(where: { $0.id == actID }), act.contains(source) else {
+                    throw route.failed(.invalidMemories, recovery: "Act settlement requires done and exact evidence from a shown completed act_id.")
+                }
+                evidence = .act(id: actID, source: source)
+            case "reply":
+                // Saying it is the deed only for a moment that ends once; a rhythm or standing step outlives one saying.
+                guard outcome == .done, request.replyDelivered, row["act_id"] == nil,
+                      MemoryManagerPromise.quoted(source, in: request.assistantMessage),
+                      let step = MyQueue.entry(item)?.step, step.rhythm == nil, MyQueue.Until(step.until) != .standing else {
+                    throw route.failed(.invalidMemories,
+                        recovery: "Reply settlement requires done, a delivered reply, its exact quote, no act_id and a moment that ends once.")
+                }
+                evidence = .reply(source)
+            default:
+                throw route.failed(.invalidMemories,
+                    recovery: "Settlement basis must be person_words, act or reply; unknown evidence leaves work open.")
+            }
+            settled.append(MemoryManagerSettlement(id: id, updatedAt: item.updatedAt, outcome: outcome, evidence: evidence, reason: reason))
+        }
+        return AfterTurnInterpretation(memories: memories, affect: affect, caring: caring,
+                                       cares: cares, careFaults: careFaults,
+                                       promises: promises, settled: settled,
+                                       appAuthored: request.appAuthored, model: route.model, surface: route.surface)
+    }
+
+    static func caresSection(_ shown: [CognitiveCareLine], careWake: Bool = false) throws -> String {
+        guard !shown.isEmpty else { return "" }
+        return try completionPolicy("turn-interpretation", section: careWake ? "care-wake-cares-data" : "cares-data", arguments: [
+            shown.map { "[\($0.key)] \($0.text)" }.joined(separator: "\n")
+        ])
+    }
+
+    /// One parseable entry for a shown care; the prompt states when about and stance are filled.
+    static let caresShape = #""cares":[{"care":"c1","about":null,"between":false,"moved":0.0,"by":"them","felt":"...","note":"...","#
+        + #""open":null,"closes":false,"stance":null}]"#
+
+    private static func deskRows(_ open: [DeskItem]) -> [JSONValue] {
+        open.map { item in
+            var row: [String: JSONValue] = ["id": .string(item.handle), "label": .string("desk." + item.alias),
+                "title": .string(item.title), "project": .string(item.project), "status": .string(item.status.rawValue)]
+            if let summary = item.summary { row["summary"] = .string(summary) }
+            if let step = item.step {
+                row["words"] = .string(step.words)
+                row["when"] = .string(step.when)
+                if let card = step.card { row["card"] = .string(card) }
+                if let until = step.until { row["until"] = .string(until) }
+                if let source = step.source { row["source"] = .string(source) }
+            }
+            return .object(row)
+        }
+    }
+
+    /// The moment's form and evidence follow the shared system policy.
+    static func prompt(_ request: MemoryManagerRequest, context: AfterTurnContext?,
+                       factsEnabled: Bool, existing: [String]) throws -> String {
+        let history = context?.caring?.context.map { "\($0.speaker.rawValue): \($0.text)" }.joined(separator: "\n") ?? ""
+        let encounters = context?.caring?.recentEncounters.map {
+            "\($0.at.ISO8601Format()) \($0.kind.rawValue): \($0.why)"
+        }.joined(separator: "\n") ?? ""
+        let shown = context?.cares ?? []
+        let clock = ISO8601DateFormatter()
+        clock.timeZone = .current
+        let exchangeTime = request.occurredAt ?? context?.event.occurredAt ?? Date()
+        let settlementInput = try JSONValue.object(["person_words": .string(request.personWords),
+            "open_moments": .array(Self.deskRows(request.openMoments)),
+            "completed_acts": .array(request.completedActs.map(\.record)),
+            "completed_acts_unavailable": request.completedActsUnavailable.map(JSONValue.string) ?? .null,
+            "reply_delivered": .bool(request.replyDelivered)]).serialize(pretty: false)
+        return try completionPolicy("turn-interpretation", section: "prompt", arguments: [
+            existing.prefix(request.standing).joined(separator: "\n"),
+            request.settlesOnly ? "" : Self.caresSection(shown, careWake: context?.careWakes.isEmpty == false),
+            request.personName ?? "the person",
+            request.appAuthored ? completionPolicy("turn-interpretation", section: "app-authored") : request.standingAgent
+                ? completionPolicy("turn-interpretation", section: "standing-agent") : ".",
+            String(factsEnabled),
+            clock.string(from: exchangeTime),
+            TimeZone.current.identifier,
+            String(context?.caring?.relayed ?? false),
+            String(context?.caring != nil),
+            existing.dropFirst(request.standing).joined(separator: "\n"),
+            request.pendingTargets.map { "[\($0.id)] \($0.content)" }.joined(separator: "\n"),
+            history + "\nPrior statement to judge (data; absent means beliefReaction=null):\n"
+                + (context?.beliefReactionTarget ?? "[absent]"),
+            encounters,
+            request.userMessage,
+            request.assistantMessage,
+            request.took.map { $0 + "\n" } ?? "",
+            completionPolicy("turn-interpretation", section: "settlement-input", arguments: [settlementInput]),
+        ])
+    }
+}

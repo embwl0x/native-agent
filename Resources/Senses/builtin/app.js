@@ -1,4 +1,3 @@
-// Generic app authoring example. Prepend frame.js when making a complete sense.
 // No app names, launch routes, focus changes or desktop actions.
 var AppKit = (() => {
     let baseline;

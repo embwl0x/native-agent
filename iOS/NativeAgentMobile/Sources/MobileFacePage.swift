@@ -88,6 +88,14 @@ struct MobileFacePage: View {
             MobileFaceRows(page: page) { pushed = $0 }
         }
         .navigationDestination(item: $pushed) { $0.view }
+        .refreshable {
+            _ = await sync.refreshSnapshotGroup(.faces)
+            switch page {
+            case "desk": _ = await sync.refreshSnapshotGroup(.desk)
+            case "inbox", "today": _ = await sync.refreshSnapshotGroup(.activity)
+            default: break
+            }
+        }
     }
 }
 
@@ -140,8 +148,8 @@ struct MobileFaceRow: View {
         FaceView(face: PartFace(sections: [.init(id: row.id, style: .list, rows: [row])]), door: door, session: session)
             .id(page + "/" + row.id)
             .buttonStyle(.borderless).pickerStyle(.menu)
-            .environment(\.faceInList, false)
-            .environment(\.faceStyle, .phone)
+            .faceList(false)
+            .phoneFaceStyle()
             .onAppear { session.notice = { SystemToastCenter.shared.push(success: $0) } }
     }
 
@@ -191,7 +199,6 @@ private struct MobileDemandFacePage: View {
             FaceItemView(item: item, door: door.scoped(to: item), reader: door, session: sync.pageSessions.page(page + "/" + item))
         }
         .navigationDestination(item: $pushed) { $0.view }
-        .macSyncErrorBanner()
     }
 
     private var door: ClosureFaceDoor {

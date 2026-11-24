@@ -38,7 +38,7 @@ extension AppModel {
         let session = activeChatSessionId
         let outcome = SkillBuildRequestPresentation.build(activeSessionID: session, existingDraft: chatDraft(for: session))
         if case .draftPrepared = outcome { injectChatDraft(starter, sessionId: session) }
-        NotificationCenter.default.post(name: .skillBuildRequest, object: starter)
+        NotificationCenter.default.post(SkillBuildRequest(starter: starter))
         return outcome
     }
 

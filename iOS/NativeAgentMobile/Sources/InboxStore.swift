@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import Foundation
 import NativeAgentShared
 import SwiftUI
@@ -7,9 +7,10 @@ import SwiftUI
 // MARK: - Store
 
 @MainActor
-final class InboxStore: ObservableObject {
+@Observable
+final class InboxStore {
     var items: [InboxItemRecord] { iCloudSyncEngine.shared.inboxItems }
-    @Published var isLoading = false
+    var isLoading = false
 
     // MARK: - Fetch
 

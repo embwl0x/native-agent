@@ -1,7 +1,7 @@
 import AppKit
-import EngineRuntime
+import BodyRuntime
 import Foundation
-import MacIntegration
+import MacNerves
 import NativeAgentCore
 import NativeAgentShared
 // Blueprint: | `SettingsDock.swift` | Body-owned permission guidance readings; the window draws and closes the native card |
@@ -36,8 +36,16 @@ final class SettingsDock {
         let id = UUID()
         target = (id, capability, face)
         let workspace = NSWorkspace.shared.notificationCenter
-        observe(SystemPermissionPreflight.permissionDidChange, center: .default)
-        observe(NSWorkspace.didActivateApplicationNotification, center: workspace)
+        let changed: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor [weak self] in
+                do { try await self?.refresh() }
+                catch { self?.target?.face.model.setFailureStatus(error, action: "refresh permission guidance") }
+            }
+        }
+        let permission = NotificationCenter.default.observeSynchronously(for: MacIntegrationPermissionStore.DidChange.self, queue: .main, using: changed)
+        observers.append((.default, permission))
+        let active = workspace.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in changed() }
+        observers.append((workspace, active))
         let quit = workspace.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.bundleIdentifier == "com.apple.systempreferences" else { return }
@@ -78,21 +86,11 @@ final class SettingsDock {
         catch { previous.face.model.setFailureStatus(error, action: "close permission guidance") }
     }
 
-    private func observe(_ name: Notification.Name, center: NotificationCenter) {
-        let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                do { try await self?.refresh() }
-                catch { self?.target?.face.model.setFailureStatus(error, action: "refresh permission guidance") }
-            }
-        }
-        observers.append((center, token))
-    }
-
     private func refresh() async throws {
         guard let target else { return }
         let capability = target.capability
         _ = await reading.read {
-            await Self.snapshot(capability)
+            await SystemPermissionPreflight.snapshot(capability)
         } publish: { snapshot in
             guard self.target?.id == target.id else { return }
             self.permissionSnapshot = snapshot
@@ -104,10 +102,6 @@ final class SettingsDock {
         guard self.target?.id == target.id else { return }
         // A grant that takes effect after one restart keeps its guidance up to say so; the person closes it by leaving System Settings.
         if grantedAtOpen == false, permissionSnapshot?.status == .granted, !Self.awaitsRestart(capability) { await closeCurrent() }
-    }
-
-    @concurrent private static func snapshot(_ capability: SystemPermissionCapability) async -> SystemPermissionSnapshot {
-        SystemPermissionPreflight.snapshot(capability)
     }
 
     /// On now but not held by this launch: the grant reaches NativeAgent at its next launch.

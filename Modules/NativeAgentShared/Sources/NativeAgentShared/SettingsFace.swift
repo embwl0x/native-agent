@@ -2,6 +2,21 @@ import Foundation
 // Blueprint: | `SettingsFace.swift` | Finished settings groups, preference scalars and permission-dock words at the settings feed key |
 
 public struct SettingsFace: FaceValue {
+    public struct Window: FaceValue {
+        public var leaves: [String]
+        /// For each page left in place, the chance a turn follows from it anyway, so the record keeps learning if the person changes.
+        public var sampling: [String: Double]
+        public init(leaves: [String] = [], sampling: [String: Double] = [:]) { self.leaves = leaves; self.sampling = sampling }
+        private enum CodingKeys: String, CodingKey { case leaves, sampling }
+        /// A body from before sampling sends leaves alone: those pages carry no sampling chance yet.
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            leaves = try values.decode([String].self, forKey: .leaves)
+            sampling = try values.decodeIfPresent([String: Double].self, forKey: .sampling) ?? [:]
+        }
+    }
+    /// Absent from a body that predates it: such a body has learned no pages to leave.
+    public var window: Window?
     public var providers = ProviderSettingsFace()
     public var trust = TrustSettingsFace()
     public var persona = PersonaSettingsFace()

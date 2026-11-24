@@ -18,8 +18,7 @@ struct SimpleContactThread: View {
     }
 
     var body: some View {
-        TranscriptDocumentView(sessionID: "contact:" + contactID, presentation: "contact", handle: transcriptHandle)
-        .safeAreaInset(edge: .top, spacing: 0) {
+        VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
                 SimpleThreadHeader(title: name, subtitle: slot.select("subtitle", as: ContactThreadFace.self) { $0?.subtitle } ?? "Conversation") {
                     if let contact = appModel.face.slot(.contacts).select("contact." + contactID, as: ContactsFace.self, {
@@ -34,6 +33,8 @@ struct SimpleContactThread: View {
                     }
                 }.simpleRoomColumn()
             }.padding(.bottom, 12)
+            TranscriptDocumentView(sessionID: "contact:" + contactID, presentation: "contact", handle: transcriptHandle)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
@@ -41,16 +42,14 @@ struct SimpleContactThread: View {
                     let waiting = slot.select("waiting.ids", as: ContactThreadFace.self) { $0?.waiting.map(\.id) ?? [] }
                     ForEach(waiting, id: \.self) { id in
                         if let row = slot.select("waiting." + id, as: ContactThreadFace.self, { $0?.waiting.first { $0.id == id } }) {
-                            FaceView(face: PartFace(sections: [.init(id: "reading", rows: [row])]), door: ReadOnlyFaceDoor(),
-                                session: FacePageSession(), retaining: false)
+                            StaticFaceRow(row: row)
                             SimpleThreadActions(command: slot.select("command." + id, as: ContactThreadFace.self) { $0?.commands[id] })
                         }
                     }
                     let queued = slot.select("queued.ids", as: ContactThreadFace.self) { $0?.queued.map(\.id) ?? [] }
                     ForEach(queued, id: \.self) { id in
                         if let row = slot.select("queued." + id, as: ContactThreadFace.self, { $0?.queued.first { $0.id == id } }) {
-                            FaceView(face: PartFace(sections: [.init(id: "reading", rows: [row])]), door: ReadOnlyFaceDoor(),
-                                session: FacePageSession(), retaining: false)
+                            StaticFaceRow(row: row)
                             SimpleThreadActions(command: slot.select("command." + id, as: ContactThreadFace.self) { $0?.commands[id] })
                         }
                     }
@@ -100,6 +99,16 @@ struct SimpleContactThread: View {
             note = error.localizedDescription
             return false
         }
+    }
+}
+
+struct StaticFaceRow: View {
+    let row: PartFace.Row
+    @State private var session = FacePageSession()
+
+    var body: some View {
+        FaceView(face: PartFace(sections: [.init(id: "reading", rows: [row])]), door: ReadOnlyFaceDoor(),
+                 session: session, retaining: false)
     }
 }
 

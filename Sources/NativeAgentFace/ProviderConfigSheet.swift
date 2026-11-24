@@ -25,6 +25,7 @@ struct ProviderConfigSheet: View {
                     ?? "This account has not been read from Providers. Check again before editing it.")
                 Button("Check again") { Task { await appModel.loadProvidersForChat() } }
                 Button("Done", action: onDone)
+                    .keyboardShortcut(.cancelAction)
             }
             .padding(20)
         }
@@ -37,6 +38,8 @@ private struct ProviderConfigEditor: View {
     @Environment(AppModel.self) private var appModel
     @State private var baseline: ProviderInfo
     @State private var session = FacePageSession()
+    @State private var testingClaude = false
+    @State private var claudeTestResult: String?
     private let entryAuthMode: String?
     private let key = "provider.connection"
 
@@ -82,7 +85,8 @@ private struct ProviderConfigEditor: View {
     private var form: PartFace.Block {
         .init(kind: "form", key: key, fields: fields, submit: [
             .init(id: "save", label: "Save", role: .primary, call: .init("provider.save"), unavailable: entryIssue),
-            .init(id: "test", label: "Test connection", call: .init("provider.test"), unavailable: entryIssue),
+            .init(id: "test", label: provider.provider_id == "anthropic" ? "Test API key" : "Test connection",
+                  call: .init("provider.test"), unavailable: entryIssue),
             .init(id: "remove", label: "Remove sign-in", role: .destructive, call: .init("provider.remove")),
             .init(id: "read", label: "Read account again", call: .init("provider.read"))
         ], protected: true, receiver: FaceSecretReceiver.saveProviderConnection.name, doors: ["mac"])
@@ -96,7 +100,15 @@ private struct ProviderConfigEditor: View {
                     .init(id: key, footer: "Save keeps the key on this Mac. Only Test checks it with the provider.", rows: [], block: form)
                 ]), receiver: .saveProviderConnection, session: session, validationFree: ["read", "remove"], close: onDone, perform: perform)
                 if ["anthropic", "anthropic_oauth_direct"].contains(provider.provider_id) {
-                    AnthropicOAuthDirectPanel()
+                    VStack(alignment: .leading, spacing: 8) {
+                        OAuthSignInButton(provider: .anthropic)
+                        AnthropicSetupTokenInput()
+                        if provider.provider_id == "anthropic" {
+                            Button(testingClaude ? "Testing Claude sign-in…" : "Test Claude sign-in", action: testClaudeSignIn)
+                                .disabled(testingClaude)
+                            if let claudeTestResult { Text(claudeTestResult).textSelection(.enabled) }
+                        }
+                    }
                 } else if let oauth = oauthProvider { OAuthSignInButton(provider: oauth) }
             }
         }
@@ -117,30 +129,46 @@ private struct ProviderConfigEditor: View {
         }
         return revision
     }
+    private func readAccount() async throws -> ProviderInfo {
+        let reply = try await appModel.protectedFormAct(.readProviderAccount(id: provider.provider_id))
+        guard case .provider(let saved) = reply,
+              let current = saved.snapshot?.providers.first(where: { $0.provider_id == provider.provider_id }) else {
+            throw WireFailure(code: "provider_unavailable", message: "This account has not been read.", cause: nil, effects: .none)
+        }
+        return current
+    }
     private func perform(_ input: FaceProtectedSubmission) async -> FaceActOutcome {
         let submission = input.submission
         do {
             if submission.action == "read" || (submission.checking && submission.action == "test") {
-                let reply = try await appModel.protectedFormAct(.readProviderAccount(id: provider.provider_id))
-                if case .provider(let saved) = reply,
-                   let current = saved.snapshot?.providers.first(where: { $0.provider_id == provider.provider_id }) {
-                    if submission.checking {
-                        return .init(words: "Couldn't confirm the test result. Test again.", effects: .unknown)
-                    }
-                    baseline = current
-                    return .init(words: "Account read. Your edits are kept.", effects: .none, accepted: true)
+                let current = try await readAccount()
+                if submission.checking {
+                    return .init(words: "Couldn't confirm the test result. Test again.", effects: .unknown)
                 }
-                throw WireFailure(code: "provider_unavailable", message: "This account has not been read.", cause: nil, effects: .none)
-            }
-            if submission.checking, submission.action == "remove" {
-                return try FaceActOutcome.reply(await appModel.protectedFormAct(.readCredential(.providerRemoval(provider.provider_id))))
+                baseline = current
+                return .init(words: "Account read. Your edits are kept.", effects: .none, accepted: true)
             }
             if submission.action == "remove" {
-                let reply = try await appModel.protectedFormAct(.disconnectProvider(id: provider.provider_id))
-                guard case .committed(let saved) = reply else { throw unconfirmed() }
-                if let issue = saved.publicationFailure { throw issue }
-                return .init(words: "Sign-in removed.", effects: .known, accepted: true,
-                    committed: [.init(id: "key")])
+                var outcome: FaceActOutcome
+                if submission.checking {
+                    outcome = try .reply(await appModel.protectedFormAct(.readCredential(.providerRemoval(provider.provider_id))))
+                } else {
+                    let reply = try await appModel.protectedFormAct(.disconnectProvider(id: provider.provider_id))
+                    guard case .committed(let saved) = reply else { throw unconfirmed() }
+                    outcome = .init(words: "Sign-in removed.", failure: saved.publicationFailure, effects: saved.effects,
+                        accepted: true, committed: [.init(id: "key")])
+                }
+                guard outcome.accepted, !outcome.unresolved else { return outcome }
+                baseline.connectionRevision = nil
+                if outcome.failure == nil {
+                    do { baseline = try await readAccount() }
+                    catch {
+                        outcome.failure = WireFailure(code: "provider_readback_failed",
+                            message: "Sign-in was removed, but the updated account could not be read. Read the account again before saving or testing.",
+                            cause: error.localizedDescription, effects: .known)
+                    }
+                }
+                return outcome
             }
             guard case .string(let mode)? = submission.values?["authMode"] else {
                 throw WireFailure(code: "provider_mode_required", message: "Choose a sign-in method.", cause: nil, effects: .none)
@@ -153,20 +181,9 @@ private struct ProviderConfigEditor: View {
                 return try FaceActOutcome.reply(await appModel.protectedFormAct(.readCredential(.provider(request))))
             }
             if submission.action == "test" {
-                let reply = try await appModel.protectedFormAct(.testProvider(.init(id: provider.provider_id,
-                    authMode: mode, secret: secret, displayedRevision: try revision())))
-                guard case .providerTest(let probe) = reply else { throw unconfirmed() }
-                let result = probe.result
-                let words: String
-                if result.tested {
-                    let draft = secret.map { !String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } == true
-                    if result.status != "ok" { words = "The connection test failed." }
-                    else if draft { words = "The typed key passed its test. It is not saved." }
-                    else if probe.credentialReady && probe.credentialMatches { words = "The saved credential passed its test." }
-                    else { words = "The check did not verify the current saved credential. Read the account before testing it again." }
-                } else { words = "This sign-in method has no connection test. It remains unverified." }
-                return .init(words: [words, result.detail, result.error].compactMap { $0 }.joined(separator: " "),
-                    effects: .none, accepted: true)
+                let words = try await testConnection(.init(id: provider.provider_id, authMode: mode,
+                    secret: secret, displayedRevision: try revision()))
+                return .init(words: words, effects: .none, accepted: true)
             }
             let reply = try await appModel.protectedFormAct(.saveProviderConnection(.init(id: provider.provider_id,
                 secret: secret, authMode: mode, defaultModel: model, expectedRevision: try revision())))
@@ -178,6 +195,34 @@ private struct ProviderConfigEditor: View {
             if mode == "api_key" { fields.append(.init(id: "key")) }
             return .init(words: "Saved to this Mac. Not tested.", effects: .known, accepted: true, committed: fields)
         } catch { return .interrupted(error) }
+    }
+    private func testClaudeSignIn() {
+        guard !testingClaude else { return }
+        testingClaude = true
+        claudeTestResult = nil
+        Task {
+            defer { testingClaude = false }
+            do {
+                claudeTestResult = try await testConnection(.init(id: OAuthProvider.anthropic.id,
+                    authMode: "oauth", secret: nil, displayedRevision: nil))
+            } catch { claudeTestResult = error.localizedDescription }
+        }
+    }
+    private func testConnection(_ request: ProviderTestRequest) async throws -> String {
+        let reply = try await appModel.protectedFormAct(.testProvider(request))
+        guard case .providerTest(let probe) = reply else {
+            throw PartCallError(code: "provider_test_unconfirmed", message: "The provider did not return a connection test result.")
+        }
+        let result = probe.result
+        let words: String
+        if result.tested {
+            let draft = request.secret.map { !String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } == true
+            if result.status != "ok" { words = "The connection test failed." }
+            else if draft { words = "The typed key passed its test. It is not saved." }
+            else if probe.credentialReady && probe.credentialMatches { words = "The saved credential passed its test." }
+            else { words = "The check did not verify the current saved credential. Read the account before testing it again." }
+        } else { words = "This sign-in method has no connection test. It remains unverified." }
+        return [words, result.detail, result.error].compactMap { $0 }.joined(separator: " ")
     }
     private func unconfirmed() -> WireFailure {
         .init(code: "provider_reply_unconfirmed", message: "Not sure that saved. Check the account again.", cause: nil, effects: .unknown)

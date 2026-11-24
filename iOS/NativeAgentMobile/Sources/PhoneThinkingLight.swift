@@ -5,7 +5,7 @@ import UIKit
 /// Core Animation owns every frame; working state comes only from the Mac projection.
 struct PhoneThinkingLight: View {
     let correlationIDs: Set<String>
-    @ObservedObject private var activity = PhoneTurnActivity.shared
+    private let activity = PhoneTurnActivity.shared
     @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion

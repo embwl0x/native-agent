@@ -8,9 +8,12 @@ import NativeAgentShared
 struct AgentScreenView: View {
 
     @Environment(AppModel.self) private var appModel
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Binding var room: String
     @State private var feedback: String?
     @State private var activityTarget: ActivityTarget?
+
+    private static let homeWidth: CGFloat = 1040
 
     private struct ActivityTarget: Identifiable {
         let reference: WorkOverviewReference
@@ -36,26 +39,31 @@ struct AgentScreenView: View {
             }
             .accessibilityLabel("Rooms")
         } detail: {
-            VStack(alignment: .leading, spacing: 10) {
-                ScrollView {
-                    if room == "home" {
-                        home
-                    } else {
-                        let pane = appModel.face.slot(.agentScreen(room: room, scope: scope)).value(as: AgentScreenFace.self)
+            ScrollView {
+                if room == "home" {
+                    home
+                } else {
+                    let pane = appModel.face.slot(.agentScreen(room: room, scope: scope)).value(as: AgentScreenFace.self)
+                    VStack(alignment: .leading, spacing: 10) {
                         FaceReadStatus(state: pane?.state)
-                        if let text = pane?.text { Text(text)
-                        .font(.system(size: ShellType.captionSize, design: .monospaced))
-                        .foregroundStyle(NativeAgentShell.text)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(AliveMetrics.rowInsetH)
+                        if let text = pane?.text {
+                            Text(text)
+                                .font(.system(size: ShellType.captionSize, design: .monospaced))
+                                .foregroundStyle(NativeAgentShell.text)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                                .padding(AliveMetrics.rowInsetH)
+                                .macContentCard()
                         }
                     }
+                    .padding(.horizontal, AliveMetrics.rowInsetH)
+                    .padding(.top, 12)
+                    .padding(.bottom, AliveMetrics.rowInsetH)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .aliveCard()
             }
-            .padding(.top, 36)
-            .padding([.horizontal, .bottom], 20)
+            .scrollEdgeEffectStyle(quietOffscreenRead ? nil : .soft, for: .top)
+            .padding(.top, NativeAgentShellLayout.titleBarInset)
         }
         .modifier(FaceObservation(demand: room == "home" ? .key(.page("home")) : .agentScreen(room: room, scope: scope)))
         .sheet(item: $activityTarget) { target in
@@ -70,14 +78,14 @@ struct AgentScreenView: View {
             if let snapshot = appModel.face.slot(.page("home")).value(as: PartFaceSnapshot.self) {
                 FaceView(snapshot: snapshot, title: "Home", door: appModel.pageDoor(page: "home", open: open),
                          session: appModel.pageSessions.page("home"), leaf: { FacePageView.leaf($0) })
-                    .onAppear {
-                        appModel.pageSessions.page("home").notice = { [weak appModel] words in appModel?.systemToasts.push(success: words) }
-                    }
             } else { Text("Waiting on Home's face.") }
             if let feedback { Text(feedback).foregroundStyle(.secondary).textSelection(.enabled) }
         }
-        .padding(AliveMetrics.rowInsetH)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .padding(.horizontal, AliveMetrics.rowInsetH)
+        .padding(.top, 12)
+        .padding(.bottom, AliveMetrics.rowInsetH)
+        .frame(maxWidth: Self.homeWidth, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private func open(_ link: String) {

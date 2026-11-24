@@ -1,6 +1,4 @@
-import EngineRuntime
-import AttentionRouting
-import DoctorChecks
+import BodyRuntime
 import Foundation
 import WidgetKit
 import AppIntents
@@ -9,39 +7,14 @@ import SwiftUI
 import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
-import MemoryV2
+import MindCore
 import ProviderRouting
-import BackgroundLoops
-import PersonaEngine
-import ChatTurnRuntime
-import ChatSessionWork
-import TrustCenter
-import MultimodalTTS
-import SystemOps
-import TelegramBot
-import DeviceSync
-import ApprovalTransactions
-import Privacy
+import SenseCore
+import DeskCore
 import Darwin
 import AppKit
-@preconcurrency import EventKit
-import ToolRegistry
-import ApprovalInbox
-import ToolExecution
-import ChatToolRuntime
-import DreamREMCycle
-import Research
-import TriggerScheduler
-import NotificationInbox
-import ScreenVision
-import Dispatcher
-import MacControl
-import Onboarding
-import MacIntegration
-import Connectors
-import Browser
-import SchedulerExecution
-import TrustPersistence
+@unsafe @preconcurrency import EventKit
+import MacNerves
 // Blueprint: | `AppModel.swift` | `AppModel`: Composition, shared drafts and owner-derived UI state |
 
 @MainActor
@@ -95,8 +68,6 @@ final class AppModel: Sendable {
         }
     }
     var chatMessages: [ChatMessage] { engine.transcripts.displayedTranscript(for: activeChatSessionId).messages }
-    typealias PanelRefreshStatus = NativeAgentShared.PanelRefreshStatus
-
 
     /// Fold transcript fetch failures into the chat panel's failed-endpoint list.
     var chatStateLoadFailed = false
@@ -112,7 +83,7 @@ final class AppModel: Sendable {
     @ObservationIgnored let engine: NativeAgentEngine
     /// The only agent state the window's views read as stage one moves them over: finished values her owners post, applied per frame.
     @ObservationIgnored let face: FaceFeed
-    @ObservationIgnored private let displayFrame = DisplayFrame(followsScreenChanges: false)
+    @ObservationIgnored private let displayFrame = DisplayFrame()
     @ObservationIgnored private let workStatusPublication = WorkStatusPublication()
     /// Share engine owners and per-turn effect gates through the immutable Mac client.
     @ObservationIgnored lazy var macChatClient = engine.chatClient(profile: .mac)
@@ -187,7 +158,7 @@ final class AppModel: Sendable {
     @ObservationIgnored private var settingsFaceUpdates: SettingsFaceUpdates?
 
     deinit {
-        if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
+        if let defaultsObserver = unsafe defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
     }
 
     init() {

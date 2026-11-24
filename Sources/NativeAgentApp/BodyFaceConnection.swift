@@ -1,7 +1,8 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-import Privacy
+import PersistenceCore
+import os
 // Blueprint: | `BodyFaceConnection.swift` | Body pipe endpoint: attach, feed receipts, act dispatch and correlated window calls |
 
 actor BodyFaceConnection {
@@ -17,12 +18,12 @@ actor BodyFaceConnection {
     private var attached = false
     private var attachmentFailure: (any Error)?
     private var feedTask: Task<Void, Never>?
-    private var acts: [UUID: Task<Void, Never>] = [:]
+    private var acts: [UInt64: Task<Void, Never>] = [:]
     private var observations: Set<UUID> = []
-    private var seen: Set<UUID> = []
-    private var waiting: [UUID: CheckedContinuation<FaceReply, Error>] = [:]
-    private var callWrites: [UUID: Task<Void, Never>] = [:]
-    private var abandoned: Set<UUID> = []
+    private var lastAct: UInt64 = 0
+    private var requests = FaceLink.Requests()
+    private var waiting: [UInt64: CheckedContinuation<FaceReply, Error>] = [:]
+    private var abandoned: Set<UInt64> = []
     private var attachment: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var failure: (any Error)?
     private var closed = false
@@ -45,7 +46,8 @@ actor BodyFaceConnection {
                 guard failure == nil else { break }
                 switch envelope {
                 case .act(let id, let act):
-                    guard seen.insert(id).inserted else { throw FaceWireError.invalidFeedOrder }
+                    guard id > lastAct else { throw FaceWireError.invalidFeedOrder }
+                    lastAct = id
                     await receive(act, id: id)
                 case .reply(let id, let reply):
                     if let continuation = waiting.removeValue(forKey: id) { continuation.resume(returning: reply) }
@@ -57,7 +59,7 @@ actor BodyFaceConnection {
         } catch { await close(error) }
     }
 
-    private func receive(_ act: FaceAct, id: UUID) async {
+    private func receive(_ act: FaceAct, id: UInt64) async {
         do {
             switch act {
             case .attach(let version):
@@ -141,28 +143,18 @@ actor BodyFaceConnection {
     func call(_ call: FaceCall, connection: UUID? = nil) async throws -> FaceReply {
         try await waitForAttachment()
         if let connection, sink?.epoch != connection { throw FaceWireError.disconnected }
-        let id = UUID()
+        try Task.checkCancellation()
+        if let failure { throw failure }
+        let (id, write) = try requests.enqueue(on: link) { .call(id: $0, call) }
         return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            if let failure { throw failure }
-            return try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { continuation in
                 waiting[id] = continuation
-                callWrites[id] = Task {
-                    do { try await link.send(.call(id: id, call)) }
+                Task {
+                    do { try await write.value }
                     catch { await close(error) }
-                    callWrites.removeValue(forKey: id)
                 }
             }
         } onCancel: { Task { await self.cancelCall(id) } }
-    }
-
-    /// The render call follows a receipt of the actual frame, never an assumed paint delay.
-    func renderPage(page: String, tab: String?, width: Double, height: Double, reader: UUID) async throws -> FaceReply {
-        try await waitForAttachment()
-        guard let sink else { throw FaceWireError.disconnected }
-        let barrier = try await source.flush(sink: sink.epoch)
-        return try await call(.renderPage(.init(page: page, tab: tab, width: width, height: height,
-                                               epoch: sink.epoch, barrier: barrier, reader: reader)))
     }
 
     private func forward(_ sink: FaceFeedSink) async {
@@ -172,7 +164,7 @@ actor BodyFaceConnection {
         } catch { await close(error) }
     }
 
-    private func dispatch(_ act: FaceAct, id: UUID) async {
+    private func dispatch(_ act: FaceAct, id: UInt64) async {
         let reply: FaceActReply
         do {
             let result = try await handler.handle(act)
@@ -190,16 +182,16 @@ actor BodyFaceConnection {
             cause: NativeAppSecretRedactor.redactText(FaceLinkLog.failure(error)), effects: .unknown)
     }
 
-    private func reply(_ reply: FaceActReply, to id: UUID, act: FaceAct) async {
+    private func reply(_ reply: FaceActReply, to id: UInt64, act: FaceAct) async {
         switch reply {
         case .failed, .refused:
-            await record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
+            record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
         case .committed(let result), .operation(.completed(let result)):
             if result.publicationFailure != nil {
-                await record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
+                record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
             }
         case .card(let result) where result.failure != nil:
-            await record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
+            record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
         default: break
         }
         acts.removeValue(forKey: id)
@@ -208,23 +200,23 @@ actor BodyFaceConnection {
         catch { await close(error) }
     }
 
-    private func record(_ event: String) async {
-        do { try await log.record(NativeAppSecretRedactor.redactText(event)) }
-        catch { ModuleLog.app("[face] link record failed: %@", error.localizedDescription, level: .error) }
+    private func record(_ event: String) {
+        log.record(NativeAppSecretRedactor.redactText(event))
     }
 
     private func cancelAttachment(_ id: UUID) {
         attachment.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
 
-    private func cancelCall(_ id: UUID) async {
-        await callWrites[id]?.value
+    private func cancelCall(_ id: UInt64) async {
         guard let continuation = waiting.removeValue(forKey: id) else { return }
         abandoned.insert(id)
         continuation.resume(throwing: CancellationError())
-        let cancellation = UUID()
-        abandoned.insert(cancellation)
-        do { try await link.send(.call(id: cancellation, .cancelCall(id))) }
+        do {
+            let (cancellation, write) = try requests.enqueue(on: link) { .call(id: $0, .cancelCall(id)) }
+            abandoned.insert(cancellation)
+            try await write.value
+        }
         catch { await close(error) }
     }
 
@@ -233,7 +225,7 @@ actor BodyFaceConnection {
         failure = cause
         let connection = sink?.epoch
         ending(connection)
-        await record("disconnect epoch=\(String(describing: connection)) cause=\(FaceLinkLog.failure(cause))")
+        record("disconnect epoch=\(String(describing: connection)) cause=\(FaceLinkLog.failure(cause))")
         feedTask?.cancel()
         feedTask = nil
         if let sink { await source.detachSink(sink.epoch, cause: cause) }
@@ -255,7 +247,7 @@ actor BodyFaceConnection {
             catch { releases.append("Observation release: \(error.localizedDescription)") }
         }
         await disconnected(connection, ([cause.localizedDescription] + releases).joined(separator: "\n"), attached)
-        if !releases.isEmpty { await record("release_failed " + releases.joined(separator: "\n")) }
+        if !releases.isEmpty { record("release_failed " + releases.joined(separator: "\n")) }
         do { try await log.close() }
         catch { ModuleLog.app("[face] link record close failed: %@", error.localizedDescription, level: .error) }
         closed = true

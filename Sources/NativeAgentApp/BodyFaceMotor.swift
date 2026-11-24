@@ -1,5 +1,5 @@
 import Foundation
-import EngineRuntime
+import BodyRuntime
 import NativeAgentCore
 import NativeAgentShared
 // Blueprint: | `BodyFaceMotor.swift` | Connection-held motor acknowledgments and driving feedback for the separate face |

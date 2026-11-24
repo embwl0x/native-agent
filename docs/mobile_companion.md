@@ -9,6 +9,9 @@ brain. The agent's interface remains its one door, `app`:
 
 ## What the mobile app exposes
 
+SwiftUI observes the store properties each phone view reads. The Share extension binds its note field
+to its observable compose model.
+
 The main tabs are **Chat**, **Today**, **Desk**, **Settings**, and **More**.
 A page the Mac publishes as a face (`faces.json`, delivered in its CloudKit status group) is
 drawn by the shared `FaceView`: Today, the Desk, their home, Memories, Personality,
@@ -310,7 +313,8 @@ the acknowledgment cue; syncing quiet on also stops current speech.
 The active call owns one `.playAndRecord` / `.voiceChat` session and enables
 voice-processing I/O for echo cancellation. Recognition stays open during speech.
 Detected new speech stops playback immediately and suppresses further speech
-from interrupted runs; a signed cancellation targets only unfinished talk runs.
+from interrupted runs. Barge-in silences the agent's voice and cancels no work:
+the run keeps going and the new words arrive as their own message.
 Old detection timestamps and cancelled replies cannot interrupt a newer answer.
 Mute feeds silence to recognition while keeping the active call's audio route.
 Only call start/end haptics run, before opening and after closing capture.
@@ -319,9 +323,9 @@ An active talk session may keep its audio, existing receive loop and signed
 contact beat running after leaving the app or locking the phone. A Live Activity
 and Dynamic Island show elapsed time, mute and end. The button sets the mute
 state shown by its action for that call ID, so repeating the same action leaves
-the microphone in the same state. Audio frames renew the activity's freshness
-every 30 seconds; after 60 seconds without renewal it asks to open the app to
-check, rather than asserting that talk is still active. A cold launch retires
+the microphone in the same state. The Live Activity updates when the call status
+or mute state changes. It has no stale date or periodic renewal. Ending the call
+dismisses its activity immediately. A cold launch retires
 orphaned talk activities. Live Activities can be disabled by the person; talk
 still works without one. Ordinary dictation/voice notes cancel on backgrounding,
 and ordinary read-aloud and note playback stop there; the audio background mode
@@ -373,6 +377,7 @@ These changes reach attention's `weigh`, without publishing Live sense news.
 Places share names and arrival/departure times, plus an initial **at**
 observation when the phone is first seen inside a place. A first outside fix
 does not invent a departure. Coordinates stay on the phone for these senses.
+The separate Location sense, when the person turns it on, shares the phone's last known position with the paired Mac, as PRIVACY.md says.
 The separate, person-approved `phone.location` request still shares the
 location the person explicitly accepts.
 Each serialized Places mutation compares its typed before/after state;
@@ -464,7 +469,7 @@ cancellation or checked pairing retirement.
 Unreadable pairing material preserves the original pending identities. Neither
 silence nor elapsed time authorizes a resend or declares delivery.
 
-`MacControl/PersonPresence.swift` derives one line for Home, MY SENSES and the
+`MacNerves/MacControl/PersonPresence.swift` derives one line for Home, MY SENSES and the
 frozen turn capsule from Mac input, `mobile/place-events.json` and
 `mobile/sense-events.json`. Setup and observations occupy separate slots in
 that same bounded history; each source's latest setup and observation survive
@@ -572,7 +577,11 @@ and an HMAC signature. CloudKit uses inline `payloadJSON` within the 800 KiB
 record-value budget. Larger qualifying attachment envelopes use pairing-encrypted
 `payloadAsset`; audio envelopes always use it (48 MiB encoded payload, 10,000,000 bytes per file; scalar fields
 still fit inline). Asset messages have one encrypted payload and no older-phone
-preview payload. The bridges handle signed chat and
+preview payload. The Mac holds the pairing key, so an asset that does not open
+under it was sealed under another pairing: its pull passes that record as it
+passes older ones, and retention deletes it. The phone receives the Mac key's
+publication time on every pairing read, pushed or polled, and starts its pull
+there. The bridges handle signed chat and
 delivery; `MacSyncEngine` handles snapshots and remote actions.
 
 The send follows the original CloudKit operation's completion or error. There
@@ -697,8 +706,9 @@ renewal independent of status latency, holding its slot until its actual exit.
 The drain remains bound to its pairing and account-failure generation. Leaving
 the foreground or ending background talk cancels the presence and catch-up tasks.
 The actual failed incoming/status read cause stays in the sync warning alongside
-any snapshot error until catch-up completes or the connection is reset. Failure
-does not change either receive or presence cadence.
+any snapshot error until catch-up completes or the connection is reset. A failed
+foreground receive waits one 30-second presence beat before its next read instead
+of the 0.75-second receive interval; the presence beat itself does not change.
 
 Durable delivery receipts cover terminal replies, actions and notifications.
 Ephemeral text deltas, progress, notices and tool presentation do not append or
@@ -833,7 +843,7 @@ route through that same owner; their snapshots and terminal reply both carry
 bubble that streamed. The original request correlation remains for recovery of
 that original run. Unavailable live delivery never discards the saved transcript.
 Admitted resident turns begun on the Mac also carry their writing movement
-through `ChatLiveTap` and the live relay as `kind: writing`, correlated by run.
+through their engine's DeviceSync relay as `kind: writing`, correlated by run.
 Each changed writing line takes a fresh message id for its immutable CloudKit
 record; consecutive equal lines coalesce in the relay's per-run state. A line
 repeated after different movement also has a fresh id, so phone message-id
@@ -918,7 +928,7 @@ direction; Stop refuses unsupported payload fields before resolving any target.
 
 `faceAction` sends `{page, row, action, value?}` in that same signed envelope.
 The Mac passes the exact page and row ids, action id and optional string value
-through `DeviceSyncHost` to `engine.pages.act`; the page's owner answers it.
+through the phone’s engine to `engine.pages.act`; the page's owner answers it.
 A successful answer returns `status:ok`, `ok:true` and its words as `message`
 when it has any. A part refusal returns `status:error`, `ok:false` and the
 owner's `code` and `message`; a page without an action owner says it has
@@ -976,9 +986,10 @@ settlement must save its orphan receipt or report that failure. The phone's reta
 progress reader reports its key and decode failure through the bridge's existing sync status;
 the Mac no longer writes that input.
 Response arrivals settle their exact mailbox identity. Launch recovery belongs to
-the action mailbox, with a five-second inherited wait ceiling and at most 64 ledger
-entries decoded. A damaged entry reports its own gap while siblings proceed; excess
-entries remain retained with an incomplete-recovery message. Lightweight snapshot
+the action mailbox: each retained pending request is reconciled by its exact
+response identity without being sent again, within the caller's wait budget (launch
+passes none; entries left when a budget ends stay retained). A damaged entry reports
+its own gap while siblings proceed; the gaps join one incomplete-recovery message. Lightweight snapshot
 refresh never runs action recovery. Daily retention removes an old response only
 with a retained terminal response receipt, and keeps that receipt while the response
 survives. Missing or unreadable ledger evidence cannot prove consumption.
@@ -1312,8 +1323,9 @@ wakes sync with `nativeAgentWake: notification`, for both event kinds; no config
 is normal and is not an error. Event kind selects the renderer before transport.
 An APNS or subscription failure never selects another visible mechanism.
 Chat and visible-alert registrations are independent and name their own failures;
-incoming chat readiness reports only chat registration. Ordinary alerts carry no
-urgency from the router and use the system interruption level; adverse
+incoming chat readiness reports only chat registration. Ordinary alerts use the
+system interruption level; the router marks a failed matter `urgent` in its
+`userInfo`, which the visible CloudKit alert does not consume; adverse
 importance bypasses the Mac's quiet-hours hold, while iPhone Focus still applies.
 Requested results retain their signed reader's urgency handling.
 The Mac retains each immutable publication before sending, so retries preserve
@@ -1358,7 +1370,7 @@ invalid durations replace the Mac notice with a sticky error and leave the phone
 notice sticky. Severity defaults are 3/5/8/3 seconds.
 Mac body toasts use those defaults; the window mirrors their IDs and removals
 without its own expiry. Turn activity notices stay in the turn's lifecycle
-presentation. Mac toast capsules render independently in one vertical stack.
+presentation. Mac toast capsules share a glass container and keep their individual outlines in one vertical stack.
 
 ## Source map
 
@@ -1366,13 +1378,13 @@ presentation. Mac toast capsules render independently in one vertical stack.
 |---|---|
 | Shared transport and wire format | `Modules/NativeAgentShared/Sources/NativeAgentShared/DeviceSyncTransport.swift` |
 | CloudKit transport/preflight | `CloudKitDeviceTransport.swift`, `DeviceCloudKitPreflight.swift` in the same shared directory |
-| Mac chat bridge | `Modules/NativeAgentCore/Sources/DeviceSync/iCloudBridge.swift` |
-| Mac pairing, snapshots and actions | `Modules/NativeAgentCore/Sources/DeviceSync/` |
+| Mac chat bridge | `Modules/NativeAgentCore/Sources/BodyRuntime/DeviceSync/iCloudBridge.swift` |
+| Mac pairing, snapshots and actions | `Modules/NativeAgentCore/Sources/BodyRuntime/DeviceSync/` |
 | iOS admission/delivery and CloudKit | `iOS/NativeAgentMobile/Sources/iCloudBridge.swift`, `iCloudBridge+CloudKit.swift` |
 | iOS snapshot/action engine | `iOS/NativeAgentMobile/Sources/iCloudSyncEngine+*.swift` |
 | iOS chat and share import | `iOS/NativeAgentMobile/Sources/ChatStore+*.swift` |
 | Voice-note capture and recognition | `VoiceInputController.swift`, `MobileSpeechAnalyzer.swift`, `ComposerVoiceMicrophone.swift` in iOS Sources |
-| Hands-free talk and voice | `TalkModeController.swift`, `MobileTalkAudio.swift`, `TalkModeView.swift`, `ChatStore+ReplyObservation.swift`; `LiveActivityShared/PhoneTalkAttributes.swift`, `LiveActivity/PhoneTalkWidget.swift`, `ControlSupport/MobileTalkRoute.swift` under iOS; `MultimodalTTS/MultimodalTTS+VoiceSelection.swift` owns Mac voice identity |
+| Hands-free talk and voice | `TalkModeController.swift`, `MobileTalkAudio.swift`, `TalkModeView.swift`, `ChatStore+ReplyObservation.swift`; `LiveActivityShared/PhoneTalkAttributes.swift`, `LiveActivity/PhoneTalkWidget.swift`, `ControlSupport/MobileTalkRoute.swift` under iOS; `ProviderRouting/MultimodalTTS/MultimodalTTS+VoiceSelection.swift` owns Mac voice identity |
 | Shared voice-note presentation | `Modules/NativeAgentShared/Sources/NativeAgentShared/VoiceNoteBubble.swift`; phone `MobileTranscriptAttachments.swift`, Mac `Sources/NativeAgentFace/TranscriptAttachmentViews.swift` |
-| Phone senses, setup and preferences | `iOS/NativeAgentMobile/Sources/PhonePlaces.swift`, `PhoneSenses.swift`, `PhoneBodyReadings.swift`; shared `PhonePlaceEvent.swift`, `PhoneSenseEvent.swift`; `AppToolRuntime/PhoneSensesGuide.swift` reads setup and exact steps on the pairing page |
-| Mac person presence and evidence | `MacControl/PersonPresence.swift`; `PersistenceCore/PhoneSenseHistory.swift`, `PhonePlaceHistory` in `PersistenceCore.swift`; admission in `DeviceSync/ICloudReceiving.swift` |
+| Phone senses, setup and preferences | `iOS/NativeAgentMobile/Sources/PhonePlaces.swift`, `PhoneSenses.swift`, `PhoneBodyReadings.swift`; shared `PhonePlaceEvent.swift`, `PhoneSenseEvent.swift`; `BodyRuntime/AppToolRuntime/PhoneSensesGuide.swift` reads setup and exact steps on the pairing page |
+| Mac person presence and evidence | `MacNerves/MacControl/PersonPresence.swift`; `PersistenceCore/PersistenceCore/PhoneSenseHistory.swift`, `PhonePlaceHistory` in `PersistenceCore.swift`; admission in `BodyRuntime/DeviceSync/ICloudReceiving.swift` |

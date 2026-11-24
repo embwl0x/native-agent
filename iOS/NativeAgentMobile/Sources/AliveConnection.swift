@@ -54,7 +54,7 @@ struct AliveUnpairedReason: View {
 
 struct AliveFreshnessNote: View {
     private let sync = iCloudSyncEngine.shared
-    @EnvironmentObject private var pairingStore: PairingStore
+    @Environment(PairingStore.self) private var pairingStore
     @State private var showsPairing = false
     let group: String
 

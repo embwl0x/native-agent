@@ -1,3 +1,4 @@
+import Foundation
 import NativeAgentShared
 import Observation
 import QuartzCore
@@ -43,6 +44,7 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
     private var reduceMotion = false
     private var viewportSize = CGSize.zero
     private var scrollingToEnd = false
+    private var selfMoving = false
     private var openingStarted = CACurrentMediaTime()
     private var firstPaintOwed = true
     private let log = ModuleLog(category: "MobileTranscriptDocument")
@@ -79,6 +81,7 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
         textView.alwaysBounceVertical = true
         textView.showsHorizontalScrollIndicator = false
         textView.keyboardDismissMode = .interactive
+        textView.bottomEdgeEffect.style = .soft
         // The host hands over the composer's room; nothing else insets the document.
         textView.contentInsetAdjustmentBehavior = .never
         textView.textContainerInset = UIEdgeInsets(top: TranscriptMetrics.documentInset, left: 0, bottom: TranscriptMetrics.documentInset,
@@ -94,12 +97,24 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
         tap.cancelsTouchesInView = false
         tap.delegate = self
         textView.addGestureRecognizer(tap)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(accessibilityFocusMoved(_:)),
+            name: UIAccessibility.elementFocusedNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     /// The document leaves the screen: the reveal stops, the hosted views leave their parent controller, and the thread reads "at
     /// the end" so no Latest button outlives it.
     func dismantle() {
         mounted = false
+        NotificationCenter.default.removeObserver(self)
+        releaseFeedSelection()
         let task = inputTask
         task?.cancel()
         pendingInput = nil
@@ -218,43 +233,68 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
     private var maxOffsetY: CGFloat {
         max(-textView.contentInset.top, textView.contentSize.height + textView.contentInset.bottom - textView.bounds.height)
     }
-    /// The reader holds the scroll: a drag or its glide is under way, and nothing moves the document under the finger.
-    private var readerHolds: Bool { textView.isDragging || textView.isDecelerating }
-    /// The laid-out end is within the reading area: the reader's scroll came to rest at the end.
+    /// The reader holds the scroll during a drag, its glide, or an animated scroll.
+    private var readerHolds: Bool { textView.isDragging || textView.isDecelerating || textView.isScrollAnimating }
     override var reachesEnd: Bool? {
-        guard let last = lastFragmentFrame(ensuringLayout: false) else { return shown.blocks.isEmpty ? true : nil }
-        return documentEnd(last) - readingBottom <= 1
+        if shown.blocks.isEmpty { return true }
+        guard textView.bounds.height > 0 else { return nil }
+        if let last = lastLaidOutFragmentFrame() {
+            return documentEnd(last) - readingBottom <= 1
+        }
+        guard textView.contentSize.height - readingBottom <= 1 else { return false }
+        if let viewport = layout.textViewportLayoutController.viewportRange,
+           content.offset(from: viewport.endLocation, to: content.documentRange.endLocation) > 0 {
+            return false
+        }
+        return true
+    }
+
+    private func lastLaidOutFragmentFrame(ensuringLayout: Bool = false) -> CGRect? {
+        var frame: CGRect?
+        let options: NSTextLayoutFragment.EnumerationOptions = ensuringLayout ? [.reverse, .ensuresLayout] : [.reverse]
+        _ = layout.enumerateTextLayoutFragments(from: content.documentRange.endLocation, options: options) { fragment in
+            if fragment.state == .layoutAvailable { frame = fragment.layoutFragmentFrame }
+            return false
+        }
+        return frame
+    }
+
+    override func moving(_ change: () -> Void) {
+        let enclosing = selfMoving
+        selfMoving = true
+        defer { selfMoving = enclosing }
+        change()
     }
 
     private func scroll(toOffsetY y: CGFloat) {
         let clamped = min(max(y, -textView.contentInset.top), maxOffsetY)
         guard textView.contentOffset.y != clamped else { return }
-        textView.contentOffset = CGPoint(x: textView.contentOffset.x, y: clamped)
+        moving {
+            textView.contentOffset = CGPoint(x: textView.contentOffset.x, y: clamped)
+        }
     }
 
     private func documentEnd(_ last: CGRect) -> CGFloat {
         last.maxY + textView.textContainerInset.top + textView.textContainerInset.bottom
     }
 
-    /// Positive: the document's end is below the reading bottom. Negative: blank room past the end.
-    private func endResidual() -> CGFloat {
-        guard let last = lastFragmentFrame(ensuringLayout: false) else { return 0 }
-        return documentEnd(last) - readingBottom
-    }
-
     /// Lay out the end before scrolling; close any residual after viewport layout.
     private func scrollToEnd() {
-        guard !scrollingToEnd, let last = lastFragmentFrame(ensuringLayout: true) else { return }
+        guard !scrollingToEnd else { return }
         scrollingToEnd = true
         defer { scrollingToEnd = false }
-        let needed = documentEnd(last)
-        if textView.contentSize.height < needed { textView.contentSize = CGSize(width: textView.contentSize.width, height: needed) }
-        scroll(toOffsetY: maxOffsetY)
-        layout.textViewportLayoutController.layoutViewport()
-        let residual = endResidual()
-        if abs(residual) > 0.5 {
-            scroll(toOffsetY: textView.contentOffset.y + residual)
+        moving {
+            guard let last = lastLaidOutFragmentFrame(ensuringLayout: true) else { return }
+            let needed = documentEnd(last)
+            if textView.contentSize.height < needed { textView.contentSize = CGSize(width: textView.contentSize.width, height: needed) }
+            scroll(toOffsetY: maxOffsetY)
             layout.textViewportLayoutController.layoutViewport()
+            guard let laidOutEnd = lastLaidOutFragmentFrame() else { return }
+            let residual = documentEnd(laidOutEnd) - readingBottom
+            if abs(residual) > 0.5 {
+                scroll(toOffsetY: textView.contentOffset.y + residual)
+                layout.textViewportLayoutController.layoutViewport()
+            }
         }
     }
 
@@ -325,6 +365,47 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
 
     func scrollViewDidScrollToTop(_ scrollView: UIScrollView) {
         readerRested()
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        if !selfMoving { readerRested() }
+    }
+
+    func readerScrolled() {
+        guard !selfMoving, !pendingOpen else { return }
+        if textView.isScrollAnimating {
+            following = false
+            didMove()
+        } else if !readerHolds {
+            readerRested()
+        }
+    }
+
+    @objc private func accessibilityFocusMoved(_ notification: Notification) {
+        guard !selfMoving, !readerHolds,
+              let element = notification.userInfo?[UIAccessibility.focusedElementUserInfoKey],
+              containsAccessibilityElement(element) else { return }
+        readerRested()
+    }
+
+    private func containsAccessibilityElement(_ element: Any) -> Bool {
+        var current: Any? = element
+        var steps = 0
+        while let node = current, steps < 64 {
+            steps += 1
+            if (node as AnyObject) === textView { return true }
+            let next: Any?
+            if let view = node as? UIView {
+                next = view.superview
+            } else if let item = node as? UIAccessibilityElement {
+                next = item.accessibilityContainer
+            } else {
+                return false
+            }
+            if let next, (next as AnyObject) === (node as AnyObject) { return false }
+            current = next
+        }
+        return false
     }
 
     /// The reader's own scroll came to rest: they follow the end exactly when it rests on it.
@@ -428,7 +509,6 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
 
     // MARK: Requests from the host
 
-    /// Back to the end, following from there: Latest, a send, the keyboard rising.
     func goToLatest() {
         guard !pendingOpen else { return }
         following = true

@@ -1,8 +1,7 @@
-#if canImport(SwiftUI) && canImport(AVFoundation)
 import Foundation
 import SwiftUI
 import Observation
-@preconcurrency import AVFoundation
+@unsafe @preconcurrency import AVFoundation
 // Blueprint: | `VoiceNoteBubble.swift` | Mac/phone voice-note face; original audio, playback and expandable transcript |
 
 @MainActor @Observable
@@ -22,8 +21,8 @@ private final class VoiceNotePlayback: NSObject, AVAudioPlayerDelegate {
             return try (0..<48).map { index -> Float in
                 file.framePosition = AVAudioFramePosition(Double(file.length - 1) * Double(index) / 48)
                 try file.read(into: buffer, frameCount: min(1024, AVAudioFrameCount(file.length - file.framePosition)))
-                guard let samples = buffer.floatChannelData?.pointee else { return 0 }
-                return (0..<Int(buffer.frameLength)).reduce(Float(0)) { max($0, abs(samples[$1])) }
+                guard let samples = unsafe buffer.floatChannelData?.pointee else { return 0 }
+                return (0..<Int(buffer.frameLength)).reduce(Float(0)) { max($0, unsafe abs(samples[$1])) }
             }
         }.value
         try Task.checkCancellation()
@@ -54,8 +53,11 @@ private final class VoiceNotePlayback: NSObject, AVAudioPlayerDelegate {
 }
 
 public struct VoiceNoteBubble: View {
-    private static let stopPlaybackNotification = Notification.Name("NativeAgent.voiceNote.stopPlayback")
-    public static func stopPlayback() { NotificationCenter.default.post(name: stopPlaybackNotification, object: nil) }
+    private struct StopPlayback: NotificationCenter.MainActorMessage {
+        typealias Subject = NSObject
+    }
+    @State private var stopObserver: NotificationCenter.ObservationToken?
+    public static func stopPlayback() { NotificationCenter.default.post(StopPlayback()) }
     private let id: String
     private let transcript: String
     private let isOwn: Bool
@@ -132,8 +134,13 @@ public struct VoiceNoteBubble: View {
             }
             catch { if !Task.isCancelled { playback.error = error.localizedDescription } }
         }
-        .onDisappear { playback.stop() }
-        .onReceive(NotificationCenter.default.publisher(for: Self.stopPlaybackNotification)) { _ in playback.stop() }
+        .onAppear {
+            stopObserver = NotificationCenter.default.addObserver(of: nil, for: StopPlayback.self) { [playback] _ in playback.stop() }
+        }
+        .onDisappear {
+            stopObserver = nil
+            playback.stop()
+        }
     }
 
     private static func duration(_ seconds: TimeInterval) -> String {
@@ -141,4 +148,3 @@ public struct VoiceNoteBubble: View {
         return String(format: "%d:%02d", value / 60, value % 60)
     }
 }
-#endif

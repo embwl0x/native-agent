@@ -1,7 +1,7 @@
 #if os(macOS)
 import AppKit
 import Foundation
-// Blueprint: | `NativePanelPresentation.swift` | macOS shared-folder picker, bookmark grants and cancellable save-panel presentation |
+// Blueprint: | `NativePanelPresentation.swift` | macOS shared-folder picker, bookmark grants and cancellable save and confirmation sheets |
 
 @MainActor public enum ConnectorPresentation {
     public static func chooseSharedFolder(operation: UUID) async throws -> FaceReply {
@@ -45,6 +45,30 @@ import Foundation
             try Task.checkCancellation()
             return result
         } onCancel: { Task { @MainActor in panel.cancel(nil) } }
+    }
+
+    public static func confirm(_ alert: NSAlert, activate: Bool = false) async throws -> NSApplication.ModalResponse {
+        alert.window.preventsApplicationTerminationWhenModal = false
+        let host: NSWindow?
+        let parent: NSWindow
+        if let current = NSApp.keyWindow { parent = current; host = nil }
+        else {
+            parent = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 120),
+                styleMask: [.titled], backing: .buffered, defer: false)
+            parent.isReleasedWhenClosed = false
+            parent.title = "NativeAgent"
+            parent.center()
+            if activate { NSApp.activate() }
+            parent.makeKeyAndOrderFront(nil)
+            host = parent
+        }
+        defer { host?.close() }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let response = await alert.beginSheetModal(for: parent)
+            try Task.checkCancellation()
+            return response
+        } onCancel: { Task { @MainActor in parent.endSheet(alert.window, returnCode: .cancel) } }
     }
 
     @concurrent nonisolated public static func resourceGrant(id: UUID, url: URL, writable: Bool) async throws -> ResourceGrant {

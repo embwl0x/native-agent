@@ -202,9 +202,10 @@ struct WorkPane: View {
                 .labelsHidden()
                 .controlSize(.small)
                 .fixedSize()
+                .frame(minHeight: NativeAgentShellLayout.columnHeaderMinHeight)
                 .padding(.horizontal, NativeAgentShellLayout.roomGutter)
-                .padding(.top, 6)
-                .padding(.bottom, 8)
+                .padding(.top, NativeAgentShellLayout.columnHeaderTopInset)
+                .padding(.bottom, 4)
 
                 Group {
                     switch state.tab {
@@ -265,6 +266,7 @@ struct WorkPane: View {
 /// The line and the rows each read their own part of the turn, so a tick of the line never redraws a row.
 struct WorkPaneSteps: View {
     let sessionId: String
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     var body: some View {
         ScrollView {
@@ -274,19 +276,33 @@ struct WorkPaneSteps: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+            .padding(.top, NativeAgentSpacing.xs)
             .padding(.bottom, NativeAgentShellLayout.roomGutter)
         }
+        .scrollEdgeEffectStyle(quietOffscreenRead ? nil : .soft, for: .top)
     }
 }
 
 /// What she is doing now, read alone: it changes as often as she moves.
 private struct WorkPaneStepsLine: View {
+    private struct LineState: Equatable {
+        let text: String
+        let isActive: Bool
+    }
+
     let sessionId: String
     @Environment(AppModel.self) private var appModel
 
     var body: some View {
-        Text(appModel.turnPart("stepsLine", for: sessionId, WorkPaneFace.stepsLine))
-            .font(.title3).foregroundStyle(.secondary)
+        let state = appModel.turnPart("stepsLine", for: sessionId) { turn in
+            LineState(
+                text: WorkPaneFace.stepsLine(turn),
+                isActive: turn.map { $0.isRunning || $0.phase == .waitingOnPerson || !$0.steps.isEmpty } ?? false
+            )
+        }
+        Text(state.text)
+            .font(state.isActive ? .title3 : ShellType.label)
+            .foregroundStyle(state.isActive ? NativeAgentShell.secondary : NativeAgentShell.tertiary)
     }
 }
 
@@ -310,6 +326,8 @@ private struct WorkPaneStepRows: View {
 struct WorkPaneScreen: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+    @State private var session = FacePageSession()
 
     var body: some View {
         if let preview = appModel.turnFace(for: sessionId)?.preview, !preview.caption.isEmpty || preview.imageError != nil {
@@ -332,18 +350,20 @@ struct WorkPaneScreen: View {
                             .accessibilityLabel("What I read: \(readText)")
                     }
                     FaceView(face: WorkPaneFace.screen(preview), door: ReadOnlyFaceDoor(),
-                             session: FacePageSession(), retaining: false)
+                             session: session, retaining: false)
                 }
                 .padding(.horizontal, NativeAgentShellLayout.roomGutter)
                 .padding(.bottom, NativeAgentShellLayout.roomGutter)
             }
             // The picture is fitted to the width, so a scroll bar that takes width would appear and hide without end; none is drawn.
             .scrollIndicators(.never)
+            .scrollEdgeEffectStyle(quietOffscreenRead ? nil : .soft, for: .top)
         } else {
             Text("When I drive the Mac or the browser, what I see shows here.")
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.tertiary)
                 .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+                .padding(.top, NativeAgentSpacing.xs)
         }
     }
 }
@@ -353,7 +373,6 @@ struct WorkPaneScreen: View {
 /// Observe busy state in this leaf so Work status cannot invalidate the header or ChatView.
 struct WorkPaneHeaderButton: View {
     @Environment(AppModel.self) private var appModel
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppStorage(WorkPaneState.openKey) private var isOpen = false
 
     var body: some View {
@@ -379,9 +398,7 @@ struct WorkPaneHeaderButton: View {
             .fixedSize()
             .padding(.horizontal, 10)
             .padding(.vertical, 2)
-            // Reduce Transparency asks for more opacity, never less.
-            .background { if reduceTransparency { Capsule().fill(NativeAgentShell.room) } }
-            .glassEffect(reduceTransparency ? .identity : HouseGlass.plate.interactive(), in: Capsule())
+            .houseSurface(in: Capsule(), interactive: true, opaqueFill: NativeAgentShell.room)
         }
         .buttonStyle(.plain)
         .help(isOpen ? "Hide the Work pane (⌥⌘0)" : "Show the Work pane (⌥⌘0)")

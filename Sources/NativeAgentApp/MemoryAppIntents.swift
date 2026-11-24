@@ -1,6 +1,6 @@
 import AppIntents
 import Foundation
-import MemoryV2
+import MindCore
 import NativeAgentCore
 // Blueprint: | `MemoryAppIntents.swift` | `QueryMemoryIntent` struct; `perform`; pending proposals use the engine's review-eligible reader |
 

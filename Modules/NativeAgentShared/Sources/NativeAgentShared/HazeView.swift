@@ -122,11 +122,7 @@ public final class HazeView: HazeNativeView {
     }
 
     required public init?(coder: NSCoder) {
-#if canImport(AppKit)
-        fatalError("init(coder:) has not been implemented")
-#else
         return nil
-#endif
     }
 
 #if canImport(AppKit)
@@ -260,14 +256,7 @@ public final class HazeView: HazeNativeView {
 #endif
         rampStart = (CACurrentMediaTime(), start, target)
 #if canImport(AppKit)
-        let timer = Timer(timeInterval: 1.0 / 12, repeats: true) { [weak self] timer in
-            let done = MainActor.assumeIsolated { () -> Bool in
-                guard let self else { return true }
-                self.stepRamp()
-                return self.rampStart == nil
-            }
-            if done { timer.invalidate() }
-        }
+        let timer = Timer(timeInterval: 1.0 / 12, target: self, selector: #selector(stepRamp), userInfo: nil, repeats: true)
         RunLoop.main.add(timer, forMode: .common)
         rampTimer = timer
 #else

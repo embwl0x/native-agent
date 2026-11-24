@@ -17,9 +17,9 @@ measured cognitive benefit.
 
 ## Implementation Status
 
-The implementation is in `Modules/NativeAgentCore/Sources/CognitiveSubstrate/`
-and `Modules/NativeAgentCore/Sources/Cognition/`.
-`EngineRuntime/NativeAgentEngine.swift` constructs the cognition runtime
+The implementation is in `Modules/NativeAgentCore/Sources/MindCore/CognitiveSubstrate/`
+and `Modules/NativeAgentCore/Sources/BodyRuntime/Cognition/`.
+`BodyRuntime/EngineRuntime/NativeAgentEngine.swift` constructs the cognition runtime
 using host ports. Core's `ChatTurnRuntime` consumes its turn projection.
 The Mac app supplies the host and UI: one brain, many doors.
 
@@ -76,7 +76,7 @@ marked as app or script paths.
 These boundaries are represented by `CognitiveSubstrate.swift`,
 `CognitiveEvent.swift`, `CognitiveSubstrate+Replay.swift`,
 `CognitiveSubstrate+Reflection.swift`, `CognitiveSQLiteStore.swift` and
-`TrustCenter/SecurityCenter.swift`.
+`DeskCore/TrustCenter/SecurityCenter.swift`.
 
 ## 2. Mechanism owners
 
@@ -85,8 +85,8 @@ restore, frozen capsules, attention, reflection and inspection. [COGNITION_WIRIN
 owns turn connections, background admission and authority boundaries.
 `CognitiveSubstrate.frozenRead` and `NativeCognitionRuntime.prepareTurnProjection`
 are the fixed-time read owners; the loop's confirmed-delivery boundary commits presentation.
-`Experiences/Attention.swift` is the one intake for happenings; `CognitiveSubstrate+Attention.swift`
-lands worth as drive, ignites and attends; `Cognition/NativeCognitionRuntime+Attention.swift` joins them
+`SenseCore/Experiences/Attention.swift` is the one intake for happenings; `CognitiveSubstrate+Attention.swift`
+lands worth as drive, ignites and attends; `BodyRuntime/Cognition/NativeCognitionRuntime+Attention.swift` joins them
 to the agent's `weigh` and mind stream.
 
 ## 3. Evidence limits

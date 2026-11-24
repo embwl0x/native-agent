@@ -1,23 +1,14 @@
-import EngineRuntime
-import ApprovalTransactions
-import AppToolRuntime
-import AttentionRouting
-import ChatTurnRuntime
-import ChatTurnContracts
-import ChatToolRuntime
-import Connectors
-import DeviceSync
-import Experiences
+import BodyRuntime
+import MindCore
+import SenseCore
 import Foundation
-import MacControl
-import MacIntegration
+import MacNerves
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
-import SlackBot
 import SwiftUI
-import TrustCenter
+import DeskCore
 
 // Blueprint: | `CardControls.swift` | Mac inline interaction resolver ports; permission requests and typed credential owners |
 
@@ -25,33 +16,64 @@ import TrustCenter
 
 @MainActor
 struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
+    let engine: @Sendable () throws -> NativeAgentEngine
+
+    nonisolated init(engine: @escaping @Sendable () throws -> NativeAgentEngine) { self.engine = engine }
+
+    func startLocalTurn(_ prompt: String, sessionID: String, hideUserBubble: Bool, turn: Turn) async throws -> Bool {
+        let owner = try engine()
+        guard let appModel = ApplicationLifetime.shared.appModel, appModel.engine === owner else {
+            throw NSError(domain: "InteractionCard", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "The request could not continue: no turn starter is available."])
+        }
+        let envelope = turn.envelope
+        var origin = ChatMessageOrigin(surface: envelope?.surface ?? "chat", agent: envelope?.agent)
+        origin.peerSources = turn.peerSteering?.checkpointSources ?? []
+        origin.elevatedPeerSources = turn.peerSteering?.elevatedSources ?? []
+        // The admitted turn retains the continuation's origin through delivery.
+        let started = await appModel.startChatTurn(
+            prompt, attachments: [], sessionId: sessionID, hideUserBubble: hideUserBubble,
+            requireActiveSession: false, origin: origin, parent: turn
+        )
+        if !hideUserBubble { appModel.publishConversationAnchor(for: started.acceptance) }
+        switch started.acceptance {
+        case .accepted: return true
+        // The refusal's own reason is the card's: a deleted conversation says so, never "just now".
+        case .rejected(let message):
+            throw NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+    }
+
     func interactionControls() -> (any InlineInteractionControlPort)? {
-        ApplicationLifetime.shared.appModel.map { AppInlineInteractionControlPort(appModel: $0) }
+        guard let owner = try? engine(), let model = ApplicationLifetime.shared.appModel, model.engine === owner else { return nil }
+        return AppInlineInteractionControlPort(appModel: model)
     }
 
-    func mailReadiness(root: URL, check: Bool) async -> (status: String, word: String, next: String?) {
-        await NativeAgentEngine.forRoot(root).macIntegration.mailReadiness(check: check)
+    func mailReadiness(check: Bool) async -> (status: String, word: String, next: String?) {
+        do { return try await engine().macIntegration.mailReadiness(check: check) }
+        catch { return ("unavailable", error.localizedDescription, nil) }
     }
 
-    func chromeConnectionStatus() async -> (enabled: Bool, connected: Bool) {
-        let status = await NativeAgentEngine.live.chrome.setupConnectionStatus(context: .init(dataRoot: PersistenceCore.defaultDataRoot()))
+    func chromeConnectionStatus() async throws -> (enabled: Bool, connected: Bool) {
+        let owner = try engine()
+        let status = await owner.chrome.setupConnectionStatus(context: .init(dataRoot: owner.dataRoot))
         return (status.enabled, status.state == .connected)
     }
 
     var chromeSteps: String { InlineCards.chromeSteps }
 
     func phoneStanding() async -> NAPhoneStanding? {
-        await NativeAgentEngine.liveDeviceSync.bridge.checkedPhoneStanding()
+        try? await engine().deviceSync?.bridge.checkedPhoneStanding()
     }
 
-    func connectorRecords(root: URL) async throws -> [InlineInteractionConnectorStatus] {
-        try await NativeAgentEngine.forRoot(root).connectors.refresh().get().map {
+    func connectorRecords() async throws -> [InlineInteractionConnectorStatus] {
+        try await engine().connectors.refresh().get().map {
             (id: $0.id, authState: $0.authState, healthStatus: $0.healthStatus)
         }
     }
 
-    func providers(root: URL) async throws -> [InlineInteractionProviderStatus] {
-        try await NativeAgentEngine.forRoot(root).providers.list().providers.map {
+    func providers() async throws -> [InlineInteractionProviderStatus] {
+        try await engine().providers.list().providers.map {
             (providerID: $0.provider_id, displayName: $0.display_name,
              authState: $0.auth_status.state, eligible: $0.auth_status.eligible, defaultModel: $0.default_model,
              firstModel: $0.offeredModels.first?.id)
@@ -143,9 +165,9 @@ extension AppInlineInteractionPlatformPort {
                 guard PersonOnlyWindows.isOwnProcess(app?.processIdentifier) else { return }
                 continuation.yield(())
             }
-            nonisolated(unsafe) let changed = NotificationCenter.default.addObserver(
-                forName: SystemPermissionPreflight.permissionDidChange, object: nil, queue: .main
-            ) { _ in continuation.yield(()) }
+            nonisolated(unsafe) let changed = NotificationCenter.default.observeSynchronously(
+                for: MacIntegrationPermissionStore.DidChange.self, queue: .main
+            ) { continuation.yield(()) }
             nonisolated(unsafe) let quit = center.addObserver(
                 forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
             ) { notification in
@@ -154,9 +176,9 @@ extension AppInlineInteractionPlatformPort {
                 continuation.yield(())
             }
             continuation.onTermination = { _ in
-                center.removeObserver(active)
-                NotificationCenter.default.removeObserver(changed)
-                center.removeObserver(quit)
+                unsafe center.removeObserver(active)
+                unsafe NotificationCenter.default.removeObserver(changed)
+                unsafe center.removeObserver(quit)
             }
             continuation.yield(())
         }
@@ -166,10 +188,13 @@ extension AppInlineInteractionPlatformPort {
         try await SystemPermissionPreflight.requestMacOSAccess(ids, mode: mode, passed: passed)
     }
 
-    func writeInteractionSnapshots() async { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
+    func writeInteractionSnapshots() async {
+        do { try await engine().deviceSync?.engine.writeSnapshots() }
+        catch { ModuleLog.app("[interaction-notification] snapshot unavailable: %@", error.localizedDescription) }
+    }
 
     func openInteractionCards() async throws -> [(id: String, sessionID: String)] {
-        let reads = try await ForPerson.at(PersistenceCore.defaultDataRoot()).inbox()
+        let reads = try await ForPerson.at(engine().dataRoot).inbox()
         var cards: [(id: String, sessionID: String)] = []
         for row in reads {
             guard row.id.hasPrefix("interaction:"), ["unread", "read"].contains(row.status) else { continue }
@@ -183,7 +208,7 @@ extension AppInlineInteractionPlatformPort {
 
     func refreshInteractionInbox() async {
         do {
-            _ = try await NativeAgentEngine.live.inbox.list()
+            _ = try await engine().inbox.list()
         } catch {
             ModuleLog.app("[interaction-notification] inbox refresh failed: %@", error.localizedDescription)
         }

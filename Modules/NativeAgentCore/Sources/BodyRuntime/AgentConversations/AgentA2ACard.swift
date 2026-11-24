@@ -1,0 +1,283 @@
+import ProviderRouting
+import Foundation
+import NativeAgentShared
+import NativeAgentCore
+import PersistenceCore
+import MindCore
+import MacNerves
+import SenseCore
+import CryptoKit
+import os
+// Blueprint: | `AgentA2ACard.swift` | `AgentPeerDiscovery`, `authenticatedInterface`, `a2aCheck`, `listTasks`, `resolve` |
+
+extension AgentPeerDiscovery {
+    /// Extended cards need fresh authorization; public discovery must not expose them or forward credentials to a new origin.
+    package static func authenticatedInterface(conversation: AgentConversationContext, card: JSONValue, cardURL: URL, bearerToken: String?) async throws -> (
+        AgentA2AWire.Interface, JSONValue) {
+        var selected = try AgentA2AWire.selectInterface(card: card, cardURL: cardURL)
+        try AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: cardURL, hasCredential: bearerToken != nil)
+        if selected.extendedAgentCard, bearerToken != nil {
+            let request = try AgentA2AWire.operationRequest("GetExtendedAgentCard", interface: selected)
+            let response = try await AgentPeerHTTP.send(conversation: conversation, request, bearerToken: bearerToken)
+            if !(200..<300).contains(response.statusCode) {
+                throw ProviderFailure.Report(cause: .http(status: response.statusCode,
+                    detail: (try? response.json?.serialize(pretty: false)) ?? ""), work: .nothingRan)
+            }
+            guard (200..<300).contains(response.statusCode), let payload = response.json else { throw AgentA2AWire.WireError.invalid(
+                "authenticated extended agent card unavailable") }
+            let extended = try AgentA2AWire.operationResult(payload, interface: selected, requestID: request.requestID)
+            selected = try AgentA2AWire.selectInterface(card: extended, cardURL: cardURL)
+            try AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: cardURL, hasCredential: true)
+            return (selected, extended)
+        }
+        return (selected, card)
+    }
+
+    /// Interface, auth or offer drift must stop sends; only dry runs learn changes to an established card.
+    package static func a2aCheck(conversation: AgentConversationContext, _ peer: AgentPeerContact, bearerToken: String?, sending: Bool)
+        async -> (interface: AgentA2AWire.Interface?, recipe: AgentRecipeStore.Recipe?, receipt: [String: JSONValue]) {
+        let dryRun = conversation.dryRun
+        var receipt: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + peer.id),
+            "transport": .string("a2a"), "sent": .bool(false), "completed": .bool(false)]
+        if dryRun { receipt["dry_run"] = .bool(true) }
+        func refused(_ detail: String) -> (AgentA2AWire.Interface?, AgentRecipeStore.Recipe?, [String: JSONValue]) {
+            receipt["detail"] = .string("\(peer.name): \(detail). Nothing was sent.")
+            return (nil, nil, receipt)
+        }
+        let recipe: AgentRecipeStore.Recipe
+        do { recipe = try AgentRecipeStore.recipe(for: peer) } catch { return refused("\(error). Fix that file, or delete it to have it seeded again") }
+        guard let part = recipe.host.a2a else { return refused("agents/recipes/\(peer.id).json has no a2a part, so its card is not known") }
+        // The card's place may move within the contact's own origin; its credential goes nowhere else.
+        guard let cardURL = URL(string: part.card), AgentPeerPolicy.origin(cardURL) == AgentPeerPolicy.origin(peer.endpoint) else {
+            return refused("its recipe's a2a.card \(part.card) is not on its own origin \(AgentPeerPolicy.origin(peer.endpoint))")
+        }
+        guard part.credential == peer.credentialKey else {
+            return refused("its recipe's a2a.credential \(part.credential ?? "none") names no key it has; its key is \(peer.credentialKey ?? "none")")
+        }
+        var card: JSONValue?
+        func stopped(_ error: Error, at method: String) -> (AgentA2AWire.Interface?, AgentRecipeStore.Recipe?, [String: JSONValue]) {
+            receipt["method"] = .string(method)
+            receipt["untrusted_remote_data"] = .bool(true)
+            if let failure = error as? ToolFailureError {
+                receipt.merge(failure.failureEvidence(defaultCode: "agent_check_failed", defaultOwner: peer.name)) { _, owned in owned }
+                receipt["detail"] = .string(failure.message)
+                return (nil, nil, receipt)
+            }
+            switch error as? AgentA2AWire.WireError {
+            case .invalid?, .unsupported?:
+                let fields: [String: JSONValue] = if case .object(let fields)? = card { fields } else { [:] }
+                let interfaces: [JSONValue] = if case .array(let list)? = fields["supportedInterfaces"] { list }
+                    else { [.object(["protocolVersion": fields["protocolVersion"] ?? .null, "protocolBinding": fields["preferredTransport"] ?? .string(
+                        "JSONRPC")])] }
+                let advertised = interfaces.compactMap { item -> String? in
+                    guard case .object(let entry) = item, case .string(let version)? = entry["protocolVersion"],
+                          case .string(let binding)? = entry["protocolBinding"] else { return nil }
+                    return version + " " + binding
+                }.joined(separator: ", ")
+                receipt["reason"] = .string("protocol_mismatch")
+                if !advertised.isEmpty { receipt["protocol_version"] = .string(advertised) }
+                if case .string(let version)? = fields["version"] { receipt["program_version"] = .string(version) }
+                receipt["detail"] = .string("""
+                    \(peer.name): \(method) — \(error.localizedDescription). It advertises \
+                    \(advertised.isEmpty ? "no readable interface" : advertised);\u{20}
+                    """
+                    + "this app speaks \(AgentA2AWire.spoken). Nothing was sent.")
+            default:
+                if let failure = ProviderFailure.report(error, work: .nothingRan) { AgentPeerPolicy.peerFailure(failure, into: &receipt) }
+                else { receipt["detail"] = .string("\(peer.name): \(method) — \(error.localizedDescription) Nothing was sent.") }
+                if dryRun { receipt["status"] = .string("failed") }
+            }
+            return (nil, nil, receipt)
+        }
+        let selected: AgentA2AWire.Interface, read: AgentHostRow.A2A.Card
+        do {
+            let response = try await AgentPeerHTTP.get(cardURL, bearerToken: bearerToken)
+            guard (200..<300).contains(response.statusCode) else {
+                throw ProviderFailure.Report(cause: .http(status: response.statusCode,
+                    detail: (try? response.json?.serialize(pretty: false)) ?? ""), work: .nothingRan)
+            }
+            guard let json = response.json else { throw AgentA2AWire.WireError.invalid("agent card is not JSON") }
+            card = json
+            let (interface, effective) = try await authenticatedInterface(conversation: conversation, card: json, cardURL: cardURL, bearerToken: bearerToken)
+            selected = interface
+            read = try a2aRead(effective, interface)
+        } catch { return stopped(error, at: "agent card") }
+        let recorded = part.read
+        let drift = recorded.map { AgentHostRow.A2A.Card.drift($0, read) } ?? []
+        // Card-authored values must remain labelled as peer data.
+        if !drift.isEmpty { receipt["untrusted_remote_data"] = .bool(true) }
+        // Text-only card changes do not invalidate a send; the next dry run records the digest.
+        let relied = drift.filter { !$0.hasPrefix("digest:") }
+        if sending, !dryRun, !relied.isEmpty {
+            receipt["reason"] = .string("recipe_mismatch")
+            receipt["method"] = .string("agent card")
+            receipt["fields"] = .array(relied.map { .string(String($0.prefix { $0 != ":" })) })
+            receipt["detail"] = .string("\(peer.name)'s card no longer matches its recipe — \(relied.joined(separator: "; ")). Nothing was sent.")
+            return (nil, nil, receipt)
+        }
+        guard sending || dryRun else { return (selected, recipe, [:]) }
+        // On 0.3 there is no safe call: the card answered, auth is unproven.
+        let proven = selected.version == "1.0"
+        if dryRun, proven {
+            do { _ = try await listTasks(conversation: conversation, ["pageSize": .int(1)], interface: selected, bearerToken: bearerToken) }
+            catch { return stopped(error, at: "ListTasks") }
+        }
+        let dropped = (recorded?.skills ?? []).filter { !read.skills.contains($0) }
+        if dryRun, !dropped.isEmpty {
+            receipt["reason"] = .string("recipe_mismatch")
+            receipt["method"] = .string("agent card")
+            receipt["detail"] = .string("\(peer.name)'s card dropped \(dropped.joined(separator: ", ")), which its recipe names, so nothing was learned — "
+                + "\(drift.joined(separator: "; ")). Nothing was sent.")
+            return (nil, nil, receipt)
+        }
+        let answered = proven ? "\(peer.name) answered with its card, its auth and a task listing; nothing was sent."
+            : "\(peer.name) answered with its card; auth unchecked — 0.3 has no safe call. Nothing was sent."
+        var checked = recipe
+        // Sends may record a first read; only dry runs may learn changes.
+        if read != recorded, dryRun || recorded == nil {
+            var host = recipe.host
+            host.a2a?.read = read
+            do { checked = try AgentRecipeStore.learn(recipe, host: host) }
+            catch {
+                receipt["detail"] = .string("""
+                    \(peer.name)'s recipe could not take what its card says (\(drift.isEmpty ? "its first read" : drift.joined(separator: "; "))): \
+                    \(error). Nothing was sent.
+                    """)
+                return (nil, nil, receipt)
+            }
+        }
+        guard dryRun else { return (selected, checked, [:]) }
+        receipt["status"] = .string(!proven ? "unchecked" : recorded == nil || recorded == read ? "passed" : "repaired")
+        receipt["recipe_version"] = .int(Int64(checked.recipeVersion))
+        receipt["detail"] = .string(answered + (recorded == nil ? " Its card is recorded in recipe v\(checked.recipeVersion)." : ""))
+        if recorded != nil, recorded != read {
+            receipt["healed"] = .string("\(peer.name): \(drift.joined(separator: "; ")) — recipe updated to v\(checked.recipeVersion)")
+        }
+        return (nil, checked, receipt)
+    }
+
+    private static func a2aRead(_ card: JSONValue, _ interface: AgentA2AWire.Interface) throws -> AgentHostRow.A2A.Card {
+        let fields: [String: JSONValue] = if case .object(let fields) = card { fields } else { [:] }
+        func strings(_ list: JSONValue?, _ key: String) -> [String] {
+            guard case .array(let items)? = list else { return [] }
+            return items.compactMap { item -> String? in
+                guard case .object(let item) = item, case .string(let value)? = item[key] else { return nil }
+                return value
+            }.sorted()
+        }
+        var auth: Set<String> = []
+        if case .array(let alternatives) = interface.securityRequirements, case .object(let schemes) = interface.securitySchemes {
+            for case .object(let entry) in alternatives {
+                var names = entry
+                if interface.version == "1.0" { names = if case .object(let named)? = entry["schemes"] { named } else { [:] } }
+                for name in names.keys { auth.insert(name + ": " + ((try? schemes[name]?.serialize(pretty: false)) ?? "undeclared")) }
+            }
+        }
+        let capabilities: [String: JSONValue] = if case .object(let capabilities)? = fields["capabilities"] { capabilities } else { [:] }
+        return .init(endpoint: interface.endpoint.absoluteString, version: interface.version, binding: interface.binding, tenant: interface.tenant,
+                     auth: auth.sorted(), streaming: interface.streaming, pushNotifications: interface.pushNotifications,
+                     extendedCard: interface.extendedAgentCard, skills: strings(fields["skills"], "id"),
+                     extensions: strings(capabilities["extensions"], "uri"), digest: try card.digest)
+    }
+
+    package static func listTasks(conversation: AgentConversationContext, _ filters: [String: JSONValue], interface: AgentA2AWire.Interface,
+        bearerToken: String?,
+                                  requestID: String = UUID().uuidString.lowercased()) async throws -> JSONValue {
+        let listing = try AgentA2AWire.operationRequest("ListTasks", parameters: filters, interface: interface, requestID: requestID)
+        let response = try await AgentPeerHTTP.send(conversation: conversation, listing, bearerToken: bearerToken)
+        guard (200..<300).contains(response.statusCode), let payload = response.json else { throw AgentCommunicationError.invalid("task listing unavailable") }
+        return try AgentA2AWire.normalizeTaskList(payload, interface: interface, requestID: listing.requestID)
+    }
+
+    package struct Result: Sendable {
+        package let transport: AgentPeerTransport?
+        package let endpoint: URL?
+        package let evidence: JSONValue
+    }
+
+    package static func resolve(conversation: AgentConversationContext, _ endpoint: URL, bearerToken: String?) async throws -> Result {
+        try AgentPeerStore.validate(AgentPeerContact(name: "Discovery", endpoint: endpoint, transport: .a2a))
+        var probes: [JSONValue] = []
+        func finish(_ status: String, _ detail: String, transport: AgentPeerTransport? = nil,
+                    endpoint: URL? = nil, card: URL? = nil, offer: String? = nil) -> Result {
+            var evidence: [String: JSONValue] = [
+                "status": .string(status), "detail": .string(detail), "probes": .array(probes),
+                "message_sent": .bool(false), "untrusted_remote_data": .bool(true),
+                "supported_transports": .array([.string("a2a"), .string("nativeAgent")])]
+            // An unsupported contract belongs to the peer; it does not imply a local fault or repair debt.
+            if let card, let offer {
+                evidence["remedy"] = Repair.why(owner: "the agent card at " + card.absoluteString,
+                                                tap: "that agent's own setup, whose card must offer " + offer)
+            }
+            return Result(transport: transport, endpoint: endpoint, evidence: .object(evidence))
+        }
+        let url = endpoint
+        try Task.checkCancellation()
+        let response = try await AgentPeerHTTP.get(url, bearerToken: bearerToken, timeout: 5)
+        probes.append(.object(["url": .string(url.absoluteString), "http_status": .int(Int64(response.statusCode))]))
+        if response.statusCode == 401 || response.statusCode == 403 {
+            return finish("auth_required", "The configured agent card requires this peer's bearer credential. No contact was saved.")
+        }
+        guard (200..<300).contains(response.statusCode) else {
+            var fields: [String: JSONValue] = ["probes": .array(probes), "message_sent": .bool(false)]
+            AgentPeerPolicy.peerFailure(.init(cause: .http(status: response.statusCode, detail: ""), work: .nothingRan), into: &fields)
+            return Result(transport: nil, endpoint: nil, evidence: .object(fields))
+        }
+        guard case .object(let card)? = response.json else {
+            return finish("unsupported", "The configured card is not a JSON object. No contact was saved.", card: url, offer: "a supported agent card")
+        }
+        if card["protocol"] == .string("nativeagent-bridge") {
+            guard card["version"] == .string("1.0"), url.path.hasSuffix("/agent/card"),
+                  case .object(let message)? = card["message"], case .object(let reply)? = card["reply"],
+                  message["method"] == .string("POST"), message["path"] == .string("/agent/message"),
+                  message["text_field"] == .string("text"), message["session_field"] == .string("sessionId"),
+                  reply["method"] == .string("POST"), reply["path"] == .string("/agent/reply"),
+                  reply["request_field"] == .string("request_id"), reply["session_field"] == .string("session_id"),
+                  case .object(let auth)? = card["authentication"], auth["scheme"] == .string("bearer"),
+                  case .bool(let required)? = auth["required"] else {
+                return finish("unsupported", """
+                    This NativeAgent card does not advertise bridge 1.0 with its message/reply contract and bearer authentication. No contact was \
+                    saved.
+                    """,
+                              card: url, offer: "NativeAgent bridge 1.0 (POST /agent/message and /agent/reply, bearer authentication)")
+            }
+            guard !required || bearerToken != nil else {
+                return finish("auth_required", "NativeAgent requires this peer's bearer credential. No contact was saved.")
+            }
+            let base = url.deletingLastPathComponent().deletingLastPathComponent()
+            return finish("discovered", "Validated NativeAgent 1.0 message and exact-receipt interfaces. No message sent.", transport: .nativeAgent,
+                endpoint: base)
+        }
+        guard card["protocolVersion"] != nil || card["supportedInterfaces"] != nil else {
+            return finish("unsupported", "The configured card declares no supported protocol. No contact was saved.", card: url, offer: AgentA2AWire.spoken)
+        }
+        guard case .string(let name)? = card["name"], !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              case .object? = card["capabilities"], case .array? = card["skills"] else {
+            return finish("unsupported", "This A2A card is missing its name, capabilities or skills. No contact was saved.",
+                          card: url, offer: "a complete A2A card (name, capabilities and skills)")
+        }
+        let authenticated: AgentA2AWire.Interface
+        do { authenticated = try await authenticatedInterface(conversation: conversation, card: .object(card), cardURL: url, bearerToken: bearerToken).0 }
+        catch {
+            switch error as? AgentA2AWire.WireError {
+            case .invalid?, .unsupported?:
+                return finish("unsupported", """
+                    This A2A card offers nothing this app speaks (\(error.localizedDescription)); it speaks \(AgentA2AWire.spoken). No contact was \
+                    saved.
+                    """,
+                              card: url, offer: AgentA2AWire.spoken + ", with no required extension")
+            default: break
+            }
+            if let failure = ProviderFailure.report(error, work: .nothingRan) {
+                var fields: [String: JSONValue] = ["message_sent": .bool(false)]
+                AgentPeerPolicy.peerFailure(failure, into: &fields)
+                return Result(transport: nil, endpoint: nil, evidence: .object(fields))
+            }
+            throw error
+        }
+        return finish("discovered", """
+            Validated advertised A2A \(authenticated.version) \(authenticated.binding) interface. Messaging and task reads are supported; no \
+            message sent.
+            """, transport: .a2a, endpoint: url)
+    }
+}

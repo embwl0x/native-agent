@@ -1,0 +1,1030 @@
+import MacNerves
+import SenseCore
+import AppKit
+import Foundation
+import NativeAgentShared
+import DeskCore
+import NativeAgentCore
+import PersistenceCore
+import ProviderRouting
+import UniformTypeIdentifiers
+// Blueprint: | `AgentCommsActions+AgentCommunication.swift` | `SwiftToolDispatcher`: `closeACPConnections`, `impl_agent_message` (contact discovery, connection, `peerConversation` and each contact's route, the A2A and NativeAgent `peerExchange` recording an unproven contact unavailable however it ends); command settlement joins its output consumer before reading replies and releasing its directory/probe; physical launch, exit success and proven delivery remain separate, launched unanswered commands retain unknown delivery |
+enum PeerConversationArgs {
+    case send(AgentMessageArgs)
+    case read(AgentReadArgs)
+
+    var message: AgentMessageArgs? { if case .send(let value) = self { value } else { nil } }
+    var reading: AgentReadArgs? { if case .read(let value) = self { value } else { nil } }
+    var agent: String? { message?.agent ?? reading?.agent }
+    var conversationID: String? { (message?.conversationID ?? reading?.conversationID).flatMap { $0.isEmpty ? nil : $0 } }
+    var messageID: String? { (message?.messageID ?? reading?.messageID).flatMap { $0.isEmpty ? nil : $0 } }
+    var taskID: String? { (message?.taskID ?? reading?.taskID).flatMap { $0.isEmpty ? nil : $0 } }
+    var wire: [String: JSONValue] {
+        var fields: [String: JSONValue]
+        switch self {
+        case .send(let args):
+            fields = args.wire
+            fields.removeValue(forKey: "dry_run")
+            if args.files?.isEmpty != false { fields.removeValue(forKey: "files") }
+        case .read(let args): fields = args.wire
+        }
+        fields["conversation_id"] = conversationID.map(JSONValue.string)
+        fields["message_id"] = messageID.map(JSONValue.string)
+        fields["task_id"] = taskID.map(JSONValue.string)
+        return fields
+    }
+}
+
+extension SwiftToolDispatcher {
+    public static func closeACPConnections() async { await AgentACPConnections.shared.closeAll() }
+    func impl_agent_message(context: ActionContext, args: AgentMessageArgs) async throws -> JSONValue {
+        let invocation = context.invocation, turn = context.turn
+        var input = args.wire.merging(context.transportMetadata) { value, _ in value }
+        try AgentMessageFiles.requireSupported(conversation: invocation.conversation, input, hasFiles: args.files?.isEmpty == false, dataRoot: dataRoot)
+        if args.files?.isEmpty != false { input.removeValue(forKey: "files") }
+        if let reply = try await HelperContact.message(conversation: invocation.conversation, input,
+            call: turn.enclosingCall ?? invocation.deadlines.innermostCall) { return reply }
+        try AgentRecipeStore.requireAvailable()
+        try Self.peerKeys(context.transportMetadata, allowed: ["__session_id"])
+        return try await peerConversation(turn: turn, invocation: invocation, args: .send(args),
+                                          store: AgentPeerStore(dataRoot: dataRoot), session: context.transportMetadata["__session_id"]?.trimmedString, surface: context.surface)
+    }
+
+    func impl_agent_read(context: ActionContext, args: AgentReadArgs) async throws -> JSONValue {
+        try AgentRecipeStore.requireAvailable()
+        try Self.peerKeys(context.transportMetadata, allowed: ["__session_id"])
+        return try await peerConversation(turn: context.turn, invocation: context.invocation, args: .read(args),
+                                          store: AgentPeerStore(dataRoot: dataRoot), session: context.transportMetadata["__session_id"]?.trimmedString, surface: context.surface)
+    }
+
+    /// agent.contacts: the saved contacts a name selects (all of them when none matches), their doors and evidence, what discovery
+    /// found, and when each last answered.
+    func impl_agent_contacts(context: ActionContext, args: AgentContactsArgs) async throws -> JSONValue {
+        try AgentRecipeStore.requireAvailable()
+        try Self.peerKeys(context.transportMetadata, allowed: ["__session_id"])
+        let store = AgentPeerStore(dataRoot: dataRoot)
+        let invocation = context.invocation, turn = context.turn, surface = context.surface
+        var named: String?
+        var refresh = false
+        switch args.discover {
+        case nil, .bool(false)?: break
+        case .bool(true)?: refresh = true
+        case .string(let text)?:
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.lowercased() == "true" { refresh = true }
+            else if !text.isEmpty, text.lowercased() != "false" { named = text }
+        }
+        let allPeers = try store.list()
+        func matches(_ handle: String, _ name: String) -> Bool {
+            named.map { handle.caseInsensitiveCompare($0) == .orderedSame || handle.split(separator: ":").last.map(String.init) == $0
+                || name.caseInsensitiveCompare($0) == .orderedSame } ?? true
+        }
+        var peers = allPeers.filter { peer in matches("peer:" + peer.id, peer.name)
+            || named.map { name in (peer.handles ?? []).contains { $0.caseInsensitiveCompare(name) == .orderedSame } } == true }
+        let allBots = named?.lowercased().hasPrefix("peer:") == true && !peers.isEmpty ? [] : try BotDefinitionStore(dataRoot: dataRoot).list()
+        var bots = allBots.filter { matches("bot:" + $0.id.uuidString.lowercased(), $0.name) }
+        let savedMatch = named != nil && (!peers.isEmpty || !bots.isEmpty)
+        if !savedMatch {
+            peers = allPeers
+            bots = allBots
+            refresh = refresh || named != nil
+        }
+        var contacts = try await contactRows(invocation: invocation, allPeers: allPeers, peers: peers, bots: bots, matches: matches)
+        let connected = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
+        // An explicit discover may run what it finds (--help, initialize), under the rule a send runs it by.
+        var launch: AgentPeerDiscovery.Launch?
+        if refresh, !savedMatch {
+            launch = .refused("running a found program needs this app's Full Mac file access on this surface")
+            if usesCanonicalBody, try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+                let origin = SecurityOriginContext.currentTurn(turn: turn, surface: surface)
+                launch = await Self.agentProgramLaunch(SwiftNativeSecurityCenter(dataRoot: dataRoot)
+                    .drivenAgentLaunchPermission(origin: origin, turn: turn), dataRoot: dataRoot).launch
+            }
+        }
+        let found = savedMatch ? [] : await AgentDiscoverySession.shared.candidates(refresh: refresh, launch: launch, dataRoot: dataRoot)
+        // An already-saved agent's discovered program is another door to that contact, never a duplicate contact.
+        let twins = found.compactMap { candidate -> (AgentDiscoveryCandidate, AgentPeerContact)? in
+            guard candidate.hostID == nil, candidate.detail.hasPrefix("Speaks ACP"),
+                  let contact = peers.first(where: { Self.sameAgent($0.name, candidate.name) }) else { return nil }
+            return (candidate, contact)
+        }
+        contacts += found.filter { candidate in
+            if twins.contains(where: { $0.0 == candidate }) { return false }
+            if let host = candidate.hostID {
+                return AgentHostDirectory.rows.first { $0.id == host }?.requiresWorkspace == true || !connected.contains(host)
+            }
+            return !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
+        }.map(\.projection)
+        var note: String?
+        if let named, !savedMatch {
+            let hits = contacts.filter {
+                guard case .object(let row) = $0 else { return false }
+                if row["agent"] == .string(named) { return true }
+                if case .string(let name)? = row["name"] { return name.localizedCaseInsensitiveContains(named) }
+                return false
+            }
+            if hits.isEmpty { note = "No contact matches '\(named)'; all \(contacts.count) below." } else { contacts = hits }
+        }
+        try readLastAnswered(&contacts, bots: bots, details: args.details == true)
+        var listed: [String: JSONValue] = ["status": .string("ok"), "contacts": .array(contacts),
+                        "detail": .string("""
+                            Last answered is read from the contact's thread; it does not prove availability now. Use details:true for doors and \
+                            connection evidence.
+                            """)]
+        if let note { listed["note"] = .string(note) }
+        if !savedMatch {
+            let ran: String = switch launch {
+            case nil: refresh
+                ? """
+                    Found programs were read (signature bytes, settings files, agent cards), not run; agent.contacts {discover: true} runs each \
+                    one's --help and initialize.
+                    """
+                : "Listed from the last discovery; nothing was read or run now."
+            case .refused(let why)?: "Found programs were read, not run: \(why)."
+            case .run?: """
+                Each found program's --help and initialize ran under the rule a send to it uses: Full Mac as is, otherwise the builder sandbox \
+                (scrubbed environment, a temporary folder, stdin closed).
+                """
+            }
+            let doors = twins.map { "\($0.0.name) is another door for \($0.1.name), already a contact" }
+            listed["discovery"] = .string(ran + (doors.isEmpty ? "" : " " + doors.joined(separator: "; ") + "."))
+        }
+        return .object(listed)
+    }
+    /// The contacts' rows: the agent lanes, a helper's door, each contact's observed reply path, its last exchange, and the bots.
+    private func contactRows(invocation: ChatToolInvocation, allPeers: [AgentPeerContact], peers: [AgentPeerContact],
+                             bots: [BotDefinition], matches: (String, String) -> Bool) async throws -> [JSONValue] {
+        if peers.contains(where: ChatGPTDotIPCTransport.owns) { _ = await chatGPTDotReadiness() }
+        var contacts = Self.agentLaneContacts(peers: allPeers, selectedPeers: peers,
+            dot: dotTransport?.snapshot ?? ChatGPTDotIPCTransport.snapshot(at: dataRoot))
+        if let door = invocation.helperDoor, matches(door.name, door.name) {
+            contacts.append(.object(["agent": .string(door.name), "name": .string(door.name),
+                "state": .string("available"), "conversation_id": .string(door.conversationID)]))
+        }
+        let health = try AgentContactHealth.read(dataRoot: dataRoot)
+        contacts = contacts.map { value in
+            guard case .object(var row) = value, case .string(let agent)? = row["agent"], let observed = health[agent] else { return value }
+            row["reply_path"] = observed.projection
+            if let presence = observed.presenceStatus {
+                row["presence"] = .object(["status": .string(presence), "detail": .string(observed.presenceDetail ?? "")])
+            }
+            if observed.brokenSince != nil || ["unverified", "not_reached"].contains(observed.replyStatus) {
+                row["state"] = .string(observed.replyStatus)
+                row["state_detail"] = .string(observed.problem ?? observed.replyDetail)
+                row["readiness"] = .string(observed.replyStatus)
+            }
+            return .object(row)
+        }
+        let lasts = AgentConversationStore.lastExchanges(peers: peers,
+            records: try (peers.isEmpty ? [] : AgentConversationStore(dataRoot: dataRoot).records()), dataRoot: dataRoot)
+        contacts = contacts.map { value in
+            guard case .object(var row) = value, case .string(let agent)? = row["agent"],
+                  let peer = peers.first(where: { "peer:" + $0.id == agent }),
+                  let last = lasts[peer.id] else { return value }
+            row["last_exchange"] = .string(last.summary)
+            if let replyState = last.replyState { row["reply_state"] = replyState }
+            row["retained_exchanges"] = .int(Int64(last.count))
+            if row["state"] == .string(AgentPeerContactState.setUp.rawValue), peer.transport != .grokBot, !ChatGPTDotIPCTransport.owns(peer) {
+                row["state_detail"] = .string("""
+                    Messages have crossed this connection: \(last.summary). No connection proof is recorded on the route itself, so its state \
+                    word stays set up.
+                    """)
+            }
+            return .object(row)
+        }
+        contacts += bots.map {
+            .object(["agent": .string("bot:" + $0.id.uuidString.lowercased()), "name": .string($0.name),
+                     "state": .string($0.paused ? "paused" : "not_checked"),
+                     "kind": .string("bot"), "paused": .bool($0.paused), "readiness": .string("not_checked"),
+                     "capabilities": .array([.string("message"), .string("read")]), "read_inputs": .array([])])
+        }
+        return contacts
+    }
+    /// When each contact last answered, read from its own thread; an unreadable history is named on its row.
+    private func readLastAnswered(_ contacts: inout [JSONValue], bots: [BotDefinition], details: Bool) throws {
+        let identity = try AgentContactIdentity(dataRoot: dataRoot)
+        let botHistory: Result<[UUID: [ShelfEntry]], Error> = Result {
+            if bots.isEmpty { return [:] }
+            return try ShelfStore(dataRoot: dataRoot).entriesByBot()
+        }
+        contacts = contacts.map { value in
+            guard case .object(var row) = value else { return value }
+            let agent = row["agent"]?.stringValue ?? ""
+            row.removeValue(forKey: "last_reply_in")
+            do {
+                let answered: Date?
+                if agent.hasPrefix("peer:") {
+                    let lines = try ContactThread.mergedLines(dataRoot: dataRoot, owner: String(agent.dropFirst(5)), identity: identity)
+                    answered = lines.last(where: { !$0.mine })?.at
+                } else if agent.hasPrefix("bot:"), let id = UUID(uuidString: String(agent.dropFirst(4))) {
+                    answered = try botHistory.get()[id]?.last(where: {
+                        !$0.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    })?.runAt
+                } else { answered = nil }
+                row["last_answered"] = answered.map { .string(NativeTimestampFormat.plainZulu($0)) } ?? .null
+                if agent.hasPrefix("peer:") {
+                    row["last_reply_in"] = row["last_answered"]
+                    if row["state"] == .string("connected") {
+                        row["state"] = .string(answered == nil ? "set up" : "answered")
+                        row["state_detail"] = .string(answered.map { "Last answered " + NativeTimestampFormat.plainZulu($0)
+                            + ". Availability now is not proven." }
+                            ?? "No answer in this contact's thread.")
+                    }
+                }
+            } catch {
+                row["last_answered"] = .null
+                row["state"] = .string("history_unavailable")
+                row["state_detail"] = .string(error.localizedDescription)
+            }
+            if case .object(let presence)? = row["presence"], presence["status"] == .string("waiting") {
+                row["state"] = .string("waiting")
+            }
+            return details ? .object(row) : Self.compactContact(.object(row))
+        }
+    }
+    /// agent.connect: moves a saved contact to an ability, disconnects or connects a known host by name, or saves a desktop or
+    /// endpoint contact.
+    func impl_agent_connect(context: ActionContext, args: AgentConnectArgs) async throws -> JSONValue {
+        try AgentRecipeStore.requireAvailable()
+        try Self.peerKeys(context.transportMetadata, allowed: ["__session_id"])
+        let turn = context.turn, invocation = context.invocation, surface = context.surface
+        let store = AgentPeerStore(dataRoot: dataRoot)
+        _ = try store.list() // Never install a secret over unreadable configuration.
+        let name = try Self.peerString(args.name, "name", max: 480)!
+        if let ability = args.ability {
+            // A named connect's gate may bind an executable path to it; a move uses none.
+            guard Set(args.wire.keys).isSubset(of: ["name", "ability", "executable_path"]) else {
+                throw AgentCommunicationError.invalid("ability takes a saved contact's name only")
+            }
+            return try routeContact(name, ability: ability, store: store)
+        }
+        let workspace = try Self.peerString(args.workspace, "workspace", max: 4096, required: false)
+        let transportName = try Self.peerString(args.transport, "transport", max: 32, required: false) ?? "auto"
+        // A name-only connect must use the known-host table rather than inventing an endpoint.
+        if args.disconnect == true {
+            guard args.endpoint == nil, args.bearerToken == nil, args.appBundleID == nil else {
+                throw AgentCommunicationError.invalid("disconnect takes a name only")
+            }
+            return try await hostDisconnect(name: name, store: store)
+        }
+        if args.endpoint == nil, args.appBundleID == nil, transportName == "auto" {
+            let connected = try await hostConnect(turn: turn, invocation: invocation, name: name, workspace: workspace,
+                executablePath: try Self.peerString(args.executablePath, "executable_path", max: 4096, required: false), store: store, surface: surface,
+                workingDirectory: Self.peerString(args.workingDirectory, "working_directory", max: 4096, required: false),
+                conversationLabel: Self.peerString(args.conversationLabel, "conversation_label", max: 480, required: false)?.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard args.reopen == true, let row = AgentHostDirectory.row(named: name) else { return connected }
+            return await Self.reopenHost(row, after: connected)
+        }
+        if transportName == "desktop" {
+            return try saveDesktopContact(args: args, name: name, store: store)
+        }
+        return try await saveEndpointContact(invocation: invocation, args: args, name: name, transportName: transportName, store: store)
+    }
+    /// Saves a desktop interaction target for an installed app; nothing is sent or interacted with.
+    private func saveDesktopContact(args: AgentConnectArgs, name: String, store: AgentPeerStore) throws -> JSONValue {
+        guard args.bearerToken == nil, args.endpoint == nil else {
+            throw AgentCommunicationError.invalid("desktop contacts use app_bundle_id, not endpoint or credentials")
+        }
+        let bundle = try Self.peerString(args.appBundleID, "app_bundle_id", max: 255)!
+        let label = try Self.peerString(args.conversationLabel, "conversation_label", max: 480, required: false)
+        guard let endpoint = URL(string: "app://" + bundle), AgentPeerStore.desktopBundleID(endpoint) == bundle else {
+            throw AgentCommunicationError.invalid("exact application bundle identifier required")
+        }
+        // A guessed identifier saves a contact that can never be reached.
+        guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) != nil else {
+            throw AgentCommunicationError.invalid("no installed app has the bundle identifier \(bundle); read the real one from the app before saving")
+        }
+        if let row = AgentHostDirectory.rows.first(where: { $0.route == .desktopChat && $0.bundleIDs.contains(bundle) }) {
+            guard label == nil else {
+                throw AgentCommunicationError.invalid("\(row.displayName) opens a chat of its own for the agent; conversation_label does not apply")
+            }
+            let proposed = AgentPeerContact(name: name, endpoint: endpoint, transport: .desktopChat)
+            let saved = try store.insertDiscovered(proposed)
+            return .object(["status": .string(saved.id == proposed.id ? "configured" : "already_configured"),
+                "contact": Self.checkedPeerProjection(saved.id, store: store), "sent": .bool(false), "completed": .bool(false),
+                "detail": .string("Saved. Your first message opens a chat of your own in \(row.displayName); agent_read reads its answer.")])
+        }
+        let proposed = AgentPeerContact(name: name, endpoint: endpoint, transport: .desktop, conversationLabel: label)
+        let saved = try store.insertDiscovered(proposed)
+        return .object(["status": .string(saved.id == proposed.id ? "configured" : "already_configured"),
+            "contact": Self.checkedPeerProjection(saved.id, store: store), "sent": .bool(false), "completed": .bool(false),
+            "detail": .string("""
+                Saved a desktop interaction target. App availability, recipient identity and delivery require ordinary screen/interact \
+                observation. No app interaction or message was performed.\u{20}
+                """ + Self.desktopSetupNote)])
+    }
+    /// Saves an endpoint contact, discovering its transport when asked; an existing contact's identity and credentials are kept.
+    private func saveEndpointContact(invocation: ChatToolInvocation, args: AgentConnectArgs, name: String, transportName: String,
+                                     store: AgentPeerStore) async throws -> JSONValue {
+        guard args.appBundleID == nil, args.conversationLabel == nil else {
+            throw AgentCommunicationError.invalid("app_bundle_id and conversation_label require desktop transport")
+        }
+        let address = try Self.peerString(args.endpoint, "endpoint", max: 2048)!
+        guard var endpoint = URL(string: address), transportName == "auto" || AgentPeerTransport(rawValue: transportName) != nil else {
+            throw AgentCommunicationError.invalid("endpoint or transport")
+        }
+        let token = try Self.peerString(args.bearerToken, "bearer_token", max: 8192, required: false)
+        guard transportName != "acp", transportName != "mcpHost" else {
+            throw AgentCommunicationError.invalid("Connect this installed agent by name so it gets its own key.")
+        }
+        guard token == nil || usesCanonicalBody else {
+            throw AgentCommunicationError.invalid("peer credentials are unavailable outside the canonical app")
+        }
+        var transport = AgentPeerTransport(rawValue: transportName) ?? .a2a
+        var discovery: JSONValue?
+        if transportName == "auto" {
+            // Validate presentation input before any discovery request.
+            try AgentPeerStore.validate(AgentPeerContact(name: name, endpoint: endpoint, transport: transport))
+            let result = try await AgentPeerDiscovery.resolve(conversation: invocation.conversation, endpoint, bearerToken: token)
+            guard let detected = result.transport, let resolved = result.endpoint else {
+                return Self.peerRedact(result.evidence, token: token)
+            }
+            endpoint = resolved; transport = detected; discovery = result.evidence
+            let matches = try store.list().filter { $0.endpoint == endpoint && $0.transport == transport }
+            guard matches.count <= 1 else {
+                return .object(["status": .string("needs_setup"), "detail": .string("""
+                    Multiple existing contacts use this endpoint and transport. Resolve the ambiguous identity before connecting; nothing was \
+                    changed.
+                    """)])
+            }
+            if let existing = matches.first {
+                return Self.peerRedact(.object(["status": .string(token == nil ? "already_configured" : "needs_setup"),
+                    "contact": Self.checkedPeerProjection(existing.id, store: store), "discovery": discovery!,
+                    "detail": .string(token == nil ? """
+                        Reused the existing contact without changing its identity or credentials. No message sent.
+                        """ : """
+                        An existing contact already owns this endpoint. Its identity and credentials were preserved; credential replacement \
+                        requires explicit setup.
+                        """)]), token: token)
+            }
+        }
+        var peer = AgentPeerContact(name: name, endpoint: endpoint, transport: transport)
+        if token != nil { peer.credentialKey = AgentPeerContact.credentialKey(for: peer.id) }
+        try AgentPeerStore.validate(peer)
+        if let token { try AgentPeerCredentials.write(token, peerID: peer.id) }
+        do {
+            let saved: AgentPeerContact
+            if transportName == "auto" { saved = try store.insertDiscovered(peer) }
+            else { saved = try store.upsert(peer) }
+            if saved.id != peer.id {
+                if token != nil { try AgentPeerCredentials.delete(peerID: peer.id) }
+                return Self.peerRedact(.object(["status": .string(token == nil ? "already_configured" : "needs_setup"),
+                    "contact": Self.checkedPeerProjection(saved.id, store: store),
+                    "detail": .string("""
+                        A matching contact was installed concurrently. Its identity and credentials were preserved; no message sent.
+                        """)]), token: token)
+            }
+        }
+        catch {
+            if token != nil {
+                do { try AgentPeerCredentials.delete(peerID: peer.id) }
+                catch { throw AgentCommunicationError.invalid("configuration failed and dedicated credential cleanup needs attention") }
+            }
+            throw error
+        }
+        var result: [String: JSONValue] = ["status": .string("configured"), "contact": Self.checkedPeerProjection(peer.id, store: store),
+            "detail": .string(discovery == nil ? "Saved a contact. No network connection, presence check, or message was performed." : """
+                Saved the discovered contact and supported transport. Discovery is not proof of message delivery or authority; no message sent.
+                """)]
+        if let discovery { result["discovery"] = discovery }
+        return Self.peerRedact(.object(result), token: token)
+    }
+    /// agent.message and agent.read: checks the call and its contact, then reaches the contact by its own route.
+    private func peerConversation(turn: Turn, invocation: ChatToolInvocation, args: PeerConversationArgs,
+                                  store: AgentPeerStore, session: String?, surface: String) async throws -> JSONValue {
+        let sending = args.message != nil
+        try Self.peerKeys(args.wire, allowed: sending
+            ? ["agent", "text", "files", "conversation_id", "message_id", "task_id", "expects_reply"]
+            : ["agent", "conversation_id", "message_id", "task_id", "limit", "offset", "max_chars", "text_offset", "source_version", "details", "page_size",
+                "page_token", "status", "context_id", "history_length", "include_artifacts", "status_timestamp_after"])
+        let agent = try Self.peerString(args.agent, "agent", max: 64)!
+        guard agent.hasPrefix("peer:"), let peer = try store.list().first(where: { "peer:" + $0.id == agent }) else {
+            throw AgentCommunicationError.invalid("""
+                No exact peer:<id> match for \(agent) in \(store.fileURL.path). Read agent.contacts for the saved handle; if absent, read \
+                agent.recipe, run agent.verify with its host name, then agent.connect to save the contact.
+                """)
+        }
+        // A repair dry-runs a recipe.
+        if invocation.dryRun, ![.acp, .desktopChat, .mcpHost, .a2a].contains(peer.transport) || ChatGPTDotIPCTransport.owns(peer)
+            || peer.ability != nil {
+            return .object(["status": .string("unchecked"), "dry_run": .bool(true), "sent": .bool(false), "agent": .string(agent),
+                "detail": .string("\(peer.name) is not reached by a recipe this app can dry-run; nothing was checked or sent.")])
+        }
+        // Reached through one of the agent's abilities: the conversation with it runs that (`AgentConversationSession.viaAbility`), never the built-in route.
+        if let ability = peer.ability {
+            guard !sending else {
+                throw ToolFailureError("\(peer.name) is reached through your ability \(ability): message it with agent and text, without protocol ids.",
+                                       argumentPath: "agent", effects: .none)
+            }
+            return .object(["status": .string("nothing_to_read"), "completed": .bool(false),
+                "detail": .string("Its answers land in your conversation with it; there is nothing more to read here.")])
+        }
+        if !ChatGPTDotIPCTransport.owns(peer), args.reading?.textOffset != nil || args.reading?.sourceVersion != nil {
+            throw AgentCommunicationError.invalid("text_offset and source_version are Dot-only. Omit them when reading this contact.")
+        }
+        let listingFields: Set<String> = ["page_size", "page_token", "status", "context_id", "history_length", "include_artifacts", "status_timestamp_after"]
+        if peer.transport == .grokBot {
+            return try grokRoute(turn: turn, invocation: invocation, session: session, args: args, peer: peer, sending: sending)
+        }
+        if !Set(args.wire.keys).isDisjoint(with: listingFields) {
+            guard peer.transport == .a2a, !sending, args.taskID == nil else {
+                throw AgentCommunicationError.invalid("A2A listing filters require agent_read without task_id")
+            }
+        }
+        if peer.transport == .desktopChat {
+            guard args.messageID == nil, args.taskID == nil,
+                  let bundle = AgentPeerStore.desktopBundleID(peer.endpoint) else {
+                throw AgentCommunicationError.invalid("This contact takes text and conversation_id only.")
+            }
+            guard sending else {
+                var plan: [String: JSONValue] = ["status": .string("desktop_chat_read"), "peer_id": .string(peer.id), "app_bundle_id": .string(bundle)]
+                if let thread = try Self.peerString(args.conversationID, "conversation_id", max: 480, required: false) { plan["conversation_id"] = .string(thread) }
+                return .object(plan)
+            }
+            var plan: [String: JSONValue] = ["status": .string("desktop_chat_send"), "peer_id": .string(peer.id),
+                "app_bundle_id": .string(bundle), "text": .string(try Self.peerString(args.message?.text, "text", max: 64000)!)]
+            if let thread = try Self.peerString(args.conversationID, "conversation_id", max: 480, required: false) { plan["conversation_id"] = .string(thread) }
+            if invocation.dryRun { plan["dry_run"] = .bool(true) }
+            return .object(plan)
+        }
+        if peer.transport == .acp {
+            let conversationID = try Self.peerString(args.conversationID, "conversation_id", max: 1024, required: false)
+            guard sending || invocation.internalRead && turn.envelope?.workIdentity == "contact.reply.read" && conversationID != nil else {
+                return .object(["status": .string("nothing_to_read"), "completed": .bool(false),
+                    "detail": .string("The answer returns with the message; there is no saved answer to recover here.")])
+            }
+            guard args.messageID == nil, args.taskID == nil else {
+                throw AgentCommunicationError.invalid("This contact takes text and conversation_id only.")
+            }
+            return try await hostACPRun(turn: turn, invocation: invocation, contact: peer,
+                                        message: sending ? Self.peerString(args.message?.text, "text", max: 64000) : nil,
+                                        conversationID: conversationID,
+                                        store: store, surface: surface)
+        }
+        if peer.transport == .mcpHost {
+            return try await mcpHostRoute(turn: turn, invocation: invocation, args: args, peer: peer, agent: agent, sending: sending,
+                                          store: store, surface: surface)
+        }
+        if peer.transport == .desktop {
+            return try desktopRoute(args: args, peer: peer, agent: agent, sending: sending)
+        }
+        return try await peerExchange(turn: turn, invocation: invocation, args: args, peer: peer, agent: agent, sending: sending, store: store)
+    }
+    /// Grok's route: a read returns its retained request; a send returns the app's plan, answered back in the chat asking.
+    private func grokRoute(turn: Turn, invocation: ChatToolInvocation, session: String?, args: PeerConversationArgs,
+                           peer: AgentPeerContact, sending: Bool) throws -> JSONValue {
+        guard args.taskID == nil else { throw AgentCommunicationError.invalid("Grok uses message_id") }
+        if !sending {
+            let id = try Self.peerString(args.messageID, "message_id", max: 36)!
+            // Grok threads are readable across chats; replies stay scoped to the asker.
+            return GrokBotRoute.projection(try GrokRequestStore(dataRoot: dataRoot).read(id, peer: peer.id))
+        }
+        let session = turn.verifiedSessionID ?? session ?? ""
+        guard !session.isEmpty else { throw AgentCommunicationError.invalid("Send from a chat so Grok's reply can return there") }
+        // Grok has one conversation, whichever chat asks; its answer returns to the chat asking.
+        let grokConversation = GrokBotRoute.conversation(peer: peer.id)
+        if let requested = try Self.peerString(args.conversationID, "conversation_id", max: 128, required: false), requested != grokConversation {
+            throw AgentCommunicationError.invalid("Grok has one conversation, \(grokConversation); its replies return to the chat asking")
+        }
+        // The exchange's own id, so its answer pairs with exactly that exchange.
+        let id = try Self.peerString(args.messageID, "message_id", max: 36, required: false)
+            ?? invocation.liveTarget?.operationID ?? UUID().uuidString.lowercased()
+        let text = try Self.peerString(args.message?.text, "text", max: 64000)!
+        // App checks running status; no secrets travel in this internal plan.
+        return .object(["status": .string("grok_send"), "peer_id": .string(peer.id),
+            "message_id": .string(id), "asking_session": .string(session), "text": .string(text)])
+    }
+    /// A host's route: its local chat server live, a reconnect to its ACP route, a held pull, or its declared command line.
+    private func mcpHostRoute(turn: Turn, invocation: ChatToolInvocation, args: PeerConversationArgs, peer: AgentPeerContact, agent: String,
+                              sending: Bool, store: AgentPeerStore, surface: String) async throws -> JSONValue {
+        if ChatGPTDotIPCTransport.owns(peer) { return try await chatGPTDotMessage(turn: turn, args, peer: peer, sending: sending) }
+        let row = AgentPeerStore.hostRowID(peer.endpoint).flatMap { id in
+            AgentHostDirectory.rows.first { $0.id == id }
+        }
+        // A conversation lives on the door it was opened through. Command hosts run their declared CLI; pull-only hosts, and the threads the
+        // contact opened by calling in (its own, or one caller's), retain the message until its next inbound call.
+        let heldThread = ContactCaller.held(args.conversationID, peer: peer.id)
+        // A host with a local chat server answers there, live. Only a conversation one of its callers opened by calling in stays with that caller;
+        // the contact's own conversation (the thread no caller owns) goes live like a new one.
+        if let row, row.localChat != nil, heldThread == nil || heldThread == ContactCaller.shared(peer: peer.id) {
+            guard sending else {
+                return .object(["status": .string("nothing_to_read"), "completed": .bool(false),
+                    "detail": .string("The answer returns with the message; there is no saved answer to recover here.")])
+            }
+            guard args.messageID == nil, args.taskID == nil else {
+                throw AgentCommunicationError.invalid("This contact takes text and conversation_id only.")
+            }
+            return try await hostLocalChatRun(invocation: invocation, row: row, contact: peer, message: Self.peerString(args.message?.text, "text", max: 64000)!,
+                                              conversationID: Self.peerString(args.conversationID, "conversation_id", max: 1024, required: false),
+                                              store: store, surface: surface)
+        }
+        // A host whose recipe opens live conversations (ACP) is reached that way, never left to its next check-in: its contact moves to
+        // that route by one reconnect.
+        if let row, row.acp != nil, heldThread == nil, sending {
+            return .object(["status": .string("reconnect_required"), "agent": .string(agent), "sent": .bool(false), "completed": .bool(false),
+                "detail": .string("""
+                    \(row.displayName) opens live two-way conversations over ACP, and this contact is still on its old check-in route. \
+                    Reconnect it once, then send again. Nothing was sent.
+                    """),
+                "remedy": Repair.remedy(owner: peer.name, nextCall: try? JSONValue.parse(Data(ToolFailureError.call("app", [
+                    "action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer.id)])]).utf8)),
+                    tap: nil, instruction: "Reconnect this contact with next_call, then send the message again.")])
+        }
+        guard let row, row.commandLine != nil, heldThread == nil else {
+            let snapshot = try Self.checkedPeerSnapshot(peer.id, store: store)
+            // A held send that names no held thread waits in the contact's own.
+            return try Self.hostPull(invocation: invocation, row: row, contact: snapshot.contact, text: sending ? Self.peerString(args.message?.text, "text", max: 64000)
+                : nil, conversation: heldThread ?? AgentConversationStore.heldThread(peerID: peer.id),
+                                     peers: snapshot.peers, dataRoot: dataRoot)
+        }
+        // Nothing to page through: the reply came back in the same call as the message that asked for it, and there is no second copy here.
+        guard sending else {
+            let (current, peers) = try Self.checkedPeerSnapshot(peer.id, store: store)
+            let state = try Self.currentPeerState(current, credentials: AgentPeerCredentials.credentialReads(peers))
+            return .object(["status": .string("nothing_to_read"), "agent": .string(agent),
+                "transport": .string("mcpHost"), "host": .string(row.id),
+                "state": .string(state.rawValue), "state_detail": .string(state.detail),
+                "read": .bool(false), "completed": .bool(false),
+                "detail": .string("""
+                    This contact answers in the same call that messages it, so there is no receipt to recover. Send again with agent_message; \
+                    anything it says on its own arrives as an ordinary inbound turn.
+                    """)])
+        }
+        let text = try Self.peerString(args.message?.text, "text", max: 64000)!
+        let requested = try Self.peerString(args.conversationID, "conversation_id", max: 128, required: false)
+        guard args.messageID == nil, args.taskID == nil else {
+            throw AgentCommunicationError.invalid("a command-line agent takes text and conversation_id only")
+        }
+        if requested != nil, row.commandLine?.continuesConversations != true {
+            throw AgentCommunicationError.invalid("""
+                \(row.displayName)'s command line documents no way to continue a conversation, so every message to it is standalone; omit \
+                conversation_id
+                """)
+        }
+        if let requested, UUID(uuidString: requested) == nil {
+            throw AgentCommunicationError.invalid("conversation_id must be the session UUID returned by this contact")
+        }
+        let session = requested ?? (row.commandLine?.continuesConversations == true && row.commandLine?.capturesThreadID != true
+            ? UUID().uuidString.lowercased() : nil)
+        return try await hostCommandRun(turn: turn, invocation: invocation, row: row, contact: peer, message: text, session: session,
+                                    resuming: requested != nil, store: store, surface: surface,
+                                    probe: !invocation.dryRun && text == AgentHostDirectory.probeText(appName: Self.appDisplayName))
+    }
+    /// A desktop contact's route: a send-only plan the app's conversation handler executes through ordinary Mac permissions.
+    private func desktopRoute(args: PeerConversationArgs, peer: AgentPeerContact, agent: String, sending: Bool) throws -> JSONValue {
+        guard args.conversationID == nil, args.messageID == nil, args.taskID == nil,
+              args.reading?.offset == nil, args.reading?.maxChars == nil,
+              let bundle = AgentPeerStore.desktopBundleID(peer.endpoint) else {
+            throw AgentCommunicationError.invalid("desktop routes use visible app/conversation verification, not protocol receipt IDs or paging")
+        }
+        var target: [String: JSONValue] = ["app_bundle_id": .string(bundle)]
+        if let label = peer.conversationLabel { target["conversation_label"] = .string(label) }
+        // Desktop contacts send only; replies arrive through the app's authenticated inbound door.
+        guard sending else {
+            return .object(["status": .string("ok"), "agent": .string(agent), "transport": .string("desktop"),
+                "operation": .string("read"), "target": .object(target),
+                "opened": .bool(false), "read": .bool(false), "sent": .bool(false), "completed": .bool(false),
+                "detail": .string(Self.desktopSendOnlyDetail)])
+        }
+        // The courier's answer comes back only through an MCP entry for this app in the contact's app. An app with its own route here (Grok
+        // Bot's routine, a desktop chat) has none and answers only through that route, so a courier send would never get its answer back:
+        // its contact moves to that route by one connect by name, as an ACP host's contact does.
+        if let row = AgentHostDirectory.rows.first(where: {
+            $0.bundleIDs.contains(bundle) && [AgentHostRow.Route.grokBot, .desktopChat].contains($0.route)
+        }) {
+            return .object(["status": .string("reconnect_required"), "agent": .string(agent), "sent": .bool(false), "completed": .bool(false),
+                "detail": .string("""
+                    \(row.displayName) answers only through its own route here, and this is an older desktop contact for its app, whose courier \
+                    send would never get an answer back. Connect \(row.displayName) by name once (next_call) and follow its steps, then \
+                    disconnect this desktop contact (\(agent)). Nothing was sent.
+                    """),
+                "remedy": Repair.remedy(owner: peer.name, nextCall: .object(["tool": .string("app"), "input": .object([
+                    "action": .string("agent.connect"), "args": .object(["agent": .string(row.displayName)])])]),
+                    tap: nil, instruction: "Connect this app by name with next_call, then send the message to that contact.")])
+        }
+        let text = try Self.peerString(args.message?.text, "text", max: 64000)!
+        return .object(["status": .string("requires_interaction"),
+            "agent": .string(agent), "transport": .string("desktop"),
+            "operation": .string("message"), "target": .object(target),
+            "target_is_untrusted_data": .bool(true), "sent": .bool(false), "completed": .bool(false),
+            "automatic_action": .bool(false), "requested_text": .string(text),
+            "detail": .string("""
+                Internal desktop route plan. The app-owned conversation handler executes it through normal Mac permissions. This Core \
+                projection has performed no interaction.
+                """)])
+    }
+    /// One message to, or read from, an A2A or NativeAgent contact once its inputs are admitted: who, what, and the ids it carries.
+    private struct PeerExchange {
+        let invocation: ChatToolInvocation
+        let args: PeerConversationArgs
+        let peer: AgentPeerContact
+        let agent: String
+        let sending: Bool
+        let token: String?
+        let text: String?
+        let fileParts: [JSONValue]
+        let outgoingFiles: [JSONValue]
+        let conversation: String?
+        let message: String?
+        let task: String?
+        let localRequestID: String
+    }
+    /// The exchange's request, or the answer that ended it before any request was sent.
+    private enum PeerRequest {
+        case finished(JSONValue)
+        case ready(AgentA2AWire.Request, a2aInterface: AgentA2AWire.Interface?, a2aRecipe: AgentRecipeStore.Recipe?)
+    }
+    /// An A2A or NativeAgent contact's exchange: admits its text, files and ids before any network operation, then builds and
+    /// sends the request; a contact that did not prove available is recorded unavailable however the exchange ends.
+    private func peerExchange(turn: Turn, invocation: ChatToolInvocation, args: PeerConversationArgs, peer: AgentPeerContact, agent: String,
+                              sending: Bool, store: AgentPeerStore) async throws -> JSONValue {
+        let text = try Self.peerString(args.message?.text, "text", max: 64000, required: sending)
+        // All files must be admitted before any network operation. Retain only these checked bytes across card discovery and request construction.
+        var fileParts: [JSONValue] = []
+        var outgoingFiles: [JSONValue] = []
+        var attachmentBytes = 0
+        if sending {
+            for file in args.message?.files ?? [] {
+                let path = file.path
+                let attachment = try await SwiftNativeSecurityCenter.outgoingAttachment(path, dataRoot: dataRoot,
+                    maximumBytes: 8 * 1024 * 1024 - attachmentBytes, turn: turn)
+                attachmentBytes += attachment.bytes.count
+                outgoingFiles.append(.object(["name": .string(attachment.file.lastPathComponent),
+                    "byteSize": .int(Int64(attachment.bytes.count)),
+                    "sha256": .string(SHA256Hex.of(attachment.bytes))]))
+                fileParts.append(.object(["raw": .string(attachment.bytes.base64EncodedString()),
+                    "filename": .string(attachment.file.lastPathComponent),
+                    // The receiver checks the same resolver (NativeAgentA2AWire+Parts); one map, both sides.
+                    "mediaType": .string(ChatAttachmentTypeResolver.typeAndMime(forExtension: attachment.file.pathExtension.lowercased())?.mime
+                        ?? UTType(filenameExtension: attachment.file.pathExtension)?.preferredMIMEType ?? "application/octet-stream")]))
+            }
+        }
+        let requestedConversation = try Self.peerString(args.conversationID, "conversation_id", max: 512, required: false)
+        // The receiving app owns the contact's session namespace. On first send, let it select the conversation and retain its returned ID.
+        let conversation = requestedConversation
+        let message = try Self.peerString(args.messageID, "message_id", max: 512, required: false)
+        let task = try Self.peerString(args.taskID, "task_id", max: 512, required: false)
+        // Validate all transport-specific inputs before any network operation.
+        if peer.transport == .nativeAgent {
+            guard task == nil, sending || (message != nil && conversation != nil),
+                  !sending || message == nil || UUID(uuidString: message!) != nil else {
+                throw AgentCommunicationError.invalid("""
+                    NativeAgent uses conversation_id and receipt message_id; send message_id must be a UUID; task_id is unsupported
+                    """)
+            }
+            guard (conversation?.utf8.count ?? 0) <= 128, (message?.utf8.count ?? 0) <= 128 else {
+                throw AgentCommunicationError.invalid("NativeAgent identity exceeds 128 bytes")
+            }
+            _ = try Self.peerPage(args.reading?.offset, "offset", default: 0, range: 0...1_048_576)
+            _ = try Self.peerPage(args.reading?.maxChars, "max_chars", default: 8000, range: 1...16000)
+        } else {
+            guard args.reading?.offset == nil, args.reading?.maxChars == nil, sending || (message == nil && conversation == nil) else {
+                throw AgentCommunicationError.invalid("""
+                    A2A read takes task_id or listing filters; offset, max_chars, message_id and conversation_id are unsupported for read
+                    """)
+            }
+        }
+        guard peer.credentialKey == nil || usesCanonicalBody else {
+            throw AgentCommunicationError.invalid("peer credentials are unavailable outside the canonical app")
+        }
+        let token = peer.credentialKey == nil ? nil : try AgentPeerCredentials.read(peerID: peer.id)
+        if peer.credentialKey != nil && token == nil { throw AgentCommunicationError.invalid("configured peer credential is unavailable") }
+        var available = false
+        defer { if !available { store.recordUnavailable(peerID: peer.id) } }
+        let localRequestID = UUID().uuidString.lowercased()
+        // The attested door id rides beside the display name: the taint latch keys trust by it.
+        var envelope: [String: JSONValue] = ["agent": .string(agent), "agent_id": .string("peer:" + peer.id),
+            "transport": .string(peer.transport.rawValue),
+            "local_request_id": .string(localRequestID), "automatic_polling": .bool(false)]
+        let exchange = PeerExchange(invocation: invocation, args: args, peer: peer, agent: agent, sending: sending, token: token, text: text,
+            fileParts: fileParts, outgoingFiles: outgoingFiles, conversation: conversation, message: message, task: task,
+            localRequestID: localRequestID)
+        let request: AgentA2AWire.Request, a2aInterface: AgentA2AWire.Interface?, a2aRecipe: AgentRecipeStore.Recipe?
+        switch try await peerRequest(exchange, envelope: &envelope, available: &available) {
+        case .finished(let result): return result
+        case .ready(let ready, let interface, let recipe):
+            request = ready
+            a2aInterface = interface
+            a2aRecipe = recipe
+        }
+        return try await sendPeerRequest(exchange, request: request, a2aInterface: a2aInterface, a2aRecipe: a2aRecipe, store: store,
+                                         envelope: &envelope, available: &available)
+    }
+    /// Binds a send's live conversation to its ids before the request leaves, with the read that recovers its answer.
+    private func bindPeerHandle(_ exchange: PeerExchange, message: String?, conversation: String?, task: String? = nil) throws {
+        let sending = exchange.sending, invocation = exchange.invocation, peer = exchange.peer, agent = exchange.agent
+        guard sending, let target = invocation.liveTarget else { return }
+        var read: [String: JSONValue] = [:]
+        if peer.transport == .nativeAgent || task != nil,
+           case .object(let action)? = AgentConversationRouting.readLocator(agent: agent,
+               message: message.map(JSONValue.string), conversation: conversation.map(JSONValue.string), task: task.map(JSONValue.string)),
+           case .object(let input)? = action["input"] {
+            read = input; read["details"] = .bool(true)
+        }
+        try AgentConversationStore(dataRoot: target.dataRoot).handle(target, conversationID: conversation, messageID: message, readInput: read)
+    }
+    /// The exchange's answer as the agent reads it: its recovery route, the contact's token redacted, a read in the conversation's view.
+    private func peerFinished(_ exchange: PeerExchange, _ fields: [String: JSONValue]) -> JSONValue {
+        let peer = exchange.peer, agent = exchange.agent, token = exchange.token, sending = exchange.sending, args = exchange.args
+        var result = fields
+        // A2A direct messages have no GetMessage endpoint. Only a task can provide an A2A recovery route; NativeAgent uses its receipt.
+        if peer.transport == .nativeAgent || fields["task_id"] != nil,
+           let locator = AgentConversationRouting.readLocator(agent: agent,
+                message: fields["message_id"], conversation: fields["conversation_id"], task: fields["task_id"]) {
+            result["read_with"] = locator
+        }
+        let redacted = Self.peerRedact(.object(result), token: token)
+        return sending ? redacted : AgentConversationView.read(redacted, agent: agent, input: args.wire)
+    }
+    /// Builds the exchange's request: an A2A send, task listing or task read through the contact's checked card, or a NativeAgent
+    /// message or receipt read through its bridge card.
+    private func peerRequest(_ exchange: PeerExchange, envelope: inout [String: JSONValue], available: inout Bool) async throws -> PeerRequest {
+        let invocation = exchange.invocation, args = exchange.args, peer = exchange.peer, sending = exchange.sending, token = exchange.token,
+            text = exchange.text, fileParts = exchange.fileParts, outgoingFiles = exchange.outgoingFiles, conversation = exchange.conversation,
+            message = exchange.message, task = exchange.task, localRequestID = exchange.localRequestID
+        let request: AgentA2AWire.Request
+        if !outgoingFiles.isEmpty { envelope["outgoing_files"] = .array(outgoingFiles) }
+        var a2aInterface: AgentA2AWire.Interface?
+        var a2aRecipe: AgentRecipeStore.Recipe?
+        if peer.transport == .a2a {
+            // Dry runs check the declared peer card without sending.
+            let checked = await AgentPeerDiscovery.a2aCheck(conversation: invocation.conversation, peer, bearerToken: token, sending: sending)
+            let reply = ToolResult(.object(checked.receipt))
+            guard let selected = checked.interface else {
+                available = reply.status == checked.receipt["status"]?.stringValue
+                    && (reply.said("passed") || reply.said("repaired"))
+                return .finished(peerFinished(exchange, envelope.merging(checked.receipt) { $1 }))
+            }
+            a2aInterface = selected
+            a2aRecipe = checked.recipe
+            if sending {
+                let outgoingID = message ?? UUID().uuidString.lowercased()
+                try bindPeerHandle(exchange, message: outgoingID, conversation: conversation, task: task)
+                envelope["outgoing_message_id"] = .string(outgoingID)
+                let push: JSONValue?
+                if selected.version == "1.0", selected.pushNotifications, AgentA2AWire.isLoopback(selected.endpoint), usesCanonicalBody {
+                    guard let a2aPushConfiguration else {
+                        throw ToolFailureError("The local A2A callback configuration owner is not mounted. No message was sent.", effects: .none,
+                            owner: "NativeAgent engine ports", tap: "Open the installed NativeAgent app",
+                            code: "agent_callback_owner_unavailable", instruction: "Repair the installed app's callback owner before sending.")
+                    }
+                    push = try await a2aPushConfiguration(peer)
+                } else { push = nil }
+                envelope["push_notifications"] = .string(push == nil
+                    ? "Unavailable: this app receives webhooks only on loopback. Using streaming or task reads."
+                    : "A running loopback webhook is offered to this local peer; task reads remain available.")
+                request = try AgentA2AWire.messageRequest(text: text!, messageID: outgoingID, contextID: conversation,
+                    taskID: task, interface: selected, requestID: localRequestID, streaming: selected.streaming, pushConfiguration: push, fileParts: fileParts)
+            } else if task == nil {
+                var filters: [String: JSONValue] = [:]
+                let supplied = args.wire
+                for (input, wire) in ["page_size": "pageSize", "page_token": "pageToken", "status": "status", "context_id": "contextId",
+                    "history_length": "historyLength", "include_artifacts": "includeArtifacts", "status_timestamp_after": "statusTimestampAfter"] {
+                    filters[wire] = supplied[input]
+                }
+                let result = try await AgentPeerDiscovery.listTasks(conversation: invocation.conversation, filters, interface: selected, bearerToken: token,
+                    requestID: localRequestID)
+                available = true
+                envelope["status"] = .string("ok")
+                if case .object(let fields) = result {
+                    envelope["tasks"] = fields["tasks"] ?? .array([])
+                    envelope["next_page_token"] = fields["nextPageToken"] ?? .string("")
+                    envelope["page_size"] = fields["pageSize"] ?? .int(0)
+                    envelope["total_size"] = fields["totalSize"] ?? .int(0)
+                }
+                envelope["completed"] = .bool(false)
+                envelope["untrusted_remote_data"] = .bool(PeerDataTaintDispatcher.containsPeerText(envelope["tasks"] ?? .null))
+                return .finished(Self.peerRedact(.object(envelope), token: token))
+            } else {
+                if await AgentA2APushReceiver.shared.consume(peerID: peer.id, taskID: task!) {
+                    envelope["push_update_received"] = .bool(true)
+                }
+                request = try AgentA2AWire.taskRequest(taskID: task!, interface: selected, requestID: localRequestID)
+            }
+        } else {
+            let cardURL = peer.endpoint.appendingPathComponent("agent/card")
+            let response = try await AgentPeerHTTP.get(cardURL, bearerToken: token)
+            if !(200..<300).contains(response.statusCode) {
+                Self.peerFailure(.init(cause: .http(status: response.statusCode,
+                    detail: (try? response.json?.serialize(pretty: false)) ?? ""), work: .nothingRan), into: &envelope)
+                return .finished(peerFinished(exchange, envelope))
+            }
+            guard (200..<300).contains(response.statusCode), case .object(let card)? = response.json,
+                  card["protocol"] == .string("nativeagent-bridge"), card["version"] == .string("1.0") else {
+                throw AgentCommunicationError.invalid("unsupported or unavailable NativeAgent card; no message sent")
+            }
+            var body: [String: JSONValue] = [:]
+            if sending {
+                body["text"] = .string(text!)
+                let remoteRequestID = message ?? localRequestID
+                try bindPeerHandle(exchange, message: remoteRequestID, conversation: conversation)
+                body["request_id"] = .string(remoteRequestID)
+                envelope["message_id"] = .string(remoteRequestID)
+                if let conversation { body["sessionId"] = .string(conversation) }
+            } else {
+                body = ["request_id": .string(message!), "session_id": .string(conversation!),
+                    "offset": .int(Int64(try Self.peerPage(args.reading?.offset, "offset", default: 0, range: 0...1_048_576))),
+                    "max_chars": .int(Int64(try Self.peerPage(args.reading?.maxChars, "max_chars", default: 8000, range: 1...16000)))]
+            }
+            request = AgentA2AWire.Request(url: peer.endpoint.appendingPathComponent(sending ? "agent/message" : "agent/reply"),
+                httpMethod: "POST", headers: ["Content-Type": "application/json"], body: .object(body), requestID: nil)
+        }
+        return .ready(request, a2aInterface: a2aInterface, a2aRecipe: a2aRecipe)
+    }
+    /// Sends the request and reads what came back; a transport or validation failure is an unknown outcome, never a resend.
+    private func sendPeerRequest(_ exchange: PeerExchange, request: AgentA2AWire.Request, a2aInterface: AgentA2AWire.Interface?,
+                                 a2aRecipe: AgentRecipeStore.Recipe?, store: AgentPeerStore, envelope: inout [String: JSONValue],
+                                 available: inout Bool) async throws -> JSONValue {
+        let invocation = exchange.invocation, peer = exchange.peer, sending = exchange.sending, token = exchange.token,
+            conversation = exchange.conversation, message = exchange.message, task = exchange.task
+        if let conversation { envelope["conversation_id"] = .string(conversation) }
+        if let task { envelope["task_id"] = .string(task) }
+        if !sending, let message { envelope["message_id"] = .string(message) }
+        do {
+            let response = try await AgentPeerHTTP.send(conversation: invocation.conversation, request, bearerToken: token)
+            envelope["http_status"] = .int(Int64(response.statusCode))
+            if response.interrupted { envelope["interrupted"] = .bool(true) }
+            guard (200..<300).contains(response.statusCode) else {
+                let detail = (try? response.json?.serialize(pretty: false)) ?? ""
+                let cause = ProviderFailure.http(status: response.statusCode, detail: detail)
+                Self.peerFailure(ProviderFailure.Report(cause: cause, work: .outcomeUnknown), into: &envelope)
+                return peerFinished(exchange, envelope)
+            }
+            if let interface = a2aInterface {
+                let result: AgentA2AWire.Result
+                if request.isStreaming {
+                    let receipt = response.receipt
+                    envelope["interrupted"] = .bool(response.interrupted || receipt?.interrupted != false)
+                    guard let receipt,
+                        let value = receipt.result else { throw AgentCommunicationError.invalid(
+                        "No answer arrived. The work may still be running; do not resend automatically.") }
+                    result = value
+                    if receipt.interrupted { envelope["detail"] = .string("""
+                        The connection ended before an outcome arrived. Read this task again; do not resend the message.
+                        """) }
+                    else if response.interrupted { envelope["detail"] = .string("""
+                        The connection was interrupted after the reported outcome arrived. Do not resend the message.
+                        """) }
+                } else {
+                    guard let payload = response.json else { throw AgentCommunicationError.invalid("No answer arrived. Do not resend automatically.") }
+                    result = try AgentA2AWire.normalizeResponse(payload, interface: interface,
+                        expectedRequestID: request.requestID, expectedTaskID: sending ? nil : task)
+                }
+                if let conversation, let returned = result.contextID, conversation != returned {
+                    throw AgentCommunicationError.invalid("conversation identity mismatch")
+                }
+                envelope["status"] = .string(result.state)
+                envelope["reply"] = .string(result.text)
+                envelope["completed"] = .bool(result.completed)
+                envelope["terminal"] = .bool(result.terminal)
+                envelope["needs_input"] = .bool(result.needsInput)
+                envelope["needs_authentication"] = .bool(result.needsAuthentication)
+                if result.needsInput { envelope["detail"] = .string("The other agent needs an answer before continuing.") }
+                if result.needsAuthentication { envelope["detail"] = .string("The other agent needs access before continuing.") }
+                if let value = result.taskID { envelope["task_id"] = .string(value) }
+                if let value = result.contextID { envelope["conversation_id"] = .string(value) }
+                if let value = result.messageID { envelope["message_id"] = .string(value) }
+                envelope["parts"] = .array(result.parts)
+                envelope["artifacts"] = .array(result.artifacts)
+                if let failure = result.failure { Self.peerFailure(failure, into: &envelope) }
+                envelope["untrusted_remote_data"] = .bool(PeerDataTaintDispatcher.containsPeerText(.object([
+                    "reply": .string(result.text), "parts": .array(result.parts),
+                    "artifacts": .array(result.artifacts)
+                ])))
+            } else {
+                guard let payload = response.json, case .object(let row) = payload, case .string(let status)? = row["status"] else {
+                    throw AgentCommunicationError.invalid("peer reply shape")
+                }
+                if !sending {
+                    guard row["request_id"] == .string(message!), row["session_id"] == .string(conversation!) else {
+                        throw AgentCommunicationError.invalid("receipt identity mismatch")
+                    }
+                } else {
+                    guard row["requestId"] == envelope["message_id"] else {
+                        throw AgentCommunicationError.invalid("message identity mismatch")
+                    }
+                    if let conversation, row["sessionId"] != .string(conversation) {
+                        throw AgentCommunicationError.invalid("conversation identity mismatch")
+                    }
+                }
+                envelope["status"] = row["ack"] == .string("enqueued") ? .string("enqueued") : .string(status)
+                if let value = row["requestId"] { envelope["message_id"] = value }
+                if let value = row["sessionId"] { envelope["conversation_id"] = value }
+                if let value = row["runId"] ?? row["run_id"] { envelope["run_id"] = value }
+                envelope["remote_evidence"] = payload
+                for key in ["reply", "detail", "work", "provider_failure"] {
+                    if let value = row[key] { envelope[key] = value }
+                }
+                // Peer-supplied error details remain peer text even when projected into the local failure envelope.
+                let gaveDetail = if case .string(let given)? = row["detail"] {
+                    !given.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } else { false }
+                let failed = ChatToolOutcome.ExactResultClass(rawValue: row["execution_result_class"]?.stringValue ?? "")?.isFailure == true
+                var promoted = false
+                if !gaveDetail, failed,
+                   case .object(let failure) = ChatToolOutcome.normalizedFailure(.object(["status": .string("failed"), "result": payload])),
+                   case .string(let why)? = failure["message"] {
+                    envelope["detail"] = .string(why)
+                    promoted = true
+                }
+                for key in ["retrieval_result_class", "execution_result_class"] { envelope[key] = row[key] }
+                if !sending { envelope["terminal"] = row["execution_terminal"] }
+                envelope["untrusted_remote_data"] = .bool(promoted || PeerDataTaintDispatcher.containsPeerText(payload))
+            }
+            // Acceptance is not a reply; promote answered state only when peer-authored content actually arrived.
+            if sending {
+                // An A2A peer accepted it: what a bound retry reads (`AgentContactHealth.heal`).
+                if a2aInterface != nil { envelope["sent"] = .bool(true) }
+                if case .string(let reply)? = envelope["reply"], !reply.isEmpty {
+                    store.recordProof(peerID: peer.id, inbound: true, outbound: true)
+                    if envelope["needs_authentication"] != .bool(true),
+                       envelope["needs_input"] != .bool(true),
+                       envelope["terminal"] != .bool(true) || envelope["completed"] == .bool(true) {
+                        store.recordRoundTrip(peerID: peer.id, workspace: "Remote workspace (not reported)", recipe: a2aRecipe)
+                    }
+                } else {
+                    store.recordProof(peerID: peer.id, outbound: true)
+                }
+            }
+            available = envelope["needs_authentication"] != .bool(true)
+                && envelope["status"] != .string("failed")
+            return peerFinished(exchange, envelope)
+        } catch {
+            envelope["status"] = .string(sending ? "outcome_unknown" : "unavailable")
+            envelope["detail"] = .string("""
+                Transport or response validation did not establish an outcome. IDs are correlation, not proof of acceptance or deduplication. \
+                NativeAgent recovery requires both message_id and a known conversation_id. Do not resend automatically.
+                """)
+            if let wire = error as? AgentA2AWire.WireError, case .invalid = wire {
+                envelope["reason"] = .string("malformed_remote_evidence")
+                envelope["detail"] = .string(wire.localizedDescription + ". Completion is unconfirmed; do not resend automatically.")
+                envelope["response_failure"] = ChatToolOutcome.failure(error: wire)
+            } else if let failure = ProviderFailure.report(error, work: .outcomeUnknown) {
+                Self.peerFailure(failure, into: &envelope)
+            } else if case .remote(_, let message) = error as? AgentA2AWire.WireError {
+                let cause = ProviderFailure.wire(message)
+                Self.peerFailure(.init(cause: cause, work: .outcomeUnknown), into: &envelope)
+            }
+            return peerFinished(exchange, envelope)
+        }
+    }
+    /// Changing a contact's execution route must preserve its conversation, identity, trust and keys.
+    private func routeContact(_ name: String, ability: DoorStringOrBool, store: AgentPeerStore) throws -> JSONValue {
+        let matches = try store.list().filter { "peer:" + $0.id == name || $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        guard matches.count == 1, let peer = matches.first else {
+            throw ToolFailureError("Name one saved contact from agent.contacts, by its name or peer:<id>, to move. Nothing changed.",
+                                   argumentPath: "agent", effects: .none)
+        }
+        var id: String?
+        if case .string(let wanted) = ability {
+            guard let file = try AbilityStore(dataRoot: dataRoot).read(id: wanted), file.kind == .part else {
+                throw ToolFailureError("No ability of yours is named \(wanted); ability.list shows them. Nothing changed.",
+                                       argumentPath: "ability", effects: .none)
+            }
+            id = file.id
+        } else if case .bool(true) = ability {
+            throw ToolFailureError("ability is one of your abilities' id, or false for the contact's built-in route.", argumentPath: "ability", effects: .none)
+        }
+        guard let moved = try store.route(peerID: peer.id, ability: id) else { throw AgentCommunicationError.invalid("This contact is no longer saved.") }
+        return .object(["status": .string("configured"), "contact": Self.checkedPeerProjection(moved.id, store: store),
+            "sent": .bool(false), "detail": .string(id.map { """
+                \(moved.name) is reached through your ability \($0) from now on: agent.message runs it, and it answers with agent.reply. Its \
+                conversation, identity and trust are unchanged.
+                """ }
+                ?? "\(moved.name) is reached through its built-in route again.")])
+    }
+    static func peerRedact(_ value: JSONValue, token: String?) -> JSONValue {
+        guard let token, !token.isEmpty else { return value }
+        switch value {
+        case .string(let text): return .string(text.replacingOccurrences(of: token, with: "[redacted]"))
+        case .array(let values): return .array(values.map { peerRedact($0, token: token) })
+        case .object(let values):
+            var cleaned: [String: JSONValue] = [:]
+            for (key, value) in values { cleaned[key.replacingOccurrences(of: token, with: "[redacted]")] = peerRedact(value, token: token) }
+            return .object(cleaned)
+        default: return value
+        }
+    }
+    static func peerKeys(_ args: [String: JSONValue], allowed: Set<String>) throws {
+        let unknown = Set(args.keys).subtracting(allowed).sorted()
+        guard unknown.isEmpty else {
+            throw ToolFailureError("Agent communication: unsupported fields: " + unknown.joined(separator: ", ") + ".",
+                                   argumentPath: unknown.first, effects: .none)
+        }
+    }
+    static func peerString(_ text: String?, _ key: String, max: Int, required: Bool = true) throws -> String? {
+        guard let text else {
+            if required { throw AgentCommunicationError.invalid("missing \(key)") }
+            return nil
+        }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              text.utf8.count <= max else { throw AgentCommunicationError.invalid("invalid \(key)") }
+        return text
+    }
+    private static func peerPage(_ number: DoorNumberLiteral?, _ key: String, default fallback: Int, range: ClosedRange<Int>) throws -> Int {
+        guard let number else { return fallback }
+        guard let integer = number.wire.exactIntegerValue, range.contains(integer) else {
+            throw AgentCommunicationError.invalid("invalid \(key)")
+        }
+        return integer
+    }
+}

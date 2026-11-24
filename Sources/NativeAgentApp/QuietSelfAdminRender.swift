@@ -1,30 +1,16 @@
-import Connectors
-import BackgroundWork
-import ApprovalTransactions
-import AppToolRuntime
-import AgentWorkspace
-import AuthoredCapabilities
-import ChatToolRuntime
-import ChatToolParsing
+import BodyRuntime
+import SenseCore
+import MacNerves
 import AppKit
-import ChatTurnRuntime
 import Foundation
-import Dispatcher
-import EngineRuntime
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import Desk
+import DeskCore
 // Read the page owners directly so quiet projections cannot drift into another store.
 import ProviderRouting
-import StandingBots
 import SwiftUI
-import MacIntegration
-import MemoryV2
-import ToolRegistry
-import ToolExecution
-import TrustCenter
-import TrustPersistence
+import MindCore
 // Blueprint: | `QuietSelfAdminRender.swift` | Body page-owner text reads, card facts, catalog and renderer-bound screenshots |
 
 @MainActor
@@ -44,7 +30,7 @@ enum QuietSelfAdminRender {
             // An app whose access the person sets on Trust reads Trust's rows for it, as Trust draws them now.
             let access: DoorPageAccess
             if page.item == .trust { access = .trust(await appModel.engine.pages.refresh(page: "trust")) } else { access = .notOnTrust }
-            return AppToolExecutor.doorPageRead(page.value, access: access, turn: turn)
+            return AppToolExecutor.doorPageRead(page.value, access: access)
         }
         // A page of the agent's own reads itself through engine.pages; the others load their shared data first.
         if page.item != .chat, page.item != .activity, page.item != .memories, page.item != .bots, page.item != .ownPage {
@@ -58,20 +44,33 @@ enum QuietSelfAdminRender {
                 instruction: "Read this page again after its owner publishes; preserve the owner's failure if it remains unavailable.",
                 next: ["page": .string(page.id)])]
         }
-        // A block starting with the face's title or a section's title ("Entities:") is headed by it; an untitled block by the face's title, or
-        // the page's. The face's title alone is no section: it heads the untitled blocks after it, so the page never reads an empty heading.
-        var untitled = page.title
+        var untitled: String? = page.title
         var sections: [JSONValue] = []
         for block in snapshot.text(title: page.title, door: true, page: page.id).components(separatedBy: "\n\n") where !block.isEmpty {
             var lines = block.components(separatedBy: "\n")
-            var heading = untitled
+            var heading: String?
             if let first = lines.first, first == snapshot.face?.title || first.hasSuffix(":") {
                 heading = first.hasSuffix(":") ? String(first.dropLast()) : first
                 lines.removeFirst()
             }
             if lines.isEmpty, heading == snapshot.face?.title { untitled = heading; continue }
-            // The face's text already bounds each row's words and keeps its reference (id, link, calls) whole; it is not cut again.
-            sections.append(.object(["heading": .string(heading), "lines": .array(lines.map(JSONValue.string))]))
+            if heading == nil {
+                if sections.count == 1, case .object(let first) = sections[0],
+                   first["heading"] == .string(snapshot.face?.title ?? page.title),
+                   case .array(let lead)? = first["lines"] {
+                    sections[0] = .object(["heading": first["heading"] ?? .string(page.title),
+                                           "lines": .array(lead + lines.map(JSONValue.string))])
+                    untitled = nil
+                    continue
+                }
+                heading = untitled
+                untitled = nil
+            } else if heading == snapshot.face?.title {
+                untitled = nil
+            }
+            var entry: [String: JSONValue] = ["lines": .array(lines.map(JSONValue.string))]
+            if let heading { entry["heading"] = .string(heading) }
+            sections.append(.object(entry))
         }
         // A page whose drawer is not known yet says nothing about it rather than guess.
         if let drawer = await appModel.engine.pages.drawer(page: page.id) {
@@ -354,7 +353,7 @@ struct QuietPage: Sendable, Equatable {
         case "capabilities", "skills", "tools": .capabilities
         case "diagnostics": .diagnostics
         case "settings": .settings
-        case "dreams", "knowledge", "cognition", "memory-upkeep": .ownPage
+        case "dreams", "knowledge", "cognition", "memory-upkeep", "home": .ownPage
         case _ where AppDoorNames.ownPageRefusal(id) == nil: .ownPage
         default: preconditionFailure("The page has no rail route")
         }
@@ -363,12 +362,7 @@ struct QuietPage: Sendable, Equatable {
 
 enum QuietPages {
     static let all = QuietToolPage.all.map(QuietPage.init)
-    static let drawOnly: [QuietPage] = [
-        QuietPage(value: QuietToolPage(id: "simple", title: "Simple view",
-                  summary: "The Simple shell on Chat: my card, the places, the folded Agents and Helpers lists, and the chat.")),
-        QuietPage(value: QuietToolPage(id: "simple_settings_menu", title: "Simple view settings",
-                  summary: "The Simple shell on Control's Settings tab, where Simple's settings live.")),
-    ]
+    static let drawOnly = QuietToolPage.drawOnly.map(QuietPage.init)
     /// An app page by name or alias, or a page of the agent's own by its id.
     @MainActor static func page(named raw: String) -> QuietPage? {
         let key = AppDoorNames.resolve(raw)
@@ -394,13 +388,7 @@ enum QuietPages {
 
     /// Agent discovery reads its owner directly, independently of the next display frame.
     @MainActor static func ownerPages(_ appModel: AppModel) async throws -> [QuietPage] {
-        let pages = appModel.engine.pages
-        guard let catalog = await pages.catalog else {
-            throw PartCallError(code: "page_inventory_pending", message: "Waiting on the authored-page inventory; read the pages again after it arrives.")
-        }
-        if let failure = catalog.failure { throw failure }
-        let snapshots = await pages.snapshots
-        return QuietToolPage.descriptions(catalog, ids: Set(catalog.claims.keys)) { snapshots[$0] }.map(QuietPage.init)
+        try await appModel.engine.pages.authoredPageDescriptions().map(QuietPage.init)
     }
 
     @MainActor static func ownerPage(named raw: String, appModel: AppModel) async -> QuietPage? {

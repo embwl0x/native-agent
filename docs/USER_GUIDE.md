@@ -97,8 +97,8 @@ conversations. The line ends when the turn settles. Thoughts without calls stay
 quiet. Main and detached Mac chats, full Shotgun and the phone share this row;
 the phone shows the Mac's last synced movement. It carries call names and
 movement, without the other conversation's words or call arguments.
-The `simple_settings_menu` page screenshot draws the same Settings items
-above the sidebar's gear; offscreen capture does not open a native menu window.
+The `simple_settings_menu` page screenshot draws the Simple shell on Control's
+Settings tab, where Simple's settings live, without changing the active selection.
 Rail screenshots derive their tab selection without changing remembered tabs;
 an unavailable saved tab stays selected with an explanation until you choose a visible tab.
 Screenshot height rejects nonfinite or invalid input before rendering. Status
@@ -190,7 +190,7 @@ matching contract says Think controls are unknown on its row and cannot be selec
 New models on a refreshed ChatGPT, Anthropic, OpenAI API, xAI, Meta or Moonshot list
 become news the agent can notice once the same credential has an earlier list.
 
-credentials name their file and repair. A valid CLI API-key file without a ChatGPT
+A valid CLI API-key file without a ChatGPT
 access token offers no ChatGPT session to adopt. Credential files may be symlinks;
 renewal updates their target and retains the link. A failed shared CLI inspection
 after sign-out is reported separately from the completed app credential removal.
@@ -513,15 +513,10 @@ intended result.
 `holding` (keys/modifiers held around physical input) and `button`
 (`auto`, `left`, or `right`), including points addressed with `at`/`from`
 and `frame_id`/`image`. These use the same gesture checks as a single act:
-explicit mouse buttons require a click, open, drag or pointer hold; real
-input requires the app in front. A failed step stops the batch. Optional
-targets and retries retain the gesture options. The app and step fields
-identify the step when continuing a stopped batch. Omitting `scroll_amount`
-and supplying 0 identify the same step. A resumed batch keeps matching landed
-and unverified steps without repeating their input, and reports how many of
-the kept steps were unverified.
 explicit mouse buttons require a click, open, drag or pointer hold. Real input
-requires the app in front. A batch without `app` binds to the process in
+requires the app in front. When an act temporarily brings another app forward,
+the receipt names the previous app and says whether restoration was requested.
+The request returns before macOS confirms the foreground change. A batch without `app` binds to the process in
 front when it starts. During a pending takeover, it binds to the app captured
 when the request arrived. The process can change windows between steps. A
 failed step stops the batch. Optional targets and retries retain the gesture
@@ -626,8 +621,13 @@ A synchronous caller never sleeps: it reads the topology and, if cold admission
 is still owed, reports still settling and emits no action. Passive reads do not
 activate renderer modes or wait for them.
 
-An element whose optional Accessibility attribute answers AX error `-25200`
-remains in the observation with every attribute that did read. Its typed
+A window walk reads each element’s role, subrole, labels, frame and control
+states together. A second read requests its value and, for editable roles,
+its selection range. If the subrole read fails on a text role, the walk skips
+its value and still reads any applicable selection range. Once a title supplies
+both names, later label slots are ignored. Each optional attribute the walk
+uses that answers AX error `-25200` keeps its
+attribute name and code alongside the slots that succeeded. The element’s
 `attributeGaps` are exposed on raw nodes, menu-bar paths, transient menu items and numbered
 marks as `attribute_gaps`, for example `["AXSubrole: AX error -25200"]`:
 the subrole is unknown, not absent. This applies to optional string, Boolean,
@@ -1017,15 +1017,10 @@ existing navigation behavior, which may open an Advanced page.
 | **Notifications** | Notification preferences and history. |
 | **Helpers** | Standing bots, their briefs, schedules or event triggers, and replies. |
 | **Personality** | One face for identity, voice, becoming, minds and dreams; links open editing and review. |
-| **Providers** | AI accounts and the model choices for Chat, Work, and Memory and mind. |
-| **Trust** | What I may do: the standing, a lock on each kind of act that asks you first, the rest folded; feature and Mac permissions, connected agents, grants, activity privacy and inventory folded until opened; backups; security receipts last. |
-| **Personality** | Identity, expression, about-you, growth and working guidelines; **My minds** and **Dreams** tabs. |
 | **Providers** | One shared face for Chat, Work and Mind choices, account connection cards and checks, and model catalog freshness. |
-| **Trust** | Access presets, feature permissions and approvals; **Mac integration** for individual Mac services. |
+| **Trust** | What I may do: the standing, a lock on each kind of act that asks you first, the rest folded; feature and Mac permissions, connected agents, grants, activity privacy and inventory folded until opened; backups; security receipts last. |
 | **Connectors** | Service accounts, the iPhone, Telegram and agent contacts, each with its settings behind its row. |
 | **Capabilities** | What waits on you, my abilities by purpose, what is built in, catalog trust, senses, guardrails, actions and checks in one face. |
-| **Diagnostics** | Health checks, Status, Run history, Cognition, Chat turn details, Skills and Tools. |
-| **Capabilities** | Capability inventory and **Show all actions**. |
 | **Diagnostics** | Health, living status, activity and runs in one reading; Cognition, Chat turn details, Skills and Tools tabs. |
 | **Settings** | Preferences in groups (where I reach you, what I can read, memory, inner life, how I look, shortcuts, other, advanced), notifications, right now, and updates and help. |
 
@@ -1141,8 +1136,10 @@ shows the owner's cause. `interaction_session_id` identifies the origin;
 `chat_session_id` identifies its separate mirror destination.
 The agent's row actions retain the existing Inbox tool checks and invoking turn;
 archive, dismiss and mark-read still require a reason. Paired-phone approval
-decisions continue through signed approval cards; the face actor alone does not
-carry the authenticated device identity needed for approval provenance.
+decisions from the Inbox face carry the verified paired device from the sync
+router, resolving with signed iOS provenance just as signed approval cards do;
+when verified device identity is absent, the approval is refused and no
+identity is synthesized.
 The chat header's updates and note detail use the shared rows and document
 reader. **Mark all read** keeps each unconfirmed update and its cause in
 **Read outcomes**; successful writes alone dismiss the list. An unknown
@@ -1346,14 +1343,14 @@ The composer context readout formats percentages without integer narrowing
 and signed token changes without taking an absolute value. Large recorded
 counts remain visible, including usage above the selected window.
 
-The agent holds your conversation word for word since it last went quiet for
-an hour, along with the couple of exchanges just before that pause, each with
-the time it was said. Anything older stays in the saved transcript: when your
+The agent holds your conversation word for word, each message with the time it
+was said; going quiet never ends what it holds. Anything that has left the
+replay stays in the saved transcript: when your
 words touch an earlier message, the agent gets a short pointer to it, and it can
 open earlier messages itself or recall them. What it was given to think with in
 a moment (the time, what came to mind, recent receipts) is sent once, with that
-message, and not again. If a conversation runs long enough without a pause to
-reach the powering model's window, its oldest whole turns leave the replay in
+message, and not again. If a conversation runs long enough to
+reach the powering model's input budget, its oldest whole turns leave the replay in
 half-budget jumps and stay in the saved transcript. A long running turn replaces
 its oldest tool-result bodies with pointers to their full saved results. It
 never writes a summary to stand in for what was said. There is no manual compact
@@ -1374,11 +1371,10 @@ lists the actions and the waits they satisfy.
 
 Use `app {action:"mind.dream", preview:true}` to generate a dream and inspect its
 proposed care judgments without applying them or writing a diary. It spends a
-real provider call. The six clock-owner actions (`mind.canon`, `mind.horizon`,
-`mind.rhythm`, `mind.cross`, `mind.maintenance`, `mind.residual_repair`) refuse
-preview with a specific reason; removing `preview` runs them for real, and
-`mind.cross` posts its line as a world happening. The run-now table documents
-that boundary.
+real provider call. The five clock-owner actions (`mind.canon`, `mind.horizon`,
+`mind.rhythm`, `mind.maintenance`, `mind.residual_repair`) refuse preview with
+a specific reason; removing `preview` runs them for real. The run-now table
+documents that boundary.
 
 Cognition's reflection records show an unavailable token total if the recorded
 components overflow, retaining the individual prompt and result counts.

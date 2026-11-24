@@ -1,0 +1,855 @@
+import SenseCore
+import MindCore
+import MacNerves
+import Foundation
+import PersistenceCore
+import NativeAgentCore
+import NativeAgentShared
+import DeskCore
+// Blueprint: | `AppDoorActions.swift` | Shared admission, previews, route corrections and typed receipts; accepted matters supply knock count |
+
+extension AppAction {
+    func runsInPreview(args: [String: JSONValue]) -> Bool {
+        guard !authored, readOnly(args: args) else { return false }
+        switch id {
+        case "agent.introspect", "agent.jobs", "artifact.find", "browser.status",
+             "calendar.calendars", "calendar.free_busy", "calendar.upcoming", "capabilities.lookup",
+             "chat.message", "chat.scratch_read", "chat.search", "contacts.search", "desk.read",
+             "files.excerpt", "files.grep", "files.info", "files.list", "files.spotlight",
+             "git.diff", "git.log", "git.status", "git.summary", "ledger.list", "mac.activity",
+             "mac.clipboard_read", "mac.system_info", "mac.volume", "maps.route", "maps.search",
+             "memory.proposals", "mind.dream_diary", "mind.inner_state", "node.list", "persona.doc", "persona.read",
+             "queue.list", "reminders.due_today", "reminders.lists", "reminders.query", "reminders.read",
+             "result.page", "schedule.list", "studio.canon", "studio.consult_read", "studio.recall", "studio.shelf", "time.now",
+             "trace.model_calls", "trace.usage", "web.search", "ability.list", "ability.read",
+             "chat.list", "claude.worklog", "find", "mac.apps", "make.read", "mind.body",
+             "mind.misses", "mind.night", "photos.count", "photos.recent", "record.read", "sense.make",
+             "sense.versions", "setting.get", "studio.intake.read":
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+extension AppToolExecutor {
+    @concurrent private static func doorUndoLayout(root: URL) async -> JSONValue {
+        SurfaceLayoutStore.read(dataRoot: root)
+    }
+    @concurrent private static func doorUndoRecipe(host: String?) async -> JSONValue {
+        AgentRecipeStore.read(host: host)
+    }
+    @MainActor
+    func doorUndo(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let session = turn.verifiedSessionID ?? input["__session_id"]?.scalarText ?? ""
+        guard !session.isEmpty, let saved = await AgentWorkspaceNavigation.shared.undoReceipt(dataRoot: root, scope: session),
+              case .object(let receipt) = saved, let action = receipt["action"]?.scalarText else {
+            return Self.failure("nothing_to_undo", "This conversation has no readable retained change to undo. Nothing was written.",
+                extra: ["remedy": Repair.terminal(instruction: """
+                    No retained inverse is available. Do not invent an undo; inspect the affected state before choosing a new change.
+                    """)])
+        }
+        if let reason = receipt["undo_unavailable"]?.scalarText {
+            return Self.doorRefusal("undo_unavailable", reason, remedy: "inspect",
+                "Read the recorded action's current contract; this receipt cannot undo it.", next: ["find": .string(action)])
+        }
+        let args: [String: JSONValue]
+        switch action {
+        case "layout.write":
+            let outcome = await Self.doorUndoLayout(root: root)
+            guard case .object(let read) = outcome, let previous = read["previous"] else {
+                if !ChatToolOutcome.outputLooksSuccessful(outcome) { return outcome }
+                return Self.failure("undo_unavailable", "The previous layout could not be read. Nothing was written.",
+                    extra: ["remedy": .object(["kind": .string("inspect"),
+                        "instruction": .string("Read the layout and its retained history; do not invent the previous layout."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("layout.read")])])])])
+            }
+            args = ["layout": previous, "layout_version": receipt["version"] ?? .null]
+        case "agent.recipe_write":
+            let outcome = await Self.doorUndoRecipe(host: receipt["host"]?.scalarText)
+            guard case .object(let read) = outcome, let previous = read["previous"] else {
+                if !ChatToolOutcome.outputLooksSuccessful(outcome) { return outcome }
+                return Self.failure("undo_unavailable", "The previous recipe could not be read. Nothing was written.",
+                    extra: ["remedy": .object(["kind": .string("inspect"),
+                        "instruction": .string("Read this recipe and its retained history; do not invent the previous recipe."),
+                        "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("agent.recipe"),
+                            "args": .object(["host": receipt["host"] ?? .null])])])])])
+            }
+            args = ["host": receipt["host"] ?? .null, "recipe": previous]
+        case "setting.set":
+            args = ["setting": receipt["setting"] ?? .null, "value": receipt["old_value"] ?? .null,
+                    "because": receipt["user_request"] ?? .string("")]
+        default:
+            return Self.failure("undo_unavailable", "That receipt has no undo action. Nothing was written.",
+                extra: ["remedy": Repair.terminal(instruction: "This receipt has no inverse. Inspect the affected state before choosing a new change.")])
+        }
+        guard let perform = execution.perform else {
+            return Self.failure("door_unavailable", "Use app from a chat turn. Nothing was written.",
+                extra: ["remedy": .object(["kind": .string("correct_arguments"),
+                    "instruction": .string("Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id."), "next_call": .null])])
+        }
+        // Re-enter the original action's gates; only its owner applies the receipt.
+        return try await perform("app", ["action": .string(action), "args": .object(args),
+                                         "__session_id": .string(session), "__undo_receipt": saved], turn, execution)
+    }
+    @MainActor
+    func doorDo(_ id: String, resolved: (action: AppAction, discovery: [String: JSONValue])?, input: [String: JSONValue], surface: String,
+        inProcess: Bool, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+        // Who decided the call is on every receipt the door returns, a read's and a refusal's too: the person when their own act is this exact
+        // call, else the agent.
+        func stamped(_ result: JSONValue) -> JSONValue {
+            guard case .object(var fields) = result, fields["decided_by"] == nil else { return result }
+            let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(id), "args": input["args"] ?? .object([:])], turn: turn)
+            fields["decided_by"] = .string(decided ? "person" : "agent")
+            return .object(fields)
+        }
+        guard let resolved else {
+            return stamped(try await doorDoBound(id, resolved: nil, input: input, surface: surface, inProcess: inProcess, turn: turn,
+                execution: execution))
+        }
+        let binding = AppActions.boundArguments(resolved.action, input["args"]?.objectValue ?? [:], schema: resolved.discovery["args_schema"])
+        var input = input
+        if !binding.understood.isEmpty { input["args"] = .object(binding.args) }
+        let result: JSONValue
+        if input[Self.doorScriptKey] == .bool(true), let refusal = AppScriptRunner.secretRefusal(resolved.action, binding.args) {
+            result = Self.doorRefusal(refusal.reason, refusal.detail, remedy: "correct_route",
+                "Pass credentials in a single app action outside a script.")
+        } else {
+            do {
+                result = try await doorDoBound(id, resolved: resolved, input: input, surface: surface, inProcess: inProcess, turn: turn,
+                    execution: execution)
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                // A throw that may have touched state was attempted, never "not run": a retry must read the effects first.
+                var failed = ChatToolOutcome.failure(error: error, tool: "app")
+                if case .object(var fields) = failed, fields["execution"] == nil, fields["effects"] != .string("none") {
+                    fields["execution"] = .string("attempted"); failed = .object(fields)
+                }
+                result = failed
+            }
+        }
+        let advised = Self.advisedRefusal(result, action: resolved.action, args: binding.args)
+        let reply = ToolResult(advised)
+        var receipt = advised.objectValue ?? ["result": advised, "action": .string(resolved.action.id),
+            "status": .string(ChatToolOutcome.statusWord(advised, verdict: reply.outcome)),
+            "execution": .string(reply.outcome == .succeeded ? "executed" : "attempted")]
+        if !binding.understood.isEmpty { receipt["understood"] = .string(binding.understood.joined(separator: "; ")) }
+        return stamped(.object(receipt))
+    }
+
+    @MainActor
+    private func doorDoBound(_ id: String, resolved: (action: AppAction, discovery: [String: JSONValue])?, input: [String: JSONValue], surface: String,
+        inProcess: Bool, turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        guard let action = resolved?.action else {
+            return try await doorUnknownAction(id, input: input, root: root, turn: turn)
+        }
+        let ownsLever = if action.lever?.asks == true {
+            try await SwiftNativeTrustCenter(dataRoot: root).agentOwnsLevers(turn: turn)
+        } else { false }
+        var receipt: [String: JSONValue] = [
+            "action": .string(action.id), "page": .string(action.page), "label": .string(action.label),
+            "owner": .string((action.lever?.holds(input["args"]?.objectValue ?? [:]) == true && !ownsLever) || PermissionLaw.personDecided(tool: "app", input: [
+                "action": .string(action.id), "args": input["args"] ?? .object([:])], turn: turn) ? "person" : "agent"),
+            "execution": .string("not_run"),
+        ]
+        // What refuses or previews a folded tool points to its guide, never carries it.
+        if !action.partAction, action.page != "*", try AppActions.about(action) != nil {
+            receipt["guide"] = .object(["page": .string(action.page), "item": .string("guide:" + action.id)])
+        }
+        let discovery = resolved?.discovery ?? [:]
+        let door = DoorBoundCall(action: action, discovery: discovery, input: input, surface: surface, inProcess: inProcess, turn: turn,
+            execution: execution, root: root, ownsLever: ownsLever, receipt: receipt)
+        if let refused = try doorAdmitArguments(door) { return refused }
+        if let owners = doorOwnersCall(door) { return owners }
+        if let early = try await doorBindCall(door) { return early }
+        if input["preview"] == .bool(true) { return try await doorPreview(door) }
+        return try await doorRun(door)
+    }
+
+    /// No action has that name: a kept part that is off or a draft says so, a near name is corrected, and anything else is refused with
+    /// the actions it may have meant.
+    @MainActor
+    private func doorUnknownAction(_ id: String, input: [String: JSONValue], root: URL, turn: Turn) async throws -> JSONValue {
+        if let partID = ToolNameAliases.authoredTool(id), let row = try Parts(root: root).row(partID),
+           let status = row["status"]?.scalarText, status != "active" {
+            let name = row["name"]?.scalarText ?? partID
+            // An off whose actor is unreadable is named as the guard names it.
+            if status == "disabled" {
+                do { _ = try CapabilityLifecycle.preservingOwnerOff(row, before: row, ownerAuthorized: true, preview: true, turn: turn) }
+                catch { return Self.failure("part_disabled", "\(name) didn't run: \(error.localizedDescription)",
+                                            extra: ["requested": .string(id), "id": .string(partID)]) }
+            }
+            // User-off and unknown-actor records remain the user's decision; only agent-off records are the agent's to restore.
+            if status == "disabled", CapabilityLifecycle.requiresOwnerToEnable(isOff: true, disabledBy: row["disabledBy"]?.scalarText) {
+                return Self.failure("part_disabled", "\(name) was switched off by the person; nothing ran.",
+                    extra: ["remedy": Repair.why(owner: "ability \(partID): switched off by the person",
+                                                 tap: "Tools page > \(name) > turn on"),
+                            "requested": .string(id), "id": .string(partID)])
+            }
+            // Failed runs prove no executable version; open their versioned source instead of manufacturing a keep from the current catalog.
+            let hasCode = (row["candidateDigest"] ?? row["codeFingerprint"]) != nil
+            let nextAction = hasCode ? "ability.read" : status == "disabled" ? "ability.restore" : "ability.enable"
+            return Self.doorRefusal(status == "disabled" ? "part_disabled" : "not_kept",
+                hasCode ? """
+                    \(name) is \(status == "disabled" ? "switched off" : "a draft, not kept yet"); nothing ran. Read its exact version before keeping it.
+                    """
+                    : status == "disabled" ? "\(name) is switched off; nothing ran. ability.restore turns it back on."
+                    : "\(name) is a draft, not kept yet; nothing ran. ability.enable keeps it.",
+                owner: "ability \(partID).status",
+                next: ["action": .string(nextAction), "args": .object(["id": .string(partID)])],
+                extra: ["requested": .string(id), "id": .string(partID)])
+        }
+        let qualified = JSONValue.trimmedScalarTextOrEmpty(input["page"]) + "." + id
+        if let correction = try await Self.doorActionCorrection(qualified, input: input, turn: turn) {
+            return correction
+        }
+        if let correction = try await Self.doorActionCorrection(id, input: input, turn: turn) {
+            return correction
+        }
+        let advice = try await AppActions.callAdvice(id, input: input, pages: doorPageIndex, dataRoot: root,
+                                                    memory: await actionIndex, turn: turn)
+        let next = AppActions.determinedCall(advice) ?? ["find": .string(id)]
+        return Self.doorRefusal("unknown_action", """
+            No action is called \(id). try_instead names current actions and their argument shapes. actions is a top-level array of calls. A home \
+            name or ref (desk.4, mail.find, an agent's name) opens with item.
+            """,
+            remedy: "find", """
+                Choose a try_instead action using its schema and your values. Read a page's action list with {page, item:\"actions\"}; batch calls with \
+                {actions:[{action,args}]}. Nothing was done.
+                """,
+            next: next,
+            extra: ["requested": .string(id), "try_instead": advice])
+    }
+
+    /// The call's arguments, read against the action's schema; an argument preflight ends here with its preview.
+    @MainActor
+    private func doorAdmitArguments(_ door: DoorBoundCall) throws -> JSONValue? {
+        let action = door.action, discovery = door.discovery, input = door.input, execution = door.execution
+        func badArgs(_ reason: String, _ detail: String, _ path: String) -> JSONValue {
+            var extra = door.receipt
+            extra["argument_path"] = .string(path)
+            extra["args_schema"] = discovery["args_schema"]
+            // A refusal names what the action takes, in the envelope's own accepted field.
+            let names = discovery["args_schema"]?.objectValue?["properties"]?.objectValue?.keys.sorted()
+            let accepted = names.map { $0.isEmpty ? "args takes no arguments" : "args takes " + $0.joined(separator: ", ") }
+            extra["accepted"] = accepted.map(JSONValue.string)
+            let advice = AppActions.callAdvice(action, input: input, discovery: discovery)
+            extra["try_instead"] = advice
+            let call = AppActions.determinedCall(advice)
+            return Self.doorRefusal(reason, detail, remedy: "correct_arguments",
+                call == nil ? "Fill the proposed form in try_instead from your supplied values before sending it. Nothing ran."
+                    : "Review next_call against try_instead and your supplied values before sending it. Nothing ran.", next: call, extra: extra)
+        }
+        let args: [String: JSONValue]
+        switch input["args"] {
+        case .object(let given)?:
+            args = Self.normalizedCallArguments(action, given, schema: discovery["args_schema"], recordShims: door.turn.doorPreview == nil)
+        case nil, .null?: args = [:]
+        default: return badArgs("invalid_args", "args is an object of the action's arguments by name: \(action.line)", "args")
+        }
+        let read = action.readOnly(args: args)
+        let validationArgs = Self.doorValidationArgs(action, args)
+        // Wake arguments live in input.wake; required call arguments must not refuse a wake.
+        let woken = action.authored && execution.wake != nil
+        guard let schema = discovery["args_schema"] else {
+            throw ToolFailureError("\(action.id)'s input schema is unavailable. Nothing ran.", effects: .none,
+                owner: "Tool catalog", code: "tool_schema_unavailable",
+                instruction: "Repair this action's registered schema before calling it again.", recovery: .repair)
+        }
+        if !woken {
+            do throws(DoorAdmissionError) {
+                if execution.argumentPreflightOnly, action.isFold || read,
+                   let (key, values) = Self.doorPlural(action, args, discovery: discovery) {
+                    for value in values {
+                        let scalar = Self.normalizedCallArguments(action, args.merging([key: value]) { $1 },
+                            schema: schema, recordShims: false)
+                        try DoorDecoder.check(Self.doorValidationArgs(action, scalar), schema: schema, path: "args")
+                    }
+                } else { try DoorDecoder.check(validationArgs, schema: schema, path: "args") }
+            } catch {
+                switch error {
+                case .schemaUnavailable(let failure): throw failure
+                case .badArguments(let problem): return badArgs("bad_input", error.failure.localizedDescription, problem.path)
+                }
+            }
+        }
+        if execution.argumentPreflightOnly {
+            door.receipt["status"] = .string("preview")
+            door.receipt["effects"] = .string("none")
+            door.receipt["preview_scope"] = .string("public_arguments")
+            return .object(door.receipt)
+        }
+        door.args = args
+        door.read = read
+        return nil
+    }
+
+    /// A lever that is the person's: the agent's call of one a card can carry is their ask, and one no card can carry is theirs to do.
+    @MainActor
+    private func doorOwnersCall(_ door: DoorBoundCall) -> JSONValue? {
+        let action = door.action, args = door.args, input = door.input, turn = door.turn, ownsLever = door.ownsLever
+        // Validate before an owner-only preview can claim a callable target.
+        let ownerRemedy: JSONValue = {
+            // Provider contracts name provider; inbox and connector contracts name id.
+            let target = JSONValue.trimmedScalarTextOrEmpty(args["id"] ?? args["provider"])
+            let tap: String
+            switch action.id {
+            case "inbox.open_on_mac": tap = "Inbox → \(target) → Open on Mac"
+            case "inbox.approve": tap = "Today → \(target) → Approve"
+            case "inbox.deny": tap = "Today → \(target) → Decline"
+            case "provider.sign_in": tap = "Mac → Providers → Accounts → Add key or Sign in → protected entry"
+            case "provider.disconnect": tap = "Providers → Accounts → \(target) → Disconnect"
+            case "connector.on": tap = target.lowercased() == "telegram"
+                ? "Connectors → Telegram → Telegram is on" : "iPhone → Connectors → \(target) → Enabled"
+            case "connector.disconnect": tap = "iPhone → Connectors → \(target) → Disconnect"
+            case "telegram.disconnect": tap = "Connectors → Telegram → Disconnect Telegram"
+            case "pairing.remove": tap = "Connectors → iPhone → \(target) → Remove"
+            case "backup.restore": tap = "Trust → Advanced → Backups → \(target) → Restore"
+            default: return .null // Actions owned by the agent never use this remedy.
+            }
+            return Repair.why(owner: action.id, tap: tap)
+        }()
+        let decided = PermissionLaw.personDecided(tool: "app", input: ["action": .string(action.id), "args": input["args"] ?? .object([:])],
+            turn: turn)
+        // A lever's preview is the gate's own check: it reads on to the owner's checks of what the call names, so a call that cannot run is
+        // refused in its owner's words first; one that can is the card's to decide, or the person's own to do (below, after the checks).
+        let ownersOnly = action.lever.map { $0.holds(input["args"]?.objectValue ?? [:]) && !decided && !$0.asks } ?? false
+        if let lever = action.lever, lever.holds(input["args"]?.objectValue ?? [:]), !decided, !ownsLever, input["preview"] != .bool(true) {
+            let why = lever.why
+            door.receipt["owner"] = .string("person")
+            door.receipt["why"] = .string(why)
+            door.receipt["remedy"] = ownerRemedy
+            func alternative(_ instruction: String, _ id: String, _ args: [String: JSONValue]) -> JSONValue {
+                .object(["instruction": .string(instruction), "next_call": .object([
+                    "tool": .string("app"), "input": .object(["action": .string(id), "args": .object(args)])])])
+            }
+            switch action.id {
+            case "inbox.open_on_mac":
+                door.receipt["alternatives"] = .array([
+                    alternative("If you mean to decline the card, use inbox.not_now.", "inbox.not_now", args),
+                    alternative("If the card is stale, archive it.", "inbox.archive", args)])
+            case "connector.disconnect":
+                door.receipt["alternatives"] = .array([alternative("To stop the connector without disconnecting it, turn it off.", "connector.off", args)])
+            case "telegram.disconnect":
+                door.receipt["alternatives"] = .array([alternative("To stop Telegram without removing its token, turn it off.", "setting.set",
+                    ["setting": .string("telegram.enabled"), "value": .bool(false)])])
+            default: break
+            }
+            let named = lever.name.isEmpty ? action.id : "\(lever.name) (\(action.id))"
+            if lever.asks {
+                // The agent's call of a lever a card can carry is the person's ask, never a bare refusal: this answer is the one a setting's
+                // raise gives (`needs_person`), and the gate that admitted the call files the person's card for this exact call from it.
+                // Their Approve replays it as their decision (`personDecided` above); their Decline leaves everything as it was.
+                var ask = door.receipt
+                ask["status"] = .string("needs_person")
+                ask["reason"] = .string("owners_call")
+                ask["effects"] = .string("none")
+                ask["execution"] = .string("not_run")
+                ask["detail"] = .string("\(named) is the person's to decide: \(why). Only their yes on a card for this exact call runs it; "
+                    + "nothing was done.")
+                return .object(ask)
+            }
+            // No card can carry it: the sentence says where the person does it themself, so the agent can tell them.
+            let place = ownerRemedy.objectValue?["tap"]?.stringValue.map { " (\($0))" } ?? ""
+            return Self.failure("owners_call", "\(named) is the person's own to do: \(why)\(place). No card can carry it, so nothing was "
+                + "done; tell the person where they do it, and do not call it again.", extra: door.receipt)
+        }
+        door.ownerRemedy = ownerRemedy
+        door.ownersOnly = ownersOnly
+        return nil
+    }
+
+    /// The owner's call bound from the arguments, its receipt's redacted copy, and the page version it was read at; a part's resume and
+    /// preview run here, and a caller outside a chat turn stops here.
+    @MainActor
+    private func doorBindCall(_ door: DoorBoundCall) async throws -> JSONValue? {
+        let action = door.action, args = door.args, read = door.read, input = door.input, surface = door.surface
+        let inProcess = door.inProcess, turn = door.turn, execution = door.execution, root = door.root
+        // Archive reasons must not use reason, which runners classify as the machine refusal code.
+        if let reason = args["reason"]?.scalarText { door.receipt["reason_given"] = .string(String(reason.prefix(280))) }
+        var call = action.binding.arguments(args)
+        // The person's quoted request beside the call reaches an action that reads one (setting.set) when its args carry none; as a door key it
+        // is no argument of the call, so the person's decision of the call still names it exactly.
+        if action.binding.declaredArguments.contains("because"), args["because"] == nil, let because = input["because"] {
+            call["__because"] = because
+        }
+        // A program calling gets a reader's structured form, where it has one.
+        if input[Self.doorScriptKey] == .bool(true), call["structured"] == nil,
+           action.argSpecs.flatMap(\.names).contains("structured") { call["structured"] = .bool(true) }
+        if action.id == "mac.look", args["__sense_screen_frame"] != nil {
+            let cursor = args.filter { ["app", "__sense_screen_frame", "__sense_text_offset"].contains($0.key) }
+            call["__sense_address"] = .string(try JSONValue.object(cursor).serialize(pretty: false))
+        }
+        // Receipts use host verb names; credentials must never ride a receipt.
+        var shown = MacInjectionArgRedaction.redacted(tool: action.tool, input: call, turn: turn)
+        for name in action.secretArgs where shown[action.rename[name] ?? name] != nil {
+            shown[action.rename[name] ?? name] = .string("[redacted]")
+        }
+        door.receipt["underlying_call"] = .object(["input": .object(shown)])
+        let expected = JSONValue.trimmedScalarTextOrEmpty(input["expected_version"])
+        let scope = expected.split(separator: "@", maxSplits: 1).first.map(String.init) ?? action.page
+        let returnsVersion = !read && (!expected.isEmpty || action.page == "chat")
+        if !expected.isEmpty {
+            let scopeName = scope.split(separator: "/", maxSplits: 1).first.map(String.init)
+            let scopePage: String? = if let scopeName { await doorPage(scopeName)?.id } else { nil }
+            guard action.page == "*" || scopePage == action.page
+                || (action.tool == "sense_lifecycle" && scope == "senses/" + JSONValue.trimmedScalarTextOrEmpty(args["sense_id"])) else {
+                door.receipt["expected_version"] = .string(expected)
+                return Self.doorRefusal("wrong_page_version",
+                    "That version is from \(scopePage ?? scope), and \(action.id) is on \(action.page). Nothing was done.",
+                    remedy: "reread", "Read \(action.id)'s current requirements before choosing its version.",
+                    next: ["find": .string(action.id)], extra: door.receipt)
+            }
+            let current = try await doorCurrentVersion(scope: scope, surface: surface, turn: turn, execution: execution)
+            guard current == expected else {
+                door.receipt["expected_version"] = .string(expected)
+                door.receipt["current_version"] = current.map(JSONValue.string) ?? .null
+                let parts = scope.split(separator: "/", maxSplits: 1).map { JSONValue.string(String($0)) }
+                var read: [String: JSONValue] = ["page": parts.first ?? .string(action.page)]
+                if parts.count > 1 { read["item"] = parts[1] }
+                if parts.first == .string("senses"), parts.count == 2 {
+                    read = ["action": .string("sense.versions"), "args": .object(["sense_id": parts[1]])]
+                }
+                return Self.doorRefusal("stale_version", current == nil
+                    ? "That version names nothing that reads now. Nothing was done."
+                    : "\(scope) changed since that read. Nothing was done.",
+                    remedy: "reread", "Read it again, check the action still fits, then pass the new version.",
+                    next: current == nil ? ["find": .string(action.id)] : read, extra: door.receipt)
+            }
+        }
+        if let session = input["__session_id"] { call["__session_id"] = session }
+        if let address = input["__sense_address"] { call["__sense_address"] = address }
+        // A stopped run resumes as its own run; a part's preview runs its code with every write previewed.
+        if action.id == "ability.resume" {
+            return Self.actionResult(await doorPartResume(args, preview: input["preview"] == .bool(true),
+                surface: surface, root: root, turn: turn, execution: execution), action: action, args: args)
+        }
+        // A part's preview runs on what its live run would get, the verb a part answers included.
+        if action.authored, input["preview"] == .bool(true) {
+            return Self.actionResult(await doorPartPreview(action, args: call.filter { !$0.key.hasPrefix("__") }, input: input,
+                surface: surface, root: root, turn: turn, execution: execution), action: action, args: args)
+        }
+        guard execution.perform != nil || inProcess else {
+            return Self.doorRefusal("door_unavailable",
+                "This call did not come from inside a chat turn, so it has no gate to pass. Nothing was read or done.",
+                remedy: "correct_arguments", "Call app from inside a chat turn; this caller cannot bind a chat by supplying a session id.")
+        }
+        door.call = call
+        door.scope = scope
+        door.returnsVersion = returnsVersion
+        return nil
+    }
+
+    /// A preview: the real call's checks without its effect, saying whether it would run, ask the person on a card, or be refused.
+    @MainActor
+    private func doorPreview(_ door: DoorBoundCall) async throws -> JSONValue {
+        let action = door.action, args = door.args, input = door.input, surface = door.surface, turn = door.turn
+        let execution = door.execution, ownerRemedy = door.ownerRemedy, ownersOnly = door.ownersOnly
+        var call = door.call
+        if !execution.argumentPreflightOnly, action.tool == "mind_run",
+           let verb = call["verb"]?.stringValue,
+           verb == "dream" || MindClockVerb(rawValue: verb) != nil {
+            call["preview"] = .bool(true)
+            // Preview returns before door notes, version reads and change receipts; the owner supplies its actual decision.
+            return try await runFolded(action, input: call, surface: surface, turn: turn, execution: execution)
+        }
+        door.receipt["status"] = .string("preview")
+        door.receipt["checks_not_run"] = .array([
+            "Live target existence, identity and eligibility unless explicitly checked below",
+            "Connector authentication and macOS permission prompts",
+            "File contents and sense views unless explicitly checked below",
+            "Action-internal approval, execution, delivery and effect verification",
+        ].map(JSONValue.string))
+        door.receipt["preview_scope"] = .string(action.id == "backup.restore"
+            ? "public_arguments_policy_and_backup_target" : ["read_file", "list_dir", "file_excerpt"].contains(action.tool)
+                ? "public_arguments_policy_and_local_file_target" : "public_arguments_and_available_policy_checks")
+        // Preview shares the real call's checks and refuses unavailable execution as door_unavailable.
+        var refusal = await foldedRefusal(action, input: call, surface: surface, turn: turn, execution: execution)
+        if let refused = refusal {
+            refusal = Self.advisedRefusal(Self.foldedResult(ChatToolOutcome.normalizedFailure(refused, tool: action.tool),
+                guide: nil, tool: action.tool), action: action, args: args)
+        }
+        // The owner's checks held for a lever no card can carry: it is the person's own to do.
+        if refusal == nil, ownersOnly, let why = action.lever?.why {
+            door.receipt["owner"] = .string("person")
+            door.receipt["why"] = .string(why)
+            door.receipt["remedy"] = ownerRemedy
+            door.receipt["would_refuse"] = .string("owners_call")
+            door.receipt["detail"] = .string("Would refuse: that's the owner's, \(why). Nothing was done.")
+            return .object(door.receipt)
+        }
+        guard case .object(let refused)? = refusal, refused["status"] != .string("would") else {
+            door.receipt["would_card"] = .bool(try await doorWouldCard(action, call: call, input: input, surface: surface, turn: turn, execution: execution))
+            door.receipt["detail"] = .string("""
+                Arguments and available preflight checks passed. See checks_not_run; this does not prove the action can run. Nothing was done.
+                """)
+            // A lifecycle preview says what the call would leave, in its own words.
+            if case .object(let would)? = refusal {
+                door.receipt.merge(would.filter { !["status", "detail"].contains($0.key) }) { $1 }
+                door.receipt["detail"] = .string(JSONValue.trimmedScalarTextOrEmpty(would["detail"]) + " Nothing was done.")
+            }
+            return .object(door.receipt)
+        }
+        // A glass-only user card retains its refusal reason.
+        let glass = refused["status"] == .string("needs_glass")
+        let failureCode = JSONValue.trimmedScalarTextOrEmpty(refused["failure_code"])
+        let code = glass ? "needs_glass" : failureCode.isEmpty ? JSONValue.trimmedScalarTextOrEmpty(refused["reason"]) : failureCode
+        let why = glass ? JSONValue.trimmedScalarTextOrEmpty(refused["reason"]) : ["detail", "message", "reason"]
+            .map { JSONValue.trimmedScalarTextOrEmpty(refused[$0]) }.first { !$0.isEmpty } ?? ""
+        // A change that is the person's to decide is not refused: the real call asks them on a card, and the preview says so.
+        if refused["status"] == .string("needs_person") || (action.id == "setting.set" && code == "owners_call") {
+            door.receipt["would_card"] = .bool(true)
+            door.receipt["detail"] = .string("Would ask the person on a card. \(why) Nothing was done.")
+            return .object(door.receipt)
+        }
+        door.receipt["would_refuse"] = .string(code)
+        // The owner's refusal keeps what it says is accepted (the targets, ids or accounts there are), so the next call can pick one.
+        for (key, value) in refused where key.hasPrefix("would_") || ["versions", "tools", "argument_path", "backups", "remedy", "try_instead",
+            "accepted", "ids", "providers"].contains(key) { door.receipt[key] = value }
+        if glass || Self.doorFloorReasons.contains(code) {
+            door.receipt["owner"] = .string("person")
+            door.receipt["why"] = .string(why)
+        }
+        door.receipt["detail"] = .string("Would refuse: \(code). \(why) Nothing was done.")
+        return .object(door.receipt)
+    }
+
+    /// The call run by its owner, and its receipt: what the owner said, what it raised and delivered, its undo and the version it left.
+    @MainActor
+    private func doorRun(_ door: DoorBoundCall) async throws -> JSONValue {
+        let action = door.action, args = door.args, read = door.read, input = door.input, surface = door.surface, turn = door.turn
+        let execution = door.execution, root = door.root, call = door.call, scope = door.scope, returnsVersion = door.returnsVersion
+        // Folded tools retain their own result, gates and card; ability faces do not change part execution.
+        if action.isFold && !action.authored || action.id == "chat.list" {
+            let result = Self.foldedResult(try await runFolded(action, input: call, surface: surface, turn: turn, execution: execution),
+                guide: door.receipt["guide"],
+                                          browser: action.tool.hasPrefix("browser."), tool: action.tool)
+            let folded = Self.actionResult(result, action: action, args: args)
+            // A versioned write says the version it left, as the app's own buttons do.
+            guard returnsVersion, case .object(let fields) = folded else { return folded }
+            return .object(await attachPageVersion(to: fields, scope: scope, surface: surface, turn: turn, execution: execution))
+        }
+        // Each script action's after is the next before; reads raise no notes and need no surrounding inbox reads.
+        let snapshot = execution.notesSnapshot
+        let watch = !read
+        let notesBefore = if !watch { [(id: String, title: String)]?.none }
+            else if let held = snapshot?.notes { held } else { await doorNotes(turn: turn) }
+        let knocksBefore: Result<Set<String>, Error> = watch ? await Self.acceptedKnocks(root: root) : .success([])
+        var result = Self.actionResult(action.authored ? try await doorPart(action, call: call, input: input, surface: surface, root: root, turn: turn,
+            execution: execution)
+            : try await runFolded(action, input: call, surface: surface, turn: turn, execution: execution), action: action, args: args)
+        let surfacesChanged = if case .object(let fields) = result, case .array(let surfaces)? = fields["surfaces_changed"] {
+            !surfaces.isEmpty
+        } else { false }
+        if execution.undoReceipt == nil, ["layout.write", "agent.recipe_write", "setting.set"].contains(action.id),
+           case .object(var fields) = result, fields["changed"] == .bool(true) || surfacesChanged, ChatToolOutcome.outputLooksSuccessful(result),
+           let session = turn.verifiedSessionID ?? input["__session_id"]?.scalarText, !session.isEmpty {
+            fields["action"] = .string(action.id)
+            do {
+                try await AgentWorkspaceNavigation.shared.rememberUndo(.object(fields), dataRoot: root, scope: session)
+                if fields["undo_unavailable"] == nil || fields["undo_unavailable"] == .null {
+                    door.receipt["undo"] = .object(["action": .string("undo")])
+                }
+            }
+            catch {
+                fields["undo_unavailable"] = .string(error.localizedDescription)
+                result = .object(fields)
+            }
+        }
+        let notesAfter = watch ? await doorNotes(turn: turn) : nil
+        if watch { snapshot?.notes = notesAfter }
+        let knocksAfter: Result<Set<String>, Error> = watch ? await Self.acceptedKnocks(root: root) : .success([])
+        let reply = ToolResult(Self.advisedRefusal(ChatToolOutcome.normalizedFailure(result, tool: action.tool),
+            action: action, args: args))
+        result = reply.payload
+        // Preserve the owner's status or result evidence; the door's ok must not replace it.
+        door.receipt["status"] = .string(ChatToolOutcome.statusWord(reply.payload, verdict: reply.outcome))
+        if case .object(let fields) = result {
+            for key in ["execution", "changed", "effects", "effect", "read_only", "irreversible", "try_instead", "next_call"] {
+                door.receipt[key] = fields[key]
+            }
+            if case .string(let status)? = fields["status"] { door.receipt["status"] = .string(status) }
+            // User-only refusals and cards remain user-only through both preview and execution.
+            if Self.doorFloorReasons.contains(JSONValue.trimmedScalarTextOrEmpty(fields["reason"])) || fields["status"] == .string("needs_glass") {
+                door.receipt["owner"] = .string("person")
+            }
+        }
+        // Receipts name the requested action even when the host uses a different verb.
+        let own = action.isCard ? "action" : "verb"
+        if case .object(var fields) = result, fields[own] != nil {
+            fields[own] = .string(String(action.id.split(separator: ".").last ?? Substring(action.id)))
+            door.receipt["result"] = .object(fields)
+        } else {
+            door.receipt["result"] = result
+        }
+        if case .object(let fields) = result,
+           !ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome)
+                || ChatToolOutcome.isWaitingApproval(reply.payload) || reply.isWaitingInteraction {
+            let reason = JSONValue.trimmedScalarTextOrEmpty(fields["reason"])
+            door.receipt["message"] = fields["message"]
+            let waiting = JSONValue.trimmedScalarTextOrEmpty(fields["not_run_status"])
+            // Keep the owner's refusal code, such as owners_screen, rather than replacing it with tool_failed.
+            if !reason.isEmpty, !reason.contains(" ") { door.receipt["reason"] = .string(reason) }
+            if !waiting.isEmpty || Self.doorFloorReasons.contains(reason) {
+                door.receipt["effects"] = .string("none")
+                door.receipt["remedy"] = reply.remedy ?? .object([
+                    "kind": .string(waiting == "approval_filed" ? "wait" : "none"),
+                    "instruction": .string(waiting == "approval_filed"
+                        ? "The owner has a card for it; it runs if they approve. Don't retry."
+                        : "Nothing ran, and retrying changes nothing. Leave it for the owner."),
+                    "next_call": .null,
+                ])
+            } else {
+                door.receipt["effects"] = fields["effects"] ?? .string(read ? "none" : "unknown")
+                door.receipt["remedy"] = reply.remedy
+            }
+        }
+        var raised: JSONValue = .string("unreadable: the inbox did not read before and after")
+        if let notesBefore, let notesAfter {
+            let seen = Set(notesBefore.map(\.id))
+            raised = .array(notesAfter.filter { !seen.contains($0.id) }.map { .string("\($0.id): \($0.title)") })
+        }
+        // A call refused before it ran keeps its own receipt (nothing raised, nothing delivered), for reads too.
+        if case .object(let fields) = result, fields["execution"] == .string("not_run"), let own = fields["side_effects"] {
+            door.receipt["side_effects"] = own
+        } else if watch { door.receipt["side_effects"] = .object([
+            // Cards and approvals the app filed during the call land here too.
+            "notes_raised": raised,
+            "knocks_delivered": Self.knocksDelivered(before: knocksBefore, after: knocksAfter),
+            "not_observed": .string("A turn a card's answer wakes on its own (one handed back to this call is "
+                + "result.continuation), and anything the app does after this call returns."),
+        ]) }
+        if returnsVersion { door.receipt = await attachPageVersion(to: door.receipt, scope: scope, surface: surface, turn: turn, execution: execution) }
+
+        return .object(door.receipt)
+    }
+
+    /// Effects have already settled. A missing readback cannot turn into a missing field, and must never invite replaying the write.
+    @MainActor
+    private func attachPageVersion(to receipt: [String: JSONValue], scope: String, surface: String, turn: Turn,
+                                   execution: AppActionExecution) async -> [String: JSONValue] {
+        var fields = receipt
+        do {
+            guard let version = try await doorCurrentVersion(scope: scope, surface: surface, turn: turn, execution: execution) else {
+                throw ToolFailureError("The page owner returned no current version for \(scope).", effects: .none, code: "page_version_unavailable")
+            }
+            fields["page_version"] = .string(version)
+        } catch {
+            fields["readback_failure"] = ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)
+            fields["readback_note"] = .string("""
+                The action returned, but its page version could not be read. Read \(scope) to reconcile the result before continuing; do not repeat the \
+                action.
+                """)
+        }
+        return fields
+    }
+    /// The same protocol normalization for runtime and read-only inspection.
+    static func normalizedCallArguments(_ action: AppAction, _ given: [String: JSONValue], schema: JSONValue?,
+        recordShims: Bool = true) -> [String: JSONValue] {
+        normalizedBoundArguments(action, AppActions.boundArguments(action, given, schema: schema).args, schema: schema, recordShims: recordShims)
+    }
+
+    static func retainsRawArgumentValues(_ action: AppAction) -> Bool {
+        action.id == "desk.close" || MacContactsExecutor.parameters(for: action.tool) != nil
+    }
+
+    /// Coerce known values only after the complete argument map has been bound, including unknown expressions during source inspection.
+    static func normalizedBoundArguments(_ action: AppAction, _ given: [String: JSONValue], schema: JSONValue?,
+        recordShims: Bool = true) -> [String: JSONValue] {
+        if retainsRawArgumentValues(action) { return given }
+        guard let schema else { return given }
+        func normalize(_ given: [String: JSONValue], shims: Bool) -> [String: JSONValue] {
+            var normalized = ToolArguments.normalized(given, schema: schema,
+                preserving: ["ability.save", "sense.make"].contains(action.id) ? ["learned", "choices"] : [], recordShims: shims)
+            if action.id == "ability.save" {
+                // Null clears params; malformed headers must reach their owner.
+                for key in ["params", "reach", "face"] { normalized[key] = given[key] }
+            }
+            if action.id == "queue.update" {
+                // Omission keeps a field; explicit null clears it.
+                for key in ["action", "say", "until", "when"] { normalized[key] = given[key] }
+            }
+            // Desk clear/set admission judges the caller's string, not a coerced number. Keep the same raw value for door validation and re-entry.
+            if action.id == "desk.blocked_on" { normalized["blocked_on"] = given["blocked_on"] }
+            if action.id == "desk.defer" { normalized["until"] = given["until"] }
+            // This door asks for macOS grants, so a bare grant name is that grant's card target; a bare name on card.request means a Trust category.
+            if action.id == "permissions.request", let raw = normalized["capability"]?.stringValue,
+               let target = SystemPermissionPreflight.grantTarget(raw) { normalized["capability"] = .string(target) }
+            if action.id == "permissions.request", case .array(let extra)? = normalized["also_needed"] {
+                normalized["also_needed"] = .array(extra.map { $0.stringValue.flatMap(SystemPermissionPreflight.grantTarget).map(JSONValue.string) ?? $0 })
+            }
+            return normalized
+        }
+        return normalize(given, shims: recordShims)
+    }
+
+    /// Setting request evidence has its own refusal and applies only to model turns.
+    static func doorValidationArgs(_ action: AppAction, _ args: [String: JSONValue]) -> [String: JSONValue] {
+        action.id == "setting.set" ? args.merging(["because": .string("")]) { _, check in check } : args
+    }
+    /// The registry's read contract supplies the evidence missing from a generic failure envelope. Preserve an explicitly uncertain mutation.
+    private static func actionResult(_ result: JSONValue, action: AppAction, args: [String: JSONValue]) -> JSONValue {
+        let result = advisedRefusal(result, action: action, args: args)
+        let reply = ToolResult(result)
+        var fields: [String: JSONValue] = if case .object(let fields) = reply.payload { fields } else { ["result": reply.payload] }
+        // Authoring receipts carry the next step; keeping a part carries its run call.
+        if action.id == "ability.enable", fields["next_call"] == nil, ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome),
+           !ChatToolOutcome.isWaitingApproval(reply.payload), !reply.isWaitingInteraction, let run = fields["run"]?.scalarText {
+            fields["next_call"] = .object(["tool": .string("app"), "input": .object(["action": .string(run), "args": .object([:])])])
+        }
+        fields.merge(action.effectFields(args: args, result: fields)) { _, value in value }
+        let status = JSONValue.trimmedScalarTextOrEmpty(fields["status"])
+        if fields["execution"] == nil {
+            fields["execution"] = .string(fields["not_run_status"] != nil || status == "not_run" || ChatToolOutcome.neverRan(result)
+                || status == "refused" && fields["effects"] == .string("none")
+                || ChatToolOutcome.isWaitingApproval(reply.payload) || reply.isWaitingInteraction ? "not_run"
+                : reply.outcome == .succeeded ? "executed" : "attempted")
+        }
+        if fields["execution"] == .string("not_run") {
+            fields["effect"] = .string("none")
+        }
+        if action.id == "agent.read", fields["execution"] == .string("executed") {
+            fields["effect"] = .string("none")
+            fields["effects"] = .string("none")
+            return .object(fields)
+        }
+        guard action.readOnly(args: args), !ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome),
+              !ChatToolOutcome.isWaitingApproval(reply.payload), !reply.isWaitingInteraction, reply.outcome != .cancelled,
+              !InlineInteractionNeed.isWaiting(result),
+              fields["effects_unknown"] != .bool(true),
+              fields["effects"] == nil || fields["effects"] == .string("unknown") || fields["effects"] == .string("none") else { return .object(fields) }
+        fields["effects"] = .string("none")
+        fields["outcome"] = .string("unmet")
+        return .object(fields)
+    }
+    /// Owner refusals, previews and folded/native returns carry the same advice as door admission. Never replace an owner's recovery or replay a call.
+    private static func advisedRefusal(_ result: JSONValue, action: AppAction, args: [String: JSONValue]) -> JSONValue {
+        let reply = ToolResult(result)
+        guard !ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome),
+              case .object(var fields) = reply.payload else { return result }
+        if let advice = reply.remedy?.objectValue?["try_instead"] { fields["try_instead"] = advice }
+        let ownedNext = reply.remedy?.objectValue?["next_call"]
+        if fields["try_instead"] == nil, let call = ownedNext?.objectValue, call["tool"] == .string("app"),
+           let input = call["input"]?.objectValue, input["action"] == .string(action.id) {
+            fields["try_instead"] = .object(input)
+        }
+        let code = JSONValue.trimmedScalarTextOrEmpty(fields["failure_code"] ?? fields["reason"])
+        if fields["try_instead"] == nil,
+           fields["argument_path"]?.stringValue != nil || reply.remedy?.objectValue?["kind"] == .string("correct_arguments")
+                || ["unknown_arg", "bad_input", "invalid_args", "invalid_arguments", "invalid_input"].contains(code) {
+            do {
+                let contract = try AppActions.discovery(action).objectValue ?? [:]
+                fields["try_instead"] = AppActions.callAdvice(action, input: ["args": .object(args)], discovery: contract, requiresChange: true)
+            } catch {
+                fields["schema_failure"] = ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)
+            }
+        }
+        if fields["next_call"] == nil {
+            if let ownedNext { fields["next_call"] = ownedNext }
+            else if let advice = fields["try_instead"], let call = AppActions.determinedCall(advice) {
+                fields["next_call"] = .object(["tool": .string("app"), "input": .object(call)])
+            }
+        }
+        return .object(fields)
+    }
+    /// Folded result guidance uses door action ids and argument names; non-user failures point to the guide. Nested data remains untouched.
+    static func foldedResult(_ result: JSONValue, guide: JSONValue?, browser: Bool = false, tool: String = "") -> JSONValue {
+        // Browser guidance names tools internally; door results must translate those steps to app calls.
+        if browser, case .string(let page) = result { return .string(browserSteps(page)) }
+        let reply = ToolResult(result)
+        guard case .object(var fields) = ToolNameAliases.appCallPointers(result) else { return result }
+        if browser, case .string(let page)? = fields["page"] { fields["page"] = .string(browserSteps(page)) }
+        if browser, case .string(let note)? = fields["readback_note"] { fields["readback_note"] = .string(browserSteps(note)) }
+        if case .object(let next)? = fields["next"] { fields["next"] = .object(ToolNameAliases.doorArgs(tool, next)) }
+        // Translate only top-level guidance; nested strings may be user or domain data.
+        for key in ToolNameAliases.foldedProseKeys {
+            if case .string(let text)? = fields[key], text.contains(" ") {
+                fields[key] = .string(ToolNameAliases.foldedProse(text))
+            }
+        }
+        if let guide, !ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome),
+           !ChatToolOutcome.isWaitingApproval(reply.payload), !reply.isWaitingInteraction,
+           !doorFloorReasons.contains(JSONValue.trimmedScalarTextOrEmpty(fields["reason"])) {
+            fields["guide"] = guide
+        }
+        return .object(fields)
+    }
+    private static let browserTools = ToolNameAliases.foldedTools.filter { $0.key.hasPrefix("browser.") }
+        .sorted { $0.key.count > $1.key.count }
+    static func browserSteps(_ text: String) -> String {
+        browserTools.reduce(text) { $0.replacingOccurrences(of: $1.key, with: "app " + $1.value) }
+    }
+    /// One happening counts once, however many of its doors accepted it.
+    private static func acceptedKnocks(root: URL) async -> Result<Set<String>, Error> {
+        do {
+            return .success(Set(try await ForPerson.at(root).matters().filter { matter in
+                matter.owes.contains { $0.key.hasPrefix("deliver:") && $0.value.phase == .accepted }
+            }.map(\.id)))
+        } catch { return .failure(error) }
+    }
+
+    /// Unknown readings stay unknown in the call's side effects.
+    private static func knocksDelivered(before: Result<Set<String>, any Error>,
+                                        after: Result<Set<String>, any Error>) -> JSONValue {
+        switch (before, after) {
+        case (.success(let before), .success(let after)):
+            return .int(Int64(after.subtracting(before).count))
+        case (.failure(let error), _), (_, .failure(let error)):
+            return ownedFailure(error, code: "attention_reading_unavailable", owner: "experiences",
+                instruction: "Repair the reading of what is for the person before deciding whether another notification is needed.",
+                next: ["page": .string("inbox")], effects: .unknown)
+        }
+    }
+    /// Include archived note ids so only newly raised notes count; an unreadable inbox stays explicit in the receipt.
+    @MainActor
+    private func doorNotes(turn: Turn) async -> [(id: String, title: String)]? {
+        guard let host = quietHost(),
+              case .object(let list) = await host.inbox(verb: "list", input: [
+                "filter": .string("all"), "limit": .int(200),
+              ], turn: turn), case .array(let notes)? = list["notes"] else { return nil }
+        return notes.compactMap { note in
+            guard case .object(let row) = note, case .string(let id)? = row["id"] else { return nil }
+            return (id, JSONValue.trimmedScalarTextOrEmpty(row["title"]))
+        }
+    }
+}
+
+/// One bound app action on its way through the door: what it was called with, the receipt it builds, and what each stage settles for
+/// the stages after it.
+private final class DoorBoundCall {
+    let action: AppAction
+    let discovery: [String: JSONValue]
+    let input: [String: JSONValue]
+    let surface: String
+    let inProcess: Bool
+    let turn: Turn
+    let execution: AppActionExecution
+    let root: URL
+    let ownsLever: Bool
+    var receipt: [String: JSONValue]
+    // Settled by the arguments' admission.
+    var args: [String: JSONValue] = [:]
+    var read = false
+    // Settled by the owner's gate.
+    var ownerRemedy: JSONValue = .null
+    var ownersOnly = false
+    // Settled by the call's binding.
+    var call: [String: JSONValue] = [:]
+    var scope = ""
+    var returnsVersion = false
+    init(action: AppAction, discovery: [String: JSONValue], input: [String: JSONValue], surface: String, inProcess: Bool, turn: Turn,
+         execution: AppActionExecution, root: URL, ownsLever: Bool, receipt: [String: JSONValue]) {
+        self.action = action
+        self.discovery = discovery
+        self.input = input
+        self.surface = surface
+        self.inProcess = inProcess
+        self.turn = turn
+        self.execution = execution
+        self.root = root
+        self.ownsLever = ownsLever
+        self.receipt = receipt
+    }
+}

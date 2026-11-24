@@ -1,0 +1,90 @@
+import NativeAgentShared
+import MindCore
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+
+// Blueprint: | `HumanConversationReplyService.swift` | `HumanConversationReplies.reply` |
+
+/// Explicit replies reuse canonical transcript and delivery owners without a provider call or synthetic person input.
+public actor HumanConversationReplies {
+    let dataRoot: URL
+    let sender: any AgentBridgeCompletionSending
+    let lifecycle: CodexCompletionLifecycle
+    let append: @Sendable (String, String, String, String, Turn) async throws -> Void
+
+    init(dataRoot: URL, sender: any AgentBridgeCompletionSending,
+         append: @escaping @Sendable (String, String, String, String, Turn) async throws -> Void) {
+        self.dataRoot = dataRoot
+        self.sender = sender
+        lifecycle = CodexCompletionLifecycle(
+            receiptURL: dataRoot.appendingPathComponent("chat/human-reply-delivery/receipts.jsonl"),
+            ownerInstanceId: CodexCompletionLifecycle.processOwnerInstanceId, dataRoot: dataRoot)
+        self.append = append
+    }
+
+    public func reply(turn: Turn, input: [String: JSONValue]) async throws -> JSONValue {
+        guard let id = input["conversation_session_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
+              let expected = input["last_message_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
+              let text = input["text"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.count <= 16000 else {
+            return failure("missing_reply", "Open the conversation, then supply the reply text.")
+        }
+        guard turn.verifiedSessionID != id else {
+            return failure("current_turn", "This is the active conversation. Reply normally here; no separate send is needed.")
+        }
+        let snapshot = try await HumanConversationReader.read(sessionID: id, dataRoot: dataRoot)
+        guard snapshot.complete, snapshot.lastMessageID == expected,
+              HumanConversationReader.routeAvailable(snapshot.route), let envelope = snapshot.route else {
+            return failure("conversation_changed", "The conversation changed or its reply destination is unavailable. Reopen it before replying.")
+        }
+        let saved = envelope.replyRoute
+        let route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: id,
+            destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
+            replyTo: saved.replyTo, correlationId: saved.correlationId, requesterUserId: saved.requesterUserId)
+        let deliveryID = "human-reply:" + SHA256Hex.of(utf8: id + "\u{1f}" + expected)
+        let requestDigest = SHA256Hex.of(utf8: id + "\u{1f}" + expected + "\u{1f}" + text)
+        // Validate known setup failures before claiming or mutating transcript.
+        do {
+            let artifacts = try AgentBridgeCompletionRouter.artifacts(deliveryId: deliveryID,
+                text: text, attachments: [])
+            try await sender.preflight(surface: saved.surface, route: route, artifacts: artifacts)
+        } catch {
+            return failure("unavailable", "This conversation's delivery connection is unavailable. Nothing was saved or sent.")
+        }
+        // Claim first. An interrupted or ambiguous attempt is never automatically replayed.
+        let claim = try await lifecycle.claim(deliveryId: deliveryID, requestDigest: requestDigest, sessionId: id,
+                                             responseRunId: deliveryID, route: route)
+        switch claim {
+        case .start: break
+        case .cached, .settled:
+            return failure("already_attempted", "This reply already has a recorded attempt. Read the conversation; do not resend it.")
+        case .inProgress, .outcomeUnknown:
+            return failure("outcome_unknown", "A prior reply may have been delivered. Do not resend it.")
+        case .conflict:
+            return failure("reply_changed", "A reply is already bound to this conversation view. Reopen it before composing another.")
+        }
+        do {
+            try await append(id, expected, text, deliveryID, turn)
+            let response = ChatResponse(runId: deliveryID, model: "explicit-assistant-reply",
+                                                         output: text, sessionId: id)
+            try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: requestDigest)
+            let delivery = await AgentBridgeCompletionRouter.deliver(turn: turn, deliveryId: deliveryID,
+                requestDigest: requestDigest, text: text, attachments: [], route: route,
+                sender: sender, lifecycle: lifecycle, notifyRequestedResult: false)
+            return .object(["status": .string(delivery.status), "conversation_session_id": .string(id),
+                "title": .string(snapshot.title), "delivery": .string(delivery.delivery),
+                "message": .string(delivery.status == "completed" ? "Reply delivered to this conversation."
+                    : "Reply is recorded in the conversation; delivery is not confirmed. Do not resend automatically."),
+                "detail": delivery.reason.map(JSONValue.string) ?? .null])
+        } catch {
+            try? await lifecycle.markOutcomeUnknown(deliveryId: deliveryID, requestDigest: requestDigest,
+                                                    detail: "explicit_reply_interrupted")
+            return failure("outcome_unknown",
+                "Reply completion could not be confirmed. Read the conversation before taking further action; do not resend automatically.")
+        }
+    }
+    private func failure(_ status: String, _ message: String) -> JSONValue {
+        .object(["status": .string(status), "message": .string(message), "ok": .bool(false)])
+    }
+}

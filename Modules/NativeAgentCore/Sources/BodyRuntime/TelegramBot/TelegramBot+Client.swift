@@ -1,0 +1,300 @@
+import SenseCore
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+import ProviderRouting
+import MacNerves
+import NativeAgentShared
+import MindCore
+import DeskCore
+
+// Blueprint: | `TelegramBot+Client.swift` | `SwiftNativeTelegramBot`: checked status and send lanes |
+
+public protocol TelegramMemoryWriteRef: Sendable {
+    func remember(text: String, source: String, turn: Turn) async throws -> String
+    func note(text: String, kind: String, source: String, turn: Turn) async throws -> String
+}
+
+/// Nil reply means unsupported; a committed restart must terminate after the reply attempt, even on send failure.
+public struct TelegramSlashDispatchOutcome: Sendable {
+    public let reply: String?
+    public let afterReplySent: (@Sendable () -> Void)?
+
+    public init(reply: String?, afterReplySent: (@Sendable () -> Void)? = nil) {
+        self.reply = reply
+        self.afterReplySent = afterReplySent
+    }
+}
+
+public struct TelegramBotCompletenessDeps: Sendable {
+    public let routing: TelegramProviderRoutingBridge?
+    public let memory: (any TelegramMemoryWriteRef)?
+    public let restart: TelegramRestartBridge?
+
+    public init(
+        routing: TelegramProviderRoutingBridge? = nil,
+        memory: (any TelegramMemoryWriteRef)? = nil,
+        restart: TelegramRestartBridge? = nil
+    ) {
+        self.routing = routing
+        self.memory = memory
+        self.restart = restart
+    }
+}
+
+public actor SwiftNativeTelegramBot {
+    let dataRoot: URL
+    let completenessDeps: TelegramBotCompletenessDeps?
+    let partCall: TelegramPartCall?
+    let partFace: PartFaces.Call?
+    var commandFaces: Task<PartFaces, Never>?
+
+    public init(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        completenessDeps: TelegramBotCompletenessDeps? = nil,
+        partCall: TelegramPartCall? = nil,
+        partFace: PartFaces.Call? = nil
+    ) {
+        self.dataRoot = dataRoot
+        self.completenessDeps = completenessDeps
+        self.partCall = partCall
+        self.partFace = partFace
+    }
+
+    func approvalStatus(destination: TelegramDestination) async -> JSONValue {
+        do {
+            let pending = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending)
+            var count = 0
+            for record in pending {
+                guard case .object(let payload) = record.payload,
+                      case .object(let route)? = payload["telegram"] else { continue }
+                func identifier(_ value: JSONValue?) throws -> Int? {
+                    switch value {
+                    case nil, .null?: return nil
+                    case .int(let number)?:
+                        if let result = Int(exactly: number) { return result }
+                    case .double(let number)?:
+                        if let result = Int(exactly: number) { return result }
+                    case .string(let string)?:
+                        let value = string.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if value.isEmpty { return nil }
+                        if let result = Int(value) { return result }
+                    default: break
+                    }
+                    throw TelegramBotError.underlying("approval destination unavailable")
+                }
+                guard let chat = try identifier(route["chatId"]) else {
+                    throw TelegramBotError.underlying("approval destination unavailable")
+                }
+                guard chat == destination.chatId else { continue }
+                if try identifier(route["threadId"]) == destination.threadId { count += 1 }
+            }
+            return .object(["status": .string("available"), "count": .int(Int64(count))])
+        } catch {
+            return .object(["status": .string("unavailable")])
+        }
+    }
+
+    /// One checked transport read; callers decide how to present unavailable settings or state.
+    public nonisolated static func readTransportStatus(
+        dataRoot: URL, manager: BackgroundLoopLifetimes
+    ) async -> (status: TelegramStatus, configuration: Result<TelegramConfig?, Error>, stateError: Error?,
+                credentialError: Error?, pollBackoffFailures: Int?, lastDiagnosticsClearedAt: String?, voiceTranscription: TelegramVoiceTranscriptionStatus) {
+        let checked = TelegramConfig.readConfigurationStatus(dataRoot: dataRoot)
+        let configuration = checked.configuration
+        let cfg: TelegramConfig?
+        let configurationError: Error?
+        switch configuration {
+        case .success(let value): cfg = value; configurationError = nil
+        case .failure(let error): cfg = nil; configurationError = error
+        }
+        var stateObj: [String: JSONValue] = [:]
+        var stateError: Error?
+        do { stateObj = try await TelegramPollLoop.readState(dataRoot: dataRoot) }
+        catch { stateError = error }
+        if let loop = await manager.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop,
+           let polledAt = await loop.lastSuccessfulPollAt {
+            stateObj["lastPollAt"] = .string(ISO8601DateFormatter().string(from: polledAt))
+        }
+        let commandMenu = stateObj["commandMenu"] ?? .object([
+            "commandCount": .int(Int64(TelegramCommandRegistry.menuCommandNames.count)),
+            "registryVersion": .string(TelegramCommandRegistry.version),
+            "synced": .bool(false),
+        ])
+        let voice = TelegramVoiceTranscriptionStatus(
+            enabled: cfg?.voiceTranscriptionEnabled ?? TelegramConfig.defaultVoiceTranscriptionEnabled,
+            backend: TelegramVoiceTranscriptionBackends.appleSpeech,
+            model: TelegramVoiceTranscriptionBackends.appleSpeechModel,
+            maxBytes: cfg?.voiceMaxBytes ?? TelegramConfig.defaultVoiceMaxBytes)
+        let extras: [String: JSONValue] = [
+            "allowedChatIds": .array((cfg?.allowedChatIds.sorted() ?? []).map { .string(String($0)) }),
+            "allowedUserIds": .array((cfg?.allowedUserIds.sorted() ?? []).map { .string(String($0)) }),
+            "requireMention": .bool(cfg?.requireMention ?? false),
+            "lastPollAt": stateObj["lastPollAt"] ?? .null,
+            "commandMenu": commandMenu,
+            "voiceTranscription": .object([
+                "enabled": .bool(voice.enabled),
+                "backend": .string(voice.backend),
+                "model": .string(voice.model),
+                "maxBytes": .int(Int64(voice.maxBytes)),
+            ]),
+        ]
+        let pollerRunning = await manager.isRunning(loopId: "telegram_poll")
+        func integer(_ value: JSONValue?) -> Int? {
+            if case .bool(let value)? = value { return value ? 1 : 0 }
+            return (value?.integerValue.flatMap(Int.init(exactly:)) ?? value?.stringValue.flatMap(Int.init))
+        }
+        let status = TelegramStatus(
+            enabled: cfg?.enabled ?? false,
+            tokenConfigured: cfg?.tokenConfigured ?? false,
+            pollerEnabled: pollerRunning,
+            lastSeenUpdateId: integer(stateObj["lastSeenUpdateId"]),
+            lastSeenAt: stateObj["lastSeenAt"]?.stringValue,
+            lastReplyAt: stateObj["lastReplyAt"]?.stringValue,
+            lastError: configurationError?.localizedDescription ?? checked.credentialError?.localizedDescription
+                ?? stateError?.localizedDescription ?? stateObj["lastError"]?.stringValue
+                ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil),
+            extras: .object(extras)
+        )
+        return (status, configuration, stateError, checked.credentialError, integer(stateObj["pollBackoffFailures"]),
+                stateObj["lastDiagnosticsClearedAt"]?.stringValue, voice)
+    }
+
+    public func sendTestMessage(message: String?, chatId: String?) async throws -> TelegramTestResult {
+        guard let cfg = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot),
+              !cfg.botToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw TelegramBotError.notConfigured
+        }
+        let target: String = {
+            if let chatId, !chatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if let first = cfg.allowedChatIds.sorted().first {
+                return String(first)
+            }
+            return ""
+        }()
+        guard !target.isEmpty else {
+            throw TelegramBotError.notConfigured
+        }
+        let text = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            // Numeric targets share the chat's send lane; usernames send directly.
+            return try await _tgSendInChatLane(chatId: Int(target)) {
+                let result = try await TelegramPollLoop._tgPostJSON(token: cfg.botToken, method: "sendMessage",
+                    resultType: TelegramTestResult.self) {
+                    try JSONSerialization.data(withJSONObject: [
+                        "chat_id": target,
+                        "text": text.flatMap { $0.isEmpty ? nil : $0 } ?? "NativeAgent Telegram test reply: online."
+                    ])
+                }
+                return try result.value
+            }
+        } catch let failure as TelegramAPIFailure {
+            throw failure
+        } catch let error as TelegramBotError {
+            throw error
+        } catch {
+            throw TelegramBotError.underlying(error.localizedDescription)
+        }
+    }
+
+    public func clearLogs() async throws {
+        let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
+        try FileManager.default.createDirectory(at: telegramDir, withIntermediateDirectories: true)
+        // Clear errors.jsonl and its rotation backup errors.jsonl.1 under the same lock.
+        for name in ["logs.jsonl", "receipts.jsonl", "blocked.jsonl", "errors.jsonl"] {
+            let path = telegramDir.appendingPathComponent(name)
+            try await SwiftNativePersistenceCore.withFileLock(path) {
+                if FileManager.default.fileExists(atPath: path.path) {
+                    try FileManager.default.removeItem(at: path)
+                }
+                if name == "errors.jsonl" {
+                    let backup = path.appendingPathExtension("1")
+                    if FileManager.default.fileExists(atPath: backup.path) {
+                        try FileManager.default.removeItem(at: backup)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// getUpdates retains one connection pool; a transport failure returns without replacing it.
+public actor TelegramLongPollSession {
+    /// Every successful response wakes health readers; disk checkpoints retain their cadence.
+    struct SuccessfulPoll: BodySignal {}
+    let current = URLSession(configuration: .ephemeral)
+    public private(set) var lastSuccessfulPollAt: Date?
+    private var lastHealthCheckpointAt: Date?
+
+    public init() {}
+
+    func recordSuccessfulPoll() -> Bool {
+        let now = Date()
+        lastSuccessfulPollAt = now
+        NotificationCenter.default.post(SuccessfulPoll())
+        if let lastHealthCheckpointAt,
+           now.timeIntervalSince(lastHealthCheckpointAt) < SwiftNativeLoopScheduler.healthCheckpointInterval { return false }
+        lastHealthCheckpointAt = now
+        return true
+    }
+
+}
+
+extension SwiftNativeTelegramBot {
+    public func longPoll(
+        token: String,
+        offset: Int,
+        timeoutSeconds: Int = 25,
+        session: TelegramLongPollSession
+    ) async throws -> TelegramPollResult {
+        guard let url = _tgBuildBotURL(
+            token: token,
+            method: "getUpdates",
+            queryItems: [
+                URLQueryItem(name: "offset", value: String(offset)),
+                URLQueryItem(name: "timeout", value: String(timeoutSeconds)),
+            ]
+        ) else {
+            throw TelegramBotError.invalidRequest
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = max(TimeInterval(timeoutSeconds) + 10, 35)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.current.data(for: req)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            // Preserve URLSession cancellation so shutdown is not reported as an outage.
+            throw CancellationError()
+        } catch {
+            // Preserve the transport error cause for diagnosis and offline classification.
+            throw TelegramBotError.underlying(String(describing: error))
+        }
+        let updates: [TelegramUpdate]
+        do {
+            updates = try TelegramPollLoop._tgValidateResponse(data, response: response,
+                operation: "getUpdates", resultType: [TelegramUpdate].self).value
+        } catch let failure as TelegramAPIFailure {
+            if failure.httpStatus == 401 { throw TelegramBotError.notConfigured }
+            if let status = failure.httpStatus, (500..<600).contains(status) {
+                throw TelegramBotError.underlying("server status \(status)")
+            }
+            if failure.kind == .httpStatus, let status = failure.httpStatus {
+                throw TelegramBotError.invalidResponse(status: status)
+            }
+            throw failure
+        }
+        guard updates.allSatisfy({ $0.updateId >= 0 && $0.nextOffset != nil }) else {
+            throw TelegramBotError.underlying("telegram: invalid upstream update ID")
+        }
+        let nextOffset: Int
+        nextOffset = updates.compactMap(\.nextOffset).max() ?? offset
+        return TelegramPollResult(updates: updates, nextOffset: nextOffset)
+    }
+}

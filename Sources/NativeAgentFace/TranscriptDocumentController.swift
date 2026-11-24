@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Observation
 import NativeAgentShared
 import SwiftUI
 
@@ -24,10 +25,13 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
     private var actTask: Task<Void, Never>?
     private var pendingActs: [UUID: Task<Void, Never>] = [:]
     private var lastGeometry: TranscriptReaderGeometry?
+    private var inlineChanges: Task<Void, Never>?
+    private var speechChanges: Task<Void, Never>?
     private var data = TranscriptAttachmentData(sessionID: "", conversation: nil)
 
     private var containerWidth = TranscriptMetrics.column
     private var pressWidth = TranscriptMetrics.column
+    private var scaleObserver: NotificationCenter.ObservationToken?
     private var scale = TranscriptTextScale.value
     private var quiet = false
     private var reduceMotion = false
@@ -121,12 +125,22 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         center.addObserver(self, selector: #selector(liveScrollStarted(_:)), name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
         center.addObserver(self, selector: #selector(liveScrollMoved(_:)), name: NSScrollView.didLiveScrollNotification, object: scrollView)
         center.addObserver(self, selector: #selector(liveScrollEnded(_:)), name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
-        center.addObserver(self, selector: #selector(scaleChanged(_:)), name: TranscriptTextScale.changed, object: nil)
+        scaleObserver = center.addObserver(of: nil, for: TranscriptTextScale.Changed.self) { [weak self] _ in
+            self?.scaleChanged()
+        }
+    }
+
+    deinit {
+        inlineChanges?.cancel()
+        speechChanges?.cancel()
     }
 
     func dismantle() {
         stopLink()
+        speechChanges?.cancel()
+        speechChanges = nil
         releaseReader()
+        scaleObserver = nil
         NotificationCenter.default.removeObserver(self)
         if handle?.controller === self { handle?.controller = nil }
         model.controller = nil
@@ -226,6 +240,9 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
     }
 
     private func releaseReader() {
+        releaseFeedSelection()
+        inlineChanges?.cancel()
+        inlineChanges = nil
         for task in pendingActs.values { task.cancel() }
         pendingActs = [:]
         if readerRequested { send(.releaseTranscriptReader(reader: readerID), settlement: true) }
@@ -272,16 +289,21 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         guard let appModel else { return }
         let id = readerID
         let session = sessionID
-        data = withObservationTracking {
-            appModel.face.slot(.conversation(session: session)).select("inline", as: ConversationFace.self) {
-                TranscriptAttachmentData(sessionID: session, conversation: $0)
-            }
-        } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.readerID == id, self.model.controller === self else { return }
-                self.observeConversation()
+        let selection = appModel.face.slot(.conversation(session: session)).selection("inline", as: ConversationFace.self) {
+            TranscriptAttachmentData(sessionID: session, conversation: $0)
+        }
+        applyConversation(selection.part)
+        let changes = Observations { selection.part }
+        inlineChanges = Task { [weak self] in
+            for await value in changes {
+                guard !Task.isCancelled, let self, readerID == id, model.controller === self else { return }
+                if value != data { applyConversation(value) }
             }
         }
+    }
+
+    private func applyConversation(_ value: TranscriptAttachmentData) {
+        data = value
         if let environment { attachments.update(data, environment: environment, columnWidth: replyWidth) }
         if case .unavailable(let failure)? = data.state { model.conversationIssue = failure.localizedDescription }
         else { model.conversationIssue = nil }
@@ -625,7 +647,7 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         }
     }
 
-    @objc private func scaleChanged(_ note: Notification) {
+    private func scaleChanged() {
         let next = TranscriptTextScale.value
         guard next != scale else { return }
         scale = next
@@ -867,7 +889,8 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
 
     func copyCode(_ blockID: String) {
         guard let position = index[blockID], case .code(_, let text) = shown.blocks[position].kind else { return }
-        ChatClipboard.copy(text)
+        // A code block's lines are U+2028 inside its one paragraph; the clipboard gets them back as newlines, as selection copy does.
+        ChatClipboard.copy(text.replacingOccurrences(of: "\u{2028}", with: "\n"))
     }
 
     func readAloud(_ id: String) {
@@ -893,15 +916,15 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
 
     private func observeSpeech(_ operation: UUID) {
         guard let appModel else { return }
-        let state = withObservationTracking {
-            appModel.face.slot(.voice(operation)).select("state", as: VoiceFace.self) { $0?.state }
-        } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.model.speechOperation == operation, self.model.controller === self else { return }
-                self.observeSpeech(operation)
+        let selection = appModel.face.slot(.voice(operation)).selection("state", as: VoiceFace.self) { $0?.state }
+        speechChanges?.cancel()
+        let changes = Observations { selection.part }
+        speechChanges = Task { [weak self] in
+            for await state in changes {
+                guard !Task.isCancelled, let self, model.speechOperation == operation, model.controller === self else { return }
+                if case .unavailable(let failure)? = state { showToast(failure.localizedDescription) }
             }
         }
-        if case .unavailable(let failure)? = state { showToast(failure.localizedDescription) }
     }
 
     func regenerate(_ id: String) {

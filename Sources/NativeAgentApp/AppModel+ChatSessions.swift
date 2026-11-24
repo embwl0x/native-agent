@@ -1,12 +1,9 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import MemoryV2
-import EngineRuntime
-import Transcripts
-import ChatTurnRuntime
-import ChatSessionWork
-import AppToolRuntime
+import MindCore
+import BodyRuntime
+import SenseCore
 // Blueprint: | `AppModel+ChatSessions.swift` | `AppModel`, `composerDraft(for:)`: Shared drafts and checked session transactions |
 
 @MainActor

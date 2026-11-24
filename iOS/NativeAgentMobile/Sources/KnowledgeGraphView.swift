@@ -272,7 +272,6 @@ struct KnowledgeGraphView: View {
         .refreshable { await sync.refreshKnowledgeGraphSnapshot() }
         .navigationDestination(item: $selected) { item in PhoneGraphItemPage(id: item.id) }
         .onChange(of: sync.knowledgeGraph) { old, new in selected = PhoneGraphItem.reconciled(selected, old: old, new: new) }
-        .macSyncErrorBanner()
     }
 
     private var shownFace: PartFace {
@@ -342,7 +341,6 @@ private struct PhoneGraphItemPage: View {
         .task(id: input) { await read() }
         .navigationDestination(item: $selected) { PhoneGraphItemPage(id: $0.id) }
         .onChange(of: sync.knowledgeGraph) { old, new in selected = PhoneGraphItem.reconciled(selected, old: old, new: new) }
-        .macSyncErrorBanner()
     }
 
     private var shownFace: PartFace {

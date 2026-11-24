@@ -33,13 +33,50 @@ struct MobileTranscriptView: UIViewRepresentable {
     }
 }
 
+struct MobileTranscriptBottomBar<Content: View>: UIViewControllerRepresentable {
+    let transcript: MobileTranscriptHandle
+    @ViewBuilder let content: Content
+
+    func makeCoordinator() -> UIScrollEdgeElementContainerInteraction {
+        let edge = UIScrollEdgeElementContainerInteraction()
+        edge.edge = .bottom
+        return edge
+    }
+
+    func makeUIViewController(context: Context) -> UIHostingController<AnyView> {
+        let host = UIHostingController(rootView: AnyView(content.environment(\.self, context.environment)))
+        host.safeAreaRegions = []
+        host.sizingOptions = .intrinsicContentSize
+        host.view.backgroundColor = .clear
+        host.view.addInteraction(context.coordinator)
+        return host
+    }
+
+    func updateUIViewController(_ host: UIHostingController<AnyView>, context: Context) {
+        host.rootView = AnyView(content.environment(\.self, context.environment))
+        transcript.bottomBarEdge = context.coordinator
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiViewController host: UIHostingController<AnyView>, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite else { return nil }
+        return host.sizeThatFits(in: CGSize(width: width, height: .greatestFiniteMagnitude))
+    }
+}
+
 /// The thread's line to its document: whether the reader follows the end (the Latest button shows while not), and back to the end.
 @MainActor @Observable
 final class MobileTranscriptHandle {
     var isAtEnd = true
     var isPreparing = true
     var issue: String?
-    @ObservationIgnored weak var controller: MobileTranscriptController?
+    @ObservationIgnored weak var controller: MobileTranscriptController? {
+        didSet { bottomBarEdge?.scrollView = controller?.textView }
+    }
+    @ObservationIgnored fileprivate weak var bottomBarEdge: UIScrollEdgeElementContainerInteraction? {
+        didSet {
+            if bottomBarEdge !== oldValue { bottomBarEdge?.scrollView = controller?.textView }
+        }
+    }
 
     init() {}
 
@@ -92,5 +129,17 @@ final class MobileTranscriptTextView: UITextView {
     override func copy(_ sender: Any?) {
         guard let text = controller?.text(for: [selectedRange], markdown: false) else { return }
         UIPasteboard.general.string = text
+    }
+
+    override func scrollRectToVisible(_ rect: CGRect, animated: Bool) {
+        let before = contentOffset.y
+        super.scrollRectToVisible(rect, animated: animated)
+        if contentOffset.y != before || (animated && isScrollAnimating) { controller?.readerScrolled() }
+    }
+
+    override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+        let moved = super.accessibilityScroll(direction)
+        if moved { controller?.readerScrolled() }
+        return moved
     }
 }

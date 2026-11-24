@@ -87,9 +87,7 @@ struct ShellTabs<Key: Hashable>: View {
 
 /// Key content by selection so tab changes replace the entire page coherently.
 struct ShellTabbedPage<Key: Hashable, Content: View>: View {
-    @Environment(AppModel.self) private var appModel
     let title: String
-    var subtitlePage: SidebarItem? = nil
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
     @ViewBuilder let content: (Key) -> Content
@@ -101,19 +99,22 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
         let shown = quietOffscreenRead
             ? (tabs.first { ($0.key as? String) == quietRailTab } ?? tabs.first)?.key ?? selection
             : selection
-        ShellPageFrame(
-            title: title,
-            subtitle: subtitlePage.flatMap { ShellPageSubtitle.line($0, appModel) }
-        ) {
-            VStack(alignment: .leading, spacing: 0) {
-                ShellTabs(tabs: tabs, selection: quietOffscreenRead ? .constant(shown) : $selection)
-                content(shown)
-                    .id(shown)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .aliveTopDissolve(18)
-            }
+        VStack(alignment: .leading, spacing: 0) {
+            ShellTabs(tabs: tabs, selection: quietOffscreenRead ? .constant(shown) : $selection)
+                .padding(.top, NativeAgentSpacing.md)
+                .padding(.horizontal, NativeAgentSpacing.pageInset)
+                .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            content(shown)
+                .id(shown)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .modifier(FaceObservation(demand: subtitlePage.flatMap(SidebarItem.doorPage).map { .key(.page($0)) }))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .scrollContentBackground(.hidden)
+        .tint(NativeAgentShell.text)
+        .navigationTitle(title)
+        .navigationBarBackButtonHidden(true)
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
     }
 }
 
@@ -135,13 +136,5 @@ extension View {
                 }
                 .ignoresSafeArea(edges: .bottom)
             }
-    }
-}
-
-enum ShellPageSubtitle {
-    @MainActor static func line(_ page: SidebarItem, _ appModel: AppModel) -> String? {
-        SidebarItem.doorPage(page).flatMap {
-            appModel.face.slot(.page($0)).value(as: PartFaceSnapshot.self)?.face?.line
-        }
     }
 }

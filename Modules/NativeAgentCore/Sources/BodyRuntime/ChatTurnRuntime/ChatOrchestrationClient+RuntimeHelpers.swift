@@ -1,0 +1,22 @@
+import Foundation
+import CryptoKit
+import NativeAgentCore
+import PersistenceCore
+import DeskCore
+import MindCore
+import ProviderRouting
+import MacNerves
+import SenseCore
+// Blueprint: | `ChatOrchestrationClient+RuntimeHelpers.swift` | `SwiftNativeChatOrchestrationClient`: `contextFingerprint` |
+
+extension SwiftNativeChatOrchestrationClient {
+    nonisolated static func contextFingerprint(recalledIds: [String]) -> String? {
+        guard !recalledIds.isEmpty else { return nil }
+        // Hash recalled memory identities so ChatResponse can compare context without disclosing it.
+        let joined = recalledIds.sorted().joined(separator: ",")
+        guard let bytes = joined.data(using: .utf8) else { return nil }
+        let digest = SHA256.hash(data: bytes)
+        return String(digest.map { String(format: "%02x", $0) }.joined().prefix(16))
+    }
+
+}

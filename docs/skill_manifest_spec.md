@@ -17,8 +17,23 @@ is what it declares, never which door made it.
   rule-of-succession rate, so a replay reads the same. The seed ends the thought on CPU with `reply.end` when `noop.silent` is true.
 - `model`: final text and requested calls, each with `id` and `index`. Visible text streams directly; no chunk events. If readable, untainted words from the person wait before the proposal reaches the part, the stem keeps the prose and delivers an `observation` naming the unstarted calls instead. The part decides again; no turn-program edit is required.
 - `result`: one call's `{index,id,name,ok,effect}`; their own call's result has its `id` and no `index`. A round's last result may carry `practice: {route, hand, loop?: {call, count}, ability?: {id, description, worked?, failed?}}`, the familiarity nerve's signal for their next thought; `ability` names an active ability whose recorded route makes exactly those writes (worked, to use next time; or the step its newest run failed at, to repair). Each operation record keeps its newest run's outcome as `last`. Effect comes from explicit receipts, else `execution:executed`, including batch receipts/script ledgers: an ability's all-read ledger reports `read`; `part` names effectful ability/sense work, else strongest of irreversible/write/read; absent when nothing landed. The broker's per-call class, not declared ability permissions or its prose, decides whether a reached call reads.
+  `spoken` records prose streamed to the person. `clean` requires every call in the round to be a reversible,
+  non-voice app binding with class `write`, reach `agent` and no `then_say`, even one whose words failed to stand.
+  Each receipt must confirm success without a wait, unknown effect, `needs_me`, hand-back or attachment to show.
+  A card or approval filed for the person by any call in the turn keeps the read-back, as does a pending arrival.
+  After they have spoken, the last eligible result may carry `close: {class, tries, empty, lower, stands, quiet}`.
+  Its class joins the sorted, distinct action IDs with `+`. The seed uses `endReply` when the calls drain and
+  `close.quiet` holds. An absent reading or a withholding draw keeps the trailing model call.
 - `provider_failure`: provider, model, text, remedy, work, owed, tries and available repair calls.
 - `observation`; `resumed`, whose `effect` uses the same reading over saved receipts.
+
+A `model` event with no calls and a deed `result` carrying closing words in
+`say` carry `reflect: {class, tries, empty, lower, stands, quiet}` when the
+record is readable. The class combines the incoming speaker and the full
+reply's character bucket, for example `self:short`. The draw is part of the
+logged event, so replay reads it unchanged. The shipped turn omits `after`
+only for `quiet: true`. An absent reading keeps `after`.
+[Reflection standing and sampling](SURPRISE.md#the-law)
 
 The same program may define `hear(h, felt)`, a CPU-only judgment while a model
 round generates. `h` carries `kind: "arrival"`, `who` (the origin
@@ -55,16 +70,22 @@ is malformed and invokes recovery.
 attachments, a silent end posts nothing and settles completed. The heard
 experience's `answer` obligation settles `accepted` with silence evidence naming
 the turn ([turn anatomy §6](ANATOMY_OF_A_TURN.md)). Reach: `turn.persona()`,
-`turn.pins()`, `turn.recall()`, `turn.context()`.
+`turn.pins()`, `turn.recall()`, `turn.context()` and `turn.body()`. The first uncached reach opens the turn's shared context preparation. Each step
+logs its reach answers, including the body's optional `changed` joint, for replay.
+A silent thought can end before its first reach or model call.
+A first model call can name its exact line in `system.body_anchor`, identifying the changed joint with `(body:<joint>)`. Acceptance credits that joint's logged digest for this conversation only if the composed input carries the line.
 
 <a id="weigh"></a>
 
 `turn` may also define `weigh(h, felt)`: what a happening nobody asked about (`world`) or a care of the agent's moving (`self`) is worth, in
 thoughts (one ignites a thought). The stem runs it on CPU outside any turn, through the same source-bound helper turns lease, with no reach
-(`TurnWeigh`, `ChatTurnRuntime/TurnPart.swift`; the prelude's `run` dispatches `{weigh}`). `h` is the happening (`kind`, `subject`, `door`, `who`,
+(`TurnWeigh`, `BodyRuntime/ChatTurnRuntime/TurnPart.swift`; the prelude's `run` dispatches `{weigh}`). `h` is the happening (`kind`, `subject`, `door`, `who`,
 `words`, `once`, optional `watch` for watch news, and for `self` `care`, `moved`, `open`). `felt` is `touch` (the nearest live care:
 `care`, `id`, `standout`, `bar`, `charge`,
-`depth`, `seed`; `{unavailable}` when nothing can judge; null when no care is live), `yield: {hits, tries}` (thoughts on that node through that
+`depth`, `seed`, and optional `crossed: {id, care, stance, unless, standout, bar}`). A crossing names the care whose
+stated condition for changing its stance reached the attention bar among all live cares and stated conditions. The nearest care's
+`standout` can be null when only the crossing was distinguishable. No live care gives a null touch. A cold or failed
+embedding read leaves the line waiting. Other readings include `yield: {hits, tries}` (thoughts on that node through that
 door within the record's horizon), `presence`, `quiet`, `busy: {open, idleMinutes}`, `mode`, `affect: {arousal, taskPressure, warmth}`, `body:
 {fatigue, curiosity, vigilance, novelty}` or null, and `notebook`. A `night` line from `sense:night` also carries `rest: {awayMinutes, activeShare, hoursSinceNight}`;
 null means the named evidence is absent. An `hour` line from `sense:hour` carries the same `rest` plus `curiosity` (a number or null).
@@ -79,8 +100,10 @@ unweighed and one `body` happening per program digest tells the agent of the org
 no finite worth leaves the same wait and says so once per program; a helper that cannot run it leaves the wait and logs it. What waited is weighed
 after every thought settles, when admission opens and on waking.
 
-The seed returns zero worth for a judged touch with `standout < bar`; at or above the bar it keeps the charge, yield and felt-state weighting.
-Below-bar happenings remain on the record. An authored turn changes only by the agent's own hand; an untouched sealed turn follows the bundle at launch.
+For a crossing the seed returns `min(1, crossed.standout / crossed.bar) * learned * state` with `crossed: true`,
+including for seed cares and cares with zero charge. Otherwise an ordinary world line needs a non-seed care
+whose standout reaches its bar and its worth scales with charge, yield and felt state. Below-bar happenings remain
+on the record. An authored turn changes only by the agent's own hand. An untouched sealed turn follows the bundle at launch.
 
 The turn program is the one shipped id the agent revises: `ability.save {id:"turn", code | edits, why}` (`Parts+TurnProgram.swift`) under the
 save law, kept and on in one act under Full Mac for the agent's own work and the owner's otherwise, the replaced version kept as `turn.prev.js` for
@@ -92,10 +115,10 @@ gaps leave the trial open as `unread`. Frozen turn baselines carry `counting:"se
 uses, is named unavailable and preserved for repair, never judged or silently reconstructed from a shortened trace window.
 A trial never became the agent: revising the version under trial supersedes that trial and leaves `turn.prev.js` the kept self,
 transferring its already frozen `kept_turns` into the new trial's opening write under the same lock. A different kept version inherits no baseline.
-The proposed turn file is fully encoded before either retained slot changes. Publication rechecks the exact selected file under its lock;
+The sandboxed sense host checks the proposed turn source for JavaScript syntax and a top-level function definition for `step`, including the kept body saved forward by set-aside. The proposed turn file is fully encoded before either retained slot changes. Publication rechecks the exact selected file under its lock;
 a stale save changes no slot. A failure after a slot write reports partial or unknown effects and asks for both retained versions to be read.
 `ability.save {id:"turn", set_aside:true, why?}` saves `turn.prev.js` forward and keeps it there, so the version set aside is no throwing turn's way
-back; a heal away from the version under trial closes that trial as set aside. `ability.read {id:"turn"}` shows the agent's program with `weighs` and the seed's `seed_weigh` beside it; the organ's
+back; a heal away from the version under trial closes that trial as set aside. `ability.read {id:"turn"}` shows the retained source and trial. It reports `weighs` and the seed's `seed_weigh` when available, with `analysis_error` or `seed_weigh_error` for a failed inspection. The organ's
 `body` happening names both calls.
 
 `turn.persona()` supplies the compiled `prompt`, caller-supplied `guidance` and
@@ -110,13 +133,11 @@ or `{status:"unavailable",reason}`. The seed authors model-reporting and setup
 advice from these facts; `fact_index` identifies the report in `facts`, where
 the seed adds its words. Swift retains settlement classifiers and identity storage.
 
-A settled Desk wait returns as a `returned` happening (`EngineRuntime/EngineTurnContinuation.swift`): to the conversation that started the work
+A settled Desk wait returns as a `returned` happening (`BodyRuntime/EngineRuntime/EngineTurnContinuation.swift`): to the conversation that started the work
 with its recorded reply route, or to the mind stream for a helper's item. Its line names the item; beside it the thought is shown the checked
 record's remaining work, last twelve settled receipts and first 1,000 characters of the last reply, within the happening's display limit.
 Desk completes only once Attention confirms the committed return's full material and settles any repair for that post.
 An exact return that is still owed is offered to attention again on retry. Native verification, claims, CAS, scope and settlement remain authoritative.
-record's remaining work, last twelve settled receipts and first 1,000 characters of the last reply. Native verification, claims, CAS, scope and
-settlement remain authoritative.
 A parked call never enters the journal. A reply after the refusal keeps the
 continuation waiting for Desk readiness. A defer on the item or an ancestor
 arms the return wake when it expires.
@@ -143,17 +164,22 @@ If every available source fails, recovery ends plainly rather than retrying fore
 | **code** | The file body, outside the JSON comment; JavaScript or retained Markdown guidance. |
 | **reach** | `{capabilities: string[], readPaths: string[], hosts: string[], apps: string[]}`, all arrays default empty. Ordinary abilities consume `capabilities`, including `app_read:<id>`/`app_write:<id>` for app targets; with `computer_files`, `readPaths` bounds an ability's `host.files.query`, `host.files.mime` and `host.files.names` (a `*` is one path component; a directory covers what is beneath it); `hosts` and `apps` constrain senses only. Retained historical headers and sense reach load into this shape; ability saves take `reach`. Declarations do not grant authority. |
 | **wake** | String array, default `[]` (called only). [Wake signals](#wake-signals) defines names, payloads and delivery. |
-| **face** | `{page?: string, action?: string, projection?: bool}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed door id, never beside `answers`. Unknown pages refuse at save. `projection:true` declares `face(input)`; its typed sections/rows are computed from frozen native sources outside view rendering and published through `LatestRead` (contract below). A projection part that defines no `run(input)` is a page, never a call (below). |
-| **answers** | Door verbs the part answers, by action id: `{description, class, args, irreversible?, screen?, summary?}` each, absent when none. `class` is `read`, `write`, `send` or `destructive`; `args` is the verb's JSON Schema (no argument named `verb`). The door registers each verb on `face.page` with that contract and judges it by its class, its Mac integration switch taken from the part's `app_read:`/`app_write:` reach; a verb a native declaration still holds stays native, and a verb two active parts answer is the first by id. `run(input)` receives `{verb, ...args}`; the part's input schema is derived from the verbs and takes no `params`. A `read` verb runs read-confined: read-only app events, read actions and read primitives only. A class other than the four refuses at admission. A verb a shipped seed answers keeps that seed's class and irreversibility as its floor: a revision may raise them, never lower them; and every revision's keep passes the one keep gate (the person's card below Full Mac, the agent's own keep under Full Mac). |
+| **face** | `{page?: string, action?: string, projection?: bool}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed door id, never beside `answers`. Unknown pages refuse at save. `projection:true` declares `face(input)`; its typed sections/rows are computed from frozen native sources outside view rendering and published through `LatestRead` (contract below). A projection with only a face entry is published as a page. |
+| **answers** | Door verbs the part answers, by action id: `{description, class, args, irreversible?, screen?, summary?}` each, absent when none. `class` is `read`, `write`, `send` or `destructive`; `args` is the verb's JSON Schema (no argument named `verb`). The door registers each verb on `face.page` with that contract and judges it by its class, its Mac integration switch taken from the part's `app_read:`/`app_write:` reach; a verb a native declaration still holds stays native, and a verb two active parts answer is the first by id. The selected handler receives `{verb, ...args}`; the part's input schema is derived from the verbs and takes no `params`. A `read` verb runs read-confined: read-only app events, read actions and read primitives only. A class other than the four refuses at admission. A verb a shipped seed answers keeps that seed's class and irreversibility as its floor: a revision may raise them, never lower them; and every revision's keep passes the one keep gate (the person's card below Full Mac, the agent's own keep under Full Mac). |
 | **state** | Abilities use `host.state.get()` → saved JSON (initially `null`) and `host.state.set(value)` → `null`. One durable notebook owner, shared with senses' keyed `state.get/set`, stores it by ability id at `senses/<id>/state.json` under key `part`; it survives helper restarts and app relaunch, and `ability.drop` deletes it with the ability. Values are limited to 16 KiB and the notebook to 64 KiB. Preview uses a scratch notebook, and each validation fixture shares its own scratch notebook across decision passes. Resume verifies prior notebook reads against the current value or the run's last later set, as applicable, before replaying their answers. Journaled writes return their saved acknowledgement. After the answer, notebook operations run live. State calls do not renew stalled execution. `abilities/state.json` remains lifecycle/run accounting only; there is no authored header `state` key. |
 | **learned** | Optional arbitrary JSON, preserved verbatim; a declared value teaches nothing, and a declared `trial` is refused at save. The stem projects `learned.use`, `learned.versions`, `learned.trial` and `learned.trials` (below). The former door-prediction layer is [retired](#expansion-a-part-is-a-prediction). |
 
 `id` and integer `version` identify the part and version.
 
+The header and the primitive broker parse the same `PartReachGrant`: a fixed
+flag, `secret:<keyring name>`, `app_read:<id>`, or `app_write:<id>`. An unknown
+flag or malformed target refuses the declaration, without discarding the bad
+entry or granting access to a different target.
+
 ### Wake signals
 
 The part wake index reads the catalog once at the mind's start, after registering
-`AbilityStore.didChange`, and rereads only on that notification. Delivered signals,
+`AbilityStore.DidChange`, and rereads only on that notification. Delivered signals,
 queued runs and Desk changes use the held index; Desk changes update their file
 watches separately. An equal index causes no repair settlement; each successful
 catalog read reconciles file watches, rearming ended subscriptions while leaving
@@ -163,11 +189,11 @@ and the index is rebuilt. An unreadable catalog leaves the index
 unavailable until an ability-change notification supplies a successful read.
 Each index read logs `[wake] reindexing part wakes` in category `EngineRuntime`.
 
-Accepted: `schedule:<cron>`, `app.installed`, `file.changed:<path>`, `turn.ended`, `message.arrived:slack`, `message.arrived:telegram`, `held`, `resumed`, `person.away`, `person.here`, `network.down`, `network.up`, `chrome.tab_taken`; suffixes are nonempty. Existing files naming another transport still read; new versions must use this set.
+Accepted: `schedule:<cron>`, `app.installed`, `file.changed:<path>`, `turn.ended`, `message.arrived:slack`, `message.arrived:telegram`, `held`, `resumed`, `person.away`, `person.here`, `network.down`, `network.up`, `chrome.tab_taken`, `body.changed`; suffixes are nonempty. Existing files naming another transport still read; new versions must use this set.
 While on and Autonomy allows unattended work, an ability runs as `authored.<id>`, a sense receives an event in its resident slot. Signals bypass params checks, supplying only `input.wake={signal,at,...payload}`:
 
 - `schedule:<cron>`: one time on the one clock per part and schedule (`part:<id>:<cron>`, five-field cron), declared from part headers and
-  withdrawn when the wake is removed (`EngineScheduledWork.declarePartTimes`). Schedule registration observes `AbilityStore.didChange` before the
+  withdrawn when the wake is removed (`EngineScheduledWork.declarePartTimes`). Schedule registration observes `AbilityStore.DidChange` before the
   first catalog read and reconciles queued changes after that first declaration. Each occurrence posts the signal to that part, coalescing like any
   identical pending signal.
 - `app.installed`: `bundle_id,name,version,path,scriptable`, as data. Once per newly seen bundle/version after the baseline,
@@ -190,8 +216,7 @@ While on and Autonomy allows unattended work, an ability runs as `authored.<id>`
   An unavailable reading preserves its last admitted identity. A failed read
   cannot prove deletion. A repaired reading signals watch `available:true`, including a checked
   absent root and `changed:[]` when no earlier identity was admitted or no member changed;
-  ordinary changes omit `available`. Exact self-write suppression stays tied to the declared watched path,
-  including the folder rather than a changed child.
+  ordinary changes omit `available`. Writes, copies, moves and Trash suppress an echo when the declared path's `lstat` generation at the vnode event matches the confirmed mutation, including permission bits and nanosecond change time. An outside change wakes parts and intentions even if they writes again before delivery. Folder watches still deliver member news.
 - `turn.ended`: `turn_id,outcome,session_id,seq` (`Int64` sequence of the terminal detail in the life record);
   excludes turns the ability's own run started.
 - `message.arrived:telegram`, `message.arrived:slack`: `text,session_id,turn_id` and chat/channel/user ids, after handling.
@@ -207,6 +232,7 @@ While on and Autonomy allows unattended work, an ability runs as `authored.<id>`
   queue conditions. Unknown/stale phone evidence emits no presence verdict.
   `mac.system_info {person:true}` remains the raw Mac-input fact for hardware
   decisions. [Phone evidence contract](mobile_companion.md#where-the-person-is).
+- `body.changed` carries the joint's `kind`, `bundle_id` and `pid`, plus `window_id` and `has_sheet` when observed.
 - `chrome.tab_taken`: `tab_id`, `reason`, `host` when the tab had one, the moment the person selects, touches or navigates one of the agent's Chrome tabs. It
   also posts a world happening (door `chrome`) that attention weighs like any other. The agent's own close and group changes do not post it. The person can
   still take a tab after this has passed, so `tab_not_owned` stays the final answer on a call.
@@ -235,11 +261,15 @@ through nested calls without changing version pinning, typed answers or settleme
 Stop cancels work;
 child settlement, terminal accounting and broker release run through `settle`.
 
-The entry a part answers with is a fact of the part, read in one place (`AbilityStore.answersCalls`): it answers calls with
-`run(input)`, unless it declares `face:{projection:true}` and its code defines no `run`. Such a part is a page: its version's
-program entry is `face`, its registry row says `callable:false`, it is not published as an action (not `authored.<id>`, not in
-`find`, not in the hand), a call that reaches it anyway is refused as `page_not_call`, and its page route draws it as before. A
-bundled seed and an ability the agent saves are read alike.
+The candidate seals its entry at save or seed time. A callable part defines `run(input)`, or declares
+`answers` and supplies handlers keyed by action id in `const verbs = { ... }`. An explicit run entry takes
+precedence. Each handler receives the ordinary frozen input, including `verb`. A face-only projection has
+entry `face` and `callable:false`; its page route draws it and a direct call returns `page_not_call`.
+Dynamic entry installation is resolved when the helper runs the program.
+
+Part realms provide a shadowable frozen `kit`. `row(fields)` omits null and undefined fields,
+`graphemes(text)` splits visible characters, `plain(text)` turns Markdown into a single line,
+and `bounded(text, limit)` shortens it at a sentence or word boundary within a grapheme window.
 
 With `face:{projection:true}`, `function face(input)` (optionally async) returns a page:
 `{title?,line?,opened?:{link,title},detail?:{of:<section id>},sections:[{id,title?,style?,footer?,folded?,beside?,rows?:[...],block?,more?,filter?,revision?}]}`.
@@ -329,7 +359,7 @@ the amount's words stay in `value`, as "3 of 5"; a page read of a meter row with
 `live`; `open` leads to `chat:<session>`, `page:<page>[/<item>]`, `approval:<id>`,
 `card:<id>`, `dream:<date>` or `url:<http(s) url>`; `actions` are up to four
 `{id,label,role?}` (`plain`, `primary`, `destructive`); `control` is a switch `{on}`, a choice
-`{options:[{id,label}],selected}`, a field `{text,placeholder?}`, a number
+`{options:[{id,label,path?}],selected}` (a `path` of groups then a short name nests a long list into submenus), a field `{text,placeholder?}`, a number
 `{number:{value,min?,max?,step?}}` or a date `{date:<ISO 8601>}`, each with an optional
 `confirm` question, and changing it is the action `set` with the new value. Ids are nonempty and
 unique within their section including nested rows; at most 64 sections and 256 rows per section including children, within the same
@@ -575,7 +605,12 @@ executor has no bundle/version policy and judges nothing. The agent's [`weigh`](
 
 `choices` is optional arbitrary JSON, preserved verbatim; nothing reads it (for
 example `{open_doc:["script","menu","screen"],date_format:[]}`).
-`resident` defaults false. An ability retains its isolated helper/JS context after successful calls; each call gets fresh frozen input and originating authority. Error, refusal, cut or cancellation discards context. Preview, validation and replay use fresh contexts.
+`resident` defaults false. An explicitly resident ability retains its isolated helper/JS context after successful calls; each call gets fresh frozen input and originating authority. Error, refusal, cut or cancellation discards context. Preview, validation and replay use fresh contexts.
+Non-resident live abilities and face projections can reuse an exact-program helper. Every pooled invocation releases its JavaScript realm before completion.
+Abilities, pooled turns and scripts share the sense helper’s default 256 MiB
+process-tree RSS cap. The parent samples during each entry and checks at
+completion. The sampler is cancelled on entry completion, helper exit or stop,
+so idle helpers do not sample. The child checks its own physical footprint at entry and completion and through the existing non-sense execution watchdog.
 One resident broker holds programs, connections and listeners until closed, off, replaced, dropped or quit, including across failed runs. Code recovers their ids from `host.state` or `held` wakes; each use rechecks admission and Trust.
 Sense retention uses `SenseRecord.mode`, not `resident`; `sense.make` creates `.onCall` senses.
 
@@ -637,7 +672,7 @@ else unknown); a prepared act is made. `record` is `tries`/`hits` since the
 last change, the lifetime counts, `unknown`, `misses` in a row, `changes`, how
 often the stem ran (`delivered`), previewed (`prepared`) or withheld it, and
 `costs`, the stem's own run times in seconds. Standing arithmetic belongs to
-[`Expectation`](../Modules/NativeAgentCore/Sources/NativeAgentCore/Expectation.swift);
+[`Expectation`](../Modules/NativeAgentCore/Sources/NativeAgentCore/NativeAgentCore/Expectation.swift);
 Expansion's practice owner measures its costs;
 nothing in the file is a setting. Only a missing file starts empty; unreadable, invalid or unsupported records remain byte-preserved and unavailable.
 Expansion diagnostics expose the cause; activity cannot replace the record.
@@ -794,8 +829,6 @@ These examples show the common header. Existing store-owned `record`,
 payloads alongside it; a header alone is not admission to execute.
 
 `ability.save` and `sense.make` accept `reach`, `wake`, `face`, `resident`,
-`learned` and `choices` alongside their authoring fields. Ability saves use
-`reach`; sense creation still accepts its current `apps` field. The census and the
 `learned` and `choices` alongside their authoring fields. `ability.save` uses
 `reach.capabilities`; its old `permissions` argument is removed. The current
 sense authoring `apps` field remains declared at that door. The census and the
@@ -811,14 +844,9 @@ its `scope:"current_version"` names the scope of `run_totals` and
 reads the selected file identity's `runs.versions` count. A version with no
 record has zero observed runs; unavailable accounting fails the read rather
 than inventing zero. The list's ambiguous `runs` field is removed.
-Every terminal runner receipt writes run accounting, including a successful
-computation with empty `calls`, `effects:none` and `notebook_changed:false`.
-Its version's count, outcome and `first_seen` are evidence for the night reading.
-The notebook owner compares before writing and emits no change for an identical
-value; its committed-write callback supplies `notebook_changed`, including state
-writes outside the call ledger.
 Every settled run of a retained version writes run accounting, including a
 successful computation with empty `calls`, `effects:none` and `notebook_changed:false`.
+Its version's count, outcome and `first_seen` are evidence for the night reading.
 The notebook owner compares before writing and emits no change for an identical
 value; its committed-write callback supplies `notebook_changed`, including state
 writes outside the call ledger. A computation's accounting does not rewrite its notebook.
@@ -827,7 +855,6 @@ Run accounting retains the terminal refusal's `reason`, `reasons`, `gate_reason`
 version, calls (metadata only, under the [receipts law](ONE_DOOR.md#authority-and-receipts); a run
 accounted before it is reduced when read) and terminal error/stop evidence. `at` is the start of that run or
 refused attempt, not its accounting-write time; an older settlement cannot replace
-a newer `lastRun`.
 a newer `lastRun`. A successful computation updates its retained run like any other completed run.
 A live notebook change counts toward `effects:occurred`. An unconfirmed
 durable notebook write makes `notebook_changed` null and `effects:unknown`,
@@ -953,13 +980,16 @@ action, without manufacturing arguments from display text. A gap proves no absen
 
 Ability file contents and parsed run accounting are reused only while their
 `lstat` identity (device, inode, size, mode, mtime and ctime with nanoseconds)
-matches; every read checks it. A walk uses one `lstat` per member for its type
-and decode identity, and compares header/file names without another disk read.
-Successful canonical file and accounting writes warm their memo with the written
-content and post-write identity. Each abilities root keeps its own latest
-validated state rows; missing state remains empty, and failed reads/validation
-are never memoized. Redaction keys on that state identity rather than serialized
-accounting bytes. Immutable bundled sense defaults are read once per resource
+matches. A walk reads entry attributes in batches on one verified directory
+descriptor and repeats if the directory identity changes. Hidden entries and
+`state.json` are excluded from the files revision. A mount point, firmlink or
+entry missing required bulk attributes carries a per-entry unsupported error.
+Each abilities root keeps registry, part and sense projections with the checked
+ability files. Readers overlay the separately checked accounting row by ability
+id and match version counts to the retained files. Authority comes from the
+ability files and bundled sense definitions. Missing state supplies empty
+accounting. A failed state read or validation fails the read. Redaction keys on
+the state file identity. Immutable bundled sense defaults are read once per resource
 root; pure tool-name prose folding, ranking's word sets and action-index text
 hashes are reused per exact input text under a lock with a 4096-entry bound. No watcher, notification, timer, background refresh or
 wait decides freshness. Pure sense queries select helpers from the catalog they read; mutation closures reread committed state.
@@ -992,13 +1022,13 @@ claiming it, in either spelling.
 | `ability.save` | `{id, description?, code?, edits?, params?, actions?, fixtures?, name?, triggers?, converts?, create_only?, reach?, wake?, face?, resident?, learned?, choices?, trial?, set_aside?, why?}`. `trial:true` with why makes a revision a trial; `set_aside:true` saves the kept self forward (trials: see `learned.use`). Creates or revises: a new ability needs description and code; a revision inherits everything it does not restate from its latest version; an explicit empty value drops one. Send code or edits, never both. `params` is the description/type map (a leading type word, optionally after `optional`, sets the type; otherwise string; words end at whitespace, commas, colons or parentheses; `?` on the type or the word `optional` marks it optional), `{type, description?}`, or a JSON Schema object (`readOnly:true` declares a read contract); `params` is its sole input-contract argument. Direct app dot/bracket members and reach derive dependencies; `actions` declares indirect calls (literal or computed). Literal calls and declarations are checked before staging; unknown actions and missing dependencies refuse save, while computed names produce warnings and keep runtime checks. Under Full Mac their own save is kept and on in this one act (sealed as kept: its first real run is its proof), with a decided Inbox row; below Full Mac, or when an untrusted agent started the turn, it is a draft. A revision inheriting tape fixtures remains staged until its exact version replays ([tape fixtures](#tape-fixtures)). A revision may name an existing ability by id or name. New ids are normalized by trimming whitespace, lowercasing, replacing runs outside `a-z`, digits, `-` and `_` with `-`, and trimming edge hyphens; the result must be 2–64 characters, a letter first (`^[a-z][a-z0-9_-]{1,63}$`). |
 | `ability.validate` | A read: `effect:none`, `read_only:true`; a reached rehearsal reports `execution:rehearsed` and `effects:none`. Rehearses its waiting version with the shared helper and intercepted replies, on fixtures or one captured run with `input`. A version with tape fixtures replays its recorded calls instead (`candidateValidation` `replayed`). Proves no live behavior; never keeps. |
 | `ability.enable`, `ability.restore` | Keeps its waiting version, or turns it back on: theirs under Full Mac for their own work (sealed as kept when never rehearsed); otherwise, once rehearsed, the owner's card for this exact version (code, fixtures and dependency shapes), approvable on the Mac and the phone, or Keep on the Tools page. Code requires `version` equal to its full digest, captured with the displayed code when the card or row was staged and saved with it; self-improvement cards and approval replay carry that same saved digest. A caller without the exact review offers a read rather than executable approval. A version with tape fixtures is kept by no one until its tape replayed (`not_replayed`). Omitting `version` restores only disabled Markdown guidance with no candidate or code fingerprint, checked and written under the ability-store lock. |
-| `authored.<id>` | Its one run, with input by its params, under one signed admission re-verified on every run. `preview:true` runs its code with every write previewed and says where it would card or hand back. |
+| `authored.<id>` | Its one run, with input by its params, under one signed admission re-verified on every run. `preview:true` passes the same ability gate before its code runs. Its calls report which reads ran live, which steps stayed previewed, and where admission would require a card or hand back. |
 | `ability.resume` | A stopped run_id and bounded answer; optional `id` binds it to that ability, with a mismatch claiming nothing. A rename claims the checkpoint; its bytes are read and verified once. Busy admission or an admission receipt with `execution:not_run` restores the holds and original checkpoint and leaves its Desk step open. Invalid bytes stay claimed for inspection. Completed or deliberately closed runs consume the checkpoint at settlement; cleanup failures stay in `settlement_failures` with cause and remedy. Rechecks selection, host revision and admission and replays prior reads. A woken run resumes with the `input.wake` it stopped on. `preview:true` only reads the checkpoint: it reports the question, input, wake and stopped call, without claiming the run, transferring holds or closing its queued step. |
 | `ability.read` | Every stored kind, including turn and sense: kind, version, declarations, status, retained versions, `run_counts` (all_versions, current_version), evidence and code in pages (`offset`), or one `step`; ordinary abilities also expose waiting/last-clean and converted versions. |
 | `ability.disable`, `ability.drop` | Off with every version kept, as whoever did it (`disabledBy`): `theirs` for their turn or their ability (a trusted agent's turn included), `owner` only for their own surface (the Tools page), `peer` for an untrusted agent's; theirs they turns back on, the owner's is their to lift (`ability.enable` asks on their card); delete it, its versions, its run state and its `host.state` notebook (`pending:true` discards only the waiting version). A built-in skill's own version is the owner's to switch off or drop below Full Mac. |
 | `ability.list` | Every stored part, including turn and sense, in a bounded page (at most 40 rows and a 24 KB row budget), ordered by id. Rows carry kind, version, `run_counts` (all_versions from stored useCount, current_version from the selected version's count) and `last_run_at` from stored `lastUsedAt` (ISO timestamp, null when never run). `count` is the rows printed, `total` is the inventory; follow `next_call`/`next_offset` with `offset` when `has_more`. The Tools page reads this same projection and accepts `args.offset`; a named Tools item accepts a source offset, also reachable by `ability.read`. Full declarations and versions remain on `ability.read`. Unshadowed built-in guidance remains discoverable; unreadable bodies are named in `guidance_gaps` and refuse only their own read. A missing guidance directory is empty; an unreadable one fails with its read error. |
 
-An ability save whose normalized authored source, declarations, fixtures and provenance already match its latest version returns
+An ability save whose syntactically valid, normalized authored source, declarations, fixtures and provenance already match its latest version returns
 `status:ok, effects:none`. It stages, signs and publishes nothing, leaves any open trial and kept baseline intact, and does not enable a draft or
 disabled part. Use the lifecycle action to keep or restore that existing version.
 
@@ -1022,8 +1052,7 @@ characters, cutting at the last sentence end within that limit or making a hard
 cut with `…` when none fits. A shortened description is reported in
 `description_note` and the receipt's detail as “description kept to its first N
 characters”; extra length or line breaks never refuse the save.
-Code defines `function run(input)` or `async function run(input)` and returns
-JSON. App and host calls answer synchronously and may be awaited. The helper
+An entry or verb handler returns JSON and may be async. App and host calls answer synchronously and may be awaited. The helper
 reads a returned thenable after JavaScriptCore drains microtasks when its API
 call returns: fulfillment supplies the result, rejection is the thrown error.
 A Promise still pending after that drain fails with “Its Promise never settled:
@@ -1040,6 +1069,31 @@ array of answers, stopping at the first throw; each entry is read as a lone requ
 (an action, `{page, item}` or `{find}`). Beside `actions`, a script accepts only `preview`, `expected_version` and `because`.
 Other keys raise `AppError` with reason `invalid_actions` before the first entry runs. Saving a literal batch names the same extra keys.
 Action entries inherit the batch's options. An entry can supply its own version or quoted request, and preview on either protects the entry.
+A previewed program carries its preview through page and find calls, version checks and named reads issued by a model. A previewed script or deed step returns its remedy to the caller without automatically dispatching the suggested read.
+
+#### Preview read decisions
+
+The door checks the registered action against its bound arguments at admission. A live read returns its actual data under the same gates as usual. Its call row says `execution:executed` on success. A previewed step says `execution:preview`. A refusal before execution retains `not_run`. A `tool.preview_read` trace identifies the read, program and execution without teaching from the read. Standalone native action previews still preflight their target.
+
+| Decision | Actions | What the reader does |
+| --- | --- | --- |
+| Live | `desk.read`, `queue.list`, `ledger.list`, `schedule.list`, `agent.jobs`, `node.list` | Reads stored work and schedules. Lock-holder stamps are transient. |
+| Live | `artifact.find`, `chat.list`, `chat.message`, `chat.scratch_read`, `chat.search`, `claude.worklog`, `record.read`, `result.page`, `trace.model_calls`, `trace.usage` | Reads existing records, transcripts, working text or receipt pages. |
+| Live | `files.excerpt`, `files.grep`, `files.info`, `files.list`, `files.spotlight`, `git.diff`, `git.log`, `git.status`, `git.summary` | Uses the file and repository read handlers. |
+| Live | `calendar.calendars`, `calendar.free_busy`, `calendar.upcoming`, `contacts.search`, `reminders.due_today`, `reminders.lists`, `reminders.query`, `reminders.read`, `photos.count`, `photos.recent` | Queries accessible collections and asset metadata. |
+| Live | `mac.activity`, `mac.apps`, `mac.clipboard_read`, `mac.system_info`, `mac.volume`, `browser.status`, `maps.route`, `maps.search`, `time.now`, `web.search` | Queries device or service state. Volume changes stay previewed. |
+| Live | `ability.list`, `ability.read`, `agent.introspect`, `capabilities.lookup`, `find`, `persona.doc`, `persona.read`, `setting.get` | Reads definitions, runtime state or discovery results. Ranking skips index repair during preview. |
+| Live | `memory.proposals`, `mind.body`, `mind.dream_diary`, `mind.inner_state`, `mind.misses`, `mind.night` | Reads proposals, recorded observations or reports. |
+| Live | `make.read`, `sense.make`, `sense.versions`, `studio.canon`, `studio.consult_read`, `studio.intake.read`, `studio.recall`, `studio.shelf` | Reads held material, versions or studio records. Only the registered material-only form of sense.make qualifies. Studio recall skips the recall-pull counter. |
+| Preview | `agent.contacts`, `agent.read`, `bot.list`, `bot.replies` | Contact discovery, conversation reconciliation and shelf access can record experience or consume a reply. |
+| Preview | `browser.links`, `browser.text`, `chrome.look`, `chrome.snapshot`, `chrome.status`, `chrome.wait`, `files.read`, `mac.look`, `mac.menu`, `mac.read`, `mac.wait`, `web.read` | These paths can retain a sense reading, bind or reconcile a tab or window, or open a browser view. |
+| Preview | `context.expand`, `graph.search`, `memory.recall`, `trace.recent`, `work.context` | Can record an expansion, recall hits or new workspace references. |
+| Preview | `mac.location`, `phone.location`, `provider.test`, `app.check_updates`, `doctor.run` | Can start a location request, provider probe, update check or recorded diagnosis. |
+| Preview | `ability.validate`, `agent.recipe`, `layout.read`, `memory.list`, `mind.why`, `reply.attach` | Can save validation, seed settings, initialize memory storage, bootstrap pending work or select an attachment. |
+| Preview | `shell.bash`, `shell.run` | Even a read-classified command records a builder execution. |
+| Preview | `agent.refresh`, `desk.refresh`, `graph.refresh`, `memories.refresh`, `memories.search`, `telegram.refresh`, `tools.refresh`, `trust.refresh_privacy` | Changes the page's query, publishes refreshed state or starts refresh work. |
+
+The registered page items `inbox/all`, `pairing/phone-senses`, `diagnostics/doctor`, `telegram/status`, `skills/census` and `tools/census` read existing data. Home, sense navigation and whole-page refreshes that retain state stay previewed. Installed guidance uses `ability.read`. An installed authored action or answered verb enters its own preview and admits each reached call. Generated sense readers follow their backing action's decision. Primitive receives, screen watches and model requests that consume a cursor, start a watch or use a provider stay previewed.
 `app({find:"words"})` is `app.find("words")`. `app({action:"find",args:{what:"words"}})` (or `query`)
 reaches that same discovery reader as a registered read action. Item/page
 requests go through `app.read(page,item)`.
@@ -1052,8 +1106,7 @@ Calling a namespace alone, such as `app.desk(args)`, refuses with the working
 requests and batch entries name those working forms as well. Saving checks
 their static call shapes; it never executes code to discover a runtime fault.
 
-Before any candidate is staged, `OwnedProgram.calls` reads literal calls using
-the shared source lexer: app members, callable action/batch requests and
+The sandboxed helper checks syntax and reads the ESTree for literal calls before staging. It recognizes app members, callable action/batch requests and
 `app.call`, action names in `app.read`, host members and `host.call` (including
 file/PIM aliases), and `part.call`.
 `Parts` checks the live door's action catalog and existing authored abilities.
@@ -1075,6 +1128,8 @@ interpretation in the receipt.
 Declared exact references also bind their namespace and contextual qualifiers:
 `context.expand` maps `message_id` or `history` to `atom_id:"history:<id>"`,
 consuming an accompanying `agent` as context without narrowing that identity.
+`body:<joint>` reads the live front, browser, files, threads or somatic joint after the same consent, helper and peer checks as `turn.body()`.
+Both kinds of address work with ContextFlow off or active.
 The same binder serves execution, evidence and saved-call inspection.
 Contacts calls pass that binder too, retaining raw values and unknown expressions
 under the same no-coercion policy as their runtime owner.
@@ -1098,7 +1153,7 @@ literals, shorthand properties and lexical variables. Unchanged lexical
 initializers can be read; parameters, reassigned values, object/array aliases or
 escapes, spreads and computed forms that cannot be read stay `unknown shape`,
 never an invented empty object. Save-time and run-admission checks both consume
-`OwnedProgram.calls`; point-of-call admission still checks the actual value.
+the candidate's exact-source analysis. Point-of-call admission checks the actual value.
 Computed action names (concatenation and interpolated templates included) remain
 runtime checks; completed save receipts carry `warnings` naming their lines,
 rather than refusing them. In particular `"authored." + id` is never validated
@@ -1130,15 +1185,15 @@ discovery. The door preserves the original `params`, `reach` and `face` through
 argument normalization: explicit param clearing reaches save, and invalid
 header nulls are refused rather than dropped into defaults or inheritance.
 
-Completed `ability.save` receipts include `timing: {validate_ms, proof_ms,
-write_ms}` in milliseconds, measured with the monotonic clock. Validation
-covers candidate preparation and dependency shapes, resolved once per action;
-proof time covers the Full Mac keep seal and its signing key; write time covers
-staging, admission and the remaining publication work. A draft runs no proof
-and reports zero proof time. A Full Mac save seals a keep, without starting a
-JavaScript helper or running fixtures; rehearsal remains `ability.validate`.
-Repeated catalog reads reuse redacted accounting only for byte-identical
-accounting, without rewriting source files or changing the content policy.
+Completed `ability.save` receipts report `validate_ms`, `proof_ms` and `write_ms`
+under `timing` in monotonic milliseconds, omitting validation or proof when it
+did not run. Validation covers the sandboxed sense host’s syntax check, candidate
+preparation and dependency shapes resolved once per action. Turn saves charge the
+syntax check to validation, even when a revision makes no change or a set-aside
+parses the retained version. Proof time covers the Full Mac keep seal and its
+signing key. Write time covers staging, admission and the remaining publication
+work. A draft runs no proof. A Full Mac ability save seals a keep after the
+source parses. Only rehearsal with `ability.validate` runs fixtures.
 
 Catalog argument rendering accepts native object schemas without `properties`,
 including a `required` list with unconstrained values (shown as `any`). Discovery
@@ -1181,18 +1236,13 @@ the holder, since and end event, with a next call
 previewing that run's resume; session evidence is optional. The single locked
 editor drops non-run markers and reservations without an open item or checkpoint.
 Resume releases its run's markers while retaining the claimed checkpoint through
-execution. A refused resume that never starts restores reservations without
-displacing another stopped run and returns the same bytes to waiting, with the
-admission remedy intact. Invalid checkpoint bytes stay claimed. Dropping a resume
-step with a recorded run binding releases its reservations and keeps any ownerless
-claim as `.abandoned` evidence. A live claim settles through its resuming
 execution. A pre-execution admission refusal or busy helper returns the same
-bytes to waiting, restores eligible reservations without displacing another
-stopped run, and keeps the Desk step open. A replay refusal's `resume.held`
-lists the reservations actually restored. Invalid checkpoint bytes stay
-claimed. Dropping a resume step with a recorded run binding releases its
-reservations and keeps any ownerless claim as `.abandoned` evidence. A live claim settles through its resuming
-call. No reservation uses a clock. A stopped run's
+bytes to waiting with the admission remedy intact, restores eligible reservations
+without displacing another stopped run, and keeps the Desk step open. A replay
+refusal's `resume.held` lists the reservations actually restored. Invalid
+checkpoint bytes stay claimed. Dropping a resume step with a recorded run binding
+releases its reservations and keeps any ownerless claim as `.abandoned` evidence.
+A live claim settles through its resuming execution. No reservation uses a clock. A stopped run's
 reservation or metadata failure retains the run result and identifies the failed
 settlement with a repair debt. Upgrade evidence remains on the result until its
 queue append succeeds. Resume reservation release, queue closure and restoration
@@ -1352,22 +1402,24 @@ judgment: Music's play stops only if the current track is the one it started.
 
 Ability file reads require `computer_files` and declared `readPaths`. After resolving symlinks and checking that reach, they refuse
 `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.codex`, `~/Library/Keychains` and the data root's `tools/.manifest_signing_key`,
-`providers`, `codex_home` and `codex_child_home`. The agent's own file reads are not fenced this way: they reads what the person can.
+`oauth`, `secrets`, `providers`, `codex_home` and `codex_child_home`. The agent's own file reads are not fenced this way: they reads what the person can.
 The fence compares device/inode identities of the file and its ancestors with existing protected roots, including alternate path spellings.
 Missing protected roots protect nothing. ENOENT or ENOTDIR at the target or any component walks up to the nearest existing ancestor,
 whose identity and ancestors decide the fence; the reader still owns reporting source absence.
 An unreadable protected root refuses the read with its cause; unresolved candidate components continue through their ancestors.
 The agent's own stores and persona remain readable through declared reach.
 
-`host.files.query({path, sql, params?, limit?})` opens the source read-only and uses SQLite's backup API for one consistent
-private snapshot, including committed WAL pages (`snapshot: "sqlite_backup"`). A source its app holds under an exclusive
-lock (Chrome's History while Chrome runs) refuses that read; then the file and its journal are cloned with APFS
-`clonefile` (instant, takes no SQLite lock), the database before its journal so SQLite rolls the clone back to its last
-committed state (`snapshot: "file_clone"`); SQLite's header change counter, read before and after the clones, proves
-they are one generation, and a commit in between is reported, never read. A clone that fails names its cause. It then
-runs one read-only statement with the stem's `folded_contains(text_or_blob, needle)` (containment that
-ignores case and diacritics) beside SQLite's own functions: at most `limit` rows
-(1–1000, default 200, `truncated` when more exist). Snapshot and query finish on
+`host.files.query({path, sql, params?, limit?})` opens the source read-only. When SQLite header bytes 18 and 19 are both
+`2`, it verifies WAL mode in a read transaction and runs the statement in that transaction (`snapshot: "live_read"`).
+A failed verification asks for a fresh read. The statement cannot attach databases, control the transaction or run a WAL checkpoint.
+Other sources use SQLite's backup API for a consistent private snapshot (`snapshot: "sqlite_backup"`). If the backup returns
+`BUSY` or `LOCKED` (as with Chrome's History while Chrome runs), APFS `clonefile` takes the database before its journal files
+so SQLite can roll back a hot journal in the clone (`snapshot: "file_clone"`). A changed SQLite header counter across cloning
+or a clone failure is reported with its cause.
+Each query runs one read-only statement with the stem's `folded_contains(text_or_blob, needle)` beside SQLite's own functions.
+Containment ignores case, diacritics and character width. SQLite can reuse a folded literal or bound needle within the statement,
+and matching two ASCII strings uses lowercase comparison. The reply holds at most `limit` rows
+(1–1000, default 200, `truncated` and `has_more` when more exist). Snapshot and query finish on
 SQLite completion/error or Stop, with no sleeping or retrying. A clone is removed when the query ends; one that
 cannot be removed is named in the result as `snapshot_left`. Nil SQLite conversion is a failure, except a genuine zero-byte
 blob. SQL tail validation completes within the SQL string buffer's lifetime.
@@ -1551,7 +1603,7 @@ inventories retain their manifest metadata, permission and OAuth ownership.
 
 Abilities are projected by `Parts` and shown on the Tools page; built-in guidance
 is read by
-[InstalledSkillInventory.swift](../Modules/NativeAgentCore/Sources/PersonaEngine/InstalledSkillInventory.swift)
+[InstalledSkillInventory.swift](../Modules/NativeAgentCore/Sources/DeskCore/PersonaEngine/InstalledSkillInventory.swift)
 as `SkillRecord` throughout discovery, source reads and Mac/phone presentation,
 and shown by
 [AppModel+SkillsIntegrations.swift](../Sources/NativeAgentApp/AppModel+SkillsIntegrations.swift).

@@ -6,7 +6,6 @@
   "record":{"description":"My page subtitles, activity phrases and automated conversation titles, over sanitized native presentation facts.","actions":[],"inputSchema":{"type":"object","required":["kind"]}}
 }
 */
-function run(input) { return face(input); }
 function face(input) {
     if (input.kind === "conversations") {
         const rows=input.rows.map(r=>({id:r.key,title:face({kind:"conversation",opening:r.opening}).sections[0].rows[0].title}));

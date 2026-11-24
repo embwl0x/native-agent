@@ -63,10 +63,10 @@ enum AdvancedSnapshotRefreshOutcome: Equatable, Sendable {
 }
 
 struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
-    static let filenames: Set<String> = ["trust_policy.json", "personality.json", "connectors.json", "health.json"]
+    static let filenames: Set<String> = ["trust_policy.json", "personality.json", "connectors.json", "health.json", "faces.json"]
 
     enum Field: CaseIterable, Hashable, Sendable {
-        case trustPolicy, personality, connectors, health
+        case trustPolicy, personality, connectors, health, faces
     }
 
     enum State: Equatable, Sendable {
@@ -166,7 +166,6 @@ extension iCloudSyncEngine {
     func refreshHelpersSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
-        await refreshSnapshotStaleness()
         let read: SnapshotReading<MobileHelpersSnapshot> = await Self.loadSnapshotObjectOnly(named: "helpers_agents.json", in: snapshotDir)
         guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return false }
         guard let snapshot = acceptSnapshot(read, named: "helpers_agents.json") else { return false }
@@ -351,12 +350,16 @@ extension iCloudSyncEngine {
     func refreshTurnSummariesSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
-        let read: SnapshotReading<TurnSummaryFile> = await Self.loadSnapshotObjectOnly(named: "turn_summaries.json", in: snapshotDir)
+        let filename = "turn_summaries.json"
+        let read: SnapshotReading<TurnSummaryFile> = await Self.loadSnapshotObjectOnly(named: filename, in: snapshotDir)
         guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return false }
-        if let latest = acceptSnapshot(read, named: "turn_summaries.json") {
+        if let latest = acceptSnapshot(read, named: filename) {
             turnSummaries = latest
             noteRefreshSucceeded()
             return true
+        }
+        if let damage = snapshotHealth.damageSentence(for: [filename]) {
+            syncError = damage
         }
         return false
     }
@@ -419,11 +422,28 @@ extension iCloudSyncEngine {
     func refreshFacesSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
-        let read: SnapshotReading<PhoneFacePages> = await Self.loadSnapshotObjectOnly(named: "faces.json", in: snapshotDir)
-        guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return false }
-        guard let snapshot = acceptSnapshot(read, named: "faces.json") else { return false }
-        faces = snapshot.pages
-        return true
+        let filename = "faces.json"
+        var refreshed = false
+        var published = false
+        let read = await facesRead.read({ () async -> SnapshotReading<PhoneFacePages> in
+            await Self.loadSnapshotObjectOnly(named: filename, in: snapshotDir)
+        }, publish: { read in
+            published = true
+            guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return }
+            let previousDamage = snapshotHealth.damageSentence(for: [filename])
+            let previousSummary = previousDamage == nil ? nil : snapshotHealth.damageSentence()
+            if let snapshot = acceptSnapshot(read, named: filename) {
+                faces = snapshot.pages
+                refreshed = true
+                if let syncError, syncError == previousDamage || syncError == previousSummary {
+                    self.syncError = snapshotHealth.damageSentence()
+                }
+            } else if let damage = snapshotHealth.damageSentence(for: [filename]) {
+                syncError = damage
+            }
+        })
+        return refreshed || (!published && read.value != nil && lifecycle == lifecycleGeneration
+            && !Task.isCancelled && snapshotHealth[filename] == nil && !faces.isEmpty)
     }
 
     func refreshCatalogSnapshot() async -> Bool {
@@ -445,11 +465,22 @@ extension iCloudSyncEngine {
     @discardableResult
     func refreshKnowledgeGraphSnapshot() async -> Bool {
         let lifecycle = lifecycleGeneration
-        let read: SnapshotReading<KGEntityResponse> = await loadSnapshotObjectAsync(named: "knowledge_graph.json")
+        let filename = "knowledge_graph.json"
+        let read: SnapshotReading<KGEntityResponse> = await loadSnapshotObjectAsync(named: filename)
         guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return false }
-        guard let snapshot = acceptSnapshot(read, named: "knowledge_graph.json") else { return false }
-        knowledgeGraph = snapshot
-        return true
+        let previousDamage = snapshotHealth.damageSentence(for: [filename])
+        let previousSummary = previousDamage == nil ? nil : snapshotHealth.damageSentence()
+        if let snapshot = acceptSnapshot(read, named: filename) {
+            knowledgeGraph = snapshot
+            if let syncError, syncError == previousDamage || syncError == previousSummary {
+                self.syncError = snapshotHealth.damageSentence()
+            }
+            return true
+        }
+        if let damage = snapshotHealth.damageSentence(for: [filename]) {
+            syncError = damage
+        }
+        return false
     }
 
     @discardableResult
@@ -492,11 +523,13 @@ extension iCloudSyncEngine {
         }
         let lifecycle = lifecycleGeneration
         let personalityPairing = pairingStore?.iCloudPairingSecret
+        async let facesLoaded = refreshSnapshotGroup(.faces)
         async let latestTrust = readTrustSnapshot(in: snapshotDir)
         async let latestPersonality: SnapshotReading<PersonalityProfile> = Self.loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         async let latestConnectors: SnapshotReading<[MobileConnectorSnapshot]> = Self.loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let latestHealth: SnapshotReading<RuntimeHealth> = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
-        let (trustRead, personalityRead, connectorRead, healthRead) = await (latestTrust, latestPersonality, latestConnectors, latestHealth)
+        let (trustRead, personalityRead, connectorRead, healthRead, hasFaces) =
+            await (latestTrust, latestPersonality, latestConnectors, latestHealth, facesLoaded)
         guard lifecycle == lifecycleGeneration,
               personalityPairing == pairingStore?.iCloudPairingSecret, !Task.isCancelled else {
             return SettingsSnapshotRefreshOutcome(availableFields: [], wasSuperseded: true)
@@ -505,13 +538,16 @@ extension iCloudSyncEngine {
         let personalityRow = acceptSnapshot(personalityRead, named: "personality.json")
         let connectorRows = acceptSnapshot(connectorRead, named: "connectors.json")
         let healthRow = acceptSnapshot(healthRead, named: "health.json")
+        let settingsFaceDamage = faces["settings"]?.error.flatMap { $0.code == "bad_face" ? $0.message : nil }
         var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
         if trustRow != nil { availableFields.insert(.trustPolicy) }
         if personalityRow != nil { availableFields.insert(.personality) }
         if connectorRows != nil { availableFields.insert(.connectors) }
         if healthRow != nil { availableFields.insert(.health) }
-        let outcome = SettingsSnapshotRefreshOutcome(availableFields: availableFields, damage: snapshotHealth.damageSentence(
-            for: SettingsSnapshotRefreshOutcome.filenames))
+        if hasFaces && settingsFaceDamage == nil { availableFields.insert(.faces) }
+        let damage = [snapshotHealth.damageSentence(for: SettingsSnapshotRefreshOutcome.filenames), settingsFaceDamage]
+            .compactMap { $0 }.joined(separator: " ")
+        let outcome = SettingsSnapshotRefreshOutcome(availableFields: availableFields, damage: damage.isEmpty ? nil : damage)
         if let personalityRow { applyPersonality(personalityRow, pairing: personalityPairing) }
         if let connectorRows { applyConnectorSnapshot(connectorRows) }
         if let healthRow { health = healthRow }

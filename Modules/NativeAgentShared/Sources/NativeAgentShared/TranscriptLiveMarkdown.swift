@@ -2,7 +2,6 @@ import Foundation
 
 // Blueprint: | `TranscriptLiveMarkdown.swift` | Incremental complete markdown blocks, one reparsed open tail and source-to-glyph reveal cuts |
 
-@available(macOS 15, iOS 18, *)
 struct TranscriptLiveMarkdown {
     private var rowID = ""
     private var source = ""

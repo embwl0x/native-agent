@@ -1,6 +1,4 @@
-import Connectors
-import AttentionRouting
-import ChatToolRuntime
+import BodyRuntime
 import Foundation
 import AppKit
 import ApplicationServices
@@ -9,8 +7,7 @@ import CoreGraphics
 import EventKit
 import Contacts
 import AVFoundation
-import MacIntegration
-import MacControl
+import MacNerves
 import NativeAgentCore
 import NativeAgentShared
 import Photos
@@ -26,7 +23,7 @@ extension SystemPermissionPreflight {
     /// request that fails is said in the result and the walk goes on. Then the first grant still off that is not in `passed` (a pane the
     /// person already came back from) is registered where macOS has a request for it and its exact pane opens: Device Control, Screen
     /// Recording, Input Monitoring, Full Disk Access, or one the person declined. The walk stops there and goes on when the person comes back
-    /// to the window (`InlineInteractionResolver.GrantWatch`). Returns what it waits on and what failed; empty when nothing is left to show.
+    /// to the window (`InlineInteractionCoordinator.observeGrants`). Returns what it waits on and what failed; empty when nothing is left to show.
     @MainActor
     static func requestMacOSAccess(
         _ ids: [String], mode: InlineInteraction.AccessMode? = nil, passed: Set<String> = []
@@ -35,26 +32,27 @@ extension SystemPermissionPreflight {
         var lines: [String] = []
         var checked = false
         // The person is checked once, before the first ask: after a macOS prompt closes, the app is not yet back in front.
-        func absent() async -> String? {
+        func absent() -> String? {
+            guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
             guard !checked else { return nil }
             checked = true
-            return await activationProblem()
+            return activationProblem()
         }
         for id in order {
             guard let gate = cardSettingsCapability(id), await asksInPlace(id, gate: gate) else { continue }
-            if let problem = await absent() { return [problem] }
+            if let problem = absent() { return lines + [problem] }
             do { try await askInPlace(id, gate: gate, mode: mode) }
             catch { lines.append("\(InlineInteractionRegistry.macCapabilityDisplayName(id)) could not be asked: \(error.localizedDescription)") }
             guard !Task.isCancelled else { return lines + ["The macOS permission request was interrupted; its grant is unconfirmed."] }
         }
         for id in order where !passed.contains(id) {
             guard let gate = cardSettingsCapability(id), let waiting = await cardBlockReason([id], mode: mode) else { continue }
-            if let problem = await absent() { return lines + [problem] }
+            if let problem = absent() { return lines + [problem] }
             register(gate)
             // The pane opens and the walk waits for the person's return; it posts no change of its own, so only their return goes on.
             return lines + [waiting] + ((await openSettings(gate, registered: true)).map { [$0] } ?? [])
         }
-        NotificationCenter.default.post(name: permissionDidChange, object: nil)
+        NotificationCenter.default.post(MacIntegrationPermissionStore.DidChange.preflightCompleted)
         return lines
     }
 
@@ -116,8 +114,7 @@ extension SystemPermissionPreflight {
     /// process has no window and macOS never makes it the active app, so waiting to become active waited forever and no request was made.
     /// macOS shows its own permission requests whichever process asks.
     @MainActor
-    private static func activationProblem() async -> String? {
-        guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
+    private static func activationProblem() -> String? {
         guard !NSApp.isActive else { return nil }
         let own = Bundle.main.bundleURL.standardizedFileURL.path
         if let front = NSWorkspace.shared.frontmostApplication,
@@ -139,6 +136,7 @@ extension SystemPermissionPreflight {
     /// just asked for it.
     @MainActor
     static func openSettings(_ capability: SystemPermissionCapability, registered: Bool = false) async -> String? {
+        guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
         if capability == .accessibility, !registered { registerForAccessibility() }
         guard let url = settingsURL(for: capability) else {
             return "NativeAgent could not find a System Settings privacy pane for \(capability.displayName)."

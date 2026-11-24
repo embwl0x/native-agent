@@ -1,0 +1,490 @@
+import Darwin
+import Foundation
+import MacNerves
+import NativeAgentCore
+import PersistenceCore
+import DeskCore
+import SenseCore
+import AppKit
+import NativeAgentShared
+import ProviderRouting
+import MindCore
+// Blueprint: | `BuilderProcess.swift` | Checked workspace and required SwiftPM shim admission before process launch; environment (the person's login PATH, as their terminal finds programs) and confinement |
+extension SwiftToolDispatcher {
+    // Escape SBPL literals so paths cannot alter confinement or credential/Trust denials.
+    static func sbplEscapeLiteral(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+    /// SwiftPM cannot nest its sandbox under the selected outer profile. Inject --disable-sandbox only for supported subcommands without an explicit flag; an
+    /// absolute real-driver path prevents recursion.
+    static func builderSwiftPMShimScript(realSwiftPath: String) -> String {
+        """
+        #!/bin/sh
+        # NativeAgent builder shim — generated, do not edit.
+        # sandbox-exec cannot nest, so SwiftPM's own manifest sandbox must be off
+        # while NativeAgent's outer profile provides the confinement.
+        real='\(realSwiftPath)'
+        case "$1" in
+          build|test|run|package)
+            sub="$1"
+            shift
+            for a in "$@"; do
+              if [ "$a" = "--disable-sandbox" ]; then
+                exec "$real" "$sub" "$@"
+              fi
+            done
+            exec "$real" "$sub" --disable-sandbox "$@"
+            ;;
+        esac
+        exec "$real" "$@"
+        """
+    }
+    /// Resolve the real driver outside the shim directory to prevent recursion.
+    static func builderRealSwiftPath() throws -> String {
+        let path = "/usr/bin/swift"
+        guard FileManager.default.isExecutableFile(atPath: path) else {
+            throw ToolFailureError("The required Swift driver is not executable.", effects: .none,
+                owner: path, code: "builder_swift_unavailable", instruction: """
+                    Repair the selected Xcode command-line toolchain before launching the sandboxed command.
+                    """)
+        }
+        return path
+    }
+    /// Shim preparation failures refuse launch at their cause. Executable staging stays in OS temp, outside backup/export/phone sync and the data-root
+    /// PrivacyMap.
+    static func builderSwiftPMShimDirectory(baseDirectory: URL? = nil) throws -> URL {
+        let realSwift = try builderRealSwiftPath()
+        let fm = FileManager.default
+        // Per-user private temp (/var/folders/<hash>/T, mode 700) — not the world-writable /tmp, so the shim cannot be pre-planted by another user.
+        let dir = (baseDirectory ?? fm.temporaryDirectory)
+            .appendingPathComponent(InstallPaths.current.name("nativeagent-swiftpm-shim"), isDirectory: true)
+        let shim = dir.appendingPathComponent("swift", isDirectory: false)
+        let script = builderSwiftPMShimScript(realSwiftPath: realSwift)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true,
+                               attributes: [.posixPermissions: 0o700])
+        // createDirectory leaves existing permissions unchanged.
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        if fm.fileExists(atPath: shim.path) {
+            let existing = try String(contentsOf: shim, encoding: .utf8)
+            if existing == script, fm.isExecutableFile(atPath: shim.path) { return dir }
+        }
+        // Publish only the complete executable body.
+        let staged = dir.appendingPathComponent("swift.staged-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: staged) }
+        try script.write(to: staged, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged.path)
+        if fm.fileExists(atPath: shim.path) {
+            _ = try fm.replaceItemAt(shim, withItemAt: staged)
+        } else {
+            try fm.moveItem(at: staged, to: shim)
+        }
+        // Replacement may preserve the destination inode's stale mode.
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shim.path)
+        return dir
+    }
+    static func builderSandboxProfile(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> String {
+        let writableRoots = builderAllowedRoots(dataRoot: dataRoot)
+            .map { #"          (subpath "\#(Self.sbplEscapeLiteral($0.path))")"# }
+            .joined(separator: "\n")
+        let home = Self.sbplEscapeLiteral(
+            URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path)
+        var seenTrustPaths = Set<String>()
+        let trustRules = builderWriteDeniedSubtrees(dataRoot: dataRoot).compactMap { url -> String? in
+            let path = url.path
+            guard seenTrustPaths.insert(path).inserted else { return nil }
+            return #"        (deny file-write* (subpath "\#(Self.sbplEscapeLiteral(path))"))"#
+        }.joined(separator: "\n")
+        // SBPL's last matching rule wins, so deny Trust writes after allowing workspace/cache writes. Reads, exec and network stay open for Git and package
+        // resolution; workspace_write confines writes, not secret reads.
+        return """
+        (version 1)
+        (allow default)
+        \(Self.sbplAutomationDenials)
+        (deny file-write*)
+        (allow file-write*
+        \(writableRoots)
+          (subpath "/tmp")
+          (subpath "/private/tmp")
+          (subpath "/private/var/folders")
+          (subpath "\(home)/Library/Caches")
+          (subpath "\(home)/Library/Developer")
+          (subpath "\(home)/.swiftpm")
+          (subpath "\(home)/.cache")
+          (literal "/dev/null"))
+        \(trustRules)
+        """
+    }
+    /// Developer Mode permits user-space writes but retains the system, credential and authority floor. Re-allow the canonical workspace after denying the data
+    /// root because public installs place it in Application Support.
+    static func builderDeveloperSandboxProfile(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> String {
+        let workspace = builderWorkspaceRoot(dataRoot: dataRoot)
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        var seen = Set<String>()
+        let denyRules = builderDeveloperProtectedRoots(dataRoot: dataRoot).compactMap { path -> String? in
+            guard seen.insert(path).inserted else { return nil }
+            return #"        (deny file-write* (subpath "\#(Self.sbplEscapeLiteral(path))"))"#
+        }.joined(separator: "\n")
+        let trustPath = dataRoot.appendingPathComponent("trust", isDirectory: true)
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        return """
+        (version 1)
+        (allow default)
+        \(Self.sbplAutomationDenials)
+        \(denyRules)
+        (allow file-write* (subpath "\(Self.sbplEscapeLiteral(workspace))"))
+        (deny file-write* (subpath "\(Self.sbplEscapeLiteral(trustPath))"))
+        """
+    }
+    /// Deny Apple Events and their transport after allow default to prevent delegated writes outside confinement.
+    static let sbplAutomationDenials = """
+        (deny appleevent-send)
+        (deny mach-lookup (global-name "com.apple.coreservices.appleevents"))
+        (deny mach-lookup (global-name "com.apple.appleeventsd"))
+    """
+    enum BuilderShellSandboxMode: String, Sendable {
+        case readOnly = "read_only"
+        /// Strict / locked-down posture keeps workspace confinement regardless of `securityPolicy.shellSandboxEnabled`.
+        case lockedDown = "locked_down"
+        case workspaceWrite = "workspace_write"
+        case developerFullMac = "developer_full_mac"
+        case off
+    }
+    /// Explicit Full Mac authority removes the workspace wrapper; the body must respect that choice.
+    static let builderYoloPermissionLevels: Set<String> = [
+        "full_mac_os",
+    ]
+    /// Trust selects confinement; locked-down mode overrides the saved sandbox-off setting.
+    static func builderShellSandboxMode(
+        dataRoot: URL
+    ) async throws -> BuilderShellSandboxMode {
+        let policy = try await SwiftNativeTrustCenter(
+            dataRoot: dataRoot
+        ).loadTrustPolicyChecked()
+        var permissionLevel = "balanced"
+        if case .string(let raw)? = policy["permissionLevel"] {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { permissionLevel = trimmed }
+        }
+        // Locked-down posture outranks the saved sandbox-off setting.
+        if permissionLevel == "strict" {
+            return .lockedDown
+        }
+        // Full Mac requires both explicit permission level and current authority.
+        if Self.builderYoloPermissionLevels.contains(permissionLevel), PermissionLaw.posture(policy) == .fullMac {
+            return .off
+        }
+        if case .bool(true)? = policy["developerMode"] {
+            return .developerFullMac
+        }
+        if case .object(let sec)? = policy["securityPolicy"],
+           case .bool(let enabled)? = sec["shellSandboxEnabled"] {
+            return enabled ? .workspaceWrite : .off
+        }
+        return .workspaceWrite
+    }
+    /// Share Trust's sandbox, admitted cwd and PATH shim across shell and part launches; an unadmitted starting folder cannot run.
+    struct BuilderLaunch: Sendable {
+        let mode: BuilderShellSandboxMode
+        let executable: String
+        let arguments: [String]
+        let cwd: String
+        let pathPrefix: String?
+        let environment: [String: String]?
+    }
+    static func builderLaunch(turn: Turn, executable: String, args: [String], cwd: String, dataRoot: URL,
+        readWords: [String]? = nil) async throws -> BuilderLaunch? {
+        // The workspace is infrastructure, not a model-created side effect. Launch prepares it for every entry surface.
+        _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
+        // Resolve the effective confinement posture before cwd validation. Full Mac YOLO deliberately removes the workspace wrapper, so it must also be able to
+        // start in a user-selected external project. Ordinary modes retain the canonical workspace/source-checkout boundary.
+        let mode = try await builderShellSandboxMode(dataRoot: dataRoot)
+        let directory = builderNormalizeCwd(cwd, dataRoot: dataRoot, allowOutsideWorkspace: mode == .off)
+        guard directory.rejection == nil else { return nil }
+        let resolvedCwd = directory.path
+        if let readWords {
+            let read = FileReadSourceMaterial.shellReadLaunch(words: readWords, cwd: resolvedCwd, dataRoot: dataRoot, turn: turn)
+            return BuilderLaunch(mode: .readOnly, executable: "/usr/bin/sandbox-exec", arguments: read.arguments,
+                                 cwd: resolvedCwd, pathPrefix: nil, environment: read.environment)
+        }
+        // sandbox-exec replaces itself with the target, so watchdog signals reach the command's pid/pgid.
+        guard mode != .off else {
+            return BuilderLaunch(mode: mode, executable: executable, arguments: args, cwd: resolvedCwd, pathPrefix: nil, environment: nil)
+        }
+        let profile = mode == .developerFullMac ? builderDeveloperSandboxProfile(dataRoot: dataRoot) : builderSandboxProfile(dataRoot: dataRoot)
+        let shim = try builderSwiftPMShimDirectory()
+        return BuilderLaunch(mode: mode, executable: "/usr/bin/sandbox-exec", arguments: ["-p", profile, executable] + args,
+                             cwd: resolvedCwd, pathPrefix: shim.path, environment: nil)
+    }
+    static func runShellLikeProcess(
+        turn: Turn,
+        toolName: String,
+        executable: String,
+        args: [String],
+        cwd: String,
+        timeoutSeconds: Int,
+        sourcePayloadForAudit: String? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        // Scrub external-agent environments to protect provider keys and bridge credentials; reap descendants so they cannot outlive the run or its directory.
+        environmentOverride: [String: String]? = nil,
+        closeStandardInput: Bool = false,
+        reapDescendantsOnExit: Bool = false,
+        exitIsAnswer: Bool = false,
+        // Streaming output feeds live progress without changing the command envelope.
+        onStdoutLine: (@Sendable (String) -> Void)? = nil
+    ) async -> JSONValue {
+        // Allocate run identity and start time before validation so pre-spawn failures receive audit receipts.
+        let runId = UUID().uuidString
+        let started = Date()
+        let readWords = ["shell", "bash"].contains(toolName)
+            ? sourcePayloadForAudit.flatMap { AuthoredToolEffects.shellReadOnlyWords(["cmd": .string($0)]) } : nil
+        // Retain a pre-spawn audit when cwd admission fails; surface audit_error too if recording that refusal fails.
+        let checkedLaunch: BuilderLaunch?
+        do { checkedLaunch = try await builderLaunch(turn: turn, executable: executable, args: args, cwd: cwd, dataRoot: dataRoot, readWords: readWords) }
+        catch { return ChatToolOutcome.failure(error: error, tool: toolName, effects: ToolFailureError.Effects.none) }
+        guard let launch = checkedLaunch else {
+            return shellInvalidDirectoryReceipt(toolName: toolName, runId: runId, started: started, cwd: cwd,
+                executable: executable, args: args, dataRoot: dataRoot)
+        }
+        let clampedTimeout = builderEffectiveTimeoutSeconds(timeoutSeconds)
+        let sandboxMode = launch.mode, resolvedCwd = launch.cwd
+        let sandboxed = sandboxMode != .off
+        let (process, resolvedCompatRewrites) = await configureShellProcess(turn: turn, launch: launch, resolvedCwd: resolvedCwd,
+            environmentOverride: environmentOverride, closeStandardInput: closeStandardInput)
+        @Sendable func spawnFailure(_ error: any Error) -> JSONValue {
+            shellSpawnFailure(error, toolName: toolName, runId: runId, started: started, resolvedCwd: resolvedCwd,
+                executable: executable, args: args, sandboxed: sandboxed, dataRoot: dataRoot)
+        }
+        let outputCapture: InvokeOutputCapture
+        do {
+            outputCapture = try InvokeOutputCapture(process: process,
+                stdoutCap: 16 * 1024 * 1024, stderrCap: 16 * 1024 * 1024, onStdoutLine: onStdoutLine)
+        } catch {
+            return await settle { spawnFailure(error) }
+        }
+        return await SubprocessWork(process).run(
+            timeoutSeconds: clampedTimeout, reapDescendantsOnExit: reapDescendantsOnExit
+        ) { exit in
+            let (stdoutText, stderrText) = outputCapture.finish(appendTruncationNotes: false)
+            if let error = exit.launchError {
+                return spawnFailure(ToolFailureError(error, effects: .none, code: "spawn_failed"))
+            }
+            let pipeTruncated = outputCapture.truncated
+            return shellExitReceipt(exit, toolName: toolName, runId: runId, started: started, clampedTimeout: clampedTimeout,
+                resolvedCwd: resolvedCwd, executable: executable, args: args, stdoutText: stdoutText, stderrText: stderrText,
+                pipeTruncated: pipeTruncated, sandboxed: sandboxed, sandboxMode: sandboxMode, sourcePayloadForAudit: sourcePayloadForAudit,
+                resolvedCompatRewrites: resolvedCompatRewrites, dataRoot: dataRoot, exitIsAnswer: exitIsAnswer)
+        }
+    }
+
+    /// Record the refusal when the working directory is outside the admitted workspace.
+    private static func shellInvalidDirectoryReceipt(toolName: String, runId: String, started: Date, cwd: String,
+        executable: String, args: [String], dataRoot: URL) -> JSONValue {
+        let auditEntry: [String: Any] = [
+            "toolName": toolName,
+            "runId": runId,
+            "createdAt": NativeTimestampFormat.plainZulu(started),
+            "completedAt": NativeTimestampFormat.plainZulu(Date()),
+            "status": "failed_pre_spawn",
+            "reason": "cwd_invalid_or_outside_workspace",
+            "cwd_requested": cwd,
+            "workspace_root": builderWorkspaceRoot(dataRoot: dataRoot).path,
+            "executable": executable,
+            "args": args,
+            "outer_sandbox_policy": "policy",
+        ]
+        let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
+        var env: [String: JSONValue] = [
+            "status": .string("failed"),
+            "effects": .string("none"),
+            "tool": .string(toolName),
+            "reason": .string("cwd_invalid_or_outside_workspace"),
+            "execution": .string("not_run"),
+            "effect": .string("none"),
+            "detail": .string("cwd is not an existing folder this action may work in; use one inside workspace_root. Nothing ran."),
+            "cwd_requested": .string(cwd),
+            "workspace_root": .string(builderWorkspaceRoot(dataRoot: dataRoot).path),
+            "source_checkout_available": .bool(builderSourceRepoRoot(dataRoot: dataRoot) != nil),
+            "runId": .string(runId),
+            "audit_path": .string(auditURL.path),
+            "outer_sandbox_policy": .string("policy"),
+        ]
+        if let auditErr { env["audit_error"] = .string(auditErr) }
+        return .object(env)
+    }
+
+    /// Configure the admitted process and capture any environment rewrites.
+    private static func configureShellProcess(turn: Turn, launch: BuilderLaunch, resolvedCwd: String,
+        environmentOverride: [String: String]?, closeStandardInput: Bool) async -> (ManagedProcess, [String]) {
+        let process = ManagedProcess()
+        // The call waiting on this command watches it: its output and processor time are the call's life.
+        process.life = turn.enclosingCall
+        process.executableURL = URL(fileURLWithPath: launch.executable)
+        process.arguments = launch.arguments
+        // SwiftPM's manifest sandbox cannot nest. Put the --disable-sandbox shim first on PATH while the outer profile retains write confinement.
+        // Her shell finds programs the way the person's own terminal does: the login PATH once it reads, else the app's own.
+        var env = launch.environment ?? environmentOverride ?? {
+            var own = ManagedProcess.agentEnvironment()
+            if case .success(let login) = AgentHostCommandLines.loginEnvironment, let path = login["PATH"] { own["PATH"] = path }
+            return own
+        }()
+        var effectiveCompatRewrites: [String] = []
+        let developerDirectory = await Self.builderSelectedDeveloperDirectory(environment: env)
+        let developerPromptPolicy = Self.builderEnvironmentSuppressingDeveloperToolsPrompt(
+            environment: env,
+            selectedDeveloperDirectory: developerDirectory
+        )
+        env = developerPromptPolicy.environment
+        if developerPromptPolicy.suppressed {
+            effectiveCompatRewrites.append(
+                "suppressed interactive Apple developer-tools install prompt; install Xcode Command Line Tools manually to use Apple toolchain shims"
+            )
+        }
+        let resolvedCompatRewrites = effectiveCompatRewrites
+        if let shimDir = launch.pathPrefix {
+            let existingPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            env["PATH"] = shimDir + ":" + existingPath
+        }
+        process.environment = env
+        process.currentDirectoryURL = URL(fileURLWithPath: resolvedCwd)
+        if closeStandardInput { process.standardInput = FileHandle.nullDevice }
+        process.qualityOfService = .utility
+        return (process, resolvedCompatRewrites)
+    }
+
+    /// Record launch or pipe setup failure before the command runs.
+    private static func shellSpawnFailure(_ error: any Error, toolName: String, runId: String, started: Date, resolvedCwd: String,
+        executable: String, args: [String], sandboxed: Bool, dataRoot: URL) -> JSONValue {
+        let spawnAudit: [String: Any] = [
+            "toolName": toolName,
+            "runId": runId,
+            "createdAt": NativeTimestampFormat.plainZulu(started),
+            "completedAt": NativeTimestampFormat.plainZulu(Date()),
+            "status": "failed_pre_spawn",
+            "reason": "spawn_failed",
+            "detail": ChatToolOutcome.errorMessage(error),
+            "cwd": resolvedCwd,
+            "executable": executable,
+            "args": args,
+            "sandboxed": sandboxed,
+            "outer_sandbox_policy": "policy",
+        ]
+        let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: spawnAudit, dataRoot: dataRoot)
+        var env = Self.builderFailureFields(error,
+            tool: toolName, reason: "spawn_failed", effects: .none,
+            owner: "process launch for \(executable) in \(resolvedCwd)",
+            instruction: "Repair the reported executable, working-directory or pipe error before another command. Nothing ran.")
+        env.merge([
+            "execution": .string("not_run"),
+            "effect": .string("none"),
+            "runId": .string(runId),
+            "sandboxed": .bool(sandboxed),
+            "outer_sandbox_policy": .string("policy"),
+            "audit_path": .string(auditURL.path),
+        ], uniquingKeysWith: { _, receipt in receipt })
+        if let auditErr { env["audit_error"] = .string(auditErr) }
+        return .object(env)
+    }
+
+    /// Write the exit audit and present the bounded command receipt during settlement.
+    private static func shellExitReceipt(_ exit: SubprocessWork.Exit, toolName: String, runId: String, started: Date, clampedTimeout: Int,
+        resolvedCwd: String, executable: String, args: [String], stdoutText: String, stderrText: String, pipeTruncated: Bool,
+        sandboxed: Bool, sandboxMode: BuilderShellSandboxMode, sourcePayloadForAudit: String?, resolvedCompatRewrites: [String],
+        dataRoot: URL, exitIsAnswer: Bool) -> JSONValue {
+        let exitCode = exit.code
+        let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+        // A launched shell timeout is command data; an explicit Stop is cancellation.
+        let timeoutIsAnswer = exitIsAnswer && exit.launched && exit.timedOut
+        let status = exit.terminationError != nil ? "failed" : exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0
+            ? "completed" : "failed"
+        var auditEntry: [String: Any] = [
+            "toolName": toolName,
+            "runId": runId,
+            "createdAt": NativeTimestampFormat.plainZulu(started),
+            "completedAt": NativeTimestampFormat.plainZulu(Date()),
+            "status": status,
+            "durationMs": durationMs,
+            "timeoutSecondsEffective": clampedTimeout,
+            "timedOut": exit.timedOut,
+            "exitCode": Int(exitCode),
+            "processExitCode": Int(exitCode),
+            "cwd": resolvedCwd,
+            "executable": executable,
+            "args": args,
+            "stdout_len": stdoutText.count,
+            "stderr_len": stderrText.count,
+            "stdout": stdoutText,
+            "stderr": stderrText,
+            "pipe_truncated": pipeTruncated,
+            "sandboxed": sandboxed,
+            "sandbox_mode": sandboxMode.rawValue,
+            "outer_sandbox_policy": "policy",
+        ]
+        if let error = exit.terminationError { auditEntry["terminationError"] = error }
+        if let sourcePayloadForAudit { auditEntry["sourcePayload"] = sourcePayloadForAudit }
+        if exit.stopped { auditEntry["reason"] = exit.timedOut ? "watchdog_timeout" : "stopped" }
+        if !resolvedCompatRewrites.isEmpty {
+            auditEntry["compat_rewrites"] = resolvedCompatRewrites
+        }
+        let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
+        // Keep 8 KiB of head and 24 KiB of tail: command/root-cause context and final errors survive the 32 KiB envelope cap.
+        let (envStdout, envStdoutTruncated) = SwiftToolDispatcher.headTailPreserve(
+            stdoutText, headBudget: 8_192, tailBudget: 24_576)
+        let (envStderr, envStderrTruncated) = SwiftToolDispatcher.headTailPreserve(
+            stderrText, headBudget: 8_192, tailBudget: 24_576)
+        var envelope: [String: JSONValue] = [
+            "status": .string(status),
+            "tool": .string(toolName),
+            "runId": .string(runId),
+            "exit_code": .int(Int64(exitCode)),
+            "process_exit_code": .int(Int64(exitCode)),
+            "stdout": .string(envStdout),
+            "stderr": .string(envStderr),
+            "durationMs": .int(Int64(durationMs)),
+            "timeout_seconds_effective": .int(Int64(clampedTimeout)),
+            "timed_out": .bool(exit.timedOut),
+            "ran": .bool(exit.launched),
+            "execution": .string(exit.launched ? "executed" : "not_run"),
+            "cwd": .string(resolvedCwd),
+            "sandboxed": .bool(sandboxed),
+            "sandbox_mode": .string(sandboxMode.rawValue),
+            "outer_sandbox_policy": .string("policy"),
+            "audit_path": .string(auditURL.path),
+        ]
+        if exitIsAnswer {
+            envelope["summary"] = .string(exit.launched
+                ? "Ran · exit \(exitCode)" + (exit.timedOut ? " · timed out after \(clampedTimeout) s" : "")
+                : "Stopped before launch")
+        }
+        if let error = exit.terminationError {
+            envelope["reason"] = .string("process_termination_incomplete")
+            envelope["effects"] = .string("unknown")
+            envelope["detail"] = .string(error)
+            envelope["remedy"] = Repair.reconcile(instruction: "Inspect the command's existing effects and repair its process group before repeating work.",
+                nextCall: .object(["tool": .string("app"), "input": .object(["find": .string("shell")])]))
+        } else if exit.timedOut {
+            if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
+            envelope["detail"] = .string("""
+                The process exceeded the effective \(clampedTimeout)-second builder timeout and its owned process group was terminated. \
+                Check what changed before retrying. If a native action handles the remaining work, use its receipt.
+                """)
+        } else if exit.stopped {
+            envelope["reason"] = .string("stopped")
+            envelope["detail"] = .string(exit.launched
+                ? "Stopped the owned process group. Captured output is saved in the audit; any changes already made remain."
+                : "Stopped before launch. Nothing ran.")
+        }
+        if !resolvedCompatRewrites.isEmpty {
+            envelope["compat_rewrites"] = .array(resolvedCompatRewrites.map { .string($0) })
+        }
+        if envStdoutTruncated || envStderrTruncated || pipeTruncated {
+            envelope["_truncated"] = .bool(true)
+        }
+        if let auditErr { envelope["audit_error"] = .string(auditErr) }
+        return .object(envelope)
+    }
+}

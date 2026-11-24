@@ -30,7 +30,8 @@ requests offer it alone. The schema is defined in
 | `app {"page":"home"}` | Their work, arrivals, conversations and places. |
 | `app {"item":"<name or ref>","args":{…}}` | Open or act on a name returned by the glance, home or one of its rooms. Message arguments are `text`, optional `conversation` and `expects_reply`. Named fields go in an action's `args`. |
 | `app {"page":"home","find":"<words>"}` | Discover matching pages, actions and skills, just like find alone. |
-| `app {"page":"<page>","item":"<optional item>"}` | Read a page or one of that page's items. Page reads return a version and registered actions, including unavailable ones with their blocker. |
+| `app {"page":"<page>","item":"<optional item>"}` | Read a page or one of that page's items. Page reads return content first, then a version and `page_actions` (action ids plus a catalog link). Bound row actions carry their exact calls. |
+| `app {"page":"<page>","item":"actions"}` | Read the page's action catalog for signatures, descriptions and blockers, independently of the page content. |
 | `app {"find":"<words>"}` | Discover matching pages, actions and skills. |
 | `app {"action":"find","args":{"what":"<words>"}}` | The same discovery reader; `query` is an alternative to `what`. |
 | `app {"action":"<id>","args":{…}}` | Run one registered action. |
@@ -81,7 +82,8 @@ arguments are therefore never matched. Under `preview`, a step that was only
 described has no result: its `expect` is not judged, which its receipt says,
 and a `found` into it cannot be resolved.
 Each step's owner reports whether it ran or was previewed; the batch aggregates
-those outcomes. A preview beside a completed change never relabels the batch
+those outcomes. A list that fills its requested page counts as complete even when more rows remain. The receipt keeps its continuation and any independent coverage gaps.
+A preview beside a completed change never relabels the batch
 as `preview`. An empty `find` returns `ok` with `reason: no_match` and does not
 stop later changes. Stop before the first step returns `canceled`; Stop after
 a step retains `partial` and the individual receipts.
@@ -174,15 +176,19 @@ Context atom pointers remain limited to the serving turn's offered generation.
 An unreadable transcript remains a named coverage gap, never proof of absence.
 
 For actions, `preview:true` reports proposed effects without performing them.
-Native preflight checks policy and selected targets; authored preview runs live
-reads with writes previewed; resume preview only inspects stopped work.
+Native preflight checks policy and selected targets. An authored preview passes
+the ability's own admission. Registered reads run live when their arguments are
+read-only and serving them preserves read positions, learning and follow-ups.
+Other steps stay previewed. Each reached step reports its execution, and each
+live read carries its preview context in the trace. Resume preview only inspects
+stopped work. See the [read decisions](skill_manifest_spec.md#preview-read-decisions).
 Before a Trust refusal or approval, argument-only preflight validates the declared
 schema and returns without executing an authored part or reading its live targets.
 Scalar-list calls validate each element without dispatching a batch; this preflight
 scope travels with the invocation through dispatcher forwarding. An unresolved
 action refuses without opening a corrected read.
 `expected_version` can guard against a page changing after it was read.
-An `ok` or `partial` page supplies the same version check and action readback;
+An `ok` or `partial` content read supplies the same version check and action readback;
 the partial page retains its named read failures.
 Trust's cloud voice, screen capture and image generation settings require a
 readable features policy; an unavailable policy cannot acknowledge a no-op.
@@ -311,10 +317,23 @@ declares `when` as one string or a schedule object with the rhythm grammar's
 fields. Cross-field timing and accounting relationships remain checked by their
 owners. The loose object declarations for these structured values are removed.
 
-The built-in catalog checks discovery's argument schemas when it initializes
-at launch. An object argument without fields is refused as a programmer error
-unless its declaration explicitly marks it open: `:object*`, or an owner schema
-with `additionalProperties:true` or a schema for map values. Ability-validation
+Built-in actions declare their argument names, optionality and shapes at their
+domain declaration. A structured record names its first field and any remaining
+fields. A closed empty record declares that shape explicitly. An open record
+declares its purpose and whether its wire schema omits `additionalProperties`,
+sets it to `true`, or specifies a value schema. Authored actions and folds can
+take their shapes from the schema their owner supplies. Discovery, binding,
+credential redaction and the launch hand use the public action's projection.
+
+The engine holds the native action owners. Each native descriptor supplies its
+parameter schema and handler. Dispatch carries the held turn and invocation to
+that handler. The desktop courier takes its five schemas from the same
+descriptors and applies its request budget and focus checks for that delivery.
+The model-facing `app` schema draws the launch forms from `ToolSignature.call`.
+The appendix lists changed or added forms, removed or disabled identifiers,
+and gaps reported by the owner of each unavailable part of the hand.
+
+Ability-validation
 input names the schema that determines its contents. Ability saves take
 `params` and `reach`; retired `input_schema` and `permissions` arguments refuse.
 `params` accepts description strings and `{type,description?}` declarations,
@@ -445,16 +464,19 @@ so their hand is whole before anything asks for it), by one SQLite query
 (`TurnTracePersistLane.doneVerbs`); after that each deed joins their done set in
 memory as its row is written, never by another query. A turn's catalog is
 collected once (`modelSchemas`, which the dispatcher serves) and that turn's
-rounds keep it. The door holds the first drawing's verb set for the process;
-later done verbs ride the volatile catalog in the same alphabetical one-line
-forms, on text-marker and native-tool requests, and enter the door at relaunch.
-Ability definition changes (`AbilityStore.didChange`, not run accounting) can
-redraw the held hand; byte-identical forms keep the door it had. The registered descriptor keeps
-the first drawing, as a registered descriptor must. A newborn agent's hand is
+rounds keep it. **Once the door has drawn forms, its tool schema is frozen for
+the process. Abilities added, changed, removed or disabled after launch are
+listed in the volatile catalog appendix until relaunch. What they can call is
+unchanged.** (User's word, 2026-11-22.) Later done verbs also ride the appendix.
+Both native-tool and text-marker requests carry current forms and the IDs of
+removed or disabled abilities seen in the checked catalog. If the launch
+inventory cannot be read, the next collection attempts the first drawing again.
+A newborn agent's hand is
 what it was born knowing; an unreadable record, an unread inventory or an
 unrendered verb is traced as `app.hand` and never fails a turn. Checked schemas
 and examples still arrive through discovery.
-A failed later-verb inventory read also appends `Hand gap (catalog): <same cause>` to the volatile catalog; the door stays held.
+A failed later-verb inventory read appends `Hand gap (catalog): <same cause>`
+beside the last confirmed forms and removal notices in the volatile catalog.
 
 Settings propagate unavailable model/account catalogs, Trust/Slack policy, helper
 definitions, shelf and trigger reads. Thinking levels come only from the selected
@@ -545,7 +567,11 @@ transient menu items preserve the unknown state. Pointer verbs with
 unreadable target geometry report `target_geometry_unavailable`, without claiming
 the verb is unsupported.
 AX read failures carry their cause; they never establish enabled state, an empty
-subtree or a clear screen. A scoped look that cannot find its section refuses
+subtree or a clear screen. For lists, tables and outlines, the walk uses the same
+visible count for the on-screen summary and the bounded child read. It checks
+AXVisibleRows, AXVisibleChildren and AXChildren in that order, advancing on
+an unsupported attribute. Menu command and visibility fields share the element's attribute batch.
+A scoped look that cannot find its section refuses
 with a discovery instruction. A wait that cannot subscribe to the app's
 changes refuses rather than sampling after subscription failure.
 An AX write, including an unsupported one, returns its own outcome and readback;
@@ -615,12 +641,16 @@ Argument interpretation belongs to the shared action binding described above.
 Current internal executors direct callers to their app action;
 provider-safe wire names remain a separate transport encoding.
 The single name declaration is
-[`ToolNameAliases.canonical`](../Modules/NativeAgentCore/Sources/ToolRegistry/ToolNameAliases.swift):
+[`ToolNameAliases.canonical`](../Modules/NativeAgentCore/Sources/DeskCore/ToolRegistry/ToolNameAliases.swift):
 executor names receive whitespace trimming only.
 
-App actions and native executors use
-[`ToolArguments.admit`](../Modules/NativeAgentCore/Sources/ChatToolRuntime/ToolArguments.swift)
-to check normalized arguments against the current owner's schema before execution.
+The door checks normalized arguments against the owner's schema before execution.
+A malformed call returns an argument refusal. An unreadable schema returns a catalog
+failure. Native action descriptors derive that schema from their typed fields.
+The invocation holds the decoded arguments for the exact call so preflight, approval
+wording and execution read the same value. The action context carries private transport
+metadata for the handler. See [DoorArgs.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatToolRuntime/DoorArgs.swift)
+and [ActionDescriptor.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatToolRuntime/ActionDescriptor.swift).
 Required fields, types, bounds and undeclared public root arguments are checked; native
 transport metadata stays outside the public argument object. Resident and helper
 model calls and their batch entries lose every `__` root field at their shared
@@ -728,8 +758,8 @@ provider selection.
   optional `id` binding it to that ability before claiming the run. Full Mac
   can keep their own save immediately; other keeps require rehearsal (`ability.validate`) and the
   owner's exact-version card. The owner's off-switch remains theirs. Code,
-  reach, input schema and fixtures share one candidate and admission, checked
-  on every run. Authoring uses only these current action names; retired names
+  reach, input schema, fixtures and sandboxed ESTree analysis share one candidate and admission, checked
+  on every run. Retained admissions keep their identity and their exact body supplies any analysis still needed. Authoring uses only these current action names; retired names
   remain unknown under the [dispatch contract](#no-loading-lifecycle).
   At launch, a changed bundled seed replaces an untouched installed seed,
   keeping the old version as previous; authored edits are preserved. The seed
@@ -763,7 +793,7 @@ a verb that reads the person's files with no app switch over them needs admitted
 
 ## Scripts
 
-`AppScriptRunner` binds the door to [`OwnedProgramRunner`](../Modules/NativeAgentCore/Sources/Senses/OwnedProgramRunner.swift) for fresh JavaScriptCore execution with
+`AppScriptRunner` binds the door to [`OwnedProgramRunner`](../Modules/NativeAgentCore/Sources/SenseCore/Senses/OwnedProgramRunner.swift) for fresh JavaScriptCore execution with
 `app.<action>(args)`, `app.call(id, args)`, `app.read`, `app.find` and `app.log`.
 No direct filesystem, network, process or timer API is exposed; every nested app call re-enters the same gate chain.
 The callable `app({action, args, preview?, expected_version?})` form and each
@@ -836,6 +866,51 @@ carrying it ([receipts](#authority-and-receipts)). Retention failures are explic
 outcome.
 
 ## Authority and receipts
+
+Each new call starts at `DoorPipeline.dispatch` with its held turn. In order, the
+pipeline intersects the request's file ceiling, binds the call and its re-entry
+door, opens its dispatch trace, checks peer provenance, and binds helper or
+waiting-host work. Trust then judges the exact call, checks any claimed replay
+against the spent approval, and decides whether to refuse, ask or run. An
+admitted call runs with its own injection capability and verified session.
+`executeAdmitted` consumes one `SecurityToolAdmission` holding the tool, input,
+surface and turn. It cannot be stored on the invocation or passed on to a nested
+call. If argument normalization changes that input, the executor still refuses it.
+Outcome accounting and peer labelling finish inside the trace. Workspace tab
+cleanup and arrival notices follow it.
+
+Work that resolves or completes an admitted call keeps that admission.
+Only the exact call named by a card can
+spend its approval. Full Mac still respects authenticated origin, the request
+ceiling, explicit blocks, integration switches and macOS grants.
+
+Native actions and tool schemas declare their effects as `CapabilitySet`
+members. Trust judges those bits directly. Receipts encode their sorted wire
+names, and decoding an unknown effect name fails. A part's JS header declares
+its reach through `PartReachGrant`, including exact app and secret grants.
+When a native caller limits a part's reach, every declared permission must
+match a wire name in the caller's ceiling.
+
+| Entry | Source | Where admission runs |
+|---|---|---|
+| Batch steps and determined reads | [AppDoorPrograms.swift:201](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppDoorPrograms.swift#L201) | Each step and each follow-up read re-enters. The batch checks steering and Stop between steps. |
+| JavaScript app calls | [AppDoorPrograms.swift:39](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppDoorPrograms.swift#L39) | Each call re-enters after the script checks credentials. |
+| Authored actions and part calls | [AppScriptRunner.swift:351](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppScriptRunner.swift#L351) | Each call re-enters with its declared reach and originating turn. |
+| New host operations | [AppActionEnvironment.swift:195](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppActionEnvironment.swift#L195) | Each primitive re-enters. Its deferred body runs inside that admission. |
+| Part thoughts | [PartThoughtTools.swift:56](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/PartThoughtTools.swift#L56) | Each host call re-enters with the original user text and declared actions. |
+| Desktop courier | [DesktopAgentConversationRoute.swift:218](../Modules/NativeAgentCore/Sources/BodyRuntime/Agents/DesktopAgentConversationRoute.swift#L218) | The scoped action re-enters after the courier checks its call budget and target. |
+| Folds and mail locators | [AppToolExecutor.swift:360](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppToolExecutor.swift#L360) | The folded executor re-enters under its own name. For `mail.read` and `mail.triage`, the call carries the locator resolved from the workspace name. |
+| Plural calls | [AppToolExecutor+AppDoor.swift:688](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppToolExecutor+AppDoor.swift#L688) | Expansion stays inside the admitted plural action. Each scalar re-enters as a batch step. |
+| Home and page names | [AppToolExecutor+AppDoor.swift:520](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppToolExecutor+AppDoor.swift#L520) | Page and item resolution stays inside the call. When Home selects an owner tool, that tool re-enters. |
+| Permission remedies | [AppActionEnvironment.swift:112](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppActionEnvironment.swift#L112) | The permission request re-enters with the originating conversation. |
+| Contact messages | [CanonicalToolNameDispatcher.swift:277](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatToolRuntime/CanonicalToolNameDispatcher.swift#L277) | Contact coordination opens or resumes the exchange before the transport call re-enters. A pending send records the card on that exchange so approval resumes the same send. |
+| Helper runs | [CanonicalToolNameDispatcher.swift:232](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatToolRuntime/CanonicalToolNameDispatcher.swift#L232) | When the conversation needs to queue a run, its callback continues to Trust with the exact input. Only that queue call spends the grant. |
+| Desk titles and numbered aliases | [ActionRuntime.swift:160](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatToolRuntime/ActionRuntime.swift#L160) | Inside the admitted mutation, resolve the handle and check its hold before changing the item. |
+| Undo replay | [AppToolExecutor+AppDoor.swift:508](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppToolExecutor+AppDoor.swift#L508) | Inside the approved call, check the action and the conversation’s last receipt, then run the inverse with that receipt. |
+| Native calls and person taps | [EngineTools.swift:201](../Modules/NativeAgentCore/Sources/BodyRuntime/EngineRuntime/EngineTools.swift#L201) | The native owner enters with its envelope. A tap verifies the sender before supplying the person’s act. |
+| Approved replay | [ApprovalSettlement.swift:174](../Modules/NativeAgentCore/Sources/BodyRuntime/ApprovalTransactions/ApprovalSettlement.swift#L174) | Replay re-enters with the card payload. The inbox spends first. The pipeline verifies the exact call and origin. |
+| Peer wakes and carried work | [EnginePartWake.swift:512](../Modules/NativeAgentCore/Sources/BodyRuntime/EngineRuntime/EnginePartWake.swift#L512) | Each admitted wake or carried step enters with its steering. A tainted write-capable wake ends before dispatch. |
+| Model calls, Stop and receipts | [ChatOrchestration+ToolDispatch.swift:751](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatTurnRuntime/ChatOrchestration+ToolDispatch.swift#L751) | Each proposed call enters the pipeline. A traced call settles its terminal event on the originating bus, including after Stop. |
 
 Registry discovery fails explicitly if its required `ability.read` action is
 missing; it cannot publish a skill inventory without that canonical reader.
@@ -980,7 +1055,7 @@ not a window multiplier.
 Presentation preserves each source's availability. Quiet pages name a failed or
 not-yet-read source with a repair issue instead of current counts. Complete
 transcript, activity and capability reads refuse rejected records; part names
-use the shared [Parts read schema](../Modules/NativeAgentCore/Sources/AuthoredCapabilities/Parts.swift)
+use the shared [Parts read schema](../Modules/NativeAgentCore/Sources/SenseCore/AuthoredCapabilities/Parts.swift)
 across the Tools page, phone catalog and capability inventory, retaining name
 damage on its unavailable row while siblings publish.
 Attachment metadata uses the shared codec: identity/type are required, recorded
@@ -1053,7 +1128,8 @@ Independent Trust and domain gates, including destructive actions and privacy
 resets, remain. Reading agent words, conversing with agents or instructing them
 does not itself steer a turn or ask for approval. `SecurityCenter` and
 `PeerTurnEffectPolicy` own those decisions. Agents enabled in Trust → Connected agents carry the owner's
-authority on authenticated turns; ordinary Trust and domain checks still apply.
+authority on authenticated turns. Ability writes recheck each peer's grant in the turn's data root
+unless the person explicitly elevated that peer for the task. Ordinary Trust and domain checks still apply.
 
 `inbox.approve` and `inbox.deny` answer one exact pending approval id on the
 person's own message from Mac chat, a signed paired-phone chat or an allowlisted
@@ -1086,7 +1162,7 @@ scripts and batches therefore close message authority, including failed calls.
 Nested model executions retain that evidence. Missing call evidence and checkpoint resumes also refuse. The refusal says
 to read the card first or ask the person to tap; the agent can answer in a fresh
 message. This restriction belongs to approval authority, not `PeerDataTaint`'s
-initiating-steering policy. Taps retain their verified authority.
+initiating-steering policy, which reads grants in the data root held by the turn. Taps retain their verified authority.
 
 Outside text from an earlier turn can still be in the agent's context. A message
 decision is the agent's judgment on the person's authenticated message, not proof
@@ -1104,7 +1180,7 @@ keeps its cause and any completed grant writes on the receipt; successful
 setup still requires the resolver's authority readback before success.
 
 A call result whose owned `remedy.next_call` is `permissions.request` files
-that action automatically on its return through `AppChatToolDispatcher`.
+that action automatically when `AppActionEnvironment.filePermissionRemedy` receives the result.
 The same gated action checks whether access is already allowed; otherwise
 the transcript owner saves a permission card or reuses the open card for that
 capability, including simultaneous requests and cards indexed from other
@@ -1181,7 +1257,7 @@ All paths below are under `Modules/NativeAgentCore/Sources/`.
 | `AppToolRuntime/AppToolExecutor+AppDoor.swift`, `AppDoorReading.swift`, `AppDoorPrograms.swift`, `AppDoorActions.swift` | One door interprets home, pages, previews, scripts, batches and action dispatch. |
 | `AppToolRuntime/AppScriptRunner.swift` | Door binding to the shared executor. |
 | `ToolRegistry/ToolNameAliases.swift` | Action translations and underlying dispatch identity. |
-| `ChatToolRuntime/SwiftToolDispatcher+ToolCatalog.swift` | The single always-on name. |
+| `ChatToolRuntime/ActionRuntime+Catalog.swift` | The single always-on name. |
 | `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift`, `ChatTurnSettlement.swift` | Request filtering and `tools.contract` traces. |
 | `Research/Research+WebSearch.swift` | Search routing. |
 

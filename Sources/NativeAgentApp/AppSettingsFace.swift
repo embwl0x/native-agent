@@ -1,11 +1,8 @@
 import AppKit
-import AppToolRuntime
-import ChatSessionWork
-import EngineRuntime
+import BodyRuntime
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-import Cognition
 import Observation
 import PersistenceCore
 // Blueprint: | `AppSettingsFace.swift` | Settings face platform rows and their Mac verbs: the updater, data reference, clipboard and live app status |
@@ -162,6 +159,7 @@ enum SoftwareUpdateRowPresentation {
 final class SettingsFaceUpdates {
     private let task: Task<Void, Never>
     private let preferences: Task<Void, Never>
+    private let embeddings: Task<Void, Never>
 
     private struct Reading: Equatable {
         let updates: SoftwareUpdateSettingsFace.Source
@@ -172,21 +170,31 @@ final class SettingsFaceUpdates {
         let shortcut: String?
         let health: RuntimeHealth?
         let refreshError: String?
-        let embedding: [String?]
+        let embeddingsError: String?
     }
 
     init(_ appModel: AppModel) {
-        task = Task { @MainActor [weak appModel] in
+        let changes = Observations { [weak appModel] in appModel.map(Self.read) }
+        task = Task { [weak appModel] in
             var previous: Reading?
-            while !Task.isCancelled {
-                let changed = ScopedWaiter()
-                guard let reading = await Self.observe(appModel, changed: changed), !Task.isCancelled else { return }
+            for await reading in changes {
+                guard !Task.isCancelled, let reading else { return }
                 appModel?.engine.settingsFeed.updateUpdates(reading.updates)
                 if previous != reading {
-                    NotificationCenter.default.post(name: SettingsFaceChange.platform, object: nil)
+                    NotificationCenter.default.post(SettingsFaceChange.PlatformDidChange())
                 }
                 previous = reading
-                await changed.park()
+            }
+        }
+        embeddings = Task { [memory = appModel.engine.memory] in
+            var previous: [String?]?
+            for await snapshot in await memory.embeddingSnapshots() {
+                guard !Task.isCancelled else { return }
+                let current = [snapshot?.requestedBackend, snapshot?.effectiveBackend, snapshot?.lastLoadError]
+                if previous != current {
+                    previous = current
+                    NotificationCenter.default.post(SettingsFaceChange.PlatformDidChange())
+                }
             }
         }
         let declared = Self.preferenceDefaults
@@ -202,12 +210,12 @@ final class SettingsFaceUpdates {
                 guard previous != current else { continue }
                 previous = current
                 feed.updatePreferences(current.values, issues: current.issues, declared: declared)
-                NotificationCenter.default.post(name: SettingsFaceChange.platform, object: nil)
+                NotificationCenter.default.post(SettingsFaceChange.PlatformDidChange())
             }
         }
     }
 
-    deinit { task.cancel(); preferences.cancel() }
+    deinit { task.cancel(); preferences.cancel(); embeddings.cancel() }
 
     private static var preferenceDefaults: [String: PartFace.Value] {
         [SimpleViewMode.key: .string(SimpleViewMode.simple), HazeColor.key: .string(HazeColor.defaultValue.rawValue),
@@ -220,17 +228,12 @@ final class SettingsFaceUpdates {
          WindowFollowsPreference.key: .bool(true)]
     }
 
-    private static func observe(_ appModel: AppModel?, changed: ScopedWaiter) async -> Reading? {
-        guard let appModel else { return nil }
-        let embedding = await appModel.engine.memory.readEmbeddingSnapshot { _ = changed.resume() }
-        return withObservationTracking {
-            let updater = UpdateController.shared
-            return Reading(updates: updater.settingsFeedSource, version: updater.status.availableVersion, canCheck: updater.status.canCheckForUpdates,
-                           automatic: updater.status.automaticChecksEnabled, failure: updater.status.noticeFailure,
-                           shortcut: ShotgunController.shared.shortcutTaken?.rawValue,
-                           health: appModel.engine.doctor.health, refreshError: appModel.lastRefreshError,
-                           embedding: [embedding?.requestedBackend, embedding?.effectiveBackend,
-                                       embedding?.lastLoadError, appModel.engine.memory.embeddingsError])
-        } onChange: { _ = changed.resume() }
+    private static func read(_ appModel: AppModel) -> Reading {
+        let updater = UpdateController.shared
+        return Reading(updates: updater.settingsFeedSource, version: updater.status.availableVersion, canCheck: updater.status.canCheckForUpdates,
+                       automatic: updater.status.automaticChecksEnabled, failure: updater.status.noticeFailure,
+                       shortcut: ShotgunController.shared.shortcutTaken?.rawValue,
+                       health: appModel.engine.doctor.health, refreshError: appModel.lastRefreshError,
+                       embeddingsError: appModel.engine.memory.embeddingsError)
     }
 }

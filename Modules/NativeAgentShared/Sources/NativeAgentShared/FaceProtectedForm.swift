@@ -121,7 +121,7 @@ public enum FaceSecretReceiver: Equatable, Sendable {
         for field in block.fields ?? [] where validating && field.kind == "secret" && field.required == true {
             if entry.values[field.id]?.isEmpty != false { errors[field.id] = field.label + " is required." }
         }
-        session.formErrors[block.key] = errors
+        session.editRow(block.key).formErrors = errors
         guard errors.isEmpty else { return }
         let secrets = entry.values, revisions = entry.revisions, generation = entry.generation, lifetime = entry.lifetime
         func clearCommitted(_ outcome: FaceActOutcome) {

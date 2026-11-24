@@ -68,8 +68,8 @@ address and user agent to the site operator.
 ## iCloud, CloudKit, and notifications
 
 When Mac/iPhone continuity is enabled, signed messages, compact snapshots,
-pairing state, action receipts, and related records move through Apple iCloud
-Key-Value Store, iCloud Drive, or the app's CloudKit private database. These
+pairing state, action receipts, and related records move through the app's
+CloudKit private database. These
 records are associated with the user's Apple account and are governed by
 Apple's terms and privacy policy. NativeAgent does not use a public CloudKit
 database for personal agent data.
@@ -82,8 +82,10 @@ Their switches explicitly permit enabled place names/transition times, motion
 estimates and confidence, Focus status, charging/night clues, battery percentage,
 app audio-route category, network type, Music playback/title/artist, or a count
 of visible photos dated today to travel through paired iCloud to the Mac and
-its selected AI provider. Coordinates, audio, images and network/device names
-are not shared by these senses. Limited Photos access yields a labelled partial
+its selected AI provider. The Location sense, when you turn it on, also sends
+the phone's last known position to your paired Mac, which keeps it for the
+agent to look up. Audio, images and network/device names are not shared by
+these senses, and no other sense shares coordinates. Limited Photos access yields a labelled partial
 count, including zero; synced/imported photos may count. Setup state (switch,
 required/current permission, saved/enabled place counts and missing steps) is
 shared so an agent can guide setup even when an observation switch is off.
@@ -151,7 +153,7 @@ To remove Mac data, quit NativeAgent, remove the app, and delete its NativeAgent
 folder under the user's Application Support directory together with any
 NativeAgent workspace files the user no longer wants. Source-based development
 installs may instead keep runtime data and work products inside the checkout.
-Remove related iCloud Drive/CloudKit data and revoke provider or connector
+Remove related iCloud (CloudKit) data and revoke provider or connector
 credentials separately. Provider-side records must be deleted through the
 provider.
 

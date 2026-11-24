@@ -16,7 +16,7 @@ public enum WorkPaneFace {
                 sections.append(.init(id: "text", rows: [], block: .init(key: "make-text", text: text, copy: true)))
             }
             let leaf = preview.kind == "file" ? "preview" : preview.kind
-            if let leaf, ["image", "preview", "web"].contains(leaf) {
+            if version.kind != BoardDocument.type, let leaf, ["image", "preview", "web"].contains(leaf) {
                 sections.append(.init(id: "preview", rows: [], block: .init(kind: "leaf", key: "make-preview", revision: preview.revision,
                     leaf: leaf, ref: version.reference, alt: title + " · version " + version.version)))
             }
@@ -35,7 +35,9 @@ public enum WorkPaneFace {
     public static func sense(_ presentation: SenseViewFace) -> PartFace {
         guard presentation.state == .ready else { return PartFace(sections: []) }
         guard let id = presentation.senseID, presentation.html != nil, let revision = presentation.revision else {
-            return PartFace(sections: [.init(id: "sense", rows: [.init(id: "empty", title: "No sense view is open.", tone: .quiet)])])
+            return PartFace(sections: [.init(id: "sense", style: .note, rows: [
+                .init(id: "empty", title: "I don’t have a sense view open.", tone: .quiet),
+            ])])
         }
         return PartFace(title: presentation.title, sections: [.init(id: "sense", rows: [],
             block: .init(kind: "leaf", key: "sense-view", revision: revision, leaf: "web", ref: id,

@@ -73,7 +73,7 @@ struct ShellRailItem: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.leading, NativeAgentShellLayout.railWordInset)
-            .frame(height: NativeAgentShellLayout.railItemHeight)
+            .frame(minHeight: NativeAgentShellLayout.railItemHeight)
             .overlay(alignment: .leading) {
                 // Share bar identity to preserve selection continuity; Reduce Motion crossfades stationary bars.
                 let bar = RoundedRectangle(cornerRadius: 1, style: .continuous)
@@ -144,7 +144,6 @@ struct ShellSidebarRail: View {
     static let selectionBarID = "shell.rail.selection-bar"
     @Namespace private var selectionBar
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         // Anchor Diagnostics at the foot so the advanced view stays apart from the places of work.
@@ -171,9 +170,9 @@ struct ShellSidebarRail: View {
         .background {
             ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.railPlateRadius)
         }
-        .glassEffect(
-            reduceTransparency ? .identity : HouseGlass.plate,
-            in: RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous)
+        .houseSurface(
+            in: RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous),
+            opaqueFill: nil
         )
         .padding([.top, .bottom, .leading], NativeAgentShellLayout.railPlateInset)
         .padding(.trailing, 6)

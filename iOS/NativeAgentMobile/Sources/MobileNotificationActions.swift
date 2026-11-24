@@ -77,6 +77,6 @@ enum MobileNotificationActions {
     @MainActor
     private static func open(screen: String, sessionID: String? = nil) {
         NativeAgentNotificationLaunchIntent.stage(screen: screen, sessionID: sessionID)
-        NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": screen])
+        NotificationCenter.default.post(NativeAgentNotificationLaunchIntent.Staged())
     }
 }

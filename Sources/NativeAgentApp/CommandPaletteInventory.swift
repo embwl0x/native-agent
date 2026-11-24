@@ -1,42 +1,18 @@
-import EngineRuntime
-import AppToolRuntime
-import ChatSessionWork
+import BodyRuntime
 import NativeAgentCore
 import SwiftUI
 import NativeAgentShared
-import Desk
-import StandingBots
-import DreamREMCycle
-import MemoryV2
+import DeskCore
+import MindCore
 import Foundation
-import Transcripts
-import TurnTrace
-import ChatTurnRuntime
-import ToolExecution
-import ApprovalTransactions
+import SenseCore
 import PersistenceCore
-import ToolRegistry
 import ProviderRouting
-import DoctorChecks
-import Research
-import TelegramBot
-import Connectors
-import AttentionRouting
+import MacNerves
 import WidgetKit
 import AppIntents
 import Observation
-import BackgroundLoops
-import PersonaEngine
-import TrustCenter
-import MultimodalTTS
-import SystemOps
-import DeviceSync
-import BackgroundWork
-import ChatToolRuntime
-import ApprovalInbox
 import AppKit
-import MacControl
-import ChatToolParsing
 import UniformTypeIdentifiers
 // Blueprint: | `CommandPaletteInventory.swift` | Saved palette destinations, shared inventory and deterministic ranking |
 
@@ -237,13 +213,13 @@ enum CommandPaletteSavedThings {
     }
 
     /// Search all saved memories and their full text, not a newest slice.
-    private static func memoryItems(_ memories: [MemoryV2.MemoryRecord]) -> [PaletteItem] {
+    private static func memoryItems(_ memories: [MindCore.MemoryRecord]) -> [PaletteItem] {
         memories.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
             .map { record in
                 PaletteItem(
                     id: "memory.\(record.id)",
                     title: firstLine(record.text),
-                    subtitle: "Memory · \(record.layer ?? "")",
+                    subtitle: record.layer.flatMap { $0.isEmpty ? nil : "Memory · \($0)" } ?? "Memory",
                     systemImage: "brain",
                     kind: .saved(.memory(record.id)),
                     searchText: record.text

@@ -11,8 +11,8 @@ extension View {
             .accessibilityLabel("Close")
     }
 
-    func houseInset<S: Shape>(in shape: S) -> some View {
-        modifier(HouseInset(shape: shape))
+    func houseInset<S: InsettableShape>(in shape: S, fill: Color = TodayPalette.cardFill) -> some View {
+        modifier(HouseInset(shape: shape, fill: fill))
     }
 
     func houseSheet() -> some View {
@@ -22,20 +22,36 @@ extension View {
                 .houseSurface(in: ConcentricRectangle())
         }
         .presentationBackground(.clear)
-        .environment(\.houseGlassEnclosed, true)
     }
 }
 
-extension EnvironmentValues {
-    @Entry var houseGlassEnclosed: Bool = false
-}
-
-private struct HouseInset<S: Shape>: ViewModifier {
+private struct HouseInset<S: InsettableShape>: ViewModifier {
     let shape: S
-    @Environment(\.houseGlassEnclosed) private var enclosed
+    let fill: Color
+    @Environment(\.colorSchemeContrast) private var contrast
 
     func body(content: Content) -> some View {
-        if enclosed { content } else { content.houseSurface(in: shape) }
+        content
+            .background(fill, in: shape)
+            .clipShape(shape)
+            .overlay {
+                shape.strokeBorder(contrast == .increased ? NativeAgentShell.hairline : TodayPalette.cardStroke, lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
+    }
+}
+
+struct HouseGlassContainer<Content: View>: View {
+    var spacing: CGFloat? = nil
+    @ViewBuilder var content: () -> Content
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+
+    var body: some View {
+        if quietOffscreenRead {
+            content()
+        } else {
+            GlassEffectContainer(spacing: spacing, content: content)
+        }
     }
 }
 
@@ -49,38 +65,44 @@ enum HouseGlass {
 }
 
 extension View {
-    func houseSurface<S: Shape>(in shape: S, interactive: Bool = false) -> some View {
-        modifier(HouseSurface(shape: shape, interactive: interactive))
+    func houseSurface<S: Shape>(
+        in shape: S,
+        interactive: Bool = false,
+        opaqueFill: Color? = TodayPalette.cardFill
+    ) -> some View {
+        modifier(HouseSurface(shape: shape, interactive: interactive, opaqueFill: opaqueFill))
     }
 }
 
 private struct HouseSurface<S: Shape>: ViewModifier {
     let shape: S
     let interactive: Bool
+    let opaqueFill: Color?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.controlActiveState) private var activeState
 
     func body(content: Content) -> some View {
         let opaque = reduceTransparency || quietOffscreenRead
+        let showRim = (opaque && opaqueFill != nil) || contrast == .increased || activeState == .inactive
         content
             .background {
-                if opaque { shape.fill(TodayPalette.cardFill) }
+                if opaque, let opaqueFill { shape.fill(opaqueFill) }
             }
             .glassEffect(opaque ? .identity : HouseGlass.plate.interactive(interactive), in: shape)
             .overlay {
-                if opaque || contrast == .increased {
-                    shape.stroke(opaque ? TodayPalette.cardStroke : Color(nsColor: .separatorColor), lineWidth: 1)
+                if showRim {
+                    shape.stroke(opaque && contrast != .increased ? TodayPalette.cardStroke : NativeAgentShell.hairline, lineWidth: 1)
                         .clipShape(shape)
                         .allowsHitTesting(false)
                 }
             }
-            .environment(\.houseGlassEnclosed, true)
     }
 }
 
 
-/// Use glass only for floating chat chrome; content cards use aliveCard.
+/// Use glass only for floating chat chrome; content cards are fills.
 struct GlassCard<Content: View>: View {
     var tint: Color? = nil
     @ViewBuilder var content: () -> Content
@@ -194,11 +216,12 @@ struct ShellGlass: NSViewRepresentable {
 
 struct ShellSheet: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ZStack {
-            if reduceTransparency {
+            if reduceTransparency || quietOffscreenRead {
                 NativeAgentShell.room
             } else {
                 ShellGlass(material: .underWindowBackground)
@@ -234,29 +257,33 @@ struct ShellLamp: View {
 enum ShellType {
     static let captionSize: CGFloat = 11
     static let labelSize: CGFloat = 13
+    static let railSize: CGFloat = 14
     static let bodySize: CGFloat = 16
     static let titleSize: CGFloat = 20
     static let displaySize: CGFloat = 25
     static let pageTitleSize: CGFloat = 44
 
+    static func scaled(_ size: CGFloat, weight: Font.Weight? = nil, design: Font.Design? = nil) -> Font {
+        Font.system(.body, design: design, weight: weight).scaled(by: size / labelSize)
+    }
+
     /// Reserve monospaced roles for codes, keys and paths so ordinary short labels keep the prose ramp.
-    static let code = Font.system(size: labelSize, design: .monospaced)
-    static let caption = Font.system(size: captionSize)
-    static let captionMedium = Font.system(size: captionSize, weight: .medium)
-    static let captionSemibold = Font.system(size: captionSize, weight: .semibold)
-    static let label = Font.system(size: labelSize)
-    static let labelMedium = Font.system(size: labelSize, weight: .medium)
-    static let railSize: CGFloat = 14
-    static let rail = Font.system(size: railSize, weight: .medium)
-    static let labelSemibold = Font.system(size: labelSize, weight: .semibold)
-    static let pageSentence = Font.system(size: railSize)
-    static let pageTitle = Font.system(size: pageTitleSize, design: .serif)
-    static let body = Font.system(size: bodySize)
-    static let bodyMedium = Font.system(size: bodySize, weight: .medium)
-    static let bodySemibold = Font.system(size: bodySize, weight: .semibold)
+    static let code = scaled(labelSize, design: .monospaced)
+    static let caption = scaled(captionSize)
+    static let captionMedium = scaled(captionSize, weight: .medium)
+    static let captionSemibold = scaled(captionSize, weight: .semibold)
+    static let label = scaled(labelSize)
+    static let labelMedium = scaled(labelSize, weight: .medium)
+    static let rail = scaled(railSize, weight: .medium)
+    static let labelSemibold = scaled(labelSize, weight: .semibold)
+    static let pageSentence = scaled(railSize)
+    static let pageTitle = scaled(pageTitleSize, design: .serif)
+    static let body = scaled(bodySize)
+    static let bodyMedium = scaled(bodySize, weight: .medium)
+    static let bodySemibold = scaled(bodySize, weight: .semibold)
     static let columnTitle = bodySemibold
-    static let title = Font.system(size: titleSize, weight: .semibold)
-    static let display = Font.system(size: displaySize, weight: .semibold, design: .rounded)
+    static let title = scaled(titleSize, weight: .semibold)
+    static let display = scaled(displaySize, weight: .semibold, design: .rounded)
 }
 
 /// A 740pt room fits the 708pt reply plus two 16pt gutters.
@@ -269,11 +296,12 @@ enum NativeAgentShellLayout {
     static let railWordInset: CGFloat = 14
     static let titleBarInset: CGFloat = 28
     static let columnHeaderTopInset: CGFloat = 6
+    static let columnHeaderMinHeight: CGFloat = 28
     static let conversationsWidth: CGFloat = 288
     static let conversationsInset: CGFloat = 12
     /// Use a 48pt row pitch (46 + 2 gap) to match the rail's two 24pt units.
     static let listRowHeight: CGFloat = 46
-    static let roomColumn: CGFloat = 740
+    static let roomColumn: CGFloat = NativeAgentSpacing.chatRoomWidth
     static let replyMaxWidth: CGFloat = 708
     static let roomGutter: CGFloat = 16
     static var roomLeadingInset: CGFloat { roomGutter }

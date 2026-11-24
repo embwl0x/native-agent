@@ -1,0 +1,499 @@
+import NativeAgentCore
+import SenseCore
+import MindCore
+import MacNerves
+import DeskCore
+import Foundation
+import OSLog
+import Observation
+import PersistenceCore
+import NativeAgentShared
+// Blueprint: | `EngineDesk.swift` | One retained board revision, ForPerson inbox changes, checked reads and gated local mutations |
+
+/// All surfaces share one retained Desk revision per root.
+@MainActor
+@Observable
+public final class DeskFacade {
+    public nonisolated let dataRoot: URL
+    public nonisolated let vetoHandler: PursuitVeto
+    private nonisolated let inbox: InboxFacade
+    private nonisolated let approvals: ApprovalsFacade
+    private nonisolated let bots: BotRunnerScheduler
+
+    public private(set) var times: [OneClock.Time] = []
+    public private(set) var timesFeedState: ClockFeedState?
+    @ObservationIgnored private lazy var timesRead = LatestRead()
+
+    public nonisolated init(dataRoot: URL, inbox: InboxFacade, approvals: ApprovalsFacade, bots: BotRunnerScheduler) {
+        self.dataRoot = dataRoot
+        self.vetoHandler = PursuitVeto(dataRoot: dataRoot)
+        self.inbox = inbox
+        self.approvals = approvals
+        self.bots = bots
+    }
+
+    public nonisolated var store: SwiftNativeDeskStore {
+        SwiftNativeDeskStore(dataRoot: dataRoot)
+    }
+
+    // MARK: board
+
+    public var board: DeskBoardRead { page.board ?? DeskBoardRead() }
+    public private(set) var page = DeskPageSnapshot.empty
+    /// Navigation holds only an identity; the face resolves its details from the retained board.
+    public var faceItem: String? {
+        didSet { if faceItem != oldValue { faceDidChange?() } }
+    }
+    @ObservationIgnored var faceDidChange: (@MainActor () -> Void)?
+    private var availableOverview: WorkOverview? {
+        guard let overview = page.overview, overview.unavailable.isEmpty else { return nil }
+        return overview
+    }
+    /// Needs you remains unavailable if any overview source cannot be read.
+    public var ownerWaitingCount: Int? { availableOverview?.needsYouCount }
+    public var ownerWaitingKinds: [WorkOverviewReference.Kind: Int]? { availableOverview?.needsYouCounts }
+    public private(set) var readCount = 0
+    public private(set) var liveUpdateError: String?
+    @ObservationIgnored private lazy var boardRead = LatestRead()
+    @ObservationIgnored private var refreshTask: Task<DeskPageSnapshot, Never>?
+    @ObservationIgnored private var deadlineTask: Task<Void, Never>?
+    @ObservationIgnored private var watcher: FileChangeWatcher?
+    @ObservationIgnored private var busTask: Task<Void, Never>?
+    @ObservationIgnored private var experienceTask: Task<Void, Never>?
+    @ObservationIgnored private var inboxTask: Task<Void, Never>?
+    @ObservationIgnored private var clockTask: Task<Void, Never>?
+    @ObservationIgnored private var watchedPaths: Set<URL> = []
+
+    /// Source changes replace one retained revision for every surface, including offscreen pages.
+    public func loadBoard() async -> DeskBoardRead {
+        await loadPage().board!
+    }
+
+    public func loadPage() async -> DeskPageSnapshot {
+        if page.loaded { return page }
+        if let refreshTask { return await refreshTask.value }
+        return await refreshPage()
+    }
+
+    private nonisolated func readBoard() async -> DeskBoardRead {
+        var read = DeskBoardRead()
+        read.revision = SwiftNativeDeskStore.currentRevision
+        async let deskState = store.liveState()
+        do {
+            read.deskState = try await deskState
+            read.debugProjection = read.deskState.map { DeskPage.render($0) } ?? ""
+        } catch {
+            read.deskError = Self.loadFailure(error)
+        }
+        do { read.agentJobs = .rows(try AgentJobStore(dataRoot: dataRoot).jobs()) }
+        catch { read.agentJobs = .failed(error) }
+        let overview = await loadOverview(read)
+        read.overview = overview.overview
+        read.approvals = overview.approvals
+        read.inbox = overview.inbox
+        return read
+    }
+
+    /// Share the checked overview read with phone snapshots.
+    private nonisolated func loadOverview(_ board: DeskBoardRead) async -> (
+        overview: WorkOverview,
+        approvals: Result<[ApprovalRecord], Error>,
+        inbox: Result<[NativeAgentShared.InboxItemRecord], Error>
+    ) {
+        async let approvalsRead = self.approvals.list()
+        async let inboxRead = self.inbox.list()
+        var unavailable: [String] = []
+        if let reason = board.deskError { unavailable.append("Desk: \(reason)") }
+        if let reason = board.agentJobs.unavailableReason { unavailable.append("Jobs: \(reason)") }
+        var approvalRows: [ApprovalRecord] = []
+        var inboxRows: [NativeAgentShared.InboxItemRecord] = []
+        let approvals: Result<[ApprovalRecord], Error>
+        let inbox: Result<[NativeAgentShared.InboxItemRecord], Error>
+        var experiences: [Experience] = []
+        do { experiences = try await ExperienceStore.at(dataRoot).projection() }
+        catch { unavailable.append("Experiences: \(Self.loadFailure(error))") }
+        do {
+            approvalRows = try await approvalsRead
+            approvals = .success(approvalRows)
+        } catch {
+            approvals = .failure(error)
+            unavailable.append("Approvals: \(Self.loadFailure(error))")
+        }
+        do {
+            inboxRows = try await inboxRead
+            inbox = .success(inboxRows)
+        } catch {
+            inbox = .failure(error)
+            unavailable.append("Inbox: \(Self.loadFailure(error))")
+        }
+        return (WorkOverviewRead.project(board: board, approvals: approvalRows,
+            inbox: inboxRows, experiences: experiences, unavailable: unavailable, now: Date()), approvals, inbox)
+    }
+
+    deinit {
+        watcher?.cancel()
+        busTask?.cancel()
+        experienceTask?.cancel()
+        inboxTask?.cancel()
+        clockTask?.cancel()
+        refreshTask?.cancel()
+        deadlineTask?.cancel()
+    }
+
+    // MARK: the clock
+
+    nonisolated static let timerOwners = ["part", "watch", "scan"]
+
+    /// What is on the one clock for the Desk's timer, read from the clock itself; an unreadable clock is unavailable, never an empty timer.
+    @discardableResult
+    public func timesFeed() async -> ClockFeedState {
+        await timesRead.read({ await self.readTimes() }) { feed in
+            timesFeedState = feed
+            if case .current(let rows) = feed { times = rows }
+        }
+    }
+
+    private nonisolated func readTimes() async -> ClockFeedState {
+        do {
+            var rows: [OneClock.Time] = []
+            for owner in Self.timerOwners { rows += try await OneClock.at(dataRoot).times(owner: owner) }
+            return .current(rows.sorted { $0.next < $1.next })
+        } catch {
+            return .unavailable(error.localizedDescription)
+        }
+    }
+}
+
+extension DeskFacade {
+    /// The stores whose writes refresh the Desk page.
+    nonisolated var pageUpdatePaths: [URL] {
+        [
+            SwiftNativeDeskStore(dataRoot: dataRoot).opsPath,
+            SwiftNativeDeskStore(dataRoot: dataRoot).basePath,
+            SwiftNativeApprovalInbox(root: dataRoot).approvalsPath,
+            dataRoot.appendingPathComponent("clock/times.json"),
+            dataRoot.appendingPathComponent("mind/rhythm.json"),
+            dataRoot.appendingPathComponent("cognition/user_turn.json"),
+            AgentJobStore(dataRoot: dataRoot).fileURL,
+            dataRoot.appendingPathComponent("bots/definitions", isDirectory: true),
+            dataRoot.appendingPathComponent("bots/missed-runs.json"),
+            DeskNagConfigStore(dataRoot: dataRoot).configPath,
+            dataRoot.appendingPathComponent("trust/policy.json"),
+        ]
+    }
+
+    public nonisolated func liveUpdatePaths() async throws -> [URL] {
+        let paths = pageUpdatePaths
+        for parent in Set(paths.map { $0.deletingLastPathComponent() }) {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
+        return paths
+    }
+
+    @discardableResult
+    public func refresh() async -> Bool {
+        let read = await refreshPage()
+        return !Task.isCancelled && page.id == read.id
+    }
+
+    public func refreshPage() async -> DeskPageSnapshot {
+        readCount += 1
+        defer { readCount -= 1 }
+        let preceding = refreshTask
+        // Read source changes after the current read; joining it would consume an edge against older captured bytes.
+        let task = Task {
+            _ = await preceding?.value
+            return await readRevision()
+        }
+        refreshTask = task
+        let read = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        if readCount == 1 { refreshTask = nil }
+        return read
+    }
+
+    /// Publish one complete retained revision; never store a parallel presentation snapshot.
+    private func readRevision() async -> DeskPageSnapshot {
+        await boardRead.read {
+            await buildRevision()
+        } publish: { snapshot in
+            page = snapshot
+            faceDidChange?()
+            deadlineTask?.cancel()
+            deadlineTask = snapshot.rows.deadline.map { deadline in
+                Task { [weak self] in
+                    do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
+                    catch { return }
+                    await self?.signalRefresh()
+                }
+            }
+        }
+    }
+
+    /// The complete page revision is built away from the observable owner; only watch lifecycle, clock publication and the final snapshot
+    /// publication hop back. Every store read and row calculation runs here.
+    @concurrent nonisolated private func buildRevision() async -> DeskPageSnapshot {
+        await bindLiveUpdates()
+        var snapshot = DeskPageSnapshot(read: await readBoard())
+        // Rescan after arming the parent to cover directories created during watch setup.
+        await bindLiveUpdates()
+        _ = await timesFeed()
+        snapshot.times = await times
+        do {
+            let timing = try await bots.effectiveSchedule()
+            snapshot.missedBots = try DeskMissedBot.load(root: dataRoot, timing: timing)
+            if timing.unattended { snapshot.timedBots = try DeskTimedBot.load(root: dataRoot, timing: timing) }
+        } catch {
+            snapshot.botScheduleError = "Helper schedules could not be read: \(error.localizedDescription). Repair the saved helper definitions and schedules."
+        }
+        snapshot.now = Date()
+        do { snapshot.nagConfig = try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked() }
+        catch {
+            snapshot.nagConfigError = "Reminder settings are unavailable: \(error.localizedDescription). "
+                + "Repair the saved reminder settings before changing them."
+        }
+        do {
+            let hour = try await Self.residentHour(dataRoot: dataRoot)
+            snapshot.wanderHour = DeskWanderHourPresentation.state(installed: true, entry: hour)
+        } catch {
+            snapshot.wanderHour = .line(text: "My hour’s thought record is unavailable.", symbol: "exclamationmark.triangle")
+        }
+        snapshot.plan = DeskSequencing.compute(DeskState(items: snapshot.boardItems, generatedTs: ""), now: snapshot.now)
+        snapshot.rows = DeskPageContent.project(snapshot: snapshot, now: snapshot.now)
+        return snapshot
+    }
+
+    public func signalRefresh() async { _ = await refresh() }
+
+    private func bindLiveUpdates() async {
+        if inboxTask == nil {
+            let changes = await ForPerson.at(dataRoot).changes()
+            inboxTask = Task { [weak self] in
+                for await _ in changes {
+                    guard !Task.isCancelled else { return }
+                    await self?.signalRefresh()
+                }
+            }
+        }
+        if clockTask == nil {
+            let changes = EventDeadlinePhysiology.storeAndFileEvents(paths: [], notifications: [
+                .NSSystemClockDidChange, .NSSystemTimeZoneDidChange, .NSCalendarDayChanged,
+            ])
+            clockTask = Task { [weak self] in
+                for await _ in changes {
+                    guard !Task.isCancelled else { return }
+                    await self?.signalRefresh()
+                }
+            }
+        }
+        if experienceTask == nil {
+            let changes = await ExperienceStore.at(dataRoot).changes()
+            experienceTask = Task { [weak self] in
+                for await _ in changes {
+                    guard !Task.isCancelled else { return }
+                    await self?.signalRefresh()
+                }
+            }
+        }
+        do {
+            let paths = try await liveUpdatePaths()
+            let normalized = Set(paths.map(\.standardizedFileURL))
+            liveUpdateError = nil
+            guard normalized != watchedPaths else { return }
+            watcher?.cancel()
+            busTask?.cancel()
+            watchedPaths = normalized
+            let changes = StoreChangeBus.shared.changes()
+            busTask = Task { [weak self] in
+                for await change in changes where normalized.contains(change.path.standardizedFileURL) {
+                    guard !Task.isCancelled else { return }
+                    await self?.signalRefresh()
+                }
+            }
+            watcher = await FileChangeWatcher.armed(paths: paths) { [weak self] _ in
+                Task { await self?.signalRefresh() }
+            }
+        } catch {
+            liveUpdateError = UserFacingError.message(error, action: "turn on Desk live updates")
+        }
+    }
+
+}
+// MARK: - The clock feed
+
+public enum ClockFeedState: Equatable, Sendable {
+    case current([OneClock.Time])
+    case unavailable(String)
+
+    public var failureDetail: String? {
+        switch self {
+        case .current: nil
+        case .unavailable(let detail): "The clock's times are unavailable: \(detail)"
+        }
+    }
+}
+
+public struct DeskToolDispatchRouter: Sendable {
+    /// Use a distinct dispatch surface so receipts distinguish the user’s click from the agent’s tool call.
+    public static let surface = "desk"
+
+    public let dataRoot: URL
+    public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
+        self.dataRoot = dataRoot
+    }
+
+    public func run(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
+        let act = tool == "desk_note"
+            ? PersonAct(by: .tap(door: "mac", device: nil, chat: nil, page: "desk", row: input["handle"]?.stringValue ?? tool),
+                        tool: tool, input: input) : nil
+        let turn = Turn(dataRoot: dataRoot, session: Happening.stream).with(\.verifiedSessionID, Happening.stream).with(\.personAct, act)
+        // Desk clicks share chat’s Trust gates; only this boundary supplies their approval filer.
+        return try await NativeAgentEngine.forRoot(dataRoot).withPartDoor(
+            envelope: .personOnMac("mac_ui:desk:" + tool, surface: Self.surface),
+            approvalFiler: DeskClickApprovalFiler(dataRoot: dataRoot), turn: turn) { door in
+            try await door.perform(tool, input)
+        }
+    }
+}
+
+public struct DeskActionOutcome: Equatable, Sendable {
+    public let ok: Bool
+    public let message: String
+
+    public init(ok: Bool, message: String) { self.ok = ok; self.message = message }
+}
+
+public enum DeskActionResultReader {
+    /// Derive success from shared receipt evidence before choosing Desk wording.
+    public static func read(_ value: JSONValue, fallback: String) -> DeskActionOutcome {
+        let reply = ToolResult(value)
+        guard case .object(let obj) = reply.payload else {
+            return DeskActionOutcome(ok: false, message: "\(fallback): unreadable tool result")
+        }
+        func text(_ keys: [String]) -> String? {
+            for key in keys {
+                if case .string(let s)? = obj[key], !s.isEmpty { return s }
+            }
+            return nil
+        }
+        let result = reply.outcome
+        switch result {
+        case .succeeded:
+            return DeskActionOutcome(ok: true, message: text(["confirmation", "summary"]) ?? fallback)
+        case .refused:
+            return DeskActionOutcome(ok: false, message: text(["reason"]) ?? "\(fallback) refused")
+        case .failed, .cancelled, .timeout:
+            return DeskActionOutcome(
+                ok: false,
+                message: text(["reason", "detail", "fix"]) ?? "\(fallback) \(result.receipt.label.lowercased())")
+        case .unknown:
+            return DeskActionOutcome(
+                ok: false,
+                message: "\(fallback): result unconfirmed")
+        }
+    }
+}
+
+extension DeskFacade {
+    public nonisolated static func residentHour(dataRoot: URL) async throws -> StudioWanderLane.ThoughtReading? {
+        guard await NativeCognitionRuntime.studioWanderIsInstalled(dataRoot: dataRoot) else { return nil }
+        return try await StudioWanderLane.latestThought(dataRoot: dataRoot)
+    }
+}
+
+extension DeskToolDispatchRouter {
+    /// Return transport failures as `ok == false` outcomes so callers always have something to render.
+    public func perform(_ action: DeskQuickAction) async -> DeskActionOutcome {
+        do {
+            let value = try await run(tool: action.tool, input: action.input)
+            return DeskActionResultReader.read(value, fallback: action.pendingLabel)
+        } catch {
+            return DeskActionOutcome(
+                ok: false,
+                message: "\(action.pendingLabel) failed: " + UserFacingError.cause(error, action: "run a Desk action"))
+        }
+    }
+}
+
+public extension DeskQuickAction {
+    var pendingLabel: String {
+        switch self {
+        case .close, .closeIfCurrent: return "Closing"
+        case .setStatus: return "Updating status"
+        case .note: return "Adding note"
+        }
+    }
+}
+
+/// Hold repeated Veto events during the durable operation; the store’s idempotence covers retries after relaunch.
+public actor PursuitVeto {
+    public enum Outcome: Equatable, Sendable {
+        case completed
+        case alreadyVetoed
+        case inFlight
+        case failed(String)
+    }
+
+    public static let rationale = "Vetoed on the Desk."
+    private static let logger = Logger(subsystem: "com.nativeagent.app", category: "pursuit-veto")
+
+    private let store: SwiftNativeDeskStore
+    private var inFlightHandles: Set<String> = []
+
+    public init(dataRoot: URL) {
+        self.store = SwiftNativeDeskStore(dataRoot: dataRoot)
+    }
+
+    public func veto(_ handle: String) async -> Outcome {
+        guard inFlightHandles.insert(handle).inserted else { return .inFlight }
+        defer { inFlightHandles.remove(handle) }
+        do {
+            return try await store.vetoPursuit(handle, note: Self.rationale) == nil
+                ? .alreadyVetoed
+                : .completed
+        } catch {
+            Self.logger.error("Veto failed: \(String(describing: error), privacy: .public)")
+            switch error {
+            case DeskError.unknownHandle:
+                return .failed("This item could not be found on the Desk.")
+            case DeskError.notAPursuit:
+                return .failed("This item is not a pursuit.")
+            case DeskError.vetoRefusedTerminal:
+                return .failed("This pursuit is already closed.")
+            case DeskError.terminalStatusRefusedNonTerminalChild:
+                return .failed("This pursuit has unfinished child items. Close them before vetoing it.")
+            case DeskError.pursuitFieldMissing:
+                return .failed("The veto reason is missing.")
+            case DeskError.compactionBaseCorrupt, DeskError.compactionBaseUnreadable:
+                return .failed("Saved Desk data could not be read. The pursuit was not changed.")
+            default:
+                return .failed("The veto could not be saved. Try again.")
+            }
+        }
+    }
+}
+
+
+/// A Desk task the person starts: the item, and the agent's line that carries it.
+public struct DeskTaskStart: Sendable {
+    public let deskItem: DeskItem
+    public let job: String
+}
+
+extension NativeAgentEngine {
+    /// A Desk task starts a line of the agent's carrying that item; its ending wakes the agent's own work conversation, where the agent settles the item.
+    public func submitDeskTask(title: String, objective: String, project: String = DeskItem.tasksProject) async throws -> DeskTaskStart {
+        let root = dataRoot
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let item = try await store.createItem(kind: DeskItem.tasksKind, project: project, title: String(title.prefix(160)),
+            summary: String(objective.prefix(600)))
+        let receipt = await AgentJobs.commission(["agent": .string(AgentJob.own), "brief": .string(objective), "desk": .string(item.handle)],
+            session: nil, surface: "desk", ceiling: .denied(reason: "a Desk task starts a line of the agent's own, never another agent"),
+            limits: (peers: [], elevated: [], fileAccess: .init()), service: agentJobs, register: AppToolExecutor.jobRegistrar(dataRoot: root))
+        guard receipt.objectValue?["status"] == .string("accepted"), let job = receipt.objectValue?["job"]?.stringValue else {
+            let why = receipt.objectValue?["detail"]?.stringValue ?? "its line did not start"
+            throw ToolFailureError("Desk item \(item.alias) was kept, but no line took it: \(why)", effects: .occurred,
+                owner: "Desk item \(item.handle)", recovery: .reconcile)
+        }
+        return DeskTaskStart(deskItem: item, job: job)
+    }
+}

@@ -1,8 +1,6 @@
 import Foundation
-// Blueprint: | `ContentView.swift` | Body notification names for canonical navigation requests |
+// Blueprint: | `ContentView.swift` | Body message for opening approvals |
 
-extension Notification.Name {
-    static let openApprovalsRequest = Notification.Name("NativeAgent.openApprovalsRequest")
-    static let openTrustMultimodalRequest = Notification.Name("openTrustMultimodalRequest")
-    static let openCommandRouteRequest = Notification.Name("NativeAgent.openCommandRouteRequest")
+struct OpenApprovalsRequest: NotificationCenter.MainActorMessage {
+    typealias Subject = NSObject
 }

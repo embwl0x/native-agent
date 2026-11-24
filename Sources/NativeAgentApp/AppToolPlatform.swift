@@ -1,29 +1,14 @@
-import EngineRuntime
-import Privacy
+import BodyRuntime
+import PersistenceCore
 import Foundation
-import ApprovalTransactions
-import AttentionRouting
-import Agents
-import Cognition
-import CognitiveSubstrate
-import MacIntegration
+import MindCore
+import MacNerves
 import NativeAgentCore
 import NativeAgentShared
-import ChatToolRuntime
-import ChatTurnContracts
-import PersistenceCore
-import PersonaEngine
+import DeskCore
 import ProviderRouting
-import ToolRegistry
-import TrustCenter
-import DeviceSync
 
-import AppToolRuntime
-import ChromeControl
 import CoreGraphics
-import MacControl
-import ApprovalInbox
-import Browser
 // Blueprint: | `AppToolPlatform.swift` | Browser, notification and away bindings; shared speech client |
 
 extension AppToolExecutor {
@@ -42,8 +27,10 @@ extension AppToolExecutor {
     }
 
     convenience init(
+        interactions: InlineInteractionCoordinator,
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         enforceAutonomySecurity: Bool = true,
+        agentJobs: AgentJobService,
         browserActionRunner: (@Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue)? = nil,
         mobileNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, [String: String], Turn) async throws -> AttentionOutcome = {
             note, userInfo, turn in
@@ -60,7 +47,7 @@ extension AppToolExecutor {
         humanConversationReplyHandler: (@Sendable ([String: JSONValue], Turn) async throws -> JSONValue)? = nil
     ) {
         self.init(
-            securityCenter: securityCenter, enforceAutonomySecurity: enforceAutonomySecurity,
+            interactions: interactions, securityCenter: securityCenter, agentJobs: agentJobs, enforceAutonomySecurity: enforceAutonomySecurity,
             browserActionRunner: browserActionRunner ?? { actionId, dryRun, input, turn, execution in
                 try await Self.defaultBrowserActionRunner(actionId: actionId, dryRun: dryRun, input: input,
                     dataRoot: securityCenter.dataRoot, turn: turn, execution: execution)

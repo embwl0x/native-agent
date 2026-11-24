@@ -1,0 +1,400 @@
+import SenseCore
+import DeskCore
+import Foundation
+import NativeAgentShared
+import PersistenceCore
+// Blueprint: | `DeskFace.swift` | The Desk packet `native-desk` draws: its facts, its rows' keys, Reminders levers, Veto key levers, Needs you's answers |
+
+extension NativeAgentEngine {
+    static let deskPart = "native-desk"
+
+    /// The Desk packet with the window's selection opened, or `item` (a handle) opened for a reader that is not the window, which leaves
+    /// the window's selection as it is.
+    @concurrent func deskPacket(opening item: String? = nil) async throws -> PartFaces.Packet {
+        let snapshot = await desk.loadPage()
+        let state = await MainActor.run {
+            var scheduleCurrent = false
+            if case .some(.current) = desk.timesFeedState { scheduleCurrent = true }
+            return (selected: item ?? desk.faceItem, liveError: desk.liveUpdateError, scheduleError: desk.timesFeedState?.failureDetail,
+                    scheduleRead: desk.timesFeedState != nil, scheduleCurrent: scheduleCurrent)
+        }
+        try Task.checkCancellation()
+        guard let board = snapshot.board else {
+            throw PartCallError(code: "desk_unavailable", message: "The Desk has not returned a board reading.")
+        }
+        let pieces = await MainActor.run { [make] in
+            make.start()
+            return DeskPieceShelf(loaded: make.loaded, fault: make.fault,
+                                  metadata: Dictionary(uniqueKeysWithValues: make.allMetadata.map { ($0.ref, $0) }))
+        }
+        var names: [String: String] = [:], answers: [String: [PartFace.Action]] = [:]
+        var contactsIssue: String?, inboxIssue: String?
+        do { names = try AgentPeerStore(dataRoot: dataRoot).list().reduce(into: [:]) { $0["peer:" + $1.id] = $1.name } }
+        catch { contactsIssue = "Contacts could not be read: " + error.localizedDescription }
+        do { answers = try await inboxAnswers() }
+        catch { inboxIssue = "Answers could not be read: " + error.localizedDescription }
+        var facts = deskFacts(snapshot, pieces: pieces, liveError: state.liveError, scheduleError: state.scheduleError,
+                              scheduleRead: state.scheduleRead, scheduleCurrent: state.scheduleCurrent,
+                              contactsIssue: contactsIssue, inboxIssue: inboxIssue)
+        facts["night"] = .object(await nextNightReading())
+        facts["table"] = pieces.standingTable(snapshot.board?.deskState?.items, dataRoot: dataRoot)
+        facts["selected"] = deskSelectedFacts(snapshot, selected: state.selected, pieces: pieces)
+        facts["keys"] = deskKeys(snapshot, selected: state.selected)
+        // A contact is shown by name. A row's words (its title and summary) may hold `peer:<id>`, written when the work was filed; the page
+        // reads the name the contact has now. Ids, handles and calls keep the identifier.
+        if !names.isEmpty { facts = facts.mapValues { Self.named($0, names) } }
+        // The board revision orders reads; a selection or a clock edge changes the facts at one revision, and the face is drawn again.
+        // A row that needs the person carries its Inbox row's own answers; unread answers carry their cause in the packet.
+        let levers = deskLevers(snapshot, selected: state.selected, answers: answers)
+        return PartFaces.Packet(facts: .object(facts), epoch: board.revision, levers: levers.page, keyLevers: levers.keyed)
+    }
+
+    /// The Desk item a page read names, found by the resolver every Desk call uses (desk.N, its handle or its exact title); nil when it names
+    /// none. Several items sharing the title is the resolver's own refusal.
+    @concurrent func deskItemHandle(_ named: String) async throws -> String? {
+        let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
+        return try state.matching(named).first?.handle
+    }
+
+    /// `app {page:"desk", item}`: the Desk face as it draws with that item opened (its rows and actions, its steps' board, its pieces,
+    /// the person's Veto riding its row), drawn by the Desk's own part from a packet opened on the item.
+    @concurrent func deskItemFace(_ named: String) async throws -> PartFace {
+        guard let handle = try await deskItemHandle(named) else {
+            throw PartCallError(code: "item_unavailable",
+                message: "No Desk item is named \(named). Name it as the Desk does: desk.<number>, its handle or its exact title.")
+        }
+        let packet = try await deskPacket(opening: handle)
+        guard let file = try AbilityStore(dataRoot: dataRoot).read(id: Self.deskPart), file.record["status"] == .string("active"),
+              let version = file.record["codeFingerprint"]?.stringValue else {
+            throw PartCallError(code: "desk_part_unavailable", message: "The Desk's part has no active selected projection.")
+        }
+        switch await tools.face(id: Self.deskPart, input: packet.facts, version: version) {
+        case .failure(let error): throw error
+        case .success(let projected):
+            let bound = try projected.bound(to: PartFace.Keys(packet: packet.facts), levers: packet.levers, keyLevers: packet.keyLevers)
+            let drawn = PartFaceSnapshot(part: Self.deskPart, version: version, sourceEpoch: packet.epoch, status: .ready, face: bound,
+                                         error: nil, owed: packet.owed, levers: packet.levers, keyLevers: packet.keyLevers).drawnFace
+            guard let drawn else { throw PartCallError(code: "bad_face", message: "The Desk's opened item drew no face.") }
+            return drawn
+        }
+    }
+
+    static func named(_ value: JSONValue, _ names: [String: String], shown: Bool = false) -> JSONValue {
+        switch value {
+        case .object(let fields):
+            return .object(Dictionary(uniqueKeysWithValues: fields.map { ($0.key, named($0.value, names, shown: $0.key == "title" || $0.key == "summary")) }))
+        case .array(let items): return .array(items.map { named($0, names) })
+        case .string(let words) where shown && words.contains("peer:"):
+            return .string(names.reduce(words) { $0.replacingOccurrences(of: $1.key, with: $1.value) })
+        default: return value
+        }
+    }
+
+    /// What a Desk item's row may do, in the order the Desk offers it, and what each does; `veto` is the person's lever, drawn by the stem.
+    static func deskItemActions(_ item: DeskItem) -> [PageKeyAction] {
+        guard !item.status.isTerminal else { return [] }
+        let handle = PartFace.Value.string(item.handle)
+        var actions: [PageKeyAction] = [
+            .mac("reply", opens: DeskMacPlace.reply(item.handle).link),
+            .calls("close", role: .destructive, "desk.close", ["handle": handle, "reason": .string(DeskQuickAction.deskCloseOutcome),
+                "expected_updated_at": .string(item.updatedAt)]),
+            .mac("note", opens: DeskMacPlace.note(item.handle).link),
+        ]
+        if item.deferUntil != nil { actions.append(.calls("unpark", "desk.defer", ["handle": handle, "until": .string("")])) }
+        if DeskBoardLayout.isPursuitLaneItem(item), item.pursuit != nil {
+            actions.append(.calls("veto", role: .destructive, "desk.veto", ["handle": handle]))
+        }
+        return actions
+    }
+
+    /// What a piece's row does: open it in the Work pane's Make view, the Mac's pane, for the person and any agent at the door. Reading
+    /// its versions (`make.read`) and laying a new one (`make.add`, which needs the agent's file) return nothing a person reads, so the
+    /// opened piece says those calls in words.
+    static func deskPieceActions(_ made: String) -> [PageKeyAction] {
+        [PageKeyAction(id: "open-piece", doors: ["mac"], call: PartFace.Call("pane.show", ["view": .string("make"), "ref": .string(made)]))]
+    }
+
+    /// The person's say over the agent on the Desk: the Reminders section (page levers, drawn first) and Veto on each pursuit the
+    /// Desk offers it on (key levers on the pursuit's row and on the selected item's Veto row).
+    func deskLevers(_ snapshot: DeskPageSnapshot, selected: String?,
+                    answers: [String: [PartFace.Action]] = [:]) -> (page: [PartFace.Section], keyed: [PartFace.Section]) {
+        func veto(_ item: DeskItem) -> PartFace.Action? {
+            Self.deskItemActions(item).first { $0.id == "veto" }.map { PartFace.Action(id: "veto", label: "Veto", role: .destructive, call: $0.call) }
+        }
+        var rows: [PartFace.Row] = snapshot.boardItems.compactMap { item in
+            veto(item).map { PartFace.Row(id: item.handle, title: item.title, actions: [$0]) }
+        }
+        if let handle = selected, let item = snapshot.boardItems.first(where: { $0.handle == handle }), let action = veto(item) {
+            rows.append(.init(id: "item-action:veto", title: "Veto", actions: [action]))
+        }
+        // Needs you: each approval or request rides its Inbox row's answers (same ids, door calls and confirmation), the person's own press.
+        let needs: [PartFace.Row] = (snapshot.overview?.needsYou ?? []).compactMap { row in
+            guard [WorkOverviewReference.Kind.approval, .inbox].contains(row.reference.kind), let actions = answers[row.reference.id] else { return nil }
+            return PartFace.Row(id: row.id, title: row.title, actions: actions)
+        }
+        var keyed: [PartFace.Section] = rows.isEmpty ? [] : [.init(id: "veto", title: "Pursuits", rows: rows)]
+        if !needs.isEmpty { keyed.append(.init(id: "needs-you", title: "Needs you", rows: needs)) }
+        return ([deskReminders(snapshot, selected: selected)], keyed)
+    }
+
+    private func deskReminders(_ snapshot: DeskPageSnapshot, selected: String?) -> PartFace.Section {
+        guard snapshot.nagConfigError == nil else {
+            return .init(id: "reminders", title: "Reminders", style: .note,
+                rows: [.init(id: "reminders-unavailable", title: "Reminder settings could not be read.", tone: .attention)])
+        }
+        let config = snapshot.nagConfig
+        let muted = config.isMuted(now: snapshot.now)
+        // Each switch calls desk.remind with its scope (its new value arrives as value); snoozing and waking call desk.nag.
+        func remind(_ kind: String, _ id: String? = nil) -> PartFace.Call {
+            var args: [String: PartFace.Value] = ["scope_kind": .string(kind)]
+            if let id { args["scope_id"] = .string(id) }
+            return .init("desk.remind", args)
+        }
+        func nag(_ action: String, until: String? = nil) -> PartFace.Call {
+            var args: [String: PartFace.Value] = ["action": .string(action)]
+            if let until { args["until"] = .string(until) }
+            return .init("desk.nag", args)
+        }
+        var rows: [PartFace.Row] = [
+            .init(id: "nag:global", title: "Nag me", detail: "Off silences every project's reminders.",
+                control: .toggle(config.enabled, call: remind("global"))),
+            .init(id: "nag:mute", title: muted ? "Snoozed" : "Snooze",
+                value: muted && config.mutedUntil == DeskNagConfig.indefiniteMuteSentinel ? "Indefinitely" : nil,
+                at: muted && config.mutedUntil != DeskNagConfig.indefiniteMuteSentinel
+                    ? config.mutedUntil.flatMap(DeskSequencing.parseDeferStamp).map(NativeTimestampFormat.fractionalZulu) : nil,
+                actions: muted ? [.init(id: "unmute", label: "Wake up", call: nag("unmute"))]
+                    : [.init(id: "mute:indefinitely", label: "Indefinitely", call: nag("mute"))]),
+        ]
+        if !muted {
+            rows += DeskDeferPreset.allCases.map { preset -> PartFace.Row in
+                let day = preset.day(from: snapshot.now)
+                return PartFace.Row(id: "nag:mute:" + preset.rawValue, title: "Snooze until",
+                    at: DeskSequencing.parseDeferStamp(day).map(NativeTimestampFormat.fractionalZulu),
+                    actions: [.init(id: "mute:" + preset.rawValue, label: "Snooze", call: nag("mute", until: day))])
+            }
+        }
+        let lanes = DeskNagPanelModel.lanes(items: snapshot.boardItems, config: config)
+        rows += lanes.map {
+            .init(id: "nag:project:" + $0.project, title: $0.project, value: "\($0.itemCount) live items",
+                control: .toggle($0.enabled, call: remind("project", $0.project)))
+        }
+        if let item = snapshot.boardItems.first(where: { $0.handle == selected }) {
+            let enabled = config.scopes.first { $0.kind == .item && $0.id == item.handle }?.enabled == true
+            rows.append(.init(id: "nag:item:" + item.handle, title: "Just this item", detail: item.title,
+                control: .toggle(enabled, call: remind("item", item.handle))))
+        }
+        // Folded, the section's one row says the state its rows hold: off, snoozed (until when), or on with the projects kept quiet.
+        var state = ["Reminders"]
+        if !config.enabled { state.append("off") }
+        else if muted {
+            let until = config.mutedUntil == DeskNagConfig.indefiniteMuteSentinel ? nil
+                : config.mutedUntil.flatMap(DeskSequencing.parseDeferStamp)
+            state.append(until.map { "snoozed until " + $0.formatted(.dateTime.month(.abbreviated).day()) } ?? "snoozed indefinitely")
+        } else {
+            state.append("on")
+            let quiet = lanes.filter { !$0.enabled }.count
+            if quiet > 0 { state.append("\(quiet) \(quiet == 1 ? "project" : "projects") quiet") }
+        }
+        return .init(id: "reminders", title: state.joined(separator: " · "), style: .values,
+            footer: muted ? "Muted — still tracking, nothing will ping."
+                : DeskNagPanelModel.summary(config, items: snapshot.boardItems, now: snapshot.now), rows: rows, folded: true)
+    }
+
+    /// Every key a Desk row may carry: where it leads, what it may do and what each action does (a door call, or a place only the Mac's
+    /// Desk view opens). The face draws a row's link and actions from its key.
+    func deskKeys(_ snapshot: DeskPageSnapshot, selected: String?) -> JSONValue {
+        var keys: [String: JSONValue] = [:]
+        func key(_ id: String, open: String? = nil, _ actions: [PageKeyAction] = []) {
+            var entry: [String: JSONValue] = [:]
+            if let open, PartFace.isLink(open) { entry["open"] = .string(open) }
+            if !actions.isEmpty { entry["actions"] = .array(actions.map(\.json)) }
+            if !entry.isEmpty { keys[id] = .object(entry) }
+        }
+        key("desk:refresh", [.calls("refresh", "desk.refresh")])
+        key("piece:" + BoardDocument.tableRef, [PageKeyAction(id: "pop-out", doors: ["mac"],
+            call: PartFace.Call("pane.show", ["view": .string("table")]))])
+        key("desk:find-item", [.mac("find-item", opens: DeskMacPlace.findItem.link)])
+        key("desk:new-task", [.mac("new-task", opens: DeskMacPlace.newTask.link)])
+        key("desk:research", [.mac("research", opens: DeskMacPlace.research.link)])
+        for item in snapshot.boardItems {
+            key(item.handle, open: "page:desk/" + item.handle, Self.deskItemActions(item).filter { $0.id != "veto" })
+        }
+        // A piece on the table opens its item and does what the piece does.
+        for item in snapshot.boardItems where !item.status.isTerminal {
+            for ref in item.refs {
+                if let made = DeskPiece.makeRef(ref) { key("table:" + ref.refId, open: "page:desk/" + item.handle, Self.deskPieceActions(made)) }
+            }
+        }
+        if let overview = snapshot.overview {
+            for row in overview.now + overview.needsYou + overview.recentlyDone {
+                switch row.reference.kind {
+                case .approval: key(row.id, open: "approval:" + row.reference.id)
+                case .inbox: key(row.id, open: "card:" + row.reference.id)
+                case .desk: key(row.id, open: "page:desk/" + row.reference.id)
+                case .execution: break
+                }
+            }
+        }
+        for job in snapshot.agentJobs.items {
+            let row = WorkOverviewRead.row(for: job).id
+            key(row, [.mac("inspect", opens: DeskMacPlace.inspect(row).link)])
+        }
+        for bot in snapshot.timedBots { key("timer-bot:" + bot.id.uuidString, open: "page:bots") }
+        for bot in snapshot.missedBots { key("missed-bot:" + bot.id.uuidString, open: "page:bots") }
+        guard let handle = selected else { return .object(keys) }
+        key("desk-selection", [.mac("board", opens: DeskMacPlace.board.link)])
+        guard !handle.hasPrefix("execution:"), let item = snapshot.items.first(where: { $0.handle == handle }) else { return .object(keys) }
+        for blocker in snapshot.plan.byHandle[item.handle]?.effectiveBlockers ?? [] where snapshot.items.contains(where: { $0.handle == blocker }) {
+            key("blocker:" + blocker, open: "page:desk/" + blocker)
+        }
+        for ref in item.refs {
+            if let made = DeskPiece.makeRef(ref) {
+                key("ref:" + ref.refId, Self.deskPieceActions(made) + [.mac("copy-reference", opens: DeskMacPlace.copy(ref.refId).link)])
+                continue
+            }
+            switch DeskRefAffordance.action(for: ref) {
+            case .open(let url, _) where PartFace.isLink("url:" + url): key("ref:" + ref.refId, open: "url:" + url)
+            case .open, .copy: key("ref:" + ref.refId, [.mac("copy-reference", opens: DeskMacPlace.copy(ref.refId).link)])
+            }
+        }
+        guard snapshot.boardItems.contains(where: { $0.handle == handle }) else { return .object(keys) }
+        let actions = Self.deskItemActions(item).filter { $0.id != "veto" }
+        key("item-action:work", actions)
+        for action in actions { key("item-action:" + action.id, [action]) }
+        if !item.status.isTerminal {
+            for preset in DeskDeferPreset.allCases {
+                key("item-action:defer:" + preset.rawValue, [.calls("defer:" + preset.rawValue, "desk.defer",
+                    ["handle": .string(item.handle), "until": .string(preset.day(from: snapshot.now))])])
+            }
+            // A step is added under the opened item by the Desk's own add, the person's words its title.
+            let add = PartFace.Call("desk.add", ["parent": .string(item.handle), "kind": .string(DeskKind.plan.rawValue),
+                                                 "project": .string(item.project)])
+            // The form's key counts the steps so far, so each step added leaves a fresh, empty form behind it.
+            let steps = snapshot.boardItems.filter { $0.parent == item.handle }.count
+            keys["add-step:" + String(steps)] = .object(["submit": .object(["add": .object(add.input)])])
+        }
+        // The steps under the opened item are its board's cards: each opens its step and moves on by the step's own status change.
+        for step in snapshot.boardItems where step.parent == item.handle {
+            var moves: [PageKeyAction] = []
+            if !step.status.isTerminal, step.status != .now {
+                moves.append(.calls("start", "desk.set_status", ["handle": .string(step.handle), "status": .string(DeskStatus.now.rawValue)]))
+            }
+            moves += Self.deskItemActions(step).filter { $0.id == "close" }
+            key("step:" + step.handle, open: "page:desk/" + step.handle, moves)
+        }
+        return .object(keys)
+    }
+
+    /// The Desk's measured facts: the board's items with what groups them, live activity, the overview, work lines, timers and named gaps.
+    private func deskFacts(_ snapshot: DeskPageSnapshot, pieces: DeskPieceShelf, liveError: String?, scheduleError: String?,
+                           scheduleRead: Bool, scheduleCurrent: Bool, contactsIssue: String?, inboxIssue: String?) -> [String: JSONValue] {
+        let now = snapshot.now
+        let evidence = DeskMovementPresentation.evidence(snapshot.agentJobs.items)
+        let studio = MakeStudio(dataRoot: dataRoot)
+        let items: [JSONValue] = snapshot.boardItems.map { item -> JSONValue in
+            let closed = item.closedAt.flatMap(UserDisplayFormatters.parseISOTimestamp)
+            var plan = JSONValue.null
+            if let sequenced = snapshot.plan.byHandle[item.handle] {
+                plan = .object(["done": .int(Int64(sequenced.doneCount)), "total": .int(Int64(sequenced.totalCount)),
+                                "blockers": .array(sequenced.effectiveBlockers.map(JSONValue.string)), "cycle": .bool(sequenced.blockedByCycle),
+                                "deferred": .bool(sequenced.isDeferred), "ready": .bool(sequenced.isReady)])
+            }
+            return .object([
+                "handle": .string(item.handle), "alias": .string(item.alias), "kind": .string(item.kind.rawValue),
+                "status": .string(item.status.rawValue), "project": .string(item.project), "title": .string(item.title),
+                "summary": faceText(item.summary), "origin": .string(item.origin.rawValue), "parent": faceText(item.parent),
+                "laneOf": faceText(item.laneOf), "updatedAt": .string(item.updatedAt), "openedAt": .string(item.openedAt),
+                // A Desk page the agent made its own reads `closedToday`; both say when the item closed.
+                "closedToday": .bool(closed.map { Calendar.current.isDate($0, inSameDayAs: now) } ?? false),
+                "closedDay": faceText(closed.map(DeskClock.dayStamp)), "upkeep": .bool(item.project == BodyQueue.project),
+                "requiresOwnerInput": .bool(item.requiresOwnerInput), "deferred": .bool(DeskSequencing.isDeferred(item, now: now)),
+                "activity": .string(DeskMovementPresentation.activity(item, evidence: evidence[item.handle], now: now).rawValue),
+                "waitingOn": faceText(item.waitingOn), "blockedReason": faceText(item.blockedReason),
+                "blockedOn": .array(item.blockedOn.map(JSONValue.string)), "lastNote": faceText(item.notes.last?.text),
+                "parked": .bool(snapshot.rows.parked.contains(item.handle)), "plan": plan,
+                "pieces": .array(item.refs.compactMap { pieces.facts($0, studio: studio, opened: false) }),
+            ])
+        }
+        let activity: JSONValue = switch snapshot.rows.activity {
+        case .rows(let content): .object(["state": .string("rows"), "stale": .bool(content.isStale), "reason": .null])
+        case .quiet: .object(["state": .string("quiet"), "stale": .null, "reason": .null])
+        case .unavailable(let reason): .object(["state": .string("unavailable"), "stale": .null, "reason": .string(reason)])
+        }
+        func overviewRows(_ rows: [WorkOverviewRow], omitted: Int) -> JSONValue {
+            .object(["omitted": .int(Int64(omitted)), "rows": .array(rows.map { row -> JSONValue in
+                .object(["id": .string(row.id), "kind": .string(row.reference.kind.rawValue), "ref": .string(row.reference.id),
+                         "title": .string(row.title), "summary": .string(row.summary), "state": .string(row.stateLabel(at: now)),
+                         "at": .string(row.updatedAt)])
+            })])
+        }
+        let overview: JSONValue = snapshot.overview.map { reading -> JSONValue in
+            .object(["now": overviewRows(reading.now, omitted: reading.omittedNow),
+                     "needsYou": overviewRows(reading.needsYou, omitted: reading.omittedNeedsYou),
+                     "recentlyDone": overviewRows(reading.recentlyDone, omitted: reading.omittedRecentlyDone)])
+        } ?? .null
+        let jobs: [JSONValue] = snapshot.agentJobs.items.map { job -> JSONValue in
+            let row = WorkOverviewRead.row(for: job)
+            return .object(["id": .string(row.id), "title": .string(row.title), "summary": .string(row.summary),
+                            "state": .string(row.stateLabel(at: now)), "at": .string(row.updatedAt),
+                            "terminal": .bool(job.state.isTerminal), "needsYou": .bool(job.state == .needsYou)])
+        }
+        let wander: JSONValue = switch snapshot.wanderHour {
+        case .absent: .null
+        case .line(let text, let symbol, let at): .object(["text": .string(text), "symbol": .string(symbol), "at": faceText(at)])
+        }
+        let timed: [JSONValue] = snapshot.timedBots.map { bot -> JSONValue in
+            .object(["id": .string(bot.id.uuidString), "name": .string(bot.name), "line": .string(bot.line),
+                     "at": faceText(bot.nextRun.map(NativeTimestampFormat.fractionalZulu))])
+        }
+        let missed: [JSONValue] = snapshot.missedBots.map { bot -> JSONValue in
+            .object(["id": .string(bot.id.uuidString), "name": .string(bot.name), "line": .string(bot.line),
+                     "at": .string(NativeTimestampFormat.fractionalZulu(bot.dueAt))])
+        }
+        let timers: [JSONValue] = snapshot.times.map { time -> JSONValue in
+            let interval = time.rhythm.flatMap(SchedulerJobNormalizer.rhythmInterval).map { JSONValue.int(Int64($0)) } ?? .null
+            let once = time.rhythm == nil ? "Once at \(time.next.formatted(date: .abbreviated, time: .shortened))." : nil
+            return .object(["id": .string(time.id), "name": .string(Self.timerName(time)), "at": .string(NativeTimestampFormat.fractionalZulu(time.next)),
+                            "enabled": .bool(true), "once": faceText(once), "intervalSeconds": interval])
+        }
+        let presets: [JSONValue] = DeskDeferPreset.allCases.map { preset -> JSONValue in
+            .object(["id": .string(preset.rawValue),
+                     "at": faceText(DeskSequencing.parseDeferStamp(preset.day(from: now)).map(NativeTimestampFormat.fractionalZulu))])
+        }
+        return [
+            "day": .string(DeskClock.dayStamp(now)),
+            "headline": faceText(snapshot.overview?.headline),
+            "loaded": .bool(snapshot.loaded),
+            "boardRead": .bool(snapshot.board?.deskState != nil),
+            "generatedAt": faceText(snapshot.generatedTs),
+            "unavailable": .object([
+                "desk": faceText(snapshot.deskUnavailable), "jobs": faceText(snapshot.agentJobs.unavailableReason),
+                "reminders": faceText(snapshot.nagConfigError), "helpers": faceText(snapshot.botScheduleError),
+                "liveUpdates": faceText(liveError), "schedule": faceText(scheduleError),
+                "contacts": faceText(contactsIssue), "inbox": faceText(inboxIssue),
+                "overview": .array((snapshot.overview?.unavailable ?? []).map(JSONValue.string)),
+            ]),
+            "scheduleRead": .bool(scheduleRead),
+            "scheduleCurrent": .bool(scheduleCurrent),
+            "activity": activity,
+            "items": .array(items),
+            "overview": overview,
+            "jobs": .array(jobs),
+            "timedHelpers": .array(timed),
+            "missedHelpers": .array(missed),
+            "timers": .array(timers),
+            "deferPresets": .array(presets),
+            "wanderHour": wander,
+        ]
+    }
+
+    /// A clock time's name on the Desk's timer: what its owner calls it.
+    static func timerName(_ time: OneClock.Time) -> String {
+        let payload = time.payload?.objectValue ?? [:]
+        switch time.owner {
+        case "part": return "\(payload["part"]?.stringValue ?? time.id) wakes on \(payload["signal"]?.stringValue ?? "its schedule")"
+        default: return payload["name"]?.stringValue ?? time.id
+        }
+    }
+}
+
+func faceText(_ value: String?) -> JSONValue { value.map(JSONValue.string) ?? .null }

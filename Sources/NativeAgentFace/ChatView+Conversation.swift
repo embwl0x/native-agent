@@ -20,9 +20,13 @@ extension ChatView {
     @ViewBuilder
     var chatColumn: some View {
         VStack(spacing: 0) {
-            chatRoom
-                .safeAreaInset(edge: .top, spacing: 0) { chatHeader }
-                .overlay(alignment: .bottomTrailing) { latestPillOverlay }
+            HouseGlassContainer(spacing: 0) {
+                VStack(spacing: 0) {
+                    chatHeader
+                    chatRoom
+                        .overlay(alignment: .bottomTrailing) { latestPillOverlay }
+                }
+            }
                 .onChange(of: transcriptLatestRequest) { _, _ in
                     guard chatPageIsVisible else { return }
                     transcriptHandle.goToLatest()
@@ -33,19 +37,18 @@ extension ChatView {
                     transcriptLatestRequest &+= 1
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
-                VStack(spacing: NativeAgentSpacing.xs) {
-                    if let toast = toasts.current {
-                        NoticePill(text: toast)
-                            .padding(.horizontal)
-                            .transition(NativeAgentMotion.fade)
-                            .accessibilityIdentifier("chat.composer.bottom-toast")
-                    }
+                HouseGlassContainer(spacing: ChatComposerTray.gap * 2) {
+                    VStack(spacing: NativeAgentSpacing.xs) {
+                        if let toast = toasts.current {
+                            NoticePill(text: toast)
+                                .padding(.horizontal)
+                                .transition(NativeAgentMotion.fade)
+                                .accessibilityIdentifier("chat.composer.bottom-toast")
+                        }
 
-                    let screenCaptureAllowed = appModel.settingsScreenCaptureEnabled == true
-                    let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
+                        let screenCaptureAllowed = appModel.settingsScreenCaptureEnabled == true
+                        let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
 
-                    // Share one glass container so tray and composer fuse at the room's width.
-                    GlassEffectContainer(spacing: ChatComposerTray.gap * 2) {
                         VStack(spacing: 0) {
                             ChatComposerTray(
                                 attachments: pendingAttachments,
@@ -90,13 +93,13 @@ extension ChatView {
                             ChatTurnCardInset(store: turnCardClearanceStore)
                                 .alignmentGuide(.top) { $0[.bottom] }
                         }
+                        // Grow the composer upward within the reply column so its lower edge stays fixed.
+                        .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
+                        .padding(.leading, NativeAgentShellLayout.roomLeadingInset)
+                        .padding(.trailing, NativeAgentShellLayout.roomTrailingInset)
+                        .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
+                        .padding(.bottom, 24)
                     }
-                    // Grow the composer upward within the reply column so its lower edge stays fixed.
-                    .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
-                    .padding(.leading, NativeAgentShellLayout.roomLeadingInset)
-                    .padding(.trailing, NativeAgentShellLayout.roomTrailingInset)
-                    .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
-                    .padding(.bottom, 24)
                 }
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
                     turnCardClearanceStore.measuredComposerHeight = height

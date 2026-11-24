@@ -18,11 +18,10 @@ const LIST_FAILED = "The conversation list could not be read. Inspect the source
 const READ_FAILED = "The bounded history read did not finish. No partial page is presented as a complete conversation; refresh to retry.";
 const graphemes = new Intl.Segmenter(undefined, {granularity: "grapheme"});
 
-function run(input) {
-    if (input.verb === "messages.recent") return worded(recent(input));
-    if (input.verb === "messages.send") return worded(send(input));
-    throw new Error("native-messages answers messages.recent and messages.send, not " + input.verb + ".");
-}
+const verbs = {
+    "messages.recent": input => worded(recent(input)),
+    "messages.send": input => worded(send(input))
+};
 
 // A failed Messages result names its reason; the recovery words for that reason replace its message.
 function worded(result) {

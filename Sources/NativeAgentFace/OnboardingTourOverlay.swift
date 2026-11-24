@@ -161,7 +161,6 @@ struct OnboardingTourOverlay: View {
         self.onComplete = onComplete
         self.onSelectTab = onSelectTab
     }
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     /// An empty rail has no stop to present.
     var body: some View {
@@ -185,63 +184,67 @@ struct OnboardingTourOverlay: View {
                 .ignoresSafeArea()
                 .onTapGesture { } // Keep background taps from reaching the dimmed room.
 
-            HStack(spacing: NativeAgentSpacing.xl) {
-                tabRail
-                    .plate(reduceTransparency: reduceTransparency)
+            GlassEffectContainer(spacing: 0) {
+                HStack(spacing: NativeAgentSpacing.xl) {
+                    tabRail
+                        .plate()
 
-                VStack(spacing: NativeAgentSpacing.xl) {
-                    Text(presentation.progressText)
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    // Keep the plate and controls fixed so only the current stop changes.
-                    VStack(spacing: NativeAgentSpacing.sm) {
-                        Text(step.title)
-                            .font(ShellType.display)
-                            .foregroundStyle(NativeAgentShell.text)
-                            .multilineTextAlignment(.center)
-
-                        Text(step.body)
-                            .font(ShellType.body)
+                    VStack(spacing: NativeAgentSpacing.xl) {
+                        Text(presentation.progressText)
+                            .font(ShellType.label)
                             .foregroundStyle(NativeAgentShell.secondary)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: 420)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        // Keep the plate and controls fixed so only the current stop changes.
+                        VStack(spacing: NativeAgentSpacing.sm) {
+                            Text(step.title)
+                                .font(ShellType.display)
+                                .foregroundStyle(NativeAgentShell.text)
+                                .multilineTextAlignment(.center)
+
+                            Text(step.body)
+                                .font(ShellType.body)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: 420)
+                        }
+                        .motionArrival()
+                        .id(step.id)
+
+                        HStack(spacing: NativeAgentSpacing.md) {
+                            Button("Skip") {
+                                completeTour()
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .font(ShellType.label)
+                            .keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("onboarding-tour.skip")
+
+                            Spacer()
+
+                            Button("Back") {
+                                retreat()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!presentation.backEnabled)
+                            .accessibilityIdentifier("onboarding-tour.back")
+
+                            Button(presentation.advanceLabel) {
+                                advance()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.large)
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("onboarding-tour.advance")
+                        }
+                        .frame(maxWidth: 420)
                     }
-                    .motionArrival()
-                    .id(step.id)
-
-                    HStack(spacing: NativeAgentSpacing.md) {
-                        Button("Skip") {
-                            completeTour()
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .font(ShellType.label)
-                        .accessibilityIdentifier("onboarding-tour.skip")
-
-                        Spacer()
-
-                        Button("Back") {
-                            retreat()
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!presentation.backEnabled)
-                        .accessibilityIdentifier("onboarding-tour.back")
-
-                        Button(presentation.advanceLabel) {
-                            advance()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                        .accessibilityIdentifier("onboarding-tour.advance")
-                    }
-                    .frame(maxWidth: 420)
+                    .padding(NativeAgentSpacing.xl)
+                    .plate()
+                    .frame(maxWidth: 520)
                 }
-                .padding(NativeAgentSpacing.xl)
-                .plate(reduceTransparency: reduceTransparency)
-                .frame(maxWidth: 520)
             }
             .padding(NativeAgentSpacing.xl)
             // The overlay stays over a dimmed room in either appearance.
@@ -256,36 +259,41 @@ struct OnboardingTourOverlay: View {
     }
 
     private var tabRail: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(tour.steps) { tabStep in
-                let isSelected = tabStep.id == tour.currentStopID
-                Button {
-                    apply(.select(stepID: tabStep.id))
-                } label: {
-                    Text(tabStep.item.shellRailTitle)
-                        .font(ShellType.rail)
-                        .foregroundStyle(isSelected ? NativeAgentShell.text : NativeAgentShell.secondary)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.leading, NativeAgentShellLayout.railWordInset)
-                        .frame(height: 30)
-                        .overlay(alignment: .leading) {
-                            RoundedRectangle(cornerRadius: 1, style: .continuous)
-                                .fill(NativeAgentShell.text)
-                                .frame(width: 2, height: 20)
-                                .padding(.leading, NativeAgentShellLayout.barInset)
-                                .opacity(isSelected ? 1 : 0)
-                                .animation(NativeAgentMotion.crossfade, value: isSelected)
-                        }
-                        .contentShape(Rectangle())
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(tour.steps) { tabStep in
+                    let isSelected = tabStep.id == tour.currentStopID
+                    Button {
+                        apply(.select(stepID: tabStep.id))
+                    } label: {
+                        Text(tabStep.item.shellRailTitle)
+                            .font(ShellType.rail)
+                            .foregroundStyle(isSelected ? NativeAgentShell.text : NativeAgentShell.secondary)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.leading, NativeAgentShellLayout.railWordInset)
+                            .frame(minHeight: 30)
+                            .overlay(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                                    .fill(NativeAgentShell.text)
+                                    .frame(width: 2, height: 20)
+                                    .padding(.leading, NativeAgentShellLayout.barInset)
+                                    .opacity(isSelected ? 1 : 0)
+                                    .animation(NativeAgentMotion.crossfade, value: isSelected)
+                            }
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("onboarding-tour.step.\(tabStep.id)")
+                    .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("onboarding-tour.step.\(tabStep.id)")
-                .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
             }
+            .padding(.vertical, 10)
         }
-        .padding(.vertical, 10)
+        .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize)
         .frame(width: 180)
+        .frame(maxHeight: 460)
     }
 
     private func advance() {
@@ -313,10 +321,10 @@ struct OnboardingTourOverlay: View {
 }
 
 private extension View {
-    /// Reduce Transparency needs a flat rail colour instead of glass.
-    func plate(reduceTransparency: Bool) -> some View {
-        let shape = RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous)
-        return background { if reduceTransparency { shape.fill(NativeAgentShell.rail) } }
-            .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
+    func plate() -> some View {
+        houseSurface(
+            in: RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous),
+            opaqueFill: NativeAgentShell.rail
+        )
     }
 }

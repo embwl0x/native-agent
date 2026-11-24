@@ -1,26 +1,16 @@
 import AppKit
-import EngineRuntime
-import ApprovalTransactions
-import AppToolRuntime
-import AttentionRouting
-import ChatTurnRuntime
-import ChatTurnContracts
-import ChatToolRuntime
-import Connectors
-import DeviceSync
-import Experiences
+import BodyRuntime
+import MindCore
+import SenseCore
 import Foundation
-import MacControl
-import MacIntegration
+import MacNerves
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
-import SlackBot
 import SwiftUI
-import TrustCenter
+import DeskCore
 
-import BackgroundLoops
 // Blueprint: | `BodyCardActions.swift` | Body-owned inline interaction answers and verified-control settlement |
 
 @MainActor
@@ -52,7 +42,7 @@ final class BodyCardActions {
         guard current.revision == identity.revision else {
             throw PartCallError(code: "card_revision_changed", message: "This request has changed. Read it again before answering.")
         }
-        let descriptor = await InlineInteractionResolver.descriptor(for: current, dataRoot: engine.dataRoot)
+        let descriptor = await InlineInteractionCoordinator.descriptor(for: current, dataRoot: engine.dataRoot)
         if answer.choice == "restart" {
             guard InlineCards.model(current, descriptor: descriptor).restartNote != nil else {
                 throw PartCallError(code: "card_restart_unavailable", message: "This request does not need an app restart.")
@@ -63,8 +53,7 @@ final class BodyCardActions {
         // A walking permission card stays answerable: Continue starts the one walk over from the first grant still off. The grant watch
         // already carries a running card (its census), and a wake of its own here would read as the person's return from the pane just opened.
         if current.kind == .permission, case .running = current.state, descriptor.control == .macPermissionGrant {
-            await InlineInteractionResolver.walk(id: identity.card, sessionID: identity.session, handed: true, asking: true,
-                dataRoot: engine.dataRoot)
+            await engine.interactions.walk(id: identity.card, sessionID: identity.session, handed: true, asking: true)
             pending[identity.card] = identity
             observe()
             await engine.transcripts.refreshCards(in: identity.session)
@@ -88,15 +77,15 @@ final class BodyCardActions {
         guard Set(values.keys).isSubset(of: permitted) else {
             throw PartCallError(code: "card_fields_changed", message: "The request's entry fields changed. Read it again.")
         }
-        let running = try await InlineInteractionResolver.begin(id: identity.card, sessionID: identity.session,
-            expectedRevision: identity.revision, dataRoot: engine.dataRoot)
+        let running = try await engine.interactions.begin(id: identity.card, sessionID: identity.session,
+            expectedRevision: identity.revision)
         let controlIdentity = CardIdentity(card: identity.card, session: identity.session, revision: running.revision)
         let turn = TurnRequest(message: "", sessionID: identity.session, surface: "chat",
-            envelope: TurnEnvelope.personOnMac("mac_ui:interaction." + identity.card)).turn()
+            envelope: TurnEnvelope.personOnMac("mac_ui:interaction." + identity.card)).turn(dataRoot: engine.dataRoot)
         do {
-            try await InlineInteractionResolver.runControl(running, descriptor: descriptor, sessionID: identity.session,
+            try await engine.interactions.runControl(running, descriptor: descriptor, sessionID: identity.session,
                 value: values["value"], choice: ["answer", "begin", "full_setup"].contains(answer.choice) ? nil : answer.choice,
-                values: values, fullSetup: answer.choice == "full_setup", turn: turn, controls: controls, dataRoot: engine.dataRoot,
+                values: values, fullSetup: answer.choice == "full_setup", turn: turn, controls: controls,
                 present: { [self] control in
                     try await present(control, descriptor: descriptor, identity: controlIdentity)
                 }, watch: { [self] in watch(controlIdentity) }, refresh: { [engine] in await engine.transcripts.refreshCards(in: identity.session) })
@@ -105,8 +94,8 @@ final class BodyCardActions {
             pending[identity.card] = nil
             if pending.isEmpty { observation?.cancel(); observation = nil }
             do {
-                _ = try await InlineInteractionResolver.complete(id: identity.card, sessionID: identity.session,
-                    expectedRevision: running.revision, setupError: cause, turn: nil, dataRoot: engine.dataRoot)
+                _ = try await engine.interactions.complete(id: identity.card, sessionID: identity.session,
+                    expectedRevision: running.revision, setupError: cause, turn: nil)
             } catch {
                 throw WireFailure(code: "card_settlement_failed", message: "The request failed and could not record its outcome.",
                     cause: cause + "\n" + FaceSecretRedaction.text(error.localizedDescription, secrets: Array(answer.secrets.values)), effects: .known)
@@ -120,8 +109,7 @@ final class BodyCardActions {
     private func watch(_ identity: CardIdentity) {
         pending[identity.card] = identity
         observe()
-        InlineInteractionResolver.GrantWatch.shared.watchUntilGranted(identity.card, sessionID: identity.session,
-            dataRoot: engine.dataRoot) { [weak self] in
+        engine.interactions.watchUntilGranted(identity.card, sessionID: identity.session) { [weak self] in
                 guard let self else { return }
                 await self.verifyPending()
             }
@@ -132,23 +120,22 @@ final class BodyCardActions {
     func verify(_ identity: CardIdentity, returned: Bool = true) async throws -> FaceActReply {
         let current = try await read(identity)
         if current.state.isOpen {
-            let selection = try await InlineInteractionResolver.selectionForReturn(current, dataRoot: engine.dataRoot)
+            let selection = try await engine.interactions.selectionForReturn(current)
             let scope: InlineInteraction.Scope? = current.kind == .modelChoice ? .persistent : nil
-            let control = await InlineInteractionResolver.descriptor(for: current, dataRoot: engine.dataRoot).control
+            let control = await InlineInteractionCoordinator.descriptor(for: current, dataRoot: engine.dataRoot).control
             if returned, Self.returnControls.contains(control), current.state == .running, current.revision == identity.revision {
-                await InlineInteractionResolver.settleOrReopen(identity.card, sessionID: identity.session, expectedRevision: current.revision,
-                    selection: selection, scope: scope, dataRoot: engine.dataRoot)
+                await engine.interactions.settleOrReopen(identity.card, sessionID: identity.session, expectedRevision: current.revision,
+                    selection: selection, scope: scope)
             } else {
-                _ = await InlineInteractionResolver.completeIfVerified(id: identity.card, sessionID: identity.session,
-                    expectedRevision: current.revision, selection: selection, scope: scope, dataRoot: engine.dataRoot)
+                _ = await engine.interactions.completeIfVerified(id: identity.card, sessionID: identity.session,
+                    expectedRevision: current.revision, selection: selection, scope: scope)
             }
         }
         return try await result(identity, controlIdentity: identity, onlyWhileRunning: true)
     }
 
     private func read(_ identity: CardIdentity) async throws -> InlineInteraction {
-        guard let card = try await InlineInteractionResolver.interaction(id: identity.card, sessionID: identity.session,
-            dataRoot: engine.dataRoot) else {
+        guard let card = try await engine.interactions.interaction(id: identity.card, sessionID: identity.session) else {
             throw PartCallError(code: "card_unavailable", message: "This request has no saved interaction. Refresh its conversation.")
         }
         return card

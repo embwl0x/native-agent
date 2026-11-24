@@ -42,7 +42,7 @@ struct InlineCardSetupPresentation: ViewModifier {
         let simple = appModel.face.slot(.settings).select("viewMode.simple", as: SettingsFace.self) {
             $0?.preferences[SimpleViewMode.key] == .string(SimpleViewMode.simple)
         }
-        let panelOpen = simple && cards.connectorSheet != nil
+        let panelOpen = simple && active && cards.connectorSheet != nil
         content
             .disabled(panelOpen)
             .overlay {
@@ -77,6 +77,9 @@ struct InlineCardSetupPresentation: ViewModifier {
             .onChange(of: scope, initial: true) {
                 endVerification()
                 requestVerification()
+            }
+            .onChange(of: active) { _, visible in
+                if !visible, simple, cards.connectorSheet != nil { closeConnector() }
             }
             .onDisappear { endVerification() }
             .task(id: requests.first?.id) {
@@ -151,7 +154,6 @@ struct SimpleSetupPanel<Content: View>: View {
     var showsClose = true
     let close: () -> Void
     @ViewBuilder let content: Content
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     static var radius: CGFloat { 22 }
 
@@ -162,7 +164,8 @@ struct SimpleSetupPanel<Content: View>: View {
             Color.black.opacity(0.35).ignoresSafeArea()
             content
                 .frame(maxWidth: 760)
-                .clipShape(shape)
+                // Full pages need an opaque room fill so chat text cannot show through their content.
+                .houseInset(in: shape, fill: NativeAgentShell.room)
                 .overlay(alignment: .topTrailing) {
                     if showsClose {
                         Button(action: close) {
@@ -175,9 +178,6 @@ struct SimpleSetupPanel<Content: View>: View {
                         .padding(12)
                     }
                 }
-                // Full pages need an opaque room fill so chat text cannot show through their content.
-                .background { shape.fill(NativeAgentShell.room) }
-                .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
                 .padding(32)
             Button("Close", action: close)
                 .keyboardShortcut(.cancelAction)

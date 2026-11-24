@@ -119,7 +119,6 @@ RELEASE_ENV_SURFACE=(
   NATIVEAGENT_MAC_BUNDLE_ID
   NATIVEAGENT_ICLOUD_CONTAINER_ID
   NATIVEAGENT_MOBILE_SOURCE_KEY
-  NATIVEAGENT_BACKGROUND_TASK_PREFIX
   NATIVEAGENT_INTERNAL_BUILD_STAMP
   NATIVEAGENT_RELEASE_ENTITLEMENTS
   NATIVEAGENT_PUBLIC_EXPORT_DIR
@@ -262,7 +261,6 @@ echo "==> NativeAgent release v$VERSION (dry-run=$DRY_RUN)"
 NATIVEAGENT_MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.nativeagent.mac}"
 NATIVEAGENT_ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.github.embwl0x.nativeagent}"
 NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
-NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
 NATIVEAGENT_RELEASE_PAGE_URL="${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}"
 
 # Stamp SUFeedURL and the updater claim only for publication in this run; never synthesize a URL.
@@ -275,15 +273,15 @@ else
 fi
 export NATIVEAGENT_DEVELOPER_ID NATIVEAGENT_TEAM_ID NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVEAGENT_SPARKLE_PUBLIC_KEY \
   NATIVEAGENT_PROVISIONING_PROFILE NATIVEAGENT_APPCAST_URL NATIVEAGENT_DMG_DOWNLOAD_URL NATIVEAGENT_RELEASE_PAGE_URL \
-  NATIVEAGENT_MAC_BUNDLE_ID NATIVEAGENT_ICLOUD_CONTAINER_ID NATIVEAGENT_MOBILE_SOURCE_KEY NATIVEAGENT_BACKGROUND_TASK_PREFIX
+  NATIVEAGENT_MAC_BUNDLE_ID NATIVEAGENT_ICLOUD_CONTAINER_ID NATIVEAGENT_MOBILE_SOURCE_KEY
 
 # Distribution transport modes:
-#   personal      — development/personal KVS + Drive + CloudKit profile
+#   personal      — development/personal CloudKit profile
 #   cloudkit      — public Developer ID build with production CloudKit only
 #   none          — public standalone build with no Apple device transport
 #
 # The official Mac+iPhone release uses `cloudkit`; KVS/CloudDocuments are not
-# part of the public Developer ID contract. Every public mode starts from the
+# part of any release contract. Every public mode starts from the
 # scrubbed, marker-bearing export.
 NATIVEAGENT_ICLOUD_BUILD="${NATIVEAGENT_ICLOUD_BUILD:-personal}"
 case "$NATIVEAGENT_ICLOUD_BUILD" in
@@ -300,19 +298,18 @@ if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" == "none" ]]; then
   # no bundle metadata that makes Doctor or the runtime expect one.
   NATIVEAGENT_ICLOUD_CONTAINER_ID="iCloud.com.example.nativeagent"
 fi
-if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" == "cloudkit" ]]; then
+if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "none" ]]; then
+  # The resolver accepts only cloudkit; personal and public builds both stamp it.
   NATIVEAGENT_DEVICE_SYNC="cloudkit"
 else
-  # Preserve the established KVS/Drive transport for personal builds. The
-  # standalone lane also stamps the inert legacy default, but carries no Apple
-  # sync entitlements so no device bridge can start.
+  # The standalone lane stamps an inert value the resolver rejects and carries
+  # no Apple sync entitlements, so no device bridge can start.
   NATIVEAGENT_DEVICE_SYNC="kvs"
 fi
 if [[ "$DRY_RUN" == "false" ]]; then
-  if [[ "$NATIVEAGENT_MAC_BUNDLE_ID" == com.example.* \
-     || "$NATIVEAGENT_BACKGROUND_TASK_PREFIX" == com.example.* ]]; then
+  if [[ "$NATIVEAGENT_MAC_BUNDLE_ID" == com.example.* ]]; then
     echo "ERROR: production release identity still uses the com.example placeholder." >&2
-    echo "       Set the stable Mac bundle and background-task identifiers explicitly." >&2
+    echo "       Set the stable Mac bundle identifier explicitly." >&2
     exit 1
   fi
   if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "none" \
@@ -641,7 +638,6 @@ xcodebuild -quiet -jobs 6 \
   NATIVEAGENT_MAC_APP_GROUP_ID="$NATIVEAGENT_MAC_APP_GROUP_ID" \
   NATIVEAGENT_ICLOUD_CONTAINER_ID="$NATIVEAGENT_ICLOUD_CONTAINER_ID" \
   NATIVEAGENT_MOBILE_SOURCE_KEY="$NATIVEAGENT_MOBILE_SOURCE_KEY" \
-  NATIVEAGENT_BACKGROUND_TASK_PREFIX="$NATIVEAGENT_BACKGROUND_TASK_PREFIX" \
   NATIVEAGENT_DEVICE_SYNC="$NATIVEAGENT_DEVICE_SYNC" \
   NATIVEAGENT_RELEASE_PAGE_URL="$NATIVEAGENT_RELEASE_PAGE_URL" \
   NATIVEAGENT_BUILD_SHORT_VERSION="$EFFECTIVE_SHORT_VERSION" \
@@ -791,15 +787,22 @@ if [[ "$_gate_rc" -ne 0 ]]; then
 fi
 
 # Preserve symbolication privately, then remove local symbols from the shipped
-# executable before signing. Public-export children write directly into the
-# private controller's ignored .runtime archive via the environment above;
-# dSYMs never enter the app, DMG, appcast, or GitHub release payload.
+# executables (the app, its Face renderer and every helper) before signing.
+# Public-export children write directly into the private controller's ignored
+# .runtime archive via the environment above; dSYMs never enter the app, DMG, appcast, or GitHub release payload.
 RELEASE_SYMBOL_ARCHIVE_DIR="${NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR:-$ROOT/.runtime/release-symbols/$VERSION/$NATIVEAGENT_SOURCE_REVISION}"
 echo "==> Archiving dSYM and stripping local executable symbols..."
-release_archive_symbols_and_strip \
+for release_executable in \
   "$BUNDLE/Contents/MacOS/$PRODUCT" \
-  "$RELEASE_SYMBOL_ARCHIVE_DIR" \
-  "$PRODUCT"
+  "$BUNDLE/Contents/Helpers/NativeAgentFace.app/Contents/MacOS/NativeAgentFace" \
+  "$BUNDLE/Contents/MacOS/nativeagent-link" \
+  "$BUNDLE/Contents/MacOS/NativeAgentChromeRelay" \
+  "$BUNDLE/Contents/MacOS/NativeAgentSenseHost"; do
+  release_archive_symbols_and_strip \
+    "$release_executable" \
+    "$RELEASE_SYMBOL_ARCHIVE_DIR" \
+    "$(basename "$release_executable")"
+done
 
 echo "==> Codesigning..."
 sign_nested_plain() {

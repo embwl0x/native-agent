@@ -34,14 +34,20 @@ struct ChatMarkdownTableView: View {
 
     @ViewBuilder
     private func cellText(_ text: AttributedString, column: Int) -> some View {
-        let aligned: Alignment = switch table.align(column) {
+        let align = table.align(column)
+        let aligned: Alignment = switch align {
+        case .leading: .leading
+        case .center: .center
+        case .trailing: .trailing
+        }
+        let textAligned: TextAlignment = switch align {
         case .leading: .leading
         case .center: .center
         case .trailing: .trailing
         }
         Text(text)
-        .multilineTextAlignment(table.align(column) == .trailing ? .trailing : .leading)
+        .multilineTextAlignment(textAligned)
         .frame(maxWidth: .infinity, alignment: aligned)
-        .gridColumnAlignment(table.align(column) == .trailing ? .trailing : .leading)
+        .gridColumnAlignment(aligned.horizontal)
     }
 }

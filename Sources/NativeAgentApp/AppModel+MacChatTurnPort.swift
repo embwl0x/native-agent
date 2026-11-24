@@ -1,13 +1,13 @@
 import PersistenceCore
 import Foundation
-import ChatTurnRuntime
+import BodyRuntime
 import NativeAgentShared
 import AppKit
 import SwiftUI
-import MacControl
+import MacNerves
 import NativeAgentCore
-import TrustCenter
-import TurnTrace
+import DeskCore
+import SenseCore
 // Blueprint: | `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` mounts checkpoint presentation through the core session delivery owner and lifecycle without forwarding a turn sink; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
 
 extension AppModel: MacChatTurnPresentationPort {

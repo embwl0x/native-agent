@@ -3,7 +3,7 @@ import Observation
 import UIKit
 import Speech
 import AVFoundation
-import os
+import Synchronization
 import NativeAgentShared
 // Blueprint: | `VoiceInputController.swift` | Session-bound capture; recognition completion or cancellation settles the draft |
 
@@ -34,6 +34,7 @@ final class VoiceInputController {
     var transcript = ""
     var lastFinalTranscript = ""
     var error: String?
+    var errorNeedsSettings = false
     var statusText: String?
     var hasReceivedAudio = false
     var isFinalizing: Bool { waitingForFinalAfterStop }
@@ -75,6 +76,16 @@ final class VoiceInputController {
 
     // MARK: - Public API
 
+    func clearError() {
+        error = nil
+        errorNeedsSettings = false
+    }
+
+    private func setError(_ message: String, needsSettings: Bool = false) {
+        error = message
+        errorNeedsSettings = needsSettings
+    }
+
     func begin(voiceNote: Bool, names: [String]) {
         startTask?.cancel()
         startTask = Task { await start(voiceNote: voiceNote, names: names) }
@@ -96,7 +107,7 @@ final class VoiceInputController {
         desiredListening = true
         waitingForFinalAfterStop = false
         hasStartedAudioSession = false
-        error = nil
+        clearError()
         statusText = "Requesting speech recognition permission..."
         transcript = ""
         lastFinalTranscript = ""
@@ -112,7 +123,7 @@ final class VoiceInputController {
         guard desiredListening, generation == startGeneration else { return }
         guard speechStatus == .authorized else {
             desiredListening = false
-            error = VoiceInputAuthorizationPresentation.speechFailureMessage(for: speechStatus)
+            setError(VoiceInputAuthorizationPresentation.speechFailureMessage(for: speechStatus), needsSettings: true)
             statusText = nil
             return
         }
@@ -123,7 +134,7 @@ final class VoiceInputController {
         guard desiredListening, generation == startGeneration else { return }
         guard micGranted else {
             desiredListening = false
-            error = VoicePresentation.deniedMicrophoneMessage()
+            setError(VoicePresentation.deniedMicrophoneMessage(), needsSettings: true)
             statusText = nil
             return
         }
@@ -156,7 +167,7 @@ final class VoiceInputController {
                     guard let self, self.startGeneration == generation
                         || (self.waitingForFinalAfterStop && self.finalizingGeneration == generation) else { return }
                     guard let detail else { return }
-                    self.error = detail
+                    self.setError(detail)
                     self.waitingForFinalAfterStop = false
                     self.desiredListening = false
                     self.teardownAudio(cancelTask: true)
@@ -164,20 +175,20 @@ final class VoiceInputController {
             })
             guard desiredListening, generation == startGeneration else {
                 do { try await MobileDictation.shared.stopInput(token: token, cancelTask: true) }
-                catch { self.error = "Cancelled voice input could not release audio: \(error.localizedDescription)" }
+                catch { self.setError("Cancelled voice input could not release audio: \(error.localizedDescription)") }
                 return
             }
             if let preparationError {
                 desiredListening = false
                 teardownAudio(cancelTask: true)
-                self.error = preparationError
+                setError(preparationError.message, needsSettings: preparationError.needsSettings)
                 statusText = nil
                 return
             }
         } catch {
             guard desiredListening, generation == startGeneration else { return }
             teardownAudio(cancelTask: true)
-            self.error = "Microphone could not start: \(error.localizedDescription)"
+            setError("Microphone could not start: \(error.localizedDescription)")
             statusText = nil
             return
         }
@@ -190,13 +201,13 @@ final class VoiceInputController {
         } catch {
             guard desiredListening, generation == startGeneration else { return }
             teardownAudio(cancelTask: true)
-            self.error = "Audio engine failed to start: \(error.localizedDescription)"
+            setError("Audio engine failed to start: \(error.localizedDescription)")
             statusText = nil
             return
         }
         guard desiredListening, generation == startGeneration else {
             do { try await MobileDictation.shared.stopInput(token: token, cancelTask: true) }
-            catch { self.error = "Cancelled voice input could not release audio: \(error.localizedDescription)" }
+            catch { self.setError("Cancelled voice input could not release audio: \(error.localizedDescription)") }
             return
         }
 
@@ -204,7 +215,7 @@ final class VoiceInputController {
         isStarting = false
         startedAt = Date()
         if isVoiceNote { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-        error = nil
+        clearError()
         statusText = hasReceivedAudio && transcript.isEmpty ? "Hearing you..." : "Listening..."
     }
 
@@ -258,9 +269,9 @@ final class VoiceInputController {
         guard let utterance, !utterance.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             waitingForFinalAfterStop = false
             if error == nil {
-                error = hasReceivedAudio
+                setError(hasReceivedAudio
                     ? "No words were recognized. Try speaking a little longer."
-                    : "No microphone audio detected. Check iOS microphone privacy and the selected audio route."
+                    : "No microphone audio detected. Check iOS microphone privacy and the selected audio route.")
             }
             teardownAudio(cancelTask: true)
             return
@@ -281,7 +292,7 @@ final class VoiceInputController {
                 do { try await MobileDictation.shared.stopInput(token: token, cancelTask: cancelTask) }
                 catch {
                     guard self.startGeneration == generation else { return }
-                    self.error = "Voice input could not finish: \(error.localizedDescription)"
+                    self.setError("Voice input could not finish: \(error.localizedDescription)")
                     self.waitingForFinalAfterStop = false
                 }
             }
@@ -331,7 +342,7 @@ actor MobileDictation {
     func prepareInput(token: UUID, names: [String], onAudio: @escaping @Sendable () -> Void,
                       onLevel: @escaping @Sendable (Float) -> Void,
                       onResult: @escaping @Sendable (SpeechUtterance) -> Void,
-                      onError: @escaping @Sendable (String?) -> Void) async throws -> String? {
+                      onError: @escaping @Sendable (String?) -> Void) async throws -> (message: String, needsSettings: Bool)? {
         if let inputToken { try await stopInput(token: inputToken, cancelTask: true) }
         try Task.checkCancellation()
         inputToken = token
@@ -345,20 +356,22 @@ actor MobileDictation {
         self.engine = engine
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else { return "No usable microphone input route was found." }
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            return ("No usable microphone input route was found.", false)
+        }
         let locale = await MobileSpeechAnalyzer.supportedLocale()
         guard inputToken == token, !Task.isCancelled else { throw CancellationError() }
         guard let locale else {
-            return """
+            return ("""
                 On-device speech recognition does not support this device or language. Choose a supported iPhone language in Settings before trying voice \
                 input again.
-                """
+                """, true)
         }
         let modern = try await MobileSpeechAnalyzer(locale: locale, sourceFormat: format, names: names)
         guard inputToken == token, !Task.isCancelled else { await modern.cancel(); throw CancellationError() }
         self.modern = modern
         modern.start(onResult: onResult, onError: onError)
-        let hasReceivedAudio = OSAllocatedUnfairLock(initialState: false)
+        let hasReceivedAudio = Atomic(false)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
             do { try modern.append(buffer) }
             catch { onError(error.localizedDescription); return }
@@ -369,12 +382,7 @@ actor MobileDictation {
                 rms = sqrt(sum / Float(buffer.frameLength))
             }
             onLevel(rms)
-            let firstAudibleBuffer = hasReceivedAudio.withLockUnchecked { received in
-                guard !received, rms > 0.002 else { return false }
-                received = true
-                return true
-            }
-            if firstAudibleBuffer { onAudio() }
+            if rms > 0.002, !hasReceivedAudio.exchange(true, ordering: .acquiringAndReleasing) { onAudio() }
         }
         tapInstalled = true
         return nil

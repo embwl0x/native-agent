@@ -4,6 +4,18 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.23 — faster reads, a body that knows where it is, a leaner core (2026-11-24)
+
+- Speed: Mail, Messages, Notes and Safari read in about two seconds and see current data while open; independent reads run together; window looks
+  under a second; recall scoring faster with identical results; Chrome history while Chrome runs; phone sync reads only what changed
+- Mac body: one event-fed picture of where things sit; each act settles on its result, not a fixed wait, with the person's hands noted beside it;
+  Chrome clicks confirmed by target or page; the agent's own file writes recognized
+- Agents: Muse chat in the background end to end; a queued send to another agent can be withdrawn
+- Window and iPhone: plain words on Home, Desk and Today, content first; one card look; safe Markdown styling; one-bar iPhone composer, no fixed pause
+- Fixed: Quit skips slow network lookups and finishes writes in flight; no provider error after a blank-line cut; Full Disk Access offers Restart; generated
+  images go straight to Make
+- Core: 61 modules into 9 on Swift 6.2 strict concurrency; about 1,300 unused lines removed
+
 ## 0.6.22 — new installs pick a model (2026-11-22)
 
 - Fix: on a new install, choosing a Chat model saved nothing; a blank Think level is now no level chosen

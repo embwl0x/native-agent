@@ -88,8 +88,11 @@ public struct RuntimeStatusFace: FaceValue {
         switch health?.reachable {
         case true:
             let needsAttention = hasError || health?.ok != true
-            return RuntimeStatusFace(text: hasError ? "App is online; some app data is unavailable" : "App is online",
-                detail: detail, tone: needsAttention ? .warning : .success,
+            let text = hasError ? "App is online; some app data is unavailable"
+                : health?.ok != true ? "App is online; needs attention" : "App is online"
+            let onlineDetail = detail ?? (health?.ok != true ? "Check Diagnostics for details." : nil)
+            return RuntimeStatusFace(text: text,
+                detail: onlineDetail, tone: needsAttention ? .warning : .success,
                 systemImage: needsAttention ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
         case false:
             return RuntimeStatusFace(text: "App reported a problem", detail: detail,

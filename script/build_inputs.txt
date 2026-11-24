@@ -15,7 +15,8 @@ Extensions/NativeAgentChrome/manifest.json
 Extensions/NativeAgentChrome/src
 # Bundled documentation (project.yml resources and stamp phase).
 docs/data-bounds.md
-docs/licenses/A2A-gRPC-NOTICES.txt
+docs/IMAGE_GENERATION.md
+docs/licenses/THIRD-PARTY-NOTICES.txt
 docs/release-notes/*.md
 # Build/generator programs, their inputs, and bundled bridge helpers.
 script/build_inputs.txt
@@ -23,6 +24,4 @@ script/lib
 script/build_and_run.sh
 script/release.sh
 script/sync_build_declarations.rb
-script/regenerate_a2a_grpc.sh
-script/proto
 script/*.js

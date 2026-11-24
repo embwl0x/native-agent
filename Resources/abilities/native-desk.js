@@ -10,9 +10,6 @@
   }
 }
 */
-function run(input) {
-    return face(input);
-}
 function face(input) {
     const keys = input.keys;
     const STATUS = {now:"now",next:"next",blocked:"blocked",flag:"needs attention",done:"done",todo:"to do",watch:"watching",canceled:"cancelled"};
@@ -23,29 +20,7 @@ function face(input) {
     // A row keeps only the fields it has; an empty action list stays, as the stem drew it.
     // "watch" is the status every item starts with, before anyone sets one. Only a watch is watching; anything else has no status to say yet.
     const said = (status, kind) => status === "watch" && kind !== "watch" ? null : STATUS[status];
-    const row = fields => Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== null && value !== undefined));
-    // A character is what the reader sees as one (a grapheme cluster), as the stem counts it; Intl is supplied by JavaScriptCore.
-    const graphemes = new Intl.Segmenter("en", {granularity: "grapheme"});
-    const characters = text => Array.from(graphemes.segment(text), s => s.segment);
-    function plain(raw) {
-        return raw.trim().replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").split(/\r\n|[\n\r\v\f\u0085\u2028\u2029]/).map(rawLine => {
-            let line = rawLine.trim(), heading = false;
-            while (/^[#>]/.test(line)) { heading = heading || line[0] === "#"; line = line.slice(1).trim(); }
-            if (heading && line && !/[.!?:]$/.test(line)) line += ".";
-            for (const bullet of ["- ", "* ", "+ "]) if (line.startsWith(bullet)) line = line.slice(bullet.length);
-            return line.replace(/[*\x60\\]/g, "").trim();
-        }).filter(Boolean).join(" ").trim();
-    }
-    function bounded(text, limit) {
-        const chars = characters(text);
-        if (chars.length <= limit) return text;
-        const window = chars.slice(0, limit);
-        let stop = -1;
-        window.forEach((c, i) => { if (c === "." || c === "!" || c === "?") stop = i; });
-        if (stop >= Math.floor(limit / 2)) return window.slice(0, stop + 1).join("");
-        const space = window.lastIndexOf(" "), head = space >= 0 ? window.slice(0, space).join("").trim() : "";
-        return (head || window.join("")) + "…";
-    }
+    const {row, plain, bounded} = kit;
     const line = (text, limit) => bounded(plain(text), limit);
     const ones = ["zero","one","two","three","four","five","six","seven","eight","nine","ten","eleven","twelve","thirteen","fourteen",
         "fifteen","sixteen","seventeen","eighteen","nineteen"];
@@ -72,6 +47,7 @@ function face(input) {
         close: item => item.requiresOwnerInput ? "Already handled" : "Close",
         note: () => "Note", unpark: () => "Un-park"
     };
+    const rank = a => a.id === "reply" ? {role: "primary"} : (a.id === "note" || a.id === "unpark") ? {aside: true} : {};
     // A step's column on its item's board, and the moves each column offers: a step not under way starts, an open one is done.
     const COLUMNS = [["now", "Now"], ["next", "Next"], ["waiting", "Waiting"], ["done", "Done"]];
     const MOVE = {start: "Start", close: "Done"};
@@ -98,7 +74,8 @@ function face(input) {
         }
         return x.length - y.length;
     };
-    const keyActions = (id, label) => ((keys[id] || {}).actions || []).map(a => row({id: a.id, label: label(a.id), role: a.role}));
+    const keyActions = (id, label, rank) => ((keys[id] || {}).actions || []).map(a =>
+        row({id: a.id, label: label(a.id), role: a.role, ...(rank ? rank(a) : {})}));
     const open = id => (keys[id] || {}).open;
     const back = {id: "desk-selection", title: "Board", actions: [{id: "board", label: "Back to the board"}]};
 
@@ -210,11 +187,10 @@ function face(input) {
                 : open(id) ? {id, title: ref.label, open: open(id)}
                 : {id, title: ref.label, detail: ref.text, actions: [{id: "copy-reference", label: "Copy reference"}]});
         }
-        // What can be done with the item is a row of buttons under it, like the Desk's own tools: a row that is only its action is a button.
-        const acts = [];
-        for (const action of ["reply", "close", "note", "unpark"]) {
-            const id = "item-action:" + action;
-            if (keys[id]) acts.push({id, title: ACTION[action](s), actions: keyActions(id, a => ACTION[a](s))});
+        const work = "item-action:work", acts = [];
+        for (const a of (keys[work] && keys[work].actions) || []) {
+            const id = "item-action:" + a.id, words = ACTION[a.id] ? ACTION[a.id](s) : a.id;
+            if (keys[id]) acts.push({id, title: words, actions: keyActions(id, () => words, a.id === "reply" ? () => ({role: "primary"}) : null)});
         }
         // The person's Veto rides this row; the stem draws its action.
         if (s.vetoable) rows.push({id: "item-action:veto", title: "Veto"});
@@ -333,7 +309,6 @@ function face(input) {
         if (item.status === "blocked" || held(item)) return stuckReason(item);
         if (trimmed(item.summary)) return line(item.summary, 96);
         if (item.status === "flag") return "Flagged for a second look.";
-        // An item nobody has started says nothing here; "Queued" beside it already does.
         const words = said(item.status, item.kind);
         return words ? words[0].toUpperCase() + words.slice(1) : null;
     }
@@ -350,17 +325,16 @@ function face(input) {
         return {working: "live", blocked: "attention", stale: "attention", finished: "done", queued: "plain"}[item.activity] || "quiet";
     }
     function itemRow(item) {
-        // A held item's detail already says what it waits on; "Queued" beside that would contradict it.
-        // A row leads with its number, the name the person and the agent both call it by; its stored handle names nothing to either.
-        const detail = [item.alias, item.project, isProject(item) ? projectLine(item) : itemDetail(item), held(item) ? null : ACTIVITY[item.activity]];
+        const shownActivity = item.status === "blocked" ? "blocked" : item.status === "watch" && item.kind === "watch" ? "watching"
+            : terminal(item) ? "finished" : null;
+        const activityNote = item.activity === shownActivity || (item.activity === "queued" && held(item)) ? null : ACTIVITY[item.activity];
+        const detail = [item.alias, item.project, isProject(item) ? projectLine(item) : itemDetail(item), activityNote];
         if (item.plan !== null && item.plan.total > 0) detail.push(item.plan.done + " of " + item.plan.total + " closed");
         if (item.pieces.length) detail.push(thingsLine(item.pieces.length));
-        // A plan with steps draws how far it has come: its closed steps out of all of them (done counts only its own steps).
         const meter = item.plan !== null && item.plan.total > 0 ? {value: item.plan.done, max: item.plan.total} : null;
-        // The detail already says how many steps closed; an empty value keeps the reading from saying it again as the meter's amount.
         return row({id: item.handle, title: line(item.title, 110) || item.handle, detail: detail.filter(part => part !== null && part !== "").join(" · "),
             value: said(item.status, item.kind) ?? (meter ? "" : null),
-            at: item.updatedAt, tone: tone(item), open: open(item.handle), actions: keyActions(item.handle, a => ACTION[a](item)), meter});
+            at: item.updatedAt, tone: tone(item), open: open(item.handle), actions: keyActions(item.handle, a => ACTION[a](item), rank), meter});
     }
     // My own upkeep stands apart from the work: what I finished today under one row of Done today, the rest at the end. An upkeep item the
     // page marks for attention, or that is blocked, is work again and stands with it.
@@ -400,12 +374,12 @@ function face(input) {
     const overview = {};
     if (input.overview !== null) {
         const onBoard = new Set(input.items.map(item => item.handle));
-        for (const [id, title, source] of [["work-now", "Other work now", input.overview.now], ["attention", "Needs you", input.overview.needsYou],
+        for (const [id, title, source] of [["attention", "Needs you", input.overview.needsYou],
             ["recent-work", "Recently done", input.overview.recentlyDone]]) {
             const rows = source.rows.filter(r => r.kind !== "execution" && (r.kind !== "desk" || !onBoard.has(r.ref))).map(r => row({id: r.id,
                 title: r.title, detail: id === "attention" && gone.inbox !== null && ["approval","inbox"].includes(r.kind)
                     ? r.summary + " · " + gone.inbox : r.summary, value: r.state, at: r.at,
-                tone: id === "attention" ? "attention" : id === "recent-work" ? "done" : "plain", open: open(r.id)}));
+                tone: id === "attention" ? "attention" : "done", open: open(r.id)}));
             if (rows.length || source.omitted > 0) overview[id] = row({id, title, style: "timeline",
                 footer: source.omitted > 0 ? source.omitted + " more items remain in the board, Activity and history." : null, rows});
         }
@@ -413,17 +387,19 @@ function face(input) {
 
     // The tools stay within reach at the top; then what waits, what I made, the work under way; what is set aside, the readings and what is
     // finished follow, and my own marks last.
-    sections.push({id: "desk-tools", style: "flow", rows: [["refresh", "Refresh"], ["find-item", "Find item"], ["new-task", "New task"],
-        ["research", "Look something up"]].map(([id, label]) =>
-        ({id: "desk:" + id, title: label, actions: keyActions("desk:" + id, () => label)}))});
-    // What I made, laid on live items: first on the board, newest first, each opening its item.
+    sections.push({id: "desk-tools", style: "flow", rows: [["new-task", "New task"], ["find-item", "Find item"], ["research", "Look something up"],
+        ["refresh", "Refresh"]].map(([id, label]) =>
+        ({id: "desk:" + id, title: label, actions: keyActions("desk:" + id, () => label, id === "new-task" ? () => ({role: "primary"}) : null)}))});
+    // What I made, laid on live items: newest first, each opening its item.
     const table = items.filter(item => !terminal(item)).flatMap(item => item.pieces.map(piece => ({item, piece})))
         .sort((a, b) => descending(a.piece.newestAt || "", b.piece.newestAt || "") || ascending(a.piece.id, b.piece.id))
         .map(({item, piece}) => row({id: "table:" + piece.id, title: pieceTitle(piece), detail: pieceLine(piece) + " · " + line(item.title, 80),
             at: piece.newestAt, tone: pieceTone(piece), open: open("table:" + piece.id), actions: keyActions("table:" + piece.id, a => PIECE_ACTION[a])}));
     for (const needs of [board.waiting, overview.attention]) if (needs) sections.push(needs);
     if (table.length) sections.push({id: "on-the-table", title: "On the table", style: "list", rows: table});
-    for (const live of [board.now, board.watching, board.queued, overview["work-now"]]) if (live) sections.push(live);
+    const tablePosition = sections.length;
+    for (const live of [board.now, board.watching, board.queued]) if (live) sections.push(live);
+    const afterLivePosition = sections.length;
     if (!items.length && input.boardRead && gone.desk === null) {
         sections.push({id: "empty-board", style: "note", rows: [{id: "empty", title: "No items on the board."}]});
     }
@@ -513,7 +489,7 @@ function face(input) {
     if (input.table) {
         const t = input.table, key = "piece:" + t.ref;
         if (sections.length >= 64) sections.pop();
-        const layTable = section => selected === null ? sections.unshift(section) : sections.push(section);
+        const layTable = (section, at = tablePosition) => sections.splice(selected === null ? at : sections.length, 0, section);
         if (t.reason) layTable({id: key, title: "The table", style: "note", rows: [{id: key, title: t.reason, tone: "attention"}]});
         else {
             const boundary = t.source_boundary ? t.source_boundary + "\n" : "";
@@ -529,10 +505,13 @@ function face(input) {
                     seen.add(piece.ref); return true;
                 }).map(piece => ({id: "piece:" + piece.ref, label: piece.title || "Untitled piece", detail: WHAT[piece.what], piece: "make:" + piece.ref})))
                 .slice(0, 200);
-            layTable({id: key, title: "The table", block: {kind: "leaf", key, leaf: "board", ref: t.ref, revision: t.version,
+            const empty = t.elements.length === 0;
+            layTable({id: key, title: "The table", ...(empty ? {folded: true} : {}),
+                block: {kind: "leaf", key, leaf: "board", ref: t.ref, revision: t.version,
                 cards: Object.fromEntries(t.card_pairs), choices,
                 alt: reading.text + "\nRaw points: make.read {ref:\"table\"} gives the file path." + (reading.cut
-                    ? "\nReading cut; make.read {ref:" + JSON.stringify(t.ref) + "} gives the complete board file." : "")}});
+                    ? "\nReading cut; make.read {ref:" + JSON.stringify(t.ref) + "} gives the complete board file." : "")}},
+                empty ? afterLivePosition : tablePosition);
         }
     }
     // What the Desk has open, for the ask bar and the agent's page read. A title is one line there, so its line breaks become spaces.

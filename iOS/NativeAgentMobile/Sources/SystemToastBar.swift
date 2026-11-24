@@ -5,7 +5,8 @@ import NativeAgentShared
 public struct iOSSystemToastBar: View {
     private static let maxVisible = 3
 
-    @ObservedObject var center: SystemToastCenter
+    let center: SystemToastCenter
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(center: SystemToastCenter) {
         self.center = center
@@ -31,7 +32,7 @@ public struct iOSSystemToastBar: View {
         .padding(.horizontal, 16)
         .padding(.top, 4)
         .frame(maxWidth: .infinity, alignment: .center)
-        .animation(AppMotion.snappy, value: center.queue.map(\.id))
+        .animation(AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: center.queue.map(\.id))
         .allowsHitTesting(!center.queue.isEmpty)
         // The overlay caller preserves status-bar safe area so the stack stays beneath it on phone and tablet.
     }
@@ -92,7 +93,7 @@ private struct iOSSystemToastPill: View {
 /// Name every connection state so a healthy dot still explains its meaning and tappability.
 struct MacStatusChip: View {
     var speaksAsAgent = false
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @Environment(MacBridgeClient.self) private var bridgeClient
     private let sync = iCloudSyncEngine.shared
     @State private var showDetail = false
 
@@ -141,6 +142,7 @@ private struct MacStatusDetail: View {
                 Circle().fill(connection.headline.state == .holds ? Color.green
                               : connection.headline.state == .waiting ? Color.orange : Color.red)
                     .frame(width: 9, height: 9)
+                    .accessibilityHidden(true)
                 Text(AliveConnection.line(connection))
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -172,6 +174,7 @@ private struct MacStatusDetail: View {
 /// Release dismissal on changed/cleared engine warnings so new failures remain visible.
 struct MacSyncErrorBanner: View {
     private let sync = iCloudSyncEngine.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var dismissedMessage: String?
     @State private var showsConnection = false
 
@@ -203,7 +206,7 @@ struct MacSyncErrorBanner: View {
                             Image(systemName: "xmark")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(AlivePalette.secondary)
-                                .frame(width: 32, height: 32)
+                                .frame(width: 44, height: 44)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -215,10 +218,13 @@ struct MacSyncErrorBanner: View {
                             .foregroundStyle(AlivePalette.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Button("Connection") { showsConnection = true }
-                        .font(.footnote.weight(.semibold))
-                        .buttonStyle(.plain)
-                        .padding(.top, 2)
+                    Button { showsConnection = true } label: {
+                        Text("Connection")
+                            .font(.footnote.weight(.semibold))
+                            .frame(minWidth: 44, minHeight: 44, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(14)
                 .aliveGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
@@ -230,9 +236,10 @@ struct MacSyncErrorBanner: View {
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        .animation(AppMotion.snappy, value: sync.syncError)
+        .animation(AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: sync.syncError)
         .sheet(isPresented: $showsConnection) {
-            NavigationStack { SettingsViewFull(opensConnection: true) }
+            NavigationStack { SettingsViewFull(presentation: .sheet, opensConnection: true) }
+                .macSyncErrorBanner()
         }
         // Clear dismissal with its condition so a later occurrence of the same sync failure can show again.
         .onChange(of: sync.syncError) { _, newValue in

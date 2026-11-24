@@ -19,7 +19,9 @@ enum PushReceiptLedger {
     }
     private static let key = "NativeAgentMobile.pushReceipts"
     private static let capacity = 20
-    static let didChange = Notification.Name("NativeAgentMobile.pushReceiptLedgerDidChange")
+    struct DidChange: NotificationCenter.AsyncMessage {
+        typealias Subject = NSObject
+    }
 
     @discardableResult
     static func record(userInfo: [AnyHashable: Any]) -> PushReceiptEntry {
@@ -33,7 +35,7 @@ enum PushReceiptLedger {
         let reading = load()
         guard reading.failure == nil else {
             NSLog("[PushReceiptLedger] Receipt history unavailable; retained existing bytes: %@", reading.failure ?? "")
-            NotificationCenter.default.post(name: didChange, object: nil)
+            NotificationCenter.default.post(DidChange())
             return entry
         }
         var entries = reading.entries
@@ -41,7 +43,7 @@ enum PushReceiptLedger {
         if entries.count > capacity { entries = Array(entries.prefix(capacity)) }
         if let data = try? JSONEncoder().encode(entries) {
             UserDefaults.standard.set(data, forKey: key)
-            NotificationCenter.default.post(name: didChange, object: nil)
+            NotificationCenter.default.post(DidChange())
         }
         NSLog("[PushReceiptLedger] push received source=%@ itemId=%@ eventId=%@",
               entry.source, entry.itemId, entry.eventId ?? "none")

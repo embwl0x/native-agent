@@ -1,8 +1,8 @@
-#if canImport(CloudKit) && !os(Linux)
 import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
+import Synchronization
 // Blueprint: | `CloudKitDeviceTransport+PairingStatus.swift` | Account-slot claims, pairing, presence and serialized status delivery |
 
 extension CloudKitDeviceTransport {
@@ -83,32 +83,31 @@ extension CloudKitDeviceTransport {
     }
 
     public var pairingHeldElsewhere: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return pairingClaim == .elsewhere
+        return state.withLock { $0.pairingClaim == .elsewhere }
     }
 
     /// Whether this transport may read and write the phone's records: always on the phone; on a Mac, only once it has read that it holds the pairing.
     public var holdsPairing: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return role != .mac || pairingClaim == .held
+        return state.withLock { role != .mac || $0.pairingClaim == .held }
     }
 
     private func notePairingPublished() {
-        lock.lock(); defer { lock.unlock() }
-        pairingPublications &+= 1
-        pairingClaim = .held
+        state.withLock { state in
+            state.pairingPublications &+= 1
+            state.pairingClaim = .held
+        }
     }
 
     private func pairingPublicationCount() -> UInt64 {
-        lock.lock(); defer { lock.unlock() }
-        return pairingPublications
+        return state.withLock { $0.pairingPublications }
     }
 
     /// A publication that landed while the claim was reading is newer than what the read saw, and already decided the answer.
     private func settleClaim(elsewhere: Bool, since publications: UInt64) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if pairingPublications == publications { pairingClaim = elsewhere ? .elsewhere : .held }
-        return pairingClaim == .held
+        return state.withLock { state in
+            if state.pairingPublications == publications { state.pairingClaim = elsewhere ? .elsewhere : .held }
+            return state.pairingClaim == .held
+        }
     }
 
     func refuseUnlessHoldingPairing() throws {
@@ -117,7 +116,8 @@ extension CloudKitDeviceTransport {
             : DeviceSyncError.transient(message: "This Mac has not read yet whether it holds the iPhone pairing.")
     }
 
-    public func observePairing(onChange: @escaping @Sendable (Data) async -> Bool) async {
+    /// The handler receives the peer's key and when the peer published it (nil when the record does not say).
+    public func observePairing(onChange: @escaping @Sendable (Data, Date?) async -> Bool) async {
         setPairingHandler(onChange)  // last registration wins (single forwarder)
         // Register pushes before draining so pairing changes cannot fall between the two.
         do {
@@ -129,17 +129,12 @@ extension CloudKitDeviceTransport {
         catch { nativeLog("[ck-device] observePairing: initial read failed: \(error)") }
     }
 
-    // Reading the peer secret must not change this Mac's publication claim.
-    public func peekPairingSecret(recovery: DeviceSyncRecovery = .init()) async throws -> Data {
-        try await peekPairing(recovery: recovery).secret
-    }
-
     /// The peer's published key and when the peer published it, by the peer's own clock (nil when the record does not say).
     public func peekPairing(recovery: DeviceSyncRecovery = .init()) async throws -> (secret: Data, publishedAt: Date?) {
         guard recovery.isActive else { throw CancellationError() }
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
         let recordName = "pairing.\(peerRole.rawValue)"
-        return try await withDeviceCKOperation("CloudKitDeviceTransport.peekPairingSecret", onFailure: accountFailureReporter) {
+        return try await withDeviceCKOperation("CloudKitDeviceTransport.peekPairing", onFailure: accountFailureReporter) {
             let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
             let publishedAt = (record["publishedAt"] as? String).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
             return (try Self.pairingSecret(in: record), publishedAt)
@@ -152,8 +147,8 @@ extension CloudKitDeviceTransport {
     public func drainPairing(recovery: DeviceSyncRecovery = .init()) async throws -> Bool {
         guard recovery.isActive else { throw CancellationError() }
         guard let handler = loadPairingHandler() else { return false }
-        let secret = try await peekPairingSecret(recovery: recovery)
-        guard await handler(secret) else { return false }
+        let published = try await peekPairing(recovery: recovery)
+        guard await handler(published.secret, published.publishedAt) else { return false }
         recovery.didApplyData?()
         return true
     }
@@ -256,27 +251,27 @@ extension CloudKitDeviceTransport {
         work: @escaping @Sendable () async throws -> Void
     ) async throws {
         try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, Error>) in
-            lock.lock()
-            defer { lock.unlock() }
-            // Keep one operation and the latest replacement. Each caller owns its result, including a value displaced before it reached the wire.
-            pendingStatusWrites.removeValue(forKey: key)?.completion.resume(
-                throwing: DeviceSyncError.transient(message: "CloudKit status write was superseded before sending."))
-            pendingStatusWrites[key] = (work, completion)
-            guard statusWrites[key] == nil else { return }
-            statusWrites[key] = Task.detached(priority: .utility) {
-                while let pending = self.nextStatusWrite(key: key) {
-                    do { try await pending.work(); pending.completion.resume() }
-                    catch { pending.completion.resume(throwing: error) }
+            state.withLock { state in
+                state.pendingStatusWrites.removeValue(forKey: key)?.completion.resume(
+                    throwing: DeviceSyncError.transient(message: "CloudKit status write was superseded before sending."))
+                state.pendingStatusWrites[key] = (work, completion)
+                guard state.statusWrites[key] == nil else { return }
+                state.statusWrites[key] = Task.detached(priority: .utility) {
+                    while let pending = self.nextStatusWrite(key: key) {
+                        do { try await pending.work(); pending.completion.resume() }
+                        catch { pending.completion.resume(throwing: error) }
+                    }
                 }
             }
         }
     }
 
     private func nextStatusWrite(key: String) -> (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)? {
-        lock.lock(); defer { lock.unlock() }
-        let work = pendingStatusWrites.removeValue(forKey: key)
-        if work == nil { statusWrites.removeValue(forKey: key) }
-        return work
+        return state.withLock { state in
+            let work = state.pendingStatusWrites.removeValue(forKey: key)
+            if work == nil { state.statusWrites.removeValue(forKey: key) }
+            return work
+        }
     }
 
     // Advance status acknowledgement only after the handler accepts its value.
@@ -288,7 +283,6 @@ extension CloudKitDeviceTransport {
         setStatusHandler(key: key, DeviceStatusObserver(pairingSecret: pairingSecret, apply: onApply))
     }
 
-    /// Server modification dates determine per-key freshness; dispatch only values newer than the last accepted value.
     @discardableResult
     public func drainStatus(recovery: DeviceSyncRecovery = .init()) async -> Int {
         (await drainStatusResult(recovery: recovery)).dispatchedCount
@@ -318,18 +312,20 @@ extension CloudKitDeviceTransport {
     }
 
     private func beginStatusDrainOrCoalesce() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if statusDrainInFlight { statusDrainAgain = true; return false }
-        statusDrainInFlight = true
-        return true
+        return state.withLock { state in
+            if state.statusDrainInFlight { state.statusDrainAgain = true; return false }
+            state.statusDrainInFlight = true
+            return true
+        }
     }
 
     private func endStatusDrainOrContinue(recovery: DeviceSyncRecovery) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if statusDrainAgain && recovery.isActive { statusDrainAgain = false; return true }
-        statusDrainAgain = false
-        statusDrainInFlight = false
-        return false
+        return state.withLock { state in
+            if state.statusDrainAgain && recovery.isActive { state.statusDrainAgain = false; return true }
+            state.statusDrainAgain = false
+            state.statusDrainInFlight = false
+            return false
+        }
     }
 
     /// Only the serialized status drain may run this body.
@@ -337,50 +333,127 @@ extension CloudKitDeviceTransport {
         let handlers = loadStatusHandlers()
         guard !handlers.isEmpty else { return .skipped(0) }
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
+        var observers: [(key: String, handler: DeviceStatusObserver, secret: Data, id: CKRecord.ID)] = []
         var dispatched = 0
         var failure: DeviceSyncError?
         for (key, handler) in handlers {
-            guard recovery.isActive else { return .skipped(dispatched) }
+            guard recovery.isActive else { return .skipped(0) }
             guard let secret = await handler.pairingSecret(), secret.count == 32 else {
                 failure = failure ?? .notConfigured
                 continue
             }
-            let recordName = Self.statusRecordName(role: peerRole, key: key, pairingSecret: secret)
-            let hit: PeerStatusHit
-            do {
-                hit = try await withDeviceCKOperation("CloudKitDeviceTransport.drainStatus",
-                    onFailure: accountFailureReporter) {
-                    let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
+            if let first = observers.first, first.secret != secret {
+                return .failure(.notConfigured, dispatched: 0)
+            }
+            let name = Self.statusRecordName(role: peerRole, key: key, pairingSecret: secret)
+            observers.append((key, handler, secret, CKRecord.ID(recordName: name)))
+        }
+
+        guard recovery.isActive else { return .skipped(0) }
+        guard let first = observers.first, holdsPairing else {
+            return .failure(failure ?? .notConfigured, dispatched: 0)
+        }
+        if role == .ios, await first.handler.pairingSecret() != first.secret {
+            return .failure(.notConfigured, dispatched: 0)
+        }
+
+        do {
+            let valueKeys = ["key", "role", "value"]
+            let records = try await fetchStatusRecords(observers.map { $0.id }, desiredKeys: role == .ios ? [] : valueKeys)
+            var changed: [CKRecord.ID: CKRecord] = [:]
+            for (key, handler, secret, id) in observers {
+                guard recovery.isActive else { return .skipped(0) }
+                do {
+                    let record = try statusRecord(records[id], key: key)
+                    if !statusIsAcknowledged(record) {
+                        changed[id] = record
+                    } else if await handler.pairingSecret() != secret || !holdsPairing {
+                        failure = failure ?? .notConfigured
+                    }
+                } catch {
+                    let error = await reportStatusReadFailure(error)
+                    failure = failure ?? error
+                }
+            }
+
+            guard recovery.isActive else { return .skipped(0) }
+            var values = records
+            if role == .ios, !changed.isEmpty {
+                guard await first.handler.pairingSecret() == first.secret else {
+                    return .failure(failure ?? .notConfigured, dispatched: 0)
+                }
+                values = try await fetchStatusRecords(Array(changed.keys), desiredKeys: valueKeys)
+            }
+            for (key, handler, secret, id) in observers {
+                guard recovery.isActive else { return .skipped(dispatched) }
+                guard let metadataRecord = changed[id] else { continue }
+                do {
+                    let record = try statusRecord(values[id], key: key)
                     guard record["key"] as? String == key,
                           record["role"] as? String == peerRole.rawValue,
                           let value = record["value"] as? String else {
                         throw DeviceSyncError.underlying(message: "CloudKit status \(key) has no readable value.")
                     }
-                    return PeerStatusHit(value: value, modDate: record.modificationDate)
+                    guard await handler.pairingSecret() == secret, holdsPairing else {
+                        failure = failure ?? .notConfigured
+                        continue
+                    }
+                    let date = record.modificationDate
+                    let metadataDate = metadataRecord.modificationDate
+                    let metadataTag = metadataRecord.recordChangeTag
+                    let dates = [metadataDate, statusAcknowledgement(for: id.recordName)?.date].compactMap { $0 }
+                    if let newest = dates.max() {
+                        guard let date, date >= newest,
+                              date != metadataDate || metadataTag == nil || metadataTag == record.recordChangeTag else {
+                            throw DeviceSyncError.transient(message: "CloudKit status \(key) did not return its observed revision.")
+                        }
+                    }
+                    guard !statusIsAcknowledged(record) else { continue }
+                    guard await handler.apply(value, date, secret, recovery),
+                          await handler.pairingSecret() == secret else {
+                        failure = failure ?? .transient(message: "CloudKit status \(key) could not be applied.")
+                        continue
+                    }
+                    acknowledgeStatus(record)
+                    dispatched += 1
+                    recovery.didApplyData?()
+                } catch {
+                    let error = await reportStatusReadFailure(error)
+                    failure = failure ?? error
                 }
-            } catch {
-                failure = failure ?? Self.mapError(error)
-                continue
             }
-            // Commit a status date only after its handler accepts the new value.
-            let acknowledgement = recordName
-            guard await handler.pairingSecret() == secret, holdsPairing else {
-                failure = failure ?? .notConfigured
-                continue
-            }
-            guard statusIsNewer(key: acknowledgement, hit.modDate) else { continue }
-            guard await handler.apply(hit.value, hit.modDate, secret, recovery),
-                  await handler.pairingSecret() == secret else {
-                failure = failure ?? .transient(message: "CloudKit status \(key) could not be applied.")
-                continue
-            }
-            commitStatusDate(key: acknowledgement, hit.modDate)
-            dispatched += 1
-            recovery.didApplyData?()
+        } catch {
+            failure = failure ?? Self.mapError(error)
         }
         guard recovery.isActive else { return .skipped(dispatched) }
         if let failure { return .failure(failure, dispatched: dispatched) }
         return .success(dispatched)
     }
+
+    private func fetchStatusRecords(
+        _ ids: [CKRecord.ID], desiredKeys: [CKRecord.FieldKey]
+    ) async throws -> [CKRecord.ID: Result<CKRecord, Error>] {
+        return try await withDeviceCKOperation("CloudKitDeviceTransport.drainStatus", onFailure: accountFailureReporter) {
+            try await self.database.records(for: ids, desiredKeys: desiredKeys)
+        }
+    }
+
+    private func statusRecord(_ result: Result<CKRecord, Error>?, key: String) throws -> CKRecord {
+        guard let result else {
+            throw DeviceSyncError.underlying(message: "CloudKit status \(key) returned no record result.")
+        }
+        return try result.get()
+    }
+
+    private func statusIsAcknowledged(_ record: CKRecord) -> Bool {
+        guard let last = statusAcknowledgement(for: record.recordID.recordName),
+              let changeTag = record.recordChangeTag else { return false }
+        return record.modificationDate == last.date && changeTag == last.changeTag
+    }
+
+    private func reportStatusReadFailure(_ error: Error) async -> DeviceSyncError {
+        await accountFailureReporter(error)
+        nativeLog("[ck-device] CloudKitDeviceTransport.drainStatus failed: \(error)")
+        return Self.mapError(error)
+    }
 }
-#endif

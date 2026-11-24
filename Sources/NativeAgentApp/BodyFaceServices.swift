@@ -1,18 +1,13 @@
 import AppKit
-import AuthoredCapabilities
-import BackgroundLoops
-import ChatTurnRuntime
-import ChatToolParsing
-import Cognition
-import Desk
-import EngineRuntime
+import SenseCore
+import BodyRuntime
+import MacNerves
+import DeskCore
 import Foundation
-import MemoryV2
+import MindCore
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import Privacy
-import Studio
 // Blueprint: | `BodyFaceServices.swift` | Body-owned contact, Desk, graph and resource acts for the separate window |
 
 @MainActor
@@ -57,7 +52,7 @@ final class BodyFaceServices {
                 throw Self.failure("contact_session_missing", "The originating conversation is absent from the checked index. Nothing was sent.")
             }
             let turn = TurnRequest(message: request.text, sessionID: session, surface: "native_actions",
-                envelope: .personOnMac("mac_ui:contact.send")).turn()
+                envelope: .personOnMac("mac_ui:contact.send")).turn(dataRoot: engine.dataRoot)
             if let cause = await engine.sendContactMessage(agent: request.contact, text: request.text, session: session,
                 root: engine.dataRoot, turn: turn) {
                 throw Self.failure("contact_send_unconfirmed", cause, effects: .unknown)
@@ -113,7 +108,7 @@ final class BodyFaceServices {
             throw Self.failure("contact_message_not_held", "This message is not waiting for an explicit resend. Read its current state.")
         }
         let turn = TurnRequest(message: queued.text, sessionID: session, surface: "native_actions",
-            envelope: .personOnMac("mac_ui:contact.send")).turn()
+            envelope: .personOnMac("mac_ui:contact.send")).turn(dataRoot: engine.dataRoot)
         if let cause = await engine.sendContactMessage(agent: contact, text: queued.text, session: session, root: engine.dataRoot,
             conversation: contact.hasPrefix("bot:") ? nil : flight.recordID, turn: turn) {
             throw Self.failure("contact_resend_unconfirmed", cause, effects: .unknown)

@@ -107,10 +107,10 @@ struct SimpleSidebar: View {
                     HStack(spacing: 10) {
                         SimpleAvatar(contact: contact)
                         VStack(alignment: .leading) {
-                            Text(contact.label).font(.system(size: 14, weight: .medium))
+                            Text(contact.label).font(ShellType.rail)
                             FaceReadStatus(state: contact.state).font(.caption)
                         }
-                    }.frame(height: 44).tag(SimpleShellView.Pane.contact(id))
+                    }.frame(minHeight: 44).tag(SimpleShellView.Pane.contact(id))
                 }
             }
             if ids.isEmpty, state == .ready {
@@ -131,17 +131,29 @@ struct SimpleSidebar: View {
                     let working = helpers.select("working." + id, as: HelpersFace.self) {
                         $0?.runningIDs.contains(id) == true || $0?.waitingIDs.contains(id) == true
                     }
-                    HStack(spacing: 10) {
-                        SimpleClockTile(working: working)
-                        FaceView(face: PartFace(sections: [.init(id: "helper", rows: [helper])]), door: ReadOnlyFaceDoor(),
-                            session: FacePageSession(), retaining: false)
-                    }.frame(minHeight: 44).tag(SimpleShellView.Pane.helper(id))
+                    SimpleHelperRow(helper: helper, working: working)
+                        .tag(SimpleShellView.Pane.helper(id))
                 }
             }
             if ids.isEmpty, state == .ready {
                 Text("None yet.").foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+private struct SimpleHelperRow: View {
+    let helper: PartFace.Row
+    let working: Bool
+    @State private var session = FacePageSession()
+
+    var body: some View {
+        HStack(spacing: 10) {
+            SimpleClockTile(working: working)
+            FaceView(face: PartFace(sections: [.init(id: "helper", rows: [helper])]), door: ReadOnlyFaceDoor(),
+                session: session, retaining: false)
+        }
+        .frame(minHeight: 44)
     }
 }
 
@@ -153,6 +165,7 @@ private struct SimpleFoldLine: View {
     let count: Int?
     let needsYou: Bool
     @Binding var isOpen: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let waiting = needsYou && !isOpen
@@ -162,6 +175,7 @@ private struct SimpleFoldLine: View {
                     .font(ShellType.captionSemibold)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .rotationEffect(.degrees(isOpen ? 90 : 0))
+                    .animation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: isOpen)
                     .accessibilityHidden(true)
                 Text(title).font(ShellType.labelSemibold).foregroundStyle(NativeAgentShell.secondary)
                 if let count {

@@ -149,7 +149,9 @@ private struct SealedSenseWebView: NSViewRepresentable {
             prepareTask?.cancel()
             for task in eventTasks.values { task.cancel() }
             eventTasks.removeAll()
+            // The capture holds the view, whose configuration holds this coordinator: let it go so the WKWebView can.
             capture?.close()
+            capture = nil
         }
 
         func webView(_ webView: WKWebView, start task: any WKURLSchemeTask) {

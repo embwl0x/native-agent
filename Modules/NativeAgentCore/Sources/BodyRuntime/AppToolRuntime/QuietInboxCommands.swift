@@ -1,0 +1,422 @@
+import MacNerves
+import SenseCore
+import MindCore
+import DeskCore
+import Foundation
+import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
+// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`; tap/message authority and receipts; committed effects survive unknown readback |
+
+@MainActor public protocol QuietInboxHost: QuietToolHost {
+    var inboxDataRoot: URL { get }
+    var interactionSource: String { get }
+    func interactionForInboxItem(_ id: String, dataRoot: URL) async throws -> InlineInteraction?
+    func readInbox() async throws -> [InboxItemRecord]
+    func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord])
+    func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws
+    func withdrawApproval(id: String, decidedBy: String) async throws
+    /// The person's decision of an approval, recorded with the provenance of the door that verified the person.
+    func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
+    func refreshInboxSurfaces() async
+    func inboxActDescription(_ item: InboxItemRecord, action: String) -> String
+}
+
+// MARK: - inbox
+
+/// Settling a note shares the page's inboxAction so Today, Desk and phone converge on the same state.
+private struct QuietInboxTarget {
+    let items: [InboxItemRecord]
+    var ids: [String] = []
+    var byID: [String: InboxItemRecord] = [:]
+    var approval: (id: String, title: String)?
+    var press: (item: InboxItemRecord, action: String)?
+    /// Full Mac admits the agent's interaction buttons with a decided row visible to the person.
+    var decided = false
+    /// The person decided this exact call (`AppToolExecutor.personDecided`): it runs as theirs, not quietly as the agent's.
+    var person = false
+    /// A checked tap or person-message decision, naming its verifying door.
+    var provenance: ApprovalResolutionProvenance?
+}
+
+private struct QuietInboxRefusal: Error { let json: JSONValue }
+
+extension QuietInboxHost {
+    /// Preview shares execution's read-only id, reason, pending-ask ownership and below-Full-Mac user-button checks.
+    public func quietInboxFence(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
+        if case .failure(let refusal) = await inboxGate(verb: verb, input: input, turn: turn) { return refusal.json }
+        return nil
+    }
+
+    private func inboxGate(verb: String, input: [String: JSONValue], turn: Turn) async -> Result<QuietInboxTarget, QuietInboxRefusal> {
+        func refuse(_ json: JSONValue) -> Result<QuietInboxTarget, QuietInboxRefusal> { .failure(QuietInboxRefusal(json: ChatToolOutcome.refusedBeforeRunning(
+            json))) }
+        func text(_ key: String) -> String { JSONValue.trimmedScalarTextOrEmpty(input[key]) }
+        let items: [InboxItemRecord]
+        do { items = try await self.readInbox() } catch {
+            return refuse(AppToolExecutor.failure("inbox_unreadable",
+                "The inbox didn't read (\(error.localizedDescription)). Try again; read \(AppToolExecutor.doorDoctor) if it keeps failing."))
+        }
+        var target = QuietInboxTarget(items: items)
+        if verb == "list" { return .success(target) }
+        target.person = AppToolExecutor.personDecided(tool: "inbox", input: input, turn: turn)
+
+        var ids = [text("id")].filter { !$0.isEmpty }
+        ids += JSONValue.trimmedScalarTextArray(input["ids"])
+        guard !ids.isEmpty else {
+            return refuse(AppToolExecutor.failure("missing_id", "Pass id (or ids). app {page:\"inbox\"} lists them."))
+        }
+        let byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // One id resolver: the full id, or a prefix unique among the notes (the short id pages show). Several matches show the choices.
+        for (index, given) in ids.enumerated() where byID[given] == nil {
+            let matches = items.map(\.id).filter { $0.hasPrefix(given) }
+            if matches.count == 1 { ids[index] = matches[0]; continue }
+            if matches.count > 1 {
+                return refuse(.object(["status": .string("refused"), "reason": .string("ambiguous_id"), "id": .string(given),
+                    "choices": .array(matches.prefix(8).map(JSONValue.string)),
+                    "detail": .string("\(given) starts \(matches.count) notes' ids; pass the full id of the one you mean. Nothing was done.")]))
+            }
+            return refuse(.object(["status": .string("not_found"), "reason": .string("unknown_id"), "id": .string(given),
+                "detail": .string("No note has id \(given). Read app {page:\"inbox\"} for the current ids.")]))
+        }
+        target.ids = ids
+        target.byID = byID
+
+        func decisionAuthority(_ item: InboxItemRecord) async -> JSONValue? {
+            do {
+                if !target.person, ids.count != 1 {
+                    return AppToolExecutor.failure("owners_call",
+                        "Answer one exact approval id on the person's own message; multiple approvals wait for the person's tap.")
+                }
+                target.provenance = try await ApprovalExecution.decisionProvenance(id: item.related_approval_id ?? item.id,
+                    turn: target.person ? turn : turn.with(\.personAct, nil), dataRoot: self.dataRootOverride ?? inboxDataRoot)
+                return nil
+            } catch {
+                return AppToolExecutor.ownedFailure(error, code: "approval_authority_unavailable", owner: "approval " + item.id,
+                    instruction: "Read this card before another decision.", next: ["page": .string("inbox"), "item": .string(item.id)], effects: .none)
+            }
+        }
+
+        switch verb {
+        case "read":
+            break
+        case "archive", "dismiss", "mark_read":
+            guard !text("reason").isEmpty else {
+                return refuse(AppToolExecutor.failure("missing_reason",
+                    "Say why in reason (a few words, e.g. \"stale test note\"); it is saved on the note."))
+            }
+            if verb != "mark_read" {
+                for id in ids {
+                    guard let item = byID[id], let approvalID = item.related_approval_id else { continue }
+                    do {
+                        let record = try await SwiftNativeApprovalInbox(root: self.dataRootOverride ?? inboxDataRoot).get(approvalID)
+                        if record.status == "pending", let refusal = await decisionAuthority(item) { return refuse(refusal) }
+                    } catch {
+                        return refuse(AppToolExecutor.failure("approval_unreadable",
+                            "Approval \(approvalID) did not read; nothing was put away. \(error.localizedDescription)"))
+                    }
+                }
+            }
+        case "withdraw":
+            // The agent may withdraw its own pending ask; answering another agent's is the owner's call.
+            guard ids.count == 1, let approvalID = byID[ids[0]]?.related_approval_id, !approvalID.isEmpty else {
+                return refuse(AppToolExecutor.failure("no_approval",
+                    "That note carries no approval. withdraw takes one note whose read shows approval_id."))
+            }
+            let root = self.dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
+            guard let record = try? await SwiftNativeApprovalInbox(root: root).get(approvalID) else {
+                return refuse(AppToolExecutor.failure("approval_unreadable",
+                    "Approval \(approvalID) didn't read, so nothing was withdrawn. Try again; read \(AppToolExecutor.doorDoctor) if it keeps failing."))
+            }
+            guard record.status == "pending" else {
+                return refuse(AppToolExecutor.failure("not_pending",
+                    "That approval is \(record.status), not waiting, so there is nothing to withdraw. Archive the note with a reason if it is stale."))
+            }
+            if case .object(let payload) = record.payload, payload["peer_id"] != nil {
+                return refuse(AppToolExecutor.failure("owners_call",
+                    "That approval is another agent's ask, not yours, so answering it is the owner's. Leave it for them."))
+            }
+            target.approval = (approvalID, record.title)
+        default:
+            guard ids.count == 1, let item = byID[ids[0]] else {
+                return refuse(AppToolExecutor.failure("one_id", "\(verb) takes one id."))
+            }
+            let actionIDs = inboxPresentation(item).actions.map { InboxActionVocabulary.normalizedAction($0.id) }
+            // Resolve note buttons by the exact ids exposed in their read.
+            let shown = inboxPresentation(item).actions.compactMap { AppToolExecutor.noteButton(id: $0.id, label: $0.label) }
+            // A card's Not now is inbox.not_now, its warning on its line; never a bare reject.
+            let requested = verb == "repair" ? "repair" : verb == "not_now" ? "reject" : text("action").lowercased()
+            if verb == "act", item.source == self.interactionSource, ["reject", "deny"].contains(requested) {
+                return refuse(AppToolExecutor.failure("use_not_now",
+                    "A card's Not now is its own action: inbox.not_now. "
+                    + "Nothing was done.", extra: ["actions": .array(shown.map { .string($0) })]))
+            }
+            let action = requested.isEmpty
+                ? actionIDs.first(where: { ["act", "open_approvals", "repair"].contains($0) }) ?? ""
+                : InboxActionVocabulary.normalizedAction(requested)
+            if ["archive", "dismiss", "read", "view"].contains(action) {
+                return refuse(AppToolExecutor.failure("use_verb",
+                    "\(action) is its own here: " + (action == "read" || action == "view"
+                        ? "app {page:\"inbox\", item:<id>} reads a note." : "use inbox.\(action).")))
+            }
+            guard !action.isEmpty, actionIDs.contains(action) else {
+                return refuse(AppToolExecutor.failure("no_such_action",
+                    action.isEmpty ? "This note has no action of its own; archive or dismiss it instead."
+                        : "This note has no \(action) action. Its actions: \(shown.joined(separator: ", ")).",
+                    extra: ["actions": .array(shown.map { .string($0) })]))
+            }
+            // Every decision verb reads the same tap or authenticated person-message authority.
+            if item.source != self.interactionSource, ["approve", "approve_task", "reject"].contains(action) {
+                if let refusal = await decisionAuthority(item) { return refuse(refusal) }
+            }
+            // Full Mac makes the agent's interaction buttons available to it; the person's own act needs no posture.
+            let fullMac = await AppToolExecutor.freshQuietPosture(
+                dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())?.name == AppToolExecutor.fullMacModeName
+            let opensForUser = item.source == self.interactionSource && action == "act"
+            if !target.person, !fullMac, opensForUser {
+                return refuse(AppToolExecutor.failure("opens_for_owner",
+                    """
+                        That card's Open on Mac only opens it for the person at the Mac (inbox.open_on_mac is theirs). inbox.not_now declines it; if it is \
+                        stale, inbox.archive or inbox.dismiss it with a reason.
+                        """,
+                    extra: ["id": .string(item.id)]))
+            }
+            let fence = opensForUser || target.person ? nil : await inboxFloor(item, action: action, dataRoot: self.inboxDataRoot)
+            if !fullMac, let fence {
+                return refuse(AppToolExecutor.failure("owners_call",
+                    "That's the owner's — leave it for them (\(fence)). If it is stale, archive or dismiss it with a reason.",
+                    extra: ["id": .string(item.id), "action": .string(action)]))
+            }
+            target.press = (item, action)
+            target.decided = !target.person && (opensForUser || fence != nil)
+        }
+        return .success(target)
+    }
+
+    public func quietInbox(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
+        let target: QuietInboxTarget
+        switch await inboxGate(verb: verb, input: input, turn: turn) {
+        case .failure(let refusal): return refusal.json
+        case .success(let ready): target = ready
+        }
+        if verb == "list" {
+            return inboxList(target.items, filter: JSONValue.trimmedScalarTextOrEmpty(input["filter"]), limit: input["limit"])
+        }
+        let (ids, byID) = (target.ids, target.byID)
+        let selected = ids.compactMap { id in byID[id].map { (id: id, item: $0) } }
+
+        switch verb {
+        case "read":
+            var notes: [JSONValue] = []
+            for (_, item) in selected {
+                var row = inboxRow(item, full: true)
+                if item.source == "rem_cycle", case .object(var fields) = row {
+                    do {
+                        guard let id = item.related_approval_id else {
+                            throw ToolFailureError("The linked REM approval is unavailable.", effects: .none)
+                        }
+                        let record = try await SwiftNativeApprovalInbox(root: dataRootOverride ?? inboxDataRoot).get(id)
+                        guard record.action == "rem.proposal" else {
+                            throw ToolFailureError("The linked approval is not a REM proposal.", effects: .none)
+                        }
+                        fields["proposal_review"] = .string(record.payloadPreview)
+                    } catch {
+                        fields["proposal_review_unavailable"] = .string(error.localizedDescription)
+                    }
+                    row = .object(fields)
+                }
+                notes.append(row)
+            }
+            return .object(["status": .string("ok"), "notes": .array(notes)])
+        case "archive", "dismiss", "mark_read":
+            let reason = String(JSONValue.trimmedScalarTextOrEmpty(input["reason"]).prefix(280))
+            let action = verb == "mark_read" ? "read" : verb
+            var done: [JSONValue] = []
+            var skipped: [JSONValue] = []
+            for (id, item) in selected {
+                // Reading is not un-archiving: mark_read leaves settled notes alone.
+                if action == "read", !item.isActivityPending {
+                    skipped.append(.object(["id": .string(id), "status": .string(item.status)]))
+                    continue
+                }
+                do {
+                    try await self.performInboxAction(id, action: action, metadata: [
+                        "settled_by": .string(target.person ? "person" : "agent"), "settled_reason": .string(reason),
+                    ], quiet: !target.person, dataRootOverride: self.dataRootOverride, turn: turn)
+                    done.append(.object(["id": .string(id), "was": .string(item.status)]))
+                } catch {
+                    await self.refreshInboxSurfaces()
+                    return AppToolExecutor.failure("write_failed",
+                        "\(error.localizedDescription) Nothing after \(id) was touched; retry with the ids not in done.",
+                        extra: ["done": .array(done), "id": .string(id), "effects": .string(done.isEmpty ? "unknown" : "partial")])
+                }
+            }
+            await self.refreshInboxSurfaces()
+            // A committed action stays done even when its readback is unavailable.
+            let expected = action == "read" ? "read" : action == "archive" ? "archived" : "dismissed"
+            let after: [InboxItemRecord]
+            do { after = try await self.readInbox() }
+            catch {
+                return .object([
+                    "status": .string("ok"), "verb": .string(verb), "effects": .string(done.isEmpty ? "none" : "occurred"),
+                    "verification": .string("unknown"), "readback_error": .string(error.localizedDescription),
+                    "reason_given": .string(reason), "done": .array(done),
+                    "skipped_already_settled": .array(skipped),
+                    "detail": .string("The actions in done completed. Their current state could not be read; do not repeat them on that evidence."),
+                ])
+            }
+            var unstuck: [String] = []
+            var unobserved: [String] = []
+            done = done.map { row in
+                guard case .object(var fields) = row, case .string(let id)? = fields["id"] else { return row }
+                // Newest first matches the visible card.
+                guard let now = after.first(where: { $0.id == id })?.status else {
+                    fields["verification"] = .string("unknown")
+                    unobserved.append(id)
+                    return .object(fields)
+                }
+                fields["now"] = .string(now)
+                if now != expected { unstuck.append(id) }
+                return .object(fields)
+            }
+            var receipt: [String: JSONValue] = [
+                "status": .string(unstuck.isEmpty ? "ok" : "did_not_stick"), "verb": .string(verb),
+                "reason_given": .string(reason), "done": .array(done), "skipped_already_settled": .array(skipped),
+                "verification": .string(unobserved.isEmpty ? "observed" : "unknown"),
+            ]
+            if !unobserved.isEmpty {
+                receipt["unobserved_ids"] = .array(unobserved.map(JSONValue.string))
+                receipt["detail"] = .string("""
+                    Completed actions remain in done; cards absent from this live read have unknown verification and may have moved to the archive.
+                    """)
+            }
+            if !unstuck.isEmpty {
+                receipt["ok"] = .bool(false)
+                receipt["effects"] = .string("occurred")
+                receipt["detail"] = .string("""
+                    Written, but \(unstuck.joined(separator: ", ")) now read as not \(expected). See now on each; the readback does not establish why the \
+                    state changed.
+                    """)
+            }
+            return .object(receipt)
+        case "withdraw":
+            let (approvalID, title) = target.approval!
+            do {
+                try await self.withdrawApproval(id: approvalID, decidedBy: "agent_withdraw")
+            } catch {
+                return AppToolExecutor.ownedFailure(error, code: "withdraw_failed", owner: "approval \(approvalID)",
+                    instruction: "Read this approval note before another change; withdrawal was not verified.",
+                    next: ["page": .string("inbox"), "item": .string(ids[0])], effects: .unknown)
+            }
+            await self.refreshInboxSurfaces()
+            return .object(["status": .string("ok"), "verb": .string(verb), "id": .string(ids[0]),
+                            "approval_id": .string(approvalID),
+                            "detail": .string("Withdrew \(title). Nothing it asked for will run.")])
+        default:
+            let (item, action) = target.press!
+            do {
+                if let provenance = target.provenance, let approvalID = item.related_approval_id {
+                    let record = try await self.resolveApproval(id: approvalID, decision: action, provenance: provenance)
+                    await self.refreshInboxSurfaces()
+                    // The decision is recorded either way; what it ran is said as it went, a failed run named with its words.
+                    let ran = record.executionResultClass.isFailure ? " What it ran did not succeed: \(record.detail ?? "no words came back")." : ""
+                    // The person's door is told the decision itself ("Denied: <the act>."), the act named when it fits one short line.
+                    let decided = (record.decision ?? action).capitalized
+                    let words = (record.title.count <= 60 ? "\(decided): \(record.title)." : "\(decided).") + ran
+                    return .object(["status": .string("ok"), "id": .string(item.id), "action": .string(action),
+                                    "approval_id": .string(approvalID), "did": .string(words), "detail": .string(words)])
+                }
+                // The person's own tap runs as theirs (a request's Not now wakes the conversation that raised it); the agent's runs quietly.
+                try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: !target.person,
+                    dataRootOverride: self.dataRootOverride, turn: turn)
+            } catch {
+                return AppToolExecutor.ownedFailure(error, code: "inbox_act_failed", owner: "inbox \(item.id) action \(action)",
+                    instruction: "Read this note's current state and resolve the reported cause before acting again.",
+                    next: ["page": .string("inbox"), "item": .string(item.id)], effects: .unknown)
+            }
+            await self.refreshInboxSurfaces()
+            if target.decided {
+                BodyDecidedRow.post(turn: turn, requester: "Full Mac", tool: "inbox.\(action)",
+                                       sessionID: input["__session_id"]?.scalarText,
+                                       dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            }
+            let did = self.inboxActDescription(item, action: action)
+            return .object(["status": .string("ok"), "id": .string(item.id), "action": .string(action), "did": .string(did),
+                            "detail": .string(did)])
+        }
+    }
+
+    /// Needs-you counts share OwnerAttentionPolicy with Today and Desk.
+    private func inboxNeedsYou(_ item: InboxItemRecord) -> Bool {
+        item.requiresOwnerInput
+    }
+
+    private func inboxList(_ items: [InboxItemRecord], filter: String, limit: JSONValue?) -> JSONValue {
+        let filter = filter.isEmpty ? "active" : filter.lowercased()
+        let kept: [InboxItemRecord]
+        switch filter {
+        case "active": kept = items.filter { !inboxPresentation($0).hidden }
+        case "unread": kept = items.filter { $0.normalizedStatus == "unread" }
+        case "needs_you": kept = items.filter(inboxNeedsYou)
+        case "all": kept = items
+        default:
+            return AppToolExecutor.failure("unknown_filter", "filter is active, unread, needs_you or all.")
+        }
+        let cap: Int
+        switch limit {
+        case .int(let n)?: cap = Int(n)
+        case .double(let d)?: cap = d.isFinite ? Int(max(1, min(d, 200))) : 30
+        default: cap = 30
+        }
+        let shown = kept.prefix(max(1, min(cap, 200)))
+        return .object([
+            "status": .string("ok"), "filter": .string(filter),
+            "count": .int(Int64(kept.count)), "shown": .int(Int64(shown.count)),
+            "needs_you_count": .int(Int64(items.filter(inboxNeedsYou).count)),
+            "notes": .array(shown.map { inboxRow($0, full: false) }),
+        ])
+    }
+
+    private func inboxRow(_ item: InboxItemRecord, full: Bool) -> JSONValue {
+        var row: [String: JSONValue] = [
+            "id": .string(item.id), "title": .string(item.title), "source": .string(item.source),
+            "severity": .string(item.severity), "status": .string(item.status),
+            "created_at": .string(item.created_at), "lane": .string(item.isSystemLane ? "system" : "for_you"),
+            "needs_you": .bool(inboxNeedsYou(item)),
+            "actions": .array(inboxPresentation(item).actions.map { .string("\($0.id): \($0.label)") }),
+        ]
+        if full {
+            // The summary is the start of the detail (a clip of it); a read says the words once.
+            let detail = String((item.detail ?? "").prefix(4_000))
+            if detail.isEmpty || !detail.hasPrefix(item.summary) { row["summary"] = .string(item.summary) }
+            if !detail.isEmpty { row["detail"] = .string(detail) }
+            if let readAt = item.read_at { row["read_at"] = .string(readAt) }
+            if let approval = item.related_approval_id, !approval.isEmpty { row["approval_id"] = .string(approval) }
+        } else {
+            row["summary"] = .string(String(item.summary.prefix(160)))
+        }
+        return .object(row)
+    }
+
+    /// Request buttons retain their own authority; approval decisions read the shared decision authority before this.
+    private func inboxFloor(_ item: InboxItemRecord, action: String, dataRoot: URL) async -> String? {
+        guard item.source == self.interactionSource else { return nil }
+        // "Not now" withdraws the agent's own ask; it grants nothing.
+        if action == "reject" { return nil }
+        let found: InlineInteraction?
+        do { found = try await self.interactionForInboxItem(item.id, dataRoot: dataRoot) }
+        catch { return "its card is unavailable: " + TurnSecretRedactor.redactText(error.localizedDescription) }
+        guard let card = found else {
+            return "its card no longer reads, so what it would grant is unknown"
+        }
+        switch card.kind {
+        case .permission: return "it grants a macOS permission"
+        case .connector, .apiKey: return "it signs in"
+        case .capability: return "it raises Trust"
+        case .unknown: return "its card is a kind this build doesn't know"
+        case .choose, .modelChoice:
+            return action.hasPrefix("interaction_choice_") ? "it is the person's answer to give" : nil
+        }
+    }
+
+}

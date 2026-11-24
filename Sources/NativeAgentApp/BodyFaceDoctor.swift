@@ -1,10 +1,9 @@
-import DoctorChecks
-import EngineRuntime
+import BodyRuntime
 import Foundation
 import NativeAgentShared
-import Privacy
+import PersistenceCore
 import Synchronization
-import TurnTrace
+import SenseCore
 // Blueprint: | `BodyFaceDoctor.swift` | Doctor reads the only Inspector and binds subscription repair to its connection and view |
 
 @MainActor
@@ -31,7 +30,8 @@ enum BodyFaceDoctor {
     static func report(_ report: RendererInspectorReport) throws {
         try held.withLock { current in
             guard current?.connection == report.connection, report.mounted == (report.view != nil),
-                  !report.observing || (report.mounted && report.subscription != nil) else { throw FaceWireError.invalidFeedOrder }
+                  !report.observing || (report.mounted && report.subscription != nil),
+                  !report.pending || (report.mounted && !report.observing) else { throw FaceWireError.invalidFeedOrder }
             current?.report = report
         }
     }
@@ -48,7 +48,8 @@ enum BodyFaceDoctor {
                 return InspectorFeedHealth.check(isOpen: false, observationActive: false)
             }
             var face = InspectorFeedHealth.check(isOpen: report.mounted,
-                observationActive: sourceActive && report.observing && report.issue == nil)
+                observationActive: sourceActive && report.observing && report.issue == nil,
+                pending: sourceActive && report.pending && report.issue == nil)
             if let issue = report.issue { face.detail += " " + NativeAppSecretRedactor.redactText(issue) }
             return face
         } catch let error where noWindowToAnswer(error) {
@@ -128,7 +129,8 @@ enum BodyFaceDoctor {
         switch reply {
         case .inspector(let report):
             guard report.connection == renderer.connection, report.mounted == (report.view != nil),
-                  !report.observing || (report.mounted && report.subscription != nil) else { throw FaceWireError.invalidFeedOrder }
+                  !report.observing || (report.mounted && report.subscription != nil),
+                  !report.pending || (report.mounted && !report.observing) else { throw FaceWireError.invalidFeedOrder }
             return report
         case .failed(let failure), .refused(let failure): throw failure
         case .cancelled: throw CancellationError()

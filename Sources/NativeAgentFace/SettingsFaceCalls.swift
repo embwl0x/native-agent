@@ -74,32 +74,6 @@ enum SettingsFaceCalls {
 }
 
 @MainActor
-extension FaceNativePanel {
-    static func confirm(_ alert: NSAlert) async throws -> NSApplication.ModalResponse {
-        alert.window.preventsApplicationTerminationWhenModal = false
-        let host: NSWindow?
-        let parent: NSWindow
-        if let current = NSApp.keyWindow { parent = current; host = nil }
-        else {
-            parent = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 120),
-                styleMask: [.titled], backing: .buffered, defer: false)
-            parent.isReleasedWhenClosed = false
-            parent.title = "NativeAgent"
-            parent.center()
-            parent.makeKeyAndOrderFront(nil)
-            host = parent
-        }
-        defer { host?.close() }
-        return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            let response = await alert.beginSheetModal(for: parent)
-            try Task.checkCancellation()
-            return response
-        } onCancel: { Task { @MainActor in parent.endSheet(alert.window, returnCode: .cancel) } }
-    }
-}
-
-@MainActor
 enum SettingsPresentation {
     static func openBundledReference(name: String) throws -> FaceReply {
         guard let url = Bundle.main.url(forResource: name, withExtension: "md") else {

@@ -7,23 +7,44 @@ import NativeAgentShared
 
 /// Use one status line and reserve teal for waiting on the user.
 enum ChatShellStatus: Equatable, Sendable {
+    enum ConversationRead: Equatable, Sendable {
+        case missing
+        case waiting(String)
+        case unavailable
+        case trouble
+        case ready
+    }
+
     /// Keep the header quiet when nothing needs attention.
     case settled
     /// Only pending approval may spend teal here.
     case waitingOnYou
     case approvalStatus(String)
+    case conversationStatus(String, failed: Bool)
     case trouble
 
     static func make(
         pendingApprovals: Int?,
         approvalError: String?,
-        hasTrouble: Bool
+        conversation: ConversationRead
     ) -> Self {
         if let approvalError { return .approvalStatus(approvalError) }
         guard let pendingApprovals else { return .approvalStatus("Checking approvals…") }
         if pendingApprovals > 0 { return .waitingOnYou }
-        if hasTrouble { return .trouble }
-        return .settled
+        switch conversation {
+        case .ready: return .settled
+        case .missing: return .conversationStatus("Reading conversation…", failed: false)
+        case .waiting(let on): return .conversationStatus("Waiting on \(on)…", failed: false)
+        case .unavailable: return .conversationStatus("Conversation unavailable", failed: true)
+        case .trouble: return .trouble
+        }
+    }
+
+    var opensTrust: Bool {
+        switch self {
+        case .waitingOnYou, .approvalStatus: true
+        case .settled, .conversationStatus, .trouble: false
+        }
     }
 
     var text: String {
@@ -31,6 +52,7 @@ enum ChatShellStatus: Equatable, Sendable {
         case .settled: ""
         case .waitingOnYou: "Waiting on you"
         case .approvalStatus(let status): status
+        case .conversationStatus(let status, _): status
         // Report the known failure without implying a retry.
         case .trouble: "That turn didn't finish"
         }
@@ -41,6 +63,7 @@ enum ChatShellStatus: Equatable, Sendable {
         case .settled: NativeAgentShell.calm
         case .waitingOnYou: NativeAgentShell.needsYou
         case .approvalStatus: NativeAgentShell.secondary
+        case .conversationStatus(_, let failed): failed ? NativeAgentShell.trouble : NativeAgentShell.secondary
         case .trouble: NativeAgentShell.trouble
         }
     }

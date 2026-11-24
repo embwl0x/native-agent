@@ -1,6 +1,7 @@
 import NativeAgentShared
 import Foundation
-import EngineRuntime
+import BodyRuntime
+import AppIntents
 // Blueprint: | `AppModel+Refresh.swift` | `AppModel`, `setIfChanged`, `refreshAll`: Shared refresh reads |
 
 @MainActor

@@ -29,11 +29,9 @@ public enum DeviceCloudKitPreflight {
         return false
         #elseif os(iOS) && targetEnvironment(simulator)
         return false
-        #elseif os(iOS)
+        #else
         // iOS builds selecting CloudKit must declare its entitlement; provisioning enforces the grant.
         return true
-        #else
-        return false
         #endif
     }
 

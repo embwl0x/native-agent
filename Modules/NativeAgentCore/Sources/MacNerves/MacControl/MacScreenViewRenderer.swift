@@ -1,0 +1,144 @@
+import Foundation
+import CoreGraphics
+import CoreText
+import AppKit
+import ImageIO
+import UniformTypeIdentifiers
+// Blueprint: | `MacScreenViewRenderer.swift` | `CoreGraphicsMacScreenImageRenderer` struct; `renderPNG` masks secret frames before encoding; `encodePNG` |
+
+// MARK: - Production renderer (CoreGraphics + CoreText)
+
+
+/// White halos under black strokes keep markers legible in both themes without content-dependent pixel sampling.
+public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
+    public init() {}
+
+    public func renderPNG(
+        shot: MacScreenShot,
+        placements: [MacScreenMarkerPlacement],
+        secretFrames: [MacAXFrame],
+        downscale: Double
+    ) -> Data? {
+        guard let source = shot.cgImage, shot.bounds.w > 0, shot.bounds.h > 0 else { return nil }
+        let factor = max(0.05, min(downscale, 1.0))
+        let width = max(1, Int((Double(shot.pixelWidth) * factor).rounded()))
+        let height = max(1, Int((Double(shot.pixelHeight) * factor).rounded()))
+        if placements.isEmpty, secretFrames.isEmpty, width == source.width, height == source.height {
+            return Self.encodePNG(source)
+        }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+
+        context.interpolationQuality = .high
+        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        context.setFillColor(gray: 0.08, alpha: 1)
+        let geometry = MacScreenViewGeometry(bounds: shot.bounds, pixelWidth: width, pixelHeight: height)
+        for frame in secretFrames {
+            let rect = geometry.imageRect(frame)
+            context.fill(CGRect(x: rect.x, y: Double(height) - rect.y - rect.h, width: rect.w, height: rect.h).integral)
+        }
+
+        // Scale badges with image size so 1x and Retina captures appear equivalent.
+        let unit = max(1.0, Double(min(width, height)) / 400.0)
+        let lineWidth = max(1.0, 1.5 * unit)
+        let fontSize = max(9.0, 9.0 * unit)
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, fontSize, nil)
+
+        for placement in placements {
+            let x = placement.x * factor
+            let w = max(1.0, placement.w * factor)
+            let h = max(1.0, placement.h * factor)
+            // Flip once at the boundary from top-left image coordinates to bottom-left CGContext coordinates.
+            let y = Double(height) - (placement.y * factor) - h
+            let rect = CGRect(x: x, y: y, width: w, height: h)
+
+            context.setLineWidth(lineWidth * 2.2)
+            context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.95))
+            context.stroke(rect)
+            context.setLineWidth(lineWidth)
+            context.setStrokeColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.95))
+            context.stroke(rect)
+
+            drawBadge(
+                context: context,
+                number: placement.mark,
+                font: font,
+                fontSize: fontSize,
+                unit: unit,
+                anchor: CGPoint(x: rect.minX, y: rect.maxY)
+            )
+        }
+
+        guard let annotated = context.makeImage() else { return nil }
+        return Self.encodePNG(annotated)
+    }
+
+    private func drawBadge(
+        context: CGContext,
+        number: Int,
+        font: CTFont,
+        fontSize: Double,
+        unit: Double,
+        anchor: CGPoint
+    ) {
+        let text = String(number)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: CGColor(red: 0, green: 0, blue: 0, alpha: 1),
+        ]
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(string: text, attributes: attributes)
+        )
+        let textBounds = CTLineGetImageBounds(line, context)
+        let padding = 2.0 * unit
+        let plateWidth = max(fontSize, textBounds.width) + padding * 2
+        let plateHeight = fontSize + padding * 2
+        // Keep above-corner badges inside the image when elements touch an edge.
+        var plate = CGRect(
+            x: anchor.x,
+            y: anchor.y,
+            width: plateWidth,
+            height: plateHeight
+        )
+        let canvasWidth = Double(context.width)
+        let canvasHeight = Double(context.height)
+        if plate.maxX > canvasWidth { plate.origin.x = canvasWidth - plate.width }
+        if plate.maxY > canvasHeight { plate.origin.y = canvasHeight - plate.height }
+        plate.origin.x = max(0, plate.origin.x)
+        plate.origin.y = max(0, plate.origin.y)
+
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.96))
+        context.fill(plate)
+        context.setLineWidth(max(1.0, unit))
+        context.setStrokeColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        context.stroke(plate)
+
+        context.textPosition = CGPoint(
+            x: plate.minX + (plate.width - textBounds.width) / 2 - textBounds.minX,
+            y: plate.minY + padding
+        )
+        CTLineDraw(line, context)
+    }
+
+    static func encodePNG(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
+    }
+}
+
+
+public func defaultMacScreenImageRenderer() -> any MacScreenImageRenderer {
+    return CoreGraphicsMacScreenImageRenderer()
+}

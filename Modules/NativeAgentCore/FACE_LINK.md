@@ -64,8 +64,8 @@ conversation. Preference edits open it only when its navigation is unmounted;
 an existing scene handles them without taking focus. Each scene task captures
 its own request before scheduling and consumes only that id.
 The tour uses Advanced locally while its overlay exists; it neither writes nor
-restores the person's saved view mode on teardown. Simple's More settings uses
-the checked Settings navigation command.
+restores the person's saved view mode on teardown. Settings… (⌘,) and Settings
+links use the checked Settings navigation command to open Control's Settings tab.
 
 Native composer model, thinking, Fast, Trust and hand-back requests run in arrival
 order in their visible conversation's view task. Leaving the conversation or its
@@ -184,8 +184,8 @@ Checked command results retain their scope:
 This source unit is not the completed stage-(c) process split. The app's
 `AppQuietSettingsHost`, `AppQuietToolHost`, composer/session presentation ports
 and several app-specific services still depend on the mounted `AppModel`.
-`NativeAgentApp.prepare` installs `BodySettingsActHandler` before mounting its
-existing window. `BodyFaceTranscripts`, `BodyFaceVoice` and `BodyFaceServices`
+`NativeAgentApp.prepare` installs `BodySettingsActHandler` before it opens the
+face process's window. `BodyFaceTranscripts`, `BodyFaceVoice` and `BodyFaceServices`
 supply transcript readers, speech/capture, resource grants, contacts, graph
 sweeps, image regeneration through Desk's gated tool router and selected Desk operations.
 Search and Agent-room projections use their canonical owners. The copied Chat
@@ -195,8 +195,7 @@ there is no selected conversation and returns an applied composer edit; existing
 text refuses the edit and all attachments are retained. Desk reply drafts use
 that same renderer operation. Refusal, conflict and cancellation leave the Inbox
 read marker to its transaction, which writes it only after presentation succeeds.
-The duplicate body-window presenter is absent; the original window keeps its
-own Inbox effects. Generic quiet commands bind scene, detached conversations,
+The duplicate body-window presenter is absent. Generic quiet commands bind scene, detached conversations,
 composer reads and edit receipts to the originating connection. Their shared
 session fences consume that window's selection without changing the body's
 selection. Model and session writes keep their existing canonical owners.
@@ -335,7 +334,7 @@ The renderer process mounts its views and reverse-call hosts from
 renderer-owned readers and captures while leaving turns alone. Capture and
 keyboard protection aggregate local windows with per-epoch renderer groups;
 credential entry awaits the body's exclusion receipt before drawing secrets.
-The body keeps its existing in-process window and owners throughout assembly.
+The body draws no window of its own; it keeps the services and owners the face reaches through the link.
 
 No saved format, phone packet or ability argument changes. There is no one-time
 data move. The release lead performs the single build, installation and bounded
@@ -351,10 +350,10 @@ barrier, draw in the face and save through the body's artifact owner off main.
 Scene reports supply the copied selection and mounted composer; Inspector
 reports feed Doctor's connection-bound health owner. Native notification
 responses retain the originating renderer and use the canonical engine action
-owner. Original-window calls retain their in-process bindings.
+owner.
 
 Quiet composer/session presentation and connector hosts use the originating
-connection; the original window retains its in-process hosts. The face links
+connection. The face links
 Sparkle for its native user driver, while the body alone owns the updater,
 download, verification and installation. Native callbacks name their exact
 operation and cannot answer a replacement interaction. Installed checks remain

@@ -5,7 +5,6 @@ NATIVEAGENT_MAC_WIDGET_BUNDLE_ID = $(NATIVEAGENT_MAC_BUNDLE_ID).widget
 NATIVEAGENT_MAC_APP_GROUP_ID = group.$(NATIVEAGENT_MAC_BUNDLE_ID)
 NATIVEAGENT_ICLOUD_CONTAINER_ID = iCloud.io.github.embwl0x.nativeagent
 NATIVEAGENT_MOBILE_SOURCE_KEY = mobile_app
-NATIVEAGENT_BACKGROUND_TASK_PREFIX = io.github.embwl0x.nativeagent
 NATIVEAGENT_DEVICE_SYNC = cloudkit
 // An empty expansion separates the slashes so xcconfig does not start a comment.
 NATIVEAGENT_RELEASE_PAGE_URL = https:/$()/github.com/embwl0x/native-agent/releases

@@ -1,8 +1,8 @@
 
 import SwiftUI
-import ApprovalInbox
-import Context
-import EngineRuntime
+import MacNerves
+import MindCore
+import BodyRuntime
 import NativeAgentShared
 import NativeAgentCore
 

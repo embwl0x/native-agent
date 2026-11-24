@@ -1,8 +1,10 @@
 import SwiftUI
+import Synchronization
 import Observation
 import UIKit
 import NativeAgentShared
 
+// The defaults queue owns UserDefaults writes and their saved errors.
 final class MobileLocalStorage: @unchecked Sendable {
     /// Missing is first use; an existing value must decode before any replacement.
     static func restore<Value: Decodable>(_ type: Value.Type, key: String, defaults: UserDefaults) throws -> Value? {
@@ -40,19 +42,13 @@ final class MobileLocalStorage: @unchecked Sendable {
 
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
-    private let lock = NSLock()
-    private var writes: [String: @Sendable () -> Void] = [:]
+    private let writes = Mutex<[String: @Sendable () -> Void]>([:])
 
     private func submit(key: String, operation: @escaping @Sendable () -> Void) {
-        lock.lock()
-        let scheduled = writes[key] != nil
-        writes[key] = operation
-        lock.unlock()
+        let scheduled = writes.withLock { $0.updateValue(operation, forKey: key) != nil }
         guard !scheduled else { return }
         queue.async { [self] in
-            lock.lock()
-            let write = writes.removeValue(forKey: key)
-            lock.unlock()
+            let write = writes.withLock { $0.removeValue(forKey: key) }
             write?()
         }
     }

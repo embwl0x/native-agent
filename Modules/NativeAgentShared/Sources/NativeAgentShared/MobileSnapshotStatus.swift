@@ -1,9 +1,6 @@
 import Foundation
-
-#if canImport(Compression)
 import Compression
 // Blueprint: | `MobileSnapshotStatus.swift` | `NAMobileSnapshotGroup`, `groups`: live phone snapshot input declarations |
-#endif
 
 /// Public Developer ID builds cannot use CloudDocuments; bounded CloudKit NAStatus bundles preserve snapshot contracts while authority remains Mac-owned.
 public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
@@ -212,13 +209,12 @@ public enum NAMobileSnapshotStatusCodec {
     }
 
     private static func zlibCompress(_ data: Data) throws -> Data {
-        #if canImport(Compression)
         guard !data.isEmpty else { return Data() }
         let destinationCapacity = max(data.count + 64 * 1024, 1024)
         var destination = Data(count: destinationCapacity)
-        let encodedCount = data.withUnsafeBytes { source in
-            destination.withUnsafeMutableBytes { output in
-                compression_encode_buffer(
+        let encodedCount = unsafe data.withUnsafeBytes { source in
+            unsafe destination.withUnsafeMutableBytes { output in
+                unsafe compression_encode_buffer(
                     output.bindMemory(to: UInt8.self).baseAddress!,
                     destinationCapacity,
                     source.bindMemory(to: UInt8.self).baseAddress!,
@@ -233,16 +229,12 @@ public enum NAMobileSnapshotStatusCodec {
         }
         destination.count = encodedCount
         return destination
-        #else
-        throw DeviceSyncError.notConfigured
-        #endif
     }
 
     private static func zlibDecompress(
         _ data: Data,
         expectedByteCount: Int
     ) throws -> Data {
-        #if canImport(Compression)
         guard expectedByteCount > 0 else {
             guard data.isEmpty else {
                 throw DeviceSyncError.underlying(message: "invalid empty mobile snapshot payload")
@@ -250,9 +242,9 @@ public enum NAMobileSnapshotStatusCodec {
             return Data()
         }
         var destination = Data(count: expectedByteCount)
-        let decodedCount = data.withUnsafeBytes { source in
-            destination.withUnsafeMutableBytes { output in
-                compression_decode_buffer(
+        let decodedCount = unsafe data.withUnsafeBytes { source in
+            unsafe destination.withUnsafeMutableBytes { output in
+                unsafe compression_decode_buffer(
                     output.bindMemory(to: UInt8.self).baseAddress!,
                     expectedByteCount,
                     source.bindMemory(to: UInt8.self).baseAddress!,
@@ -266,8 +258,5 @@ public enum NAMobileSnapshotStatusCodec {
             throw DeviceSyncError.underlying(message: "mobile snapshot decompression failed")
         }
         return destination
-        #else
-        throw DeviceSyncError.notConfigured
-        #endif
     }
 }

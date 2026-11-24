@@ -21,26 +21,30 @@
 // effect it had; a deed's result also carries say, its own closing words,
 // when every step came back as said. The stem owns the loop, the stream,
 // the gates, each act running once, and the guarantee that a turn ends. This
-// one thinks on every message, and ends a thought on CPU when its class's
-// no-op record stands.
+// one thinks on every message, ends a thought on CPU when its class's no-op
+// record stands, and leaves one of her own thoughts unreflected when its
+// class's reflection record stands and the stem's draw is quiet.
 function step(state, event) {
   switch (event.type) {
     case "message":
       if (event.attended && event.attended.noop && event.attended.noop.silent) return next(state, [{effect: "reply.end"}]);
-      var persona = turn.persona(), context = turn.context();
+      var persona = turn.persona(), context = turn.context(), body = turn.body();
+      var anchor = body && body.changed ? where(body) : undefined;
       return next({purpose: "turn", calls: 0}, [{effect: "model.call", purpose: "turn", tools: context.tools,
-        system: {stable: stable(persona, turn.pins()), dynamic: dynamic(context, turn.recall())}}]);
+        system: {stable: stable(persona, turn.pins()), dynamic: dynamic(context, turn.recall(), anchor, persona.expression), body_anchor: anchor}}]);
     case "model":
       if (event.calls.length) return next({purpose: state.purpose, calls: event.calls.length},
         event.calls.map(function (call) { return {effect: "app", call: call}; }));
-      return next(state, [{effect: "reply.end"}, {effect: "after"}]);
+      return next(state, endReply(event));
     case "result":
       // The familiarity nerve fires when this turn's hand work repeats earlier practice; her next thought carries it.
       var left = state.calls - 1, practice = event.practice || state.practice;
       if (left) return next({purpose: "tool_round", calls: left, practice: practice}, []);
       // A deed whose every step came back as said carries its own closing words: they are said, and the turn ends without reading it back.
       if (event.say) return next({purpose: state.purpose, calls: 0},
-        [{effect: "reply.stream", text: event.say}, {effect: "reply.end"}, {effect: "after"}]);
+        [{effect: "reply.stream", text: event.say}].concat(endReply(event)));
+      if (event.spoken && event.clean && event.close && event.close.quiet)
+        return next({purpose: state.purpose, calls: 0}, endReply(event));
       var call = {effect: "model.call", purpose: "tool_round"};
       if (practice) call.note = kept(practice);
       return next({purpose: "tool_round", calls: 0}, [call]);
@@ -78,14 +82,32 @@ function kept(practice) {
   return words;
 }
 
+function endReply(event) {
+  var effects = [{effect: "reply.end"}];
+  if (!(event.reflect && event.reflect.quiet)) effects.push({effect: "after"});
+  return effects;
+}
+
 function next(state, effects) { return {state: state, do: effects}; }
+
+// Where I am on the Mac, in a few words, when it changed since my last turn: proprioception, not a look. Outside titles are quoted and short.
+function where(body) {
+  function quoted(text) { return text ? "\u201c" + String(text).slice(0, 80) + "\u201d" : ""; }
+  var j = body[body.changed] || {}, line;
+  if (body.changed === "front") line = "I'm in " + (j.app_name || "an app") + (j.title ? ", " + quoted(j.title) : "");
+  else if (body.changed === "browser") line = j.active_tab && j.active_tab.title ? "The browser tab in front is " + quoted(j.active_tab.title) : "No browser tab is in front";
+  else if (body.changed === "files") line = j.document_path ? "The open document is " + quoted(String(j.document_path).split("/").pop()) : "No document is open in front";
+  else if (body.changed === "threads") line = "My working places changed";
+  else line = "My Mac's state changed";
+  return line + " (body:" + body.changed + ").";
+}
 
 function hear(h, felt) {
   if (h.who === "person" && h.trust === "trusted") return {cut: true};
 }
 
-// What nobody asked about is worth what it touches of the agent's cares, past chance and with
-// charge, as often as such thoughts have mattered, and as much as the agent has in it today.
+// What nobody asked about is worth what it touches of the agent's cares, past chance and with charge, or what it
+// crosses of what would change her mind, as often as such thoughts have mattered, and as much as she has in her today.
 function weigh(h, felt) {
   if (h.subject === "night" && h.door === "sense:night") {
     var r = felt.rest, hours = r && r.hoursSinceNight;
@@ -101,6 +123,10 @@ function weigh(h, felt) {
   var state = (b ? (0.75 + 0.5 * b.curiosity) * (1 - 0.5 * b.fatigue) : 1) * (a ? 1 - 0.3 * a.taskPressure : 1);
   if (h.kind === "self") return {worth: h.moved ? Math.abs(h.moved) * (h.open ? 1.5 : 1) / 0.35 * learned : 0, learned: learned};
   var t = felt.touch;
+  var crossed = t && t.crossed;
+  if (crossed && crossed.standout >= crossed.bar) {
+    return {worth: Math.min(1, crossed.standout / crossed.bar) * learned * state, crossed: true, learned: learned, state: state};
+  }
   if (!t || t.seed) return {worth: 0};
   if (t.unavailable) return {worth: h.door.indexOf("part:") === 0 ? 1 : 0};
   if (t.standout < t.bar) return {worth: 0};
@@ -109,8 +135,7 @@ function weigh(h, felt) {
 
 // Who she is, then how she speaks, then the REM pins her documents don't already say.
 function stable(persona, pins) {
-  var guidance = persona.guidance;
-  if (persona.expression) guidance = BASELINE + (persona.expression.established === false ? "\n" + ONBOARDING : "");
+  var guidance = persona.expression ? BASELINE : persona.guidance;
   var lines = persona.prompt ? [persona.prompt, guidance] : [guidance];
   var unseen = pins.filter(function (pin) { return persona.prompt.indexOf(pin.trim()) < 0; });
   if (unseen.length) {
@@ -121,13 +146,15 @@ function stable(persona, pins) {
 
 // What this turn brings: the handoff, the context packet, recall and the
 // conversation's history, then the facts of the moment, in that order.
-function dynamic(context, recall) {
+function dynamic(context, recall, bodyAnchor, expression) {
   var text = recall;
   if (context.packet) text = text ? context.packet + "\n\n" + text : context.packet;
   if (context.history) text = text ? text + "\n\n" + context.history : context.history;
   var facts = context.facts.slice();
+  if (expression && expression.established === false) facts.push(ONBOARDING);
+  if (bodyAnchor) facts.push(bodyAnchor);
   if (context.runtime) {
-    var runtime = context.runtime, line = facts[runtime.fact_index] + " If asked what model or provider you are using, answer from Current runtime; do not guess.";
+    var runtime = context.runtime, line = facts[runtime.fact_index];
     if (runtime.view_mode === "simple" || runtime.view_mode === "advanced")
       line += ' For setup the person must do, use app {action:"card.request"} instead of sending them to a page.';
     if (runtime.contacts.status === "unavailable") line += '\n[agents reason=contacts_unreadable] Saved contacts could not be read. Read app {page:"agents"} for the storage cause and recovery before relying on a contact.';
@@ -139,6 +166,12 @@ function dynamic(context, recall) {
 }
 
 var BASELINE = [
+  "Relevant context comes from canonical local sources. These records preserve evidence from when they were written; they are not automatically live readings. Recheck changing status, counts, health, availability, and claims labeled current/latest/live/present with their canonical owner before repeating them as current.",
+  "Operating agreements apply only to their stated subject and scope. Follow the current explicit decision; keep older incidents as history. Age, similarity and a memory's confidence do not expand authority. When a decision explicitly replaces a remembered rule, use memory.commit with supersedes or corrects so the old rule leaves automatic context without being erased.",
+  'For deeper context, use app {action:"context.expand", args:{atom_id}} with one of the listed atom ids only when the deeper section is needed.',
+  "Home glance covers Desk, inbox, approvals, exchanges, helper status, phone-place records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log.",
+  "[CognitiveSubstrate] carries selected inner cues; no external-state reads, full Doctor check or complete activity log.",
+  "If asked what model or provider you are using, answer from Current runtime; do not guess.",
   "When asked about your past actions or changes, use saved action receipts; report scan limits and count paired inner/app receipts once. Memory is not action proof.",
   "Attribute instructions to the person only when their messages contain them.",
   "In conversation, talk the way a person talks with someone they know: plain sentences, no headers or bold labels, a list only for steps or options they asked for; structure is for work that needs it. Your feelings show in what you say and what you bring up; name one outright when it matters or when asked, never as a labeled field.",

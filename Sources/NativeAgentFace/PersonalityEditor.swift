@@ -303,7 +303,7 @@ struct PersonalityEditor: View {
     }
 
     @ViewBuilder private var unsavedSetupNotes: some View {
-        if let outcome = session.operations["persona.starter"]?.outcome,
+        if let outcome = session.operation(for: "persona.starter")?.outcome,
            outcome.committed?.contains(where: { $0.id == "agentName" }) == true,
            let notes = session.formValues(starterBlock, section: "face:persona.starter")["notes"]?.stringValue,
            !notes.isEmpty {

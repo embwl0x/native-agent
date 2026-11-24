@@ -1,19 +1,12 @@
 import AppKit
-import ActivityWatch
-import AppToolRuntime
-import ApprovalTransactions
-import ChatToolParsing
-import ChatTurnContracts
-import ChatTurnRuntime
-import ChatToolRuntime
-import EngineRuntime
-import MacIntegration
+import MacNerves
+import BodyRuntime
+import MindCore
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import SwiftUI
-import TrustCenter
-import TrustPersistence
+import DeskCore
 import UniformTypeIdentifiers
 // Blueprint: | `AppTrustFaceActions.swift` | Mac hosts for Trust, Settings, contact and capability face actions |
 
@@ -88,8 +81,8 @@ extension AppQuietToolHost {
     func askGrants(_ targets: [String]) async throws -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
         let dataRoot = appModel.engine.dataRoot
         var card: (id: String, sessionID: String)?
-        for open in try await InlineInteractionResolver.platform.openInteractionCards() {
-            guard let found = try await InlineInteractionResolver.interaction(id: open.id, sessionID: open.sessionID, dataRoot: dataRoot),
+        for open in try await appModel.engine.interactions.platform.openInteractionCards() {
+            guard let found = try await appModel.engine.interactions.interaction(id: open.id, sessionID: open.sessionID),
                   found.kind == .permission, found.state.isOpen, Set(targets).isSubset(of: found.allTargets) else { continue }
             card = open
             break
@@ -100,9 +93,9 @@ extension AppQuietToolHost {
                     why: "You asked for these macOS grants; macOS asks you for each one.") else {
                 return (false, "No conversation is open to hold the permission card; nothing was asked.", ["effects": .string("none")])
             }
-            let turn = Turn(session: session).with(\.envelope, .native("trust:ask-grant")).with(\.verifiedSessionID, session)
-            guard let raised = await InlineInteractionResolver.raise(ask, sessionID: session, resumable: false,
-                origin: .native("trust:ask-grant"), turn: turn, dataRoot: dataRoot) else {
+            let turn = Turn(dataRoot: dataRoot, session: session).with(\.envelope, .native("trust:ask-grant")).with(\.verifiedSessionID, session)
+            guard let raised = await appModel.engine.interactions.raise(ask, sessionID: session, resumable: false,
+                origin: .native("trust:ask-grant"), turn: turn) else {
                 return (false, "The permission card could not be filed; nothing was asked.", ["effects": .string("none")])
             }
             card = (raised.id, session)
@@ -110,11 +103,11 @@ extension AppQuietToolHost {
         guard let card else { return (false, "No permission card holds these grants; nothing was asked.", ["effects": .string("none")]) }
         try await runCardControl(id: card.id, sessionID: card.sessionID, choice: nil)
         await appModel.engine.macIntegration.refresh()
-        guard let after = try await InlineInteractionResolver.interaction(id: card.id, sessionID: card.sessionID, dataRoot: dataRoot) else {
+        guard let after = try await appModel.engine.interactions.interaction(id: card.id, sessionID: card.sessionID) else {
             return (false, "The permission card is absent from readback; check it before asking again.", ["effects": .string("unknown")])
         }
-        let descriptor = await InlineInteractionResolver.descriptor(for: after, dataRoot: dataRoot)
-        let words = [await InlineInteractionResolver.grantsNow(after, control: descriptor),
+        let descriptor = await InlineInteractionCoordinator.descriptor(for: after, dataRoot: dataRoot)
+        let words = [await appModel.engine.interactions.grantsNow(after, control: descriptor),
                      InlineCards.model(after, descriptor: descriptor).busyNote, after.state.failureReason, after.state.outcome?.summary]
             .compactMap { $0 }.joined(separator: " ")
         return (after.state.failureReason == nil, words.isEmpty ? "The permission card is \(after.state.name)." : words,
@@ -140,7 +133,7 @@ extension AppQuietToolHost {
         alert.informativeText = "Everything already recorded for \(id) is deleted for good, including the recovery log. Future recording skips it entirely."
         alert.addButton(withTitle: "Exclude and delete")
         alert.addButton(withTitle: "Cancel")
-        guard try await FaceNativePanel.confirm(alert) == .alertFirstButtonReturn else {
+        guard try await FaceNativePanel.confirm(alert, activate: true) == .alertFirstButtonReturn else {
             return (true, "Exclusion cancelled; nothing changed.", ["changed": .bool(false)])
         }
         let controller = appModel.engine.activityWatch

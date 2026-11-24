@@ -1,0 +1,192 @@
+import SenseCore
+import Foundation
+import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
+import DeskCore
+import CryptoKit
+// Blueprint: | `Parts+Reading.swift` | shared checked inventory and latest-version reads |
+
+extension Parts {
+    /// Every ability verb must resolve the same reference spelling, including IDs created by save.
+    public static func referenceID(_ given: String) -> String {
+        ToolNameAliases.authoredTool(given) ?? given.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// An ability is named by its id, its name or the door action it answers to (face.action, unique by admission's collision check).
+    public func row(_ named: String, kind: AbilityStore.Kind? = .part) throws -> [String: JSONValue]? {
+        let name = Self.referenceID(named)
+        let all = try rows(kind: kind)
+        return all.first { Self.string($0, "id")?.caseInsensitiveCompare(name) == .orderedSame }
+            ?? all.first { Self.string($0, "name")?.caseInsensitiveCompare(name) == .orderedSame }
+            ?? all.first { Self.string(Self.fields($0["face"] ?? .null), "action")?.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    /// Bound IDs to 2–64 lowercase letters/digits/dashes/underscores with an initial letter so names produce stable references.
+    public static func id(_ given: String) -> String {
+        AbilityStore.normalizedID(referenceID(given))
+    }
+
+    /// Waiting code is the latest version even while another version remains selected.
+    public func latest(_ row: [String: JSONValue]) throws -> OwnedProgramStore.Candidate? {
+        guard let id = Self.string(row, "id"),
+              let digest = Self.string(row, "candidateDigest") ?? Self.string(row, "codeFingerprint") else { return nil }
+        return try store.load(id: id, digest: digest)
+    }
+
+    public func unknown(_ named: String, kind: AbilityStore.Kind? = .part, guidanceIDs: [String] = []) throws -> Outcome {
+        let requested = Array(Self.referenceID(named).lowercased())
+        // Edit distance ranks suggestions only; it never selects a mutation target.
+        let ids = Set(try rows(kind: kind).compactMap { Self.string($0, "id") } + guidanceIDs)
+        let distances: [(id: String, distance: Int)] = ids.map { (id: $0, distance: characterEditDistance(Array($0.lowercased()), requested)) }
+        let ordered = distances.sorted { lhs, rhs in
+            if lhs.distance != rhs.distance { return lhs.distance < rhs.distance }
+            return lhs.id < rhs.id
+        }
+        let nearest: [String] = ordered.prefix(3).map { $0.id }
+        let detail = "No ability of yours is called \(named.isEmpty ? "(none passed)" : named). "
+            + (nearest.isEmpty ? "No ability ids are available." : "Nearest ids: \(nearest.joined(separator: ", ")).")
+            + " ability.list shows them."
+        return (false, detail,
+         ["reason": .string("unknown_part"), "effects": .string("none"), "detail": .string(detail),
+          "nearest_ids": .array(nearest.map(JSONValue.string)),
+          "remedy": Repair.remedy(owner: "abilities", nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("ability.list")])]),
+              tap: nil,
+                                  instruction: "Choose an exact id from ability.list, or save a new ability.")])
+    }
+
+    static func readCall(_ id: String) -> JSONValue {
+        .object(["tool": .string("app"), "input": .object(["action": .string("ability.read"), "args": .object(["id": .string(id)])])])
+    }
+
+    static func missing(_ named: String) -> ToolFailureError {
+        ToolFailureError(PartError.notFound(named).localizedDescription, effects: .none, owner: "abilities",
+            nextCall: ToolFailureError.call("app", ["action": .string("ability.list")]), code: "unknown_part", status: .refused,
+            instruction: "Choose an exact id from ability.list, or save a new ability.", recovery: .inspect)
+    }
+
+    /// Label latest code by its source version so waiting code cannot look selected.
+    public func read(_ named: String, offset: Int = 0, step: Int? = nil) async throws -> JSONValue {
+        guard let row = try row(named, kind: nil), let id = Self.string(row, "id") else {
+            let entries = try InstalledSkillInventory.entries(dataRoot: root)
+            guard let guidance = InstalledSkillInventory.match(Self.referenceID(named), in: entries) else {
+                return .object(try unknown(named, kind: nil, guidanceIDs: entries.map(\.id)).fields
+                    .merging(["status": .string("not_found")]) { $1 })
+            }
+            guard guidance.status == "active", let body = guidance.body else {
+                throw ToolFailureError(guidance.description, effects: .none, owner: "persona",
+                    code: "skill_body_unavailable", status: .refused,
+                    instruction: "Repair the named guidance file, then read it again.", recovery: .inspect)
+            }
+            return .object(["status": .string("ok"), "id": .string(guidance.id), "built_in": .bool(true),
+                            "guidance": .string(body),
+                            "note": .string("Built-in guidance from the persona: read it; it is not an ability and does not run.")])
+        }
+        var read = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason", "triggers", "origin", "overrides",
+            "disabledBy", "disabledReason",
+                                 "validation_evidence", "candidate_validation_evidence", "learned", "run_counts"].contains($0.key) }
+        if row["status"] == .string("unavailable") { return .object(read) }
+        read["status"] = .string("ok"); read["ability_status"] = row["status"] ?? .null
+        var declares: [String: JSONValue] = [:]
+        for (key, field) in [("params", "params"), ("input_schema", "inputSchema"), ("actions", "actions"), ("reach", "reach"),
+                             ("wake", "wake"), ("face", "face"), ("resident", "resident")] { declares[key] = row[field] ?? .null }
+        if row["kind"] == .string("sense") {
+            declares.removeValue(forKey: "wake"); declares.removeValue(forKey: "resident"); declares["mode"] = row["mode"]
+        }
+        read["declares"] = .object(declares)
+        var versions: [String: JSONValue] = [:]
+        for (key, field) in [("current", "codeFingerprint"), ("waiting", "candidateDigest"), ("previous", "previousVersion"),
+                             ("last_clean", "lastCleanVersion")] { versions[key] = row[field] ?? .null }
+        if row["candidateDigest"] != nil { versions["waiting_validation"] = row["candidateValidation"] ?? .null }
+        if row["kind"] != .string("ability") {
+            versions = ["current": row["version"] ?? .null, "previous": row["previousVersion"] ?? .null]
+        }
+        read["versions"] = .object(versions)
+        if Self.runs(row) { read["run"] = .object(["action": .string("authored." + id), "args": .object([:])]) }
+        read["converted_versions"] = .array(try (row["kind"] == .string("ability") ? store.conversions(id: id) : []).map { candidate in
+            .object(["version": .string(candidate.digest), "converts": Self.fields(candidate.manifest)["converts"] ?? .array([])])
+        })
+        let latest = row["kind"] == .string("ability") ? try latest(row) : nil
+        let file: AbilityStore.File?
+        if row["kind"] == .string("turn") {
+            guard let current = try abilities.read(id: id, slot: .current) else { throw PartError.invalid("The selected turn program is missing.") }
+            file = current
+        } else { file = latest == nil ? try abilities.files().first(where: { $0.id == id }) : nil }
+        if let source = latest?.program.source ?? file?.body {
+            if latest != nil || file?.pathExtension == "js" {
+                let version = try latest?.digest ?? (file?.record["version"] ?? .null).serialize(pretty: false)
+                read["source"] = AbilityStore.sourcePage(source, version: version, offset: offset) {
+                    .object(["tool": .string("app"), "input": .object(["action": .string("ability.read"),
+                        "args": .object(["id": .string(id), "offset": .int(Int64($0))])])])
+                }
+                if file?.kind == .turn {
+                    read.merge(try await turnReading(source: source, step: step)) { _, turn in turn }
+                } else if let step {
+                    let facts = try await OwnedProgramRunner(dataRoot: root).analyze(source)
+                    read["step"] = Self.step(source, step, steps: facts.steps)
+                }
+            } else { read["guidance"] = .string(source) }
+        }
+        return .object(read)
+    }
+
+    static func step(_ source: String, _ n: Int, steps: [OwnedProgram.Analysis.Step]) -> JSONValue {
+        let lines = OwnedProgram.Analysis.lines(source)
+        let starts = steps.map { $0.line - 1 }
+        guard n >= 1, n <= starts.count else {
+            let instruction = starts.isEmpty ? "This code declares no app.step calls; omit step to read its source."
+                : "Set step to an integer from 1 to \(starts.count), or omit it to read the source."
+            return .object(["status": .string("refused"), "reason": .string("invalid_ability_step"), "effects": .string("none"),
+                "argument_path": .string("step"), "accepted": .string(starts.isEmpty ? "omit step; no steps exist" : "an integer from 1 to \(starts.count)"),
+                "detail": .string("The code declares \(starts.count) app.step calls; step \(n) does not select one."),
+                "remedy": .object(["kind": .string("correct_arguments"), "instruction": .string(instruction), "next_call": .null])])
+        }
+        let at = n - 1
+        var out: [String: JSONValue] = ["step": .string("\(n) of \(starts.count)")]
+        if let label = steps[at].label { out["label"] = .string(label) }
+        if let guidance = steps[at].guidance { out["guidance"] = .string(guidance) }
+        let end = at + 1 < starts.count ? max(starts[at] + 1, starts[at + 1]) : lines.count
+        out["lines"] = .string("\(starts[at] + 1)-\(end)")
+        out["source"] = .string(lines[starts[at]..<end].joined(separator: "\n"))
+        return .object(out)
+    }
+
+    /// List code and readable built-in guidance through the same inventory.
+    public func list(offset: Int = 0) throws -> JSONValue {
+        let rows = try rows(kind: nil).sorted { (Self.string($0, "id") ?? "") < (Self.string($1, "id") ?? "") }
+        let start = min(max(0, offset), rows.count)
+        let guidanceEntries = try InstalledSkillInventory.entries(dataRoot: root)
+        let guidance = guidanceEntries.map(\.id).sorted()
+        let guidanceGaps = guidanceEntries.filter { $0.status == "unavailable" }.map { entry in
+            JSONValue.object(["id": .string(entry.id), "detail": .string(entry.description)])
+        }
+        var parts: [JSONValue] = []
+        var bytes = try JSONValue.array(guidance.map(JSONValue.string)).serializedData(pretty: false).count
+        for row in rows.dropFirst(start).prefix(40) {
+            let id = Self.string(row, "id") ?? ""
+            var item = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason"].contains($0.key) }
+            item["run_counts"] = row["run_counts"]
+            let last = row["lastUsedAt"]
+            if case .double(let stamp)? = last {
+                item["last_run_at"] = .string(NativeTimestampFormat.plainZulu(Date(timeIntervalSinceReferenceDate: stamp)))
+            } else { item["last_run_at"] = last ?? .null }
+            // The current version's rounds histogram (model rounds → uses) exposes the part's own learned cost.
+            if case .object(let rounds)? = row["learned"]?.objectValue?["use"]?.objectValue?["rounds_per_use"], !rounds.isEmpty {
+                item["rounds_per_use"] = .object(rounds)
+            }
+            item["next_call"] = .object(Self.runs(row)
+                ? ["action": .string("authored." + id), "args": .object([:])]
+                : ["action": .string("ability.read"), "args": .object(["id": .string(id)])])
+            let value = JSONValue.object(item)
+            let size = try value.serializedData(pretty: false).count
+            if !parts.isEmpty, bytes + size > 24_000 { break }
+            parts.append(value); bytes += size
+        }
+        let end = start + parts.count
+        return .object(["status": .string("ok"), "abilities": .array(parts), "built_in_guidance": .array(guidance.map(JSONValue.string)),
+            "guidance_gaps": .array(guidanceGaps),
+            "count": .int(Int64(parts.count)), "total": .int(Int64(rows.count)), "offset": .int(Int64(start)),
+            "has_more": .bool(end < rows.count), "next_offset": end < rows.count ? .int(Int64(end)) : .null,
+            "next_call": end < rows.count ? .object(["action": .string("ability.list"), "args": .object(["offset": .int(Int64(end))])]) : .null])
+    }
+}

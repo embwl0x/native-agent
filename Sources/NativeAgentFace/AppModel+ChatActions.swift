@@ -5,11 +5,9 @@ import NativeAgentShared
 struct AppMutationResult: Equatable, Sendable {
     let succeeded: Bool
     let userMessage: String
-    var cause: String?
-    var agentMessage: String { cause.map { userMessage + "\n" + $0 } ?? userMessage }
     static func success(_ message: String) -> Self { Self(succeeded: true, userMessage: message) }
-    static func failure(_ message: String, cause: String? = nil) -> Self {
-        Self(succeeded: false, userMessage: message, cause: cause)
+    static func failure(_ message: String) -> Self {
+        Self(succeeded: false, userMessage: message)
     }
 }
 
@@ -50,13 +48,13 @@ extension AppModel {
             }
             if let failure = issue {
                 setFailureStatus(failure, action: success)
-                return .failure(failure.message, cause: failure.cause)
+                return .failure(failure.message)
             }
             statusText = success
             return .success(success)
         } catch {
             setFailureStatus(error, action: success)
-            return .failure(statusText, cause: error.localizedDescription)
+            return .failure(statusText)
         }
     }
 
@@ -85,7 +83,7 @@ extension AppModel {
             return .success(statusText)
         } catch {
             setFailureStatus(error, action: "archive this chat")
-            return .failure(statusText, cause: error.localizedDescription)
+            return .failure(statusText)
         }
     }
 

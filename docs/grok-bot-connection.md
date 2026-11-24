@@ -1,6 +1,6 @@
 # Grok Bot connection
 
-The `grok-bot` row in `Resources/agent-hosts.json` uses the installed app with bundle ID
+The `grok-bot` row in `Modules/NativeAgentCore/Sources/BodyRuntime/AgentConversations/Resources/agent-hosts.json` uses the installed app with bundle ID
 `com.anysphere.sand`. Its route is a webhook routine with a local reply helper.
 
 ## Connect
@@ -109,7 +109,7 @@ through one Grok-only binding reader while those saved exchanges exist.
 Grok's credential authorizes correlated replies through `POST /agent/grok-reply`
 and conversations through `/agent/mcp`, with verified peer authorship under
 peer Trust, including Trust → Connected agents. Control routes, direct tool
-access and HTTP/gRPC A2A remain excluded.
+access and HTTP A2A remain excluded.
 
 `GrokRequestStore` claims the request, persists the full correlated answer and
 its pending handover in one durable transition. A failed write leaves it
@@ -140,14 +140,14 @@ Release and development scripts still explicitly sign the helper
 
 ## Owners
 
-- `Modules/NativeAgentCore/Sources/Agents/GrokBotConnection.swift`: the
+- `Modules/NativeAgentCore/Sources/BodyRuntime/Agents/GrokBotConnection.swift`: the
   contact record, `agent.grok_paste`'s clipboard take, send coordination, and
   connect and disconnect answering with the ability's words.
 - `Resources/abilities/grok-bot-setup.js`: setup's and disconnect's message and
   steps, the agent's own to revise.
-- `Modules/NativeAgentCore/Sources/AgentConversations/GrokBotRoute.swift`:
+- `Modules/NativeAgentCore/Sources/BodyRuntime/AgentConversations/GrokBotRoute.swift`:
   pending requests, webhook delivery and reply-helper instructions.
-- `Modules/NativeAgentCore/Sources/Agents/GrokInboundReply.swift`: correlation
+- `Modules/NativeAgentCore/Sources/BodyRuntime/Agents/GrokInboundReply.swift`: correlation
   and answer handoff.
 - `Sources/NativeAgentFace/GrokSecureSetupCard.swift`: secure credentials for the exact contact supplied by its Agents row.
 - `Sources/NativeAgentLink/NativeAgentLink.swift`: local reply command.

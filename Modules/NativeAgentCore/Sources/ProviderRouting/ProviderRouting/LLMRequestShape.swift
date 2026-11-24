@@ -1,0 +1,217 @@
+import Synchronization
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+import os
+import SenseCore
+// Blueprint: | `LLMRequestShape.swift` | `ToolContractWeight`: bounded request receipts and secondary-call isolation |
+
+/// Cache marker positions and TTLs from the finished request body, never prompt bytes. Anthropic renders tools → system → messages; longer TTLs must
+/// precede shorter ones.
+public struct LLMCacheMarker: Sendable, Equatable {
+    public let position: String
+    /// `"1h"` for extended TTL; `"5m"` names the wire's absent-`ttl` default.
+    public let ttl: String
+
+    public init(position: String, ttl: String) {
+        self.position = position
+        self.ttl = ttl
+    }
+
+    var json: JSONValue {
+        .object(["position": .string(position), "ttl": .string(ttl)])
+    }
+}
+
+// MARK: - Conversation-prefix shape receipts
+// Prefix receipts are held by `LLMCall.prefixMeasurement` and remain absent when not supplied. Receipts contain sizes, digests and bounded redacted previews.
+public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
+    public let shapeVersion: String
+    public let prefixFingerprintSHA256: String
+    public let historyMessageCount: Int
+    public let historyMessageChars: Int
+    public let volatileBlockChars: Int
+    public let volatileDelivery: String
+    public let historyContextWindow: String
+    /// Role/content digests expose head drift even when message sizes match.
+    public let messageCount: Int
+    public let messageDigests: [String]
+    /// One digest per cacheable-prefix message, excluding the current user message. Reuse requires turn N's list to prefix turn N+1's; the whole-prefix
+    /// hash changes each turn.
+    public let prefixMessageDigests: [String]
+    /// Bounded prefix conversation excerpts, credential-redacted before truncation.
+    public let headPreviews: [String]
+    /// Separate stable-instruction, tools and history-head fingerprints identify drift. Empty when the caller does not compute them.
+    public let stablePrefixFingerprintSHA256: String
+    public let toolsFingerprintSHA256: String
+    public let historyHeadFingerprintSHA256: String
+    public init(
+        shapeVersion: String,
+        prefixFingerprintSHA256: String,
+        historyMessageCount: Int,
+        historyMessageChars: Int,
+        volatileBlockChars: Int,
+        volatileDelivery: String,
+        historyContextWindow: String,
+        messageCount: Int = 0,
+        messageDigests: [String] = [],
+        prefixMessageDigests: [String] = [],
+        stablePrefixFingerprintSHA256: String = "",
+        toolsFingerprintSHA256: String = "",
+        historyHeadFingerprintSHA256: String = "",
+        headPreviews: [String] = []
+    ) {
+        self.shapeVersion = shapeVersion
+        self.prefixFingerprintSHA256 = prefixFingerprintSHA256
+        self.historyMessageCount = historyMessageCount
+        self.historyMessageChars = historyMessageChars
+        self.volatileBlockChars = volatileBlockChars
+        self.volatileDelivery = volatileDelivery
+        self.historyContextWindow = historyContextWindow
+        self.messageCount = messageCount
+        self.messageDigests = messageDigests
+        self.prefixMessageDigests = prefixMessageDigests
+        self.headPreviews = headPreviews
+        self.stablePrefixFingerprintSHA256 = stablePrefixFingerprintSHA256
+        self.toolsFingerprintSHA256 = toolsFingerprintSHA256
+        self.historyHeadFingerprintSHA256 = historyHeadFingerprintSHA256
+    }
+
+    public var payload: [String: JSONValue] {
+        var out: [String: JSONValue] = [
+            "shapeVersion": .string(shapeVersion),
+            "prefixFingerprintSHA256": .string(prefixFingerprintSHA256),
+            "historyMessageCount": .int(Int64(historyMessageCount)),
+            "historyMessageChars": .int(Int64(historyMessageChars)),
+            "volatileBlockChars": .int(Int64(volatileBlockChars)),
+            "volatileDelivery": .string(volatileDelivery),
+            "historyContextWindow": .string(historyContextWindow),
+            "messageCount": .int(Int64(messageCount)),
+            "messageDigests": .array(messageDigests.map { .string($0) }),
+            "prefixMessageDigests": .array(prefixMessageDigests.map { .string($0) }),
+            "headPreviews": .array(headPreviews.map { .string($0) }),
+        ]
+        if !stablePrefixFingerprintSHA256.isEmpty {
+            out["component.stablePrefixSHA256"] = .string(stablePrefixFingerprintSHA256)
+        }
+        if !toolsFingerprintSHA256.isEmpty {
+            out["component.toolsSHA256"] = .string(toolsFingerprintSHA256)
+        }
+        if !historyHeadFingerprintSHA256.isEmpty {
+            out["component.historyHeadSHA256"] = .string(historyHeadFingerprintSHA256)
+        }
+        return out
+    }
+}
+
+/// Admission supplies an empty receipt sink to the call; context assembly fills that exact sink.
+public final class ConversationPrefixTelemetrySink: Sendable {
+    private struct State {
+        var value: ConversationPrefixTelemetrySnapshot?
+        var pending: Task<ConversationPrefixTelemetrySnapshot, Never>?
+        var weight: ToolContractWeight.Measurement?
+    }
+    private let state = Mutex(State())
+
+    /// A shedding binding stays empty so secondary calls cannot carry an outer turn's receipts.
+    public let marksRequestShapeUnmeasured: Bool
+
+    /// A permanently empty shared sink safely detaches secondary calls from parent receipts.
+    public static let unmeasuredRequestShape =
+        ConversationPrefixTelemetrySink(marksRequestShapeUnmeasured: true)
+
+    public init(marksRequestShapeUnmeasured: Bool = false) {
+        self.marksRequestShapeUnmeasured = marksRequestShapeUnmeasured
+    }
+
+    public func set(_ snapshot: ConversationPrefixTelemetrySnapshot) {
+        // Secondary-call bindings remain permanently unmeasured.
+        guard !marksRequestShapeUnmeasured else { return }
+        state.withLock { $0.value = snapshot; $0.pending = nil }
+    }
+
+    /// Diagnostics can prepare beside the request. Receipt writers join this exact work before reading it; request construction never needs it.
+    public func setPending(_ task: Task<ConversationPrefixTelemetrySnapshot, Never>) {
+        guard !marksRequestShapeUnmeasured else { return }
+        state.withLock { $0.value = nil; $0.pending = task }
+    }
+
+    public func resolved() async -> ConversationPrefixTelemetrySnapshot? {
+        let task = state.withLock { $0.pending }
+        if let task { return await task.value }
+        return current
+    }
+
+    public var current: ConversationPrefixTelemetrySnapshot? {
+        state.withLock { $0.value }
+    }
+
+    public func set(_ measurement: ToolContractWeight.Measurement) {
+        guard !marksRequestShapeUnmeasured else { return }
+        state.withLock { $0.weight = measurement }
+    }
+
+    public var toolWeight: ToolContractWeight.Measurement? {
+        state.withLock { $0.weight }
+    }
+}
+
+private enum PrefixMeasurementPart: LLMCallPart { static let unset: ConversationPrefixTelemetrySink? = nil }
+private enum AnthropicReusePart: LLMCallPart { static let unset = false }
+
+extension LLMCall {
+    /// The request builder's measurement; nil means no measurement was supplied.
+    public var prefixMeasurement: ConversationPrefixTelemetrySink? {
+        get { self[PrefixMeasurementPart.self] }
+        set { self[PrefixMeasurementPart.self] = newValue }
+    }
+    public var requestShapeUnmeasured: Bool { prefixMeasurement?.marksRequestShapeUnmeasured == true }
+    public var withinTurnReuse: Bool {
+        get { self[AnthropicReusePart.self] }
+        set { self[AnthropicReusePart.self] = newValue }
+    }
+    /// A secondary call retains causal identity, with its own route, layout and allowance.
+    public func unmeasured() -> LLMCall {
+        var call = self
+        call.prefixMeasurement = .unmeasuredRequestShape
+        call.conversationRequest = false
+        call.requestPlan = nil
+        call.systemSegments = nil
+        call.currentUserIndex = nil
+        call.withinTurnReuse = false
+        call.admission = nil
+        call.turn?.tokenBudget = nil
+        return call
+    }
+}
+
+/// Tool totals measure schema-material bytes (name, description and parameter JSON) without retaining content.
+public enum ToolContractWeight {
+    public struct Measurement: Sendable, Equatable {
+        public let floorCount: Int
+        public let appendedCount: Int
+        public let floorBytes: Int
+        public let appendedBytes: Int
+
+        public init(floorCount: Int, appendedCount: Int, floorBytes: Int, appendedBytes: Int) {
+            self.floorCount = floorCount
+            self.appendedCount = appendedCount
+            self.floorBytes = floorBytes
+            self.appendedBytes = appendedBytes
+        }
+
+        public var wireBytes: Int { floorBytes + appendedBytes }
+        /// nil rather than 0/0 when there is no tool material to divide.
+        public var appendedShareOfWireBytes: Double? {
+            wireBytes > 0 ? Double(appendedBytes) / Double(wireBytes) : nil
+        }
+    }
+
+    /// Schema weight follows context.snapshot's material-byte convention.
+    public static func materialBytes(
+        name: String, description: String, parameterBytes: Int
+    ) -> Int {
+        name.utf8.count + description.utf8.count + max(0, parameterBytes)
+    }
+
+}

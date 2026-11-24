@@ -1,3 +1,4 @@
+import CoreGraphics
 import AppKit
 import Foundation
 import NativeAgentShared
@@ -202,10 +203,10 @@ struct BoardGeometry {
         let font = nsFont(element, table: true), width = max(1, CGFloat(element.number("w") ?? 160) - 24)
         let key = "\(width)|\(font.pointSize)|\(font.fontName)|\(words)" as NSString
         let needed: CGFloat
-        if let known = measuredHeights.object(forKey: key) { needed = CGFloat(known.doubleValue) } else {
+        if let known = unsafe measuredHeights.object(forKey: key) { needed = CGFloat(known.doubleValue) } else {
             needed = NSAttributedString(Self.words(words, font: font)).boundingRect(
                 with: CGSize(width: width, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading]).height
-            measuredHeights.setObject(NSNumber(value: Double(needed)), forKey: key)
+            unsafe measuredHeights.setObject(NSNumber(value: Double(needed)), forKey: key)
         }
         return ceil(max(CGFloat(element.number("h") ?? 80), needed + 16))
     }

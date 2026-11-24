@@ -33,7 +33,7 @@ struct InboxStripContainer<Header: View>: View {
             Text("Reading updates…").font(.caption).foregroundStyle(.secondary)
         }
         }
-        .task(id: scenePhase) {
+        .liveTask(id: scenePhase) {
             guard scenePhase == .active else { return }
             do { _ = try await appModel.checkedFaceAct(.refresh(.page("inbox"))) }
             catch { appModel.setFailureStatus(error, action: "read updates") }

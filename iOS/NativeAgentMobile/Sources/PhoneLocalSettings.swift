@@ -65,7 +65,7 @@ enum PhoneLocalSettings {
     static func controls() async -> [PhoneLocalSetting] {
         await PhoneSenses.shared.restorationTask?.value
         await PhonePlaces.shared.restorationTask?.value
-        return [NativeAgentAppearance.settingControl, HazeSwatches.settingControl, PhoneTurnActivity.shared.settingControl]
+        return [NativeAgentAppearance.settingControl, HazeColor.settingControl, PhoneTurnActivity.shared.settingControl]
             + PhoneSenses.shared.settingControls + PhonePlaces.shared.settingControls
     }
 

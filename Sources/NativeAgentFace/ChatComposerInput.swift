@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import NativeAgentShared
+import UniformTypeIdentifiers
 // Blueprint: | `ChatComposerInput.swift` | `ChatComposerInput`: draft-local text entry, slash menu, recipient chip and command-key handling |
 
 /// Assemble chrome without reading characters; the field and Send own their observations.
@@ -123,12 +124,12 @@ private struct ChatComposerField: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             if let recipient = input.recipient { ComposerRecipientChip(name: recipient) }
             TextField(
-                input.voiceInput.isListening ? "" : input.placeholder,
+                input.voiceInput.isListening ? "" : (input.recipient == nil ? input.placeholder : "Message…"),
                 text: input.draft.textBinding,
                 axis: .vertical
             )
             .textFieldStyle(.plain)
-            .accessibilityLabel("Message")
+            .accessibilityLabel(input.recipient.map { "Message \($0)" } ?? input.placeholder)
             .accessibilityIdentifier(FaceComposerFocus.identifier(session: input.draft.sessionId,
                                                                  active: input.isActive && !quietOffscreenRead))
             .accessibilityHint(showSlashMenu ? selectedSlashCommand?.helpLine ?? "" : "")

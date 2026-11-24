@@ -30,7 +30,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Take a photo to share with your agent when you accept a camera request.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Share enabled place transitions and wake brief phone-presence readings when you move, even while NativeAgent is closed. Coordinates for these senses stay on this phone.</string>
+	<string>Share enabled place transitions and wake brief phone-presence readings when you move, even while NativeAgent is closed. Only the Location sense, if you turn it on, shares this phone's position with your Mac.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Save a place on this phone or share your current location when you accept a phone request.</string>
 	<key>NSMotionUsageDescription</key>

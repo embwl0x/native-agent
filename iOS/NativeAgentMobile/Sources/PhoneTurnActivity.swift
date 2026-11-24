@@ -1,10 +1,12 @@
+import Observation
 import ActivityKit
 import Foundation
 import NativeAgentShared
 import SwiftUI
 
 @MainActor
-final class PhoneTurnActivity: ObservableObject {
+@Observable
+final class PhoneTurnActivity {
     static let shared = PhoneTurnActivity()
     var settingControl: PhoneLocalSetting {
         PhoneLocalSetting(id: "phone.live_activities", label: "Show task names on the iPhone Lock Screen", type: "boolean",
@@ -20,6 +22,7 @@ final class PhoneTurnActivity: ObservableObject {
             }, approval: { try PhoneLocalSetting.boolean($0) && !self.settingEnabled() })
     }
     private func settingEnabled() throws -> Bool {
+        access(keyPath: \.isEnabled)
         guard let saved = UserDefaults.standard.object(forKey: "NativeAgentMobile.workActivityEnabled") else { return false }
         guard let enabled = saved as? Bool else {
             throw PhoneLocalSetting.failure(
@@ -27,37 +30,37 @@ final class PhoneTurnActivity: ObservableObject {
         }
         return enabled
     }
-    @Published var workCorrelations: [String: Set<String>] = [:]
+    var workCorrelations: [String: Set<String>] = [:]
     var workingIDs: Set<String> {
         Set(work.values.filter {
             [.preparing, .working, .tool, .retrying].contains($0.content.state)
         }.flatMap { workCorrelations[$0.id] ?? [] })
     }
-    @Published private(set) var errorMessage: String?
-    @Published var isEnabled = UserDefaults.standard.bool(forKey: "NativeAgentMobile.workActivityEnabled")
-    @Published var work: [String: MobileWorkActivity] = [:]
-    @Published var turnSessions: TurnSessionsFace?
+    private(set) var errorMessage: String?
+    var isEnabled = UserDefaults.standard.bool(forKey: "NativeAgentMobile.workActivityEnabled")
+    var work: [String: MobileWorkActivity] = [:]
+    var turnSessions: TurnSessionsFace?
     var visibleTurnSessions: TurnSessionsFace? {
         guard activityPairing != nil, workPairing == activityPushPairing else { return nil }
         return turnSessions
     }
-    var pushConfigured = false
-    var acceptedRegistrations: [String: [String: String]] = [:]
-    var acceptedRegistrationPairing: String?
-    var workUpdates: [String: (token: UUID, task: Task<Void, Never>)] = [:]
+    @ObservationIgnored var pushConfigured = false
+    @ObservationIgnored var acceptedRegistrations: [String: [String: String]] = [:]
+    @ObservationIgnored var acceptedRegistrationPairing: String?
+    @ObservationIgnored var workUpdates: [String: (token: UUID, task: Task<Void, Never>)] = [:]
     var workPairing: String?
-    var tokenObservers: [String: Task<Void, Never>] = [:]
-    var activityObserver: Task<Void, Never>?
-    var startTokenObserver: Task<Void, Never>?
-    var registrationTask: Task<Void, Never>?
-    var workReconciliationTask: Task<Void, Never>?
-    var workReconciliationIDs: Set<String> = []
-    var disableRegistrationInFlight = false
-    var disableRegistrationPending = (UserDefaults.standard.object(forKey: "NativeAgentMobile.workActivityDisablePending") as? Bool)
+    @ObservationIgnored var tokenObservers: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored var activityObserver: Task<Void, Never>?
+    @ObservationIgnored var startTokenObserver: Task<Void, Never>?
+    @ObservationIgnored var registrationTask: Task<Void, Never>?
+    @ObservationIgnored var workReconciliationTask: Task<Void, Never>?
+    @ObservationIgnored var workReconciliationIDs: Set<String> = []
+    @ObservationIgnored var disableRegistrationInFlight = false
+    @ObservationIgnored var disableRegistrationPending = (UserDefaults.standard.object(forKey: "NativeAgentMobile.workActivityDisablePending") as? Bool)
         ?? !UserDefaults.standard.bool(forKey: "NativeAgentMobile.workActivityEnabled") {
         didSet { UserDefaults.standard.set(disableRegistrationPending, forKey: "NativeAgentMobile.workActivityDisablePending") }
     }
-    var failedWorkStarts: Set<String> = []
+    @ObservationIgnored var failedWorkStarts: Set<String> = []
     var activityPairing: String? { AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) }
     var activityPushPairing: String? {
         guard let secret = iCloudBridge.shared.pairingSecretForPhoneRequests else { return nil }

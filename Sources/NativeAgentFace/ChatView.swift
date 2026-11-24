@@ -7,7 +7,6 @@ import NativeAgentShared
 struct ChatView: View {
     @Environment(AppModel.self) var appModel
     @Environment(\.accessibilityReduceMotion) var reduceMotion
-    @Environment(\.accessibilityReduceTransparency) var reduceTransparency
     /// Suspend hidden-page input, commands and visual work.
     @Environment(\.chatPageIsVisible) var chatPageIsVisible
     /// Simple's seeded profile omits the conversation list, Work pane and new-chat button.
@@ -135,7 +134,7 @@ struct ChatView: View {
         .navigationTitle("Chat")
         .modifier(FaceObservation(demand: .key(.sessions)))
         .modifier(FaceObservation(demand: .key(.layout)))
-        .modifier(FaceDictationObservation(input: voiceInput))
+        .observeDictation(voiceInput, showToast: showToast)
         // Use the surface's existing setup presentation so a card opens in the correct host.
         .inlineCardSetup(inlineCards, sessionID: appModel.activeChatSessionId, active: chatPageIsVisible)
         .liveOnAppear {
@@ -171,14 +170,20 @@ struct ChatView: View {
                 renamingSessionId = nil
             }
         }
-        .onChange(of: voiceInput.errorMessage) {
-            if let message = voiceInput.errorMessage {
-                showToast(message)
-                voiceInput.errorMessage = nil
-            }
-        }
     }
 
+}
+
+extension View {
+    @MainActor
+    func observeDictation(_ input: FaceVoiceInput, showToast: @escaping @MainActor (String) -> Void) -> some View {
+        modifier(FaceDictationObservation(input: input))
+            .onChange(of: input.errorMessage) { _, message in
+                guard let message else { return }
+                showToast(message)
+                input.errorMessage = nil
+            }
+    }
 }
 
 /// Keep retained-data failure observation in this leaf so it cannot invalidate the chat root.

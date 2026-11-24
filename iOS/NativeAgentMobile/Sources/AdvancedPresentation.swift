@@ -19,8 +19,7 @@ extension View {
     func mobileReadingScreen() -> some View {
         scrollContentBackground(.hidden)
             .background { AliveRoom() }
-            // Sheet backgrounds extend edge to edge so haze remains continuous under the bar.
-            .presentationBackground { AliveRoom() }
+            .presentationBackground { AlivePalette.room }
             .hazeTinted()
             .environment(\.defaultMinListRowHeight, NativeAgentMobileTheme.Layout.controlHeight)
             .navigationBarTitleDisplayMode(.inline)

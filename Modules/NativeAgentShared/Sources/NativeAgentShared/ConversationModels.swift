@@ -308,14 +308,6 @@ public struct SessionSearchFace: FaceValue {
     public init(query: String, sections: SessionListFace) { self.query = query; self.sections = sections }
 }
 
-/// A completed palette ranking and the query it answers travel together.
-public struct SessionPaletteFace: FaceValue {
-    public let query: String
-    /// Exact title, title prefix, preview prefix, title words and preview words.
-    public let matches: [[String]]
-    public init(query: String, matches: [[String]]) { self.query = query; self.matches = matches }
-}
-
 /// Read availability has its own key, independent of the list's membership.
 public struct SessionNavigationFace: FaceValue {
     public let hasLoadedIndex: Bool
@@ -345,13 +337,10 @@ public struct ChatMessageRecord: Identifiable, Codable, Hashable, Sendable {
     /// What the Mac read of this row; the phone builds the same face from it.
     public var face: TranscriptRowFace? = nil
     public init(id: String, sessionId: String?, role: String, content: String, createdAt: String,
-                runId: String?, source: String?, metadata: ChatMessageMetadata?, isPersonVisible: Bool) {
+                runId: String?, source: String?, metadata: ChatMessageMetadata?) {
         self.id = id; self.sessionId = sessionId; self.role = role; self.content = content
         self.createdAt = createdAt; self.runId = runId; self.source = source; self.metadata = metadata
-        self.isPersonVisible = isPersonVisible
     }
-    /// Local paging evidence, excluded from the transport bytes.
-    public var isPersonVisible = true
     private enum CodingKeys: String, CodingKey {
         case id, sessionId, role, content, createdAt, runId, source, metadata
         case interactionJSON, interactionDescriptorJSON, interactionSessionID, cardFaceJSON, toolEvents, face

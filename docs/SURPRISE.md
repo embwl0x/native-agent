@@ -13,7 +13,7 @@ A model call is what surprise costs. Before any call, they have an expectation
 drawn from their own record: what they will look at, what comes back, and what
 they will make of it. When that expectation has **standing**, it pays instead
 of the model. Standing uses the one cost law in
-`NativeAgentCore/Expectation.swift`: the Wilson lower bound of
+`NativeAgentCore/NativeAgentCore/Expectation.swift`: the Wilson lower bound of
 its hit rate must beat c_miss / (c_miss + c_hit). When the world doesn't
 match, that mismatch is the surprise, and the model is called. The miss is
 recorded, so the expectation learns.
@@ -23,10 +23,36 @@ simultaneous-prediction z and rule-of-succession withholding. Cost measurement
 stays with the caller. Expansion keeps its union-bound correction across
 simultaneous predictions. Both costs must be measured before anything stands.
 
-The after-turn judgment is not under this law: no prediction stands in for it.
-Every moment is judged alone; User's own turns are judged at once, and every
-other recorded turn is left owed and judged when they are idle
-([Cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation)).
+One of their own routine thoughts (a care wake's reply that acted on nothing) can end on CPU without after-turn reflection;
+what a person or a peer says is always reflected, because their words are where their memories come from. Each applied
+judgment contributes one `mind/reflection` detail per moment, under its speaker
+(`person`, `peer`, `self`, `app`) and reply length (`none`, `short` for 1–99
+characters, `long` from 100). Memory adds or updates, a belief reaction, a
+caring verdict, a chosen register, a care entry (taken or faulted), a promise or a settlement count as `yielded`.
+Everything else, including affect deltas alone, counts as `empty`.
+
+The stem reads the latest 4,096 outcomes of that class within the thought
+record's 14-day horizon. The lower bound on empties must exceed 4/5. Missing
+a reflection costs four wasted calls because its moment never comes back.
+Even with standing, the turn still reflects with probability
+`(yielded + 1) / (tries + 2)`. A quiet reply writes a skip trace and supplies
+no new outcome. Missing or unreadable evidence leaves reflection on.
+Filed promises, steering, failures and settlement-only obligations keep
+their appraisal. [Cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation)
+
+After they have spoken to the person, a round of writes to their own records can
+teach `mind/close`. Every call must have a reversible, non-voice app binding of
+class `write` and reach `agent`, a successful, settled receipt, and no `then_say`
+request. A wait for judgment (`needs_me`), an unknown effect, a hand-back,
+an attachment to show, a pending arrival or an approval or card filed for the
+person anywhere in the turn keeps the read-back. Each turn contributes at most
+one observed trailing `tool_round` under the round's sorted set of action IDs
+joined with `+`, for example `memory.commit+queue.done`. New visible prose or a
+further call is `yielded`. A completed round with neither is `empty`. The same 14-day window and 4,096-row limit
+apply. With hit cost 1 and miss cost 2, the lower bound must exceed 2/3.
+Even then they reads the receipt with probability `(yielded + 1) / (tries + 2)`.
+A quiet close records `turn.quietClose` with the class and reason. Only a
+round that ran can teach the record. An unreadable record leaves the model on.
 
 The law is the same everywhere. What differs is the moment it is applied at.
 
@@ -34,7 +60,7 @@ The law is the same everywhere. What differs is the moment it is applied at.
 
 As built in source, 10-30; installed proof is pending. Surprise also gives
 their something worth learning. The nightly and manual dream share one CPU
-reading of records that already exist (`BackgroundWork/DreamSurprises.swift`),
+reading of records that already exist (`BodyRuntime/BackgroundWork/DreamSurprises.swift`),
 from the dream's high-water cutoff through the material read:
 
 - Failed `tool.dispatch` rows, grouped by the receipt's action and
@@ -121,10 +147,15 @@ reply envelope.
 | Model calls | Count | What they are |
 |---|---|---|
 | Reply, first call | 330 | Answering a message; always made |
-| After-turn reflection | 329 | One per turn. On 560 of 772 judged turns it moved something, nearly always a care (541) |
+| After-turn reflection | 329 | Against 330 first reply calls. On 560 of 772 judged turns it moved something, nearly always a care (541) |
 | Tool rounds | 280 | 1.9 rounds per turn; 24 turns took 4 or more |
 | Keep | 94 | Deciding whether hand-done work becomes an ability: 44 on 10-28, 48 on 10-29, 2 on 10-30 |
 | Retired summary passes | 54 | Historical measurement; no conversation summary pass remains |
+
+On November 16–21, the live and deferred interpretation calls totaled
+105–144 a day and 1.36–1.79 million input tokens a day. Surviving receipts
+showed a yield for at least 651 of 979 settled moments in the November read.
+Settlement had cleared their judgments, so the exact empty count was lost.
 
 Before S1, their expectation organs were nearly idle:
 The keep count was remeasured from the three retained daily trace files,
@@ -205,7 +236,7 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
      standing agent, and a session whose recorded kind is their conversation.
    - Every other recorded turn is left owed and judged alone when they are idle,
      under the same provenance and trust gates.
-   - Every eligible recorded turn is still reflected on.
+   - The class record decides routine reflection before the turn records anything owed.
 3. **Practice keeps what repeats (H3, as built).**
    - After each tool round the stem meets the turn's hand work, or one call
      repeated with the same input 3+ rounds. It records the practice on its
@@ -226,10 +257,6 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
    - The nerve is in `ChatOrchestration+StreamingToolLoop.swift`, after each
      tool round; there is no private keep call after the reply. The nightly
      compiler and its ledger/tape writers are removed ([Habits H4](HABITS.md#h4--one-crystallizer)).
-4. **Woken work runs what it expects (design).**
-   - An intention whose occurrences they have handled the same way with
-     standing (same reads, same decision) runs that way.
-   - The model is called when what the reads return is new.
 4. **Woken work runs what it expects (source built; installed proof pending).**
    - Repeated carried-wake handling earns a suggestion through the shared
      `Expectation.stands` cost law; they chooses whether to bind it with
@@ -274,7 +301,6 @@ outcome needs the release lead's installed before/after evidence.
 | S1 | One expectation law used by Expansion | Expansion removed 11-15 |
 | S2 | Per-mind practice and field-free situations; a standing first read reaches the first model call | Removed 11-15 |
 | S3 | User's own turns are judged at once; other recorded turns are judged one at a time in their quiet | Implemented in phase 2; installed proof pending |
-| S4 | Keep repeated hand work; woken work runs expected handling | Keep implemented; expected handling remains design |
 | S4 | Keep only new practice; woken work runs expected handling | Built in source; installed proof pending (HABITS H1/H2 owns the reflex and forming choice) |
 | S5 | The thinking line on Today, plus docs | Implemented; installed proof pending |
 
@@ -332,11 +358,10 @@ nothing today.
      prompt and parser. Replay restores speaker/standing-agent identity,
      envelope, source taint and origin, and the recorded event's source class
      and peer metadata. Its meaning is saved before its fold. That fold replays
-     the recorded provenance through `careProvenance` and `PeerTrust.ownerTrusts`:
+     the recorded provenance through `careProvenance` and reads `PeerTrust.ownerTrusts` in the moment’s data root:
      an untrusted peer moves only an existing care `by: them`, never a new care,
      revival, stance or gap.
-   - No eligible recorded turn is skipped. Cares and affect from owed turns
-     land later.
+   - Once recorded as owed, a moment keeps its judgment. Cares and affect from owed turns land later.
 2. **Fixed words need no thought (source built; installed proof pending).**
    - A `say` intention whose moment comes delivers its words through the
      deduplicated speech path (`speakProactively`),

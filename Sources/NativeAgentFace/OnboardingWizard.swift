@@ -11,6 +11,7 @@ struct OnboardingWizard: View {
 
     // Offscreen identity presentation needs state without starting a runtime.
     @Environment(AppModel.self) private var appModel: AppModel?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private(set) var state = OnboardingWizardState()
     init(onComplete: @escaping () -> Void) {
         self.onComplete = onComplete
@@ -25,7 +26,7 @@ struct OnboardingWizard: View {
                             Circle()
                                 .fill(i <= state.step.rawValue ? NativeAgentShell.text : NativeAgentShell.tertiary)
                                 .frame(width: 8, height: 8)
-                                .animation(NativeAgentMotion.quick, value: state.step)
+                                .animation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: state.step)
                         }
                     }
                     .padding(.top, NativeAgentSpacing.xl)

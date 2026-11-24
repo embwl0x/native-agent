@@ -7,7 +7,6 @@ public enum TranscriptRevealMapping: Equatable, Sendable, Codable {
     case mapped([TranscriptRevealCut])
     case failed(reason: String)
 
-    @available(macOS 15, iOS 18, *)
     public init(_ block: TranscriptBlock, rendered: String) {
         do { self = .mapped(try Self.cuts(block, rendered: rendered)) }
         catch {
@@ -19,7 +18,6 @@ public enum TranscriptRevealMapping: Equatable, Sendable, Codable {
     }
 
     /// Parser positions address source bytes, including entities and escapes whose glyphs are not literal source characters.
-    @available(macOS 15, iOS 18, *)
     private static func cuts(_ block: TranscriptBlock, rendered: String) throws -> [TranscriptRevealCut] {
         guard block.id.hasPrefix(block.messageID + "#") else { return [] }
         let source = block.source

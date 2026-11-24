@@ -1,34 +1,19 @@
 // The only JavaScript bridge: the app's plug and local redaction policy.
 // There is no filesystem, process, network or timer API.
-(function (call, redactText) {
+(function (call) {
     "use strict";
-    function invoke(type, fields) {
-        const reply = JSON.parse(call(type, JSON.stringify(fields || {})));
-        if (reply.failure) {
-            const error = new Error(reply.failure.message);
-            error.code = reply.failure.code;
-            throw error;
-        }
-        return reply.value;
-    }
-    function material(raw) {
-        if (raw.kind !== "file") return raw;
-        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        const encoded = raw.data;
-        const bytes = new Uint8Array(raw.bytes);
-        let bits = 0, buffer = 0, offset = 0;
-        for (let i = 0; i < encoded.length && encoded[i] !== "="; i++) {
-            buffer = (buffer << 6) | alphabet.indexOf(encoded[i]);
-            bits += 6;
-            if (bits >= 8) { bits -= 8; bytes[offset++] = (buffer >> bits) & 255; }
-        }
-        return {kind: "file", path: raw.path, bytes: raw.bytes, version: raw.version, data: bytes};
-    }
+    function invoke(type, fields) { return call(type, fields || {}); }
     const api = Object.freeze({
         // Local canonical Swift policy; no plug traffic or progress credit.
-        redactText: text => redactText(String(text)),
+        redactText: text => call("redact", String(text)),
+        bytes: Object.freeze({
+            utf8: bytes => call("utf8", bytes),
+            text: bytes => call("text", bytes),
+            inflate: (bytes, size) => call("inflate", bytes, size),
+            crc32: bytes => call("crc32", bytes)
+        }),
         source: Object.freeze({
-            read: address => material(invoke("source_read", {address: address == null ? null : address})),
+            read: address => invoke("source_read", {address: address == null ? null : address}),
             watch: () => invoke("source_watch")
         }),
         apps: Object.freeze({read: args => invoke("app_read", {args})}),
@@ -51,4 +36,4 @@
             typeof value === "string" ? value : JSON.stringify(value)).join(" ")})
     });
     Object.defineProperty(globalThis, "sense", {value: api, writable: false, configurable: false});
-})(__senseCall, __senseRedactText);
+})(__senseCall);

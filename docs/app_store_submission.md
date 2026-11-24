@@ -71,7 +71,7 @@ app's entitlements. Reconcile them with the signed archive:
 | Focus Status | Opt-in Boolean Focus status, never the Focus kind |
 | Camera | Photo capture for an accepted phone request |
 | Location when in use | Save a place locally; current location for an accepted phone request |
-| Location always/when in use | Arrival/departure for places the user enables; significant-change wakes for brief enabled sense readings, no coordinates exported by senses |
+| Location always/when in use | Arrival/departure for places the user enables; significant-change wakes for brief enabled sense readings; Places exports no coordinates, but the Location sense, when the person turns it on, shares the phone's last known position with the paired Mac |
 | Remote notifications | APNS registration and background sync |
 | CloudKit, CloudDocuments and KVS | Companion sync and pairing |
 | Communication/time-sensitive notifications | Notification presentation |

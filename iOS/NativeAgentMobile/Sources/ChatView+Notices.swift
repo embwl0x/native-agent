@@ -34,11 +34,10 @@ extension ChatView {
             banners.append(MobileChatBanner(
                 id: "voice", message: voiceErr, systemImage: "mic.slash.fill", tint: .orange,
                 dismissLabel: "Dismiss voice input error",
-                action: voiceErr.localizedCaseInsensitiveContains("permission")
-                    || voiceErr.localizedCaseInsensitiveContains("settings")
+                action: voiceInput.errorNeedsSettings
                     ? ("Open Settings", { voiceInput.openSettings() })
                     : nil,
-                onDismiss: { voiceInput.error = nil }
+                onDismiss: { voiceInput.clearError() }
             ))
         }
         if let speechErr = voiceOutput.error {
@@ -126,17 +125,23 @@ private struct MobileChatIssueBanner: View {
             if banner.action != nil || moreCount > 0 {
                 HStack(spacing: 16) {
                     if let action = banner.action {
-                        Button(action.title, action: action.handler)
-                            .font(.callout.weight(.semibold))
+                        Button(action: action.handler) {
+                            Text(action.title)
+                                .font(.callout.weight(.semibold))
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
                     }
                     Spacer(minLength: 0)
                     if moreCount > 0 {
-                        Button("\(moreCount) more", action: onMore)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .frame(minHeight: 44)
-                            .contentShape(Rectangle())
-                            .accessibilityHint("Shows the next notice")
+                        Button(action: onMore) {
+                            Text("\(moreCount) more")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityHint("Shows the next notice")
                     }
                 }
                 .padding(.leading, 28)

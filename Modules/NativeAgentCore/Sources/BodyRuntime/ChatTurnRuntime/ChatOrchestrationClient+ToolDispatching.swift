@@ -1,0 +1,29 @@
+import Foundation
+import MindCore
+import NativeAgentCore
+import PersistenceCore
+import DeskCore
+import ProviderRouting
+import MacNerves
+import SenseCore
+// Blueprint: | `ChatOrchestrationClient+ToolDispatching.swift` | `SwiftNativeChatOrchestrationClient`: `makeTracedGatedDispatcher` |
+
+extension SwiftNativeChatOrchestrationClient {
+    /// Build each chat dispatch chain here so its tracer sees admitted provenance and autonomy once.
+    /// The loop records calls refused before the inner tracer as well as offered-contract refusals.
+    /// Direct bridge tools use the shared untraced factory because they create no chat rows.
+    func makeTracedGatedDispatcher(
+        fileAccess: String,
+        verifiedSessionId: String?, work: ChatTurnWork
+    ) -> any ToolDispatchClient {
+        makeGatedToolDispatchClient(
+            tools: tools, jobStore: engine.jobStore,
+            fileAccess: fileAccess,
+            approvalFiler: approvalFiler,
+            approvalTimeoutSeconds: approvalTimeoutSeconds,
+            dataRoot: dataRoot,
+            verifiedSessionId: verifiedSessionId,
+            tracePeerTurn: true, work: work
+        )
+    }
+}

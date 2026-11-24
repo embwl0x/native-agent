@@ -4,6 +4,7 @@ import SwiftUI
 struct DictationTranscript: View {
     let input: VoiceInputController
     var maxHeight: CGFloat = 240
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var height: CGFloat = 22
 
     private var mode: String {
@@ -14,10 +15,14 @@ struct DictationTranscript: View {
 
     var body: some View {
         let words = input.transcript
+        let compact = verticalSizeClass == .compact
+        let cap = compact ? min(maxHeight, 72) : maxHeight
         VStack(alignment: .leading, spacing: 4) {
             Text(mode)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(AlivePalette.secondary)
+                .lineLimit(compact ? 1 : nil)
+                .minimumScaleFactor(compact ? 0.85 : 1)
             ScrollView {
                 Text(words.isEmpty ? (input.statusText ?? "Listening…") : words)
                     .font(.body)
@@ -26,13 +31,13 @@ struct DictationTranscript: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
             }
-            .frame(height: min(max(height, 22), maxHeight))
+            .frame(height: min(max(height, 22), cap))
             .scrollBounceBehavior(.basedOnSize)
             .defaultScrollAnchor(.bottom)
             .defaultScrollAnchor(.bottom, for: .sizeChanges)
         }
         .padding(.horizontal, 12)
-        .padding(.top, 10)
+        .padding(.top, compact ? 6 : 10)
         .accessibilityElement(children: .combine)
     }
 }

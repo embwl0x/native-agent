@@ -1,8 +1,9 @@
+import CoreFoundation
 import Darwin
 import Dispatch
 import Foundation
 import CoreServices
-import os
+import Synchronization
 import NativeAgentChromeRelayCore
 import PersistenceCore
 
@@ -59,7 +60,7 @@ private enum RelayError: Error, LocalizedError {
     }
 }
 
-private final class RelayEndpoint: @unchecked Sendable {
+private final class RelayEndpoint: Sendable {
     let input: FileHandle
     let output: FileHandle
 
@@ -69,24 +70,19 @@ private final class RelayEndpoint: @unchecked Sendable {
     }
 }
 
-private final class RelayCompletion: @unchecked Sendable {
-    private let lock = NSLock()
-    private var firstError: Error?
+private final class RelayCompletion: Sendable {
+    private let firstError = Mutex<Error?>(nil)
     let semaphore = DispatchSemaphore(value: 0)
 
     func finish(_ error: Error?) {
-        lock.lock()
-        if firstError == nil, let error {
-            firstError = error
+        firstError.withLock { first in
+            if first == nil { first = error }
         }
-        lock.unlock()
         semaphore.signal()
     }
 
     func error() -> Error? {
-        lock.lock()
-        defer { lock.unlock() }
-        return firstError
+        firstError.withLock { $0 }
     }
 }
 
@@ -197,16 +193,16 @@ private func connectUnixSocket(path: String) throws -> Int32 {
     address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
     address.sun_family = sa_family_t(AF_UNIX)
     withUnsafeMutablePointer(to: &address.sun_path) { tuplePointer in
-        tuplePointer.withMemoryRebound(to: Int8.self, capacity: pathBytes.count) { pathPointer in
+        unsafe tuplePointer.withMemoryRebound(to: Int8.self, capacity: pathBytes.count) { pathPointer in
             for (index, byte) in pathBytes.enumerated() {
-                pathPointer[index] = byte
+                unsafe pathPointer[index] = byte
             }
         }
     }
     let addressLength = socklen_t(MemoryLayout<sockaddr_un>.size)
     let result = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            Darwin.connect(descriptor, $0, addressLength)
+        unsafe pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            unsafe Darwin.connect(descriptor, $0, addressLength)
         }
     }
     guard result == 0 else {
@@ -269,7 +265,7 @@ private func run() throws {
     let acceptedListener = ChromeHostIdentity.FileIdentity(path: socketPath)
     var peer: pid_t = 0
     var peerSize = socklen_t(MemoryLayout<pid_t>.size)
-    let appPID: pid_t? = getsockopt(socketDescriptor, SOL_LOCAL, LOCAL_PEERPID, &peer, &peerSize) == 0 && peer > 0 ? peer : nil
+    let appPID: pid_t? = unsafe getsockopt(socketDescriptor, SOL_LOCAL, LOCAL_PEERPID, &peer, &peerSize) == 0 && peer > 0 ? peer : nil
     let readDescriptor = dup(socketDescriptor)
     guard readDescriptor >= 0 else {
         let code = errno
@@ -310,11 +306,11 @@ private func run() throws {
     if browserPID > 1, getppid() == browserPID,
        goneListener(path: socketPath, accepted: acceptedListener, appPID: appPID) != nil {
         var on: Int32 = 1
-        _ = setsockopt(socketDescriptor, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+        _ = unsafe setsockopt(socketDescriptor, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         for descriptor in [socketDescriptor, readDescriptor] { _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC) }
         diagnostic("NativeAgent.app closed its listener; reconnecting waits on an accepting listener; closing Chrome cancels the wait.")
         if let executable = CommandLine.arguments.first, executable.hasPrefix("/") {
-            execv(executable, CommandLine.unsafeArgv)
+            unsafe execv(executable, CommandLine.unsafeArgv)
             diagnostic("could not restart for NativeAgent.app's new listener (errno \(errno)).")
         }
     }
@@ -331,7 +327,7 @@ private func goneListener(path: String, accepted: ChromeHostIdentity.FileIdentit
     guard let appPID else { return nil }
     var info = proc_bsdinfo()
     let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
-    let read = withUnsafeMutablePointer(to: &info) { proc_pidinfo(appPID, PROC_PIDTBSDINFO, 0, $0, expected) }
+    let read = withUnsafeMutablePointer(to: &info) { unsafe proc_pidinfo(appPID, PROC_PIDTBSDINFO, 0, $0, expected) }
     guard read != expected || info.pbi_status == UInt32(SZOMB) || info.pbi_flags & UInt32(PROC_FLAG_INEXIT) != 0 else { return nil }
     do {
         Darwin.close(try connectUnixSocket(path: path))
@@ -344,20 +340,20 @@ private func goneListener(path: String, accepted: ChromeHostIdentity.FileIdentit
 private final class ListenerEvents: Sendable {
     let path: String
     let changed = DispatchSemaphore(value: 0)
-    let failure = OSAllocatedUnfairLock<String?>(initialState: nil)
+    let failure = Mutex<String?>(nil)
 
     init(path: String) { self.path = path }
 
     func receive(count: Int, paths: UnsafeMutableRawPointer, flags: UnsafePointer<FSEventStreamEventFlags>) {
-        let eventPaths = UnsafeBufferPointer(start: paths.assumingMemoryBound(to: UnsafePointer<CChar>.self), count: count)
-        let eventFlags = UnsafeBufferPointer(start: flags, count: count)
+        let eventPaths = unsafe UnsafeBufferPointer(start: paths.assumingMemoryBound(to: UnsafePointer<CChar>.self), count: count)
+        let eventFlags = unsafe UnsafeBufferPointer(start: flags, count: count)
         let lost = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
             | kFSEventStreamEventFlagUnmount)
-        for (eventPath, eventFlag) in zip(eventPaths, eventFlags) {
+        for (eventPath, eventFlag) in unsafe zip(eventPaths, eventFlags) {
             if eventFlag & lost != 0 {
                 failure.withLock { $0 = "Socket file observation lost its events or watched directory." }
                 changed.signal()
-            } else if String(cString: eventPath) == path {
+            } else if unsafe String(cString: eventPath) == path {
                 changed.signal()
             }
         }
@@ -373,19 +369,19 @@ private func awaitSocket(path: String) throws -> (descriptor: Int32, token: Stri
         throw RelayError.listenerWatch("The browser parent has exited.")
     }
     let events = ListenerEvents(path: URL(fileURLWithPath: directory).appendingPathComponent(socketURL.lastPathComponent).path)
-    var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(events).toOpaque(), retain: { info in
+    var context = unsafe FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(events).toOpaque(), retain: { info in
         guard let info else { return nil }
-        _ = Unmanaged<ListenerEvents>.fromOpaque(info).retain()
-        return info
+        _ = unsafe Unmanaged<ListenerEvents>.fromOpaque(info).retain()
+        return unsafe info
     }, release: { info in
-        if let info { Unmanaged<ListenerEvents>.fromOpaque(info).release() }
+        if let info { unsafe Unmanaged<ListenerEvents>.fromOpaque(info).release() }
     }, copyDescription: nil)
     let options = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot
         | kFSEventStreamCreateFlagNoDefer)
-    guard let stream = FSEventStreamCreate(nil, { _, info, count, paths, flags, _ in
-        let eventPaths: UnsafeMutableRawPointer? = paths
+    guard let stream = unsafe FSEventStreamCreate(nil, { _, info, count, paths, flags, _ in
+        let eventPaths: UnsafeMutableRawPointer? = unsafe paths
         if let info, let eventPaths {
-            Unmanaged<ListenerEvents>.fromOpaque(info).takeUnretainedValue().receive(count: count, paths: eventPaths, flags: flags)
+            unsafe Unmanaged<ListenerEvents>.fromOpaque(info).takeUnretainedValue().receive(count: count, paths: eventPaths, flags: flags)
         }
     }, &context, [directory] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0, options) else {
         throw RelayError.listenerWatch("Socket file observation could not be created.")

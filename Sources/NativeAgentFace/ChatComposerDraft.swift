@@ -41,8 +41,10 @@ final class ChatComposerDraft {
     /// window where the person has it for the rest of a running turn (`FaceFollows`).
     var textBinding: Binding<String> {
         Binding(get: { self.text }, set: {
+            // The view echoes the text back through this setter (after a send, on layout); only a change of the words is the person typing.
+            let typed = $0 != self.text
             self.edit($0)
-            FaceFollows.shared.personTyped()
+            if typed { FaceFollows.shared.personTyped() }
         })
     }
 }

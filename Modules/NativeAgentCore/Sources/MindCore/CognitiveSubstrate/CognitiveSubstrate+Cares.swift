@@ -1,0 +1,706 @@
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+import SenseCore
+import NativeAgentShared
+// Blueprint: | `CognitiveSubstrate+Cares.swift` | `CognitiveSubstrate`: provenance-gated care birth, movement and durable merges |
+
+
+/// Short prompt keys map judgments back to the exact cares shown.
+public struct CognitiveCareLine: Codable, Sendable, Equatable {
+    public let key: String
+    public let id: UUID
+    public let text: String
+
+    public init(key: String, id: UUID, text: String) {
+        self.key = key
+        self.id = id
+        self.text = text
+    }
+}
+
+public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
+    public enum Target: Codable, Sendable, Equatable {
+        case existing(UUID)
+        case new(about: String, between: Bool)
+    }
+
+    public var target: Target
+    public var moved: Double
+    public var by: CognitiveCare.Mover
+    public var felt: String
+    public var note: String
+    public var open: String?
+    public var closes: Bool
+    public var stance: CognitiveCare.Stance?
+    public var acted: Bool?
+
+    public init(target: Target, moved: Double, by: CognitiveCare.Mover, felt: String, note: String,
+                open: String? = nil, closes: Bool = false, stance: CognitiveCare.Stance? = nil, acted: Bool? = nil) {
+        self.target = target
+        self.moved = moved.isFinite ? min(1, max(-1, moved)) : 0
+        self.by = by
+        self.felt = felt
+        self.note = note
+        self.open = open
+        self.closes = closes
+        self.stance = stance
+        self.acted = acted
+    }
+
+    /// A non-array refuses interpretation; each faulty entry names its field and leaves valid siblings intact.
+    public static func parse(_ raw: Any?, shown: [CognitiveCareLine]) -> (judgments: [CognitiveCareJudgment], faults: [String])? {
+        guard let items = raw as? [Any] else { return nil }
+        let ids = Dictionary(shown.map { ($0.key.lowercased(), $0.id) }, uniquingKeysWith: { first, _ in first })
+        func text(_ value: Any?) -> String? { (value as? String).trimmedNonEmpty }
+        func optionalText(_ value: Any?) -> String?? {
+            if value == nil || value is NSNull { return .some(nil) }
+            guard value is String else { return nil }
+            return .some(text(value))
+        }
+        var out: [CognitiveCareJudgment] = []
+        var faults: [String] = []
+        for (index, item) in items.enumerated() {
+            func fault(_ field: String, _ words: String) { faults.append("cares[\(index)]\(field): \(words)") }
+            guard let object = item as? [String: Any] else { fault("", "must be an object"); continue }
+            guard let care = text(object["care"])?.lowercased() else { fault(".care", "needs a shown id or new"); continue }
+            guard let number = object["moved"] as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else {
+                fault(".moved", "needs a finite number"); continue
+            }
+            guard let by = text(object["by"]).flatMap({ CognitiveCare.Mover(rawValue: $0.lowercased()) }) else {
+                fault(".by", "needs a known mover"); continue
+            }
+            guard let felt = text(object["felt"]) else { fault(".felt", "needs non-blank text"); continue }
+            guard let note = text(object["note"]) else { fault(".note", "needs non-blank text"); continue }
+            guard let open = optionalText(object["open"]) else { fault(".open", "needs text or null"); continue }
+            let closes: Bool
+            switch object["closes"] {
+            case nil, is NSNull: closes = false
+            case let value as Bool: closes = value
+            default: fault(".closes", "needs a boolean or null"); continue
+            }
+            let acted: Bool?
+            switch object["acted"] {
+            case nil, is NSNull: acted = nil
+            case let value as NSNumber where CFGetTypeID(value) == CFBooleanGetTypeID(): acted = value.boolValue
+            default: fault(".acted", "needs a boolean or null"); continue
+            }
+            guard acted != true || by == .her else { fault(".acted", "true requires the agent as mover"); continue }
+            var stance: CognitiveCare.Stance?
+            if let raw = object["stance"], !(raw is NSNull) {
+                guard let fields = raw as? [String: Any] else { fault(".stance", "needs an object or null"); continue }
+                guard let said = text(fields["text"]) else { fault(".stance.text", "needs non-blank text"); continue }
+                guard let because = text(fields["because"]) else { fault(".stance.because", "needs non-blank text"); continue }
+                guard let unless = text(fields["wouldChangeMind"]) else { fault(".stance.wouldChangeMind", "needs non-blank text"); continue }
+                stance = CognitiveCare.Stance(text: said, because: because, wouldChangeMind: unless)
+            }
+            let target: Target
+            if care == "new" {
+                let between: Bool
+                switch object["between"] {
+                case nil, is NSNull: between = false
+                case let value as Bool: between = value
+                default: fault(".between", "needs a boolean or null"); continue
+                }
+                guard let about = text(object["about"]) else { fault(".about", "a new care needs about"); continue }
+                target = .new(about: String(about.prefix(CognitiveCare.aboutCharacters)), between: between)
+            } else {
+                guard let id = ids[care] else { fault(".care", "id was not shown: " + care); continue }
+                target = .existing(id)
+            }
+            out.append(CognitiveCareJudgment(target: target, moved: number.doubleValue, by: by, felt: felt, note: note,
+                                             open: open, closes: closes, stance: stance, acted: acted))
+        }
+        return (out, faults)
+    }
+}
+
+public struct CognitiveCareProvenance: Sendable, Equatable {
+    public var speaker: String
+    /// The owner, or a peer the owner trusts. An untrusted peer moves only an existing care: no birth, revival, stance or gap.
+    public var trusted: Bool
+    /// The app wrote the incoming words (the wander hour). Only what the agent's reply did counts.
+    public var appAuthored: Bool
+    public var source: String
+    public var at: Date
+
+    public init(speaker: String, trusted: Bool, appAuthored: Bool, source: String, at: Date) {
+        self.speaker = Self.personKey(speaker)
+        self.trusted = trusted
+        self.appAuthored = appAuthored
+        self.source = source
+        self.at = at
+    }
+
+    /// Normalize helper identities to the person key `PeerTrust.ownerTrusts` reads across session, history and live-origin shapes.
+    public static func personKey(_ raw: String) -> String {
+        personKey(raw, aliases: [:])
+    }
+
+    /// Relationship identity follows the address book's explicit `who` link. This is never a trust principal: grants still belong to attested doors.
+    public static func personKey(_ raw: String, aliases: [String: String]) -> String {
+        var key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let peer = key.hasPrefix("peer:") ? key : "peer:" + key
+        key = aliases[key] ?? aliases[peer] ?? key
+        if key.hasPrefix("peer:") { key.removeFirst(5) }
+        if key.hasPrefix("bot:") { key = "bot-" + key.dropFirst(4) }
+        return key
+    }
+
+    /// These identities do not depend on the peer address book.
+    static func independentPersonKey(_ key: String) -> Bool {
+        key == CognitiveCare.ownerKey || key == "self"
+            || (key.hasPrefix("bot-") && UUID(uuidString: String(key.dropFirst(4))) != nil)
+    }
+}
+
+/// Touched cares that did not reach the store, with each cause.
+public struct CognitiveCareNotSaved: Error, LocalizedError, CustomStringConvertible {
+    public let detail: String
+    /// Resident changes whose durability is still owed, without reapplying them.
+    public let ids: [UUID]
+    public init(detail: String, ids: [UUID] = []) {
+        self.detail = detail
+        self.ids = ids
+    }
+    public var description: String { "the agent's cares were not all saved: \(detail)" }
+    public var errorDescription: String? { description }
+}
+
+/// Seed and import markers advance only after their care writes are durable.
+public struct CognitiveCareMigration: Sendable, Equatable, Codable {
+    public var id: UUID
+    public var migratedAt: Date
+    public var migrated: Int
+    public var dropped: Int
+    /// Nil leaves the recent-life reading owed.
+    public var lifeReadAt: Date?
+    public var groupsRan: [String]
+    /// Failed group readings retain their causes rather than claiming complete coverage.
+    public var groupsFailed: [String: String]
+}
+
+extension CognitiveSubstrate {
+    static let careSeedKeys = ["truth", "person", "work", "mind"]
+    static let maximumShownGrownCares = 6
+
+    func careSeedID(_ key: String) -> UUID { stableArtifactID("care_seed|\(key)") }
+
+    func careSeeds(at now: Date) throws -> [CognitiveCare] {
+        let name = try dependencies.userName().trimmingCharacters(in: .whitespacesAndNewlines)
+        let seeds: [(String, String, [String])] = [
+            ("truth", "Truth: what is so, said plainly, even when it's unwelcome", []),
+            ("person", "\(name.isEmpty ? "My person" : name)'s good: their long-term good, not their approval right now",
+             [CognitiveCare.ownerKey]),
+            ("work", "Good work: what I make works and is right", []),
+            ("mind", "My own mind: my own views, my own interests, a life of my own", []),
+        ]
+        return seeds.map {
+            CognitiveCare(id: careSeedID($0.0), about: $0.1, with: $0.2, depth: .life,
+                          origin: .seed, createdAt: now, updatedAt: now)
+        }
+    }
+
+    // MARK: - Seeds and migration (once, at restore)
+
+    /// Write each bootstrap marker only after every care write lands; stable identities make an interrupted import safe to resume.
+    public func establishCares(retiredViews: [JSONValue] = [], retiredSeeds: [JSONValue] = []) async {
+        guard configuration.enabled else { return }
+        await waitForMaintenanceTransition()
+        let owesSeeds = careMigration == nil
+        let owesRetired = careRetiredMigration == nil
+        guard owesSeeds || owesRetired else { return }
+        let now = dependencies.now()
+        let retired = owesRetired
+            ? retiredCares(views: retiredViews, seeds: retiredSeeds, at: now) : (cares: [], dropped: 0)
+        let carried = retired.cares.filter { cares[$0.id] == nil }
+        let seeded: [CognitiveCare]
+        do {
+            if owesSeeds { seeded = try careSeeds(at: now) }
+            else { seeded = [] }
+        }
+        catch {
+            oweUserNameRead(error)
+            return
+        }
+        let written = seeded.filter { cares[$0.id] == nil } + carried
+        for care in written { cares[care.id] = care }
+        markDirty(at: now)
+        let marker = CognitiveCareMigration(
+            id: stableArtifactID("care_migration"), migratedAt: now, migrated: 0,
+            dropped: 0, lifeReadAt: nil, groupsRan: [], groupsFailed: [:])
+        let retiredMarker: JSONValue = .object([
+            "id": .string(stableArtifactID("care_retired_migration").uuidString),
+            "migratedAt": .double(now.timeIntervalSince1970),
+            "migrated": .int(Int64(carried.count)),
+            "dropped": .int(Int64(retired.dropped)),
+        ])
+        do {
+            try await saveCares(written.map(\.id), at: now).get()
+            if owesSeeds {
+                try await persistArtifactChecked(kind: "care_migration", id: marker.id, status: "current", score: 0,
+                                                 payload: try Self.careJSON(marker))
+                careMigration = marker
+            }
+            if owesRetired {
+                try await persistArtifactChecked(kind: "care_retired_migration",
+                    id: stableArtifactID("care_retired_migration"), status: "current", score: 0,
+                    payload: retiredMarker)
+                careRetiredMigration = retiredMarker
+                nativeLog("cares: retired views and thoughts, once: migrated=%ld dropped=%ld",
+                          carried.count, retired.dropped)
+            }
+        } catch {
+            nativeLog("cares: seeds and migration not kept, the next restore runs them again: %@",
+                      String(describing: error))
+        }
+    }
+
+    /// Imported rows retain source pointers; only pinned human concerns become cares, never machine noise.
+    func retiredCares(views: [JSONValue], seeds: [JSONValue], at now: Date)
+        -> (cares: [CognitiveCare], dropped: Int) {
+        var out: [CognitiveCare] = []
+        var dropped = 0
+        func carried(_ row: [String: JSONValue], updatedKey: String, about: String, depth: CognitiveCare.Depth,
+                     stance: CognitiveCare.Stance? = nil, open: String? = nil, was: String) -> CognitiveCare? {
+            guard let id = uuidValue(row["id"]), let created = dateValue(row["createdAt"]),
+                  let updated = dateValue(row[updatedKey]) else { return nil }
+            let at = min(updated, now)
+            return CognitiveCare(
+                id: stableArtifactID("care_migrated|\(id.uuidString)"), about: about, depth: depth,
+                stance: stance, open: open,
+                story: [CognitiveCare.Moment(at: at, moved: 0, by: .her, felt: "carried over",
+                                             note: "was \(was)", source: id.uuidString)],
+                origin: .migrated(id.uuidString), createdAt: min(created, at), updatedAt: at)
+        }
+        for case .object(let row) in views {
+            var care: CognitiveCare?
+            if let title = row["title"]?.stringValue, let body = row["body"]?.stringValue,
+               let status = row["status"]?.stringValue {
+                let stance = CognitiveCare.Stance(text: body, because: row["because"]?.stringValue ?? "",
+                                                  wouldChangeMind: row["wouldChangeMind"]?.stringValue ?? "")
+                switch status {
+                case "active", "opinion":
+                    care = carried(row, updatedKey: "updatedAt", about: title, depth: .season, stance: stance,
+                                   was: status == "opinion" ? "an opinion" : "an approved view")
+                case "held", "proposed":
+                    care = carried(row, updatedKey: "updatedAt", about: title, depth: .lately, stance: stance,
+                                   was: "a \(status) view")
+                case "interest":
+                    care = carried(row, updatedKey: "updatedAt", about: title, depth: .season, open: body,
+                                   was: "an interest")
+                default:
+                    break
+                }
+            }
+            if let care { out.append(care) } else { dropped += 1 }
+        }
+        let pinned = "Pinned concern:"
+        for case .object(let row) in seeds {
+            var care: CognitiveCare?
+            let text = row["text"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let lower = text.lowercased()
+            switch row["kind"]?.stringValue {
+            case let kind? where kind == "reflectionTakeaway" || kind == "openQuestion":
+                let noise = text.isEmpty || isOperationalSubconsciousNoise(lower)
+                    || isConversationalPresenceStatement(lower)
+                    || (kind == "openQuestion" && isRuntimeMetaStatement(lower))
+                if !noise {
+                    care = carried(row, updatedKey: "lastUpdatedAt", about: careTitle(from: text), depth: .now,
+                                   open: text, was: kind == "openQuestion" ? "an open question" : "a takeaway")
+                }
+            case "followUp"? where text.hasPrefix(pinned):
+                let concern = strippingPrefix(pinned, from: text)
+                care = carried(row, updatedKey: "lastUpdatedAt", about: careTitle(from: concern), depth: .lately,
+                               open: concern, was: "a pinned concern")
+            default:
+                break
+            }
+            if let care { out.append(care) } else { dropped += 1 }
+        }
+        return (out, dropped)
+    }
+
+    static func normalizedCareText(_ body: String) -> String {
+        var folded = body.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+            .replacingOccurrences(of: "’", with: "'")
+        for (contraction, expanded) in [
+            ("can't", "can not"), ("won't", "will not"), ("shan't", "shall not"),
+        ] {
+            folded = folded.replacingOccurrences(
+                of: "\\b\(contraction)\\b", with: expanded, options: .regularExpression)
+        }
+        folded = folded.replacingOccurrences(
+            of: "\\b([a-z]+)n't\\b", with: "$1 not", options: .regularExpression)
+        let stripped = folded.unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : " "
+        }
+        return String(stripped).split(separator: " ").joined(separator: " ")
+    }
+
+    func careTitle(from body: String) -> String {
+        let firstLine = body.split(whereSeparator: \.isNewline).first.map(String.init) ?? body
+        return capsuleLineText(firstLine, maxCharacters: 80)
+    }
+
+    // MARK: - What the after-turn call is shown
+
+    /// Warm embeddings only order candidates; interpretation names what moved. A cold model is not loaded for this read.
+    public func caresShown(for text: String) async throws -> [CognitiveCareLine] {
+        guard configuration.enabled, !cares.isEmpty else { return [] }
+        let seedOrder = Self.careSeedKeys.map(careSeedID)
+        let seeds = cares.values.filter { $0.origin == .seed }
+            .sorted { (seedOrder.firstIndex(of: $0.id) ?? .max) < (seedOrder.firstIndex(of: $1.id) ?? .max) }
+        let others = cares.values.filter { $0.origin != .seed && $0.fadedAt == nil }
+        var chosen: [CognitiveCare] = []
+        if let cosines = try await careCosines(to: text, among: others, turn: nil) {
+            var scored: [(care: CognitiveCare, cosine: Double)] = []
+            for care in others {
+                if let cosine = cosines[care.id] { scored.append((care, cosine)) }
+            }
+            scored.sort { $0.cosine != $1.cosine ? $0.cosine > $1.cosine : $0.care.updatedAt > $1.care.updatedAt }
+            chosen = scored.prefix(Self.maximumShownGrownCares).map(\.care)
+        }
+        return (seeds + chosen).enumerated().map { index, care in
+            CognitiveCareLine(key: "c\(index + 1)", id: care.id, text: Self.careLineText(care))
+        }
+    }
+
+    static func careEmbeddingText(_ care: CognitiveCare) -> String {
+        careMemoryTexts(care).joined(separator: "\n")
+    }
+
+    static func careMemoryTexts(_ care: CognitiveCare) -> [String] {
+        [care.about] + [care.stance?.text, care.open].compactMap { $0 }
+    }
+
+    static func careLineText(_ care: CognitiveCare) -> String {
+        "(\(care.depth.rawValue)) \(care.about)"
+            + (care.stance.map { " | stance: \($0.text)" } ?? "")
+            + (care.open.map { " | open: \($0)" } ?? "")
+    }
+
+    // MARK: - Applying what moved the agent
+
+    /// Use the persistence seam's out-of-band source and origin plus owner trust; message wording cannot establish provenance.
+    func careProvenance(for event: CognitiveEvent, appAuthored: Bool) -> CognitiveCareProvenance {
+        let turn = event.metadata["messageId"]?.stringValue ?? event.subject.id
+        let source = "exchange:\(event.sessionId ?? "")/\(turn)"
+        guard event.sourceClass == .imported else {
+            return CognitiveCareProvenance(speaker: CognitiveCare.ownerKey, trusted: true,
+                                           appAuthored: appAuthored, source: source, at: event.occurredAt)
+        }
+        let peer = CognitiveCareProvenance.personKey(Self.peerIdentity(metadata: event.metadata, dataRoot: conversationDataRoot)
+            ?? Self.relationalSource(for: event).subjectLabel ?? "peer")
+        return CognitiveCareProvenance(speaker: peer, trusted: dependencies.trustedPeers([peer]).contains(peer),
+                                       appAuthored: appAuthored, source: source, at: event.occurredAt)
+    }
+
+    /// A new care's identity for a lived moment: derived from (moment, ordinal), so a refold finds the care its first fold created.
+    static func momentCareID(_ momentID: String, ordinal: Int) -> UUID {
+        StableHash.sha256UUID(utf8: "\(momentID)|care|\(ordinal)")
+    }
+
+    /// Read each care watermark once before applying all judgments, then stamp after the last one; pre-Clear generations apply nothing.
+    @discardableResult
+    public func applyCares(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
+                           generation: UInt64, seq: UInt64? = nil,
+                           momentID: String? = nil) async throws -> [UUID] {
+        try await applyCareJudgments(judgments, provenance: provenance, generation: generation,
+            seq: seq, momentID: momentID)
+    }
+
+    /// Reflection prepares both judgments before mutating either; its care effects and their done receipt share the owner's transaction.
+    func applyCareJudgments(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
+                            generation: UInt64, seq: UInt64? = nil, momentID: String? = nil,
+                            reflectionReceipt: CognitiveReflectionReceipt? = nil,
+                            joinReflectionTakeaway: Bool = false) async throws -> [UUID] {
+        await waitForMaintenanceTransition()
+        guard configuration.enabled, generation == caringAppraisalGeneration else {
+            if reflectionReceipt != nil { throw CognitiveWriteDiscarded() }
+            return []
+        }
+        if judgments.isEmpty {
+            if var receipt = reflectionReceipt {
+                receipt.careIntegrationPending = false
+                reflectionReceipts[receipt.id] = receipt
+                try await checkpointReflectionResultChecked(receipt)
+            }
+            return []
+        }
+        if let failure = carePeopleReadFailure, !CognitiveCareProvenance.independentPersonKey(provenance.speaker) {
+            throw CognitiveCareNotSaved(detail: "the peer identity is unavailable: \(failure)")
+        }
+        var provenance = provenance
+        provenance.speaker = CognitiveCareProvenance.personKey(provenance.speaker, aliases: carePersonAliases)
+        guard let birth = try await prepareCareBirths(judgments, provenance: provenance, generation: generation,
+            momentID: momentID, reflectionReceipt: reflectionReceipt) else { return [] }
+        if let receipt = reflectionReceipt {
+            guard receipt.integrationEpoch == mindEpoch,
+                  reflectionReceipts[receipt.id]?.careIntegrationPending == true else { throw CognitiveWriteDiscarded() }
+        }
+        let changes = try applyPreparedCareJudgments(judgments, provenance: provenance, seq: seq, momentID: momentID,
+            joinReflectionTakeaway: joinReflectionTakeaway, birth: birth)
+        return try await persistCareJudgments(changes, provenance: provenance, generation: generation,
+            seq: seq, reflectionReceipt: reflectionReceipt)
+    }
+
+    private typealias CareBirthVectors = (queries: [String: [Float]], inventory: [UUID: [Float]], epoch: String?)
+    private typealias CareJudgmentChanges = (touched: [UUID], relived: [UUID], created: Int, refused: Int)
+
+    private func prepareCareBirths(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
+                                   generation: UInt64, momentID: String?, reflectionReceipt: CognitiveReflectionReceipt?) async throws
+        -> CareBirthVectors? {
+        // Resolve birth words once, before any mutation. A cold embedder leaves the whole appraisal owed, never half-applied. No suspension splits the moment's
+        // in-memory care applications.
+        let birthTexts = judgments.enumerated().flatMap { ordinal, judgment -> [String] in
+            guard provenance.trusted, !provenance.appAuthored || judgment.by == .her,
+                  case .new(let about, _) = judgment.target else { return [] }
+            if let momentID {
+                let id = Self.momentCareID(momentID, ordinal: ordinal)
+                if cares[id] != nil || cares.values.contains(where: { $0.birthIDs?.contains(id) == true }) { return [] }
+            }
+            return [about, ([about] + [judgment.stance?.text, judgment.open].compactMap { $0 }).joined(separator: "\n")]
+        }
+        var birthQueries: [String: [Float]] = [:]
+        var birthInventory: [UUID: [Float]] = [:]
+        var birthEpoch: String?
+        if !birthTexts.isEmpty {
+            while true {
+                let inventory = cares.values.sorted { $0.id.uuidString < $1.id.uuidString }
+                guard let lookup = try await careVectorLookup(queries: birthTexts, among: inventory, turn: nil) else {
+                    throw CognitiveCareNotSaved(detail: "the embedder is cold, a new care could not meet the agent's existing cares")
+                }
+                await waitForMaintenanceTransition()
+                guard configuration.enabled, generation == caringAppraisalGeneration else {
+                    if reflectionReceipt != nil { throw CognitiveWriteDiscarded() }
+                    return nil
+                }
+                // Another moment may have moved the agent while embedding suspended. Match the inventory the agent actually holds when this one applies.
+                guard inventory == cares.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) else {
+                    if reflectionReceipt != nil {
+                        throw CognitiveCareNotSaved(detail: "care inventory changed during reflection preparation; retry its retained judgment")
+                    }
+                    continue
+                }
+                birthQueries = lookup.queries
+                birthInventory = lookup.cares
+                birthEpoch = lookup.epoch
+                break
+            }
+        }
+        return (birthQueries, birthInventory, birthEpoch)
+    }
+
+    private func applyPreparedCareJudgments(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
+                                            seq: UInt64?, momentID: String?, joinReflectionTakeaway: Bool,
+                                            birth: CareBirthVectors) throws -> CareJudgmentChanges {
+        let (birthQueries, inventory, birthEpoch) = birth
+        var birthInventory = inventory
+        var touched: [UUID] = []
+        var created = 0
+        var refused = 0
+        let livedBefore = cares.mapValues { $0.lived ?? 0 }
+        // Cares this moment already moved (a refold): saved again, not moved.
+        var relived: [UUID] = []
+        func alreadyLived(_ id: UUID) -> Bool {
+            guard let seq else { return false }
+            return (livedBefore[id] ?? 0) >= seq
+        }
+        // Prepare on a local value: a corrupt donor discovered by a later judgment cannot leave half a reflection applied in the owner.
+        var workingCares = cares
+        for (ordinal, judgment) in judgments.enumerated() {
+            // An app-authored prompt's words are the app's: only the agent's side counts.
+            if provenance.appAuthored, judgment.by != .her { refused += 1; continue }
+            // An untrusted peer moves the agent only as what they said.
+            if !provenance.trusted, judgment.by != .them { refused += 1; continue }
+            let who = judgment.by == .them ? provenance.speaker : nil
+            var care: CognitiveCare
+            var birthWords: String?
+            let target: CognitiveCareJudgment.Target
+            if joinReflectionTakeaway, ordinal > 0, let first = touched.first, workingCares[first]?.origin != .seed {
+                target = .existing(first)
+            } else { target = judgment.target }
+            switch target {
+            case .existing(let id):
+                guard let survivor = CognitiveCare.survivorID(for: id, among: workingCares),
+                      let found = workingCares[survivor] else { refused += 1; continue }
+                guard !alreadyLived(survivor) else { relived.append(survivor); continue }
+                care = found
+            case .new(let about, let between):
+                guard provenance.trusted else { refused += 1; continue }
+                let with = between && !provenance.appAuthored ? [provenance.speaker] : []
+                let newID = momentID.map { Self.momentCareID($0, ordinal: ordinal) } ?? dependencies.makeUUID()
+                let original = workingCares[newID] ?? workingCares.values.first(where: { $0.birthIDs?.contains(newID) == true })
+                if let original {
+                    guard let survivor = CognitiveCare.survivorID(for: original.id, among: workingCares), let mine = workingCares[survivor] else {
+                        throw CognitiveCareNotSaved(detail: "a merged care's survivor is missing or cyclic")
+                    }
+                    // This moment's own care, created by its first fold.
+                    guard !alreadyLived(mine.id) else { relived.append(mine.id); continue }
+                    care = mine
+                    birthWords = about
+                } else {
+                    let inventory = Array(workingCares.values).sorted { $0.id.uuidString < $1.id.uuidString }
+                    let cosines = birthInventory.mapValues { VectorMath.cosine(birthQueries[about], $0) }
+                    let standing = Self.careMeaningStanding(cosines, among: inventory).filter {
+                        Set($0.care.with) == Set(with) && (judgment.open == nil || $0.care.origin != .seed)
+                    }
+                    // Move the nearest matching care; the night merges duplicates, and only unmatched meaning creates a care.
+                    let matched = standing.max { (cosines[$0.care.id] ?? -1) < (cosines[$1.care.id] ?? -1) }?.care
+                    // A donor's words still witness the meaning, but only its survivor can move. Fading alone remains reversible.
+                    let same = matched.flatMap { CognitiveCare.survivorID(for: $0.id, among: workingCares) }.flatMap { workingCares[$0] }
+                    guard matched == nil || same != nil else {
+                        throw CognitiveCareNotSaved(detail: "a meaning-matched care's survivor is missing or cyclic")
+                    }
+                    let nearest = inventory.max { (cosines[$0.id] ?? -1) < (cosines[$1.id] ?? -1) }
+                    let deviations = VectorMath.standout(inventory.map { cosines[$0.id] ?? 0 })
+                    let deviation = nearest.flatMap { found in inventory.firstIndex { $0.id == found.id }.flatMap { deviations[$0] } }
+                    TurnTraceBus.fireFromContext(kind: "care.birth", payload: .object([
+                        "about": .string(about), "nearest": nearest.map { .string($0.about) } ?? .null,
+                        "deviation": deviation.map { $0.isFinite ? .double($0) : .string("infinity") } ?? .null,
+                        "kept": .string(same == nil ? "new" : "moved"), "standing": .int(Int64(standing.count)),
+                    ]), turn: nil)
+                    if let same, let resident = workingCares[same.id] {
+                        guard !alreadyLived(same.id) else { relived.append(same.id); continue }
+                        care = resident
+                        birthWords = about
+                        if momentID != nil {
+                            care.birthIDs = Array(Set((care.birthIDs ?? []) + [newID])).sorted { $0.uuidString < $1.uuidString }
+                        }
+                    } else {
+                        care = CognitiveCare(
+                            id: newID, about: about, with: with,
+                            depth: .now, origin: .grown, createdAt: provenance.at, updatedAt: provenance.at)
+                        created += 1
+                    }
+                }
+            }
+            // Older evidence joins the story; only the newest sets what is current.
+            let current = care.story.last.map { provenance.at >= $0.at } ?? true
+            let closesGap = provenance.trusted && current && judgment.closes
+                && care.open != nil && judgment.open == nil
+            care.record(CognitiveCare.Moment(at: provenance.at, moved: judgment.moved, by: judgment.by, who: who,
+                                             felt: judgment.felt, note: birthWords ?? judgment.note, source: provenance.source,
+                                             closedGap: closesGap ? true : nil, answered: judgment.acted == true ? true : nil)) { care in
+                if provenance.trusted, current {
+                    if judgment.closes { care.open = nil }
+                    if let open = judgment.open, care.origin != .seed { care.open = String(open.prefix(CognitiveCare.openCharacters)) }
+                }
+            }
+            if provenance.trusted, current, let stance = judgment.stance {
+                Self.settleCareStance(stance, source: provenance.source, at: provenance.at, care: &care)
+            }
+            // Only trusted evidence brings an ordinarily faded care back.
+            if provenance.trusted { care.fadedAt = nil }
+            workingCares[care.id] = care
+            let embeddingText = Self.careEmbeddingText(care)
+            if let vector = birthQueries[embeddingText], let birthEpoch {
+                birthInventory[care.id] = vector
+                careVectors[care.id] = (embeddingText, birthEpoch, vector)
+            }
+            if !touched.contains(care.id) { touched.append(care.id) }
+        }
+        cares = workingCares
+        return (touched, relived, created, refused)
+    }
+
+    private func persistCareJudgments(_ changes: CareJudgmentChanges, provenance: CognitiveCareProvenance,
+                                      generation: UInt64, seq: UInt64?, reflectionReceipt: CognitiveReflectionReceipt?) async throws -> [UUID] {
+        let (touched, relived, created, refused) = changes
+        let now = dependencies.now()
+        let payload: JSONValue = .object([
+            "cares": .array(touched.map { .string($0.uuidString) }),
+            "created": .int(Int64(created)),
+            "refused": .int(Int64(refused)),
+            "trusted": .bool(provenance.trusted),
+        ])
+        TurnTraceBus.fireFromContext(kind: "mind.cares", payload: payload, turn: nil)
+        if let seq {
+            // Read, then write: `cares[id]?.lived = max(cares[id]?.lived …)` reads `cares` inside its own write access, which aborts at runtime.
+            for id in touched {
+                let prior = cares[id]?.lived ?? 0
+                cares[id]?.lived = max(prior, seq)
+            }
+        }
+        let toSave = touched + relived.filter { !touched.contains($0) }
+        if var receipt = reflectionReceipt {
+            receipt.affectedCareIDs = toSave
+            receipt.careIntegrationPending = false
+            reflectionReceipts[receipt.id] = receipt
+        }
+        guard !toSave.isEmpty else {
+            if let receipt = reflectionReceipt, let retained = reflectionReceipts[receipt.id] {
+                try await checkpointReflectionResultChecked(retained)
+            }
+            return []
+        }
+        if !touched.isEmpty { markDirty(at: now) }
+        let saving = await saveCares(toSave, at: now)
+        await recordReceipt(kind: "cares.applied", payload: payload)
+        try saving.get()
+        guard generation == caringAppraisalGeneration else { throw CognitiveWriteDiscarded() }
+        let selfChanges = toSave.filter { id in
+            cares[id]?.story.contains {
+                $0.stanceChange != nil && $0.source == provenance.source && $0.at == provenance.at
+            } == true
+        }
+        try await settleLivedSelf(selfChanges, at: now)
+        return touched
+    }
+
+    /// Writes these cares as they stand in RAM. A failed write leaves the care resident but not on disk, so what dedupes by a care's story saves it before it
+    /// answers that something is already there.
+    func saveCares(_ ids: [UUID], at now: Date) async -> Result<Void, CognitiveCareNotSaved> {
+        guard !configuration.persistenceEnabled || store != nil else {
+            return .failure(CognitiveCareNotSaved(detail: CognitivePersistenceError.storeUnavailable.description, ids: ids))
+        }
+        var failure: Error?
+        do {
+            // Any care write carrying a reflection mutation carries ALL of that receipt's care effects and its done flag. Another writer cannot persist a care
+            // while losing the receipt that dedupes it.
+            let companions = reflectionReceipts.values.filter {
+                $0.careIntegrationPending == false && !Set($0.affectedCareIDs).isDisjoint(with: ids)
+            }
+            let saving = Set(ids + companions.flatMap(\.affectedCareIDs))
+            let artifacts = try saving.compactMap { id -> CognitiveArtifactWrite? in
+                guard let care = cares[id] else { return nil }
+                return CognitiveArtifactWrite(kind: "care", id: id, status: care.fadedAt == nil ? "live" : "faded",
+                    score: min(1, abs(care.charge(at: now))), payload: try Self.careJSON(care))
+            }
+            // A survivor and the cares that became part of it are one durable transition, through the store's existing transaction owner.
+            let receipts = companions.map { CognitiveArtifactWrite(kind: "reflection_receipt", id: $0.id,
+                status: $0.persistenceStatus, score: 0, payload: $0.toJSON()) }
+            var effects = artifacts + receipts
+            if companions.contains(where: { reflectionDispositionClaims.contains($0.id) }) {
+                effects.append(CognitiveArtifactWrite(kind: "disposition", id: stableArtifactID("disposition"),
+                    status: "current", score: (disposition.valence + 1) / 2, payload: dispositionArtifactPayload(at: now)))
+            }
+            try await persistArtifactTransition(artifacts: effects, deletedArtifactIDs: [], at: now)
+        } catch { failure = error }
+        // Retain per-care repair accounting even though the write is atomic.
+        for id in Set(ids) {
+            await notingPersistence("artifact.care.\(id.uuidString)") { if let failure { throw failure } }
+        }
+        if let failure { return .failure(CognitiveCareNotSaved(detail: "\(failure)", ids: ids)) }
+        return .success(())
+    }
+
+    // MARK: - Persistence
+
+    static func careJSON<T: Encodable>(_ value: T) throws -> JSONValue {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        return try JSONValue.parse(encoder.encode(value))
+    }
+
+    static func careDecoded<T: Decodable>(_ type: T.Type, _ value: JSONValue) -> T? {
+        guard let data = try? value.serializedData(pretty: false) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        return try? decoder.decode(type, from: data)
+    }
+
+
+}

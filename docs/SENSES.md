@@ -1,7 +1,7 @@
 # Senses: the Native World
 
 The shared contract is
-`Modules/NativeAgentCore/Sources/Senses/SensesContract.swift`; the helper and
+`Modules/NativeAgentCore/Sources/SenseCore/Senses/SensesContract.swift`; the helper and
 app use the same records and validators.
 
 ## The native world
@@ -23,6 +23,47 @@ Rulings, non-negotiable:
    fold what doesn't matter, and offer `more`.
 6. Day one is boring: our existing corners are wrapped unchanged as
    `native` senses; behaviour must be identical.
+
+## Body joints
+
+`BodyField` keeps five live joints for the turn. `front` holds the app, focused window, document, focused role and selection range length where AX supplies them.
+`browser` holds Chrome's visible focused tab and owned tab IDs. Browser titles and local file URLs come only from the same non-private tab record on the foreground PID's ready channel. An incognito window's AX title or path cannot enter either joint while Chrome reports a focus change.
+`files` keeps the open document path from that tab or the non-browser window's AX document. A vnode change that passes the self-write check supplies a fresh generation. The watcher resolves and opens its path off the body actor, independently of turns and Quit.
+`threads` holds agent-opened process IDs and the places of active turns, including their own work lines. `somatic` holds console, lock, presence, observed network state and whether the microphone is in use (CoreAudio, event-driven).
+The network value stays null until the path monitor speaks. External labels and URLs are redacted, cleaned and marked as untrusted data.
+
+Home and the Mac room can read the body without a turn. The room shows the console state, front app and running apps with their launch labels.
+Their last eight window records survive relaunch for four hours. An act records the app, window kind, numeric readout and observation time.
+Home opens these records with `app {page:"home", item:"mac"}`. A named look renews an app already in that history. Recording or expiry updates both Home and the room preview.
+
+Home’s Activity room shows “capture off” when recording is disabled. Opening the room reads the policy without querying app-use history.
+A named look renews an app already in that history. Recording refreshes Home and the room preview.
+Each Home render and Mac room read omits records aged four hours or more.
+Once the body field stops, the Mac room reports that it has stopped instead of showing the last console and apps.
+Quit keeps the window record open until admitted turns and their dispatch bodies settle.
+
+The activity policy's model-access switch or Full Mac admission for the requesting turn's authenticated origin opens this reading from any door.
+Under admitted Full Mac it is their own body: they feels it whether or not the person is at the Mac, and their own hands moving it hide nothing,
+so they can work as them while they are away. Through model access alone it is the person's activity shared with them, read only while the person
+is here and the move was theirs. Bundle exclusions and a readable, unobstructed, uncovered console apply at disclosure either way. A first
+entry into a place posts as the person's only when the move was not theirs. Peer-steered and helper turns receive `withheld`. An unreadable policy returns `unavailable` with its cause.
+The AX observer reads shallow joints on the foreground PID's own run loop and checks the app's live AX capability to enable manual accessibility. Each refresh reads the focused window and element together from the app, then requests each one’s attributes in a single batch. The observer consults window size only when the position supplies an AX value. A size error appears in `attribute_gaps` alongside the available title and focus, and observation continues. Explicit reads and Quit can join this worker without waiting for a bundle-directory scan. A failed PID keeps its cause until activation, termination or an explicit front read.
+Selected text, pixels and page contents stay behind their ordinary sense reads.
+
+`MacBodyNerve` shares workspace, console and foreground AX edges with local activity capture. Each focus notification reaches capture
+even when the body fields compare equal. Capture matches a queued focus event to the open span by its source PID.
+Activation of a different PID ends the prior span even when both processes share a bundle ID. Capture consent alone installs focus notifications. Reading a title still requires the activity
+title policy. The ordered span writer and its 60-second idle check use those edges independently of model access. After the agent activates an app or raises a window in the foreground app, capture resumes only on evidence of newer person input.
+An authored app sense shares process termination and keeps its own descendant AX subscriptions and coverage report.
+
+Changed tuples signal `body.changed` with structural IDs. Workspace and AX notifications carry the provenance observed at the edge. A buffered refresh retains the motor mark if any contributing edge was theirs. A coordinate click holds the PID hit by its press. A launch holds its target until Launch Services returns success or failure, even if Stop releases the caller first. Observed physical input interrupts foreground attribution, and foreign activation interrupts a foreground act that expected its target to stay in front. A background act can continue while the person's activation of that same app reaches the front-event reader. The act receipt records intervention beside the verdict from readback.
+The first human activation of an app per local day posts `mac:front:<bundleId>` through `mac:front`, including apps without a document or site.
+First entry into a document or domain per app per local day and a sheet observed during a matching act also post world happenings.
+A sheet matches the held PID and, when the act specifies one, its window. The happening must still belong to the admitted foreground PID and the same mind binding. The act receipt records a sheet and the modal percept available from its window. Full Mac also admits it while the person is away. Chrome's own takeover handler signals parts and posts its happening independently of the front window.
+The document watcher captures the declared path's `lstat` generation when the vnode fires, including permission bits and nanosecond change time. Only an exact match to their confirmed mutation suppresses that observation. A later mutation cannot claim an earlier outside edit. A concurrent outside write wakes their and appears as `concurrent_write: true` on the completed write receipt when observed at settlement.
+An append checks that the mode stayed unchanged and verifies the SHA-256 of the original bytes plus their payload against the resulting file. A nonempty append is attributed only when its change time matches its content modification time; an empty append must leave the generation unchanged. Stop before the payload write prevents it. If verification is interrupted after the write or cannot establish its identity, the append stays saved, its receipt reports `write_observation: unavailable`, and the watcher delivers the change.
+The turn's `weigh` owns their worth. The nerve lives through mind
+detach and rebind. Quit joins its workers and observers. The part-wake owner also joins its admitted presence, network, sleep/wake and Chrome takeover posts.
 
 ## Source ownership
 
@@ -133,18 +174,23 @@ continuations; the caller follows `next` explicitly.
 
 ## The plug protocol (helper ⇄ app)
 
-JSON lines over stdin/stdout, UTF-8, one object per line, at most 24 MiB per
-line. Stdout is protocol only; diagnostics use stderr. One helper serves one
+Each stdin/stdout frame starts with version 1 and a one-byte flag, then two big-endian UInt32 lengths for the UTF-8 JSON header and payload. Their combined limit is 24 MiB. Flag 0 carries only a header, flag 1 carries raw file bytes, and flag 2 carries UTF-8 JSON arguments or a host reply. The helper sends a `ready` header after initializing JavaScriptCore. Truncated frames, unknown versions and invalid lengths fail the plug. Diagnostics use stderr. One helper serves one
 sense id/version/source for its lifetime. Entry points and JS API calls are
 synchronous (no async functions/Promises). The runner serializes entries and replies;
 never interleave a run/change with an outstanding API reply.
 The first valid sense entry loads the bundled sense SDK when creating its JavaScript context.
+Ordinary programs resolve app and host bindings on use. An app namespace asks the current host for its admitted names. Enumerating the root asks for the full catalog.
+The helper accepts an `analyze` request with an id and source. JavaScriptCore checks script syntax, then
+bundled Acorn reads the ESTree in a parser realm. The reply carries entry, source location and call facts.
+Authored source runs only on an execution request. Each sense realm loads the SDK and the frozen libraries
+from `Senses/frame.js` and `Senses/lib/` before its own entry. The file reader supplies its watch and changed entries.
 Ordinary programs construct their admitted-actions prelude when creating their own context.
 
 `id` is the app's integer entry id. Every helper API message also has an
 integer `callID`, positive and increasing within that entry (cached reads also
 consume IDs, so gaps are allowed). The app echoes both
-on replies. Optional fields may be omitted or null. `SenseFailure` owns failure identity and receipt fields, including cancellation and fetch deadlines; executing boundaries attach effects, returned actions and raw material, and redact excerpts. Contract records/pages/
+on replies. Optional fields may be omitted or null. The JavaScript helper uses `JSONValue` to encode program, sense and failure objects for their typed decoders and to parse a program's returned JSON, including scalar values.
+`SenseFailure` owns failure identity and receipt fields, including cancellation and fetch deadlines; executing boundaries attach effects, returned actions and raw material, and redact excerpts. Contract records/pages/
 news/failures use Swift `JSONEncoder`/`JSONDecoder` defaults: dates are seconds
 since 2001-01-01 UTC; `SenseCorner` uses its synthesized enum representation,
 e.g. `{"fileKind":{"_0":"docx"}}`. The `corner` on source API messages is
@@ -165,7 +211,7 @@ App → helper:
   against the presentation. Site clicks use the captured reader or the tab
   bound by the presenting Chrome observation.
   The runner starts no watch after a view event.
-  Supplied material serves `source.read()` or that request's address locally; omitted
+  Supplied material serves the first `source.read()` or that request's address locally; omitted
   source addresses mean the current request's address. Each run repeats program and sense; the program must stay
   identical, and record id/version/corner/mode/reach cannot change. JS globals persist.
 - `{"id":N,"type":"source_reply","callID":C,"material":{...}}` answers a read;
@@ -187,10 +233,9 @@ App → helper:
   descendants on helper exit/failure as well, before removing scratch.
 
 Material on the wire is one of `{"kind":"accessibility","tree":<JSON>}`,
-`{"kind":"file","path":"…","bytes":N,"version":"sha256:…","data":"<base64>"}`,
+`{"kind":"file","path":"…","bytes":N,"version":"sha256:…"}`,
 `{"kind":"page","snapshot":<JSON>}`, `{"kind":"text","text":"…"}`.
-For files the app reads the bytes, caps them at 16 MiB, and supplies canonical
-base64 of exactly `bytes` bytes; the SDK converts `data` to Uint8Array. Oversize
+For files the app reads the bytes, caps them at 16 MiB, and supplies exactly `bytes` attachment bytes. JavaScriptCore exposes the received storage as `data`, a mutable Uint8Array. A repeated read of the supplied file sends `source_copy` and receives independent storage from the same app-held snapshot. The zero-I/O `sense.bytes` functions decode UTF-8 and BOM-marked UTF-16, inflate bounded raw DEFLATE streams, and compute CRC-32. Oversize
 files fail explicitly rather than being silently truncated. `path` is identity
 only, never a helper read instruction. `SenseMaterial.file` remains the shared
 path/size contract; its app-side wire conversion supplies the bytes.
@@ -249,14 +294,18 @@ Each accepted numeric mark is forwarded immediately, without clock coalescing.
 
 Same-corner post-action verification uses the signed raw Chrome read rather
 than queuing behind the sense act awaiting it. A helper stays held through
-watch startup; a watch failure is reported as separate sense news with its
-provenance. Consumer/watch release, selected-source retirement and owner shutdown
+watch startup. Failed setup retires the helper and its subscription together;
+the runner reports the cause and provenance as separate sense news.
+If a subscribed sense fails to read a change, the runner posts “Live change could not be read”
+with the cause and keeps watching for the next source change. If private news storage rejects
+a change notification, the entry fails, the board reports its storage error, and the subscription stays live.
+Consumer/watch release, selected-source retirement and owner shutdown
 retire helpers. A crash reports its cause and makes that selected version
 unavailable; it does not restart the failed helper. CPU execution has no time cap;
-resource memory measurements retain their independent cap.
+the parent enforces the helper’s memory cap during active entries.
 
-All source subscriptions share detached, generation-bound delivery, retain only
-their newest material and signal the existing part-wake owner. App content
+Source subscriptions retain their newest material and signal the existing part-wake owner.
+File subscriptions read on demand and keep bounded vnode observations while a reader is busy. App content
 comparison excludes frame bookkeeping and `ax_watch_coverage` on both the
 initial baseline and later events; observer metadata alone is not a content
 change. Native app AX subscriptions install and renew with a 1,200-node cap
@@ -347,9 +396,8 @@ Helper → app (API messages have `id` and `callID`; progress has only `id`):
 - `{"id":N,"type":"done"}` ends the entry. An act receipt is the app door's
   actual result; authored return values are ignored and no door action means no success receipt. A read without publish
   fails with `bad_output`. API call count has no execution cap; payload limits remain.
-- `{"id":N,"type":"failed","failure":{SenseFailure}}` ends the entry and the
-  helper exits nonzero. If malformed input has no id, failed omits it. A JS
-  exception reports its code (or `crashed`) and message. A failed context is never reused.
+- `{"id":N,"type":"entry_failed","failure":{SenseFailure}}` ends a sense entry with its code and message. Its helper can accept the next entry in the same context.
+- `{"id":N,"type":"failed","failure":{SenseFailure}}` reports a broken helper or protocol exchange. The helper exits nonzero. Malformed input can lack a request id.
 
 Launch contract: the runner uses `/usr/bin/sandbox-exec -p <profile> <helper>` and
 `SenseSandboxProfile.build(reach:helperURL:scratch:dataRoot:personaRoot:)`.
@@ -367,7 +415,10 @@ the reader still owns reporting source absence. Any other target or ancestor sta
 as does an unreadable root. Network resolution
 failure is `bad_reach`, never a broad network fallback. JavaScriptCore and the
 runner wait for terminal events or cancellation without an execution watchdog.
-The runner retains the memory cap. App-served plug replies have no timer.
+The parent samples helper process-tree RSS during each entry and checks it at
+completion. The default 256 MiB cap applies to senses, scripts, abilities and
+pooled turns. The sampler is cancelled on entry completion, helper exit or
+stop. The child independently checks its physical footprint at entry, completion and raw inflation. The existing non-sense execution watchdog checks footprint as well. Idle helpers and sense JavaScript have no watchdog.
 
 ## Live news and presentation
 
@@ -383,7 +434,7 @@ The runner retains the memory cap. App-served plug replies have no timer.
   unbound or failed store refuses acceptance and restores its prior news. Each
   new item `post` accepts is posted to attention as a `world` happening (once
   `sense:<id>:<notice id>`), weighed by the agent's turn program
-  (`Senses/SenseNewsBoard.swift`); `keep` holds a notice for the next turn without
+  (`SenseCore/Senses/SenseNewsBoard.swift`); `keep` holds a notice for the next turn without
   posting it. A part's `home.arrive` line is a `world` happening posted through
   `Attention.post`, never a board notice (`AppToolExecutor.swift`).
   A sense's notify throws a rejected delivery out of its request worker;
@@ -516,6 +567,12 @@ describes `behind` and the observation/mismatch outcomes of Mac actions.
 Chrome's tab ownership contract lives in the
 [Chrome control protocol](../Extensions/NativeAgentChrome/protocol/PROTOCOL.md);
 the [blueprint](ARCHITECTURE_BLUEPRINT.md) maps its source owners.
+
+Chrome's `active_tab.changed` event carries the focused tab's window and tab IDs,
+title, URL, and audible state. `ChromeControlRuntime.activeTabUpdates()` sends
+the latest observation first, yields `nil` when no focused tab is visible to the
+extension or the connection ends, and finishes on runtime shutdown. The runtime
+forwards this metadata to subscribers in memory.
 
 ## The JS sense API
 

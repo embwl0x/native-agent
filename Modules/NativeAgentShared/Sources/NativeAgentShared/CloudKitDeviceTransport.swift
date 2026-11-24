@@ -1,8 +1,7 @@
 
+import Synchronization
 import Foundation
 import CryptoKit
-
-#if canImport(CloudKit) && !os(Linux)
 import CloudKit
 import OSLog
 // Blueprint: | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport`: checked account, push and cursor ownership |
@@ -40,22 +39,26 @@ func withDeviceCKOperation<T: Sendable>(
 
 /// Thread-safe accumulator for the retention sweep's recordMatchedBlock. Holds record NAMES (not `CKRecord.ID`s) so the page crosses the continuation
 /// as a plain Sendable value; the delete op rebuilds the ids in the default zone, which is the zone every send writes into.
-final class DeviceCKRecordNameHolder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var names: [String] = []
+final class DeviceCKRecordNameHolder: Sendable {
+    private struct State {
+        var names: [String] = []
+        var fetched = 0
+        var failure: Error?
+    }
+    private let state = Mutex(State())
     // Backlog means a full fetched page, regardless of how many records expired.
-    private var fetched = 0
-    private var failure: Error?
-    func noteFetched() { lock.lock(); fetched += 1; lock.unlock() }
-    func add(_ name: String) { lock.lock(); names.append(name); lock.unlock() }
+    func noteFetched() { state.withLock { $0.fetched += 1 } }
+    func add(_ name: String) { state.withLock { $0.names.append(name) } }
     func fail(_ error: Error) {
-        lock.lock(); defer { lock.unlock() }
-        if failure == nil { failure = error }
+        state.withLock { state in
+            if state.failure == nil { state.failure = error }
+        }
     }
     func snapshot() throws -> (names: [String], fetched: Int) {
-        lock.lock(); defer { lock.unlock() }
-        if let failure { throw failure }
-        return (names, fetched)
+        return try state.withLock { state in
+            if let error = state.failure { throw error }
+            return (state.names, state.fetched)
+        }
     }
 }
 
@@ -72,28 +75,33 @@ struct DeviceCKSweepOutcome {
 }
 
 /// Thread-safe per-page accumulator for pull's recordMatchedBlock. The CK callback runs on CloudKit's own queue, so the holder locks its own appends.
-final class DeviceCKPullPageHolder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var items: [NAChatMessageFields] = []
-    private var modificationDates: [String: Date?] = [:]
-    private var firstError: Error?
-    private var payloadError: DeviceSyncError?
-    func add(_ r: NAChatMessageFields) { lock.lock(); items.append(r); lock.unlock() }
+final class DeviceCKPullPageHolder: Sendable {
+    private struct State {
+        var items: [NAChatMessageFields] = []
+        var modificationDates: [String: Date?] = [:]
+        var firstError: Error?
+        var payloadError: DeviceSyncError?
+    }
+    private let state = Mutex(State())
+    func add(_ r: NAChatMessageFields) { state.withLock { $0.items.append(r) } }
     func noteModificationDate(_ id: String, _ date: Date?) {
-        lock.lock(); modificationDates.updateValue(date, forKey: id); lock.unlock()
+        state.withLock { _ = $0.modificationDates.updateValue(date, forKey: id) }
     }
     func fail(_ error: Error) {
-        lock.lock(); defer { lock.unlock() }
-        if firstError == nil { firstError = error }
+        state.withLock { state in
+            if state.firstError == nil { state.firstError = error }
+        }
     }
     func failPayload(_ error: DeviceSyncError) {
-        lock.lock(); defer { lock.unlock() }
-        if payloadError == nil { payloadError = error }
+        state.withLock { state in
+            if state.payloadError == nil { state.payloadError = error }
+        }
     }
     func snapshot() throws -> (records: [(fields: NAChatMessageFields, modDate: Date?)], payloadError: DeviceSyncError?, modificationDates: [Date?]) {
-        lock.lock(); defer { lock.unlock() }
-        if let firstError { throw firstError }
-        return (items.map { ($0, modificationDates[$0.recordName] ?? nil) }, payloadError, Array(modificationDates.values))
+        return try state.withLock { state in
+            if let error = state.firstError { throw error }
+            return (state.items.map { ($0, state.modificationDates[$0.recordName] ?? nil) }, state.payloadError, Array(state.modificationDates.values))
+        }
     }
 }
 
@@ -104,55 +112,46 @@ struct DeviceCKPullResult: Sendable {
 
 // MARK: - CloudKitDeviceTransport
 
-/// CloudKit-backed device transport. `@unchecked Sendable` with an internal NSLock for mutable state (handlers + last-pull cursor + seen ids).
-public final class CloudKitDeviceTransport: @unchecked Sendable {
+public final class CloudKitDeviceTransport: Sendable {
     public let role: NADeviceRole
     public let containerIdentifier: String
 
-    let lock = NSLock()
-    private var incomingHandler: (@Sendable (BridgeMessage) async -> Bool)?
-    var controlAdmission: (@Sendable (BridgeMessage) async -> Bool)?
-    var controlDrainInFlight = false
-    private var pairingHandler: (@Sendable (Data) async -> Bool)?
-    var statusWrites: [String: Task<Void, Never>] = [:]
-    var pendingStatusWrites: [String: (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)] = [:]
-    private var statusHandlers: [String: DeviceStatusObserver] = [:]
-    private var lastPullDate: Date?
-    private var lastPullCursorPersistenceAt: Date?
-    // One drain owns claims and cursor advancement; event callers queue another pass, while periodic callers can skip a busy slot without extending
-    // it.
-    var drainInFlight = false
-    var drainAgain = false
-    // Status delivery is serialized so an older handler cannot overwrite a newer value.
-    var statusDrainInFlight = false
-    var statusDrainAgain = false
-    // LWW/dedup cursors per (pairing, peer role, key). We only re-dispatch when the server modificationDate advances, so a redraw triggered by a
-    // redundant push does not re-fire the same value.
-    private var lastStatusModDates: [String: Date] = [:]
-    // Retention cadence is in-memory; a relaunch permits another sweep.
-    var lastRetentionSweepAt: Date?
-    // A full query page signals backlog and shortens the next sweep interval.
-    var retentionBacklog = false
-    private var seenMessageIDs: Set<String> = []
-    private var seenMessageIDsOrdered: [String] = []
+    struct State {
+        var incomingHandler: (@Sendable (BridgeMessage) async -> Bool)?
+        var controlAdmission: (@Sendable (BridgeMessage) async -> Bool)?
+        var controlDrainInFlight = false
+        var pairingHandler: (@Sendable (Data, Date?) async -> Bool)?
+        var statusWrites: [String: Task<Void, Never>] = [:]
+        var pendingStatusWrites: [String: (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)] = [:]
+        var statusHandlers: [String: DeviceStatusObserver] = [:]
+        var lastPullDate: Date?
+        var lastPullCursorPersistenceAt: Date?
+        var drainInFlight = false
+        var drainAgain = false
+        var statusDrainInFlight = false
+        var statusDrainAgain = false
+        var statusAcknowledgements: [String: (date: Date, changeTag: String?)] = [:]
+        var lastRetentionSweepAt: Date?
+        var retentionBacklog = false
+        var seenMessageIDs: Set<String> = []
+        var seenMessageIDsOrdered: [String] = []
+        var bellEntries: [DeviceBellEntry] = []
+        var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
+        var assetSecretProvider: (@Sendable () async -> Data?)?
+        var pairingClaim: PairingClaim = .unread
+        var pairingPublications: UInt64 = 0
+    }
+    let state = Mutex(State())
     private let seenMessageIDsCap = 2000
-    // This side's bell: the record names it sent most recently, newest last.
-    var bellEntries: [DeviceBellEntry] = []
-    private var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
-    private var assetSecretProvider: (@Sendable () async -> Data?)?
-    // A Mac may access phone records only after proving it holds the account's Mac pairing slot; an unread claim grants no access.
-    var pairingClaim: PairingClaim = .unread
-    // Counts this transport's own pairing publications, so a claim whose read began before one of them cannot undo it.
-    var pairingPublications: UInt64 = 0
 
     public func useAssetSecret(_ provider: @escaping @Sendable () async -> Data?) {
-        lock.lock(); defer { lock.unlock() }
-        assetSecretProvider = provider
+        state.withLock { state in
+            state.assetSecretProvider = provider
+        }
     }
 
     func loadAssetSecretProvider() -> (@Sendable () async -> Data?)? {
-        lock.lock(); defer { lock.unlock() }
-        return assetSecretProvider
+        return state.withLock { $0.assetSecretProvider }
     }
 
     static func assetContext(recordName: String, direction: String) -> Data {
@@ -188,13 +187,13 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
     }
 
     public func observeAccountFailures(_ handler: @escaping @Sendable (DeviceSyncAccountFailure) async -> Void) {
-        lock.lock(); defer { lock.unlock() }
-        accountFailureHandler = handler
+        state.withLock { state in
+            state.accountFailureHandler = handler
+        }
     }
 
     private func loadAccountFailureHandler() -> (@Sendable (DeviceSyncAccountFailure) async -> Void)? {
-        lock.lock(); defer { lock.unlock() }
-        return accountFailureHandler
+        return state.withLock { $0.accountFailureHandler }
     }
 
     private func reportAccountFailure(_ error: Error) async {
@@ -214,8 +213,10 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         self.containerIdentifier = containerIdentifier
         // Restore the role/container cursor so restarts cannot replay messages beyond the seen-set cap.
         if let ts = UserDefaults.standard.object(forKey: Self.cursorKey(role: role, container: containerIdentifier)) as? Double {
-            self.lastPullDate = Date(timeIntervalSince1970: ts)
-            self.lastPullCursorPersistenceAt = Date()
+            state.withLock {
+                $0.lastPullDate = Date(timeIntervalSince1970: ts)
+                $0.lastPullCursorPersistenceAt = Date()
+            }
         }
     }
 
@@ -263,104 +264,74 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         CKContainer(identifier: containerIdentifier).privateCloudDatabase
     }
 
-    // MARK: account status
-
-    public func accountStatus() async throws -> String {
-        return try await withDeviceCKOperation("CloudKitDeviceTransport.accountStatus", onFailure: accountFailureReporter) {
-            let s = try await CKContainer(identifier: self.containerIdentifier).accountStatus()
-            switch s {
-            case .available: return "available"
-            case .noAccount: return "noAccount"
-            case .restricted: return "restricted"
-            case .temporarilyUnavailable: return "temporarilyUnavailable"
-            case .couldNotDetermine: return "unknown"
-            @unknown default: return "unknown"
-            }
-        }
-    }
-
     // MARK: helpers
 
     // MARK: locked state accessors (synchronous — never call lock from an async
     // context; scoped critical sections only, matching MemoryV2+CloudKit).
 
     func setIncomingHandler(_ h: @escaping @Sendable (BridgeMessage) async -> Bool) {
-        lock.lock(); incomingHandler = h; lock.unlock()
+        state.withLock { $0.incomingHandler = h }
     }
 
-    func setPairingHandler(_ h: @escaping @Sendable (Data) async -> Bool) {
-        lock.lock(); pairingHandler = h; lock.unlock()
+    func setPairingHandler(_ h: @escaping @Sendable (Data, Date?) async -> Bool) {
+        state.withLock { $0.pairingHandler = h }
     }
 
     func setStatusHandler(key: String, _ h: DeviceStatusObserver) {
-        lock.lock(); statusHandlers[key] = h; lock.unlock()
+        state.withLock { $0.statusHandlers[key] = h }
     }
 
-    func loadPairingHandler() -> (@Sendable (Data) async -> Bool)? {
-        lock.lock(); defer { lock.unlock() }
-        return pairingHandler
+    func loadPairingHandler() -> (@Sendable (Data, Date?) async -> Bool)? {
+        return state.withLock { $0.pairingHandler }
     }
 
     /// Snapshot handlers before awaiting them so no lock spans suspension.
     func loadStatusHandlers() -> [String: DeviceStatusObserver] {
-        lock.lock(); defer { lock.unlock() }
-        return statusHandlers
+        return state.withLock { $0.statusHandlers }
     }
 
-    /// Per-key LWW freshness check for status singletons. It does NOT consume the record: `commitStatusDate` is what marks it seen, and only a
-    /// handler that applied it may call that.
-    func statusIsNewer(key: String, _ modDate: Date?) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if let modDate, let last = lastStatusModDates[key] {
-            return modDate > last
-        }
-        return true
+    func statusAcknowledgement(for recordName: String) -> (date: Date, changeTag: String?)? {
+        state.withLock { $0.statusAcknowledgements[recordName] }
     }
 
-    func commitStatusDate(key: String, _ modDate: Date?) {
-        guard let modDate else { return }
-        lock.lock()
-        if let last = lastStatusModDates[key] {
-            if modDate > last { lastStatusModDates[key] = modDate }
-        } else {
-            lastStatusModDates[key] = modDate
+    func acknowledgeStatus(_ record: CKRecord) {
+        guard let date = record.modificationDate else { return }
+        let name = record.recordID.recordName
+        let changeTag = record.recordChangeTag
+        state.withLock { state in
+            if let last = state.statusAcknowledgements[name], date < last.date { return }
+            state.statusAcknowledgements[name] = (date, changeTag)
         }
-        lock.unlock()
     }
 
     func loadHandlerAndCursor() -> ((@Sendable (BridgeMessage) async -> Bool)?, Date?) {
-        lock.lock(); defer { lock.unlock() }
-        return (incomingHandler, lastPullDate)
+        return state.withLock { ($0.incomingHandler, $0.lastPullDate) }
     }
 
     /// Records the reader can never verify are not read at all: the phone raises its cursor to the publication of the Mac's current key (less
     /// the clock-skew overlap), since anything older was signed with an earlier key.
     public func raisePullCursor(toAtLeast date: Date) {
         let floor = date.addingTimeInterval(-Self.pullOverlap)
-        lock.lock()
-        let behind = lastPullDate.map { $0 < floor } ?? true
-        lock.unlock()
+        let behind = state.withLock { $0.lastPullDate.map { $0 < floor } ?? true }
         guard behind else { return }
         nativeLog("[ck-device] pull cursor raised to the current key's publication %@", "\(floor)")
         setLastPullDate(floor, persistImmediately: true)
     }
 
     func setLastPullDate(_ date: Date, persistImmediately: Bool) {
-        let shouldPersist: Bool = {
-            lock.lock()
-            defer { lock.unlock() }
+        let shouldPersist = state.withLock { state in
             // The cursor only moves forward: a drain that began before a raise cannot pull it back.
-            guard lastPullDate.map({ date > $0 }) ?? true else { return false }
-            lastPullDate = date
+            guard state.lastPullDate.map({ date > $0 }) ?? true else { return false }
+            state.lastPullDate = date
             let now = Date()
             let persist = Self.shouldPersistPullCursor(
                 immediately: persistImmediately,
-                lastPersistenceAt: lastPullCursorPersistenceAt,
+                lastPersistenceAt: state.lastPullCursorPersistenceAt,
                 now: now
             )
-            if persist { lastPullCursorPersistenceAt = now }
+            if persist { state.lastPullCursorPersistenceAt = now }
             return persist
-        }()
+        }
         guard shouldPersist else { return }
         // Cursor persistence is thread-safe; its role and container key components are immutable.
         UserDefaults.standard.set(date.timeIntervalSince1970,
@@ -376,45 +347,46 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
     /// Atomic check-and-claim: inserts `id` into the seen set and returns true iff it was newly claimed. Prevents two concurrent drains from both
     /// delivering the same message id (the check + insert are one locked op).
     func isSeen(_ id: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return seenMessageIDs.contains(id)
+        return state.withLock { $0.seenMessageIDs.contains(id) }
     }
 
     func claimIfUnseen(_ id: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return claimWhileLocked(id)
+        return state.withLock { claimWhileLocked(id, state: &$0) }
     }
 
     func claimForSerialDrain(_ id: String) -> Bool? {
-        lock.lock(); defer { lock.unlock() }
-        guard !controlDrainInFlight else { return nil }
-        return claimWhileLocked(id)
+        return state.withLock { state in
+            guard !state.controlDrainInFlight else { return nil }
+            return claimWhileLocked(id, state: &state)
+        }
     }
 
-    private func claimWhileLocked(_ id: String) -> Bool {
-        guard !seenMessageIDs.contains(id) else { return false }
-        seenMessageIDs.insert(id)
-        seenMessageIDsOrdered.append(id)
-        while seenMessageIDsOrdered.count > seenMessageIDsCap {
-            let oldest = seenMessageIDsOrdered.removeFirst()
-            seenMessageIDs.remove(oldest)
+    private func claimWhileLocked(_ id: String, state: inout State) -> Bool {
+        guard !state.seenMessageIDs.contains(id) else { return false }
+        state.seenMessageIDs.insert(id)
+        state.seenMessageIDsOrdered.append(id)
+        while state.seenMessageIDsOrdered.count > seenMessageIDsCap {
+            let oldest = state.seenMessageIDsOrdered.removeFirst()
+            state.seenMessageIDs.remove(oldest)
         }
         return true
     }
 
     /// The names among `names` whose record no delivery has claimed. A claim is keyed by name and payload digest; the bell knows names only.
     func unclaimedRecordNames(_ names: [String]) -> [String] {
-        lock.lock(); defer { lock.unlock() }
-        let claimed = Set(seenMessageIDs.compactMap { id in id.lastIndex(of: ":").map { String(id[..<$0]) } })
-        return names.filter { !claimed.contains($0) }
+        return state.withLock { state in
+            let claimed = Set(state.seenMessageIDs.compactMap { id in id.lastIndex(of: ":").map { String(id[..<$0]) } })
+            return names.filter { !claimed.contains($0) }
+        }
     }
 
     /// Release a claim taken by `claimIfUnseen` when delivery is rejected, so the message is retried on the next drain.
     func releaseClaim(_ id: String) {
-        lock.lock(); defer { lock.unlock() }
-        guard seenMessageIDs.remove(id) != nil else { return }
-        if let i = seenMessageIDsOrdered.lastIndex(of: id) {
-            seenMessageIDsOrdered.remove(at: i)
+        state.withLock { state in
+            guard state.seenMessageIDs.remove(id) != nil else { return }
+            if let i = state.seenMessageIDsOrdered.lastIndex(of: id) {
+                state.seenMessageIDsOrdered.remove(at: i)
+            }
         }
     }
 
@@ -516,16 +488,12 @@ public extension DeviceSyncTransportResolver {
     }
 }
 
-/// Sendable results of pairing and status reads.
 enum PairingSlot: Sendable { case empty, holds(Data) }
 /// Where a Mac stands on the account's Mac pairing record.
 enum PairingClaim: Sendable { case unread, held, elsewhere }
-struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
 /// One sent record on a bell, with when its sender saw it saved (the sender's clock).
 struct DeviceBellEntry: Codable, Sendable { let name: String; let sentAt: Date }
 struct DeviceStatusObserver: Sendable {
     let pairingSecret: @Sendable () async -> Data?
     let apply: @Sendable (String, Date?, Data, DeviceSyncRecovery) async -> Bool
 }
-
-#endif

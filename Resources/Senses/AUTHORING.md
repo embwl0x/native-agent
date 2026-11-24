@@ -8,11 +8,9 @@ corners. Read with mac.look, chrome.snapshot or files.read first. Without
 place, sense.make uses the most recent read in this conversation; an explicit
 place selects that captured read. show:"material" reveals it without rereading.
 
-Return one self-contained ES2020 JavaScript file. No imports, host IO or
-network. Start with frame.js; copy only the shared helpers your reader needs.
-The builtin entries are complete worked examples. The examples/ files are
-their small format entry points; lib/ holds the shared readers. assemble.sh
-concatenates these authoring sources into the runnable builtin/ entries.
+Write one JavaScript entry. The helper supplies frozen `NativeKit`, `SenseZip`, `SenseXml`
+(also spelled `SenseXML`), `SenseDocuments`, `SenseIWork` and `SenseRTF`. The short
+format readers under `builtin/` use these directly. Their state belongs to this sense's realm.
 
 Define read(request). Read real material with sense.source.read(address?).
 For app scripting reads, declare bundle ids with sense.make's apps list.

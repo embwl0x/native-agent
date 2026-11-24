@@ -1,6 +1,7 @@
+import Synchronization
 import Foundation
-@preconcurrency import Speech
-@preconcurrency import AVFoundation
+@unsafe @preconcurrency import Speech
+@unsafe @preconcurrency import AVFoundation
 
 // Blueprint: | `SpeechUtterance.swift` | `SpeechUtterance`: original recognition evidence and compact uncertainty |
 
@@ -63,26 +64,25 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
     }
 
     /// One user-initiated capture. The attachment owner takes the bytes; abandoned and failed captures remove their temporary audio when released.
-    public final class Recording: @unchecked Sendable {
-        private let lock = NSLock()
+    public final class Recording: Sendable {
         private let url: URL
-        private var file: AVAudioFile?
+        private let file: Mutex<AVAudioFile?>
 
         public init(format: AVAudioFormat) throws {
             url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
-            file = try AVAudioFile(forWriting: url, settings: format.settings,
-                                   commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+            file = Mutex(try AVAudioFile(forWriting: url, settings: format.settings,
+                                   commonFormat: format.commonFormat, interleaved: format.isInterleaved))
         }
 
         public func append(_ buffer: AVAudioPCMBuffer) throws {
-            try lock.withLock {
+            try file.withLock { file in
                 guard let file else { throw CocoaError(.fileWriteUnknown) }
                 try file.write(from: buffer)
             }
         }
 
         public func finish(utterance: SpeechUtterance) throws -> MultimodalAttachment {
-            let bytes = try lock.withLock {
+            let bytes = try file.withLock { file in
                 file = nil
                 return try Data(contentsOf: url)
             }

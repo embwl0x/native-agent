@@ -2,6 +2,21 @@ import { ProtocolError } from "./protocol.js";
 
 const GROUP_TITLE = "NativeAgent";
 
+export async function readActiveTab(chromeApi, windowId) {
+  if (windowId === chromeApi.windows.WINDOW_ID_NONE) return null;
+  try {
+    const window = await (windowId === undefined
+      ? chromeApi.windows.getLastFocused() : chromeApi.windows.get(windowId));
+    if (!window.focused || window.incognito || window.id === undefined) return null;
+    const [tab] = await chromeApi.tabs.query({ active: true, windowId: window.id });
+    if (!tab || tab.incognito || tab.id === undefined || tab.id < 0) return null;
+    return { windowId: tab.windowId, tabId: tab.id, title: tab.title ?? null,
+      url: tab.url ?? null, audible: tab.audible === true };
+  } catch {
+    return null;
+  }
+}
+
 export function tabNotOwnedError(tabId, reason) {
   const message = reason === "tab_missing" ? `No tab ${tabId} exists any more (tab_missing).`
     : reason === "tab_active" ? "The person selected this tab, so it is theirs now (tab_active)."

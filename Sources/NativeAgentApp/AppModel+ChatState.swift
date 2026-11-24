@@ -1,10 +1,8 @@
 import Foundation
 import SwiftUI
 import NativeAgentShared
-import EngineRuntime
-import PersonaEngine
-import ChatTurnRuntime
-import ChatSessionWork
+import BodyRuntime
+import DeskCore
 // Blueprint: | `AppModel+ChatState.swift` | `AppModel`: Checked profile and transcript reads, pinning and pruning |
 
 @MainActor
@@ -71,8 +69,8 @@ extension AppModel {
 
     /// Observe defaults changes once so bridge and external writes reach the running settings without a relaunch.
     func installDefaultsBackedSettingsObserver() {
-        guard defaultsObserver == nil else { return }
-        defaultsObserver = NotificationCenter.default.addObserver(
+        guard unsafe defaultsObserver == nil else { return }
+        unsafe defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: UserDefaults.standard,
             queue: .main

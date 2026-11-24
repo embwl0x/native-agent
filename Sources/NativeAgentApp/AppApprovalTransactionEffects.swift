@@ -1,22 +1,16 @@
-import EngineRuntime
+import BodyRuntime
 import Foundation
-import BackgroundWork
-import Browser
-import AppToolRuntime
+import MacNerves
 import PersistenceCore
-import Connectors
 import NativeAgentShared
 import NativeAgentCore
-import ApprovalTransactions
-import ApprovalInbox
-import ChatTurnRuntime
-import ChatTurnContracts
-import TrustCenter
+import MindCore
+import DeskCore
 // Blueprint: | `AppApprovalTransactionEffects.swift` | Approval factory and live effect bindings; canonical browser outcomes |
 
 extension ApprovalExecution {
     static func app() -> ApprovalExecution {
-        ApprovalExecution(effects: AppApprovalTransactionEffects(), dataRootOverride: NativeAgentEngine.live.dataRoot)
+        ApprovalExecution(effects: AppApprovalTransactionEffects(), jobStore: NativeAgentEngine.live.agentJobs.store, dataRootOverride: NativeAgentEngine.live.dataRoot)
     }
 }
 
@@ -24,7 +18,7 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
     private var dataRoot: URL { NativeAgentEngine.live.dataRoot }
 
     func enableSkill(name: String, reviewedDigest: String?, turn: Turn) async throws {
-        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(
+        try await NativeAgentEngine.forRoot(dataRoot).withPartDoor(
             envelope: TurnEnvelope.current(turn: turn, surface: "ability.enable"), turn: turn) { door in
             try await NativeSkillRegistryActions.enableSkill(name: name, dataRoot: dataRoot,
                 reviewedDigest: reviewedDigest, turn: door.turn, execution: door.execution)
@@ -34,7 +28,7 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
     func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue],
                             approvedReplayApprovalID: String, dataRoot: URL, turn: Turn) async throws -> ConnectorActionReceipt {
         let engine = NativeAgentEngine.forRoot(dataRoot)
-        return try await engine.tools.withPartDoor(envelope: TurnEnvelope.current(turn: turn, surface: "approval:connector_action"), turn: turn) { door in
+        return try await engine.withPartDoor(envelope: TurnEnvelope.current(turn: turn, surface: "approval:connector_action"), turn: turn) { door in
             try await ConnectorActions(platform: AppConnectorActionPlatform(engine: engine))
                 .runConnectorAction(descriptor: descriptor, dryRun: dryRun, input: input,
                                     approvedReplayApprovalID: approvedReplayApprovalID, dataRoot: dataRoot, turn: door.turn)
@@ -52,9 +46,7 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
     }
 
     func chatTurnCompleted(sessionID: String?) async {
-        await MainActor.run {
-            NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
-        }
+        await ChatTurnCompleted.post(sessionID: sessionID)
     }
 
     func observeBrowserMotorAction(runID: String, dataRoot: URL) async {

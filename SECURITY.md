@@ -13,7 +13,7 @@ NativeAgent is a **single-operator, Swift-app-owned** system. `NativeAgent.app` 
 
 - **Local app UI:** trusted user surface, still subject to NativeAgent policy gates for risky actions.
 - **Local loopback bridges:** listener-bound to the loopback interface, with bearer-token authorization for protected routes, intended for same-user local agent CLIs. Accept-time peer checks remain enabled as defense in depth; loopback checks do not authenticate an operating-system user or process identity. See the live [loopback boundaries](docs/threat-model.md#trust-boundaries).
-- **Paired iOS app:** remote paired trust over the selected Apple-native device transport: iCloud KVS + Drive or an entitlement-gated CloudKit private database. Action and chat envelopes are HMAC-SHA256 signed with pairing material; iOS does not use local network HTTP.
+- **Paired iOS app:** remote paired trust over the CloudKit private database, the one device-sync transport the app accepts. Action and chat envelopes are HMAC-SHA256 signed with pairing material; iOS does not use local network HTTP.
 - **Browser, web, Telegram, Slack, and connector inputs:** untrusted or externally authenticated surfaces that must pass connector proof, policy gates, and receipts before side effects.
 - **All other callers:** rejected by default or fail closed.
 

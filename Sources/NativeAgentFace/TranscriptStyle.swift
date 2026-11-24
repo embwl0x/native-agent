@@ -1,4 +1,5 @@
 import AppKit
+import Foundation
 import NativeAgentShared
 import SwiftUI
 
@@ -34,7 +35,9 @@ enum TranscriptInk {
 @MainActor
 enum TranscriptTextScale {
     static let defaultsKey = "transcriptTextScale"
-    static let changed = Notification.Name("TranscriptTextScale.changed")
+    struct Changed: NotificationCenter.MainActorMessage {
+        typealias Subject = NSObject
+    }
     static let range: ClosedRange<Double> = 0.8...1.6
     static let step = 0.1
 
@@ -49,6 +52,6 @@ enum TranscriptTextScale {
         let rounded = (next * 10).rounded() / 10
         guard rounded != Double(value) else { return }
         UserDefaults.standard.set(rounded, forKey: defaultsKey)
-        NotificationCenter.default.post(name: changed, object: nil)
+        NotificationCenter.default.post(Changed())
     }
 }

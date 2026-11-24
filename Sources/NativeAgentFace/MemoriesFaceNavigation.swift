@@ -9,10 +9,11 @@ struct MemoriesFaceNavigation: ViewModifier {
     @Environment(AppModel.self) private var appModel
     @Environment(\.quietOffscreenRead) private var offscreen
     @Environment(\.quietRailTab) private var drawnTab
-    @AppStorage(ShellRailTab.storageKey(.memories)) private var tab = "memories"
     @State private var target: FaceDestination?
     @State private var document: DocumentRequest?
     @State private var showing = false
+
+    private var tab: String { ShellRailTabStore.shared.value(for: .memories, default: "memories") }
 
     static let tabs = [ShellTab(key: "memories", title: "Memories"), ShellTab(key: "knowledge", title: "Knowledge graph")]
 
@@ -20,7 +21,11 @@ struct MemoriesFaceNavigation: ViewModifier {
         Group {
             if offscreen, drawnTab == "knowledge" { KnowledgeGraphView() } else { content }
         }
-        .sheet(isPresented: $showing, onDismiss: { tab = "memories"; target = nil; document = nil }) { destination }
+        .sheet(isPresented: $showing, onDismiss: {
+            ShellRailTabStore.shared.set("memories", for: .memories)
+            target = nil
+            document = nil
+        }) { destination }
         .onChange(of: tab, initial: true) { _, value in
             guard !offscreen, value == "knowledge" else { return }
             open(FaceDestination(page: "memories", item: "graph", session: nil, message: nil))
@@ -140,6 +145,6 @@ struct FaceDocumentReadout: View {
 
             What's actually true:
             """
-        NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
+        NotificationCenter.default.post(OpenChatDraftRequest(draft: draft))
     }
 }

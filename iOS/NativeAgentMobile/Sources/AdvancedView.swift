@@ -12,8 +12,8 @@ enum MoreAboutPresentation {
 struct AdvancedView: View {
     @Binding var opensMemories: Bool
     init(opensMemories: Binding<Bool> = .constant(false)) { _opensMemories = opensMemories }
-    @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @Environment(PairingStore.self) private var pairingStore
+    @Environment(MacBridgeClient.self) private var bridgeClient
     @State private var showPairingRecovery = false
     @State private var localDestination: Destination?
     @State private var remoteDestination: FaceDestination?
@@ -29,11 +29,16 @@ struct AdvancedView: View {
             AlivePage(title: "More", line: "Rooms, settings and tools.", style: .root) {
                 FaceView(face: face, door: door, session: session)
             }
+            .refreshable {
+                await sync.refreshLightweightSnapshots()
+                _ = await sync.refreshFacesSnapshot()
+                await sync.refreshSnapshotGroup(.advanced)
+            }
             .navigationDestination(isPresented: $opensMemories) { MobileFacePage(page: "memories") }
             .navigationDestination(item: $remoteDestination) { $0.view }
             .navigationDestination(item: $localDestination) { destination in
                 switch destination {
-                case .settings: SettingsViewFull()
+                case .settings: SettingsViewFull(presentation: .pushed)
                 case .graph: KnowledgeGraphView()
                 case .turns: TurnInspectorView()
                 case .tools: MacToolsView()
@@ -42,7 +47,7 @@ struct AdvancedView: View {
             }
             .sheet(isPresented: $showPairingRecovery) {
                 PairingView(onSkip: { showPairingRecovery = false }, onPaired: { showPairingRecovery = false })
-                    .environmentObject(pairingStore)
+                    .environment(pairingStore)
             }
             #if DEBUG
             .onAppear {

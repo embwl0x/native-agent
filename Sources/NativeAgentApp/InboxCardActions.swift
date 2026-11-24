@@ -1,40 +1,39 @@
-import EngineRuntime
+import BodyRuntime
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-import ApprovalTransactions
-import NotificationInbox
-import ChatTurnRuntime
-import BackgroundWork
-import Experiences
-import ChatToolRuntime
-import ApprovalInbox
+import DeskCore
+import SenseCore
+import MacNerves
 // Blueprint: | `InboxCardActions.swift` | `AppInboxCardActionEffects`: native navigation for core inbox transactions |
 
 struct AppInboxCardActionEffects: InboxCardActionEffects {
+    let engine: NativeAgentEngine
+
     func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool, turn: Turn) async throws {
-        try await Self.answerRequest(id: id, action: action, dataRoot: dataRoot, quiet: quiet, turn: turn)
+        try await answerRequest(id: id, action: action, quiet: quiet, turn: turn)
     }
 
     /// Provider requests open the same protected entry as Providers; other requests open their conversation.
     @MainActor
-    private static func answerRequest(id: String, action: String, dataRoot: URL, quiet: Bool, turn: Turn) async throws {
-        try await InlineInteractionDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet, turn: turn) { pointer in
-            guard let appModel = ApplicationLifetime.shared.appModel else {
+    private func answerRequest(id: String, action: String, quiet: Bool, turn: Turn) async throws {
+        let interactions = engine.interactions
+        try await InlineInteractionDelivery.act(interactions: interactions, id: id, action: action, quiet: quiet, turn: turn) { pointer in
+            guard let appModel = ApplicationLifetime.shared.appModel, appModel.engine === self.engine else {
                 throw NSError(domain: "InteractionCard", code: 2, userInfo: [
                     NSLocalizedDescriptionKey: "Open NativeAgent on your Mac to finish this request."
                 ])
             }
-            if let card = try await InlineInteractionResolver.interaction(id: pointer.interactionID,
-                sessionID: pointer.sessionID, dataRoot: dataRoot), card.kind == .apiKey, card.secret == nil {
+            if let card = try await interactions.interaction(id: pointer.interactionID,
+                sessionID: pointer.sessionID), card.kind == .apiKey, card.secret == nil {
                 _ = try await appModel.engine.signInProviderFace(InlineInteractionRegistry.canonicalProviderID(card.target))
                 return
             }
             await appModel.refreshChatSessionIndex()
             guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == pointer.sessionID }),
-                  try await InlineInteractionResolver.interaction(id: pointer.interactionID,
-                    sessionID: pointer.sessionID, dataRoot: dataRoot) != nil else {
+                  try await interactions.interaction(id: pointer.interactionID,
+                    sessionID: pointer.sessionID) != nil else {
                 throw NSError(domain: "InteractionCard", code: 1, userInfo: [
                     NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
                 ])
@@ -69,7 +68,7 @@ struct AppInboxCardActionEffects: InboxCardActionEffects {
     }
 
     @MainActor func openApprovals() async {
-        NotificationCenter.default.post(name: .openApprovalsRequest, object: nil)
+        NotificationCenter.default.post(OpenApprovalsRequest())
     }
 
     @MainActor func openChatDraft(_: String) async throws {

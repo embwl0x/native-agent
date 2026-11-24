@@ -1,13 +1,10 @@
-import ActivityWatch
-import AppToolRuntime
-import ChatSessionWork
-import EngineRuntime
+import MacNerves
+import BodyRuntime
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import Observation
 import PersistenceCore
-import Privacy
 // Blueprint: | `BodyFacePalette.swift` | Connection-owned global search using the canonical inventory, ranking and saved-result owners |
 
 @MainActor
@@ -31,6 +28,8 @@ final class BodyFacePalette {
             guard let reader = readers[id] else { return nil }
             reader.task.cancel()
             await reader.task.value
+            // A released search's results leave the feed with it, before the view may open another query that posts its own.
+            await engine.face.remove(.palette(reader.view))
             if readers[id]?.task == reader.task { readers.removeValue(forKey: id) }
             return .acknowledged
         default: return nil
@@ -42,6 +41,7 @@ final class BodyFacePalette {
         let held = readers
         for reader in held.values { reader.task.cancel() }
         for reader in held.values { await reader.task.value }
+        for reader in held.values { await engine.face.remove(.palette(reader.view)) }
         readers.removeAll()
         closing = false
     }
@@ -55,8 +55,8 @@ final class BodyFacePalette {
         let changes = FileChangeEvents(paths: paths, emitInitial: false)
         let (events, wake) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let root = engine.dataRoot
-        let token = NotificationCenter.default.addObserver(forName: TranscriptsFacade.sessionIndexDidChange, object: nil, queue: nil) { notice in
-            if notice.object as? URL == root { wake.yield(()) }
+        let token = NotificationCenter.default.addObserver(for: TranscriptsFacade.SessionIndexDidChange.self) { message in
+            if message.root == root { wake.yield(()) }
         }
         defer { NotificationCenter.default.removeObserver(token); wake.finish() }
         await withTaskCancellationHandler {
@@ -83,16 +83,13 @@ final class BodyFacePalette {
     }
 
     private func observeLayout(_ wake: AsyncStream<Void>.Continuation) async {
-        let (observed, changed) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        defer { changed.finish() }
-        var next = observed.makeAsyncIterator()
-        while !Task.isCancelled {
-            withObservationTracking {
-                _ = engine.layout.availability
-                _ = engine.activityWatch.removableExclusions
-            } onChange: { changed.yield(()) }
+        let changes = Observations { [engine] in
+            _ = engine.layout.availability
+            _ = engine.activityWatch.removableExclusions
+        }
+        for await _ in changes {
+            guard !Task.isCancelled else { return }
             wake.yield(())
-            guard await next.next() != nil else { break }
         }
     }
 

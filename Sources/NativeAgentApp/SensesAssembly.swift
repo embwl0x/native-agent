@@ -1,20 +1,13 @@
 import Foundation
 import NativeAgentShared
 import Synchronization
-import ApprovalTransactions
-import Senses
-import AppToolRuntime
+import BodyRuntime
+import SenseCore
 import PersistenceCore
 import NativeAgentCore
-import EngineRuntime
-import ChatTurnRuntime
-import ChatTurnContracts
-import MemoryV2
-import MacControl
-import TrustCenter
-import AuthoredCapabilities
-import Cognition
-import DoctorChecks
+import MindCore
+import MacNerves
+import DeskCore
 
 // Blueprint: | `SensesAssembly.swift` | `SensesAssembly`: gated hub bindings; scoped readiness and repair; quiet reads borrow no authority |
 
@@ -26,6 +19,7 @@ enum SensesAssembly {
     static func install(dataRoot: URL) {
         installation.withLock { installation in
             guard installation == nil else { return }
+            OwnedProgramRunner(dataRoot: dataRoot).warmHelpers()
             let registry = FileSenseRegistry(dataRoot: dataRoot)
             let runner = HelperSenseRunner(dataRoot: dataRoot, helperURL: SenseHostLocator.helperURL,
                 sandboxProfile: { record, _, scratch in
@@ -69,7 +63,7 @@ enum SensesAssembly {
                     await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
                         id: "launch.senses", title: "Senses installation", status: "ok",
                         detail: "Senses registered; dependent reads and file subscriptions may proceed.")], dataRoot: dataRoot)
-                    NotificationCenter.default.post(name: SensesHub.didBecomeReady, object: nil)
+                    NotificationCenter.default.post(SensesHub.DidBecomeReady())
                 } catch is CancellationError { throw CancellationError() }
                 catch {
                     let detail = "Senses registration failed: " + error.localizedDescription
@@ -102,7 +96,7 @@ enum SensesAssembly {
             try SenseSandboxProfile.requirePublicPath(path, dataRoot: dataRoot,
                 personaRoot: defaultPersonaRoot(dataRoot: dataRoot))
         }
-        return try await NativeAgentEngine.forRoot(dataRoot).tools.readSense(tool: tool, input: input,
+        return try await NativeAgentEngine.forRoot(dataRoot).readSense(tool: tool, input: input,
             turn: turn, operation: operation, admissionOnly: admissionOnly)
     }
 }

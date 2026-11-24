@@ -1,34 +1,18 @@
 import Foundation
 import AppKit
-import EngineRuntime
+import BodyRuntime
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import TrustCenter
-import TrustPersistence
-import ApprovalInbox
-import ApprovalTransactions
-import ChatToolRuntime
-import MacControl
-import MacIntegration
-import SystemOps
-import Connectors
-import AttentionRouting
-import DoctorChecks
+import DeskCore
+import MacNerves
 import WidgetKit
 import AppIntents
 import Observation
 import SwiftUI
-import MemoryV2
+import MindCore
 import ProviderRouting
-import BackgroundLoops
-import PersonaEngine
-import ChatTurnRuntime
-import ChatTurnContracts
-import ChatSessionWork
-import MultimodalTTS
-import TelegramBot
-import DeviceSync
+import SenseCore
 // Blueprint: | `AppModel+TrustActions.swift` | `AppModel`: Trust policy, backups, approval resolution and Mac control commands |
 
 enum BackupCreationOutcome {
@@ -189,7 +173,7 @@ extension AppModel {
     func resolveApproval(id: String, decision: String) async throws -> ApprovalRecord {
         try await engine.approvals.resolveApproval(
             id: id, decision: decision,
-            coordinator: .app(), turn: ApprovalResolutionProvenance.local(decidedBy: "mac_ui").resolvingTurn
+            coordinator: .app(), turn: ApprovalResolutionProvenance.local(decidedBy: "mac_ui").resolvingTurn(dataRoot: engine.dataRoot)
         )
     }
 
@@ -206,7 +190,7 @@ extension AppModel {
 
     func macControlNotify(title: String, message: String) async throws -> Bool {
         let turn = TurnRequest(message: "", sessionID: nil, surface: "native_actions",
-            envelope: TurnEnvelope.personOnMac("mac_ui:mac_control.notify", surface: "native_actions")).turn()
+            envelope: TurnEnvelope.personOnMac("mac_ui:mac_control.notify", surface: "native_actions")).turn(dataRoot: engine.dataRoot)
         return try await engine.trust.notify(
             title: title, message: message,
             notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn

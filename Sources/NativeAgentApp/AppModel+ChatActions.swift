@@ -1,13 +1,9 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import EngineRuntime
-import Transcripts
-import TurnTrace
-import ChatTurnRuntime
-import ChatTurnContracts
-import ChatSessionWork
-import ToolExecution
+import BodyRuntime
+import SenseCore
+import MindCore
 // Blueprint: | `AppModel+ChatActions.swift` | Chat mutations, regeneration and turn admission through `MacChatTurnRuntime`. |
 
 struct AppMutationResult: Equatable, Sendable {
@@ -88,7 +84,7 @@ extension AppModel {
             client: macChatClient,
             presentFailure: { [self] in setFailureStatus($0, action: "try that again") },
             didComplete: {
-                NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionId)
+                ChatTurnCompleted.post(sessionID: sessionId)
             }
         )
     }
@@ -193,17 +189,13 @@ extension AppModel {
         }
     }
 
-    typealias ChatTurnAcceptance = MacChatTurnAcceptance
-    typealias _StartedChatTurn = MacChatStartedTurn
-
-
     /// Return at turn acceptance so the composer clears its draft and attachments only after the task is installed.
     @MainActor
     func startActiveChatTurn(
         _ text: String,
         attachments: [MultimodalAttachment] = [],
         expectedSessionId: String? = nil
-    ) async -> ChatTurnAcceptance {
+    ) async -> MacChatTurnAcceptance {
         let activityAt = Date()
         guard let targetSessionId = readyActiveChatSessionId() else {
             return rejectChatTurn(activeChatReadinessFailureMessage())
@@ -227,7 +219,7 @@ extension AppModel {
         _ text: String,
         attachments: [MultimodalAttachment] = [],
         sessionId: String
-    ) async -> ChatTurnAcceptance {
+    ) async -> MacChatTurnAcceptance {
         let activityAt = Date()
         return publishConversationAnchor(for: await startChatTurn(
             text,
@@ -240,7 +232,7 @@ extension AppModel {
 
     /// An accepted Mac send anchors the conversation across surfaces; publication failure must not reject an accepted message.
     @discardableResult
-    func publishConversationAnchor(for acceptance: ChatTurnAcceptance, activityAt: Date = Date()) -> ChatTurnAcceptance {
+    func publishConversationAnchor(for acceptance: MacChatTurnAcceptance, activityAt: Date = Date()) -> MacChatTurnAcceptance {
         let sessionId: String
         switch acceptance {
         case .accepted(let id): sessionId = id
@@ -279,9 +271,9 @@ extension AppModel {
         sessionId: String? = nil,
         hideUserBubble: Bool = false,
         requireIdleAndEmpty: Bool = false
-    ) async -> ChatTurnAcceptance {
+    ) async -> MacChatTurnAcceptance {
         let activityAt = Date()
-        let started: _StartedChatTurn
+        let started: MacChatStartedTurn
         if let sessionId, !sessionId.isEmpty {
             // Fixed-session callers own their target and may send while another session is active.
             started = await startChatTurn(
@@ -328,7 +320,7 @@ extension AppModel {
     }
 
     @MainActor
-    private func rejectChatTurn(_ message: String) -> ChatTurnAcceptance {
+    private func rejectChatTurn(_ message: String) -> MacChatTurnAcceptance {
         statusText = message
         return .rejected(message: message)
     }

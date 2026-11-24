@@ -1,26 +1,16 @@
 import Foundation
 import SwiftUI
-import EngineRuntime
+import BodyRuntime
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-import ChatSessionWork
-import ChatTurnRuntime
-import Onboarding
-import AttentionRouting
-import DoctorChecks
+import MindCore
 import WidgetKit
 import AppIntents
 import Observation
-import MemoryV2
 import ProviderRouting
-import BackgroundLoops
-import PersonaEngine
-import TrustCenter
-import MultimodalTTS
-import SystemOps
-import TelegramBot
-import DeviceSync
+import SenseCore
+import DeskCore
 // Blueprint: | `AppModel+Onboarding.swift` | `AppModel`: first-run greeting port and onboarding commands |
 
 @MainActor
@@ -74,7 +64,7 @@ extension AppModel: FirstRunWelcomePort {
     func sendFirstRunGreeting(
         _ kickoff: String,
         sessionID: String
-    ) async -> ChatTurnAcceptance {
+    ) async -> MacChatTurnAcceptance {
         return await sendChat(kickoff, sessionId: sessionID, hideUserBubble: true, requireIdleAndEmpty: true)
     }
 

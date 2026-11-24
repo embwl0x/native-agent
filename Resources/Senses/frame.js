@@ -1,5 +1,3 @@
-// Starter frame. ES2020 / JavaScriptCore; no modules, filesystem or network.
-// Keep this in front of the sense's own read(request) implementation.
 var NativeKit = (() => {
     const maximumTextBytes = 40000; // NativePage.maximumTextBytes
     const maximumItems = 100000;
@@ -22,34 +20,7 @@ var NativeKit = (() => {
         }
         return out;
     }
-    function utf8(bytes) {
-        let out = "";
-        for (let p = 0; p < bytes.length;) {
-            const first = bytes[p++];
-            let value, count, minimum;
-            if (first < 128) { out += String.fromCharCode(first); continue; }
-            if (first >= 194 && first <= 223) { value = first & 31; count = 1; minimum = 128; }
-            else if (first >= 224 && first <= 239) { value = first & 15; count = 2; minimum = 2048; }
-            else if (first >= 240 && first <= 244) { value = first & 7; count = 3; minimum = 65536; }
-            else fail("Invalid UTF-8 lead byte");
-            while (count--) {
-                if (p >= bytes.length || (bytes[p] & 192) !== 128) fail("Truncated or invalid UTF-8");
-                value = value * 64 + (bytes[p++] & 63);
-            }
-            if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) fail("Invalid UTF-8 scalar");
-            out += String.fromCodePoint(value);
-        }
-        return out.replace(/^\uFEFF/, "");
-    }
-    function textBytes(bytes) {
-        if (bytes.length >= 2 && ((bytes[0] === 255 && bytes[1] === 254) || (bytes[0] === 254 && bytes[1] === 255))) {
-            if (bytes.length % 2) fail("Truncated UTF-16");
-            let text = ""; const little = bytes[0] === 255;
-            for (let p = 2; p < bytes.length; p += 2) text += String.fromCharCode(little ? bytes[p] + 256 * bytes[p + 1] : 256 * bytes[p] + bytes[p + 1]);
-            return text;
-        }
-        return utf8(bytes);
-    }
+    const {utf8, text: textBytes} = sense.bytes;
     function bytes(material) {
         if (material.kind !== "file" || !material.data) fail("This sense needs file bytes from sense.source.read");
         const data = material.data instanceof Uint8Array ? material.data : Uint8Array.from(material.data);
@@ -163,14 +134,3 @@ var NativeKit = (() => {
     return { maximumTextBytes, maximumItems, fail, utf8Length, prefix, utf8, textBytes,
         bytes, root, sourceAddress, address, thing, paragraphs, column, deltaRows, publish, changed };
 })();
-
-function watch() { sense.source.watch(); }
-function changed(material) { NativeKit.changed(material); }
-
-// Replace this read with your format reader; the plain-text starter is runnable.
-function read(request) {
-    const material = sense.source.read(NativeKit.sourceAddress(request.address));
-    if (material.kind !== "text") NativeKit.fail("The starter frame needs a format-specific reader for this material");
-    const root = "text:document";
-    NativeKit.publish("need:document", root, "Document", [NativeKit.thing("Text", "text", root + "/text", material.text)], request);
-}

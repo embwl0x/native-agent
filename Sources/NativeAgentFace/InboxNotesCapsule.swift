@@ -13,21 +13,21 @@ struct InboxNotesCapsule: View {
     @State private var actionFlight = InboxRowActionFlight()
     @State private var isMarkingAll = false
     @State private var failedReads: [String: String] = [:]
-    @State private var session = FacePageSession()
+    @State private var capsuleSession = FacePageSession()
+    @State private var listSession = FacePageSession()
 
     var body: some View {
         let unread = ids
         ZStack {
             if !unread.isEmpty || !failedReads.isEmpty {
+                let label = failedReads.isEmpty
+                    ? "\(unread.count) \(unread.count == 1 ? "update" : "updates")"
+                    : "\(failedReads.count) updates need review"
                 FaceView(face: PartFace(sections: [
                     .init(id: "capsule", style: .flow, rows: [
-                        .init(id: "capsule", title: "", actions: [
-                            .init(id: "open", label: failedReads.isEmpty
-                                  ? "\(unread.count) \(unread.count == 1 ? "update" : "updates")"
-                                  : "\(failedReads.count) updates need review", open: "page:inbox/notes"),
-                        ]),
+                        .init(id: "capsule", title: label, open: "page:inbox/notes"),
                     ]),
-                ]), door: ReadOnlyFaceDoor(open: { _ in showsList.toggle() }), session: FacePageSession(), retaining: false)
+                ]), door: ReadOnlyFaceDoor(open: { _ in showsList.toggle() }), session: capsuleSession)
                 .help("Unread notes")
                 .accessibilityLabel(failedReads.isEmpty
                                     ? "\(unread.count) unread \(unread.count == 1 ? "update" : "updates")"
@@ -55,10 +55,11 @@ struct InboxNotesCapsule: View {
 
     private func list(_ unread: [String]) -> some View {
         List {
-            FaceView(face: notesPage(unread, start: 0), door: notesDoor(unread), session: session)
+            FaceView(face: notesPage(unread, start: 0), door: notesDoor(unread), session: listSession)
         }
-        .environment(\.faceInList, true)
+        .faceList()
         .listStyle(.plain)
+        .scrollContentBackground(.hidden)
         .macFaceStyle()
         .frame(width: 360, height: (min(CGFloat(unread.count), 8) + 2) * 44)
     }

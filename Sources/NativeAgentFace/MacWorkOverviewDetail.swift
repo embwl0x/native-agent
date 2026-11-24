@@ -11,7 +11,10 @@ struct MacWorkOverviewDetail: View {
     private var detail: WorkDetailFace? { appModel.face.slot(key).value(as: WorkDetailFace.self) }
     var body: some View {
         PageSheetHost(title: detail?.title, onDone: onDone) {
-            if reference.kind == .approval || reference.kind == .inbox {
+            if reference.kind == .approval {
+                if detail?.state == .ready { FacePageView(page: "inbox", rowID: reference.id) }
+                else { FaceReadStatus(state: detail?.state) }
+            } else if reference.kind == .inbox {
                 FacePageView(page: "inbox")
             } else {
                 ScrollView {

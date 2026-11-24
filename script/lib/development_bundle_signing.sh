@@ -163,14 +163,6 @@ _nativeagent_sign_widget() {
   return "$result"
 }
 
-_nativeagent_strip_unprovisioned_entitlements() {
-  local source_entitlements="$1" output="$2"
-  # The current personal development profile does not grant this future-facing
-  # capability. Signing it anyway causes AMFI to reject the bundle at launch.
-  /usr/bin/perl -0pe 's/\s*<key>com\.apple\.developer\.background-tasks<\/key>\s*<array>.*?<\/array>//s' \
-    "$source_entitlements" > "$output"
-}
-
 # Push (CloudKit phone→Mac notifications) needs aps-environment in the signed
 # payload; codesign does not copy it from the embedded profile. Sign whatever
 # environment the profile grants, and nothing when it grants none.
@@ -235,7 +227,7 @@ _nativeagent_sign_with_development_identity() {
 
   entitlement_template="${TMPDIR:-/tmp}/na_ent_template.$$.entitlements"
   entitlement_sign="${TMPDIR:-/tmp}/na_ent_sign.$$.entitlements"
-  if ! _nativeagent_strip_unprovisioned_entitlements "$source_entitlements" "$entitlement_template" \
+  if ! cp "$source_entitlements" "$entitlement_template" \
     || ! verify_profile_identity_contract "$profile_plist" "$bundle_id" \
     || ! _nativeagent_set_widget_group "$bundle" "$entitlement_template" "$profile_plist" \
     || ! prepare_profile_signing_entitlements "$entitlement_template" "$profile_plist" "$entitlement_sign" \

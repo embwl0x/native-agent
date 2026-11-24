@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 import Sparkle
-import SystemOps
+import DeskCore
 import NativeAgentCore
 import NativeAgentShared
 
@@ -292,7 +292,7 @@ final class UpdateController: NSObject {
             alert.messageText = "Software updates could not start"
             alert.informativeText = startupFailure
             alert.addButton(withTitle: "OK")
-            Task { _ = try? await FaceNativePanel.confirm(alert) }
+            Task { _ = try? await FaceNativePanel.confirm(alert, activate: true) }
             return
         }
         let reason = unavailability ?? .notConfigured
@@ -309,7 +309,7 @@ final class UpdateController: NSObject {
         if releaseURL != nil { alert.addButton(withTitle: "Open Releases") }
 
         Task {
-            if try await FaceNativePanel.confirm(alert) == .alertSecondButtonReturn, let releaseURL {
+            if try await FaceNativePanel.confirm(alert, activate: true) == .alertSecondButtonReturn, let releaseURL {
                 NSWorkspace.shared.open(releaseURL)
             }
         }

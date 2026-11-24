@@ -1,7 +1,7 @@
 import AVFoundation
 import Foundation
 import NativeAgentShared
-import os
+import Synchronization
 // Blueprint: | `MobileTalkAudio.swift` | Full-duplex voice capture, timed on-device recognition and quiet acknowledgment |
 
 /// Keep one audio session running across input, output, turns, mute and backgrounding.
@@ -10,7 +10,8 @@ actor MobileTalkAudio {
     private var analyzer: MobileSpeechAnalyzer?
     private var tapped = false
     private var active = false
-    private let muted = OSAllocatedUnfairLock(initialState: false)
+    private final class Mute: Sendable { let active = Atomic(false) }
+    private let mute = Mute()
 
     func start(names: [String], onLevel: @escaping @Sendable (Float, Double) -> Void,
                onResult: @escaping @Sendable (NativeAgentShared.SpeechUtterance, Double) -> Void,
@@ -20,7 +21,7 @@ actor MobileTalkAudio {
             throw Self.failure("Talk needs on-device speech recognition for this device and language. Dictation and voice notes are available in Chat.")
         }
         try Task.checkCancellation()
-        muted.withLock { $0 = false }
+        mute.active.store(false, ordering: .releasing)
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
         try session.setAllowHapticsAndSystemSoundsDuringRecording(false)
@@ -36,11 +37,11 @@ actor MobileTalkAudio {
         guard !Task.isCancelled, self.engine === engine else { await analyzer.cancel(); throw CancellationError() }
         self.analyzer = analyzer
         analyzer.startConversation(onResult: onResult, onSpeech: onSpeech, onError: onError)
-        let muted = self.muted
-        let frames = OSAllocatedUnfairLock(initialState: Int64(0))
+        let mute = self.mute
+        let frames = Mutex(Int64(0))
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
             // Feed silence while muted to advance time without admitting words; pre-mute results must not appear as new speech.
-            let isMuted = muted.withLock { $0 }
+            let isMuted = mute.active.load(ordering: .acquiring)
             let time = frames.withLock { frames in
                 frames += Int64(buffer.frameLength)
                 return Double(frames) / format.sampleRate
@@ -65,7 +66,7 @@ actor MobileTalkAudio {
         try engine.start()
     }
 
-    nonisolated func setMuted(_ value: Bool) { muted.withLock { $0 = value } }
+    nonisolated func setMuted(_ value: Bool) { mute.active.store(value, ordering: .releasing) }
 
     func stop() throws {
         if tapped { engine?.inputNode.removeTap(onBus: 0) }

@@ -21,14 +21,16 @@ struct MobileQuickAskIntent: OpenIntent {
                 userInfo: [NSLocalizedDescriptionKey: "NativeAgent's shared storage is unavailable."])
         }
         defaults.set(true, forKey: MobileQuickAskRoute.key)
-        NotificationCenter.default.post(name: MobileQuickAskRoute.notification, object: nil)
+        NotificationCenter.default.post(MobileQuickAskRoute.Requested())
         return .result()
     }
 }
 
 enum MobileQuickAskRoute {
     static let key = "NativeAgentMobile.quickAsk"
-    static let notification = Notification.Name("NativeAgentMobile.quickAsk")
+    struct Requested: NotificationCenter.MainActorMessage {
+        typealias Subject = NSObject
+    }
     static var defaults: UserDefaults? {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "NativeAgentAppGroupID") as? String else { return nil }
         return UserDefaults(suiteName: group)

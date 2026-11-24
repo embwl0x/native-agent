@@ -24,7 +24,7 @@ function face(input) {
     sections.push(documents.state === "available"
         ? {id: "documents", title: "Persona documents", style: "list",
             footer: "Open a document to read or edit it. About you is written from memory and stays read-only here.",
-            rows: documents.documents.map(doc => timed({id: "document:" + doc.id, title: doc.title, detail: doc.firstLine,
+            rows: documents.documents.map(doc => timed({id: "document:" + doc.id, title: doc.title,
                 open: keys["document:" + doc.id].open}, doc.updatedAt))}
         : issue("documents", "Persona documents", documents.reason));
 
@@ -47,7 +47,6 @@ function face(input) {
         const rows = [{id: "dreams", title: "Dream diary", value: dreams.enabled ? "Dream cycle on" : "Dream cycle off", open: keys.dreams.open}];
         for (const entry of dreams.entries) {
             const row = {id: "dream:" + entry.date, title: entry.date, open: keys["dream:" + entry.date].open};
-            if (entry.firstLine !== null) row.detail = entry.firstLine;
             rows.push(timed(row, entry.modifiedAt));
         }
         if (dreams.unreadable !== null && dreams.unreadable > 0) {

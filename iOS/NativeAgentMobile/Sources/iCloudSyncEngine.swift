@@ -7,8 +7,6 @@ import NativeAgentShared
 
 // MARK: - Inbox action envelope (iOS → Mac)
 
-typealias InboxAction = NativeAgentShared.InboxAction
-
 extension InboxAction {
     static func make(action: String, payload: [String: String]) -> InboxAction {
         InboxAction(
@@ -274,6 +272,7 @@ final class iCloudSyncEngine {
     @ObservationIgnored let memoryRead = LatestRead()
     @ObservationIgnored let inboxRead = LatestRead()
     @ObservationIgnored let deskRead = LatestRead()
+    @ObservationIgnored let facesRead = LatestRead()
     @ObservationIgnored let approvalsRead = LatestRead()
     @ObservationIgnored let transcriptsRead = LatestRead()
     @ObservationIgnored let sessionListRead = LatestRead()

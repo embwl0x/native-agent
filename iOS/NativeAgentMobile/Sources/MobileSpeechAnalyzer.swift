@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Speech
 import AVFoundation
 import CoreMedia
@@ -6,19 +7,20 @@ import NativeAgentShared
 // Blueprint: | `MobileSpeechAnalyzer.swift` | On-device timed recognition, name context and PCM conversion; detector events retain capture |
 
 /// Admit only supported device/locale pairs; report admitted failures without switching recognition engines.
-@available(iOS 26.0, *)
-final class MobileSpeechAnalyzer: @unchecked Sendable {
+final class MobileSpeechAnalyzer: Sendable {
     private let analyzer: SpeechAnalyzer
     private let transcriber: SpeechTranscriber
     private let input: AsyncStream<AnalyzerInput>
     private let continuation: AsyncStream<AnalyzerInput>.Continuation
-    private let converter: AVAudioConverter
+    private let converter: Mutex<AVAudioConverter>
     private let format: AVAudioFormat
-    private let conversionLock = NSLock()
-    private var resultTask: Task<Void, Never>?
-    private var analysisTask: Task<Void, Never>?
     private let detector: SpeechDetector?
-    private var detectionTask: Task<Void, Never>?
+    private struct Tasks {
+        var result: Task<Void, Never>?
+        var analysis: Task<Void, Never>?
+        var detection: Task<Void, Never>?
+    }
+    private let tasks = Mutex(Tasks())
 
     static func supportedLocale() async -> Locale? {
         guard SpeechTranscriber.isAvailable else { return nil }
@@ -42,7 +44,7 @@ final class MobileSpeechAnalyzer: @unchecked Sendable {
             throw NSError(domain: "VoiceNote", code: 1, userInfo: [NSLocalizedDescriptionKey: "The microphone format cannot be used for on-device speech."])
         }
         self.format = format
-        self.converter = converter
+        self.converter = Mutex(converter)
         let stream = AsyncStream.makeStream(of: AnalyzerInput.self)
         input = stream.stream
         continuation = stream.continuation
@@ -57,48 +59,52 @@ final class MobileSpeechAnalyzer: @unchecked Sendable {
     func startConversation(onResult: @escaping @Sendable (SpeechUtterance, Double) -> Void,
                            onSpeech: @escaping @Sendable (Bool, Double) -> Void,
                            onError: @escaping @Sendable (String) -> Void) {
-        resultTask = Task { [transcriber] in
-            do {
-                for try await result in transcriber.results {
-                    onResult(Self.utterance([result], final: result.isFinal), result.range.start.seconds)
-                }
-                if !Task.isCancelled { onError("On-device speech recognition ended. End talk and start again.") }
-            } catch { if !Task.isCancelled { Self.log("results", error); onError(error.localizedDescription) } }
-        }
-        detectionTask = Task { [detector] in
-            guard let detector else { return }
-            do {
-                for try await result in detector.results { onSpeech(result.speechDetected, result.range.end.seconds) }
-            } catch { if !Task.isCancelled { Self.log("detector", error); onError(error.localizedDescription) } }
-        }
-        analysisTask = Task { [analyzer, input] in
-            do { try await analyzer.start(inputSequence: input) }
-            catch { if !Task.isCancelled { Self.log("analyzer", error); onError(error.localizedDescription) } }
+        tasks.withLock { tasks in
+            tasks.result = Task { [transcriber] in
+                do {
+                    for try await result in transcriber.results {
+                        onResult(Self.utterance([result], final: result.isFinal), result.range.start.seconds)
+                    }
+                    if !Task.isCancelled { onError("On-device speech recognition ended. End talk and start again.") }
+                } catch { if !Task.isCancelled { Self.log("results", error); onError(error.localizedDescription) } }
+            }
+            tasks.detection = Task { [detector] in
+                guard let detector else { return }
+                do {
+                    for try await result in detector.results { onSpeech(result.speechDetected, result.range.end.seconds) }
+                } catch { if !Task.isCancelled { Self.log("detector", error); onError(error.localizedDescription) } }
+            }
+            tasks.analysis = Task { [analyzer, input] in
+                do { try await analyzer.start(inputSequence: input) }
+                catch { if !Task.isCancelled { Self.log("analyzer", error); onError(error.localizedDescription) } }
+            }
         }
     }
 
 
     func start(onResult: @escaping @Sendable (SpeechUtterance) -> Void,
                onError: @escaping @Sendable (String?) -> Void) {
-        resultTask = Task { [transcriber] in
-            var finals: [SpeechTranscriber.Result] = []
-            do {
-                for try await result in transcriber.results {
-                    if result.isFinal { finals.append(result) }
-                    let visible = result.isFinal ? finals : finals + [result]
-                    onResult(Self.utterance(visible, final: false))
-                }
-                onResult(Self.utterance(finals, final: true))
-            } catch { if !Task.isCancelled { onError(error.localizedDescription) } }
-        }
-        analysisTask = Task { [analyzer, input] in
-            do { try await analyzer.start(inputSequence: input) }
-            catch { if !Task.isCancelled { onError(error.localizedDescription) } }
+        tasks.withLock { tasks in
+            tasks.result = Task { [transcriber] in
+                var finals: [SpeechTranscriber.Result] = []
+                do {
+                    for try await result in transcriber.results {
+                        if result.isFinal { finals.append(result) }
+                        let visible = result.isFinal ? finals : finals + [result]
+                        onResult(Self.utterance(visible, final: false))
+                    }
+                    onResult(Self.utterance(finals, final: true))
+                } catch { if !Task.isCancelled { onError(error.localizedDescription) } }
+            }
+            tasks.analysis = Task { [analyzer, input] in
+                do { try await analyzer.start(inputSequence: input) }
+                catch { if !Task.isCancelled { onError(error.localizedDescription) } }
+            }
         }
     }
 
     func append(_ source: AVAudioPCMBuffer) throws {
-        try conversionLock.withLock {
+        try converter.withLock { converter in
             let capacity = AVAudioFrameCount(ceil(Double(source.frameLength) * format.sampleRate / source.format.sampleRate) + 32)
             guard let converted = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { throw CocoaError(.coderInvalidValue) }
             var supplied = false
@@ -121,8 +127,10 @@ final class MobileSpeechAnalyzer: @unchecked Sendable {
 
     func cancel() async {
         continuation.finish()
-        resultTask?.cancel(); analysisTask?.cancel()
-        detectionTask?.cancel()
+        let running = tasks.withLock { $0 }
+        running.result?.cancel()
+        running.analysis?.cancel()
+        running.detection?.cancel()
         await analyzer.cancelAndFinishNow()
     }
 

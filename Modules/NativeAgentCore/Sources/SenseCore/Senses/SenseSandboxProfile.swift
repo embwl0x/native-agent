@@ -1,0 +1,147 @@
+import Darwin
+import Foundation
+import PersistenceCore
+// Blueprint: | `Modules/NativeAgentCore/Sources/SenseCore/Senses/SenseSandboxProfile.swift` | Deny-default helper reach and exact-IP network fences |
+
+/// Supply code and material over the supervised plug so the sandbox needs no direct source access.
+public enum SenseSandboxProfile {
+    public static let senseLibraries = ["frame.js", "lib/zip.js", "lib/xml.js", "lib/documents.js", "lib/iwork.js", "lib/rtf.js"]
+    public static let analyzerLibraries = ["analyzer/acorn.js", "analyzer/program.js"]
+    public static let partLibrary = "part-kit.js"
+
+    public static func resources(for helper: URL) -> URL {
+        helper.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/Senses")
+    }
+
+    public static var credentialRoots: [URL] {
+        [".ssh", ".aws", ".gnupg", ".codex", "Library/Keychains"]
+            .map { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent($0) }
+    }
+
+    /// Filesystem identity fences alternate spellings; a path stat cannot resolve is judged by its nearest resolvable ancestor.
+    public static func containsResolved(_ candidate: URL, roots: [URL]) throws -> Bool {
+        let identities = try roots.compactMap { root -> stat? in
+            var info = stat()
+            guard stat(root.path, &info) == 0 else {
+                let code = errno
+                if code == ENOENT || code == ENOTDIR { return nil }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: root.path])
+            }
+            return info
+        }
+        var ancestor = candidate
+        while true {
+            var info = stat()
+            // A spelling stat cannot resolve cannot be opened either; its nearest resolvable ancestor decides.
+            if stat(ancestor.path, &info) == 0,
+               identities.contains(where: { $0.st_dev == info.st_dev && $0.st_ino == info.st_ino }) { return true }
+            let parent = ancestor.deletingLastPathComponent()
+            if parent.path == ancestor.path { return false }
+            ancestor = parent
+        }
+    }
+
+    private static func exclusions(dataRoot: URL, personaRoot: URL) -> (roots: [URL], deliveryWorkspace: URL) {
+        ([dataRoot, personaRoot] + credentialRoots, NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot))
+    }
+
+    /// App delivery may reach the workspace, but the helper must not directly reach it or other private roots.
+    public static func requirePublicPath(_ path: String, dataRoot: URL, personaRoot: URL) throws {
+        let candidate = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let policy = exclusions(dataRoot: dataRoot, personaRoot: personaRoot)
+        if try containsResolved(candidate, roots: [policy.deliveryWorkspace]) { return }
+        guard try !containsResolved(candidate, roots: policy.roots) else {
+            throw SenseFailure(code: "source_denied", message: "Sense material cannot come from private app stores, persona or credentials.")
+        }
+    }
+
+    public static func build(reach: SenseReach, helperURL: URL, scratch: URL,
+                             dataRoot: URL, personaRoot: URL) throws -> String {
+        func quote(_ path: String) -> String {
+            "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        func path(_ url: URL) -> String {
+            quote(url.standardizedFileURL.resolvingSymlinksInPath().path)
+        }
+        guard scratch.isFileURL, dataRoot.isFileURL, personaRoot.isFileURL, helperURL.isFileURL,
+              scratch.standardizedFileURL.path != "/" else {
+            throw SenseFailure(code: "bad_reach", message: "Sense sandbox requires local roots and a private scratch folder.")
+        }
+        let scratchPath = scratch.standardizedFileURL.resolvingSymlinksInPath().path
+        let scratchAttributes = try FileManager.default.attributesOfItem(atPath: scratchPath)
+        guard scratchAttributes[.type] as? FileAttributeType == .typeDirectory,
+              (scratchAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o700,
+              (scratchAttributes[.ownerAccountID] as? NSNumber)?.uint32Value == geteuid(),
+              ![dataRoot, personaRoot].contains(where: {
+                  let root = $0.standardizedFileURL.resolvingSymlinksInPath().path
+                  return NativeAgentWorkspaceRoot.relativePath(scratchPath, under: root) != nil
+              }) else {
+            throw SenseFailure(code: "bad_reach", message: "Sense scratch must be an owned 0700 directory outside data and persona roots.")
+        }
+        let resources = Self.resources(for: helperURL)
+        let libraries = (senseLibraries + analyzerLibraries + ["sense.js", partLibrary]).map { "(literal \(path(resources.appendingPathComponent($0))))" }
+        var rules = [
+            "(version 1)", "(deny default)",
+            "(allow process-info* (target self) (target children))",
+            "(allow sysctl-read)",
+            "(allow signal (target self) (target children))",
+            "(allow file-read-metadata)",
+            """
+                (allow file-read-data (literal \"/\") (subpath \"/System\") (subpath \"/private/var/db/timezone\") (subpath \"/usr/share/icu\") (subpath \
+                \"/usr/lib\") (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \(path(helperURL))) \(libraries.joined(separator: " ")))
+                """,
+            "(allow file-write-data (literal \"/dev/null\"))",
+            "(allow file-read-data file-write-data (literal \"/dev/stdin\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") (subpath \"/dev/fd\"))",
+            "(allow process-exec (literal \(path(helperURL))))",
+            "(allow file-map-executable (subpath \"/System\") (subpath \"/usr/lib\") (literal \(path(helperURL))))",
+        ]
+        for readPath in reach.readPaths {
+            guard readPath.hasPrefix("/"), !readPath.contains("\u{0}"), !readPath.contains("\n") else {
+                throw SenseFailure(code: "bad_reach", message: "Sense read reach must contain absolute paths.")
+            }
+            rules.append("(allow file-read-data (subpath \(path(URL(fileURLWithPath: readPath)))))")
+        }
+        // Resolve before launch because Seatbelt must fence exact IPs; DNS changes require a fresh profile.
+        for host in reach.hosts {
+            guard !host.isEmpty, host.utf8.count <= 253,
+                  host.unicodeScalars.allSatisfy({
+                      CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:").contains($0)
+                  }) else {
+                throw SenseFailure(code: "bad_reach", message: "Sense network reach requires exact hosts without wildcards, ports or URLs.")
+            }
+            var hints = addrinfo()
+            hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM
+            var result: UnsafeMutablePointer<addrinfo>?
+            guard unsafe getaddrinfo(host, nil, &hints, &result) == 0, let first = unsafe result else {
+                throw SenseFailure(code: "bad_reach", message: "Sense network host could not be resolved: \(host).")
+            }
+            defer { unsafe freeaddrinfo(first) }
+            var cursor: UnsafeMutablePointer<addrinfo>? = unsafe first
+            var addresses = Set<String>()
+            while let info = unsafe cursor {
+                var numeric = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if unsafe getnameinfo(info.pointee.ai_addr, info.pointee.ai_addrlen, &numeric, socklen_t(numeric.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    addresses.insert(String(decoding: numeric.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
+                }
+                cursor = unsafe info.pointee.ai_next
+            }
+            guard !addresses.isEmpty else { throw SenseFailure(code: "bad_reach", message: "Sense network host has no IP addresses.") }
+            for address in addresses.sorted() {
+                rules.append("(allow network-outbound (remote ip \(quote(address.contains(":") ? "[\(address)]:*" : "\(address):*"))))")
+            }
+        }
+        if !reach.hosts.isEmpty {
+            rules.append("""
+                (allow mach-lookup (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \
+                \"com.apple.trustd\") (global-name \"com.apple.trustd.agent\"))
+                """)
+        }
+        // Private-root denies must win over root reach; workspace access belongs only to app-side delivery.
+        for root in exclusions(dataRoot: dataRoot, personaRoot: personaRoot).roots {
+            rules.append("(deny file-read* file-write* (subpath \(path(root))))")
+        }
+        return rules.joined(separator: "\n")
+    }
+}

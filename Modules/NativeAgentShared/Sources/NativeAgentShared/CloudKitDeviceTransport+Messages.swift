@@ -1,8 +1,8 @@
-#if canImport(CloudKit) && !os(Linux)
 import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
+import Synchronization
 // Blueprint: | `CloudKitDeviceTransport+Messages.swift` | Signed sends and serialized two-family drains |
 
 extension CloudKitDeviceTransport {
@@ -189,21 +189,23 @@ extension CloudKitDeviceTransport {
 
     /// Coalesce only callers requesting a re-run; periodic wakes must not extend an active drain.
     private func beginDrainOrCoalesce(queueIfBusy: Bool) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if drainInFlight {
-            if queueIfBusy { drainAgain = true }
-            return false
+        return state.withLock { state in
+            if state.drainInFlight {
+                if queueIfBusy { state.drainAgain = true }
+                return false
+            }
+            state.drainInFlight = true
+            return true
         }
-        drainInFlight = true
-        return true
     }
 
     private func endDrainOrContinue(recovery: DeviceSyncRecovery) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if drainAgain && recovery.isActive { drainAgain = false; return true }
-        drainAgain = false
-        drainInFlight = false
-        return false
+        return state.withLock { state in
+            if state.drainAgain && recovery.isActive { state.drainAgain = false; return true }
+            state.drainAgain = false
+            state.drainInFlight = false
+            return false
+        }
     }
 
     // Only the serialized drain calls this body; concurrent bodies can lose records.
@@ -266,11 +268,11 @@ extension CloudKitDeviceTransport {
 
     /// Message first, then bell. The bell never fails or delays the send it follows; a lost write is carried by the next send's bell.
     private func ringBell(_ recordName: String) {
-        lock.lock()
-        bellEntries.removeAll { $0.name == recordName }
-        bellEntries.append(DeviceBellEntry(name: recordName, sentAt: Date()))
-        if bellEntries.count > Self.bellCapacity { bellEntries.removeFirst(bellEntries.count - Self.bellCapacity) }
-        lock.unlock()
+        state.withLock { state in
+            state.bellEntries.removeAll { $0.name == recordName }
+            state.bellEntries.append(DeviceBellEntry(name: recordName, sentAt: Date()))
+            if state.bellEntries.count > Self.bellCapacity { state.bellEntries.removeFirst(state.bellEntries.count - Self.bellCapacity) }
+        }
         Task {
             guard let secret = await self.loadAssetSecretProvider()?(), secret.count == 32 else { return }
             do { try await self.writeStatus(key: Self.bellKey, pairingSecret: secret) { try self.bellValue(secret: secret) } }
@@ -280,7 +282,7 @@ extension CloudKitDeviceTransport {
 
     /// Signed as the phone's contact status is: a signed envelope whose text is the list.
     private func bellValue(secret: Data) throws -> String {
-        lock.lock(); let entries = bellEntries; lock.unlock()
+        let entries = state.withLock { $0.bellEntries }
         let list = String(decoding: try JSONEncoder().encode(entries), as: UTF8.self)
         let message = try BridgeMessage.make(sender: role.rawValue, text: list, metadata: ["kind": Self.bellKey]).signed(with: secret)
         let encoder = JSONEncoder()
@@ -442,8 +444,9 @@ extension CloudKitDeviceTransport {
 
     /// Mac-only admission for authenticated input that must reach its owner while ordinary chat is held.
     public func setControlAdmission(_ admission: @escaping @Sendable (BridgeMessage) async -> Bool) {
-        lock.lock(); defer { lock.unlock() }
-        controlAdmission = admission
+        state.withLock { state in
+            state.controlAdmission = admission
+        }
     }
 
     @discardableResult
@@ -482,25 +485,25 @@ extension CloudKitDeviceTransport {
     }
 
     private func isControlDrainInFlight() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return controlDrainInFlight
+        return state.withLock { $0.controlDrainInFlight }
     }
 
     private func beginControlDrain() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard !controlDrainInFlight else { return false }
-        controlDrainInFlight = true
-        return true
+        return state.withLock { state in
+            guard !state.controlDrainInFlight else { return false }
+            state.controlDrainInFlight = true
+            return true
+        }
     }
 
     private func endControlDrain() {
-        lock.lock(); defer { lock.unlock() }
-        controlDrainInFlight = false
+        state.withLock { state in
+            state.controlDrainInFlight = false
+        }
     }
 
     private func loadControlAdmission() -> (@Sendable (BridgeMessage) async -> Bool)? {
-        lock.lock(); defer { lock.unlock() }
-        return controlAdmission
+        return state.withLock { $0.controlAdmission }
     }
 
     func deliverControls(_ records: [(fields: NAChatMessageFields, modDate: Date?)],
@@ -571,4 +574,3 @@ extension CloudKitDeviceTransport {
         return max(previousCursor, candidate)
     }
 }
-#endif

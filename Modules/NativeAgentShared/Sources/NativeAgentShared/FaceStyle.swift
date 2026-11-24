@@ -1,4 +1,6 @@
 import SwiftUI
+import Foundation
+import Observation
 #if os(iOS)
 import UIKit
 #else
@@ -48,8 +50,7 @@ public struct FaceStyle: Sendable {
 
 public extension EnvironmentValues {
     @Entry var faceStyle: FaceStyle = .inherited
-    /// A list owns cards and dividers; an embedded face draws its own groups.
-    @Entry var faceInList = false
+    @Entry var faceListColumnWidth: CGFloat? = nil
     /// Quiet capture draws the held reading or its waiting state, without starting lifecycle work.
     @Entry var faceHoldsDocuments = true
 }
@@ -57,4 +58,119 @@ public extension EnvironmentValues {
 struct FaceCard: ViewModifier {
     @Environment(\.faceStyle) private var style
     func body(content: Content) -> some View { style.card(AnyView(content)) }
+}
+
+extension EnvironmentValues {
+    @Entry var faceContainerWidth: CGFloat = 0
+    @Entry var faceListWidth: FaceListWidth? = nil
+}
+
+@MainActor @Observable final class FaceConfirmations {
+    enum Source: Equatable { case row(UUID), control(UUID) }
+
+    struct Request {
+        let source: Source
+        let title: String
+        let label: String
+        let role: ButtonRole?
+        let perform: @MainActor () -> Void
+    }
+
+    var pending: Request?
+}
+
+struct FaceDialogs: ViewModifier {
+    #if os(macOS)
+    @State private var confirmations = FaceConfirmations()
+    #endif
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content.environment(confirmations)
+            .modifier(FaceConfirmationDialog(pending: Binding(
+                get: { confirmations.pending }, set: { confirmations.pending = $0 })))
+        #else
+        content
+        #endif
+    }
+}
+
+struct FaceConfirmationDialog: ViewModifier {
+    @Binding var pending: FaceConfirmations.Request?
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(pending?.title ?? "", isPresented: Binding(
+            get: { pending != nil }, set: { if !$0 { pending = nil } }),
+            titleVisibility: .visible, presenting: pending) { request in
+            Button(request.label, role: request.role) { request.perform() }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
+}
+
+struct FaceWidth: ViewModifier {
+    @State private var width: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content.environment(\.faceContainerWidth, width)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+    }
+}
+
+@MainActor @Observable final class FaceListWidth {
+    var width: CGFloat = 0
+    @ObservationIgnored private var mounted: [UUID: Binding<Bool>] = [:]
+    @ObservationIgnored private var reader: UUID?
+
+    func attach(_ id: UUID, measuring: Binding<Bool>) {
+        mounted[id] = measuring
+        if reader == nil { reader = id }
+        measuring.wrappedValue = reader == id
+    }
+
+    func detach(_ id: UUID) {
+        mounted.removeValue(forKey: id)
+        if reader == id {
+            reader = mounted.keys.first
+            if let reader { mounted[reader]?.wrappedValue = true }
+        }
+    }
+
+    func measured(_ width: CGFloat, by id: UUID) {
+        if reader == id { self.width = width }
+    }
+}
+
+struct FaceListWidthProbe: ViewModifier {
+    let list: FaceListWidth
+    @State private var id = UUID()
+    @State private var measuring = false
+
+    func body(content: Content) -> some View {
+        content.background {
+            if measuring {
+                Color.clear.allowsHitTesting(false).onGeometryChange(for: CGFloat.self) { $0.size.width } action: { list.measured($0, by: id) }
+            }
+        }
+        .onAppear { list.attach(id, measuring: $measuring) }
+        .onDisappear { list.detach(id) }
+    }
+}
+
+private struct FaceListHost: ViewModifier {
+    @State private var list = FaceListWidth()
+
+    func body(content: Content) -> some View {
+        content.environment(\.faceContainerWidth, list.width)
+            .environment(\.faceListWidth, list)
+            .modifier(FaceDialogs())
+    }
+}
+
+public extension View {
+    @ViewBuilder func faceList(_ enabled: Bool = true) -> some View {
+        if enabled { modifier(FaceListHost()) }
+        else { environment(\.faceListWidth, nil) }
+    }
 }

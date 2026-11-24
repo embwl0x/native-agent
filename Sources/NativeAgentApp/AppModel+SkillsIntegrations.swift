@@ -1,18 +1,13 @@
-import EngineRuntime
-import ApprovalTransactions
+import BodyRuntime
 import Foundation
 import NativeAgentCore
 import SwiftUI
 import NativeAgentShared
 import PersistenceCore
-import AppToolRuntime
-import ToolRegistry
+import DeskCore
 import ProviderRouting
-import DoctorChecks
-import Research
-import Connectors
-import ChatTurnRuntime
-import ChatTurnContracts
+import MacNerves
+import MindCore
 // Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`: connector updates, Telegram status/test/clear through the Telegram owner, Doctor runs |
 
 enum ConnectorUpdateOutcome: Equatable {

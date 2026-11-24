@@ -1,0 +1,64 @@
+// Project checked envelopes directly into Sendable values without JSON reserialization. Wrong-shaped entity fields are absent; malformed elements fail the read
+// rather than disappearing.
+
+import Foundation
+import PersistenceCore
+// Blueprint: | `KnowledgeGraphTypedRead.swift` | Typed checked projections on `SwiftNativeKnowledgeGraphReader` |
+
+public struct KnowledgeGraphEntity: Sendable, Identifiable, Hashable {
+    public var id: String
+    public var name: String
+    public var type: String
+    public var firstSeen: String?
+    public var lastSeen: String?
+    public var mentionCount: Int?
+    public var aliases: [String]?
+    public var summary: String?
+    /// The agent's contact this entity names (`peer:<id>`), derived by the indexer from the agent's contacts.
+    public var contactID: String?
+}
+
+public struct KnowledgeGraphEdge: Sendable, Identifiable, Hashable {
+    public var id: String { "\(from)-\(to)-\(kind)" }
+    public var from: String
+    public var to: String
+    public var kind: String
+    public var weight: Double?
+    public var mentionCount: Int?
+}
+
+extension KnowledgeGraphEntity {
+    init(checked value: JSONValue) throws {
+        guard case .object(let o) = value else {
+            throw KnowledgeGraphReadError.malformedEnvelope("entity was not an object")
+        }
+        id = o["id"]?.stringValue ?? ""
+        name = o["name"]?.stringValue ?? ""
+        type = o["type"]?.stringValue ?? ""
+        firstSeen = o["first_seen"]?.stringValue
+        lastSeen = o["last_seen"]?.stringValue
+        mentionCount = o["mention_count"]?.exactIntegerValue
+        if case .array(let raw)? = o["aliases"] {
+            let strings = raw.compactMap(\.stringValue)
+            aliases = strings.count == raw.count ? strings : nil
+        }
+        summary = o["summary"]?.stringValue
+        contactID = o["contact_id"]?.stringValue
+    }
+}
+
+extension KnowledgeGraphEdge {
+    init(checked value: JSONValue) throws {
+        guard case .object(let o) = value,
+              let from = o["from"]?.stringValue,
+              let to = o["to"]?.stringValue,
+              let kind = o["kind"]?.stringValue ?? o["type"]?.stringValue else {
+            throw KnowledgeGraphReadError.malformedEnvelope("edge needs string endpoints and a kind")
+        }
+        self.from = from
+        self.to = to
+        self.kind = kind
+        weight = o["weight"]?.numberValue(coercingStrings: false, finiteOnly: false)
+        mentionCount = o["mention_count"]?.exactIntegerValue
+    }
+}

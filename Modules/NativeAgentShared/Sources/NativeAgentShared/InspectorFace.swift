@@ -20,6 +20,10 @@ public enum InspectorRowStatus: String, Equatable, Sendable, Codable {
 }
 
 public struct InspectorEventRow: Identifiable, Equatable, Sendable, Codable {
+    public enum TimestampRole: String, Equatable, Sendable, Codable {
+        case start, end
+    }
+
     public let id: String
     public let kind: String
     public let ts: Date
@@ -30,6 +34,7 @@ public struct InspectorEventRow: Identifiable, Equatable, Sendable, Codable {
     public let detailLines: [DetailLine]
     /// The engine's name for the call this row is; nil for an event that is no call.
     public let call: String?
+    public let timestampRole: TimestampRole?
 
     public struct DetailLine: Identifiable, Equatable, Sendable, Codable {
         public var id: String { label }
@@ -39,9 +44,11 @@ public struct InspectorEventRow: Identifiable, Equatable, Sendable, Codable {
     }
 
     public init(id: String, kind: String, ts: Date, status: InspectorRowStatus, title: String,
-                durationMs: Int?, isExpandable: Bool, detailLines: [DetailLine], call: String? = nil) {
+                durationMs: Int?, isExpandable: Bool, detailLines: [DetailLine], call: String? = nil,
+                timestampRole: TimestampRole? = nil) {
         self.id = id; self.kind = kind; self.ts = ts; self.status = status; self.title = title
         self.durationMs = durationMs; self.isExpandable = isExpandable; self.detailLines = detailLines; self.call = call
+        self.timestampRole = timestampRole
     }
 
     public var kindChip: String {
@@ -95,24 +102,37 @@ extension InspectorTurnCard {
             throw PartCallError(code: "inspector_cursor_invalid", message: "The Inspector event position exceeds this window's range.")
         }
         // A row is one line: a timed row shows its duration, an untimed one its time.
+        var meterStart = 0.0
+        var meterEnd = Double(wallMs)
+        for event in rows {
+            guard let duration = event.durationMs else { continue }
+            let start = event.meterStart(relativeTo: startedAt, duration: duration)
+            meterStart = min(meterStart, start)
+            meterEnd = max(meterEnd, start + Double(duration))
+        }
+        let meterSpan = max(1, meterEnd - meterStart)
         let projected: [PartFace.Row] = slice.map { event in
             .init(id: event.id, title: event.title, detail: event.call ?? event.kindChip,
                   value: event.durationMs.map(Self.duration), at: event.durationMs == nil ? event.ts.formatted(.iso8601) : nil,
                   tone: event.faceTone, expands: event.isExpandable, read: event.isExpandable ? event.detailCall(turn: id) : nil,
                   // A call's bar sits where the call ran within its turn.
-                  meter: event.durationMs.map { .init(value: Double($0), max: Double(max(wallMs, 1)),
-                                                      start: max(0, event.ts.timeIntervalSince(startedAt) * 1_000)) })
+                  meter: event.durationMs.map { .init(value: Double($0), max: meterSpan,
+                                                      start: event.meterStart(relativeTo: startedAt, duration: $0) - meterStart) })
         }
+        let when = Calendar.current.isDateInToday(startedAt) ? "at " + startedAt.formatted(date: .omitted, time: .shortened)
+            : "on " + startedAt.formatted(date: .abbreviated, time: .shortened)
+        let title = "Turn " + when
+        let shortID = String(id.prefix(8))
         // The turn's own row leads a reading that starts the turn; a continuation adds only the rows after it.
         return PartFace(sections: [
-            .init(id: "turn:" + id, footer: String(id.prefix(8)), rows: cursor == nil ? [turnRow] + projected : projected,
+            .init(id: "turn:" + id, footer: shortID, rows: cursor == nil ? [turnRow(title: title)] + projected : projected,
                   more: next < rows.count ? .init(next: String(next), total: rows.count + 1, revision: pageRevision, read: collectionCall) : nil,
-                  revision: pageRevision),
+                  revision: pageRevision, filled: true, foldContext: title + ", " + shortID),
         ])
     }
 
     /// The turn in one line: when it started, its whole time and how many calls it made, led by its slowest call.
-    private var turnRow: PartFace.Row {
+    private func turnRow(title: String) -> PartFace.Row {
         let calls = rows.filter { $0.call != nil }
         let slowest = calls.compactMap { call in call.durationMs.map { (title: call.title, ms: $0) } }.max { $0.ms < $1.ms }
         var about = slowest.map { ["Slowest: " + $0.title + " · " + Self.duration($0.ms)] } ?? []
@@ -121,9 +141,7 @@ extension InspectorTurnCard {
         if let surface { about.append(surface) }
         about.append(eventCount == 1 ? "1 event" : "\(eventCount) events")
         let count = calls.isEmpty ? "no calls" : calls.count == 1 ? "1 call" : "\(calls.count) calls"
-        let when = Calendar.current.isDateInToday(startedAt) ? "at " + startedAt.formatted(date: .omitted, time: .shortened)
-            : "on " + startedAt.formatted(date: .abbreviated, time: .shortened)
-        return .init(id: "turn:" + id, title: "Turn " + when, detail: about.joined(separator: " · "),
+        return .init(id: "turn:" + id, title: title, detail: about.joined(separator: " · "),
                      value: Self.duration(wallMs) + " · " + count)
     }
 
@@ -147,7 +165,7 @@ extension InspectorTurnCard {
         return PartFace(sections: [
             .init(id: "event:" + event.id, title: event.kindChip, rows: [], block: .init(key: event.documentKey,
                   text: event.detailText.utf8.count <= PartFace.Block.inlineByteLimit ? event.detailText : nil,
-                  read: event.documentCall(turn: id), revision: event.documentRevision)),
+                  read: event.documentCall(turn: id), revision: event.documentRevision), filled: true),
         ])
     }
 
@@ -161,6 +179,11 @@ extension InspectorTurnCard {
 }
 
 private extension InspectorEventRow {
+    func meterStart(relativeTo start: Date, duration: Int) -> Double {
+        let offset = ts.timeIntervalSince(start) * 1_000
+        return timestampRole == .end ? offset - Double(duration) : offset
+    }
+
     var faceTone: PartFace.Tone {
         switch status {
         case .ok: .done

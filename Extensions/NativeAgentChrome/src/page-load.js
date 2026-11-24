@@ -18,6 +18,7 @@ export class PageLoads {
       state.documentId = details.documentId;
       state.committedAt = this.now();
       state.url = details.url;
+      state.transitionQualifiers = details.transitionQualifiers ?? [];
       state.error = null;
       this.changed(details.tabId);
     });
@@ -25,7 +26,7 @@ export class PageLoads {
       if (details.frameId !== 0) return;
       const state = this.documents.get(details.tabId) ?? this.newDocument(details.tabId);
       this.documents.set(details.tabId, { ...state, documentId: details.documentId, url: details.url,
-        contentAt: null, loadedAt: null, error: null });
+        transitionQualifiers: details.transitionQualifiers ?? [], contentAt: null, loadedAt: null, error: null });
       this.changed(details.tabId);
     };
     chrome.webNavigation.onHistoryStateUpdated.addListener(routeChanged);
@@ -52,7 +53,7 @@ export class PageLoads {
   now() { return performance.timeOrigin + performance.now(); }
 
   newDocument(tabId) {
-    const state = { documentId: null,
+    const state = { documentId: null, transitionQualifiers: null,
       committedAt: null, contentAt: null, loadedAt: null, error: null };
     this.documents.set(tabId, state);
     return state;
@@ -61,6 +62,7 @@ export class PageLoads {
   reader(tabId, documentId, observation) {
     const state = this.documents.get(tabId) ?? this.newDocument(tabId);
     if (state.documentId && state.documentId !== documentId && state.committedAt !== null) return;
+    if (state.documentId !== documentId || state.url !== observation.url) state.transitionQualifiers = null;
     state.documentId = documentId;
     state.url = observation.url;
     state.contentAt = observation.contentPresent === true && Number.isFinite(observation.contentPresentAt) ? observation.contentPresentAt : null;

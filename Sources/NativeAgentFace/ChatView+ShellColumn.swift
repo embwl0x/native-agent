@@ -202,10 +202,19 @@ extension ChatView {
         appModel.face.slot(.counts).select("approvals.waitingCount", as: CountsFace.self) { $0?.approvals.waitingCount }
     }
 
-    /// Derive failure from the loaded transcript so no duplicate retry counter can go stale.
-    var shellHasTrouble: Bool {
-        appModel.face.slot(.conversation(session: appModel.activeChatSessionId)).select("hasTrouble", as: ConversationFace.self) {
-            $0?.actions.contains { $0.failure != nil } == true
+    var shellConversationRead: ChatShellStatus.ConversationRead {
+        let session = appModel.activeChatSessionId
+        guard !session.isEmpty else {
+            return appModel.chatRestoreIssue != nil ? .unavailable : .missing
+        }
+        return appModel.face.slot(.conversation(session: session)).select("shellStatus", as: ConversationFace.self) { face in
+            guard let face else { return .missing }
+            switch face.state {
+            case .waiting(let on): return .waiting(on)
+            case .unavailable: return .unavailable
+            case .ready:
+                return face.attachments.contains { $0.kind == "trouble" } ? .trouble : .ready
+            }
         }
     }
 
@@ -213,7 +222,7 @@ extension ChatView {
         .make(
             pendingApprovals: shellPendingApprovalCount,
             approvalError: appModel.face.slot(.counts).select("approvals.error", as: CountsFace.self) { $0?.approvals.error },
-            hasTrouble: shellHasTrouble
+            conversation: shellConversationRead
         )
     }
 
@@ -249,11 +258,7 @@ extension ChatView {
                 latestPillLabel
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
-                    // Use an opaque pill for quiet capture because tinted glass can blank the bitmap.
-                    .background {
-                        if reduceTransparency || quietOffscreenRead { Capsule().fill(NativeAgentShell.room) }
-                    }
-                    .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate.interactive(), in: Capsule())
+                    .houseSurface(in: Capsule(), interactive: true, opaqueFill: NativeAgentShell.room)
             }
             .buttonStyle(.borderless)
             .accessibilityIdentifier("chat.latest")

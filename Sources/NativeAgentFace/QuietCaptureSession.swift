@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ImageIO
+import Observation
 import NativeAgentShared
 import QuickLookThumbnailing
 import WebKit
@@ -87,14 +88,13 @@ final class QuietCaptureSession {
                 observed.append(id)
                 try FaceWindowReply.check(try await appModel.client.act(.observe(id: id, demand: .key(key))))
                 // Wait on the value itself: the body's answer wakes this, and a stopped picture ends it.
-                let (changes, signal) = AsyncStream<Void>.makeStream()
-                defer { signal.finish() }
-                var events = changes.makeAsyncIterator()
-                while true {
-                    preview = withObservationTracking { appModel.face.slot(key).value(as: MakePreviewFace.self) } onChange: { signal.yield() }
-                    if let state = preview?.state, try Self.ready(state) { break }
-                    guard await events.next() != nil else { throw CancellationError() }
+                let changes = Observations { appModel.face.slot(key).value(as: MakePreviewFace.self) }
+                for await value in changes {
+                    try Task.checkCancellation()
+                    preview = value
+                    if let state = value?.state, try Self.ready(state) { break }
                 }
+                try Task.checkCancellation()
             }
             guard let preview, try Self.ready(preview.state) else { continue }
             makes[Self.key(piece.reference, piece.version)] = try await hold(preview, size: size)

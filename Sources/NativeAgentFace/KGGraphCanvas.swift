@@ -67,7 +67,13 @@ struct KGGraphCanvas: View {
                     }
                 }
                         }
-                        .background(Color.gray.opacity(0.04))
+                        .background(TodayPalette.cardFill, in: RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                                .allowsHitTesting(false)
+                        }
                         .accessibilityLabel("Knowledge graph")
                         .accessibilityChildren {
                             ForEach(nodes, id: \.id) { accessibleNode($0) }
@@ -149,10 +155,11 @@ enum KGGraphCanvasLayout {
         entities: [FaceGraphEntity], positions: [String: CGPoint], in size: CGSize,
         selectedID: String?, nodeRadius: CGFloat
     ) -> [String: CGRect] {
-        guard entities.count <= 40, size.width >= 24, size.height >= 20 else { return [:] }
+        guard size.width >= 24, size.height >= 20 else { return [:] }
         let width = min(100, size.width - 8)
         let height: CGFloat = 16
-        let ordered = entities.sorted {
+        let candidates = entities.count > 40 ? entities.filter { $0.id == selectedID } : entities
+        let ordered = candidates.sorted {
             if ($0.id == selectedID) != ($1.id == selectedID) { return $0.id == selectedID }
             return $0.id < $1.id
         }

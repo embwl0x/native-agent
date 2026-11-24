@@ -161,7 +161,7 @@ struct PageMakeBoard: View {
             } else if issue == nil { Text("Reading the board…").foregroundStyle(.secondary) }
         }
         // Until the board is read it holds the room it will take, so what follows it on the page does not jump down when it arrives.
-        .frame(minHeight: arrival == nil && !fillsWindow ? MakeBoardView.height : nil, alignment: .top)
+        .frame(minHeight: capture == nil && arrival == nil && !fillsWindow ? MakeBoardView.height : nil, alignment: .top)
         .task(id: preview) {
             guard capture == nil, let preview, preview.state == .ready, preview.reference == reference, preview.version == version,
                   let grant = preview.resources.first else { return }
@@ -277,8 +277,14 @@ struct MakeBoardView: View {
     }
 
     static let height: CGFloat = 560
+    static let pristineIdleInlineHeight: CGFloat = 220
     static let tableToolsInset: CGFloat = 10
     private var geometry: BoardGeometry { BoardGeometry(cards: reference == BoardDocument.tableRef ? cards : nil) }
+
+    private func isPristineIdleInline(_ document: BoardDocument) -> Bool {
+        !fillsWindow && reference == BoardDocument.tableRef && boardPage == "desk"
+            && document.elements.isEmpty && newNote == nil && writing == nil
+    }
 
     var body: some View {
         let state = MakeBoardState.of(reference)
@@ -286,6 +292,7 @@ struct MakeBoardView: View {
         let older = !still && state.read > MakeBoardState.number(arrival.version)
         let changeable = !still && !older && state.latest != nil
         let base = reference == BoardDocument.tableRef ? picture : changeable ? (state.current ?? arrival.document) : arrival.document
+        let pristine = isPristineIdleInline(base)
         VStack(alignment: .leading, spacing: 8) {
             if !still, let said = MakePieceWords.shared.said[reference] {
                 Text(said).font(ShellType.label).foregroundStyle(.secondary).textSelection(.enabled)
@@ -296,6 +303,7 @@ struct MakeBoardView: View {
             }
             GeometryReader { geometry in
                 let camera = self.camera ?? self.geometry.fit(base, in: geometry.size)
+                let placementSize = pristine ? CGSize(width: geometry.size.width, height: Self.height) : geometry.size
                 let drawn = reference == BoardDocument.tableRef ? base : hand.map(holding) ?? base
                 let mark = !still && !older ? connectFrom ?? chosen : nil
                 let joining = hand.flatMap(Self.joining)
@@ -344,7 +352,11 @@ struct MakeBoardView: View {
                     }
                     if !still && !older, state.latest != nil {
                         if reference == BoardDocument.tableRef {
-                            tableControls(state, camera: camera, size: geometry.size, document: drawn)
+                            GlassEffectContainer(spacing: 0) {
+                                ZStack(alignment: .topLeading) {
+                                    tableControls(state, camera: camera, size: geometry.size, placementSize: placementSize, document: drawn)
+                                }
+                            }
                         } else { controls(state, camera: camera, size: geometry.size, changeable: changeable) }
                     }
                 }
@@ -358,13 +370,13 @@ struct MakeBoardView: View {
                     .onEnded { value in
                         if let hand, case .draw = hand.kind { advance(to: value.location, state) }
                         else { hand?.now = value.location }
-                        if let held = hand { end(held, state, size: geometry.size) }
+                        if let held = hand { end(held, state, size: placementSize) }
                         hand = nil
                         deadPress = false
                     })
                 .simultaneousGesture(SpatialTapGesture(count: 2).onEnded { tap in
                     guard changeable, reference != BoardDocument.tableRef || tool == .select else { return }
-                    write(at: tap.location, base, camera: camera, size: geometry.size, state)
+                    write(at: tap.location, base, camera: camera, size: placementSize, state)
                 })
                 .simultaneousGesture(MagnifyGesture()
                     .onChanged { value in
@@ -384,7 +396,7 @@ struct MakeBoardView: View {
                     }
                 }
             }
-            .frame(height: fillsWindow ? nil : Self.height)
+            .frame(height: fillsWindow ? nil : pristine ? Self.pristineIdleInlineHeight : Self.height)
             .background(reference == BoardDocument.tableRef ? NativeAgentShell.list : Color.primary.opacity(0.03),
                         in: RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous))
@@ -536,13 +548,16 @@ struct MakeBoardView: View {
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
 
-    @ViewBuilder private func tableControls(_ state: MakeBoardState, camera: BoardCamera, size: CGSize, document: BoardDocument) -> some View {
+    @ViewBuilder private func tableControls(
+        _ state: MakeBoardState, camera: BoardCamera, size: CGSize, placementSize: CGSize, document: BoardDocument
+    ) -> some View {
         let middle = CGPoint(x: size.width / 2, y: size.height / 2)
         TableBoardTools(tool: $tool, picking: $picking, choices: choices, percent: Int((camera.scale * 100).rounded()), choose: { choice in
             self.camera = camera
             let field = choice["item"] == nil ? "piece" : "item"
-            let origin = geometry.landing(CGSize(width: 260, height: 120), at: camera.board(middle),
-                                               in: camera.board(CGRect(origin: .zero, size: size)), document)
+            let placementMiddle = CGPoint(x: placementSize.width / 2, y: placementSize.height / 2)
+            let origin = geometry.landing(CGSize(width: 260, height: 120), at: camera.board(placementMiddle),
+                                               in: camera.board(CGRect(origin: .zero, size: placementSize)), document)
             let card: [String: PartFace.Value] = ["type": .string("shape"), field: choice[field]!,
                 "x": .int(Int64(origin.x.rounded())), "y": .int(Int64(origin.y.rounded())), "w": .int(260), "h": .int(120)]
             let id = BoardDocument.mintID()

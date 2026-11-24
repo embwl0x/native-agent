@@ -17,7 +17,7 @@ struct CognitionProposalsView: View {
                 }
             }.padding(NativeAgentSpacing.xl)
         }
-        .navigationTitle("REM Replay Lineage")
+        .navigationTitle("Growth proposals")
         .faceObservation(.key(.cognition))
     }
 }

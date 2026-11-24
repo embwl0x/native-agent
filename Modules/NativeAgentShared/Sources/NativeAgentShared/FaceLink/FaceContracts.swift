@@ -4,6 +4,7 @@ import Foundation
 public enum FaceEffects: String, Codable, Sendable { case none, known, unknown }
 public enum FacePresentationPolicy: String, Codable, Sendable { case foreground, quiet }
 public enum FaceNavigationDisposition: String, Codable, Sendable { case mounted, queued, unavailable }
+public enum FollowOutcome: String, Codable, Sendable { case tookBack, kept }
 public enum ComposerEditDisposition: String, Codable, Sendable { case applied, conflict, preservedExisting }
 public enum FaceEffectDisposition: String, Codable, Sendable { case completed, skipped }
 public enum FaceApprovalDecision: String, Codable, Sendable { case approved, denied, canceled }
@@ -34,8 +35,6 @@ public enum FaceDemand: Codable, Sendable, Equatable {
     case sessionSearch(view: UUID, query: String)
     case deskPalette(view: UUID, query: String)
     case agentScreen(room: String, scope: String?)
-    case graphNeighborhood(entity: String)
-    case dreamDiary(limit: Int)
 }
 
 public enum FaceRefreshScope: Codable, Sendable, Equatable {
@@ -122,6 +121,12 @@ public struct FaceDestination: Codable, Sendable, Equatable {
         self.session = session
         self.message = message
     }
+}
+
+public struct OpenCommandRouteRequest: NotificationCenter.MainActorMessage {
+    public typealias Subject = NSObject
+    public let route: String
+    public init(route: String) { self.route = route }
 }
 
 public struct FaceNavigationRequest: Codable, Sendable, Equatable {
@@ -670,14 +675,31 @@ public struct RendererInspectorReport: Codable, Sendable, Equatable {
     public var subscription: UUID?
     public var mounted: Bool
     public var observing: Bool
+    public var pending: Bool
     public var issue: String?
-    public init(connection: UUID, view: UUID?, subscription: UUID?, mounted: Bool, observing: Bool, issue: String?) {
+    public init(connection: UUID, view: UUID?, subscription: UUID?, mounted: Bool, observing: Bool, issue: String?, pending: Bool = false) {
         self.connection = connection
         self.view = view
         self.subscription = subscription
         self.mounted = mounted
         self.observing = observing
+        self.pending = pending
         self.issue = issue
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case connection, view, subscription, mounted, observing, pending, issue
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        connection = try container.decode(UUID.self, forKey: .connection)
+        view = try container.decodeIfPresent(UUID.self, forKey: .view)
+        subscription = try container.decodeIfPresent(UUID.self, forKey: .subscription)
+        mounted = try container.decode(Bool.self, forKey: .mounted)
+        observing = try container.decode(Bool.self, forKey: .observing)
+        pending = try container.decodeIfPresent(Bool.self, forKey: .pending) ?? false
+        issue = try container.decodeIfPresent(String.self, forKey: .issue)
     }
 }
 

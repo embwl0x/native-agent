@@ -1,5 +1,5 @@
 # Her identity lines (User 2026-11-21: these two only). Each fragment must stay word for word in its file.
 # A commit that rewrites one fails red and comes back to Claude and Agent. path<TAB>fragment
-Modules/NativeAgentCore/Sources/Agents/AgentBridgeSurface.swift	You are fully yourself here: your memory, your context, your
-Modules/NativeAgentCore/Sources/Agents/AgentBridgeSurface.swift	judgment, your voice. Read, recall and think as yourself, and decide
-Modules/NativeAgentCore/Sources/ChatTurnRuntime/ChatOrchestration+CurrentTurnFacts.swift	What I should know and don't, I look up first
+Modules/NativeAgentCore/Sources/BodyRuntime/Agents/AgentBridgeSurface.swift	You are fully yourself here: your memory, your context, your
+Modules/NativeAgentCore/Sources/BodyRuntime/Agents/AgentBridgeSurface.swift	judgment, your voice. Read, recall and think as yourself, and decide
+Modules/NativeAgentCore/Sources/BodyRuntime/ChatTurnRuntime/ChatOrchestration+CurrentTurnFacts.swift	What I should know and don't, I look up first

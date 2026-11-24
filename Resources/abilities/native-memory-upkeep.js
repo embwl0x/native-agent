@@ -10,4 +10,3 @@
 function face(input) {
     return {title: input.title, sections: input.sections};
 }
-function run(input) { return face(input); }

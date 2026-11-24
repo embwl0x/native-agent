@@ -52,7 +52,6 @@ public enum TranscriptReaderReceipt: Sendable {
 /// back: the first visible paragraph at the offset it had, or the end while the reader follows it. A platform's reader subclasses
 /// this and overrides the hooks under "Glass": its text view's geometry, its scroll, its receipts and its hosted views.
 /// Nothing here reads `.layoutManager`: that silently drops a text view to TextKit 1.
-@available(macOS 15, iOS 18, *)
 @MainActor
 open class TranscriptReaderCore: NSObject {
     /// The pacer reveals glyphs from paragraphs already rendered by the press.
@@ -97,6 +96,7 @@ open class TranscriptReaderCore: NSObject {
     public let folds: TranscriptLayoutDelegate
     public let rules: TranscriptReaderRules
 
+    private var feedObservation: Task<Void, Never>?
     public var readerID = UUID()
     public var appliedScript: UUID?
     public var pendingOpen = true
@@ -322,19 +322,29 @@ open class TranscriptReaderCore: NSObject {
 
     // MARK: The one edit
 
+    deinit { feedObservation?.cancel() }
+
+    public func releaseFeedSelection() {
+        feedObservation?.cancel()
+        feedObservation = nil
+    }
+
     /// Reads this reader's script from the feed and applies it; a change reads it again while this is still the view's reader.
     public func observeFeed() {
+        releaseFeedSelection()
         guard let feed, let session = feedSession else { return }
         let id = readerID
-        let packet = withObservationTracking {
-            feed.slot(.transcript(session: session)).select("press:" + id.uuidString, as: TranscriptFace.self) { $0?.readers[id] }
-        } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.readerID == id, self.isCurrentReader else { return }
-                self.observeFeed()
+        let selection = feed.slot(.transcript(session: session)).selection("press:" + id.uuidString, as: TranscriptFace.self) { $0?.readers[id] }
+        let initial = selection.part
+        let initialID = initial?.id
+        let packets = Observations { selection.part }
+        feedObservation = Task { [weak self] in
+            for await packet in packets.drop(while: { $0?.id == initialID }) {
+                guard !Task.isCancelled, let self, self.readerID == id, self.isCurrentReader else { return }
+                if let packet { self.receive(packet) }
             }
         }
-        if let packet { receive(packet) }
+        if let initial { receive(initial) }
     }
 
     /// The reader consumes an applicable script and acknowledges exactly what reached TextKit.

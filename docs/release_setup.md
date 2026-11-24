@@ -93,7 +93,6 @@ error until a fresh observed result replaces them.
 `release_github.sh` defaults to `NATIVEAGENT_PUBLIC_DEVICE_SYNC=cloudkit` and:
 
 - `NATIVEAGENT_MAC_BUNDLE_ID=io.github.embwl0x.nativeagent.mac`;
-- `NATIVEAGENT_BACKGROUND_TASK_PREFIX=io.github.embwl0x.nativeagent`;
 - `NATIVEAGENT_ICLOUD_CONTAINER_ID=iCloud.io.github.embwl0x.nativeagent`;
 - `NATIVEAGENT_MOBILE_SOURCE_KEY=mobile_app`.
 

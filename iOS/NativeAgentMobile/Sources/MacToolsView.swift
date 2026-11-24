@@ -4,8 +4,8 @@ import NativeAgentShared
 // Blueprint: | `MacToolsView.swift` | Shared forms and receipt rows over policy-gated signed Mac controls |
 
 struct MacToolsView: View {
-    @EnvironmentObject private var pairingStore: PairingStore
-    @StateObject private var ledger = RemoteActionLedger.shared
+    @Environment(PairingStore.self) private var pairingStore
+    private let ledger = RemoteActionLedger.shared
     @State private var hasLoadedPolicy = false
     private let sync = iCloudSyncEngine.shared
     private var session: FacePageSession { sync.pageSessions.page("phone-mac-tools") }
@@ -19,7 +19,6 @@ struct MacToolsView: View {
         }
         .task { await refresh() }
         .refreshable { await refresh() }
-        .macSyncErrorBanner()
     }
 
     private func restriction(_ privilege: PhoneMacControlAction) -> String? {
@@ -84,7 +83,7 @@ struct MacToolsView: View {
         }
         if submission.expectedCall.action == "phone.reviewApproval" {
             NativeAgentNotificationLaunchIntent.stage(screen: "approvals")
-            NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": "approvals"])
+            NotificationCenter.default.post(NativeAgentNotificationLaunchIntent.Staged())
             return .init(effects: .none, accepted: true)
         }
         guard let privilege = PhoneMacControlAction(rawValue: submission.expectedCall.action) else {

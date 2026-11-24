@@ -1,6 +1,5 @@
 import SwiftUI
 import Foundation
-import Combine
 import NativeAgentShared
 // Blueprint: | `DiagnosticsView.swift` | Mac diagnostics face and phone push, verification, refusal and connection evidence |
 
@@ -9,9 +8,9 @@ import NativeAgentShared
 /// The Mac's diagnostics as the agent's face draws them, then what only this iPhone knows.
 struct DiagnosticsView: View {
     private let sync = iCloudSyncEngine.shared
-    @ObservedObject private var cloudReplies = iCloudBridge.shared
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @EnvironmentObject private var pairingStore: PairingStore
+    private let cloudReplies = iCloudBridge.shared
+    @Environment(MacBridgeClient.self) private var bridgeClient
+    @Environment(PairingStore.self) private var pairingStore
     @State private var pushReceipts: PushReceiptLedger.Reading?
     @State private var pushed: FaceDestination?
 
@@ -22,12 +21,20 @@ struct DiagnosticsView: View {
             FaceView(face: localFace, door: ReadOnlyFaceDoor(), session: sync.pageSessions.page("phone-diagnostics"))
         }
         .navigationDestination(item: $pushed) { $0.view }
-        .task {
-            pushReceipts = await Self.readPushReceipts()
+        .refreshable {
+            _ = await sync.refreshSnapshotGroup(.faces)
             _ = await sync.refreshRunsSnapshot()
         }
-        .onReceive(NotificationCenter.default.publisher(for: PushReceiptLedger.didChange).receive(on: RunLoop.main)) { _ in
-            Task { pushReceipts = await Self.readPushReceipts() }
+        .task {
+            let changes = NotificationCenter.default.messages(for: PushReceiptLedger.DidChange.self)
+            pushReceipts = await Self.readPushReceipts()
+            for await _ in changes {
+                guard !Task.isCancelled else { return }
+                pushReceipts = await Self.readPushReceipts()
+            }
+        }
+        .task {
+            _ = await sync.refreshRunsSnapshot()
         }
     }
 

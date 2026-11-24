@@ -52,7 +52,6 @@ public struct TranscriptDoor: Equatable, Sendable {
     }
 }
 
-@available(macOS 15, iOS 18, *)
 public enum TranscriptBuilder {
     /// The whole conversation. A group unchanged since the last build reuses its blocks; ids never depend on anything but the row, so an
     /// unchanged conversation is no edit and a reader's place holds.
@@ -72,9 +71,22 @@ public enum TranscriptBuilder {
         }
         for exchange in rooms[""] ?? [] { blocks.append(roomBlock(exchange)) }
         blocks += thread.door.trailing
-        if !blocks.isEmpty { blocks[0].lead = .none }
+        for index in blocks.indices {
+            blocks[index].lead = lead(for: blocks[index], after: index > 0 ? blocks[index - 1] : nil)
+        }
         cache.trim(retaining: Set(groups.map(\.id)))
         return TranscriptDocument(blocks: blocks)
+    }
+
+    static func lead(for block: TranscriptBlock, after previous: TranscriptBlock?) -> TranscriptBlock.Lead {
+        guard let previous else { return .none }
+        guard block.lead == .message, block.role == "assistant" else { return block.lead }
+        switch previous.kind {
+        case .foldHeadline, .foldDetail:
+            return .paragraph
+        default:
+            return block.lead
+        }
     }
 
     // MARK: Groups
@@ -223,7 +235,6 @@ public struct TranscriptCardSlot: Equatable, Sendable {
 
 /// Built blocks per group, reused while the group's rows, gap, cards, face epoch, live line and the agent's words are unchanged. A door keeps one
 /// for the conversation it shows.
-@available(macOS 15, iOS 18, *)
 public final class TranscriptBuildCache<Row: TranscriptRow> {
     struct Entry {
         var rows: [Row]

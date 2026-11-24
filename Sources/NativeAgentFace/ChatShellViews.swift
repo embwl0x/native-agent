@@ -43,28 +43,25 @@ struct ShellRoomHeader: View {
             notes
 
             if status != .settled {
-                Button {
-                    NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
-                } label: {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(status.color)
-                            .frame(width: 8, height: 8)
-                        Text(status.text)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .lineLimit(1)
+                Group {
+                    if status.opensTrust {
+                        Button {
+                            NotificationCenter.default.post(OpenCommandRouteRequest(route: "trust"))
+                        } label: {
+                            statusLabel.contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Review permissions in Trust")
+                        .accessibilityLabel("\(status.text). Open Trust")
+                    } else {
+                        statusLabel
                     }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .help("Review permissions in Trust")
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(status.text). Open Trust")
                 .accessibilityIdentifier("chat.shell.status-dot")
                 .padding(.leading, 4)
             }
         }
+        .frame(minHeight: NativeAgentShellLayout.columnHeaderMinHeight)
         // Align header, transcript and composer to one column and gutter.
         .padding(.horizontal, NativeAgentShellLayout.roomGutter)
         .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
@@ -73,6 +70,13 @@ struct ShellRoomHeader: View {
         .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
         .padding(.top, NativeAgentShellLayout.columnHeaderTopInset)
         .padding(.bottom, 4)
+    }
+
+    private var statusLabel: some View {
+        HStack(spacing: 8) {
+            Circle().fill(status.color).frame(width: 8, height: 8).accessibilityHidden(true)
+            Text(status.text).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary).lineLimit(1)
+        }
     }
 }
 
@@ -100,15 +104,15 @@ struct ShellConversationRow: View {
                 .truncationMode(.tail)
             // Use previews to distinguish conversations without rewriting their titles.
             let preview = face.preview
-            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
                 if !preview.isEmpty {
                     Text(preview)
                         .font(ShellType.labelMedium)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                        .layoutPriority(1)
-                    Spacer(minLength: 0)
+                    Spacer(minLength: NativeAgentSpacing.sm)
+                        .layoutPriority(-1)
                 }
                 SessionRowAge(date: face.date, surface: face.surface)
                     .font(preview.isEmpty ? ShellType.labelMedium : ShellType.caption)
@@ -122,7 +126,7 @@ struct ShellConversationRow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityValue(selected ? "Selected" : "Not selected")
-        .padding(.trailing, pinned || !pinsKnown ? 26 : 0)
+        .padding(.trailing, 26)
         .frame(maxWidth: .infinity, minHeight: NativeAgentShellLayout.listRowHeight, alignment: .leading)
         .overlay(alignment: .trailing) {
             Button(action: onTogglePin) {
@@ -233,25 +237,37 @@ private struct SessionRowAge: View {
     let date: Date?
     let surface: String
 
+    @MainActor
+    private static let formatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+
     var body: some View {
         TimelineView(.periodic(from: .now, by: 60)) { context in
-            HStack(spacing: 3) {
-                if surface != "Mac" { Text(surface) }
-                if let date {
-                    if surface != "Mac" { Text("·") }
-                    Text(age(date, at: context.date))
-                } else {
-                    Text("Time unavailable")
+            let timeText = date.map { age($0, at: context.date) } ?? "No time"
+            if !surface.isEmpty, surface != "Mac" {
+                ViewThatFits(in: .horizontal) {
+                    Text("\(surface) · \(timeText)")
+                        .fixedSize()
+                    Text(surface)
+                        .fixedSize()
+                    Text(surface)
+                        .truncationMode(.tail)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(surface), \(timeText)")
+            } else {
+                Text(timeText)
+                    .fixedSize()
             }
         }
     }
 
     private func age(_ date: Date, at now: Date) -> String {
         if now.timeIntervalSince(date) < 60 { return "now" }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: now)
+        return Self.formatter.localizedString(for: date, relativeTo: now)
     }
 }
 
@@ -285,88 +301,6 @@ struct SessionListEmptyNotice: View {
     }
 }
 
-// MARK: - Tool traffic
-
-/// Use one bare disclosure so activity does not add another plate.
-struct ChatActivityRow<Leading: View, Detail: View>: View {
-    let title: String
-    var trailing: String = ""
-    @Binding var isExpanded: Bool
-    var accessibilityLabel: String? = nil
-    @ViewBuilder var leading: () -> Leading
-    @ViewBuilder var detail: () -> Detail
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    static var indent: CGFloat { 18 }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.arrive, reduceMotion: reduceMotion
-                )) { isExpanded.toggle() }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(ShellType.captionSemibold)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .frame(width: 10)
-                    leading()
-                    Text(title)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 8)
-                    if !trailing.isEmpty {
-                        Text(trailing)
-                            .font(ShellType.caption)
-                            .foregroundStyle(NativeAgentShell.tertiary)
-                    }
-                }
-                .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.secondary)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .buttonFocusable()
-            .shellKeyboardTarget(.receipt)
-            .accessibilityLabel(accessibilityLabel ?? title)
-            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-
-            VStack(alignment: .leading, spacing: 0) {
-                if isExpanded {
-                    detail()
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .textSelection(.enabled)
-                        .padding(.leading, Self.indent)
-                        .padding(.top, 6)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .transition(NativeAgentMotion.arrivalFade)
-                }
-            }
-            // Clip transition travel without clipping the moving rows.
-            .clipped()
-        }
-        .padding(.vertical, NativeAgentSpacing.xs)
-        .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-    }
-}
-
-extension ChatActivityRow where Leading == EmptyView {
-    init(
-        title: String,
-        trailing: String = "",
-        isExpanded: Binding<Bool>,
-        accessibilityLabel: String? = nil,
-        @ViewBuilder detail: @escaping () -> Detail
-    ) {
-        self.init(title: title, trailing: trailing, isExpanded: isExpanded,
-                  accessibilityLabel: accessibilityLabel,
-                  leading: { EmptyView() }, detail: detail)
-    }
-}
-
-
 // MARK: - The empty room
 
 struct ShellEmptyRoom: View {
@@ -384,25 +318,37 @@ struct ShellEmptyRoom: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 460)
 
-            HStack(spacing: 8) {
-                ForEach(ChatShellCopy.greetingChips, id: \.self) { chip in
-                    Button {
-                        onSuggestion(chip)
-                    } label: {
-                        Text(chip)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.text)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .houseSurface(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Start with: \(chip)")
-                }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { chips }
+                VStack(spacing: 8) { chips }
             }
             .padding(.top, 10)
         }
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private var chips: some View {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        ForEach(ChatShellCopy.greetingChips, id: \.self) { chip in
+            Button {
+                onSuggestion(chip)
+            } label: {
+                Text(chip)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(TodayPalette.cardFill, in: shape)
+                    .clipShape(shape)
+                    .overlay { shape.strokeBorder(TodayPalette.cardStroke, lineWidth: 1).allowsHitTesting(false) }
+                    .contentShape(shape)
+            }
+            .buttonStyle(.plain)
+            .help("Start with: \(chip)")
+        }
     }
 }

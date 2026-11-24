@@ -18,7 +18,8 @@ public struct FaceView: View {
     @State private var viewer = UUID()
     /// Rows, controls and action buttons share the page's focus reconciliation and scroll owner.
     @FocusState private var focus: FaceFocus?
-    @Environment(\.faceInList) private var inList
+    @Environment(\.faceListWidth) private var listWidth
+    private var inList: Bool { listWidth != nil }
     @Environment(\.faceHoldsDocuments) private var holdsDocuments
 
     public init(face: PartFace, levers: [PartFace.Section] = [], words: String? = nil, keyed: [PartFace.Section] = [],
@@ -70,7 +71,7 @@ public struct FaceView: View {
         sections.flatMap { section in
             session.visibleRows(section).compactMap { entry in
                 let row = entry.row
-                guard row.expands == true, session.expanded.contains(.init(section: section.id, row: row.id)) else { return nil }
+                guard row.expands == true, session[open: .row(.init(section: section.id, row: row.id))] else { return nil }
                 return FaceReadRequest(id: viewer, key: row.id, expectedCall: row.read, revision: section.revision)
             }
         }
@@ -91,7 +92,7 @@ public struct FaceView: View {
     }
 
     private var documents: [PartFace.Block] {
-        sections.filter { $0.folded != true || session.unfolded.contains($0.id) }.compactMap(\.block)
+        sections.filter { $0.folded != true || session[open: .section($0.id)] }.compactMap(\.block)
             .filter { $0.kind == "document" && $0.text == nil }
             .map { PartFace.Block(key: $0.key, read: $0.read, revision: $0.revision) }
     }
@@ -99,7 +100,7 @@ public struct FaceView: View {
     private var visibleRows: [FaceItemID] {
         sections.flatMap { section in
             if section.block != nil { return [FaceItemID]() }
-            if section.folded == true && !session.unfolded.contains(section.id) { return [FaceItemID]() }
+            if section.folded == true && !session[open: .section(section.id)] { return [FaceItemID]() }
             return session.visibleRows(filtered(section)).map { FaceItemID(section: section.id, row: $0.row.id) }
         }
     }
@@ -113,6 +114,15 @@ public struct FaceView: View {
         return result
     }
 
+    private var sectionFilter: String? { face.sections.compactMap(\.filter).first }
+    private var searchableOwnsFilter: Bool {
+        #if os(macOS)
+        false
+        #else
+        inList && sectionFilter != nil
+        #endif
+    }
+
     public var body: some View {
         #if os(macOS)
         ScrollViewReader { reader in
@@ -121,8 +131,8 @@ public struct FaceView: View {
             }
         }
         #else
-        if inList, face.sections.contains(where: { $0.filter != nil }) {
-            pageContent.searchable(text: Binding(get: { session.filter }, set: { session.filter = $0 }))
+        if searchableOwnsFilter, let prompt = sectionFilter {
+            pageContent.searchable(text: Binding(get: { session.filter }, set: { session.filter = $0 }), prompt: Text(prompt))
         }
         else { pageContent }
         #endif
@@ -131,7 +141,16 @@ public struct FaceView: View {
     private var pageContent: some View {
         Group {
             if inList { contents }
-            else { VStack(alignment: .leading, spacing: NativeAgentSpacing.section) { contents } }
+            else {
+                let stack = VStack(alignment: .leading, spacing: NativeAgentSpacing.section) { contents }
+                    .modifier(FaceWidth())
+                    .modifier(FaceDialogs())
+                #if os(macOS)
+                GlassEffectContainer(spacing: 0) { stack }
+                #else
+                stack
+                #endif
+            }
         }
         .onChange(of: visibleRows) { old, new in reconcile(old: old, new: new) }
         .onAppear {
@@ -174,18 +193,23 @@ public struct FaceView: View {
     @ViewBuilder private var contents: some View {
         if face.title?.isEmpty == false || face.line?.isEmpty == false {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                if let title = face.title, !title.isEmpty { Text(title).font(.largeTitle.weight(.semibold)) }
+                if let title = face.title, !title.isEmpty {
+                    Text(title).font(.largeTitle.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                }
                 if let line = face.line, !line.isEmpty { Text(line).font(.title3).foregroundStyle(.secondary) }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .modifier(FaceListEdge())
         }
-        if session.showsFilter || face.sections.contains(where: { $0.filter != nil }) {
-            TextField(face.sections.compactMap(\.filter).first ?? "Filter", text: Binding(get: { session.filter }, set: { session.filter = $0 }))
+        if !searchableOwnsFilter && (session.showsFilter || sectionFilter != nil) {
+            TextField(sectionFilter ?? "Filter", text: Binding(get: { session.filter }, set: { session.filter = $0 }))
                 .textFieldStyle(.roundedBorder).focused($focus, equals: .filter)
                 .accessibilityLabel(Text("Filter"))
                 .onKeyPress(.escape) { session.showsFilter = false; session.filter = ""; return .handled }
+                .modifier(FaceListEdge())
         }
         sectionViews(shown(levers, scope: "levers"))
-        if let words, !words.isEmpty { Text(words).foregroundStyle(.secondary).textSelection(.enabled) }
+        if let words, !words.isEmpty { Text(words).foregroundStyle(.secondary).textSelection(.enabled).modifier(FaceListEdge()) }
         sectionViews(shown(keyed, scope: "keyed"))
         sectionViews(shown(face.sections, scope: "face"))
     }
@@ -197,7 +221,7 @@ public struct FaceView: View {
         } else {
             ForEach(FaceColumnRun.runs(sections)) { run in
                 if run.sections.count > 1 {
-                    FaceColumns(spacing: NativeAgentSpacing.section) { ForEach(run.sections) { sectionView($0) } }
+                    FaceColumns(spacing: NativeAgentSpacing.section) { ForEach(run.sections) { sectionView($0).modifier(FaceWidth()) } }
                 } else {
                     ForEach(run.sections) { sectionView($0) }
                 }
@@ -225,7 +249,7 @@ public struct FaceView: View {
         let next = old.dropFirst(index + 1).first { new.contains($0) } ?? new.first
         session.selection = next
         if focus?.item == selected { focus = next.map(FaceFocus.row) }
-        if let next, let title = sections.first(where: { $0.id == next.section })?.rows.first(where: { $0.id == next.row })?.title {
+        if let next, let title = sections.first(where: { $0.id == next.section })?.allRows.first(where: { $0.id == next.row })?.title {
             AccessibilityNotification.Announcement(title).post()
         }
     }
@@ -309,28 +333,68 @@ struct FaceColumns: Layout {
     }
 }
 
+struct FaceListEdge: ViewModifier {
+    @Environment(\.faceListWidth) private var listWidth
+    @Environment(\.faceListColumnWidth) private var listColumnWidth
+
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        if listWidth != nil, let columnWidth = listColumnWidth {
+            content
+                .padding(.horizontal, NativeAgentSpacing.pageInset)
+                .frame(maxWidth: columnWidth, alignment: .leading)
+                .frame(maxWidth: .infinity)
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
+    }
+}
+
+struct FaceFlowLine: LayoutValueKey {
+    static let defaultValue = false
+}
+
 /// Pills wrap without exceeding their proposed width.
 struct FaceFlow: Layout {
     var spacing: CGFloat
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width ?? .infinity
+        let lineProposal = width.isFinite ? ProposedViewSize(width: width, height: nil) : .unspecified
         var x: CGFloat = 0, y: CGFloat = 0, line: CGFloat = 0, widest: CGFloat = 0
         for view in subviews {
-            let size = Self.size(of: view, within: width)
-            if x > 0, x + size.width > width { y += line + spacing; x = 0; line = 0 }
-            x += size.width + spacing; line = max(line, size.height); widest = max(widest, x - spacing)
+            let full = view[FaceFlowLine.self]
+            let size = full ? view.sizeThatFits(lineProposal) : Self.size(of: view, within: width)
+            if x > 0, full || x + size.width > width { y += line + spacing; x = 0; line = 0 }
+            if full {
+                y += size.height + spacing; widest = max(widest, size.width); x = 0; line = 0
+            } else {
+                x += size.width + spacing; line = max(line, size.height); widest = max(widest, x - spacing)
+            }
         }
-        return CGSize(width: min(widest, width), height: y + line)
+        let total = line > 0 ? y + line : max(0, y - spacing)
+        return CGSize(width: min(widest, width), height: total)
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         var x = bounds.minX, y = bounds.minY, line: CGFloat = 0
         for view in subviews {
-            let size = Self.size(of: view, within: bounds.width)
-            if x > bounds.minX, x + size.width > bounds.maxX { y += line + spacing; x = bounds.minX; line = 0 }
-            view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
-            x += size.width + spacing; line = max(line, size.height)
+            let full = view[FaceFlowLine.self]
+            let size = full ? view.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil)) : Self.size(of: view, within: bounds.width)
+            if x > bounds.minX, full || x + size.width > bounds.maxX { y += line + spacing; x = bounds.minX; line = 0 }
+            if full {
+                view.place(at: CGPoint(x: bounds.minX, y: y), proposal: ProposedViewSize(width: bounds.width, height: size.height))
+                y += size.height + spacing; x = bounds.minX; line = 0
+            } else {
+                view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+                x += size.width + spacing; line = max(line, size.height)
+            }
         }
     }
 

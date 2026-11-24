@@ -11,18 +11,16 @@
   }
 }
 */
-function run(input) {
-    return face(input);
-}
 function face(input) {
     const keys = input.keys;
-    // A row keeps only the fields it has; it leads and acts only as its key allows.
-    const row = fields => Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== null && value !== undefined));
+    const {row} = kit;
     const open = id => (keys[id] || {}).open;
-    const LABEL = {"queue.done": "Done", "queue.drop": "Drop", "agent.read": "Read job"};
+    const LABEL = {"queue.done": "Done", "queue.drop": "Drop", "desk.close": "Close", "agent.read": "Read job"};
     const actions = id => {
         const held = (keys[id] || {}).actions || [];
-        return held.length ? held.map(a => row({id: a.id, label: LABEL[a.id] || a.id, role: a.role})) : undefined;
+        return held.length ? held.map(a => row({id: a.id, label: LABEL[a.id] || a.id,
+            role: a.id === "queue.done" ? "primary" : a.role,
+            aside: a.id === "queue.drop" ? true : undefined})) : undefined;
     };
     const person = input.person;
     const capital = text => text.replace(/(^|\s)(\S)/g, (_, space, first) => space + first.toUpperCase());
@@ -42,13 +40,13 @@ function face(input) {
         const first = t.attended[0];
         const outcome = OUTCOME[t.outcome] || [t.outcome || "Open", "attention"];
         const more = t.count - t.attended.length;
+        const detail = [t.attended.slice(1).map(said).join(" · "), more > 0 ? "+" + more + " more" : ""].filter(Boolean).join(" · ");
         mind.push(row({id: t.id, title: first ? said(first) : (t.node || t.kind || "A thought"),
-            detail: [t.attended.slice(1).map(said).join(" · "), more > 0 ? "+" + more + " more" : "", t.through.join(", ")]
-                .filter(Boolean).join(" · "),
+            detail: detail || null,
             value: t.mattered ? "Mattered" : outcome[0], at: t.at, tone: t.mattered ? "done" : outcome[1]}));
     }
     const owed = input.owed.rows.map(h => row({id: h.id, title: said(h),
-        detail: [KIND[h.kind] || h.kind, h.door, h.returns ? "returns to the conversation that started it" : ""].filter(Boolean).join(" · "),
+        detail: [KIND[h.kind] || h.kind, h.returns ? "returns to the conversation that started it" : ""].filter(Boolean).join(" · "),
         at: h.at, tone: "attention"}));
     if (input.owed.count > owed.length) owed.push({id: "owed:more", title: "+" + (input.owed.count - owed.length) + " more owed", tone: "quiet"});
 
@@ -57,13 +55,6 @@ function face(input) {
     if (owed.length) sections.push({id: "owed", title: "Owed to me", style: "list",
         footer: "Returns, moments I set and my body's asks, each opening a thought.", rows: owed});
 
-    const STEP = {
-        unread: s => ["Condition not read yet", "attention"], blocked: s => ["Waits " + s.blockers.join(", "), "attention"],
-        cycle: s => ["Blocked by a cycle", "attention"], deferred: s => ["Deferred", "attention"],
-        conditions: s => ["Waits on its Desk conditions", "attention"], conditions_unavailable: s => ["Desk conditions unavailable", "attention"],
-        ready: s => ["Ready", "plain"], stopped: s => ["Stopped", "quiet"], waits: s => ["Waits " + s.when, "quiet"],
-        unavailable: s => [s.detail, "failed"]
-    };
     const PEOPLE = {
         unread: c => ["Exchange not read yet", "attention"], unavailable: c => ["Exchange unavailable", "attention"],
         send_failed: c => ["Send failed", "failed"], problem: c => [c.problem, "failed"], ready: c => ["Ready", "plain"],
@@ -74,27 +65,29 @@ function face(input) {
             + (c.execution.failed ? " · execution error recorded" : ""), c.execution.failed ? "failed" : "plain"]
     };
     const HELPER = {unread: ["Run queue not read", "attention"], running: ["Running or queued", "attention"], never: ["Never run", "quiet"]};
+    const QUEUE_STATE = {
+        ready: "Ready", blocked: "Blocked", deferred: "Deferred", stopped: "Stopped",
+        conditions: "Waiting on conditions", conditions_unavailable: "Conditions unavailable",
+        cycle: "Blocked by cycle", waits: "Waiting", unread: "Not read yet", unavailable: "Unavailable"
+    };
+    const BODY_OWNER = {agent: "Upkeep", builder: "Builder", owner: "Waits on " + person};
     const repair = r => row({id: r.key, title: r.title, detail: r.detail, value: r.state, at: r.at, tone: "attention", open: open(r.key)});
 
     const draw = {
         notable: () => input.mail ? [row({id: input.mail.key, title: "Last Mail read", detail: input.mail.words, at: input.mail.at,
             open: open(input.mail.key)})] : [],
-        changed: () => [{id: "changed.scope", title: "Changes since the last look are read on each door", tone: "quiet"}],
         waits: () => input.waits.map(w => w.kind === "repair" ? repair(w)
             : w.kind === "desk" ? row({id: w.key, title: w.title, value: "Waits on " + person, at: w.at, tone: "attention", open: open(w.key)})
             : row({id: w.key, title: w.title, detail: w.detail, at: w.at, tone: "attention", open: open(w.key)})),
-        queue: () => input.queue.map(q => {
-            if (q.kind === "step") {
-                const [value, tone] = (STEP[q.state] || (() => [q.state, "attention"]))(q);
-                const detail = (q.from ? "Filed in " + q.from.join(", ") + "'s turn" : q.words + (q.inferred ? " · inferred" : ""))
-                    + (q.blockedReason ? " · " + q.blockedReason : "") + (q.note ? " · note: " + q.note : "");
-                return row({id: q.key, title: q.from ? q.words : q.title, detail, value, at: q.at, tone,
-                    open: open(q.key), actions: actions(q.key)});
+        queue: () => input.queue.filter(q => q.kind !== "repair").map(q => {
+            if (q.kind === "step" || q.kind === "blocked" || q.kind === "body") {
+                const value = q.when || (q.state ? (QUEUE_STATE[q.state] || q.state)
+                    : q.kind === "blocked" ? "Blocked" : BODY_OWNER[q.assignee] || "Upkeep");
+                const detail = q.detail || q.blockedReason
+                    || (Array.isArray(q.blockers) && q.blockers.length ? q.blockers.join(" · ") : null)
+                    || (Array.isArray(q.waitsOn) && q.waitsOn.length ? "Waiting on " + q.waitsOn.join(", ") : null);
+                return row({id: q.key, title: q.title, detail, value, open: open(q.key), actions: actions(q.key)});
             }
-            if (q.kind === "blocked") return row({id: q.key, title: q.title, detail: q.detail, value: "Waits on " + q.waitsOn.join(", "),
-                at: q.at, tone: "quiet", open: open(q.key)});
-            if (q.kind === "body") return row({id: q.key, title: q.title, detail: q.assignee, value: "Open body work", at: q.at,
-                open: open(q.key)});
             if (q.kind === "reviews") return row({id: q.key, title: "Memories to review", detail: "Waiting for Keep or Don't keep",
                 value: q.count + (q.capped ? "+" : ""), open: open(q.key)});
             if (q.kind === "input") return row({id: q.key, title: q.name, value: "Asks for input", at: q.at, tone: "attention",
@@ -122,12 +115,17 @@ function face(input) {
         places: () => input.places.map(p => row({id: p.key, title: p.name, detail: p.detail, at: p.at, open: open(p.key)})),
         mac: () => input.mac.map(m => row({id: m.key, title: m.app, detail: m.about, value: m.readout, at: m.at, open: open(m.key)}))
     };
-    const TITLE = {notable: "Notable", changed: "Changed", waits: capital(person) + " waits", queue: "My queue", working: "Working",
+    const TITLE = {notable: "Notable", waits: capital(person) + " waits", queue: "My queue", working: "Working",
         people: "People", helpers: "Helpers", senses: "My senses", elsewhere: "Elsewhere", places: "Places", mac: "Mac"};
+    const EMPTY = {
+        waits: "Nothing waiting on " + person + ".", queue: "Nothing queued.", working: "Nothing running.",
+        people: "No recent people.", helpers: "No helpers.", senses: "No senses.",
+        elsewhere: "No recent messages elsewhere.", places: "No recent places.", mac: "No recent Mac reads."
+    };
     const COVERAGE = {
-        notable: "Prior Mail previews, not a current inbox scan.", changed: "The agent's door compares tracked records per look.",
+        notable: "Prior Mail previews, not a current inbox scan.",
         waits: "Desk, inbox asks and repairs; approvals stand above, yours to decide; no fresh calendar, reminders or Mail read.",
-        queue: "Queued Desk steps, reviews, handoffs and repairs; not all of my own activity.",
+        queue: "Queued Desk steps, reviews and handoffs; not all of my own activity.",
         working: "Jobs and lines at work; agent.jobs lists them all.",
         people: "Contacts, exchanges, discovery offers and local health; no full Doctor check.",
         helpers: "Definitions, latest shelf results and run queue; not full run history.", senses: "Retained abilities, senses and watches.",
@@ -147,8 +145,16 @@ function face(input) {
         let body = draw[name]().concat(gaps(name));
         if (name === "notable" && input.layoutFailure) body.push({id: "layout.failed", title: "Layout unavailable", detail: input.layoutFailure,
             tone: "failed"});
-        if (!body.length) body = [{id: name + ":empty", title: "No retained rows", tone: "quiet"}];
+        if (name === "notable" && !body.length) continue;
+        if (!body.length) body = [{id: name + ":empty", title: EMPTY[name] || "Nothing here yet.", tone: "quiet"}];
         sections.push({id: name, title: TITLE[name], style: "list", footer: COVERAGE[name], rows: body.slice(0, 256)});
+        if (name === "queue") {
+            const repairs = input.queue.filter(q => q.kind === "repair").map(repair);
+            if (repairs.length) {
+                sections.push({id: "repairs", title: "Owed repairs", style: "list",
+                    footer: "Unfinished repair obligations filed from prior failures.", rows: repairs.slice(0, 256)});
+            }
+        }
     }
     return row({title: input.agent, line: "Where I am, what waits and what is within reach.", sections: sections.slice(0, 64)});
 }

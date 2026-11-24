@@ -1,0 +1,501 @@
+import Foundation
+import PersistenceCore
+// Blueprint: | `VisionFourVerbAdapter.swift` | `VisionPercept.fourVerbSupplement` and its stages `fourVerbRowRendering`, `fourVerbRowTarget`, `fourVerbSurface`, `fourVerbValues` over one `VisionSupplementState`: Additive physical evidence retains provenance and abstention |
+
+extension VisionPercept {
+    /// Abstaining evidence stays visible but cannot become an act target.
+    public func fourVerbSupplement(
+        geometry: MacScreenViewGeometry,
+        viewId: String? = nil,
+        globalRegionOfInterest: MacAXFrame? = nil,
+        liveRegionIdentities: [VisionRect: VisionLiveRegionIdentity] = [:],
+        liveOccludedRegions: [VisionLiveOccludedRegion] = []
+    ) -> MacFourVerbsSupplement {
+        let origin = (x: geometry.bounds.x, y: geometry.bounds.y)
+        let logicalSize = (width: geometry.bounds.w, height: geometry.bounds.h)
+        func abstainReason(_ row: VisionAffordanceRow) -> String? {
+            if let ambiguous = row.ambiguous { return ambiguous }
+            if row.destructiveRisk { return "destructive-looking pixel target needs semantic confirmation" }
+            if row.confidence.bounds < 0.55 { return "bounds confidence below physical-action floor" }
+            if row.confidence.target < 0.55 { return "target confidence below physical-action floor" }
+            return nil
+        }
+
+        func insideRegionOfInterest(_ rect: VisionRect) -> Bool {
+            guard let globalRegionOfInterest else { return true }
+            let translated = geometry.screenRect(rect)
+            let centerX = translated.x + translated.w / 2
+            let centerY = translated.y + translated.h / 2
+            return centerX >= globalRegionOfInterest.x
+                && centerX <= globalRegionOfInterest.x + globalRegionOfInterest.w
+                && centerY >= globalRegionOfInterest.y
+                && centerY <= globalRegionOfInterest.y + globalRegionOfInterest.h
+        }
+        let perceivedRows = rows.filter { insideRegionOfInterest($0.rect) }
+        let physicalRows = Self.physicalRowSelection(in: perceivedRows, frameSize: frameSize)
+        let indicatorRender = Self.linearIndicatorValues(
+            in: perceivedRows,
+            indexes: physicalRows.indicators,
+            frameSize: frameSize,
+            readouts: readouts,
+            recognizedText: recognizedText
+        )
+
+        // Bound and rank physical vocabulary so decorative pixel fragments cannot overwhelm action discovery.
+        let spatialIndexes = Set(physicalRows.eligible
+            .map { (offset: $0, element: perceivedRows[$0]) }
+            .sorted { lhs, rhs in
+                let left = lhs.element.salience * 3
+                    + (lhs.element.visualContrast ?? 0) * 2
+                    + min(1, lhs.element.rect.area / max(1, frameSize.width * frameSize.height) * 20)
+                let right = rhs.element.salience * 3
+                    + (rhs.element.visualContrast ?? 0) * 2
+                    + min(1, rhs.element.rect.area / max(1, frameSize.width * frameSize.height) * 20)
+                return left == right ? lhs.offset < rhs.offset : left > right
+            }
+            .prefix(8)
+            .map(\.offset))
+        let supplement = VisionSupplementState(geometry: geometry, viewId: viewId,
+            globalRegionOfInterest: globalRegionOfInterest, liveRegionIdentities: liveRegionIdentities,
+            origin: origin, logicalSize: logicalSize, perceivedRows: perceivedRows, spatialIndexes: spatialIndexes)
+
+        for (rowIndex, row) in perceivedRows.enumerated() {
+            if physicalRows.redundant.contains(rowIndex) { continue }
+            if physicalRows.indicators.contains(rowIndex) {
+                continue
+            }
+            guard let rendered = fourVerbRowRendering(supplement, rowIndex: rowIndex, row: row,
+                abstainReason: abstainReason) else { continue }
+            fourVerbRowTarget(supplement, rowIndex: rowIndex, row: row, rendered)
+        }
+
+        let contents = fourVerbSurface(supplement)
+        let (values, effectValueTexts) = fourVerbValues(supplement, indicatorRender: indicatorRender,
+            liveOccludedRegions: liveOccludedRegions, insideRegionOfInterest: insideRegionOfInterest)
+        return MacFourVerbsSupplement(
+            contents: contents,
+            controls: supplement.controls,
+            values: values,
+            targets: supplement.targets,
+            diagnostics: [
+                "vision_effect_value_text": .array(effectValueTexts.map { .string($0) })
+            ]
+        )
+    }
+
+    /// What a rendered row hands its target: the facts its rendering decided.
+    private struct VisionRowRendering {
+        let kind: String
+        let reason: String?
+        let spatiallyAddressable: Bool
+        let renderedConfidence: Double
+        let motorAddressable: Bool
+        let renderedLabel: MacScreenText?
+        let isControl: Bool
+    }
+
+    private func fourVerbRowRendering(
+        _ supplement: VisionSupplementState, rowIndex: Int, row: VisionAffordanceRow,
+        abstainReason: (VisionAffordanceRow) -> String?
+    ) -> VisionRowRendering? {
+        let liveRegionIdentities = supplement.liveRegionIdentities
+        let spatialIndexes = supplement.spatialIndexes
+        let kind = MacScreenRender.kindName(role: row.roleGuess)
+        // Reject isolated OCR markers in row labels too, or that route could resurrect glyphs already excluded from readouts.
+        let labelText: MacScreenText? = {
+            guard let label = supplement.screenText(row.label) else { return nil }
+            guard let display = label.display,
+                  !Self.isStandaloneOCRNoise(display) else { return nil }
+            return label
+        }()
+        let reason = abstainReason(row)
+        let states = [
+            ("selected", "not selected", row.state.selected),
+            ("checked", "not checked", row.state.checked),
+            ("disabled", "enabled", row.state.disabled),
+        ].compactMap { positive, negative, flag -> String? in
+            guard let flag else { return nil }
+            return "\(flag.value ? positive : negative) guess \(Int((flag.confidence * 100).rounded()))%"
+        }
+        // Saliency supplies a prominent physical place, never an invented semantic button.
+        let spatiallyAddressable = reason != nil && spatialIndexes.contains(rowIndex)
+        let renderedConfidence = spatiallyAddressable
+            ? Self.physicalPointConfidence(row)
+            : row.confidence.target
+        // Muted regions may remain scene evidence below motor confidence; publish targets only at the tracking confidence floor.
+        let motorAddressable = spatiallyAddressable && renderedConfidence >= 0.25
+        let spatialLabel: MacScreenText? = {
+            guard spatiallyAddressable else { return nil }
+            let identity = liveRegionIdentities[row.rect]
+            let number: Int
+            if let identity {
+                number = identity.id
+            } else {
+                supplement.visualRegionOrdinal += 1
+                number = supplement.visualRegionOrdinal
+            }
+            let label = "visual region \(number)"
+            return MacScreenText(label, redacted: .string(label))
+        }()
+        let renderedLabel = labelText ?? spatialLabel
+        let spatialDescription: [MacScreenText] = {
+            guard spatiallyAddressable else { return [] }
+            let horizontal = row.rect.centerX < frameSize.width / 3 ? "left"
+                : row.rect.centerX > frameSize.width * 2 / 3 ? "right" : "center"
+            let vertical = row.rect.centerY < frameSize.height / 3 ? "upper"
+                : row.rect.centerY > frameSize.height * 2 / 3 ? "lower" : "middle"
+            let contrast = row.visualContrast ?? 0
+            let prominence = contrast >= 0.45 ? "high contrast"
+                : contrast >= 0.25 ? "visible contrast" : "low contrast"
+            let motion = liveRegionIdentities[row.rect]?.motion
+            let color = row.visualColor.map { "\($0), " } ?? ""
+            func percent(_ value: Double, of total: Double) -> Int {
+                guard total > 0 else { return 0 }
+                return min(100, max(0, Int((value / total * 100).rounded())))
+            }
+            let centerX = percent(row.rect.centerX, of: frameSize.width)
+            let centerY = percent(row.rect.centerY, of: frameSize.height)
+            let width = max(1, percent(row.rect.w, of: frameSize.width))
+            let height = max(1, percent(row.rect.h, of: frameSize.height))
+            let geometry = "at \(centerX)%,\(centerY)%, size \(width)%x\(height)%"
+            // Separate slots keep geometry and motion within the 40-character cap.
+            let facts = ["\(color)\(prominence)", "\(vertical) \(horizontal)", geometry]
+                + (motion.map { [$0] } ?? [])
+            return facts.map { MacScreenText($0, redacted: .string($0)) }
+        }()
+        // Uncertain spatial regions must not become semantic controls or lose their content budget behind AX chrome.
+        let isControl = !spatiallyAddressable
+            && MacPerceptionCompiler.controlRoles.contains(row.roleGuess)
+        if isControl {
+            supplement.controls.append(MacScreenRender.Control(
+                label: renderedLabel ?? MacScreenText("unnamed \(kind)", redacted: .string("unnamed \(kind)")),
+                kind: kind,
+                states: states + (reason == nil ? [] : ["uncertain"]),
+                provenance: .vision(renderedConfidence),
+                abstain: spatiallyAddressable ? nil : reason
+            ))
+        } else {
+            if renderedLabel == nil, !spatiallyAddressable, let reason {
+                let category: String
+                if reason.contains("overlapping") { category = "overlapping" }
+                else if reason.contains("bounds confidence") { category = "low bounds confidence" }
+                else if reason.contains("target confidence") { category = "low target confidence" }
+                else if reason.contains("unlabeled") { category = "unlabeled" }
+                else { category = "other uncertainty" }
+                supplement.summarizedFragments[category, default: 0] += 1
+                supplement.summarizedFragmentConfidence = max(supplement.summarizedFragmentConfidence, row.confidence.target)
+                return nil
+            }
+            supplement.rowOrdinal += 1
+            let aspect = row.rect.h > 0 ? row.rect.w / row.rect.h : 1
+            let physicalShape = row.visualShape ?? (aspect <= 0.70 ? "tall"
+                : aspect >= 1.45 ? "wide" : "compact")
+            let physicalKind = spatiallyAddressable
+                ? "\(physicalShape) physical object" : kind
+            supplement.contentRows.append(MacScreenRender.Row(
+                label: renderedLabel,
+                detail: [MacScreenText(physicalKind, redacted: .string(physicalKind))]
+                    + spatialDescription
+                    + states.map { MacScreenText($0, redacted: .string($0)) },
+                provenance: .vision(renderedConfidence),
+                abstain: motorAddressable ? nil : (spatiallyAddressable
+                    ? "physical point confidence too low; observe again" : reason),
+                physicalOnly: motorAddressable
+            ))
+        }
+        return VisionRowRendering(kind: kind, reason: reason, spatiallyAddressable: spatiallyAddressable,
+            renderedConfidence: renderedConfidence, motorAddressable: motorAddressable, renderedLabel: renderedLabel,
+            isControl: isControl)
+    }
+
+    private func fourVerbRowTarget(
+        _ supplement: VisionSupplementState, rowIndex: Int, row: VisionAffordanceRow, _ rendered: VisionRowRendering
+    ) {
+        let (geometry, viewId, liveRegionIdentities, origin, logicalSize, perceivedRows, spatialIndexes) = (
+            supplement.geometry, supplement.viewId, supplement.liveRegionIdentities, supplement.origin, supplement.logicalSize,
+            supplement.perceivedRows, supplement.spatialIndexes)
+        let (kind, reason, spatiallyAddressable, renderedConfidence, motorAddressable, renderedLabel, isControl) = (
+            rendered.kind, rendered.reason, rendered.spatiallyAddressable, rendered.renderedConfidence,
+            rendered.motorAddressable, rendered.renderedLabel, rendered.isControl)
+        guard reason == nil || motorAddressable else { return }
+        let ordinal: Int? = isControl ? nil : supplement.rowOrdinal
+        let targetLabel: MacScreenText = {
+            if let renderedLabel { return renderedLabel }
+            let number = (supplement.unnamedOrdinalByKind[kind] ?? 0) + 1
+            supplement.unnamedOrdinalByKind[kind] = number
+            let synthetic = "visual \(kind) \(number)"
+            return MacScreenText(synthetic, redacted: .string(synthetic))
+        }()
+        let appearanceAliases: [String] = {
+            guard spatiallyAddressable else { return [] }
+            var aliases: [String]
+            switch (row.visualShape, row.visualColor) {
+            case let (shape?, color?):
+                aliases = [
+                    "\(shape) \(color) object",
+                    "\(color) \(shape) object",
+                    "\(color) object",
+                ]
+            case let (nil, color?):
+                aliases = ["\(color) object"]
+            case let (shape?, nil):
+                aliases = ["\(shape) object"]
+            case (nil, nil):
+                aliases = []
+            }
+            let base = aliases.last
+            // Measured silhouettes accept ordinary shape nouns; unknown shapes get none.
+            let naturalBases = Self.naturalShapeNames(row)
+            aliases.append(contentsOf: naturalBases)
+            let horizontal = row.rect.centerX < frameSize.width / 3 ? "left"
+                : row.rect.centerX > frameSize.width * 2 / 3 ? "right" : "center"
+            let vertical = row.rect.centerY < frameSize.height / 3 ? "upper"
+                : row.rect.centerY > frameSize.height * 2 / 3 ? "lower" : "middle"
+            for spatialBase in [base].compactMap({ $0 }) + naturalBases {
+                aliases.append("\(horizontal) \(spatialBase)")
+                aliases.append("\(vertical) \(spatialBase)")
+                aliases.append("\(spatialBase) at \(vertical) \(horizontal)")
+                if horizontal != "center" {
+                    aliases.append("\(spatialBase) on the \(horizontal)")
+                }
+            }
+            let temporalBases = Array(Set([base, aliases.first].compactMap { $0 } + naturalBases)).sorted()
+            if let motion = liveRegionIdentities[row.rect]?.motion,
+               motion.hasPrefix("moving ") {
+                aliases.append("moving object")
+                if let shape = row.visualShape {
+                    aliases.append("moving \(shape) object")
+                }
+                for temporalBase in temporalBases {
+                    aliases.append("moving \(temporalBase)")
+                    aliases.append("\(motion) \(temporalBase)")
+                    aliases.append("\(temporalBase) \(motion)")
+                }
+            } else if liveRegionIdentities[row.rect]?.motion == "stationary" {
+                aliases.append("stationary object")
+                if let shape = row.visualShape {
+                    aliases.append("stationary \(shape) object")
+                }
+                for temporalBase in temporalBases {
+                    aliases.append("stationary \(temporalBase)")
+                    aliases.append("\(temporalBase) stationary")
+                }
+            }
+            let nearest = spatialIndexes
+                .filter { $0 != rowIndex && liveRegionIdentities[perceivedRows[$0].rect] != nil }
+                .compactMap { index -> (row: VisionAffordanceRow, distance: Double)? in
+                    let other = perceivedRows[index]
+                    guard other.visualColor != nil || other.visualShape != nil else { return nil }
+                    let dx = (other.rect.centerX - row.rect.centerX) / max(1, frameSize.width)
+                    let dy = (other.rect.centerY - row.rect.centerY) / max(1, frameSize.height)
+                    return (other, hypot(dx, dy))
+                }
+                .min { $0.distance < $1.distance }?.row
+            if let base, let nearest {
+                let direction = Self.spatialDirection(from: row.rect, to: nearest.rect, frameSize: frameSize)
+                let relation = direction == "overlaps" ? "overlapping" : direction
+                let otherBase = nearest.visualColor.map { "\($0) object" }
+                    ?? nearest.visualShape.map { "\($0) object" }
+                if let otherBase {
+                    // Private relation aliases accept both participants’ measured shape nouns without inventing another relation.
+                    for subject in [base] + naturalBases {
+                        for object in [otherBase] + Self.naturalShapeNames(nearest) {
+                            aliases.append("\(subject) \(relation) \(object)")
+                        }
+                    }
+                }
+            }
+            return aliases
+        }()
+        supplement.targets.append(MacFourVerbsSupplementalTarget(
+            label: targetLabel,
+            aliases: appearanceAliases,
+            kind: spatiallyAddressable ? "visual region" : kind,
+            frame: {
+                let observed = geometry.screenRect(row.rect)
+                guard spatiallyAddressable,
+                      let identity = liveRegionIdentities[row.rect] else { return observed }
+                return MacAXFrame(
+                    x: min(
+                        max(origin.x, observed.x + identity.projectedX),
+                        origin.x + logicalSize.width - observed.w
+                    ),
+                    y: min(
+                        max(origin.y, observed.y + identity.projectedY),
+                        origin.y + logicalSize.height - observed.h
+                    ),
+                    w: observed.w,
+                    h: observed.h
+                )
+            }(),
+            observedFrame: geometry.screenRect(row.rect),
+            provenance: .vision(renderedConfidence),
+            viewId: viewId,
+            ordinal: ordinal,
+            physicalOnly: motorAddressable,
+            motionUncertain: motorAddressable
+                && (liveRegionIdentities[row.rect]?.needsMotionConfirmation == true
+                    || (liveRegionIdentities[row.rect]?.motion != "stationary"
+                        && liveRegionIdentities[row.rect]?.motion?.hasPrefix("moving ") != true)),
+            enabled: row.state.disabled?.value != true
+        ))
+    }
+
+    private func fourVerbSurface(_ supplement: VisionSupplementState) -> [MacScreenRender.Content] {
+        let (geometry, viewId, globalRegionOfInterest) = (supplement.geometry, supplement.viewId, supplement.globalRegionOfInterest)
+        let summarizedCount = supplement.summarizedFragments.values.reduce(0, +)
+        if summarizedCount > 0 {
+            let categories = supplement.summarizedFragments.keys.sorted().map {
+                "\(supplement.summarizedFragments[$0] ?? 0) \($0)"
+            }.joined(separator: ", ")
+            let label = "\(summarizedCount) uncertain visual fragment"
+                + (summarizedCount == 1 ? "" : "s")
+            supplement.contentRows.append(MacScreenRender.Row(
+                label: MacScreenText(label, redacted: .string(label)),
+                detail: [MacScreenText("not separately addressable", redacted: .string("not separately addressable"))],
+                provenance: .vision(supplement.summarizedFragmentConfidence),
+                abstain: "summarized non-addressable regions: \(categories)"
+            ))
+        }
+
+        var contents: [MacScreenRender.Content] = []
+        if !supplement.contentRows.isEmpty {
+            contents.append(MacScreenRender.Content(
+                kind: .grid,
+                rows: supplement.contentRows
+            ))
+        }
+        // Captured image extent remains exact on canvases without OCR; object confidence cannot erase the observed surface.
+        let canvasConfidence = 1.0
+        let fullCanvasRect = VisionRect(x: 0, y: 0, w: frameSize.width, h: frameSize.height)
+        let canvasFrame = globalRegionOfInterest ?? geometry.screenRect(fullCanvasRect)
+        contents.append(MacScreenRender.Content(
+            kind: .canvas,
+            canvas: MacScreenRender.Canvas(
+                description: "visual surface",
+                width: canvasFrame.w,
+                height: canvasFrame.h,
+                provenance: .vision(canvasConfidence),
+                hasPerceptualEvidence: !rows.isEmpty || !recognizedText.isEmpty || !readouts.isEmpty,
+                hasRegionTarget: canvasFrame.w > 0 && canvasFrame.h > 0
+            )
+        ))
+        if canvasConfidence >= 0.55, canvasFrame.w > 0, canvasFrame.h > 0 {
+            supplement.targets.append(MacFourVerbsSupplementalTarget(
+                label: MacScreenText("visual surface", redacted: .string("visual surface")),
+                aliases: ["canvas", "viewport", "world"],
+                kind: "canvas",
+                frame: canvasFrame,
+                provenance: .vision(canvasConfidence),
+                viewId: viewId,
+                regionOnly: true
+            ))
+        }
+        return contents
+    }
+
+    private func fourVerbValues(
+        _ supplement: VisionSupplementState, indicatorRender: VisionLinearIndicatorRender,
+        liveOccludedRegions: [VisionLiveOccludedRegion], insideRegionOfInterest: (VisionRect) -> Bool
+    ) -> (values: [MacScreenRender.Value], effectValueTexts: [String]) {
+        let (liveRegionIdentities, perceivedRows, spatialIndexes) = (
+            supplement.liveRegionIdentities, supplement.perceivedRows, supplement.spatialIndexes)
+        var values = indicatorRender.values + readouts.filter {
+            insideRegionOfInterest($0.rect)
+                && !indicatorRender.claimedReadoutHandles.contains($0.handle)
+                && !($0.text.display.map(Self.isStandaloneOCRNoise) ?? false)
+        }.map {
+            MacScreenRender.Value(
+                text: MacScreenText($0.text.raw, redacted: $0.text.json),
+                provenance: .vision($0.confidence)
+            )
+        }
+        // Publish bounded redacted OCR values independently of row-label and readout ranking.
+        var valueKeys = Set(values.compactMap { $0.text.display?.lowercased() })
+        for recognized in recognizedText {
+            guard values.count < 16,
+                  let label = supplement.screenText(recognized.text),
+                  let display = label.display else { continue }
+            let key = display.lowercased()
+            guard !valueKeys.contains(key),
+                  !indicatorRender.claimedRecognizedKeys.contains(key),
+                  !Self.isStandaloneOCRNoise(display) else { continue }
+            valueKeys.insert(key)
+            values.append(MacScreenRender.Value(
+                text: label,
+                provenance: .vision(recognized.confidence)
+            ))
+        }
+        // Only observed HUD, readout and OCR values prove effects; motion changes relations even when input did nothing.
+        let effectValueTexts = indicatorRender.effectValueTexts
+            + values.dropFirst(indicatorRender.values.count).compactMap(\.text.display)
+        for occluded in liveOccludedRegions.prefix(max(0, 16 - values.count)) {
+            let appearance = [occluded.shapeName, occluded.colorName]
+                .compactMap { $0 }
+                .joined(separator: " ")
+            let prefix = appearance.isEmpty ? "" : "\(appearance) "
+            let frameWord = occluded.missedFrames == 1 ? "frame" : "frames"
+            var text = """
+                \(prefix)visual region \(occluded.id) temporarily not visible; last seen at \(occluded.lastCenterXPercent)%,\(occluded.lastCenterYPercent)% \
+                (\(occluded.missedFrames) \(frameWord) ago)
+                """
+            if let x = occluded.expectedCenterXPercent,
+               let y = occluded.expectedCenterYPercent {
+                text += "; expected near \(x)%,\(y)% if motion continued"
+            }
+            values.append(MacScreenRender.Value(
+                text: MacScreenText(text, redacted: .string(text)),
+                provenance: .vision(occluded.confidence)
+            ))
+        }
+        let spatialValues = Self.spatialRelationValues(
+            in: perceivedRows,
+            indexes: spatialIndexes,
+            frameSize: frameSize,
+            identities: liveRegionIdentities
+        )
+        values.append(contentsOf: spatialValues.prefix(max(0, 16 - values.count)))
+        return (values, effectValueTexts)
+    }
+
+}
+
+/// One supplement's accumulating render: the rows, controls and targets its stages append, and the ordinals they count.
+private final class VisionSupplementState {
+    let geometry: MacScreenViewGeometry
+    let viewId: String?
+    let globalRegionOfInterest: MacAXFrame?
+    let liveRegionIdentities: [VisionRect: VisionLiveRegionIdentity]
+    let origin: (x: Double, y: Double)
+    let logicalSize: (width: Double, height: Double)
+    let perceivedRows: [VisionAffordanceRow]
+    let spatialIndexes: Set<Int>
+    var contentRows: [MacScreenRender.Row] = []
+    var controls: [MacScreenRender.Control] = []
+    var targets: [MacFourVerbsSupplementalTarget] = []
+    var rowOrdinal = 0
+    var unnamedOrdinalByKind: [String: Int] = [:]
+    var visualRegionOrdinal = 0
+    var summarizedFragments: [String: Int] = [:]
+    var summarizedFragmentConfidence = 0.0
+
+    init(
+        geometry: MacScreenViewGeometry, viewId: String?, globalRegionOfInterest: MacAXFrame?,
+        liveRegionIdentities: [VisionRect: VisionLiveRegionIdentity], origin: (x: Double, y: Double),
+        logicalSize: (width: Double, height: Double), perceivedRows: [VisionAffordanceRow], spatialIndexes: Set<Int>
+    ) {
+        self.geometry = geometry
+        self.viewId = viewId
+        self.globalRegionOfInterest = globalRegionOfInterest
+        self.liveRegionIdentities = liveRegionIdentities
+        self.origin = origin
+        self.logicalSize = logicalSize
+        self.perceivedRows = perceivedRows
+        self.spatialIndexes = spatialIndexes
+    }
+
+    func screenText(_ label: VisionRedactedText?) -> MacScreenText? {
+        guard let label else { return nil }
+        return MacScreenText(label.raw, redacted: label.json)
+    }
+}

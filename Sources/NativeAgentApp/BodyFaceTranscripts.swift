@@ -1,13 +1,10 @@
-import ApprovalTransactions
-import ChatSessionWork
-import ChatTurnRuntime
-import EngineRuntime
+import BodyRuntime
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import Observation
-import Privacy
-import TurnTrace
+import PersistenceCore
+import SenseCore
 // Blueprint: | `BodyFaceTranscripts.swift` | Connection-owned press readers, live conversation projections and checked transcript resource grants |
 
 @MainActor
@@ -17,6 +14,7 @@ final class BodyFaceTranscripts {
         let lifetime = UUID()
         var request: TranscriptReaderRequest
         var appliedScript: UUID?
+        var printed: (version: UInt64, exchanges: [OtherRoomExchange], title: String?)?
         var task: Task<Void, Never>?
     }
     private var readers: [UUID: Reader] = [:]
@@ -170,14 +168,11 @@ final class BodyFaceTranscripts {
             await words(reader: id, messages: all)
             return .acknowledged
         case .requestCopy(let keys):
-            var values: [String: PartFace.Value] = [:]
-            for key in keys {
-                guard let words = await engine.transcripts.presentation.words(key) else {
-                    throw BodyFaceServices.failure("copy_words_waiting", "The requested words have not been prepared by their presentation owner.")
-                }
-                values[key] = .string(words)
+            let values = await engine.transcripts.presentation.words(keys)
+            guard keys.allSatisfy({ values[$0] != nil }) else {
+                throw BodyFaceServices.failure("copy_words_waiting", "The requested words have not been prepared by their presentation owner.")
             }
-            return .result(.object(values))
+            return .result(.object(values.mapValues(PartFace.Value.string)))
         case .exportConversation(let request): return try await export(request)
         case .observe(let id, .key(.conversation(let session))):
             guard NativeAgentChatSessionID.normalizedPathComponent(session) == session else {
@@ -232,55 +227,67 @@ final class BodyFaceTranscripts {
     }
 
     private func watch(_ id: UUID) async {
-        let (changes, signal) = AsyncStream<Void>.makeStream()
-        defer { signal.finish() }
-        var events = changes.makeAsyncIterator()
-        while !Task.isCancelled, let reader = readers[id] {
-            let session = reader.request.session
-            withObservationTracking {
-                if let contact = Self.contact(reader.request) {
-                    let owner = engine.contactThreads
-                    _ = owner.lines[contact]
-                    _ = owner.partial(for: contact)
-                    _ = owner.flight(for: contact)
-                    _ = owner.contacts
-                    _ = owner.helpers
-                    _ = owner.loaded
-                    _ = owner.helpersLoaded
-                    _ = owner.contactRefreshError
-                    _ = owner.helpersRefreshError
-                    _ = engine.persona.displayName
-                    _ = engine.transcripts.sessions
-                    _ = engine.transcripts.sessionIndexError
-                    _ = engine.transcripts.hasLoadedSessionIndex
-                } else {
-                    _ = engine.transcripts.structureVersion(for: session)
-                    let live = engine.turns.streamingBubbleID(for: session)
-                    if let live { _ = engine.transcripts.streamingTailBox(forMessage: live).content }
-                    _ = engine.contactThreads.otherRooms
-                    _ = engine.transcripts.transcriptReadStatus(for: session)
-                }
-            } onChange: { signal.yield() }
+        guard let request = readers[id]?.request else { return }
+        let session = request.session
+        let contact = Self.contact(request)
+        let changes = Observations { [engine] in
+            if let contact {
+                let owner = engine.contactThreads
+                _ = owner.lines[contact]
+                _ = owner.partial(for: contact)
+                _ = owner.flight(for: contact)
+                _ = owner.contacts
+                _ = owner.helpers
+                _ = owner.loaded
+                _ = owner.helpersLoaded
+                _ = owner.contactRefreshError
+                _ = owner.helpersRefreshError
+                _ = engine.persona.displayName
+                _ = engine.transcripts.sessions
+                _ = engine.transcripts.sessionIndexError
+                _ = engine.transcripts.hasLoadedSessionIndex
+            } else {
+                _ = engine.transcripts.structureVersion(for: session)
+                let live = engine.turns.streamingBubbleID(for: session)
+                if let live { _ = engine.transcripts.streamingTailBox(forMessage: live).content }
+                _ = engine.contactThreads.otherRooms
+                _ = engine.transcripts.transcriptReadStatus(for: session)
+            }
+        }
+        for await _ in changes {
+            guard !Task.isCancelled else { return }
+            if contact == nil, let printed = readers[id]?.printed, let liveID = engine.turns.streamingBubbleID(for: session),
+               await engine.transcripts.readFirstConversationReceiptTitle() == printed.title,
+               engine.transcripts.structureVersion(for: session) == printed.version,
+               engine.transcripts.transcriptReadStatus(for: session) == .current,
+               engine.contactThreads.otherRooms == printed.exchanges,
+               engine.turns.streamingBubbleID(for: session) == liveID,
+               let text = engine.transcripts.streamingTailBox(forMessage: liveID).content,
+               await engine.transcripts.press.live(reader: id, rowID: liveID, text: text) { continue }
             await update(id)
-            guard await events.next() != nil else { return }
         }
     }
 
     private func observeConversation(_ session: String) async {
-        let (changes, signal) = AsyncStream<Void>.makeStream()
-        let token = NotificationCenter.default.addObserver(forName: .pageFacePublished, object: nil, queue: nil) { notice in
-            if notice.object as? String == "inbox" { signal.yield() }
+        let (changes, signal) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let token = NotificationCenter.default.observeSynchronously(for: PageFacePublished.self) { message in
+            if message.page == "inbox" { signal.yield() }
         }
         defer { NotificationCenter.default.removeObserver(token); signal.finish() }
-        var events = changes.makeAsyncIterator()
-        while !Task.isCancelled {
-            withObservationTracking {
-                _ = conversationContact(session)
-                _ = engine.transcripts.structureVersion(for: session)
-                _ = engine.transcripts.transcriptReadStatus(for: session)
-            } onChange: { signal.yield() }
-            await publishCurrentConversation(session)
-            guard await events.next() != nil else { return }
+        let owners = Observations {
+            _ = self.conversationContact(session)
+            _ = self.engine.transcripts.structureVersion(for: session)
+            _ = self.engine.transcripts.transcriptReadStatus(for: session)
+        }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for await _ in owners { signal.yield() }
+            }
+            for await _ in changes {
+                guard !Task.isCancelled else { break }
+                await publishCurrentConversation(session)
+            }
+            group.cancelAll()
         }
     }
 
@@ -292,11 +299,16 @@ final class BodyFaceTranscripts {
             return
         }
         let title = await engine.transcripts.readFirstConversationReceiptTitle()
-        guard !Task.isCancelled, readers[id]?.lifetime == reader.lifetime else { return }
+        guard !Task.isCancelled, let current = readers[id], current.lifetime == reader.lifetime else { return }
         guard case .current = engine.transcripts.transcriptReadStatus(for: request.session) else {
+            readers[id]?.printed = nil
             await publishCurrentConversation(request.session)
             return
         }
+        let version = engine.transcripts.structureVersion(for: request.session)
+        let exchanges = engine.contactThreads.otherRooms
+        let liveID = engine.turns.streamingBubbleID(for: request.session)
+        let live = liveID.flatMap { engine.transcripts.streamingTailBox(forMessage: $0).content }
         let displayed = engine.transcripts.displayedTranscript(for: request.session)
         var messages = displayed.messages
         let all = messages
@@ -310,14 +322,12 @@ final class BodyFaceTranscripts {
             messages = messages.filter { selected.contains($0.id) }
         }
         let groups = MessageGrouper.projection(for: messages)
-        let liveID = engine.turns.streamingBubbleID(for: request.session)
-        let live = liveID.flatMap { engine.transcripts.streamingTailBox(forMessage: $0).content }
         let transcripts = engine.transcripts
         let cards = TranscriptReadout(messages: messages).cardsByRow.mapValues { $0.map(\.model.id) }
         let trailing = ChatTurnFailure.read(all) == nil ? [] : [TranscriptBlock(id: TranscriptBlockID.trouble, messageID: TranscriptBlockID.trouble, role: "system",
             kind: .attachment(.trouble), source: "", lead: .message, foldGroup: nil)]
         let input = TranscriptPressInput(session: request.session, presentation: request.presentation, groups: Array(groups),
-            exchanges: engine.contactThreads.otherRooms.filter { $0.sessionID != request.session }, cards: cards,
+            exchanges: exchanges.filter { $0.sessionID != request.session }, cards: cards,
             faceEpoch: title ?? "", face: { TranscriptRowFace.read($0, receiptTitle: title) },
             wanted: { [weak self] rows in
                 Task { @MainActor in
@@ -325,9 +335,10 @@ final class BodyFaceTranscripts {
                     await self?.words(reader: id, messages: transcripts.displayedTranscript(for: request.session).messages)
                 }
             }, render: TranscriptRenderer.prepare, door: TranscriptDoor(trailing: trailing), liveID: liveID, liveText: live,
-            width: request.geometry.width, scale: request.geometry.scale, viewport: request.geometry.viewport,
+            width: current.request.geometry.width, scale: current.request.geometry.scale, viewport: current.request.geometry.viewport,
             openingParagraphs: request.openingParagraphCount, hasEarlierMessages: !displayed.isComplete)
         guard !Task.isCancelled, readers[id]?.lifetime == reader.lifetime else { return }
+        readers[id]?.printed = (version, exchanges, title)
         await transcripts.press.update(reader: id, input: input)
     }
 
@@ -350,11 +361,7 @@ final class BodyFaceTranscripts {
     }
 
     private func words(reader: UUID, messages: [ChatMessage]) async {
-        var values: [String: String] = [:]
-        for message in messages {
-            if let text = await engine.transcripts.presentation.words("headline:" + message.id) { values["headline:" + message.id] = text }
-            if let text = await engine.transcripts.presentation.words("detail:" + message.id) { values["detail:" + message.id] = text }
-        }
+        let values = await engine.transcripts.presentation.words(messages.flatMap { ["headline:" + $0.id, "detail:" + $0.id] })
         guard readers[reader] != nil else { return }
         await engine.transcripts.press.words(reader: reader, values: values)
     }
@@ -399,7 +406,8 @@ final class BodyFaceTranscripts {
         let messages = transcript.messages
         let contact = conversationContact(session)
         let snapshot = await engine.pages.snapshots["inbox"]
-        let inbox = snapshot?.drawnFace
+        let inbox = Dictionary((snapshot?.drawnFace?.sections.flatMap(\.rows) ?? []).map { ($0.id, $0) },
+                               uniquingKeysWith: { first, _ in first })
         var attachments: [FaceResolvedAttachment] = []
         for message in messages {
             try Task.checkCancellation()
@@ -420,7 +428,7 @@ final class BodyFaceTranscripts {
             }
             for card in message.inlineCards {
                 // The card reads from itself; its Inbox row lends only its answers, so a card the Inbox no longer holds still draws whole.
-                let answers = inbox?.sections.flatMap(\.rows).first { $0.id == "interaction:" + card.interaction.id }
+                let answers = inbox["interaction:" + card.interaction.id]
                 let face = card.face(answers: answers)
                 let unanswerable = card.model.needsAttention && answers == nil && snapshot?.error != nil
                 attachments.append(.init(id: TranscriptBlockID.card(card.interaction.id), message: message.id, kind: "card", title: card.model.title,
@@ -429,7 +437,7 @@ final class BodyFaceTranscripts {
                         cause: snapshot?.error?.message, effects: .none) : nil, secureCard: card.secureFace))
             }
             if let approval = message.metadata?.approvalId, message.metadata?.isPendingApproval == true {
-                let row = inbox?.sections.flatMap(\.rows).first { $0.id == approval }
+                let row = inbox[approval]
                 attachments.append(.init(id: TranscriptBlockID.approval(message.id), message: message.id, kind: "approval", title: "Approval request",
                     text: nil, resource: nil, card: row.map { PartFace(sections: [.init(id: $0.id, style: .list, rows: [$0])]) },
                     failure: row == nil ? .init(code: "approval_presentation_unavailable", message: "This approval could not be read from Inbox.",

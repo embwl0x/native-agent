@@ -17,6 +17,10 @@ options:
 
 settings:
   SWIFT_VERSION: "6.0"
+  SWIFT_UPCOMING_FEATURE_NONISOLATED_NONSENDING_BY_DEFAULT: "YES"
+  SWIFT_UPCOMING_FEATURE_INFER_ISOLATED_CONFORMANCES: "YES"
+  SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY: "YES"
+  SWIFT_STRICT_MEMORY_SAFETY: "YES"
   ENABLE_USER_SCRIPT_SANDBOXING: NO
   # Both app plists start with these keys; the body stamps both from VERSION.
   CURRENT_PROJECT_VERSION: "0.0.0"
@@ -32,15 +36,6 @@ packages:
   NativeAgentShared:
     path: Modules/NativeAgentShared
   # BEGIN generated package requirements (Package.swift; script/sync_build_declarations.rb)
-  grpc-swift-2:
-    url: https://github.com/grpc/grpc-swift-2.git
-    exactVersion: 2.4.3
-  grpc-swift-nio-transport:
-    url: https://github.com/grpc/grpc-swift-nio-transport.git
-    exactVersion: 2.10.0
-  grpc-swift-protobuf:
-    url: https://github.com/grpc/grpc-swift-protobuf.git
-    exactVersion: 2.4.1
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle.git
     from: 2.9.6
@@ -86,7 +81,7 @@ targets:
     deploymentTarget: "27.0"
     sources:
       - path: Extensions/NativeAgentWidget
-      - path: Modules/NativeAgentCore/Sources/EngineRuntime/NativeAgentWidgetSnapshot.swift
+      - path: Modules/NativeAgentCore/Sources/BodyRuntime/EngineRuntime/NativeAgentWidgetSnapshot.swift
       - path: Sources/NativeAgentApp/NativeAgentDesignTokens.swift
     dependencies:
       - package: NativeAgentShared
@@ -132,7 +127,7 @@ targets:
     dependencies:
       - package: NativeAgentCore
         products:
-          - Senses
+          - SenseCore
           - NativeAgentCore
           - PersistenceCore
     settings:
@@ -147,7 +142,7 @@ targets:
         type: syncedFolder
     dependencies:
       - package: NativeAgentCore
-        products: [PersistenceCore]
+        products: [PersistenceCore, NativeAgentCore]
     settings:
       PRODUCT_MODULE_NAME: NativeAgentLink
       ENABLE_HARDENED_RUNTIME: YES
@@ -185,7 +180,7 @@ targets:
       - path: Resources/prompts
         type: folder
         buildPhase: resources
-      - path: docs/licenses/A2A-gRPC-NOTICES.txt
+      - path: docs/licenses/THIRD-PARTY-NOTICES.txt
         buildPhase: resources
       - path: Extensions/NativeAgentChrome/manifest.json
         buildPhase:
@@ -224,12 +219,6 @@ targets:
         embed: true
         copy:
           destination: resources
-      - package: grpc-swift-2
-        product: GRPCCore
-      - package: grpc-swift-nio-transport
-        product: GRPCNIOTransportHTTP2TransportServices
-      - package: grpc-swift-protobuf
-        product: GRPCProtobuf
       - package: Sparkle
         product: Sparkle
       - package: NativeAgentShared
@@ -237,62 +226,13 @@ targets:
       - package: NativeAgentCore
         products:
           - NativeAgentCore
-          - ApprovalInbox
-          - MemoryV2
-          - Context
-          - ToolRegistry
-          - ToolExecution
-          - AuthoredCapabilities
-          - PersonaEngine
-          - TrustCenter
-          - TrustPersistence
           - PersistenceCore
-          - Privacy
-          - Desk
-          - Studio
-          - Senses
-          - TurnTrace
-          - Transcripts
-          - BackgroundLoops
-          - BackgroundWork
-          - DoctorChecks
+          - SenseCore
+          - DeskCore
+          - MacNerves
           - ProviderRouting
-          - DreamREMCycle
-          - TriggerScheduler
-          - SchedulerExecution
-          - StandingBots
-          - SwarmRuns
-          - NotificationInbox
-          - Research
-          - SystemOps
-          - Dispatcher
-          - MacControl
-          - ScreenVision
-          - Onboarding
-          - CognitiveSubstrate
-          - Connectors
-          - TelegramBot
-          - SlackBot
-          - ChromeControl
-          - Agents
-          - ContextFlow
-          - Cognition
-          - DeviceSync
-          - AttentionRouting
-          - EngineRuntime
-          - ChatSessionWork
-          - AgentConversations
-          - AgentWorkspace
-          - ChatToolParsing
-          - ChatToolRuntime
-          - ChatTurnContracts
-          - ChatTurnRuntime
-          - AppToolRuntime
-          - ApprovalTransactions
-          - Browser
-          - MultimodalTTS
-          - MacIntegration
-          - ActivityWatch
+          - MindCore
+          - BodyRuntime
     settings:
       base:
         PRODUCT_NAME: NativeAgent
@@ -356,9 +296,6 @@ targets:
         NSDesktopFolderUsageDescription: NativeAgent may read files from your Desktop when you request it.
         NSDocumentsFolderUsageDescription: NativeAgent may read files from your Documents folder when you request it.
         NSDownloadsFolderUsageDescription: NativeAgent may read files from your Downloads folder when you request it.
-        BGTaskSchedulerPermittedIdentifiers:
-          - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).dream_cycle
-          - $(NATIVEAGENT_BACKGROUND_TASK_PREFIX).rem_cycle
     postBuildScripts:
       # Runs before Xcode's CodeSign step, so everything here is sealed.
       - name: Stamp version, source identity, REPO_PATH, embedding model

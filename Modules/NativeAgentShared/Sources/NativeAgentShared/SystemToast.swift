@@ -1,7 +1,5 @@
 import Foundation
-#if os(iOS)
-import Combine
-#endif
+import Observation
 // Blueprint: | `SystemToast.swift` | `SystemToast`, `SystemToastCenter`: replace-by-ID notices and owned dismissal timers |
 
 public struct SystemToast: Identifiable, FaceValue {
@@ -23,22 +21,17 @@ public struct SystemToast: Identifiable, FaceValue {
 }
 
 @MainActor
+@Observable
 public final class SystemToastCenter {
     public static let shared = SystemToastCenter()
 
     public nonisolated let id = UUID()
-    private var observers: [UUID: AsyncStream<[SystemToast]>.Continuation] = [:]
-    #if os(iOS)
-    @Published public private(set) var queue: [SystemToast] = [] {
+    @ObservationIgnored private var observers: [UUID: AsyncStream<[SystemToast]>.Continuation] = [:]
+    public private(set) var queue: [SystemToast] = [] {
         didSet { for observer in observers.values { observer.yield(queue) } }
     }
-    #else
-    private var queue: [SystemToast] = [] {
-        didSet { for observer in observers.values { observer.yield(queue) } }
-    }
-    #endif
 
-    private var dismissTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var dismissTasks: [UUID: Task<Void, Never>] = [:]
 
     public init() {}
 
@@ -100,7 +93,3 @@ public final class SystemToastCenter {
         queue.removeAll { $0.id == id }
     }
 }
-
-#if os(iOS)
-extension SystemToastCenter: ObservableObject {}
-#endif

@@ -1,0 +1,18 @@
+import Foundation
+import NativeAgentCore
+import NativeAgentShared
+import SenseCore
+import ProviderRouting
+// Blueprint: | `ChatSessionWork.swift` | `ChatSessionWork`; `SwiftNativeChatOrchestrationClient`; Bind the composed request tail fitting to its turn |
+
+extension SwiftNativeChatOrchestrationClient {
+    func withSessionContextMeasurement<T: Sendable>(sessionId: String, surface: String,
+        turn: Turn, work: ChatTurnWork,
+        _ body: (ChatTurnWork) async throws -> T) async throws -> T {
+        let fit: SessionRequestFit.Handler = { [self] context, codec, additional in
+            try await self.fitSessionRequest(context, codec: codec, additionalMessages: additional, sessionId: sessionId,
+                surface: surface, turn: turn)
+        }
+        return try await body(work.with(\.fit, fit))
+    }
+}

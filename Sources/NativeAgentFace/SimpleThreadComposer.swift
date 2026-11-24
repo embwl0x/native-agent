@@ -14,7 +14,6 @@ struct SimpleComposer: View {
     var note: String?
     var alternate: (title: String, send: (String) async -> Bool)?
     let send: (String) async -> Bool
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var focused: Bool
     @Environment(AppModel.self) private var appModel
@@ -32,22 +31,14 @@ struct SimpleComposer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                if let recipient {
-                    Text("To: \(recipient)")
-                        .font(ShellType.captionMedium)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(1)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(NativeAgentShell.softFill, in: Capsule())
-                        .fixedSize()
-                }
-                TextField(placeholder, text: text, axis: .vertical)
+                if let recipient { ComposerRecipientChip(name: recipient) }
+                TextField(recipient == nil ? placeholder : "Message…", text: text, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(ShellType.body)
                     .lineLimit(1...8)
                     .focused($focused)
                     .onSubmit { submit() }
+                    .accessibilityLabel(placeholder)
             }
             HStack(alignment: .center, spacing: 10) {
                 Text(note ?? "")
@@ -71,7 +62,7 @@ struct SimpleComposer: View {
                         .frame(width: 36, height: 36)
                         .background(
                             sendable ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill,
-                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            in: Circle()
                         )
                         .foregroundStyle(sendable ? NativeAgentShell.text : NativeAgentShell.tertiary)
                         .contentShape(Rectangle())
@@ -86,21 +77,19 @@ struct SimpleComposer: View {
         .padding(.top, 12)
         .padding(.bottom, 11)
         .background {
-            if reduceTransparency {
-                shape.fill(Color(nsColor: .controlBackgroundColor))
-                    .overlay { shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1) }
-            }
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { focused = true }
             HazeBottomGlow(cornerRadius: NativeAgentShellLayout.composerRadius)
         }
-        .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
+        .houseSurface(in: shape, opaqueFill: Color(nsColor: .controlBackgroundColor))
         .overlay {
-            if focused, !reduceTransparency {
-                shape.fill(Color.primary.opacity(0.04)).allowsHitTesting(false)
-            }
+            shape
+                .strokeBorder(NativeAgentShell.text, lineWidth: focused ? 2 : 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         }
         .animation(reduceMotion ? nil : NativeAgentMotion.quick, value: focused)
-        .contentShape(Rectangle())
-        .onTapGesture { focused = true }
         .simpleRoomColumn(gutter: 0)
         .padding(.bottom, 24)
     }

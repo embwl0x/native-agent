@@ -1,4 +1,3 @@
-#if canImport(CloudKit) && !os(Linux)
 import Foundation
 import CloudKit
 import OSLog
@@ -185,4 +184,3 @@ extension CloudKitDeviceTransport {
         }
     }
 }
-#endif

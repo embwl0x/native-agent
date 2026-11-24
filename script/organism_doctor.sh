@@ -248,7 +248,7 @@ section "Next Troubleshooting Step"
 if [ "$bridge_rc" -ne 0 ]; then
   echo "Start/reinstall the app: $REPO_ROOT/script/install_app.sh"
 else
-  echo "Open $REPO_ROOT/docs/build_plans/nativeagent-organism-troubleshooting.md for symptom-specific checks."
+  echo "Open $REPO_ROOT/docs/ORGANISM.md for symptom-specific checks."
 fi
 
 printf 'FAIL_COUNT=%d\n' "$FAIL_COUNT"

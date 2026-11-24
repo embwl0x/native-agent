@@ -27,8 +27,7 @@ struct SimpleHelperRuns: View {
                             selectedDocument = DocumentRequest(id: UUID(), subject: .helperEntry(id))
                             showingDocument = true
                         } label: {
-                            FaceView(face: PartFace(sections: [.init(id: "reading", rows: [row])]), door: ReadOnlyFaceDoor(),
-                                session: FacePageSession(), retaining: false)
+                            StaticFaceRow(row: row)
                         }.buttonStyle(.plain)
                     }
                 }
@@ -40,16 +39,14 @@ struct SimpleHelperRuns: View {
                 let waiting = thread.select("waiting.ids", as: ContactThreadFace.self) { $0?.waiting.map(\.id) ?? [] }
                 ForEach(waiting, id: \.self) { id in
                     if let row = thread.select("waiting." + id, as: ContactThreadFace.self, { $0?.waiting.first { $0.id == id } }) {
-                        FaceView(face: PartFace(sections: [.init(id: "reading", rows: [row])]), door: ReadOnlyFaceDoor(),
-                            session: FacePageSession(), retaining: false)
+                        StaticFaceRow(row: row)
                         SimpleThreadActions(command: thread.select("command." + id, as: ContactThreadFace.self) { $0?.commands[id] })
                     }
                 }
                 let queued = thread.select("queued.ids", as: ContactThreadFace.self) { $0?.queued.map(\.id) ?? [] }
                 ForEach(queued, id: \.self) { id in
                     if let row = thread.select("queued." + id, as: ContactThreadFace.self, { $0?.queued.first { $0.id == id } }) {
-                        FaceView(face: PartFace(sections: [.init(id: "reading", rows: [row])]), door: ReadOnlyFaceDoor(),
-                            session: FacePageSession(), retaining: false)
+                        StaticFaceRow(row: row)
                         SimpleThreadActions(command: thread.select("command." + id, as: ContactThreadFace.self) { $0?.commands[id] })
                     }
                 }

@@ -177,7 +177,6 @@ open class TranscriptAttachmentHosts<Box: AnyObject, Root: View> {
 
 /// What a hosted block draws in: it grows to its whole height at the width it is given and reports every size change, so the
 /// document re-lays its paragraph (a card answered, details opened, an image loaded).
-@available(macOS 15, iOS 18, *)
 public struct TranscriptAttachmentFrame<Content: View>: View {
     private let resized: () -> Void
     private let content: Content

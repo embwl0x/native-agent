@@ -96,10 +96,9 @@ bundled resources (including shipped documentation). Update that inventory with
 assembly changes. Unbundled repository notes do not change this identity; equality
 remains exact. Local signing/model overrides remain separate build settings.
 
-Builds consume the committed `TurnPart+ShippedBodies.swift` upgrade table, including
-in a one-commit public export. After committing turn-body edits, maintainers explicitly
-run `swift script/generate_turn_part_versions.swift` with complete history and commit
-the generated table; ordinary builds do not regenerate it.
+There is no shipped-body upgrade table or generator for `turn.js`: keep its declared
+version, committed bodies may share it, and the installed turn is the current form
+(see [AGENTS.md](AGENTS.md)).
 
 The pre-commit timer gate runs the single classifier on an immutable staged tree,
 including its staged Swift, policy, classifier and TSV. Swift changes, inventory or

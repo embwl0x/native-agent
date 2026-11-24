@@ -71,7 +71,7 @@ extension ChatView {
             }
             var record = ChatMessageRecord(id: id, sessionId: nil, role: role, content: content,
                                            createdAt: String(format: "2026-11-04T09:%02d:00Z", minute), runId: nil, source: nil,
-                                           metadata: metadata, isPersonVisible: true)
+                                           metadata: metadata)
             record.face = face
             records.append(record)
         }
@@ -246,17 +246,15 @@ extension ChatView {
                                 .ignoresSafeArea(edges: .bottom)
                                 .overlay(alignment: .top) {
                                     if let issue = transcript.issue {
-                                        Text(issue).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                                            .padding().background(.regularMaterial)
+                                        MobileTranscriptStatusFill(text: issue, isError: true)
                                     } else if transcript.isPreparing {
-                                        Text("Preparing conversation…").font(.caption).foregroundStyle(.secondary)
-                                            .padding().background(.regularMaterial)
+                                        MobileTranscriptStatusFill(text: "Preparing conversation…", isError: false)
                                     }
                                 }
                         }
                     }
                 }
-                .aliveBottomFade(room: AliveChatRoom(store: store))
+                .scrollEdgeEffectStyle(.soft, for: .bottom)
                 // Latest floats over the document: as part of the composer's inset, showing it would move the end the reader just reached.
                 .overlay(alignment: .bottomTrailing) {
                     if showLatestButton {
@@ -276,22 +274,24 @@ extension ChatView {
                         .transition(.opacity)
                     }
                 }
-                .animation(.easeOut(duration: 0.18), value: showLatestButton)
-                .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
-                    otherTurnLine.padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
-                    GlassEffectContainer(spacing: NativeAgentMobileTheme.Spacing.md) { composerBar }
-                        .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
-                        .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                .animation(AppMotion.respecting(.easeOut(duration: 0.18), reduceMotion: reduceMotion), value: showLatestButton)
+                .safeAreaBar(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
+                    MobileTranscriptBottomBar(transcript: transcript) {
+                        VStack(spacing: 0) {
+                            otherTurnLine.padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+                            GlassEffectContainer(spacing: NativeAgentMobileTheme.Spacing.md) { composerBar }
+                                .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+                                .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                        }
+                    }
                 }
-                // Only the reader's own acts move the chat: Latest, sending, the keyboard rising, opening a conversation.
-                .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in followEnd() }
             }
             .background { AliveChatRoom(store: store) }
             // Hide the visual navigation title but retain it for VoiceOver and the app switcher.
             .navigationTitle(agentDisplayName)
             .toolbar(.hidden, for: .navigationBar)
             .tint(AlivePalette.text)
-            .animation(AppMotion.snappy, value: voiceInput.isListening)
+            .animation(AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: voiceInput.isListening)
             // Sync-error dismissal must end when its condition changes.
             .onChange(of: sync.syncError) { _, newValue in
                 if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
@@ -311,10 +311,12 @@ extension ChatView {
                                 }
                             }
                     }
+                    .macSyncErrorBanner()
                 }
             }
             .sheet(isPresented: $showsSyncConnection) {
-                NavigationStack { SettingsViewFull(opensConnection: true) }
+                NavigationStack { SettingsViewFull(presentation: .sheet, opensConnection: true) }
+                    .macSyncErrorBanner()
             }
             .fileImporter(isPresented: $showsFileImporter, allowedContentTypes: [.pdf, .plainText, .init(filenameExtension: "md") ?? .plainText],
                 allowsMultipleSelection: true) { result in
@@ -333,7 +335,7 @@ extension ChatView {
             .onChange(of: scenePhase, conversationSceneChanged)
             .onDisappear(perform: conversationDisappeared)
             .onChange(of: notifiedSessionID) { _, _ in consumeNotifiedChatSessionIfNeeded() }
-            .onReceive(NotificationCenter.default.publisher(for: MobileQuickAskRoute.notification)) { _ in
+            .onMessage(MobileQuickAskRoute.Requested.self) { _ in
                 if MobileQuickAskRoute.consume() { composerIsFocused = true }
             }
             .onChange(of: store.isSwitchingSession) { _, switching in
@@ -343,7 +345,7 @@ extension ChatView {
                 adoptMainSessionFromSnapshots()
             }
             // Only process arguments may inject turns; Release exposes no URL route.
-            .onReceive(NotificationCenter.default.publisher(for: .nativeagentDeepLinkSend)) { _ in
+            .onMessage(NativeAgentDeepLinkSendHook.Staged.self) { _ in
                 NativeAgentDeepLinkSendHook.deliverPending(
                     to: store,
                     client: bridgeClient,
@@ -414,5 +416,26 @@ extension ChatView {
     /// Back to the end, and following from there.
     func followEnd() {
         transcript.goToLatest()
+    }
+}
+
+private struct MobileTranscriptStatusFill: View {
+    let text: String
+    let isError: Bool
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.composer, style: .continuous)
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(isError ? Color.red : AlivePalette.secondary)
+            .textSelection(.enabled)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(NativeAgentMobileTheme.Colors.contentSurface, in: shape)
+            .overlay {
+                shape.strokeBorder(NativeAgentMobileTheme.Colors.hairline, lineWidth: NativeAgentMobileTheme.Layout.hairline)
+            }
+            .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+            .padding(.top, NativeAgentMobileTheme.Spacing.sm)
     }
 }

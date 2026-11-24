@@ -1,51 +1,13 @@
 import Foundation
 // Blueprint: | `FaceEnvelope.swift` | Complete typed act/call vocabulary and correlated replies on the body–face pipe |
 
-public enum FaceEnvelope: Codable, Sendable {
-    public static let protocolVersion = 1
+public enum FaceEnvelope: Sendable {
+    public static let protocolVersion = 2
     case feed(FaceBatch)
-    case call(id: UUID, FaceCall)
-    case reply(id: UUID, FaceReply)
-    case act(id: UUID, FaceAct)
-    case actReply(id: UUID, FaceActReply)
-
-    private enum Payload: Codable {
-        case feed(FaceBatch)
-        case call(id: UUID, FaceCall)
-        case reply(id: UUID, FaceReply)
-        case act(id: UUID, FaceAct)
-        case actReply(id: UUID, FaceActReply)
-    }
-    private enum CodingKeys: String, CodingKey { case payload }
-
-    /// JSON bytes preserve Shared scalar nulls inside the binary property-list envelope.
-    public func encode(to encoder: any Encoder) throws {
-        let payload: Payload = switch self {
-        case .feed(let batch): .feed(batch)
-        case .call(let id, let call): .call(id: id, call)
-        case .reply(let id, let reply): .reply(id: id, reply)
-        case .act(let id, let act): .act(id: id, act)
-        case .actReply(let id, let reply): .actReply(id: id, reply)
-        }
-        let json = JSONEncoder()
-        json.userInfo = encoder.userInfo
-        var fields = encoder.container(keyedBy: CodingKeys.self)
-        try fields.encode(json.encode(payload), forKey: .payload)
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let fields = try decoder.container(keyedBy: CodingKeys.self)
-        let json = JSONDecoder()
-        json.userInfo = decoder.userInfo
-        let payload = try json.decode(Payload.self, from: fields.decode(Data.self, forKey: .payload))
-        self = switch payload {
-        case .feed(let batch): .feed(batch)
-        case .call(let id, let call): .call(id: id, call)
-        case .reply(let id, let reply): .reply(id: id, reply)
-        case .act(let id, let act): .act(id: id, act)
-        case .actReply(let id, let reply): .actReply(id: id, reply)
-        }
-    }
+    case call(id: UInt64, FaceCall)
+    case reply(id: UInt64, FaceReply)
+    case act(id: UInt64, FaceAct)
+    case actReply(id: UInt64, FaceActReply)
 }
 
 public enum FaceAct: Codable, Sendable {
@@ -57,7 +19,7 @@ public enum FaceAct: Codable, Sendable {
     case unobserve(id: UUID)
     case refresh(FaceRefreshScope)
     case frameApplied(epoch: UUID, sequence: UInt64, barriers: [UUID])
-    case cancelRequest(UUID)
+    case cancelRequest(UInt64)
     case restoreConversation
     case createConversation
     case selectConversation(session: String, userInitiated: Bool)
@@ -176,6 +138,7 @@ public enum FaceAct: Codable, Sendable {
     case voice(VoiceAct)
     case handBackMacControl(expectedGeneration: UInt64)
     case reportScene(SceneReport)
+    case followSettled(origin: String, landing: String, outcome: FollowOutcome)
     case reportProtectedWindows(ProtectedWindowsReport)
     case reportOverlayWindow(number: Int?)
     case reportInspector(RendererInspectorReport)
@@ -254,8 +217,6 @@ public enum FaceCall: Codable, Sendable {
     case navigate(FaceNavigationRequest)
     case readScene
     case openConversation(session: String, message: String?)
-    case openDetachedConversation(session: String)
-    case closeDetachedConversation(session: String)
     case readDetachedConversations
     case readComposer(session: String)
     case readComposerControls(turn: String?)
@@ -300,7 +261,7 @@ public enum FaceCall: Codable, Sendable {
     case replayTour
     case copyText(String)
     case closeRenderer
-    case cancelCall(UUID)
+    case cancelCall(UInt64)
 }
 
 public enum DeskPresentationRequest: Codable, Sendable {

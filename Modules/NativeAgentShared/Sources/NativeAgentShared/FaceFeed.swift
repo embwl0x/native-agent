@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Synchronization
 // Blueprint: | `FaceFeed.swift` | Finished values, replayable connection sinks and applied-frame barriers for local and remote faces |
 
 /// Where a finished value lives on a face. One key, one slot: a change at a key redraws only what reads that key.
@@ -8,7 +9,6 @@ public enum FaceKey: Hashable, Sendable, Codable {
     case sessions
     case session(String)
     case sessionNavigation
-    case sessionPalette
     case sessionSearch(UUID)
     case page(String)
     case pageTitle(String)
@@ -34,11 +34,7 @@ public enum FaceKey: Hashable, Sendable, Codable {
     case makeShelf
     case makePreview(reference: String, version: String)
     case senseView
-    case memoryDiagnostics
     case knowledgeGraph
-    case graphNeighborhood(entity: String)
-    case dreamDiary
-    case dreamEntry(date: String)
     case cognition
     case contextFlowHealth
     case mood
@@ -125,7 +121,7 @@ public actor FaceFeedSource {
     /// Each connection receives a complete base before its ordered changes.
     public func attachSink() -> FaceFeedSink {
         let id = UUID()
-        let (batches, continuation) = AsyncThrowingStream<FaceBatch, Error>.makeStream()
+        let (batches, continuation) = AsyncThrowingStream<PendingFaceFrame, Error>.makeStream()
         continuation.onTermination = { [weak self] _ in
             Task { await self?.detachSink(id, cause: FaceWireError.disconnected) }
         }
@@ -133,7 +129,7 @@ public actor FaceFeedSource {
         var base = retained
         base.replacesAll = true
         deliver(base, to: id)
-        return FaceFeedSink(epoch: id, batches: batches)
+        return FaceFeedSink(epoch: id, frames: batches)
     }
 
     public func detachSink(_ epoch: UUID, cause: any Error = FaceWireError.disconnected) {
@@ -199,14 +195,17 @@ public actor FaceFeedSource {
 
     private func deliver(_ batch: FaceBatch, to epoch: UUID) {
         guard var sink = sinks[epoch] else { return }
+        if sink.tail?.merge(batch) == true { return }
         let (next, overflow) = sink.sequence.addingReportingOverflow(1)
         guard !overflow else { detachSink(epoch, cause: FaceWireError.invalidFeedOrder); return }
         var frame = batch
         frame.epoch = epoch
         frame.sequence = sink.sequence
+        let pending = PendingFaceFrame(frame)
+        sink.tail = pending
         sink.sequence = next
         sinks[epoch] = sink
-        sink.continuation.yield(frame)
+        sink.continuation.yield(pending)
     }
 
     /// A capture waits for its queued values to reach the face's frame; cancellation ends the wait without drawing early.
@@ -241,7 +240,7 @@ public final class FaceSlot {
     public private(set) var value: AnyFaceValue?
     /// The value as selections read it, outside observation, so a selection never ties its reader to the whole value.
     @ObservationIgnored private var current: AnyFaceValue?
-    @ObservationIgnored private var selections: [String: any FaceSelectionBox] = [:]
+    private let selections = NSMapTable<NSString, AnyObject>.weakToWeakObjects()
 
     fileprivate init() {}
 
@@ -249,24 +248,41 @@ public final class FaceSlot {
         if let value, value.same(as: next) { return false }
         current = next
         value = next
-        for selection in selections.values { selection.refresh(next) }
+        refreshSelections(next)
         return true
     }
 
     fileprivate func clear() {
         current = nil
         value = nil
-        for selection in selections.values { selection.refresh(nil) }
+        refreshSelections(nil)
+    }
+
+    private func refreshSelections(_ value: AnyFaceValue?) {
+        for case let selection as any FaceSelectionBox in selections.objectEnumerator()?.allObjects ?? [] {
+            selection.refresh(value)
+        }
+    }
+
+    private nonisolated subscript<Value, Part>(_ selection: FaceSelection<Value, Part>) -> FaceSelection<Value, Part> {
+        access(keyPath: \.[selection])
+        return selection
     }
 
     /// The one part of this key's value a view draws. The view redraws when that part changes, never for the rest of the value.
     /// A name is one projection: the same name always selects the same part.
     public func select<Value: FaceValue, Part: Equatable>(_ name: String, as type: Value.Type,
                                                           _ part: @escaping (Value?) -> Part) -> Part {
-        if let selection = selections[name] as? FaceSelection<Value, Part> { return selection.part }
-        let selection = FaceSelection(part, from: current)
-        selections[name] = selection
-        return selection.part
+        self[selection(name, as: type, part)].part
+    }
+
+    public func selection<Value: FaceValue, Part: Equatable>(_ name: String, as type: Value.Type,
+                                                             _ part: @escaping (Value?) -> Part) -> FaceSelection<Value, Part> {
+        let key = name as NSString
+        if let selection = selections.object(forKey: key) as? FaceSelection<Value, Part> { return selection }
+        let selection = FaceSelection(name: key, part, from: current)
+        selections.setObject(selection, forKey: selection.name)
+        return selection
     }
 
     public func value<Value: FaceValue>(as type: Value.Type) -> Value? { value?.base as? Value }
@@ -279,11 +295,13 @@ private protocol FaceSelectionBox: AnyObject {
 
 /// A selection observes only its part; the slot refreshes it with each new value and it changes only when the part does.
 @MainActor @Observable
-private final class FaceSelection<Value: FaceValue, Part: Equatable>: FaceSelectionBox {
-    private(set) var part: Part
+public final class FaceSelection<Value: FaceValue, Part: Equatable>: NSObject, FaceSelectionBox {
+    fileprivate let name: NSString
+    public private(set) var part: Part
     @ObservationIgnored private let project: (Value?) -> Part
 
-    init(_ project: @escaping (Value?) -> Part, from value: AnyFaceValue?) {
+    init(name: NSString, _ project: @escaping (Value?) -> Part, from value: AnyFaceValue?) {
+        self.name = name
         self.project = project
         part = project(value?.base as? Value)
     }
@@ -361,11 +379,49 @@ public final class FaceFeed {
 
 public struct FaceFeedSink: Sendable {
     public let epoch: UUID
-    public let batches: AsyncThrowingStream<FaceBatch, Error>
+    fileprivate let frames: AsyncThrowingStream<PendingFaceFrame, Error>
+    public var batches: some AsyncSequence<FaceBatch, any Error> {
+        frames.map { try $0.take() }
+    }
+}
+
+fileprivate final class PendingFaceFrame: Sendable {
+    private let frame: Mutex<FaceBatch?>
+
+    init(_ batch: FaceBatch) { frame = Mutex(batch) }
+
+    func take() throws -> FaceBatch {
+        try frame.withLock { frame in
+            guard let batch = frame else { throw FaceWireError.invalidFeedOrder }
+            frame = nil
+            return batch
+        }
+    }
+
+    func merge(_ change: FaceBatch) -> Bool {
+        guard !change.replacesAll, change.barriers.isEmpty, change.removals.isEmpty,
+              change.values.count == 1, let (key, value) = change.values.first else { return false }
+        return frame.withLock { frame in
+            guard frame?.replacesAll == false, frame?.barriers.isEmpty == true,
+                  frame?.removals.isEmpty == true else { return false }
+            if let previous = frame?.values[key], !Self.supersedes(previous.base, with: value.base) { return false }
+            frame?.values[key] = value
+            return true
+        }
+    }
+
+    private static func supersedes(_ previous: any FaceValue, with next: any FaceValue) -> Bool {
+        if let prior = previous as? TurnFace, let next = next as? TurnFace { return next.supersedesPreview(of: prior) }
+        guard var partial = previous as? VoiceFace, let next = next as? VoiceFace,
+              partial.phase == .listening, partial.state == .ready else { return false }
+        partial.text = next.text
+        return partial == next
+    }
 }
 
 private struct FaceFeedSinkState {
-    let continuation: AsyncThrowingStream<FaceBatch, Error>.Continuation
+    let continuation: AsyncThrowingStream<PendingFaceFrame, Error>.Continuation
+    var tail: PendingFaceFrame?
     var sequence: UInt64 = 1
     var appliedSequence: UInt64 = 0
 }

@@ -1,16 +1,12 @@
 import Foundation
-import EngineRuntime
+import BodyRuntime
 import AppKit
-import ChromeControl
+import MacNerves
 import PersistenceCore
 import NativeAgentCore
-import TrustCenter
-import ChatTurnContracts
-import ChatToolRuntime
-import MacControl
-// Blueprint: | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder` alias to `ChromeControl.ChromeExtensionFolder`; app-bound `setUp`, `setupMessage` |
-
-typealias ChromeExtensionFolder = ChromeControl.ChromeExtensionFolder
+import DeskCore
+import MindCore
+// Blueprint: | `ChromeExtensionFolder.swift` | App-bound `ChromeExtensionFolder.setUp`, `setupMessage` |
 
 extension ChromeExtensionFolder {
     @MainActor

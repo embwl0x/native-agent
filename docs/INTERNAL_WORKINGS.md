@@ -62,7 +62,7 @@ The Mac draws attention and status through selections of `CountsFace` at
 actor; inbox readings and panel freshness also have actor owners. Native
 settings draw selections of `SettingsFace` at `.settings`; provider controls
 and per-conversation context are separate selections. The
-[stage-one feed contract](designs/separate-face.md#stage-one-counts-and-native-settings)
+[face-link contract](../Modules/NativeAgentCore/FACE_LINK.md)
 defines the projection boundary and retained operational ownership.
 Helper schedules and reminder settings retain their source errors on the Desk;
 unreadable settings cannot appear as reminders switched off. Contact snapshots
@@ -286,14 +286,14 @@ those requests. Offscreen capture installs no editor port. No second board
 projection or write owner is introduced.
 
 A piece is a Make ref laid on a Desk item: a `url` reference addressed
-`make:<ref>` (`DeskPiece`, `Desk/DeskRef.swift`), so every build decodes it as
+`make:<ref>` (`DeskPiece`, `DeskCore/Desk/DeskRef.swift`), so every build decodes it as
 a url reference and the record shape is unchanged. `desk.add_ref` refuses a
 `make:` address whose Make ref holds no version. The packet reads the Make
 shelf (`MakeStudio.Shelf`, the index the Work pane's Make view draws), starting
 it the first time the Desk holds a piece, and gives each board item its
 pieces (Make ref, title, what it is, version count, newest time) and the
 selected item its pieces with a text piece's words, or a table's rows, columns
-and first rows (`DeskPieceShelf`, `EngineRuntime/DeskFaceItem.swift`). The part
+and first rows (`DeskPieceShelf`, `BodyRuntime/EngineRuntime/DeskFaceItem.swift`). The part
 draws them first as **On the table** and, in the opened item, as each piece's
 words or a `leaf` block (key `piece:<refId>`, `ref` the Make ref, `revision` the
 version, `alt` the Make ref and the `make.read`/`make.add` calls, and for a table
@@ -975,9 +975,10 @@ transcript rows remain saved. `ConversationPrefixSeeding.seed` applies the
 [sent-context contract](conversation-context-history.md) before provider dispatch.
 The resident turn's replay metadata write and context/prefix diagnostics run
 beside dispatch and join before tool reads or turn settlement; the in-memory
-seed alone supplies the request. Exact-source/version idle turn programs
-retain their opened JavaScript body and realm; each call replaces frozen
-input and uses the requesting turn's journal and host reach.
+seed alone supplies the request. The pool can reuse a helper for the same
+turn program and version. Each invocation evaluates the body in a fresh realm
+with the requesting turn's frozen input, journal and host reach. The helper
+releases the body and realm before reporting completion.
 The `app` schema stays fixed while action discovery travels in results.
 Documents and skill bodies are retrieved when needed. There is no tool preload
 or session tool-loading lifecycle.
@@ -1017,7 +1018,7 @@ provenance, kinds, counted reads, trusted acceptance, untrusted review,
 care movements, atomic replacement and rejection protection.
 
 The Memories page is the agent's part `native-memories`, drawn over the packet
-`EngineRuntime/MemoriesFace.swift` reads through `MemoryFacade` (`memoriesPacket`):
+`BodyRuntime/EngineRuntime/MemoriesFace.swift` reads through `MemoryFacade` (`memoriesPacket`):
 kept memories with their pin, lifecycle, times and the provenance the memory owners
 derive, the waiting and rejected proposals, the active search, status failures and
 the total, and the Misses (corrections by lesson, this week against last, read from
@@ -1066,8 +1067,8 @@ The current after-turn path uses one model interpretation for facts, cares
 and semantic appraisal; routing follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
 Every moment is judged alone. User's own turns are judged at once; every other
 recorded turn is left owed and judged when they are idle. The judgment's fixed
-policy, reply shapes, form instructions and standing memories occupy its
-cache-marked system block; exchange evidence and nonstanding recall stay in
+policy and reply shapes precede the conditional form instructions in the
+system. Standing and recalled memories accompany exchange evidence in
 the user message. Promise filing likewise keeps instructions in the system
 and per-call JSON in the user message.
 Details are in
@@ -1099,11 +1100,11 @@ ability, saved with `ability.save` and run as `authored.<id>`, with `ability.ena
 [manifest spec](skill_manifest_spec.md). Skills are not factual memory and
 grant no new authority.
 
-Source owners: `MemoryV2/MemoryV2+AdaptivePromoter.swift`,
+Source owners: `MindCore/MemoryV2/MemoryV2+AdaptivePromoter.swift`,
 `AdaptiveMemoryPromoter+Recovery.swift`,
 `MemoryStorage+Projections.swift`,
 `MemoryV2+Proposals.swift`, `MemoryV2+UserMDGen.swift`,
-`MemoryV2+Recall.swift` and `ChatTurnRuntime/MindMemoryManager.swift`.
+`MemoryV2+Recall.swift` and `BodyRuntime/ChatTurnRuntime/MindMemoryManager.swift`.
 See [Memory system map](MEMORY_SYSTEM_MAP.md) for the store-level map.
 
 ## 3. Anatomy of a safe action
@@ -1132,10 +1133,10 @@ request; it does not establish that the effect succeeded. Dispatch results and
 the domain's verification evidence determine what can be reported. An
 uncertain send or interrupted effect must not be presented as confirmed.
 
-Source owners: `TrustCenter/SecurityCenter.swift`,
-`TrustCenter/PeerTurnEffectPolicy.swift`,
-`ApprovalTransactions/ApprovalTransactionCoordinator.swift` and
-`AppToolRuntime/AppToolExecutor+AppDoor.swift`.
+Source owners: `DeskCore/TrustCenter/SecurityCenter.swift`,
+`DeskCore/TrustCenter/PeerTurnEffectPolicy.swift`,
+`BodyRuntime/ApprovalTransactions/ApprovalTransactionCoordinator.swift` and
+`BodyRuntime/AppToolRuntime/AppToolExecutor+AppDoor.swift`.
 
 ## 4. How a native agent grows without losing itself
 
@@ -1184,8 +1185,8 @@ Desk tracks work; a job that carries a Desk item is its movement
 ([Desk](DESK.md)). Delegation does not replace the canonical persona, MemoryV2
 or Trust owners.
 
-Source owners: `AgentConversations/AgentJob*.swift`, `AgentConversations/JobDoor*.swift` and
-`AgentConversations/BuilderWorktreeAllocator.swift`.
+Source owners: `BodyRuntime/AgentConversations/AgentJob*.swift`, `BodyRuntime/AgentConversations/JobDoor*.swift` and
+`BodyRuntime/AgentConversations/BuilderWorktreeAllocator.swift`.
 See [Agent conversations](agent-communication.md).
 
 ## 6. One agent across every surface
@@ -1203,7 +1204,7 @@ conversation identities remain attached to the work.
 Slack DMs keep their own bindings: an allowlisted sender alone does not prove
 ownership and never moves the shared owner conversation anchor.
 
-Anything for them is one experience addressed to `person` (`Experiences/ForPerson.swift`, step 4 Build 4c). Its face is a
+Anything for them is one experience addressed to `person` (`SenseCore/Experiences/ForPerson.swift`, step 4 Build 4c). Its face is a
 `PartFace.Row` (title, detail, symbol, tone, link, actions) plus the words text doors read; an ask owes their `decide`;
 each of the person's doors owes `deliver:<door>` (`phone`, `mac`, `telegram:<chat>[:<thread>]`, `slack:<channel>[:<ts>]`,
 `conversation:<session>`), declared at birth (`Matter.born`, the one birth shape). Their reading is the matter's
@@ -1278,9 +1279,9 @@ Processed-message IDs and completion markers prevent already-executed
 commands from being dispatched again after a restart. The phone does not
 become the execution or memory owner.
 
-Source owners: `EngineRuntime/NativeAgentEngine.swift`,
-`DeviceSync/MacSyncEngine+Inbox.swift` and
-`DeviceSync/State/ICloudSyncStatePaths.swift`.
+Source owners: `BodyRuntime/EngineRuntime/NativeAgentEngine.swift`,
+`BodyRuntime/DeviceSync/MacSyncEngine+Inbox.swift` and
+`PersistenceCore/DeviceSyncState/ICloudSyncStatePaths.swift`.
 See [Mobile companion](mobile_companion.md).
 
 ## 7. Why the owners remain separate

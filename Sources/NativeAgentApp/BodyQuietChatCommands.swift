@@ -1,13 +1,11 @@
-import AppToolRuntime
-import ChatToolRuntime
-import ChatTurnContracts
-import EngineRuntime
+import BodyRuntime
+import MindCore
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
-import TrustCenter
+import DeskCore
 // Blueprint: | `BodyQuietChatCommands.swift` | Connection-held quiet composer snapshots, CAS edits and canonical session commands |
 
 @MainActor
@@ -182,8 +180,7 @@ struct BodyQuietChatCommands {
                 existingAttachmentIDs: before.attachments.map(\.id)))) else { throw FaceWireError.invalidFeedOrder }
             guard receipt.disposition == .applied else { return draftChanged() }
         }
-        let steer = PeerDataTaint.carried(turn: turn,
-            peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: turn.envelope?.surface ?? "chat"), peerID: turn.envelope?.verifiedUserId)
+        let steer = PeerDataTaint.carried(turn: turn)
         var origin = QuietChatSessionCommands.agentOrigin
         origin.peerSources = steer.sources
         origin.elevatedPeerSources = steer.elevated
@@ -293,35 +290,8 @@ extension BodyQuietChatCommands {
     func runSession(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) async -> JSONValue {
         do {
             let scope = try await sessionScope(verb: verb, input: input, reachesUser: reachesUser, turn: turn)
-            let resolved = QuietChatSessionCommands.fence(verb: verb, input: input, reachesUser: reachesUser,
+            return await QuietChatSessionCommands.run(verb: verb, input: input, reachesUser: reachesUser,
                 appModel: model, turn: turn, scope: scope)
-            if case .failure(let refusal) = resolved { return refusal.json }
-            guard ["show", "detach", "close_window"].contains(verb), case .success(let session?) = resolved else {
-                return await QuietChatSessionCommands.run(verb: verb, input: input, reachesUser: reachesUser,
-                    appModel: model, turn: turn, scope: scope)
-            }
-            let changed: Bool
-            switch verb {
-            case "show":
-                try await face.present(.openConversation(session: session.id, message: nil))
-                let after = try await self.scope()
-                guard after.selectedSessionID == session.id else { throw FaceWireError.invalidFeedOrder }
-                changed = scope.selectedSessionID != session.id
-            case "detach":
-                try await face.present(.openDetachedConversation(session: session.id))
-                guard case .detachedSessions(let after) = try await call(.readDetachedConversations), after.contains(session.id) else {
-                    throw FaceWireError.invalidFeedOrder
-                }
-                changed = !scope.detachedSessionIDs.contains(session.id)
-            default:
-                try await face.present(.closeDetachedConversation(session: session.id))
-                guard case .detachedSessions(let after) = try await call(.readDetachedConversations), !after.contains(session.id) else {
-                    throw FaceWireError.invalidFeedOrder
-                }
-                changed = scope.detachedSessionIDs.contains(session.id)
-            }
-            return .object(["status": .string("ok"), "session_id": .string(session.id), "title": .string(session.title),
-                "changed": .bool(changed), "detail": .string("The originating window confirmed \(verb) for \(session.title).")])
         } catch { return AppToolExecutor.failure("chat_session_failed", error.localizedDescription, extra: ["effects": .string("unknown")]) }
     }
 }

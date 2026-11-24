@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import Desk
+import DeskCore
 
 // Blueprint: | `main.swift` | `TaskLedgerCLI`: Strict ledger CLI and explicit data-root resolution |
 

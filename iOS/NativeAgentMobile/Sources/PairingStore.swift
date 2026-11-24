@@ -66,7 +66,8 @@ actor PhoneSigningIdentity {
 }
 
 @MainActor
-final class PairingStore: ObservableObject {
+@Observable
+final class PairingStore {
     /// Unreadable pairing is not removal; retire retained state only on checked removal or a committed different key.
     enum Material: Equatable {
         case unavailable
@@ -158,11 +159,11 @@ final class PairingStore: ObservableObject {
         )
     }
 
-    @Published var isICloudPaired: Bool {
+    var isICloudPaired: Bool {
         didSet { UserDefaults.standard.set(isICloudPaired, forKey: Keys.iCloudPaired) }
     }
     // The checked Keychain result is the one owner of availability and bytes.
-    @Published private(set) var material: Material = .unavailable {
+    private(set) var material: Material = .unavailable {
         didSet {
             if oldValue.secret != iCloudPairingSecret, iCloudSyncEngine.shared.pairingStore === self {
                 iCloudSyncEngine.shared.invalidateSnapshots(pairing: iCloudPairingSecret)
@@ -210,12 +211,12 @@ final class PairingStore: ObservableObject {
         NSLog("[PairingStore] %@", detail)
     }
     /// Counts the Mac's acceptances taken here; an open pairing screen closes on the next one.
-    @Published private(set) var macAcceptances = 0
+    private(set) var macAcceptances = 0
     /// Where this phone's answer to the Mac's acceptance stands while it is not settled; nil once the Mac has it.
-    @Published private(set) var confirmationStep: String?
-    @Published private(set) var connectionRepairPending = UserDefaults.standard.bool(forKey: "mobile.pairing.connectionRepairPending")
-    @Published var isRepairingConnection = false
-    @Published private(set) var secretStorageError: String?
+    private(set) var confirmationStep: String?
+    private(set) var connectionRepairPending = UserDefaults.standard.bool(forKey: "mobile.pairing.connectionRepairPending")
+    var isRepairingConnection = false
+    private(set) var secretStorageError: String?
 
     func clearPairingForConnectionRepair() throws {
         let query: [String: Any] = [

@@ -37,7 +37,7 @@ final class OnboardingWizardState {
     var providers: [ProviderInfo] { draftOwner?.providerAccounts ?? [] }
     var providersLoading = false
     var savingModel: Bool {
-        guard let operation = forms.operations["onboarding.model"] else { return false }
+        guard let operation = forms.operation(for: "onboarding.model") else { return false }
         return operation.outcome == nil || operation.checking || operation.outcome?.unresolved == true
     }
     var providerLoadError: String? {

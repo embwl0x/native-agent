@@ -95,7 +95,9 @@ struct ContentView: View {
     }
 
     private var preferenceContent: some View {
-        ZStack {
+        let tourPresented = showTour && appModel.shellLayout?.value != nil
+        let connectorPresented = showsSimpleView && isShowingChat && CardControls.shared.connectorSheet != nil
+        return ZStack {
             Group {
             if let failure = appModel.settingsViewModeIssue {
                 VStack(spacing: 16) {
@@ -140,7 +142,9 @@ struct ContentView: View {
             }
             }
             }
-            .accessibilityHidden((showTour && appModel.shellLayout?.value != nil) || showFirstRunOnboarding)
+            .viewModeSwitch(visible: !connectorPresented)
+            .disabled(tourPresented)
+            .accessibilityHidden(tourPresented || showFirstRunOnboarding)
             .onChange(of: shownRow, initial: true) {
                 surfacePages[shownSurface] = shownRow
                 ApplicationLifetime.shared.sceneShown()
@@ -176,6 +180,7 @@ struct ContentView: View {
             }
         }
         .disabled(chatShortcut != nil)
+        .accessibilityHidden(chatShortcut != nil)
         .overlay {
             if let page = chatShortcut {
                 SimpleSetupPanel { chatShortcut = nil } content: {
@@ -197,7 +202,6 @@ struct ContentView: View {
             }
             shownBodyToasts = Set(toasts.map(\.id))
         }
-        .viewModeSwitch()
         .animation(
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: showTour
@@ -268,25 +272,25 @@ struct ContentView: View {
         .sheet(isPresented: $showCommandPalette) {
             CommandPaletteView(isPresented: $showCommandPalette)
         }
-        .onReceive(NotificationCenter.default.publisher(for: .openCommandPaletteRequest)) { _ in
+        .onMessage(OpenCommandPaletteRequest.self) { _ in
             guard DeskWindowPresentation.shared.receiver == nil else { return }
             showCommandPalette = true
         }
         // AppModel already prepared the draft; this receiver only routes and recovers a missing first session.
-        .onReceive(NotificationCenter.default.publisher(for: .skillBuildRequest)) { note in
+        .onMessage(SkillBuildRequest.self) { message in
             selectionRaw = SidebarItem.chat.rawValue
-            let starter = (note.object as? String) ?? "Create a skill from this conversation:"
             guard appModel.activeChatSessionId.isEmpty else { return }
             Task {
                 await appModel.newChatSession()
                 guard !appModel.activeChatSessionId.isEmpty else { return }
-                _ = appModel.requestSkillBuild(starter: starter)
+                _ = appModel.requestSkillBuild(starter: message.starter)
             }
         }
         // Prefill only an empty composer so routing cannot clobber a half-written message.
-        .onReceive(NotificationCenter.default.publisher(for: .openChatDraftRequest)) { note in
+        .onMessage(OpenChatDraftRequest.self) { message in
             selectionRaw = SidebarItem.chat.rawValue
-            guard let draft = note.object as? String, !draft.isEmpty else { return }
+            let draft = message.draft
+            guard !draft.isEmpty else { return }
             if appModel.activeChatSessionId.isEmpty { return }
             if appModel.chatDraft(for: appModel.activeChatSessionId).isEmpty {
                 appModel.injectChatDraft(draft, sessionId: appModel.activeChatSessionId)
@@ -302,7 +306,7 @@ struct ContentView: View {
             // Today's source owner posts its face; opening it only draws that face.
         } else if item == .settings || item == .ownPage
                     || (item == .memories
-                        && UserDefaults.standard.string(forKey: ShellRailTab.storageKey(.memories)) != "knowledge") {
+                        && ShellRailTabStore.shared.value(for: .memories, default: "memories") != "knowledge") {
             // These pages own their arrival refresh, so the shell does not repeat it.
         } else {
             await appModel.refreshForSidebarItem(item)
@@ -368,7 +372,7 @@ struct ContentView: View {
                 selectSidebarItem(.dreams)
             case .memory:
                 appModel.pendingPaletteDestination = saved
-                UserDefaults.standard.set("memories", forKey: ShellRailTab.storageKey(.memories))
+                ShellRailTabStore.shared.set("memories", for: .memories)
                 selectSidebarItem(.memories)
             }
         case .activity(let section):
@@ -379,7 +383,7 @@ struct ContentView: View {
                 return
             }
             if let layout = appModel.shellLayout, let first = ShellRailTab.all(layout).first(where: { $0.page == target })?.tabs.first?.key {
-                UserDefaults.standard.set(first, forKey: ShellRailTab.storageKey(target))
+                ShellRailTabStore.shared.set(first, for: target)
             }
             selectSidebarItem(target)
         }
@@ -421,7 +425,7 @@ struct ContentView: View {
         guard target != .ownPage else { return }
         // Write the tab before selecting its parent so the page mounts on that tab.
         if let home = SidebarItem.shellHome(for: target) {
-            UserDefaults.standard.set(home.tab, forKey: ShellRailTab.storageKey(home.parent))
+            ShellRailTabStore.shared.set(home.tab, for: home.parent)
             selectionRaw = home.parent.rawValue
             return
         }
@@ -432,22 +436,19 @@ struct ContentView: View {
         if section == .memoryProposals {
             appModel.pendingActivitySectionRaw = nil
             // The waiting card is on the Memories tab, not the graph.
-            UserDefaults.standard.set("memories", forKey: ShellRailTab.storageKey(.memories))
+            ShellRailTabStore.shared.set("memories", for: .memories)
             selectionRaw = SidebarItem.memories.rawValue
             return
         }
         appModel.pendingActivitySectionRaw = section.rawValue
         selectionRaw = SidebarItem.activity.rawValue
-        NotificationCenter.default.post(
-            name: .openActivitySectionRequest,
-            object: section.rawValue
-        )
+        NotificationCenter.default.post(OpenActivitySectionRequest(section: section))
     }
 
     private func applyActivityRoot() {
         appModel.pendingActivitySectionRaw = nil
         selectionRaw = SidebarItem.activity.rawValue
-        NotificationCenter.default.post(name: .openActivityRootRequest, object: nil)
+        NotificationCenter.default.post(OpenActivityRootRequest())
     }
 
 }
@@ -455,10 +456,20 @@ struct ContentView: View {
 
 
 
-extension Notification.Name {
-    static let openCommandRouteRequest = Notification.Name("NativeAgent.openCommandRouteRequest")
-    static let openCommandPaletteRequest = Notification.Name("NativeAgent.openCommandPaletteRequest")
-    static let openActivitySectionRequest = Notification.Name("NativeAgent.openActivitySectionRequest")
-    static let openActivityRootRequest = Notification.Name("NativeAgent.openActivityRootRequest")
-    static let openChatDraftRequest = Notification.Name("NativeAgent.openChatDraftRequest")
+struct OpenCommandPaletteRequest: NotificationCenter.MainActorMessage {
+    typealias Subject = NSObject
+}
+
+struct OpenActivitySectionRequest: NotificationCenter.MainActorMessage {
+    typealias Subject = NSObject
+    let section: ActivitySection
+}
+
+struct OpenActivityRootRequest: NotificationCenter.MainActorMessage {
+    typealias Subject = NSObject
+}
+
+struct OpenChatDraftRequest: NotificationCenter.MainActorMessage {
+    typealias Subject = NSObject
+    let draft: String
 }

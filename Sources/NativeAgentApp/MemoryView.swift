@@ -1,8 +1,8 @@
 import Foundation
-import EngineRuntime
+import BodyRuntime
 import SwiftUI
 import NativeAgentShared
-import MemoryV2
+import MindCore
 import PersistenceCore
 
 // Blueprint: | `MemoryView.swift` | Canonical Spotlight reindex operation and checked outcome words |

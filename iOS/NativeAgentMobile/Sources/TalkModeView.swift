@@ -7,6 +7,8 @@ struct TalkModeView: View {
     let talk: TalkModeController
     @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @ScaledMetric(relativeTo: .largeTitle) private var titleSize: CGFloat = 34
 
     private var shades: [Color] { HazeColor(stored: hazeRaw).shades.map { Color(hex: $0) } }
     private var level: CGFloat {
@@ -17,11 +19,17 @@ struct TalkModeView: View {
         ZStack {
             AliveRoom(mood: talk.isSpeaking ? .replying : .idle)
             VStack(spacing: 0) {
-                header.padding(.top, 28)
-                Spacer(minLength: 8)
-                presence
-                Spacer(minLength: 8)
-                captions.padding(.horizontal, 28)
+                ScrollView {
+                    VStack(spacing: 8) {
+                        header
+                        presence
+                            .containerRelativeFrame(.vertical) { height, _ in min(300, height * 0.4) }
+                        captions
+                    }
+                    .padding(.top, 28)
+                    .padding(.horizontal, 28)
+                }
+                .scrollBounceBehavior(.basedOnSize)
                 controls.padding(.top, 24).padding(.bottom, 16)
             }
         }
@@ -31,7 +39,8 @@ struct TalkModeView: View {
     private var header: some View {
         VStack(spacing: 6) {
             Text(talk.agentName)
-                .font(.system(size: 34, weight: .regular, design: .serif))
+                .font(.system(size: titleSize, weight: .regular, design: .serif))
+                .multilineTextAlignment(.center)
             HStack(spacing: 6) {
                 if let start = talk.startedAt { Text(start, style: .timer).monospacedDigit() }
                 if talk.startedAt != nil, !talk.status.isEmpty { Text("·") }
@@ -45,30 +54,35 @@ struct TalkModeView: View {
 
     /// The speaking voice lifts a ~4.5 s breath; Reduce Motion must still it.
     private var presence: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || !(talk.isActive || talk.isStarting))) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            let breath = reduceMotion ? 0 : CGFloat((sin(t * 2 * .pi / 4.5) + 1) / 2)
-            let lift = reduceMotion ? 0 : level
-            ZStack {
-                Circle()
-                    .fill(shades[0].opacity(talk.isSpeaking ? 0.45 : 0.30))
-                    .frame(width: 270, height: 270)
-                    .blur(radius: 52)
-                    .scaleEffect(1 + 0.06 * breath + 0.28 * lift)
-                Circle()
-                    .fill(RadialGradient(colors: [shades[2].opacity(0.95), shades[1].opacity(0.70)],
-                                         center: .center, startRadius: 6, endRadius: 82))
-                    .frame(width: 148, height: 148)
-                    .blur(radius: 5)
-                    .scaleEffect(1 + 0.03 * breath + 0.18 * lift)
-                Circle()
-                    .stroke(.white.opacity(talk.isSpeaking ? 0.32 : 0.14), lineWidth: 1)
-                    .frame(width: 148, height: 148)
-                    .scaleEffect(1 + 0.03 * breath + 0.18 * lift)
+        GeometryReader { proxy in
+            let scale = max(0, min(1, proxy.size.height / 300))
+            TimelineView(.animation(minimumInterval: 1.0 / 30,
+                                    paused: reduceMotion || scenePhase != .active || !(talk.isActive || talk.isStarting))) { context in
+                let t = context.date.timeIntervalSinceReferenceDate
+                let breath = reduceMotion ? 0 : CGFloat((sin(t * 2 * .pi / 4.5) + 1) / 2)
+                let lift = reduceMotion ? 0 : level
+                ZStack {
+                    Circle()
+                        .fill(shades[0].opacity(talk.isSpeaking ? 0.45 : 0.30))
+                        .frame(width: 270, height: 270)
+                        .blur(radius: 52)
+                        .scaleEffect(1 + 0.06 * breath + 0.28 * lift)
+                    Circle()
+                        .fill(RadialGradient(colors: [shades[2].opacity(0.95), shades[1].opacity(0.70)],
+                                             center: .center, startRadius: 6, endRadius: 82))
+                        .frame(width: 148, height: 148)
+                        .blur(radius: 5)
+                        .scaleEffect(1 + 0.03 * breath + 0.18 * lift)
+                    Circle()
+                        .stroke(.white.opacity(talk.isSpeaking ? 0.32 : 0.14), lineWidth: 1)
+                        .frame(width: 148, height: 148)
+                        .scaleEffect(1 + 0.03 * breath + 0.18 * lift)
+                }
+                .scaleEffect(scale)
+                .opacity(talk.isActive || talk.isStarting ? 1 : 0.45)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .opacity(talk.isActive || talk.isStarting ? 1 : 0.45)
         }
-        .frame(height: 300)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: level)
         .accessibilityHidden(true)
     }
@@ -81,7 +95,7 @@ struct TalkModeView: View {
                 Text(error).font(.callout).foregroundStyle(.orange)
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private func line(_ who: String, _ text: String, emphasized: Bool) -> some View {

@@ -9,11 +9,11 @@ import Observation
 struct InspectorView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    @State private var store = TurnInspectorStore()
-    @State private var session = FacePageSession()
-    private var slot: FaceSlot {
-        appModel.face.slot(store.mode == .replay ? .inspectorReplay(day: store.replayDate) : .inspector(after: store.clearBefore))
-    }
+    private var store: TurnInspectorStore { appModel.inspectorStore }
+    private var session: FacePageSession { appModel.pageSessions.page(quietOffscreenRead ? "inspector/capture" : "inspector") }
+    private var mode: TurnInspectorStore.Mode { quietOffscreenRead ? .live : store.mode }
+    private var key: FaceKey { quietOffscreenRead ? .inspector(after: nil) : store.key }
+    private var slot: FaceSlot { appModel.face.slot(key) }
     private var replay: InspectorReplayReading? {
         appModel.face.slot(.inspectorReplay(day: store.replayDate)).select("reading", as: InspectorFace.self) { $0.map(InspectorReplayReading.init) }
     }
@@ -24,42 +24,58 @@ struct InspectorView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+        VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            AlivePageHeader(
+                title: "Chat turn details",
+                line: mode == .live ? "What happens during each message, as it happens" : replayPresentation.statusText,
+                wrapsLine: true
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .top)
             header
-            Divider()
-            if let issue = store.issue { Text(issue).foregroundStyle(.orange).textSelection(.enabled) }
+                .padding(.horizontal, 20)
+                .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .top)
+            if !quietOffscreenRead, let issue = store.issue {
+                Text(issue).foregroundStyle(.orange).textSelection(.enabled)
+                    .padding(.horizontal, 20)
+                    .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .top)
+            }
             content
         }
-        .padding(NativeAgentSpacing.lg)
+        .padding(.top, TodayMetrics.topPadding)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .liveTask(id: store.key) {
+        .liveTask(id: key) {
             await store.observe(client: appModel.client)
         }
         .onChange(of: inspectorReport, initial: true) { _, report in
-            if !quietOffscreenRead, let report { FaceReports.shared.submit(.reportInspector(report)) }
+            if let report { FaceReports.shared.submit(.reportInspector(report)) }
         }
     }
 
     private var inspectorReport: RendererInspectorReport? {
-        FaceReports.shared.connectionID.map { store.report(connection: $0) }
+        quietOffscreenRead ? nil : FaceReports.shared.connectionID.map { store.report(connection: $0) }
     }
 
     private var header: some View {
-        FaceView(face: headerFace, door: headerDoor, session: session).macFaceStyle()
+        FaceView(face: headerFace, door: headerDoor, session: session)
     }
 
     private var headerFace: PartFace {
         var rows: [PartFace.Row] = [
-            .init(id: "inspector-mode", title: "Chat turn details", control: .choice(
+            .init(id: "inspector-mode", title: "Mode", control: .choice(
                 TurnInspectorStore.Mode.allCases.map { .init(id: $0.rawValue, label: $0.rawValue) },
-                selected: store.mode.rawValue, call: .init("inspector.mode"))),
+                selected: mode.rawValue, call: .init("inspector.mode"))),
         ]
-        if store.mode == .live {
-            rows.append(.init(id: "inspector-clear", title: "What happens during each message, as it happens", actions: [
+        if mode == .live {
+            rows.append(.init(id: "inspector-clear", title: "Live turns", actions: [
                 .init(id: "clear", label: "Clear", call: .init("inspector.clear")),
             ]))
         } else {
-            rows.append(.init(id: "inspector-date", title: "Replay date", detail: replayPresentation.statusText,
+            rows.append(.init(id: "inspector-date", title: "Replay date",
                 control: .init(call: .init("inspector.date"), date: store.replayDate.formatted(.iso8601))))
             if let replay, replay.unreadable > 0 {
                 rows.append(.init(id: "inspector-unreadable", title: "\(replay.unreadable) unreadable rows skipped", tone: .attention))
@@ -116,26 +132,35 @@ struct InspectorView: View {
         let status = slot.select("status", as: InspectorFace.self) { $0?.status }
         if let issue = slot.select("issue", as: InspectorFace.self, { $0?.issue }) {
             Text(issue).foregroundStyle(.orange)
+                .padding(.horizontal, 20)
+                .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .top)
         }
         if ids.isEmpty, status == nil || status == .reading {
-            statusFace(store.mode == .replay ? replayPresentation.statusText : "Reading saved turns…", waiting: true)
+            if mode == .live { statusFace("Reading saved turns…", waiting: true) }
         } else if ids.isEmpty, status == .ready {
             emptyState
         } else if ids.isEmpty {
             statusFace("Inspector evidence is unavailable.", tone: .failed)
         } else {
             List {
-                ForEach(ids, id: \.self) { InspectorCardReadout(slot: slot, id: $0, session: session) }
+                ForEach(ids, id: \.self) { id in
+                    let card = slot.selection("card." + id, as: InspectorFace.self) { $0?.cards[id] }
+                    InspectorCardReadout(reading: card, id: id, session: session)
+                }
             }
-            .environment(\.faceInList, true)
+            .faceList()
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
-            .macFaceStyle()
+            .pageScrollColumn()
+            .environment(\.faceListColumnWidth, TodayMetrics.contentWidth)
+            .contentMargins(.bottom, quietOffscreenRead ? 16 : 32, for: .scrollContent)
+            .scrollEdgeEffectStyle(quietOffscreenRead ? nil : .soft, for: [.top, .bottom])
         }
     }
 
     private var emptyState: some View {
-        statusFace(store.mode == .live
+        statusFace(mode == .live
             ? "Waiting for a turn — send a message to watch it happen."
             : (replay?.issue ?? (replay?.hasEvidence == false
                 ? "Nothing was recorded for this date."
@@ -147,7 +172,10 @@ struct InspectorView: View {
             .init(id: "inspector-status", style: waiting ? .waiting : .note, rows: [
                 .init(id: "inspector-status", title: words, tone: tone),
             ]),
-        ]), door: ReadOnlyFaceDoor(), session: session).macFaceStyle()
+        ]), door: ReadOnlyFaceDoor(), session: session)
+            .padding(.horizontal, 20)
+            .frame(maxWidth: TodayMetrics.contentWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .top)
     }
 }
 
@@ -166,11 +194,11 @@ private struct InspectorReplayReading: Equatable {
 }
 
 private struct InspectorCardReadout: View {
-    let slot: FaceSlot
+    let reading: FaceSelection<InspectorFace, InspectorTurnCard?>
     let id: String
     let session: FacePageSession
 
-    private var card: InspectorTurnCard? { slot.select("card." + id, as: InspectorFace.self) { $0?.cards[id] } }
+    private var card: InspectorTurnCard? { reading.part }
 
     var body: some View {
         if let card {
@@ -247,7 +275,8 @@ final class TurnInspectorStore {
 
     private(set) var mode: Mode = .live
     private(set) var clearBefore: Date?
-    private(set) var replayDate = Calendar(identifier: .gregorian).startOfDay(for: Date())
+    private var selectedReplayDate: Date?
+    var replayDate: Date { selectedReplayDate ?? Calendar(identifier: .gregorian).startOfDay(for: Date()) }
     private(set) var subscription: UUID?
     private(set) var issue: String?
     @ObservationIgnored private var mounting: UUID?
@@ -335,17 +364,20 @@ final class TurnInspectorStore {
         }
     }
 
-    func setMode(_ value: Mode) { mode = value }
+    func setMode(_ value: Mode) {
+        if value == .replay, selectedReplayDate == nil { loadReplay(for: Date()) }
+        mode = value
+    }
     func clearLive() { clearBefore = Date() }
-    func loadReplay(for date: Date) { replayDate = Calendar(identifier: .gregorian).startOfDay(for: date) }
+    func loadReplay(for date: Date) { selectedReplayDate = Calendar(identifier: .gregorian).startOfDay(for: date) }
 
     func report(connection: UUID) -> RendererInspectorReport {
         let state = observedKey.flatMap { client?.face.slot($0).value(as: InspectorFace.self) }
-        let pending = owner != nil && (subscription == nil || state?.observationActive == nil)
+        let pending = owner != nil && issue == nil && state?.issue == nil && (subscription == nil || state?.observationActive == nil)
         return RendererInspectorReport(connection: connection, view: owner, subscription: subscription, mounted: mounted,
             observing: mounted && subscription != nil && issue == nil && state?.observationActive == true,
-            issue: issue ?? state?.issue ?? (pending ? "Waiting on the body's trace-observation state."
-                : state?.observationActive == false ? "The body trace observer is inactive." : nil))
+            issue: issue ?? state?.issue ?? (state?.observationActive == false ? "The body trace observer is inactive." : nil),
+            pending: pending)
     }
 
     func rearm(connection: UUID, view: UUID, subscription expected: UUID?) async throws -> RendererInspectorReport {

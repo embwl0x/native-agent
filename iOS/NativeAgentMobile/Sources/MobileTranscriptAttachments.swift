@@ -198,28 +198,31 @@ private struct TranscriptTableView: View {
 
     var body: some View {
         let columns = Array(0..<table.columnCount)
-        Grid(alignment: .topLeading, horizontalSpacing: NativeAgentSpacing.sm, verticalSpacing: 0) {
-            GridRow {
-                ForEach(columns, id: \.self) { column in
-                    cell(table.cell(table.header, column), column: column)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(AlivePalette.secondary)
-                        .padding(.vertical, NativeAgentSpacing.xs)
-                }
-            }
-            Divider().gridCellUnsizedAxes(.horizontal)
-            ForEach(table.rows.indices, id: \.self) { row in
+        ScrollView(.horizontal, showsIndicators: true) {
+            Grid(alignment: .topLeading, horizontalSpacing: NativeAgentSpacing.sm, verticalSpacing: 0) {
                 GridRow {
                     ForEach(columns, id: \.self) { column in
-                        cell(table.cell(table.rows[row], column), column: column)
-                            .font(.subheadline)
-                            .foregroundStyle(AlivePalette.text)
+                        cell(table.cell(table.header, column), column: column)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(AlivePalette.secondary)
                             .padding(.vertical, NativeAgentSpacing.xs)
                     }
                 }
+                Divider().gridCellUnsizedAxes(.horizontal)
+                ForEach(table.rows.indices, id: \.self) { row in
+                    GridRow {
+                        ForEach(columns, id: \.self) { column in
+                            cell(table.cell(table.rows[row], column), column: column)
+                                .font(.subheadline)
+                                .foregroundStyle(AlivePalette.text)
+                                .padding(.vertical, NativeAgentSpacing.xs)
+                        }
+                    }
+                }
             }
+            .padding(NativeAgentSpacing.md)
         }
-        .padding(NativeAgentSpacing.md)
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(NativeAgentMobileTheme.Colors.quietFill, in: RoundedRectangle(cornerRadius: TranscriptMetrics.codeRadius, style: .continuous))
         .accessibilityElement(children: .contain)
@@ -228,10 +231,34 @@ private struct TranscriptTableView: View {
 
     private func cell(_ text: String, column: Int) -> some View {
         let align = table.align(column)
-        return Text(ChatRichContentParser.inline(text).presentation)
-            .multilineTextAlignment(align == .trailing ? .trailing : align == .center ? .center : .leading)
-            .frame(maxWidth: .infinity, alignment: align == .trailing ? .trailing : align == .center ? .center : .leading)
-            .gridColumnAlignment(align == .trailing ? .trailing : .leading)
+        let horizontal: HorizontalAlignment = align == .trailing ? .trailing : align == .center ? .center : .leading
+        return TranscriptTableCellLayout(maxWidth: 220, alignment: horizontal) {
+            Text(ChatRichContentParser.inline(text).presentation)
+                .multilineTextAlignment(align == .trailing ? .trailing : align == .center ? .center : .leading)
+        }
+        .gridColumnAlignment(horizontal)
+    }
+}
+
+private struct TranscriptTableCellLayout: Layout {
+    let maxWidth: CGFloat
+    let alignment: HorizontalAlignment
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let child = subviews.first else { return .zero }
+        let cap = proposal.width.map { min($0, maxWidth) } ?? maxWidth
+        let fit = child.sizeThatFits(ProposedViewSize(width: cap, height: proposal.height))
+        return CGSize(width: min(cap, fit.width), height: fit.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let child = subviews.first else { return }
+        let (x, anchor): (CGFloat, UnitPoint) = switch alignment {
+        case .trailing: (bounds.maxX, .topTrailing)
+        case .center: (bounds.midX, .top)
+        default: (bounds.minX, .topLeading)
+        }
+        child.place(at: CGPoint(x: x, y: bounds.minY), anchor: anchor, proposal: ProposedViewSize(bounds.size))
     }
 }
 

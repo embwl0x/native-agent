@@ -6,6 +6,7 @@ import NativeAgentShared
 
 struct CommandPaletteView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Binding var isPresented: Bool
     var desk: DeskPaletteScope? = nil
     @State private var viewID = UUID()
@@ -13,6 +14,8 @@ struct CommandPaletteView: View {
     @State private var selection: String?
     @State private var issue: String?
     @State private var pendingCommitQuery: String?
+    @State private var committing = false
+    @State private var mounted = true
     @FocusState private var fieldFocused: Bool
     private struct Reading: Equatable {
         let query: String
@@ -58,12 +61,13 @@ struct CommandPaletteView: View {
                 TextField(desk == nil ? "Jump to anything…" : "Find anything — or type close, defer or note", text: $query)
                     .textFieldStyle(.plain).font(.title3).focused($fieldFocused)
                     .onSubmit {
+                        guard !committing else { return }
                         if shown.state == .ready { commitCurrent(shown) }
                         else { pendingCommitQuery = query }
                     }
                 if !query.isEmpty {
                     Button { query = ""; fieldFocused = true } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.plain).help("Clear")
+                        .buttonStyle(.plain).help("Clear").accessibilityLabel("Clear search")
                 }
             }.padding(14)
             Divider()
@@ -98,27 +102,41 @@ struct CommandPaletteView: View {
                             .padding(.horizontal, 14).padding(.vertical, 8)
                             .background(selection == row.id ? NativeAgentShell.softFill : Color.clear)
                             .contentShape(Rectangle()).id(row.id)
-                            .onTapGesture { selection = row.id; commit(row, from: shown) }
+                            .onTapGesture { commit(row, from: shown) }
+                            .accessibilityAddTraits(selection == row.id ? [.isButton, .isSelected] : .isButton)
+                            .accessibilityAction { commit(row, from: shown) }
                             .onContinuousHover { phase in
-                                if commandPaletteShouldAdoptHover(phase.isActive, eventType: NSApp.currentEvent?.type) { selection = row.id }
+                                if !committing, commandPaletteShouldAdoptHover(phase.isActive, eventType: NSApp.currentEvent?.type) { selection = row.id }
                             }
                         }
                     }
                 }.frame(maxHeight: 360)
                 .onChange(of: selection) { _, id in
-                    if let id { withAnimation(NativeAgentMotion.quick) { proxy.scrollTo(id, anchor: .center) } }
+                    if let id {
+                        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion)) {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                    }
                 }
             }
             Divider()
             HStack {
-                Text("↑↓ Navigate   ↩ Open   Esc Close")
+                Text(committing ? "Opening…" : "↑↓ Navigate   ↩ Open   Esc Close")
                 Spacer()
                 Text("\(shown.rows.count) results")
             }.font(ShellType.caption).foregroundStyle(.secondary).padding(14)
         }
+        .disabled(committing)
+        .allowsHitTesting(!committing)
+        .interactiveDismissDisabled(committing)
         .frame(width: 560).houseSheet()
-        .background(KeyCatcher(onMoveUp: { move(-1, in: shown.rows) }, onMoveDown: { move(1, in: shown.rows) }, onEscape: { isPresented = false }))
-        .onAppear { fieldFocused = true }
+        .background(KeyCatcher(
+            onMoveUp: { move(-1, in: shown.rows) },
+            onMoveDown: { move(1, in: shown.rows) },
+            onEscape: { if !committing { isPresented = false } }
+        ))
+        .onAppear { mounted = true; fieldFocused = true }
+        .onDisappear { mounted = false }
         .onChange(of: query) { selection = nil; issue = nil; pendingCommitQuery = nil }
         .onChange(of: shown) { _, value in
             if pendingCommitQuery == value.query, value.state == .ready {
@@ -131,7 +149,7 @@ struct CommandPaletteView: View {
     }
 
     private func move(_ delta: Int, in rows: [PartFace.Row]) {
-        guard !rows.isEmpty else { return }
+        guard !committing, !rows.isEmpty else { return }
         let current = rows.firstIndex { $0.id == selection }
         let next = min(max((current ?? (delta > 0 ? -1 : 1)) + delta, 0), rows.count - 1)
         selection = rows[next].id
@@ -156,7 +174,10 @@ struct CommandPaletteView: View {
     }
 
     private func commit(_ row: PartFace.Row, from shown: Reading) {
+        guard !committing else { return }
         guard shown.state == .ready, shown.query == query else { issue = "Read the current search before choosing a result."; return }
+        committing = true
+        selection = row.id
         if let desk {
             if let command = shown.commands.first(where: { $0.handle == row.id }) {
                 desk.onCommand(command)
@@ -167,13 +188,14 @@ struct CommandPaletteView: View {
             return
         }
         Task {
+            defer { if mounted { committing = false } }
             do {
                 guard let target = shown.targets[row.id] else {
                     throw PartCallError(code: "palette_destination_missing", message: "This search row has no supplied destination.")
                 }
                 try await open(target)
-                isPresented = false
-            } catch { issue = error.localizedDescription }
+                if mounted { isPresented = false }
+            } catch { if mounted { issue = error.localizedDescription } }
         }
     }
 

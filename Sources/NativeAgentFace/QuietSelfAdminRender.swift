@@ -88,8 +88,9 @@ enum QuietSelfAdminRender {
     static func pageView(for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize) -> some View {
         // Render tab destinations inside their rail frame so screenshots match the visible page.
         Group {
-            if QuietPages.drawOnly.contains(page) {
-                // A picture changes no selection: Simple is drawn on Chat, or on Control's Settings tab, where Simple's settings live.
+            if page.id == "home" {
+                AgentScreenView(room: .constant("home"))
+            } else if QuietPages.drawOnly.contains(page) {
                 SimpleShellView(shown: page.id == QuietPages.simpleSettings ? .item(.settings) : .item(.chat),
                                 choose: { _, _ in }, select: { _ in })
             } else {
@@ -98,6 +99,7 @@ enum QuietSelfAdminRender {
         }
         .environment(\.quietRailTab, tab ?? SidebarItem.shellHome(for: page.item)?.tab)
         .environment(appModel)
+        .environment(\.colorScheme, AppearanceController.shared.colorScheme)
         // A screenshot is a read, so lifecycle work must not change the state being captured.
         .environment(\.quietOffscreenRead, true)
         .environment(\.faceHoldsDocuments, false)
@@ -159,6 +161,7 @@ enum QuietSelfAdminRender {
         hosting.frame = CGRect(origin: .zero, size: size)
         let host = QuietCaptureWindow(contentRect: CGRect(origin: .zero, size: size),
                                       styleMask: [.borderless], backing: .buffered, defer: true)
+        host.appearance = AppearanceController.shared.appearance
         host.isReleasedWhenClosed = false
         host.contentView = hosting
         defer { host.contentView = nil; host.close() }
@@ -231,7 +234,7 @@ enum QuietSelfAdminRender {
             present = present && appModel.face.slot(.inspector(after: nil)).value(as: InspectorFace.self) != nil
         default: break
         }
-        if QuietPages.drawOnly.contains(page) {
+        if page.id == "simple" || page.id == QuietPages.simpleSettings {
             present = present && appModel.face.slot(.contacts).value(as: ContactsFace.self) != nil
                 && appModel.face.slot(.helpers).value(as: HelpersFace.self) != nil
         }
@@ -304,13 +307,8 @@ struct QuietPage: Sendable, Equatable {
 enum QuietPages {
     static let all = QuietToolPage.all.map(QuietPage.init)
     /// The draw-only page that pictures Simple on Control's Settings tab.
-    static let simpleSettings = "simple_settings_menu"
-    static let drawOnly: [QuietPage] = [
-        QuietPage(value: QuietToolPage(id: "simple", title: "Simple view",
-                  summary: "The Simple shell on Chat: my card, the places, the folded Agents and Helpers lists, and the chat.")),
-        QuietPage(value: QuietToolPage(id: simpleSettings, title: "Simple view settings",
-                  summary: "The Simple shell on Control's Settings tab, where Simple's settings live.")),
-    ]
+    static let simpleSettings = QuietToolPage.simpleSettings
+    static let drawOnly = QuietToolPage.drawOnly.map(QuietPage.init)
     /// An app page by name or alias, or a page of the agent's own by its id.
     @MainActor static func page(named raw: String) -> QuietPage? {
         let key = AppDoorNames.resolve(raw)

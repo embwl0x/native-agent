@@ -49,7 +49,8 @@ struct AliveSearchField: View {
                 Button { text = "" } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(AlivePalette.secondary)
-                        .frame(width: 32, height: 44)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Clear search")
@@ -153,7 +154,7 @@ private struct HazeControlTint: ViewModifier {
     }
 }
 
-struct HazeSwatches: View {
+extension HazeColor {
     @MainActor static var settingControl: PhoneLocalSetting {
         PhoneLocalSetting(id: "phone.haze_color", label: "iPhone haze", type: "choice",
             choices: HazeColor.allCases.map(\.rawValue), read: {
@@ -167,39 +168,5 @@ struct HazeSwatches: View {
                 try authority.check()
                 UserDefaults.standard.set(raw, forKey: HazeColor.key)
             })
-    }
-    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
-
-    var body: some View {
-        let selected = HazeColor(stored: colorRaw)
-        // 7 × 36 + 6 × 2 = 264pt: fits a Settings row on the narrowest iPhone.
-        VStack(alignment: .leading, spacing: 6) {
-        if selected == .unavailable {
-            Text("The saved color is unsupported. Choose a color to repair this setting.")
-                .font(.footnote).foregroundStyle(AlivePalette.secondary)
-        }
-        HStack(spacing: 2) {
-            ForEach(HazeColor.allCases) { color in
-                Button {
-                    colorRaw = color.rawValue
-                } label: {
-                    Circle()
-                        .fill(color.swatch)
-                        .frame(width: 26, height: 26)
-                        .padding(4)
-                        .overlay {
-                            Circle().strokeBorder(color == selected ? AlivePalette.text : .clear, lineWidth: 2)
-                        }
-                        .frame(width: 36, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(color.name)
-                .accessibilityAddTraits(color == selected ? .isSelected : [])
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .sensoryFeedback(.selection, trigger: colorRaw)
-        }
     }
 }

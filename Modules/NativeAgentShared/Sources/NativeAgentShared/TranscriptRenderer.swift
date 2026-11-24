@@ -95,7 +95,6 @@ public struct TranscriptLook {
 
 /// Renders one block as one paragraph. Every paragraph is one NSTextParagraph: newlines inside a block become line separators.
 /// Rendering runs on the press actor.
-@available(macOS 15, iOS 18, *)
 public struct TranscriptRenderer {
     /// The text container's width: the column, or less in a narrow window or on a narrow screen.
     public let width: CGFloat

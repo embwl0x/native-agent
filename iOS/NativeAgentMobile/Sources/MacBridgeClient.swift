@@ -1,90 +1,58 @@
 import Foundation
-import Combine
+import Observation
 import NativeAgentShared
-#if canImport(UIKit)
 import UIKit
-#endif
 // Blueprint: | `MacBridgeClient.swift` | Signed iCloud chat transport, pairing and connection observation |
 
 @MainActor
-final class MacBridgeClient: ObservableObject {
+@Observable
+final class MacBridgeClient {
     private let bridge: iCloudBridge
-    @Published private(set) var connection = NAPhoneConnection(
-        pairing: .init(.waiting, AliveConnection.unpaired),
-        transport: .init(.waiting, "Not connected yet; pairing starts it"),
-        exchange: .init(.waiting, "Not heard from your Mac yet")
-    )
     var lastSeenAt: Date? { bridge.lastMacConfirmationAt }
-    private var presenceExpiryTask: Task<Void, Never>?
-
-    private var connectionGeneration = 0
-    private var bridgeAvailabilityCancellable: AnyCancellable?
-    private var macKeyCancellable: AnyCancellable?
-    private var pairingCancellable: AnyCancellable?
-    @Published private(set) var macPairingKey: iCloudBridge.MacPairingKeyReading?
-    private var networkPathCancellable: AnyCancellable?
-    private let pathObserver: NetworkPathObserver = .shared
+    @ObservationIgnored private var presenceExpiryTask: Task<Void, Never>?
+    private var macContactIsCurrent = false
+    @ObservationIgnored private var connectionGeneration = 0
+    @ObservationIgnored private var bridgeChanges: Task<Void, Never>?
+    @ObservationIgnored private var pathRestoration: NotificationCenter.ObservationToken?
+    private let pathObserver = NetworkPathObserver.shared
     /// Replay a missed network-restoration event when the queue callback attaches.
-    var onNetworkPathRestored: (() -> Void)? {
+    @ObservationIgnored var onNetworkPathRestored: (() -> Void)? {
         didSet {
             guard missedPathRestore, let onNetworkPathRestored else { return }
             missedPathRestore = false
             onNetworkPathRestored()
         }
     }
-    private var missedPathRestore = false
-    /// Nil means NWPathMonitor has not reported, so it cannot establish an outage; republish changes for client-observing views.
-    @Published private(set) var deviceIsOffline: Bool?
+    @ObservationIgnored private var missedPathRestore = false
     var offlineBannerMessage: String? {
-        NetworkPathObserver.offlineBannerMessage(isOffline: deviceIsOffline)
+        NetworkPathObserver.offlineBannerMessage(isOffline: pathObserver.isOffline)
     }
     var isConnecting = false
-    weak var pairingStore: PairingStore? {
-        didSet {
-            pairingCancellable = pairingStore?.objectWillChange.sink { [weak self] _ in
-                Task { @MainActor in self?.refreshConnection() }
-            }
-            refreshConnection()
-        }
-    }
+    weak var pairingStore: PairingStore?
 
     init(bridge: iCloudBridge = .shared) {
         self.bridge = bridge
-        bridgeAvailabilityCancellable = bridge.$available.combineLatest(bridge.$accountFailure, bridge.$lastMacConfirmationAt,
-                                                                         bridge.$pushSubscriptionsReady)
-            .sink { [weak self] _, _, _, _ in
-                Task { @MainActor in
-                    self?.objectWillChange.send()
-                    if self?.bridge.lastMacConfirmationAt != nil { self?.isConnecting = false }
-                    self?.refreshConnection()
-                }
+        let changes = Observations { bridge.lastMacConfirmationAt }
+        bridgeChanges = Task { [weak self] in
+            for await _ in changes {
+                guard let self else { return }
+                refreshConnection()
             }
-        macKeyCancellable = bridge.$macPairingKey
-            .sink { [weak self] key in
-                Task { @MainActor in
-                    self?.macPairingKey = key
-                    self?.refreshConnection()
-                }
-            }
-        networkPathCancellable = pathObserver.$isOffline
-            .sink { [weak self] offline in
-                Task { @MainActor in
-                    guard let self else { return }
-                    let wasOffline = self.deviceIsOffline
-                    self.deviceIsOffline = offline
-                    self.refreshConnection()
-                    // Cold launch must resume retained sends even when the network was already online.
-                    if wasOffline != false, offline == false {
-                        self.bridge.setup()
-                        self.bridge.startForegroundReceiving()
-                        Task { await self.bridge.catchUpCloudKit() }
-                        if let handler = self.onNetworkPathRestored { handler() }
-                        else { self.missedPathRestore = true }
-                    }
-                }
-            }
-        pathObserver.start()
+        }
+        pathRestoration = pathObserver.onRestoration { [weak self] in
+            guard let self else { return }
+            bridge.setup()
+            bridge.startForegroundReceiving()
+            Task { await bridge.catchUpCloudKit() }
+            if let handler = self.onNetworkPathRestored { handler() }
+            else { self.missedPathRestore = true }
+        }
         refreshConnection()
+    }
+
+    deinit {
+        bridgeChanges?.cancel()
+        presenceExpiryTask?.cancel()
     }
 
     private var pairingFact: NAPhoneConnection.Fact {
@@ -95,7 +63,7 @@ final class MacBridgeClient: ObservableObject {
         if pairingStore.isRepairingConnection {
             return .init(.waiting, "Repairing the connection\u{2026}")
         }
-        guard let reading = macPairingKey, reading.phoneKey == pairingStore.iCloudPairingSecret else {
+        guard let reading = bridge.macPairingKey, reading.phoneKey == pairingStore.iCloudPairingSecret else {
             return .init(.waiting, "Waiting to read your Mac's pairing key", owner: .network,
                          lever: "Refresh the connection to read your Mac's current key.")
         }
@@ -116,17 +84,16 @@ final class MacBridgeClient: ObservableObject {
     }
 
     /// Derive connection facts only from this phone's pairing, transport and Mac evidence.
-    private func assessedConnection() -> NAPhoneConnection {
+    var connection: NAPhoneConnection {
         var transport = NAPhoneConnection.Fact(.holds, "iCloud is carrying our messages")
         var exchange = NAPhoneConnection.Fact(.waiting, "Not heard from your Mac yet")
-        if deviceIsOffline == true {
+        if pathObserver.isOffline == true {
             transport = .init(.broken, "You\u{2019}re offline. I\u{2019}ll send when you\u{2019}re back", owner: .network,
                          lever: "Reconnect this iPhone to Wi-Fi or cellular data.")
         } else if bridge.accountFailure != nil {
             transport = .init(.broken, DeviceSyncAccountFailure.phoneMessage, owner: .iCloudAccount,
                          lever: "Open Settings \u{203A} Apple Account on this iPhone and finish signing in to iCloud.")
-        } else if bridge.available, let lastSeenAt,
-                  case .current = StatusConnectionPresentation.syncState(lastSyncedAt: lastSeenAt, staleAfter: NAMacPresence.phoneWindow) {
+        } else if bridge.available, let lastSeenAt, macContactIsCurrent {
             exchange = .init(.holds, "Heard from your Mac \(lastSeenAt.formatted(date: .omitted, time: .shortened))")
         } else if isConnecting {
             transport = .init(.waiting, "Finding your Mac\u{2026}")
@@ -153,7 +120,6 @@ final class MacBridgeClient: ObservableObject {
     }
 
     func configureICloud() {
-        isConnecting = true
         bridge.setup()
         refreshConnection()
     }
@@ -302,17 +268,19 @@ final class MacBridgeClient: ObservableObject {
     /// Only Mac activity or confirmed Mac actions refresh status; an accepted phone upload proves iCloud receipt only.
     func recordMacConfirmation(at timestamp: Date) {
         bridge.recordMacConfirmation(at: timestamp)
-        isConnecting = false
         refreshConnection()
     }
 
     func refreshConnection() {
         presenceExpiryTask?.cancel()
         presenceExpiryTask = nil
-        let next = assessedConnection()
-        if connection != next { connection = next }
-        guard let lastSeenAt else { return }
         let now = Date()
+        if case .current = StatusConnectionPresentation.syncState(lastSyncedAt: lastSeenAt, now: now, staleAfter: NAMacPresence.phoneWindow) {
+            macContactIsCurrent = true
+        } else {
+            macContactIsCurrent = false
+        }
+        guard let lastSeenAt else { return }
         let date = lastSeenAt.timeIntervalSince(now) > 60
             ? lastSeenAt.addingTimeInterval(-60) : lastSeenAt.addingTimeInterval(NAMacPresence.phoneWindow)
         let delay = date.timeIntervalSince(now)

@@ -50,7 +50,8 @@ struct MacSnapshotFreshnessBadge: View {
             }
         }
         .sheet(isPresented: $showsConnection) {
-            NavigationStack { SettingsViewFull(opensConnection: true) }
+            NavigationStack { SettingsViewFull(presentation: .sheet, opensConnection: true) }
+                .macSyncErrorBanner()
         }
     }
 }

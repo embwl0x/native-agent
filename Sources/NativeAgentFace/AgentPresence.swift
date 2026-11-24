@@ -9,12 +9,10 @@ import Foundation
 struct SimpleAgentCard: View {
     let selected: Bool
     @Environment(AppModel.self) private var appModel
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.controlActiveState) private var activeState
 
     static let radius: CGFloat = 14
 
-    static let nameFont = Font.system(size: 28, weight: .semibold, design: .serif)
+    static let nameFont = ShellType.scaled(28, weight: .semibold, design: .serif)
 
     /// Keep steps in the transcript; the card summarizes the current activity.
     /// Only the line the pill shows: a reply's movement never redraws it.
@@ -81,13 +79,7 @@ struct SimpleAgentCard: View {
         .padding(.vertical, 10)
         .background { shape.fill(selected ? NativeAgentShell.softFill : .clear) }
         .background { ThinkingGlow(kind: .shimmer, cornerRadius: Self.radius, wholeTurn: true) }
-        .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
-        // Keep a hairline because background windows lose the glass rim.
-        .overlay {
-            if activeState == .inactive || reduceTransparency {
-                shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1).allowsHitTesting(false)
-            }
-        }
+        .houseSurface(in: shape)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(name). \(line.text)")
         .accessibilityHint("Opens the chat with \(name)")

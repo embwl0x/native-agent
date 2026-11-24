@@ -3,7 +3,6 @@
  "reach":{"capabilities":[]},"face":{"page":"telegram","projection":true},
  "record":{"description":"My Telegram progress and status voice over sanitized native lifecycle facts. No transport, approval, or terminal authority.","actions":[],"inputSchema":{"type":"object"}}}
 */
-function run(input) { return face(input); }
 function face(input) {
     const words = text => text.replace(/\b(?:Claude|Codex)\b/gi, "background work");
     const duration = seconds => {

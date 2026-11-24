@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import AppKit
 import NativeAgentCore
 import Darwin
@@ -58,14 +59,14 @@ private struct BridgeDescriptor {
 
     static func load(pathOverride: String? = nil, bearer: String? = nil) throws -> Self {
         let path = pathOverride ?? Self.path
-        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        let fd = unsafe Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else {
             if errno == ENOENT { throw LinkFailure.bridgeAbsent }
             throw LinkFailure.descriptor(path, "Descriptor open failed (errno \(errno)); the file must not be a symlink.")
         }
         defer { Darwin.close(fd) }
         var info = stat()
-        guard fstat(fd, &info) == 0 else { throw LinkFailure.descriptor(path, "Descriptor fstat failed (errno \(errno)).") }
+        guard unsafe fstat(fd, &info) == 0 else { throw LinkFailure.descriptor(path, "Descriptor fstat failed (errno \(errno)).") }
         guard info.st_uid == getuid() else { throw LinkFailure.descriptor(path, "Descriptor owner must be the current uid.") }
         guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw LinkFailure.descriptor(path, "Descriptor must be a regular file.") }
         guard info.st_mode & 0o077 == 0 else { throw LinkFailure.descriptor(path, "Descriptor permissions must exclude group and other access (0600).") }
@@ -73,7 +74,7 @@ private struct BridgeDescriptor {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
         while true {
-            let count = Darwin.read(fd, &buffer, buffer.count)
+            let count = unsafe Darwin.read(fd, &buffer, buffer.count)
             if count == 0 { break }
             guard count > 0, data.count + count <= 65_536 else { throw LinkFailure.descriptor(path, "Descriptor read failed or exceeded 65536 bytes.") }
             data.append(contentsOf: buffer.prefix(count))
@@ -241,13 +242,13 @@ private struct NativeAgentLink {
     newline-delimited MCP JSON-RPC over stdio; configure it as an MCP server command.
     """
 
-    private static let outputLock = NSLock()
+    private static let outputLock = Mutex(())
 
     /// One whole line per write, so concurrent relay requests never interleave.
     static func output(_ object: [String: Any]) {
         guard var data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
         data.append(10)
-        outputLock.withLock { FileHandle.standardOutput.write(data) }
+        outputLock.withLock { _ in FileHandle.standardOutput.write(data) }
     }
 
     static func main() async {
@@ -364,7 +365,7 @@ private struct NativeAgentLink {
             var data = Data()
             var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
-                let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
+                let count = unsafe Darwin.read(STDIN_FILENO, &buffer, buffer.count)
                 if count == 0 { break }
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0, data.count + count <= GrokReplyInput.maximumBytes else { throw LinkFailure.invalidArguments }
@@ -398,26 +399,30 @@ private struct NativeAgentLink {
         }
         await withDiscardingTaskGroup { group in
             var line = Data()
+            // An oversized line is refused once and skipped to its newline; the session carries on with the next request.
+            var discarding = false
             var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
-                let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
+                let count = unsafe Darwin.read(STDIN_FILENO, &buffer, buffer.count)
                 if count == 0 { return }
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else { return }
                 var rest = buffer.prefix(count)
                 while !rest.isEmpty {
                     let part = rest.prefix { $0 != 10 }
-                    guard line.count + part.count <= 1_048_576 else {
+                    if !discarding && line.count + part.count > 1_048_576 {
                         output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "MCP input exceeds limit"]])
-                        return
+                        discarding = true
+                        line = Data()
                     }
-                    line.append(contentsOf: part)
+                    if !discarding { line.append(contentsOf: part) }
                     let end = part.endIndex
                     if end == rest.endIndex { break }
-                    if !line.isEmpty {
+                    if !discarding && !line.isEmpty {
                         let request = line
                         group.addTask { await relayOne(request, caller: caller) }
                     }
+                    discarding = false
                     line.removeAll(keepingCapacity: true)
                     rest = rest[rest.index(after: end)...]
                 }

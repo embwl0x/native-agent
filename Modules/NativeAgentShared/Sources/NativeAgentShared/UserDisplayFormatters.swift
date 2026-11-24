@@ -1,3 +1,4 @@
+import Synchronization
 import Foundation
 // Blueprint: | `UserDisplayFormatters.swift` | Shared timestamp/path display and `CompactDurationFormatter`; parsing is cached |
 
@@ -31,7 +32,7 @@ public enum UserDisplayFormatters {
 
 /// ISO timestamps are immutable wire values and recur throughout lists and status chrome. Keep both successful and failed parses in a small FIFO so a
 /// SwiftUI redraw does not rebuild the same Date over and over. The lock keeps the shared formatter helper safe for background projections too.
-private final class TimestampParseCache: @unchecked Sendable {
+private final class TimestampParseCache: Sendable {
     private enum Entry {
         case date(Date)
         case invalid
@@ -43,34 +44,27 @@ private final class TimestampParseCache: @unchecked Sendable {
     }
 
     private let capacity: Int
-    private let lock = NSLock()
-    private var entries: [String: Entry] = [:]
-    private var order: [String] = []
+    private struct State {
+        var entries: [String: Entry] = [:]
+        var order: [String] = []
+    }
+    private let state = Mutex(State())
 
     init(capacity: Int) {
         self.capacity = max(1, capacity)
     }
 
     func value(for key: String, load: () -> Date?) -> Date? {
-        lock.lock()
-        if let entry = entries[key] {
-            lock.unlock()
-            return entry.date
-        }
-        lock.unlock()
-
+        if let entry = state.withLock({ $0.entries[key] }) { return entry.date }
         let loaded = load()
-        lock.lock()
-        if let raced = entries[key] {
-            lock.unlock()
-            return raced.date
+        return state.withLock { state in
+            if let raced = state.entries[key] { return raced.date }
+            state.entries[key] = loaded.map(Entry.date) ?? .invalid
+            state.order.append(key)
+            if state.order.count > capacity {
+                state.entries.removeValue(forKey: state.order.removeFirst())
+            }
+            return loaded
         }
-        entries[key] = loaded.map(Entry.date) ?? .invalid
-        order.append(key)
-        if order.count > capacity {
-            entries.removeValue(forKey: order.removeFirst())
-        }
-        lock.unlock()
-        return loaded
     }
 }

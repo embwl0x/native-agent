@@ -1,0 +1,129 @@
+import MindCore
+import Foundation
+import NativeAgentCore
+import PersistenceCore
+import ProviderRouting
+// Blueprint: | `FluidContextToolScope.swift` | Explicit prepared-context dependency; expanded memory pages retain stored untrusted sources |
+
+extension SwiftToolDispatcher {
+    func impl_context_expand(turn: Turn, invocation: ChatToolInvocation, input: ContextExpandArgs) async throws -> JSONValue {
+        let locator = input.atomID
+            .replacingOccurrences(of: "[context_expand ", with: "")
+            .replacingOccurrences(of: "[context.expand ", with: "")
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "]")))
+        if locator.hasPrefix("body:") {
+            return await TurnBodyAccess.read(invocation.bodyField, root: dataRoot, turn: turn, session: turn.verifiedSessionID ?? turn.session,
+                                             joint: String(locator.dropFirst(5)))
+        }
+        if locator.hasPrefix("history:") {
+            let offset = try input.offset.map { value in
+                guard let offset = value.wire.exactIntegerValue else { throw ContextExpansionError.invalidCharacterOffset }
+                return offset
+            } ?? 0
+            guard offset >= 0 else { throw ContextExpansionError.invalidCharacterOffset }
+            let maximum = max(1, min(input.maxCharacters ?? 8_000, 12_000))
+            let message = ReadChatMessageArgs(historyID: String(locator.dropFirst("history:".count)), offset: offset, limit: maximum)
+            let result = try await impl_read_chat_message(input: message, invokedAs: "context_expand")
+            guard case .object(var fields) = result else { return result }
+            fields["atom_id"] = .string(locator)
+            if fields["has_more"] == .bool(true),
+               case .int(let start)? = fields["offset"],
+               case .int(let count)? = fields["returned_characters"] {
+                fields["next_offset"] = .int(start + count)
+            } else {
+                fields["next_offset"] = .null
+            }
+            return .object(fields)
+        }
+        guard let prepared = invocation.preparedContext else {
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("context_generation_unavailable"),
+                "message": .string("""
+                    No context packet was prepared for this turn (context flow off, or its build failed), so there is nothing to expand; read the \
+                    source directly instead (memory_search, read_file, or the action that produced it).
+                    """),
+            ])
+        }
+        // Blank selects the sole offered atom; multiple atoms require an explicit selection.
+        let offered = prepared.packet.expandablePointers.map(\.atomID.rawValue)
+        var given = locator.split(separator: " ").first.map(String.init)
+        if given?.isEmpty != false, offered.count == 1 { given = offered[0] }
+        guard let rawAtomID = given, !rawAtomID.isEmpty else {
+            return .object([
+                "status": .string("failed"),
+                "effects": .string("none"),
+                "reason": .string("missing_atom_id"),
+                "message": .string(offered.isEmpty
+                    ? "Nothing in this turn's context is cut short, so there is nothing to expand."
+                    : "Pass atom_id: one of offered_atom_ids (the id in a [context.expand atom:… ] marker)."),
+                "offered_atom_ids": .array(offered.prefix(12).map(JSONValue.string)),
+            ])
+        }
+        let atomID = ContextAtomID(rawValue: rawAtomID)
+        guard let pointer = prepared.packet.expandablePointers.first(where: {
+            $0.atomID == atomID
+        }) else {
+            return .object([
+                "status": .string("failed"),
+                "effects": .string("none"),
+                "reason": .string("pointer_not_offered_this_turn"),
+                "message": .string("""
+                    That atom id is not in this turn's context pointer list (ids from earlier turns expire); use an id listed this turn, or read \
+                    the source directly.
+                    """),
+                "atom_id": .string(rawAtomID),
+            ])
+        }
+        let requestedMaximum = input.maxCharacters
+        let offset = try input.offset.map { value in
+            guard let offset = value.wire.exactIntegerValue else { throw ContextExpansionError.invalidCharacterOffset }
+            return offset
+        } ?? 0
+        // Expansion re-checks the one atom it opens, as the choice did: an atom its owner retired or narrowed since the turn began is not opened.
+        let withheld = await prepared.verify(pointer)
+        if !withheld.atomIDs.isEmpty {
+            let why = withheld.unverified.map(\.reason).joined(separator: "; ")
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("context_atom_withheld"),
+                "message": .string(why.isEmpty
+                    ? "This item is no longer available to this turn: its owner retired or narrowed it since the turn began."
+                    : why),
+            ])
+        }
+        let result = try ContextExpander().expand(
+            pointer,
+            for: prepared.need,
+            from: prepared.generation,
+            pinnedTo: prepared.lease.snapshot,
+            maximumCharacters: requestedMaximum,
+            offset: offset,
+            offeredSelectedItems: prepared.packet.selectedItems.filter { item in
+                prepared.packet.expandablePointers.contains(item.pointer)
+            }
+        )
+        Task {
+            await prepared.recordExpansion(
+                atomID: result.receipt.atomID,
+                receiptID: result.receipt.id
+            )
+        }
+        var fields: [String: JSONValue] = [
+            "status": .string("ok"),
+            "generation_id": .int(result.receipt.generationID),
+            "atom_id": .string(result.receipt.atomID.rawValue),
+            "source_id": .string(result.receipt.sourceID.rawValue),
+            "text": .string(result.text),
+            "offset": .int(Int64(result.receipt.characterOffset)),
+            "next_offset": result.nextOffset.map { .int(Int64($0)) } ?? .null,
+            "full_character_count": .int(Int64(result.receipt.fullCharacterCount)),
+            "truncated": .bool(result.truncated),
+            "receipt_id": .string(result.receipt.id),
+        ]
+        let sources = prepared.packet.selectedItems.first { $0.pointer == pointer }?.untrustedSources ?? []
+        let steering = MemoryDataProvenance.steering(sources, dataRoot: turn.dataRoot)
+        fields.merge(MemoryDataProvenance.fields(steeredBy: steering)) { _, value in value }
+        return .object(fields)
+    }
+}

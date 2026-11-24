@@ -1,0 +1,63 @@
+import MindCore
+import Foundation
+import SenseCore
+import NativeAgentCore
+import DeskCore
+import PersistenceCore
+import NativeAgentShared
+// Blueprint: | `NativeContextFlowConfiguration.swift` | `NativeContextFlowConfiguration`: checked modes; absent defaults; invalid unavailable |
+
+public struct NativeContextFlowConfiguration: Sendable, Equatable {
+    public static let modeEnvironmentKey = "NATIVE_AGENT_CONTEXT_FLOW_MODE"
+    public static let modeDefaultsKey = "contextFlowMode"
+
+    let mode: ContextFlowMode
+
+    public static func initializeMissingInnerLifeMode(defaults: UserDefaults) {
+        guard defaults.object(forKey: modeDefaultsKey) == nil else { return }
+        defaults.set(ContextFlowMode.active.rawValue, forKey: modeDefaultsKey)
+    }
+
+    static func resolve(dataRoot: URL) throws -> Self {
+        let environment = ProcessInfo.processInfo.environment
+        let defaults = UserDefaults.standard
+        let isPublicSafe = NativeAgentPublicSafety.isPublicSafeMode(environment: environment)
+        let preOnboarding = isPublicSafe
+            && !NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
+        // Validate every present setting, even under an environment override or before onboarding. Only absence supplies a default.
+        let savedMode: ContextFlowMode?
+        if let raw = defaults.object(forKey: modeDefaultsKey) {
+            guard let value = raw as? String, let parsed = ContextFlowMode(rawValue: value) else {
+                throw NativeContextFlowStartupError(detail: "Invalid saved \(modeDefaultsKey); choose off or active in Settings.")
+            }
+            savedMode = parsed
+        } else { savedMode = nil }
+        let environmentMode: ContextFlowMode?
+        if let raw = environment[modeEnvironmentKey] {
+            guard let parsed = ContextFlowMode(rawValue: raw) else {
+                throw NativeContextFlowStartupError(detail: "Invalid \(modeEnvironmentKey); use off or active.")
+            }
+            environmentMode = parsed
+        } else { environmentMode = nil }
+        let mode: ContextFlowMode = preOnboarding ? .off : (environmentMode ?? savedMode ?? .active)
+        return Self(mode: mode)
+    }
+}
+
+public struct NativeContextFlowModeStatus: Sendable, Equatable {
+    public let effectiveMode: ContextFlowMode?
+    public let unavailableReason: String?
+}
+
+/// Carries the startup cause to a turn that cannot proceed without context.
+public struct NativeContextFlowStartupError: Error, LocalizedError, Sendable, Equatable {
+    public let detail: String
+    public var errorDescription: String? { "Context Flow could not start: \(detail)" }
+}
+
+/// Configured-off health is distinct from an unavailable runtime.
+public enum ContextFlowObservatoryHealthState: Sendable, Equatable {
+    case unavailable
+    case off
+    case health(ContextFlowCoordinatorHealth)
+}

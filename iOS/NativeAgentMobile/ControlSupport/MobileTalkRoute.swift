@@ -22,15 +22,17 @@ struct MobileOpenTalkIntent: OpenIntent {
 
 enum MobileTalkRoute {
     static let key = "NativeAgentMobile.openTalk"
-    static let notification = Notification.Name("NativeAgentMobile.openTalk")
+    struct Requested: NotificationCenter.MainActorMessage {
+        typealias Subject = NSObject
+    }
     static var isPending: Bool { MobileQuickAskRoute.defaults?.bool(forKey: key) == true }
-    static func request() throws {
+    @MainActor static func request() throws {
         guard let defaults = MobileQuickAskRoute.defaults else {
             throw NSError(domain: "NativeAgentTalk", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "NativeAgent’s shared storage is unavailable."])
         }
         defaults.set(true, forKey: key)
-        NotificationCenter.default.post(name: notification, object: nil)
+        NotificationCenter.default.post(Requested())
     }
     static func consume() -> Bool {
         guard isPending else { return false }

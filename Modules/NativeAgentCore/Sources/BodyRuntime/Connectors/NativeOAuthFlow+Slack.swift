@@ -1,0 +1,202 @@
+import ProviderRouting
+import Foundation
+import NativeAgentShared
+import NativeAgentCore
+import PersistenceCore
+// Blueprint: | `NativeOAuthFlow+Slack.swift` | `saveSlackToken` verifies via `SlackWebAPI`; SlackCredentials owns revision-checked publication |
+
+extension NativeOAuthFlow {
+    /// Slack exposes a generated bot token after installation; validate it with auth.test before saving.
+    public static func saveSlackToken(
+        _ rawToken: String,
+        appToken rawAppToken: String? = nil,
+        allowedChannelIds: Set<String>? = nil,
+        allowedUserIds: Set<String>? = nil,
+        requireMention: Bool? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> OAuthFlowResult {
+        let providedToken = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapshot: (revision: [JSONValue], token: String)
+        do {
+            try SlackCredentials.recoverPendingSave(dataRoot: dataRoot)
+            snapshot = try SlackCredentials.withSnapshot(dataRoot: dataRoot) {
+                (try slackSaveRevision(dataRoot: dataRoot), providedToken.isEmpty
+                    ? (try SlackCredentials.read(.bot, dataRoot: dataRoot) ?? "") : providedToken)
+            }
+        }
+        catch {
+            return OAuthFlowResult(ok: false,
+                error: "Could not save Slack token: \(OAuthGrantOperations.redact(error.localizedDescription))")
+        }
+        let token = snapshot.token
+        guard isPlausibleSlackToken(token) else {
+            return OAuthFlowResult(ok: false,
+                error: "Paste a Slack OAuth token such as xoxb-... from OAuth & Permissions, or save the bot token before adding Socket Mode.")
+        }
+        let appToken = rawAppToken?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !appToken.isEmpty, !isPlausibleSlackAppToken(appToken) {
+            return OAuthFlowResult(ok: false,
+                error: "Paste a Slack Socket Mode app token such as xapp-... with connections:write, or leave that field blank.")
+        }
+        let channels = allowedChannelIds ?? []
+        let users = allowedUserIds ?? []
+        guard !channels.isEmpty || !users.isEmpty else {
+            return OAuthFlowResult(ok: false,
+                error: """
+                    Add at least one allowed Slack channel or user before saving. NativeAgent will not create an inbound connector with an empty \
+                    allowlist.
+                    """)
+        }
+
+        let authFields: [String: String]
+        do {
+            authFields = slackAuthFields(try await slackAuthTest(token: token))
+        } catch {
+            return OAuthFlowResult(ok: false,
+                error: "Slack token validation failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
+        }
+
+        let root = dataRoot
+        let now = NativeTimestampFormat.basicZulu(Date())
+        let connectorPath = TransportAllowlist.slackMetadataPath(dataRoot: root)
+
+        // Stage an immutable, verified grant before a durable save intent. Startup finishes that exact intent before admitting the connection.
+        do {
+            try SlackCredentials.recoverPendingSave(dataRoot: root)
+            _ = try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
+                root: root,
+                provider: "slack",
+                createIfMissing: true,
+                publish: { registry, _ in
+                    try await SwiftNativePersistenceCore.withFileLock(connectorPath) {
+                        guard try slackSaveRevision(dataRoot: root) == snapshot.revision else {
+                            throw PersistenceCoreError.ioFailure("Slack credentials changed while saving. The token was not saved.")
+                        }
+                        let policy = try TransportAllowlist.slackPolicy(dataRoot: root)
+                        // Publish exactly the current schema; unrelated document keys cannot enter auth metadata.
+                        var connector: [String: JSONValue] = [:]
+                        let savedAppToken = appToken.isEmpty
+                            ? try SlackCredentials.read(.app, dataRoot: root, allowMissingGrant: !providedToken.isEmpty)
+                            : appToken
+                        let reference = try SlackCredentials.stageGrant(bot: token, app: savedAppToken,
+                            dataRoot: root, allowMissingGrant: !providedToken.isEmpty)
+                        connector["provider"] = .string("slack")
+                        connector["credential_store"] = .string("keychain")
+                        connector[SlackCredentials.referenceField] = .string(reference)
+                        connector["token_type"] = .string("Bearer")
+                        connector["auth_mode"] = .string("manual_oauth_token")
+                        connector["saved_at"] = .string(now)
+                        connector["socket_mode_enabled"] = .bool(!appToken.isEmpty || policy.socketModeEnabled)
+                        mergeSlackIngressFields(
+                            allowedChannelIds: channels,
+                            allowedUserIds: users,
+                            requireMention: requireMention ?? policy.requireMention,
+                            into: &connector
+                        )
+                        mergeSlackAuthFields(authFields, into: &connector)
+                        connector["validated_at"] = .string(now)
+                        try SlackCredentials.commitSave(connector: .object(connector),
+                                                        registry: registry, dataRoot: root)
+                    }
+                }
+            ) { entry in
+                entry["id"] = .string("slack")
+                entry[ConnectorOAuthRegistry.decisionField] = ConnectorOAuthRegistry.ConnectionDecision.connected.value
+                entry[SlackCredentials.generationField] = .string(UUID().uuidString)
+                entry["name"] = .string("Slack")
+                entry["kind"] = .string("connector")
+                entry["description"] = .string("Slack workspace messaging connector.")
+                entry["enabled"] = .bool(true)
+                entry["registered"] = .bool(true)
+                entry["client_id_present"] = .bool(true)
+                // Saved setup state; runtime health requires credential-backed action proof.
+                entry["authState"] = .string("connected")
+                entry["healthStatus"] = .string("ok")
+                entry["connected"] = .bool(true)
+                entry["connectedAt"] = .string(now)
+            }
+        } catch {
+            return OAuthFlowResult(ok: false,
+                error: "Could not save Slack token: \(OAuthGrantOperations.redact(error.localizedDescription))")
+        }
+
+        return OAuthFlowResult(ok: true, error: nil)
+    }
+
+    private static func isPlausibleSlackToken(_ token: String) -> Bool {
+        let lower = token.lowercased()
+        guard lower.hasPrefix("xox") else { return false }
+        return token.count > 20 && token.range(of: #"\s"#, options: .regularExpression) == nil
+    }
+
+    /// Caller holds registry and connector locks. The registry epoch also detects revocation when there were no credential files to remove.
+    private static func slackSaveRevision(dataRoot: URL) throws -> [JSONValue] {
+        let registry = try ConnectorOAuthRegistry.readRegistry(at: ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot))
+        let row = registry.first {
+            ConnectorOAuthRegistry.connectorRow($0, matches: "slack")
+        }
+        return try [.object(SlackCredentials.metadata(dataRoot: dataRoot)),
+                    row?[SlackCredentials.generationField] ?? .null]
+    }
+
+    private static func isPlausibleSlackAppToken(_ token: String) -> Bool {
+        let lower = token.lowercased()
+        guard lower.hasPrefix("xapp-") else { return false }
+        return token.count > 20 && token.range(of: #"\s"#, options: .regularExpression) == nil
+    }
+
+    private static func slackAuthTest(token: String) async throws -> [String: Any] {
+        var req = URLRequest(url: SlackWebAPI.apiURL("auth.test"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = .infinity
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data("{}".utf8)
+        let obj = try await SlackWebAPI.response(for: req, session: ProviderHTTP.session)
+        guard obj["error"] as? String != "non_json_response" else {
+            throw NSError(domain: "NativeAgentSlack", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "Slack auth.test returned non-JSON."
+            ])
+        }
+        if let status = obj["httpStatus"] as? Int {
+            throw NSError(domain: "NativeAgentSlack", code: status, userInfo: [
+                NSLocalizedDescriptionKey: "Slack auth.test HTTP \(status)."
+            ])
+        }
+        if (obj["ok"] as? Bool) != true {
+            let err = (obj["error"] as? String) ?? "unknown_error"
+            throw NSError(domain: "NativeAgentSlack", code: -2, userInfo: [
+                NSLocalizedDescriptionKey: "Slack auth.test rejected the token: \(err)"
+            ])
+        }
+        return obj
+    }
+
+    private static func slackAuthFields(_ authInfo: [String: Any]) -> [String: String] {
+        var fields: [String: String] = [:]
+        for key in ["url", "team", "team_id", "user", "user_id", "bot_id", "enterprise_id"] {
+            if let value = authInfo[key] as? String, !value.isEmpty {
+                fields[key] = value
+            }
+        }
+        return fields
+    }
+
+    private static func mergeSlackAuthFields(_ authFields: [String: String], into obj: inout [String: JSONValue]) {
+        for (key, value) in authFields {
+            obj[key] = .string(value)
+        }
+    }
+
+    private static func mergeSlackIngressFields(
+        allowedChannelIds: Set<String>,
+        allowedUserIds: Set<String>,
+        requireMention: Bool,
+        into obj: inout [String: JSONValue]
+    ) {
+        obj["allowed_channel_ids"] = .array(allowedChannelIds.sorted().map(JSONValue.string))
+        obj["allowed_user_ids"] = .array(allowedUserIds.sorted().map(JSONValue.string))
+        obj["require_mention"] = .bool(requireMention)
+    }
+
+}

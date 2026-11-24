@@ -54,8 +54,8 @@ Desk, cognition, agents and device sync. `ChatTurnRuntime` owns turn execution;
 `MacChatTurnRuntime` owns Mac-session admission, queues, cancellation and
 lifecycle state. The SwiftUI app supplies platform wiring and presentation.
 
-Source: [NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/EngineRuntime/NativeAgentEngine.swift),
-[MacChatTurnRuntime.swift](../Modules/NativeAgentCore/Sources/ChatTurnRuntime/MacChatTurnRuntime.swift).
+Source: [NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/EngineRuntime/NativeAgentEngine.swift),
+[MacChatTurnRuntime.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/ChatTurnRuntime/MacChatTurnRuntime.swift).
 
 ## Conversation surfaces
 
@@ -201,19 +201,21 @@ filesystem API; it cannot call every action merely because the action exists.
   resumable (`ability.resume`); declared reach gives it the host primitives.
 - `ability.read`, `ability.list`, `ability.restore`, `ability.disable` and
   `ability.drop` are the rest of its one lifecycle; see the [manifest
-  spec](skill_manifest_spec.md). Abilities grant no new authority. The older
-  `skill.*` and `tool.*` doors answer through these until the release after the one that ships one-part.
+  spec](skill_manifest_spec.md). Abilities grant no new authority. The retired
+  `skill.*` and `tool.*` compatibility aliases are removed and answer as unknown
+  actions; `skill.build` remains separately registered as a person-owned Mac
+  action that starts a skill build in the Mac's message box.
 - NativeAgent runs no MCP client of its own: an MCP server they wants is an
   ability they grows, a resident one holding the server's program or connection.
   Servers a data root kept from before are raised to their once on home as theirs
   to grow; their file is left as it was.
 
 A part's reach comes from its declared permissions: `app_data_read`, `app_data_write`, `model`, `network_localhost` and `app_read:*` are theirs; anything else is their.
-Beneath every ability is the Mac's own reach, raw and gated: `host.fetch` and `host.network` to any host its network reach allows, and `host.program` to start a program by name and talk over its stdio, for the run or, in a resident ability, for as long as it holds it. A secret lives in the one keyring ([Keyring.swift](../Modules/NativeAgentCore/Sources/PersistenceCore/Keyring.swift)) under the name they gives it, granted once by the person on a card (pasted, or by a sign-in NativeAgent runs from their parameters, any client secret typed on the card) for the hosts and programs (each the exact file that runs) it may go to, replaced or removed the same way; their code writes `{{secret:<name>}}` and the broker inserts the value at the edge. Redaction covers exact values as written, URL-encoded, escaped in a JSON string and base64 (case-insensitively in reply header names); stream-piece boundaries can expose up to three leading bytes. A granted program or service can transform the value into an encoding the redactor does not catch: the granted recipient is the fence. The [manifest's secret contract](skill_manifest_spec.md#secret-insertion-and-redaction) owns these limits.
+Beneath every ability is the Mac's own reach, raw and gated: `host.fetch` and `host.network` to any host its network reach allows, and `host.program` to start a program by name and talk over its stdio, for the run or, in a resident ability, for as long as it holds it. A secret lives in the one keyring ([Keyring.swift](../Modules/NativeAgentCore/Sources/PersistenceCore/PersistenceCore/Keyring.swift)) under the name they gives it, granted once by the person on a card (pasted, or by a sign-in NativeAgent runs from their parameters, any client secret typed on the card) for the hosts and programs (each the exact file that runs) it may go to, replaced or removed the same way; their code writes `{{secret:<name>}}` and the broker inserts the value at the edge. Redaction covers exact values as written, URL-encoded, escaped in a JSON string and base64 (case-insensitively in reply header names); stream-piece boundaries can expose up to three leading bytes. A granted program or service can transform the value into an encoding the redactor does not catch: the granted recipient is the fence. The [manifest's secret contract](skill_manifest_spec.md#secret-insertion-and-redaction) owns these limits.
 
-Sources: [AppActions+Declarations.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppActions+Declarations.swift),
-[app door](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppToolExecutor+AppDoor.swift),
-[AppScriptRunner.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppScriptRunner.swift).
+Sources: [AppActions+Declarations.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppActions+Declarations.swift),
+[app door](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppToolExecutor+AppDoor.swift),
+[AppScriptRunner.swift](../Modules/NativeAgentCore/Sources/BodyRuntime/AppToolRuntime/AppScriptRunner.swift).
 The interface contract is [ONE_DOOR.md](ONE_DOOR.md).
 
 ## Mac, files and web
@@ -352,10 +354,12 @@ connectors and agent communication under the saved policy.
   checked capability readback and event-backed content readiness; passive reads
   never write mode flags. See [renderer perception](USER_GUIDE.md#turn-on-mac-computer-control-and-the-activity-watcher)
   for empty/unknown topology, assistive/system exclusions and window-animation effects.
-  An optional AX attribute's error `-25200` is an element's named
-  `attribute_gaps`, retaining every readable attribute without blocking acts.
+  Screen and masking walks batch each element’s metadata before requesting its
+  value. A failed subrole read suppresses a text role’s value. The screen walk
+  still reads the selection range on editable roles. Only optional attributes
+  the reader consults can contribute a `-25200` entry to `attribute_gaps`.
   Act-time name reads have the same scope. A failed own-name read, including
-  `AXTitle`, marks the label unreadable without trying another label attribute,
+  `AXTitle`, marks the label unreadable without substituting another label attribute,
   caption or hint; unsupported/no-value attributes remain absent.
   Missing `AXEnabled` stays unknown in perception. An action that requires
   enabled-state evidence refuses `false` and reports the cause of a failed
@@ -419,8 +423,8 @@ connectors and agent communication under the saved policy.
   window at the same position cannot inherit captured marks or paths.
   Delivered window/region and desktop image points retain their capture-start time,
   window-server numbers, owning processes, frames and capture-time AX control
-  regions through cropping and resizing. The existing complete masking walk
-  supplies the regions; bounded hit reads through the action source retain the
+  regions through cropping and resizing. The AX walk for each pictured window
+  supplies its regions. Bounded hit reads through the action source retain the
   reached role and a digest of its identity label, without field values or raw
   captions. Missing, unnamed or unverified inner regions cannot inherit an
   enclosing control's identity. Desktop composition retains each actual window
@@ -474,24 +478,25 @@ connectors and agent communication under the saved policy.
   prefer exact bundle filenames over display names; duplicate winning filenames
   remain ambiguous. Explicit bundle IDs and paths keep their exact meaning.
   Fused views capture the anchored window alone; open menus remain structural
-  observations. Desktop pixels use the separate desktop look owner. Window
-  pixel disclosure brackets capture with complete secret inspections of that
-  same retained AX root, unions both masks, and checks process, geometry and
-  capture provenance within one five-second disclosure budget. AX, ScreenCaptureKit
+  observations. Desktop pixels use the separate desktop look owner. Every fused
+  capture checks the process, geometry and capture provenance. When masking is
+  required, complete secret inspections of the same retained AX root bracket
+  capture and both masks are combined within one five-second disclosure budget. AX, ScreenCaptureKit
   and window-server geometry use the window selector's shared two-point tolerance
   per origin/size component; native window identity remains required. Missing, changed,
   late or incomplete evidence withholds the image with
   `image_unavailable_reason:"redaction_coverage_unavailable"` and a named
   `image_withheld_reason`, retaining the text observation for automatic and
-  explicit pixel requests. Under Full Mac nothing is masked (User 11-20), so the
-  secret inspections and the disclosure budget cannot withhold their pixels: an
-  incomplete inspection costs only the marks it would have placed; process,
-  geometry and capture provenance still bind the image to the window. A subrole gap alone requires a finite element frame
+  explicit pixel requests. Under Full Mac nothing is masked (User 11-20). Fused
+  captures skip the pre-capture inspection. A pictured capture reads the retained
+  root afterward for fresh point targets. An incomplete read limits target evidence,
+  and the bound picture remains available. An OCR-only fused capture skips both walks.
+  When masking is required, a subrole gap alone requires a finite element frame
   and masks it completely; caption and geometry failures still withhold pixels.
   Text roles with an unreadable subrole contribute no value to text looks,
   including values read as another control's caption or a native selector label.
-  Window OCR uses caption redaction and the complete pre-capture and post-capture
-  mask union, including when no picture is requested. Any intersecting OCR row
+  Window OCR uses caption redaction. When masking is required, it uses the complete
+  pre-capture and post-capture mask union even for OCR alone. Any intersecting OCR row
   is omitted. Incomplete coverage, unproven capture geometry or unproven OCR
   positions withhold recognized text with a named cause and retain the AX observation.
   Released images report both inspected node counts and the union's
@@ -537,7 +542,7 @@ connectors and agent communication under the saved policy.
   Screen document reads select the focused readable container, an explicit named
   `section`, or the sole document region; unresolved multiple regions are reported
   as ambiguous before scrolling.
-  expose perception and action. Accessibility and Screen Recording grants
+  Accessibility and Screen Recording grants
   remain macOS decisions. Action verification retains every observed change;
   only the rendered receipt limits each change channel to ten rows, with full totals.
   Visible-text deduplication keeps AX coordinates as floating-point values,
@@ -600,14 +605,18 @@ connectors and agent communication under the saved policy.
   Save command is issued by placement.
   Supplied mouse buttons, scroll units and gesture durations are validated
   before emission; defaults apply only to omitted values.
-  A screen watch establishes complete secret masks before retaining a candidate,
-  then inspects it again and masks the union of both inspections before publication.
-  A field scrolling out during inspection still masks its captured pixels.
-  Inspections start at most twice per second. Captures arriving during an inspection
-  or its interval replace one pending capture, retaining that capture's preceding
-  masks. The same inspection task processes the pending capture when due even if
-  the window stays static and supplies no further frame. An incomplete inspection
-  ends the watch; expiry or retirement cancels inspection and discards pending pixels.
+  A screen watch inspects the window before capture starts. Every published frame
+  passes its own complete inspection and masks every window-relative rectangle
+  identified by any inspection completed by publication. A field found after
+  the frame arrived stays masked even if it scrolls away before that frame's inspection.
+  Inspections start at most twice per second. The watch retains the newest pending
+  pixel buffer. Replacing it releases the superseded buffer without copying
+  pixels. The inspection task takes the pending buffer when
+  due, even if the window stays static. Once that frame passes inspection, the
+  watch copies its rows into one packed BGRA array and fills each masked span
+  in place. Published frames and their comparison pixels stay immutable. An
+  incomplete inspection ends the watch. Expiry or retirement cancels inspection
+  and releases the pending buffer.
   Pointer obstruction checks include visible system panels, including full-display
   overlays; neither an application's name nor its window size proves pass-through.
   A document read without a path reads the live window;
@@ -816,7 +825,6 @@ connectors and agent communication under the saved policy.
   own app actions. Chrome requires the extension's connection and authority.
   The built-in browser's [operation contract](INTERNAL_WORKINGS.md#built-in-browser-operation-ownership)
   owns pure previews, settlement, bounded WebKit waits and checked IPC readiness.
-- **Web search:** `web.search` searches SearXNG and returns its results (with the engines' direct `answers` and up to three `infoboxes` knowledge panels, each a title, summary and page, when SearXNG has them) or an explicit failure with setup or repair guidance. A malformed result is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
 - **Web search:** `web.search` searches SearXNG and returns its results (with the engines' direct `answers` and up to three `infoboxes` knowledge panels, each a title, summary and page, when SearXNG has them) or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
 - **Web reads:** `web.read` (`read_page`) extracts the retained HTTP HTML as
   paragraphs, list items and table rows, with each content link inline as
@@ -864,8 +872,8 @@ connectors and agent communication under the saved policy.
   distinct from recording.
 
 Sources: [page vocabulary](../Modules/NativeAgentShared/Sources/NativeAgentShared/SurfaceLayout.swift),
-[workspace resolver](../Modules/NativeAgentCore/Sources/PersistenceCore/NativeAgentWorkspaceRoot.swift),
-[search routing](../Modules/NativeAgentCore/Sources/Research/Research+WebSearch.swift).
+[workspace resolver](../Modules/NativeAgentCore/Sources/PersistenceCore/PersistenceCore/NativeAgentWorkspaceRoot.swift),
+[search routing](../Modules/NativeAgentCore/Sources/MacNerves/Research/Research+WebSearch.swift).
 Chrome setup is in the [extension guide](../Extensions/NativeAgentChrome/README.md).
 
 ## Memory, knowledge, and learning
@@ -1055,9 +1063,9 @@ A returned protocol response, approval or builder report is evidence, not
 automatic proof that the requested effect completed. Inspect the receipt and
 the owner of the external effect.
 
-Sources: [Full Mac policy](../Modules/NativeAgentCore/Sources/TrustCenter/SecurityCenter+FullMacPolicy.swift),
-[SecurityCenter.swift](../Modules/NativeAgentCore/Sources/TrustCenter/SecurityCenter.swift),
-[PeerTurnEffectPolicy.swift](../Modules/NativeAgentCore/Sources/TrustCenter/PeerTurnEffectPolicy.swift).
+Sources: [Full Mac policy](../Modules/NativeAgentCore/Sources/DeskCore/TrustCenter/SecurityCenter+FullMacPolicy.swift),
+[SecurityCenter.swift](../Modules/NativeAgentCore/Sources/DeskCore/TrustCenter/SecurityCenter.swift),
+[PeerTurnEffectPolicy.swift](../Modules/NativeAgentCore/Sources/DeskCore/TrustCenter/PeerTurnEffectPolicy.swift).
 
 ## Honest limits
 

@@ -3,6 +3,7 @@
   if (existing?.isActive?.()) return;
   existing?.();
   const snapshots = new Map();
+  let snapshotLayout = null;
   const inputTargets = new Map();
   let scrollObservation = null;
   const elementIdentities = new WeakMap();
@@ -194,7 +195,7 @@
           result = documentEvidence(message.scope);
           break;
         case "nativeagent.page.click":
-          result = clickNode(message);
+          result = clickNode(message, "click");
           break;
         case "nativeagent.page.input.prepare":
           result = prepareInput(message);
@@ -229,7 +230,7 @@
           result = setCheckedNode(message);
           break;
         case "nativeagent.page.double_click":
-          result = doubleClickNode(message);
+          result = clickNode(message, "double_click");
           break;
         case "nativeagent.page.drag":
           result = dragNode(message);
@@ -515,7 +516,12 @@
     if (disposed) throw pageError("tab_not_owned", "The page reader was replaced before capture.");
     if (cancelledActions.has(message.actionId)) throw pageError("action_cancelled", "The read was cancelled before capture.");
     if (embedding.cancelled) throw pageError("tab_not_owned", "The tab was released before capture.");
-    return createSnapshot({ ...message, embedding });
+    snapshotLayout = new WeakMap();
+    try {
+      return createSnapshot({ ...message, embedding });
+    } finally {
+      snapshotLayout = null;
+    }
   }
 
   function createSnapshot(message) {
@@ -635,7 +641,7 @@
       });
       const navigationProof = captureNavigationProof(element);
       if (navigationProof) navigationProofs.set(nodeId, navigationProof);
-      const rect = element.getBoundingClientRect();
+      const rect = boundingRect(element);
       const role = element.getAttribute("role") ?? implicitRole(element);
       const blockedByModal = modals.length > 0 && (modals.length !== 1 || !withinElement(element, modals[0]));
       const blockingDialogs = blockedByModal ? modals.filter(modal => !withinElement(element, modal))
@@ -689,7 +695,7 @@
       let text = fullText.slice(textOffset);
       let name = bounded(accessibleName(element, text), 500);
       if (kind === "image") {
-        const box = element.getBoundingClientRect();
+        const box = boundingRect(element);
         const visual = ["canvas", "svg"].includes(element.localName) ? "chart/graphic" : "image";
         name = `${name} (${visual}, ${Math.round(box.width)} × ${Math.round(box.height)} CSS px)`;
       }
@@ -713,30 +719,42 @@
       }
       let optionOffset = element === continuedElement ? (cursor?.optionOffset ?? 0) : 0;
       if (element.options && optionOffset > element.options.length) { pageMoved = true; optionOffset = 0; }
-      let selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element, optionOffset) : null;
+      const selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element, optionOffset) : null;
       if (selectInfo) name = bounded(accessibleName(element, fullText), 500);
+      let optionChars = 0, optionBytes = 0;
+      const optionCosts = selectInfo?.options.map((option, index) => {
+        const json = JSON.stringify(option), comma = Number(index > 0);
+        const chars = json.length + comma, bytes = utf8.encode(json).length + comma;
+        optionChars += chars; optionBytes += bytes;
+        return { chars, bytes };
+      });
+      let envelopeSize = selectInfo ? selectEnvelopeSize(selectInfo) : 0;
       let elementMore = null;
       if (selectInfo && (optionOffset || selectInfo.optionsTruncated
-        || name.length + text.length + JSON.stringify(selectInfo).length > maxTextChars - aggregateNodeText
-        || utf8.encode(name + text + JSON.stringify(selectInfo)).length > nodeByteBudget - aggregateNodeBytes)) {
+        || name.length + text.length + optionChars + envelopeSize > maxTextChars - aggregateNodeText
+        || utf8.encode(name + text).length + optionBytes + envelopeSize > nodeByteBudget - aggregateNodeBytes)) {
         selectInfo.optionOffset = optionOffset;
+        envelopeSize = selectEnvelopeSize(selectInfo);
         const room = maxTextChars - aggregateNodeText - name.length;
         const byteRoom = nodeByteBudget - aggregateNodeBytes - utf8.encode(name).length;
         const offered = selectInfo.options.length;
-        let choices = JSON.stringify(selectInfo);
-        while (selectInfo.options.length && (choices.length > room || utf8.encode(choices).length > byteRoom)) {
+        while (selectInfo.options.length && (optionChars + envelopeSize > room || optionBytes + envelopeSize > byteRoom)) {
           selectInfo.options.pop();
-          selectInfo.optionsTruncated = true;
-          choices = JSON.stringify(selectInfo);
+          const { chars, bytes } = optionCosts[selectInfo.options.length];
+          optionChars -= chars; optionBytes -= bytes;
+          if (!selectInfo.optionsTruncated) {
+            selectInfo.optionsTruncated = true;
+            envelopeSize = selectEnvelopeSize(selectInfo);
+          }
         }
-        if (choices.length > room || utf8.encode(choices).length > byteRoom || (offered && !selectInfo.options.length)) {
+        if (optionChars + envelopeSize > room || optionBytes + envelopeSize > byteRoom || (offered && !selectInfo.options.length)) {
           if (foldAtBoundary()) { truncationReasons.push("text_limit"); break; }
           nextRead = readAt(element, { textOffset, optionOffset, ...(cursor?.elementOnly ? { elementOnly: true } : {}) });
           if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold this control's name and next choice. Increase max_text_chars.");
           truncationReasons.push("text_limit");
           break;
         }
-        const textRoom = room - choices.length, textByteRoom = byteRoom - utf8.encode(choices).length;
+        const textRoom = room - optionChars - envelopeSize, textByteRoom = byteRoom - optionBytes - envelopeSize;
         let end = 0, bytes = 0;
         for (const character of text) {
           const size = utf8.encode(character).length;
@@ -755,9 +773,12 @@
             textOffset: textOffset + end, optionOffset: nextOption }) };
           text = text.slice(0, end);
         }
-        if (!optionOffset && !elementMore) delete selectInfo.optionOffset;
+        if (!optionOffset && !elementMore) {
+          delete selectInfo.optionOffset;
+          envelopeSize = selectEnvelopeSize(selectInfo);
+        }
       }
-      const choiceText = selectInfo ? JSON.stringify(selectInfo) : "";
+      const choiceChars = optionChars + envelopeSize, choiceBytes = optionBytes + envelopeSize;
       // A prose prefix and every link proof it names are budgeted together.
       // Prefix costs only grow, so a bounded binary search finds a window
       // that advances without ever leaving dangling action references.
@@ -771,8 +792,8 @@
           const text = snapshotText(link), name = bounded(accessibleName(link, text), 500);
           proofs.push({ link, text, name, path });
         }
-        const chars = name.length + value.length + choiceText.length + proofs.reduce((sum, proof) => sum + 2 * proof.name.length, 0);
-        const bytes = utf8.encode(name + value + choiceText).length + proofs.reduce((sum, proof) => sum + 2 * utf8.encode(proof.name).length, 0);
+        const chars = name.length + value.length + choiceChars + proofs.reduce((sum, proof) => sum + 2 * proof.name.length, 0);
+        const bytes = utf8.encode(name + value).length + choiceBytes + proofs.reduce((sum, proof) => sum + 2 * utf8.encode(proof.name).length, 0);
         return { inline, proofs, chars, bytes, fits: nodes.length + 1 + proofs.length <= maxNodes
           && aggregateNodeText + chars <= maxTextChars && aggregateNodeBytes + bytes <= nodeByteBudget };
       };
@@ -809,7 +830,7 @@
         sectionPath: sectionStart ? stableElementPath(sectionStart.element) : null,
         paragraphPath: stableElementPath(paragraph),
         inlineText: group.inline,
-        inline: ["inline", "inline-block", "contents"].includes(getComputedStyle(element).display),
+        inline: ["inline", "inline-block", "contents"].includes(computedStyle(element).display),
         ...(selectInfo ? { select: selectInfo } : {}),
         ...(elementMore ? { more: elementMore } : {}),
         ...(!isPasswordField(element) && element.validity ? {
@@ -953,13 +974,27 @@
     return actions;
   }
 
-  function clickNode(message) {
-    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "click");
+  function clickTargetState(element) {
+    return JSON.stringify([typeof element.checked === "boolean" ? element.checked : null, element.getAttribute("aria-checked"),
+      element.getAttribute("aria-expanded"), element.getAttribute("aria-pressed"), element.getAttribute("aria-selected")]);
+  }
+
+  function clickNode(message, action) {
+    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, action);
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    requireEnabledNode(element, "click");
+    const double = action === "double_click";
+    requireEnabledNode(element, double ? "double click" : "click");
+    const before = clickTargetState(element);
     element.click();
-    return { snapshotId: message.snapshotId, nodeId: message.nodeId, clicked: true,
-      outcome: "succeeded", verification: "page_acknowledged" };
+    if (double) {
+      element.click();
+      if (typeof MouseEvent === "function") {
+        element.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, composed: true, detail: 2, button: 0 }));
+      }
+    }
+    const targetChanged = !element.isConnected || clickTargetState(element) !== before;
+    return { snapshotId: message.snapshotId, nodeId: message.nodeId, [double ? "doubleClicked" : "clicked"]: true,
+      targetChanged, outcome: "succeeded", verification: targetChanged ? "verified" : "page_acknowledged" };
   }
 
   // Retain the exact host across this action's own DOM mutations for readback.
@@ -1145,19 +1180,6 @@
       checked: after,
       changed: before !== after,
     };
-  }
-
-  function doubleClickNode(message) {
-    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "double_click");
-    if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    requireEnabledNode(element, "double click");
-    element.click();
-    element.click();
-    if (typeof MouseEvent === "function") {
-      element.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, composed: true, detail: 2, button: 0 }));
-    }
-    return { snapshotId: message.snapshotId, nodeId: message.nodeId, doubleClicked: true,
-      outcome: "succeeded", verification: "page_acknowledged" };
   }
 
   async function waitForNodeState(message) {
@@ -1390,7 +1412,7 @@
   function captureViewport(target, walk = readingElementWalk([target === window ? document.body : target], target)) {
     if (walk.truncated && walk.positions.get(walk.nextElement).distance === 0) return null;
     const rows = walk.elements.filter(element => isPageContentElement(element) && isVisible(element) && intersectsViewport(element)).map(element => {
-      const rect = element.getBoundingClientRect();
+      const rect = boundingRect(element);
       const text = snapshotText(element);
       return { element, content: JSON.stringify([text, accessibleName(element, text), safeValue(element),
         element.getAttribute("role"), element.getAttribute("aria-expanded"), element.getAttribute("aria-checked"),
@@ -1449,7 +1471,7 @@
           if (elementKind(child) === "image") continue;
           if (insideNavigation(child) && !insideNavigation(element)) continue;
           if (child.tagName === "BR") { parts.push({ text: preformatted ? "\n" : " " }); continue; }
-          const style = getComputedStyle(child);
+          const style = computedStyle(child);
           if (style.display === "none" || style.visibility === "hidden" || transparent(child, style)) continue;
           if (isTextClipped(child, style)) continue;
           if (preformatted || ["inline", "inline-block", "inline-flex", "contents"].includes(style.display)) visit(child, child.tagName === "A" ? child : link, code || child.tagName === "CODE");
@@ -1480,13 +1502,13 @@
     // unless structure proves that it contains clipped or navigation copies.
     const navigational = insideNavigation(element);
     if (![...element.querySelectorAll("*")].some(child => isTextClipped(child)
-      || transparent(child, getComputedStyle(child)) || (insideNavigation(child) && !navigational))) {
+      || transparent(child, computedStyle(child)) || (insideNavigation(child) && !navigational))) {
       return element.innerText ?? element.textContent ?? "";
     }
     return [...element.childNodes].map(child => {
       if (child.nodeType === 3) return child.textContent ?? "";
       if (child.nodeType !== 1 || !isPageContentElement(child) || elementKind(child) === "image") return "";
-      const style = getComputedStyle(child);
+      const style = computedStyle(child);
       if (style.display === "none" || style.visibility === "hidden" || transparent(child, style)
         || isTextClipped(child, style) || (insideNavigation(child) && !insideNavigation(element))) return "";
       if (child.tagName === "BR") return "\n";
@@ -1520,7 +1542,7 @@
         || isScrollable(element) || element.draggable === true) continue;
       const children = Array.from(element.children);
       if (children.some((child) => !counts.has(child)
-        || !["inline", "inline-block"].includes(getComputedStyle(child).display))) continue;
+        || !["inline", "inline-block"].includes(computedStyle(child).display))) continue;
       const fragments = Array.from(element.childNodes).filter((node) => node.nodeType === 3)
         .map((node) => normalizedText(node.textContent ?? "")).filter(Boolean);
       // Only single-character fragments count toward a glyph run.
@@ -1713,12 +1735,12 @@
   function meaningfulImageName(element) {
     for (let current = element; current; current = composedParent(current)) {
       if (!isPageContentElement(current) || current.hidden || current.getAttribute("aria-hidden") === "true") return "";
-      const style = getComputedStyle(current);
+      const style = computedStyle(current);
       if (style.display === "none" || style.visibility === "hidden" || transparent(current, style)) return "";
     }
     const role = element.getAttribute("role");
     if (role === "presentation" || role === "none") return "";
-    const rect = element.getBoundingClientRect();
+    const rect = boundingRect(element);
     if (rect.width <= 1 && rect.height <= 1) return "";
     if (element.tagName === "IMG" && ((element.naturalWidth === 1 && element.naturalHeight === 1)
       || (element.getAttribute("width") === "1" && element.getAttribute("height") === "1"))) return "";
@@ -1796,7 +1818,7 @@
       const headings = previous ? (elementKind(previous) === "heading" ? [previous]
         : [...previous.children].filter(child => elementKind(child) === "heading")) : [];
       if (headings.length !== 1) continue;
-      const heading = headings[0], a = heading.getBoundingClientRect(), b = current.getBoundingClientRect();
+      const heading = headings[0], a = boundingRect(heading), b = boundingRect(current);
       if (Math.min(a.bottom, b.bottom) <= Math.max(a.top, b.top)) continue;
       if (!isClickable(current, current.getAttribute("role") ?? implicitRole(current))
         && !current.querySelector("a,button,[role=link],[role=button]")) continue;
@@ -1809,7 +1831,7 @@
 
   function isPreformatted(element) {
     return element.tagName === "PRE" || (element.tagName === "CODE"
-      && !["inline", "inline-block", "inline-flex", "contents"].includes(getComputedStyle(element).display));
+      && !["inline", "inline-block", "inline-flex", "contents"].includes(computedStyle(element).display));
   }
 
   function hasUncontrolledWords(element) {
@@ -1820,7 +1842,7 @@
 
   function readingBlock(element) {
     for (let current = element; current; current = composedParent(current)) {
-      if (!["inline", "inline-block", "inline-flex", "inline-grid", "contents"].includes(getComputedStyle(current).display)) return current;
+      if (!["inline", "inline-block", "inline-flex", "inline-grid", "contents"].includes(computedStyle(current).display)) return current;
     }
     return element;
   }
@@ -1858,13 +1880,35 @@
     } catch { return null; }
   }
 
+  function layoutFor(element) {
+    if (!snapshotLayout) return null;
+    let layout = snapshotLayout.get(element);
+    if (!layout) {
+      layout = {};
+      snapshotLayout.set(element, layout);
+    }
+    return layout;
+  }
+
+  function computedStyle(element) {
+    const layout = layoutFor(element);
+    if (!layout) return getComputedStyle(element);
+    return layout.style ??= getComputedStyle(element);
+  }
+
+  function boundingRect(element) {
+    const layout = layoutFor(element);
+    if (!layout) return element.getBoundingClientRect();
+    return layout.rect ??= element.getBoundingClientRect();
+  }
+
   function isVisible(element) {
-    const style = getComputedStyle(element);
+    const style = computedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || transparent(element, style)) return false;
-    const rect = element.getBoundingClientRect();
+    const rect = boundingRect(element);
     if (rect.width <= 0 || rect.height <= 0 || isTextClipped(element, style)) return false;
     for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
-      const parentStyle = getComputedStyle(parent);
+      const parentStyle = computedStyle(parent);
       if (transparent(parent, parentStyle) || isTextClipped(parent, parentStyle)) return false;
     }
     return true;
@@ -1878,7 +1922,7 @@
       && animation.effect?.getKeyframes().some(frame => "opacity" in frame));
   }
 
-  function isTextClipped(element, style = getComputedStyle(element)) {
+  function isTextClipped(element, style = computedStyle(element)) {
     const rectangle = style.clip?.match(/^rect\((.*)\)$/);
     if (rectangle) {
       const values = rectangle[1].split(/[\s,]+/).map(Number.parseFloat);
@@ -1889,14 +1933,14 @@
     const parts = inset[1].split(/\s+round\s+/)[0].trim().split(/\s+/);
     if (parts.length < 1 || parts.length > 4 || parts.some(part => !/^\d+(?:\.\d+)?(?:px|%)?$/.test(part))) return false;
     const [top, right = top, bottom = top, left = right] = parts;
-    const box = element.getBoundingClientRect();
+    const box = boundingRect(element);
     const amount = (part, length) => Number.parseFloat(part) * (part.endsWith("%") ? length / 100 : 1);
     return amount(top, box.height) + amount(bottom, box.height) >= box.height
       || amount(left, box.width) + amount(right, box.width) >= box.width;
   }
 
   function intersectsViewport(element) {
-    const rect = element.getBoundingClientRect();
+    const rect = boundingRect(element);
     let left = Math.max(0, rect.x), top = Math.max(0, rect.y);
     let right = Math.min(window.innerWidth, rect.x + rect.width), bottom = Math.min(window.innerHeight, rect.y + rect.height);
     // A child can intersect the window while lying outside its scrolled box.
@@ -1907,7 +1951,7 @@
       // them again empties the region after one viewport. A body that scrolls
       // as its own container is a real clipping ancestor and stays.
       if (parent === document.documentElement || parent === document.scrollingElement) continue;
-      const style = getComputedStyle(parent), box = parent.getBoundingClientRect();
+      const style = computedStyle(parent), box = boundingRect(parent);
       if (["auto", "scroll", "hidden", "clip"].includes(style.overflowX)) {
         left = Math.max(left, box.x + parent.clientLeft);
         right = Math.min(right, box.x + parent.clientLeft + parent.clientWidth);
@@ -1943,8 +1987,8 @@
       if (owners.has(element)) return owners.get(element);
       const ancestor = composedParent(element);
       const inherited = ancestor ? owner(ancestor) : embeddedOverlay ? element : null;
-      const role = element.getAttribute("role"), style = getComputedStyle(element);
-      const box = element.getBoundingClientRect();
+      const role = element.getAttribute("role"), style = computedStyle(element);
+      const box = boundingRect(element);
       const width = Math.max(0, Math.min(innerWidth, box.right) - Math.max(0, box.left));
       const height = Math.max(0, Math.min(innerHeight, box.bottom) - Math.max(0, box.top));
       // Scroll-locking a body's layout does not turn the whole article into
@@ -1963,7 +2007,7 @@
   }
 
   function coversPageContent(element) {
-    const box = element.getBoundingClientRect();
+    const box = boundingRect(element);
     const left = Math.max(0, box.left), right = Math.min(innerWidth, box.right);
     const top = Math.max(0, box.top), bottom = Math.min(innerHeight, box.bottom);
     const root = element.getRootNode();
@@ -2010,6 +2054,10 @@
 
   function isSelectable(element) {
     return element.tagName.toLowerCase() === "select" && !isEffectivelyDisabled(element);
+  }
+
+  function selectEnvelopeSize(selectInfo) {
+    return JSON.stringify({ ...selectInfo, options: [] }).length;
   }
 
   function selectDescription(element, offset = 0, limit = 100) {
@@ -2085,7 +2133,7 @@
   }
 
   function readingViewport(target) {
-    const box = target === window ? null : target.getBoundingClientRect();
+    const box = target === window ? null : boundingRect(target);
     return {
       left: box ? Math.max(0, box.left + target.clientLeft) : 0,
       top: box ? Math.max(0, box.top + target.clientTop) : 0,
@@ -2130,7 +2178,7 @@
     });
     const columnPrefix = readingColumnPrefixes(geometry, overlayFor);
     const position = element => {
-      const place = geometry(element.getBoundingClientRect());
+      const place = geometry(boundingRect(element));
       const complementary = insideNavigation(element) || inPageChrome(element);
       return { scrollX: view.scrollX, scrollY: view.scrollY,
         ...(overlayFor(element) ? { overlay: true } : {}),
@@ -2217,7 +2265,7 @@
       if (groups.has(parent)) return groups.get(parent);
       const children = [...Array.from(parent.children ?? []), ...Array.from(elementShadowRoot(parent)?.children ?? [])];
       const candidates = children.filter(element => !overlayFor(element) && isVisible(element))
-        .map(element => ({ element, box: element.getBoundingClientRect() }))
+        .map(element => ({ element, box: boundingRect(element) }))
         .filter(({ box }) => box.width >= 80 && box.height >= 120);
       const ranks = new Map(), remaining = new Set(candidates);
       // A long, vertically stacked list shares one horizontal strip and has
@@ -2420,7 +2468,7 @@
   }
 
   function isScrollable(element) {
-    const style = getComputedStyle(element);
+    const style = computedStyle(element);
     return /(auto|scroll)/.test(`${style.overflow} ${style.overflowX} ${style.overflowY}`)
       && (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth);
   }

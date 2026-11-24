@@ -60,8 +60,17 @@ Work in flight has two parts:
   it held (a process tree, the foreground app, an observer, a slot), and say
   plainly what landed and what did not. Settlement always runs to completion,
   exactly once, however the effect ended. It runs through `settle { … }`
-  (`Modules/NativeAgentCore/Sources/NativeAgentCore/Settle.swift`), which a
+  (`Modules/NativeAgentCore/Sources/NativeAgentCore/NativeAgentCore/Settle.swift`), which a
   cancelled caller still waits for.
+
+A structured chat takes a noncopyable `SettlementTicket` on accepting its Stop
+marker and consumes it to save the outcome. A held host call likewise consumes
+its ticket to release its cards and finish its lifecycle. `withSettledScope` lends a held
+resource to work and transfers it to one release outside cancellation, on success
+or throw. Turn admission uses it for the session/root place; Mac acts use it for
+their intervention receipt, including the existing requested-restoration case.
+File descriptors close with their owner. Only the held, unreaped process leader
+can signal its group; a failed reap leaves that same leader owned.
 
 Inbound contact and builder tasks settle returned text and files even when
 Stop arrives at the return boundary. Cancellation selects the terminal state
@@ -113,15 +122,16 @@ the stopped program cannot continue, and completed writes are never replayed.
 
 An admitted authored fetch owns its network request separately from the calling
 program's response wait. Stop, caller expiry and run close end that wait without
-cancelling the request. Its own wall-clock transport ceiling cancels and joins
-actual transport exit; `settle` saves its one redacted receipt and settles its
-experience's `finish` obligation. The timeout names that experience for later
-inspection; no response means unknown effects, never permission to resend.
+cancelling the request. The admitted request runs to its own end: NativeAgent
+puts no time limit on it. When it ends, `settle` saves a modifying request's one
+redacted receipt and settles its experience's `finish` obligation, which names the
+experience for later inspection; the effects are unknown, and no response is never
+permission to resend.
 The [authored fetch contract](skill_manifest_spec.md#secret-insertion-and-redaction)
-owns the wait/transport limits and receipt path.
+owns the response limits and receipt path.
 
 A resident program's call waiting for another call's busy slot parks through
-`ScopedWaiter` (`Senses/OwnedProgramRunner.swift`). Cancelling that call releases and removes only its own parker, without stopping
+`ScopedWaiter` (`SenseCore/Senses/OwnedProgramRunner.swift`). Cancelling that call releases and removes only its own parker, without stopping
 the active resident call or waking sibling parkers. Slot release, completed
 retirement and pool closure resolve the remaining waits. Without cancellation
 or an inherited deadline, a still-busy slot remains pending; waking alone is
@@ -166,54 +176,76 @@ Their mind's durable work record is the lived-moment journal (`lived_moments` in
 `cognition/cognition.sqlite`; [SUBCONSCIOUS.md](SUBCONSCIOUS.md#lived-moments)).
 Its `owed` and `meant` rows are not promises about an effect in flight: they are what is still owed to them, and the next wake lives them.
 Quitting is their **sleep**, one joinable operation started in the async quit
-hold: bridge and phone ingress closes immediately, and retained launch,
-wake, practice, aging and background producers are stopped and joined before
-`NativeAgentEngine.sleepMind` takes the final snapshot. Admission of interpretation closes
+hold: bridge and phone ingress closes immediately, cognition admission closes
+(unhooking attention intake, latching cognition admission closed, cancelling and
+joining `MindStream` work first, then stopping and joining runtime producers,
+registered attention handoffs, night admission, and claimed-work drive returns
+through `settle` while keeping the mind runtime and approval-lifecycle
+observation active for admitted-turn and promoter settlement), and retained
+launch, wake, practice, aging and background producers are stopped and joined
+before `NativeAgentEngine.sleepMind` takes the final snapshot. Admission of interpretation closes
 (settled turns are still recorded owed), the interpretations in flight stop (a
 returned one is already `meant`; an interrupted call stays owed), the fold in
 flight finishes, `appSleep` is lived once as the terminal transition, and body
 and substrate are saved through `settle { … }` (the substrate in one checked
 final flush of affect, consumed residue and nodes, `persistAffectAndNodes`). Its result names each part's
-final save and the moments left unlived (a `lifecycle.sleep` receipt); a save
+final save, any unsettled attention landing, claim, or drive return, and the moments left unlived (a `lifecycle.sleep` receipt); a save
 that fails is reported, never swallowed.
+
+The part-wake drain joins every admitted world post for presence, network, Mac sleep or wake, and Chrome tab takeover.
+The engine cancels and joins its part-schedule observer with launch work. The helper scheduler
+cancels and joins its queue observer. The clock closes scheduled delivery admission and waits
+for every occurrence it already recorded as delivered to finish. Future occurrences stay pending.
 
 Reply-mirror reconciliation keeps each row's failed preparation owed and names
 its cause after processing the remaining rows. Cancellation stops the pass;
 an unavailable shared reconciliation read fails the pass before delivery.
 
-Ordinary quit raises each captured in-flight turn's own Stop, waits for its
-settlement, then joins the turn engine's retained dispatch bodies, including
+Quit raises each captured in-flight turn's own Stop. Ordinary quit waits for
+the captured runs in its initial wait. Restart skips that initial wait
+because it already waited on its origin. Both drain all registered turns
+before joining the turn engine's retained dispatch bodies, including
 calls whose stopped waiters or turns have already returned. Each body joins
-its actual exit and journal settlement; accepted trace writes drain before the
-final mind save. A body that never returns keeps Quit held without a clock,
+its actual exit and journal settlement. Quit then joins each history index's worker through the
+final committed transcript appends. The Mac room record closes after this drain so a finishing
+Mac action can save its window. Pending contact-reply writes and returned news
+(including their repair records), `Attention.post` commits, session-usage
+receipts, dream-theme extractions (including failure repair records), and
+accepted trace writes join without cancelling owed writes before the final mind
+save; contact-reply transcript appends settle before the history index drain.
+A body that never returns keeps Quit held without a clock,
 and the app log names the calls it waits on. Outside Quit, a stopped call's
 late body does not hold its conversation: the next turn is admitted while it
 settles, and its real result lands in the journal, never in that next turn.
 The held quit then retires resident dependencies (Chrome, senses, resident
-programs, ACP, ContextFlow, memory services, attention, the trace feed, then
+programs, ACP, ContextFlow, memory services, the trace feed, then
+any post-retirement `Attention.post` commits from shutting down senses before
 the app index) before it answers the termination, so none of it is cut by
 process exit and the quit puts no clock on it: each step ends when its own work
 is seen done or its processes are seen exited (ACP's escalation keeps its own
 inventoried signal graces). Retirement follows the very same
 retained operation; it cannot start a competing flush or retire any of them
 ahead of producer and turn settlement.
+Registered turns waiting for admission observe their own Stop marker, so a
+Stop releases their wait and lets the door clear the run from the registry.
 Browser IPC's full stop likewise follows tracked turns and wake runs, so it
 does not cancel their browser operations early. Browser admission-only closure
-and universal turn/cognition admission still require their owning APIs; new
+and universal turn admission still require their owning APIs; new
 requests through those doors are not fenced by this ordering alone.
 OtherDoorTurns' stop receipt joins its retained consumer, including an in-flight
 transcript refresh, subscription cleanup through `settle` and exit bookkeeping.
 ActivityWatch's controller retains one termination task joining startup, policy,
 policy/cadence observation and retention bodies. The watcher's `requestStop()`
-has two phases: a bounded request (at most five seconds for capture-thread
-handoff and five for thread/pump settlement) returns `settled` or
+allows up to five seconds for the capture queue to close and five for the span
+writer to drain. It returns `settled` or
 `settlementPending`, alongside the existing pump's eventual settlement task.
 The controller retains and joins that task even when stopping was already
 underway. A pending outcome reports degraded state without releasing live
 capture ownership or cancelling the pump; a wedged thread can leave this join
 pending until process exit. A
 policy-disable handoff alone is not the controller's full termination barrier. The quit producer
-settlement joins both the OtherDoorTurns and ActivityWatch handles before the
+settlement stops `AttentionRouter` (cancelling and unblocking in-flight outbound peer deliveries
+before the mind sleeps) and joins both the OtherDoorTurns and ActivityWatch handles before the
 final mind save.
 The next launch reconciles retained journal work and committed
 dream cutoffs; the quit result must never claim an unfinished snapshot landed.
@@ -256,7 +288,9 @@ Mac tool-call deadlines bound the reporting caller and its work waiters, never
 detached settlement. A reporting timeout or Stop without the body's result is
 an unknown effect, not proof of cancellation acknowledgement; the in-flight
 body alone writes its terminal settlement. Reporting uncertainty has no
-`terminalAt`; actual exit replaces it with the body's real result. A
+`terminalAt`; actual exit replaces it with the body's real result. A Mac launch
+retains its act scope after Stop releases the caller. Launch Services returning
+success or failure releases the scope through `settle`. A
 cancellation request atomically records intent or returns the outcome already
 stored. If cancellation wins during policy preflight and preflight refuses,
 the refusal path acknowledges cancellation before any execution starts.

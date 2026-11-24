@@ -67,10 +67,6 @@ extension TrustPolicy {
     }
 }
 
-typealias ProviderAuthStatus = NativeAgentShared.ProviderAuthStatus
-
-typealias ProviderModelInfo = NativeAgentShared.ProviderModelInfo
-
 /// One built-in guidance entry in the skills snapshot.
 struct SkillManifestEntry: Decodable, Identifiable, Hashable, Sendable {
     let id: String

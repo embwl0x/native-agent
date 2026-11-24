@@ -26,8 +26,6 @@ public struct TranscriptAttributes: AttributeScope {
     public let appKit: AttributeScopes.AppKitAttributes
 #elseif os(iOS)
     public let uiKit: AttributeScopes.UIKitAttributes
-#else
-    public let foundation: AttributeScopes.FoundationAttributes
 #endif
     public let blockID: BlockID
     public let kind: Kind

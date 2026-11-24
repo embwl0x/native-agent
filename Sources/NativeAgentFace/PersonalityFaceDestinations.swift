@@ -15,8 +15,7 @@ enum PersonalityFaceDestinations {
         guard tabs.contains(where: { $0.key == item }) else {
             throw PartCallError(code: "personality_destination_unknown", message: "This Personality destination is unavailable.")
         }
-        let key = ShellRailTab.storageKey(.personality)
-        if UserDefaults.standard.string(forKey: key) != item { UserDefaults.standard.set(item, forKey: key) }
+        ShellRailTabStore.shared.set(item, for: .personality)
     }
 }
 
@@ -27,13 +26,16 @@ extension View {
 private struct PersonalityFaceDestinationModifier: ViewModifier {
     @Environment(\.quietOffscreenRead) private var offscreen
     @Environment(\.quietRailTab) private var drawnDestination
-    @AppStorage(ShellRailTab.storageKey(.personality)) private var destination = "personality"
+
+    private var destination: String {
+        ShellRailTabStore.shared.value(for: .personality, default: "personality")
+    }
 
     private var isPresented: Binding<Bool> {
         Binding(get: {
             !offscreen && destination != "personality" && PersonalityFaceDestinations.tabs.contains { $0.key == destination }
         }, set: { presented in
-            if !presented { destination = "personality" }
+            if !presented { ShellRailTabStore.shared.set("personality", for: .personality) }
         })
     }
 
@@ -52,7 +54,8 @@ private struct PersonalityFaceDestinationModifier: ViewModifier {
             HStack {
                 Text(PersonalityFaceDestinations.tabs.first { $0.key == key }?.title ?? "Personality").font(.title2)
                 Spacer()
-                Button("Done") { destination = "personality" }
+                Button("Done") { ShellRailTabStore.shared.set("personality", for: .personality) }
+                    .keyboardShortcut(.cancelAction)
             }
             destinationView(key)
         }

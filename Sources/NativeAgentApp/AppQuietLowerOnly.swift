@@ -1,19 +1,11 @@
-import EngineRuntime
+import BodyRuntime
 import NativeAgentShared
-import ActivityWatch
-import AgentConversations
-import AppToolRuntime
-import ChatToolRuntime
-import Connectors
-import DeviceSync
+import MacNerves
 import Foundation
-import MacIntegration
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
-import SlackBot
-import TelegramBot
-import TrustCenter
+import DeskCore
 
 // Blueprint: | `AppQuietLowerOnly.swift` | `AppQuietSettingsHost`, `AppQuietToolHost`: Connector commands; Full Mac ownership |
 
@@ -113,7 +105,7 @@ extension AppQuietToolHost {
         case "connector_disconnect":
             let connector = try await namedConnector(input).get()
             return { [self] in
-                do { _ = try await NativeAgentEngine.live.ports.deviceSyncHost.disconnectConnector(id: connector.id) } catch {
+                do { _ = try await NativeAgentEngine.live.connectors.disconnectMobileConnector(id: connector.id) } catch {
                     return AppToolExecutor.failure("connector_disconnect_failed",
                         "\(error.localizedDescription) Read app {page:\"connectors\"} for where \(connector.name) stands.",
                         extra: ["id": .string(connector.id), "effects": .string("unknown")])

@@ -21,7 +21,7 @@ failed or superseded navigation leaves it available to follow.
 Launch's permission-card anchor reads also run off MainActor. A failed navigation
 refresh retains its prior publication and issue; selecting a room does not
 reinterpret that unavailable read as a missing anchor.
-Mac conversation lists draw the [session faces](designs/separate-face.md#stage-one-conversation-lists).
+Mac conversation lists draw the [session faces](../Modules/NativeAgentCore/FACE_LINK.md).
 The index, pins and anchor remain engine command state; the window reads finished
 row slots and ordered identity sections. Unread metadata does not hide a committed
 room, and an unknown message count does not establish an empty conversation.
@@ -159,10 +159,10 @@ session-index transaction, then correct kind and ownership when opening their
 session; a contact corrects its exact owned
 session on its next write, never an arbitrary conversation it was asked to
 answer in. The mind stream declares `mind` as `builder` before each thought
-(`Agents/MindStream.swift`). There is no manual rewrite of installed data.
+(`BodyRuntime/Agents/MindStream.swift`). There is no manual rewrite of installed data.
 
 An own line (`agent.job` with `agent: "self"`) uses the `chat` surface, chosen
-by `Agents/OwnLineDoor.swift` where its conversation is minted. Its arriving
+by `BodyRuntime/Agents/OwnLineDoor.swift` where its conversation is minted. Its arriving
 message's origin, request and turn envelope all carry `chat`, which has a
 Context Flow persona kernel. The declaration derives its source through
 `ChatThreadKind.transcriptSource(surface:)`, so the index and message rows
@@ -229,7 +229,6 @@ with the person; it no longer gates a conversation page's history. The page's
 to the intact-tail and recorded-route requirements below. Archived sessions
 remain readable but have `reply_available:false` and no `saved_route` reply kind.
 
-Recent session-conversation reads use `SwiftNativePersistenceCore.tailPhysicalLines`
 Mounted Mac conversations watch their own transcript file and accept card/message
 notifications only for that exact session ID. The main conversation displays a
 read failure before its first successful load as well as beside retained rows;

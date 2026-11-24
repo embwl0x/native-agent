@@ -150,7 +150,6 @@ extension TranscriptDocument {
     }
 }
 
-@available(macOS 15, iOS 18, *)
 extension TranscriptDocument {
     /// Parse readable reply blocks; only the live edge closes unfinished Markdown.
     public static func replyPieces(_ text: String, ink: TranscriptBlock.Ink, edge: Bool) -> [TranscriptPiece] {

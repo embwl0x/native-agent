@@ -1,0 +1,349 @@
+import Foundation
+import NativeAgentShared
+import PersistenceCore
+import SenseCore
+import NativeAgentCore
+// Blueprint: | `ShelfStore.swift` | `ShelfStore`; `append`, `settleApproval`: indexed history, canonical approvals and exact notification acknowledgement |
+
+public struct ShelfStore: Sendable {
+    public struct DidChange: NotificationCenter.AsyncMessage {
+        public typealias Subject = NSURL
+        public let root: URL
+    }
+    public static let maximumPageSize = 100
+    public static let conditionNotificationReaderID = "condition-notification"
+    private let disk: StandingBotsDisk
+    let dataRoot: URL
+    public init(dataRoot: URL) {
+        disk = StandingBotsDisk(dataRoot: dataRoot)
+        self.dataRoot = dataRoot
+    }
+
+    /// Per-entry files bound append IO; append sequence keeps late and backdated runs pageable.
+    public func append(_ entry: ShelfEntry) throws {
+        try disk.locked { try appendLocked(entry) }
+    }
+
+    func appendLocked(_ entry: ShelfEntry) throws {
+        let definition = try disk.definition(entry.botId)
+        guard definition.audit.contains(where: { $0.definition.briefVersion == entry.briefVersion }) else {
+            throw StandingBotsError.invalidValue("unknown brief version")
+        }
+        try validate(entry)
+        var index = try loadIndex()
+        guard try disk.bytes(at: indexedPath(entry.id)) == nil else {
+            throw StandingBotsError.alreadyExists(entry.id)
+        }
+        let last = index.sequence
+        guard last < UInt64.max else { throw StandingBotsError.invalidValue("sequence overflow") }
+        let book = Book(sequence: last + 1, entry: entry)
+        try disk.write(book, at: pendingPath)
+        try apply(book, index: &index)
+        recordExperience(entry)
+    }
+
+    /// Persist observed approval decisions at their existing sequence so inbox eviction cannot erase settlement.
+    /// Approval absence cannot establish a decision.
+    public func settleApproval(_ id: UUID, detail: String) throws {
+        try disk.locked {
+            var index = try loadIndex()
+            guard let book = try disk.read(Book.self, at: indexedPath(id)),
+                  book.entry.runtimeStatus == .waitingForApproval else { return }
+            var entry = book.entry
+            entry.status = .interrupted
+            entry.statusDetail = detail
+            let settled = Book(sequence: book.sequence, entry: entry)
+            try disk.write(settled, at: pendingPath)
+            try apply(settled, index: &index)
+        }
+    }
+
+    public func entry(_ id: UUID) throws -> ShelfEntry {
+        let stored = try disk.locked {
+            guard let entry = try rawEntryLocked(id) else { throw StandingBotsError.notFound(id) }
+            recordExperience(entry)
+            return entry
+        }
+        return try reconciling([stored])[0]
+    }
+
+    /// Only locked claim reconciliation may bypass approval projection to inspect raw settlement.
+    func rawEntryLocked(_ id: UUID) throws -> ShelfEntry? {
+        _ = try loadIndex()
+        guard let book = try disk.read(Book.self, at: indexedPath(id)) else { return nil }
+        guard book.entry.id == id else { throw StandingBotsError.corruptStore("exact shelf entry identity") }
+        try validate(book.entry)
+        return book.entry
+    }
+
+    /// Open-workspace reads never acknowledge results or execute work.
+    public func latestEntries(botIDs: Set<UUID>) throws -> [ShelfEntry] {
+        guard botIDs.count <= 24 else { throw StandingBotsError.invalidValue("too many open helpers") }
+        let entries: [ShelfEntry] = try disk.locked {
+            let index = try loadIndex()
+            return try botIDs.compactMap { bot in
+                guard let id = index.latestByBot[bot] else { return nil }
+                guard let book = try disk.read(Book.self, at: indexedPath(id)), book.entry.botId == bot else {
+                    throw StandingBotsError.corruptStore("latest helper result index")
+                }
+                try validate(book.entry)
+                return book.entry
+            }
+        }
+        return try reconciling(entries)
+    }
+
+    /// A glance cannot wait on the store lock; unavailable evidence throws without replay.
+    public func latestEntriesUnlocked(botIDs: Set<UUID>) throws -> [ShelfEntry] {
+        guard let index = try disk.read(Index.self, at: indexPath) else {
+            guard try disk.files(at: indexedDirectory, extension: "json").isEmpty,
+                  try disk.bytes(at: pendingPath) == nil else {
+                throw StandingBotsError.corruptStore("helper result index missing; repair the index before reading retained entries")
+            }
+            return []
+        }
+        let entries = try botIDs.compactMap { bot -> ShelfEntry? in
+            guard let id = index.latestByBot[bot] else { return nil }
+            guard let book = try disk.read(Book.self, at: indexedPath(id)), book.entry.botId == bot else {
+                throw StandingBotsError.corruptStore("latest helper result index")
+            }
+            try validate(book.entry)
+            return book.entry
+        }
+        return try reconciling(entries, persist: false)
+    }
+
+    /// Cursors bind the filters and ordering; offset cannot accompany a cursor.
+    /// Reads never acknowledge entries; restart with nil cursor to revisit unread holes or newly appended rows.
+    public func shelfRead(bot: UUID? = nil, since: Date? = nil, topic: String? = nil,
+                          limit: Int = 20, cursor: String? = nil, readerId: String? = nil,
+                          newestFirst: Bool = false, offset: Int = 0) throws -> ShelfReadPage {
+        guard (1...Self.maximumPageSize).contains(limit) else { throw StandingBotsError.invalidValue("limit must be 1...100") }
+        guard offset >= 0, cursor == nil || offset == 0 else {
+            throw StandingBotsError.invalidValue("offset must be nonnegative; use offset or cursor, not both")
+        }
+        if let since, !since.timeIntervalSince1970.isFinite { throw StandingBotsError.invalidValue("since") }
+        if let readerId { try validateReader(readerId) }
+        let query = Query(bot: bot, since: since, topic: topic?.trimmingCharacters(in: .whitespacesAndNewlines), readerId: readerId,
+                          newestFirst: newestFirst)
+        let after: UInt64
+        if let cursor {
+            guard let bytes = Data(base64Encoded: cursor),
+                  let decoded = try? JSONDecoder().decode(PageCursor.self, from: bytes),
+                  decoded.version == 1, decoded.query == query else { throw StandingBotsError.invalidCursor }
+            after = decoded.after
+        } else { after = newestFirst ? UInt64.max : 0 }
+        return try disk.locked {
+            let seen = try readerId.map { try readerState($0).readEntryIds } ?? []
+            // Read one lookahead row; only returned rows can move the continuation boundary.
+            let all = try books()
+            let ordered = newestFirst ? Array(all.reversed()) : all
+            let matching = ordered.filter { book in
+                let entry = book.entry
+                return !seen.contains(entry.id)
+                    && (bot == nil || entry.botId == bot)
+                    && (since == nil || entry.runAt > since!)
+                    && matches(entry, topic: query.topic)
+            }
+            let start = cursor == nil ? offset : matching.prefix(while: {
+                newestFirst ? $0.sequence >= after : $0.sequence <= after
+            }).count
+            let candidates = Array(matching.dropFirst(start).prefix(limit + 1))
+            let page = Array(candidates.prefix(limit))
+            let entries = try reconciling(page.map(\.entry), persist: false)
+            let rows = zip(page, entries).map { book, entry in
+                return ShelfIndexRow(id: entry.id, botId: entry.botId, briefVersion: entry.briefVersion,
+                                     runAt: entry.runAt, coverageStart: entry.coverageStart, coverageEnd: entry.coverageEnd,
+                                     headline: BotHeadline.clipped(entry.headline), headlineTruncated: entry.headline.count > 240,
+                                     runHealth: entry.runHealth)
+            }
+            let hasMore = candidates.count > limit
+            let next = try page.last.map { try disk.encode(PageCursor(version: 1, query: query, after: $0.sequence)).base64EncodedString() }
+            // Ascending cursors admit later appends; descending history requires a fresh cursor for new arrivals.
+            let continuation = newestFirst && !hasMore ? nil : (next ?? cursor)
+            return ShelfReadPage(rows: rows, nextCursor: continuation,
+                                 truncated: hasMore || rows.contains(where: \.headlineTruncated),
+                                 nextOffset: hasMore && start <= Int.max - page.count ? start + page.count : nil)
+        }
+    }
+
+    /// One checked bulk read shares shelf validation and append ordering without acknowledging results.
+    public func entriesByBot() throws -> [UUID: [ShelfEntry]] {
+        let stored = try disk.locked { try books().map(\.entry) }
+        var grouped: [UUID: [ShelfEntry]] = [:]
+        for entry in try reconciling(stored) { grouped[entry.botId, default: []].append(entry) }
+        for entries in grouped.values {
+            if let latest = entries.filter({ $0.runtimeStatus == .completed }).max(by: { $0.runAt < $1.runAt }) {
+                recordExperience(latest)
+            }
+        }
+        return grouped
+    }
+
+    private func recordExperience(_ entry: ShelfEntry) {
+        guard entry.runtimeStatus == .completed else { return }
+        let result = Experience(id: entry.id.uuidString, kind: .run,
+            evidence: [.init(source: "bots/shelf-entries", id: entry.id.uuidString)],
+            outcome: .init(domain: "bot", status: entry.runtimeStatus.rawValue),
+            face: .init(words: TurnSecretRedactor.redactText(entry.actualReply),
+                artifacts: (entry.artifacts ?? []).map { .init(source: $0.path, id: $0.name) }),
+            addressedTo: ["bot:" + entry.botId.uuidString])
+        ExperienceStore.record(dataRoot, result.id) { try await $0.begin(result) }
+    }
+
+    /// Commit verdict with identity so exact reader acknowledgement proves notification acceptance.
+    public func pendingConditionNotifications() throws -> [ShelfEntry] {
+        let stored = try disk.locked {
+            let seen = try readerState(Self.conditionNotificationReaderID).readEntryIds
+            return try books().map(\.entry).filter {
+                $0.conditionNotificationTitle != nil && $0.conditionMet != false && !seen.contains($0.id)
+            }
+        }
+        return try reconciling(stored)
+    }
+
+    /// Acknowledge exactly the IDs actually consumed, never a high-water mark or an entire page token.
+    /// Repeated acknowledgement is idempotent; unknown IDs reject the whole transaction.
+    public func acknowledge(readerId: String, entryIds: [UUID]) throws {
+        try validateReader(readerId)
+        try disk.locked {
+            let known = Set(try books().map { $0.entry.id })
+            if let unknown = entryIds.first(where: { !known.contains($0) }) { throw StandingBotsError.notFound(unknown) }
+            var readers = try disk.read([String: ShelfReaderCursor].self, at: cursorsPath) ?? [:]
+            try validateReaders(readers)
+            var state = readers[readerId] ?? ShelfReaderCursor(readerId: readerId, readEntryIds: [])
+            state.readEntryIds.formUnion(entryIds)
+            readers[readerId] = state
+            try disk.write(readers, at: cursorsPath)
+        }
+    }
+
+    private var cursorsPath: URL { disk.root.appendingPathComponent("cursors.json") }
+
+    private func readerState(_ readerId: String) throws -> ShelfReaderCursor {
+        let readers = try disk.read([String: ShelfReaderCursor].self, at: cursorsPath) ?? [:]
+        try validateReaders(readers)
+        return readers[readerId] ?? ShelfReaderCursor(readerId: readerId, readEntryIds: [])
+    }
+
+    private func validateReaders(_ readers: [String: ShelfReaderCursor]) throws {
+        for (key, value) in readers {
+            try validateReader(key)
+            guard key == value.readerId else { throw StandingBotsError.corruptStore("reader ID mismatch") }
+        }
+    }
+
+    private func validateReader(_ readerId: String) throws {
+        guard !readerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, readerId.utf8.count <= 256 else {
+            throw StandingBotsError.invalidValue("readerId")
+        }
+    }
+
+    private func matches(_ entry: ShelfEntry, topic: String?) -> Bool {
+        guard let topic, !topic.isEmpty else { return true }
+        return ([entry.headline, entry.findings, entry.changedSinceLastGood] + entry.uncertainties)
+            .contains { $0.range(of: topic, options: [.caseInsensitive]) != nil }
+    }
+
+    private struct Index: Codable {
+        var sequence: UInt64 = 0
+        var lastEntry: UUID? = nil
+        var latestByBot: [UUID: UUID] = [:]
+    }
+    private var indexPath: URL { disk.root.appendingPathComponent("shelf-index.json") }
+    private var pendingPath: URL { disk.root.appendingPathComponent("shelf-pending.json") }
+    private var indexedDirectory: URL { disk.root.appendingPathComponent("shelf-entries") }
+    private func indexedPath(_ id: UUID) -> URL { indexedDirectory.appendingPathComponent(id.uuidString + ".json") }
+
+    private func readIndex(allowingFirstAppend pending: Book? = nil) throws -> Index {
+        if let saved = try disk.read(Index.self, at: indexPath) { return saved }
+        let entries = try disk.files(at: indexedDirectory, extension: "json")
+        if !entries.isEmpty {
+            // Only the exact pending append can complete an interrupted commit; an absent index cannot rebuild history.
+            guard let pending, pending.sequence == 1, entries.count == 1,
+                  entries[0].standardizedFileURL.path == indexedPath(pending.entry.id).standardizedFileURL.path,
+                  let saved = try disk.read(Book.self, at: entries[0]),
+                  saved.sequence == pending.sequence, saved.entry == pending.entry else {
+                throw StandingBotsError.corruptStore("Shelf index is missing while saved entries remain. Repair shelf-index.json without dropping the entries.")
+            }
+            try validate(pending.entry)
+        }
+        return Index()
+    }
+
+    // A pending append is settled under the store lock before publication.
+    private func loadIndex() throws -> Index {
+        let pending = try disk.read(Book.self, at: pendingPath)
+        var index = try readIndex(allowingFirstAppend: pending)
+        if let pending {
+            guard pending.sequence <= index.sequence || (index.sequence < UInt64.max && pending.sequence == index.sequence + 1) else {
+                throw StandingBotsError.corruptStore("pending shelf sequence")
+            }
+            try apply(pending, index: &index)
+        }
+        if let id = index.lastEntry {
+            guard let last = try disk.read(Book.self, at: indexedPath(id)),
+                  last.entry.id == id, last.sequence == index.sequence else {
+                throw StandingBotsError.corruptStore("latest shelf entry")
+            }
+            try validate(last.entry)
+        }
+        return index
+    }
+
+    private func apply(_ book: Book, index: inout Index) throws {
+        try validate(book.entry)
+        try disk.write(book, at: indexedPath(book.entry.id))
+        if book.sequence >= index.sequence { index.sequence = book.sequence; index.lastEntry = book.entry.id }
+        let previous = try index.latestByBot[book.entry.botId].flatMap { try disk.read(Book.self, at: indexedPath($0)) }
+        if previous == nil || previous!.sequence <= book.sequence { index.latestByBot[book.entry.botId] = book.entry.id }
+        try disk.write(index, at: indexPath)
+        try disk.validatePath(pendingPath)
+        try FileManager.default.removeItem(at: pendingPath)
+        NotificationCenter.default.post(Self.DidChange(root: dataRoot), subject: dataRoot as NSURL)
+    }
+
+    private func books() throws -> [Book] {
+        let index = try loadIndex()
+        var sequences = Set<UInt64>()
+        return try disk.files(at: indexedDirectory, extension: "json").map { path in
+            guard let book = try disk.read(Book.self, at: path),
+                  indexedPath(book.entry.id).standardizedFileURL.path == path.standardizedFileURL.path,
+                  book.sequence > 0, book.sequence <= index.sequence, sequences.insert(book.sequence).inserted else {
+                throw StandingBotsError.corruptStore("indexed book identity/sequence mismatch")
+            }
+            try validate(book.entry)
+            return book
+        }.sorted { $0.sequence < $1.sequence }
+    }
+
+    private func validate(_ entry: ShelfEntry) throws {
+        let dates = [entry.runAt, entry.coverageStart, entry.coverageEnd] + entry.sourceLinks.map(\.datedAt)
+        guard dates.allSatisfy({ $0.timeIntervalSince1970.isFinite }), entry.coverageStart <= entry.coverageEnd,
+              entry.briefVersion > 0,
+              entry.spend.tokens.map({ $0 >= 0 }) ?? true,
+              entry.spend.seconds.isFinite, entry.spend.seconds >= 0,
+              entry.conditionMet != true || entry.conditionNotificationTitle?.isEmpty == false else {
+            throw StandingBotsError.invalidValue("shelf entry storage")
+        }
+    }
+}
+
+private struct Book: Codable {
+    let sequence: UInt64
+    let entry: ShelfEntry
+}
+
+private struct Query: Codable, Equatable {
+    let bot: UUID?
+    let since: Date?
+    let topic: String?
+    let readerId: String?
+    var newestFirst: Bool
+}
+
+private struct PageCursor: Codable {
+    let version: Int
+    let query: Query
+    let after: UInt64
+}

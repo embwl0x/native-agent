@@ -1,0 +1,140 @@
+import Foundation
+import NativeAgentCore
+import Darwin
+import PersistenceCore
+import DeskCore
+// Blueprint: | `StandingBotsDisk.swift` | `StandingBotsDisk` struct; `validatePath`, `locked` |
+
+/// Share one synchronous cross-process boundary so definition and shelf transactions cannot interleave.
+struct StandingBotsDisk: Sendable {
+    let root: URL
+    private let dataRoot: URL
+    init(dataRoot: URL) {
+        self.dataRoot = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
+        root = self.dataRoot.appendingPathComponent("bots", isDirectory: true)
+    }
+
+    /// Resolve the root once, rejecting storage symlinks, including dangling links, on every disk path.
+    func validatePath(_ path: URL) throws {
+        guard let relative = NativeAgentWorkspaceRoot.relativePath(path.standardizedFileURL.path, under: dataRoot.path), !relative.isEmpty else {
+            throw StandingBotsError.corruptStore("bot storage outside data root")
+        }
+        var current = dataRoot
+        for component in relative.split(separator: "/") {
+            current.appendPathComponent(String(component))
+            var info = stat()
+            if unsafe lstat(current.path, &info) == 0 {
+                guard info.st_mode & S_IFMT != S_IFLNK else {
+                    throw StandingBotsError.corruptStore("symlink in bot storage")
+                }
+            } else if errno != ENOENT {
+                throw StandingBotsError.corruptStore("bot storage path unavailable")
+            }
+        }
+    }
+
+    func locked<T>(_ body: () throws -> T) throws -> T {
+        try validatePath(root.appendingPathComponent("store.lock"))
+        return try CredentialFileLock.withLock(root.appendingPathComponent("store"), body)
+    }
+
+    func read<T: Decodable>(_ type: T.Type, at path: URL) throws -> T? {
+        guard let data = try bytes(at: path) else { return nil }
+        return try JSONDecoder().decode(type, from: data)
+    }
+
+    func bytes(at path: URL) throws -> Data? {
+        try validatePath(path)
+        do { return try Data(contentsOf: path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+    }
+
+    func write<T: Encodable>(_ value: T, at path: URL) throws {
+        try validatePath(path)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encode(value), to: path)
+    }
+
+    func encode<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(value)
+    }
+
+    func files(at directory: URL, extension suffix: String) throws -> [URL] {
+        try validatePath(directory)
+        do {
+            return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                .filter { $0.pathExtension == suffix }.sorted { $0.path < $1.path }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+    }
+
+    func definitionPath(_ id: UUID) -> URL {
+        root.appendingPathComponent("definitions").appendingPathComponent(id.uuidString + ".json")
+    }
+
+    func definition(_ id: UUID) throws -> BotDefinitionDocument {
+        guard let document = try read(BotDefinitionDocument.self, at: definitionPath(id)) else {
+            throw StandingBotsError.notFound(id)
+        }
+        guard document.definition.id == id, document.audit.last?.definition == document.definition else {
+            throw StandingBotsError.corruptStore("definition/audit mismatch")
+        }
+        try validate(document.definition)
+        return document
+    }
+
+    func validate(_ bot: BotDefinition, validateCron: Bool = false) throws {
+        guard !bot.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !bot.brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              bot.briefVersion > 0, bot.budget.tokens > 0, (bot.dailyTokenCeiling ?? 1) > 0,
+              bot.createdAt.timeIntervalSince1970.isFinite, bot.updatedAt.timeIntervalSince1970.isFinite else {
+            throw StandingBotsError.invalidValue("definition")
+        }
+        if let trigger = bot.eventTrigger {
+            guard !trigger.filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw StandingBotsError.invalidValue("An event trigger needs a channel ID.")
+            }
+            if !BotEventTrigger.isChannelID(trigger.filter) {
+                throw StandingBotsError.invalidValue("A Slack trigger needs the channel ID, such as C0123ABCD.")
+            }
+        }
+        switch bot.cadence {
+        case .manual: return
+        case .interval(let seconds):
+            let floor = validateCron ? try BotRunLimits.checkedMinimumInterval() : 60
+            guard seconds.isFinite, seconds >= floor else {
+                throw ToolFailureError("The agent's bot cadence must be at least \(floor / 60) minutes.",
+                    argumentPath: "$.cadence.interval.seconds", accepted: "A finite number of seconds at least \(floor).", effects: .none)
+            }
+        case .cron(let expression):
+            guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw StandingBotsError.invalidValue("cron") }
+            if validateCron { _ = try Self.nextOccurrence(bot, after: bot.updatedAt) }
+        }
+    }
+
+    /// Spend the claimed civil minute so a repeated DST hour cannot run the same daily occurrence twice.
+    static func nextOccurrence(_ bot: BotDefinition, after date: Date,
+                               lastRunAt: Date? = nil, beyond due: Date? = nil,
+                               minimumInterval: TimeInterval? = nil) throws -> Date {
+        let minimumInterval = try minimumInterval ?? BotRunLimits.checkedMinimumInterval()
+        switch bot.cadence {
+        case .manual: return .distantFuture
+        case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))
+        case .cron(let expression):
+            do {
+                // Apply the spacing floor to actual runs; configuration time cannot prove execution. Past the minute `due` claimed too: in a fall-back hour
+                // a run finishing at the second 01:01 must not be handed the second 01:59.
+                let after = max(date.timeIntervalSince1970,
+                    lastRunAt.map { $0.addingTimeInterval(minimumInterval).timeIntervalSince1970.nextDown }
+                        ?? date.timeIntervalSince1970, due?.timeIntervalSince1970 ?? date.timeIntervalSince1970)
+                return try SchedulerJobNormalizer.checkedNextOccurrence(["type": .string("cron"), "expression": .string(expression)],
+                                                                        after: Date(timeIntervalSince1970: after))
+            } catch { throw StandingBotsError.invalidValue("cron: \(error)") }
+        }
+    }
+}
+
+struct BotDefinitionDocument: Codable {
+    var definition: BotDefinition
+    var audit: [BotAuditRow]
+}

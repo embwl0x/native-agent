@@ -1,6 +1,6 @@
 # The agent is the app
 
-The design NativeAgent is building toward (User and the lead, 2026-10-14; draft 4). NORTHSTAR clause 8 is its one-paragraph form. Current implementation notes follow the design; the superseded phase-one plan is in [history](history/AGENT_IS_THE_APP_PHASE_ONE_2026-10-14.md).
+The design NativeAgent is building toward (User and the lead, 2026-10-14; draft 4). NORTHSTAR clause 8 is its one-paragraph form. Current implementation notes follow the design; the superseded phase-one plan is archived in private maintainer history.
 
 Each agent is called by their own configured name ([Project Direction](PROJECT_DIRECTION.md#product-principles)); “they” here means that agent.
 
@@ -24,7 +24,7 @@ A part has six properties, all in its header, all theirs to change:
 |---|---|---|
 | **code** | what it does, as they wrote it | the ability body |
 | **reach** | what it may touch: files, apps, network, programs, the model | `permissions`, `SenseReach` |
-| **wake** | what makes it run: a call, a signal, a schedule, a turn ending, a message, an app arriving | declared signals delivered by `EnginePartWake`: `turn.ended`, `file.changed:<path>`, and those posted through `AbilityStore.signalled` |
+| **wake** | what makes it run: a call, a signal, a schedule, a turn ending, a message, an app arriving | declared signals delivered by `EnginePartWake`: `turn.ended`, `file.changed:<path>`, and those posted through `AbilityStore.Signalled` |
 | **face** | how it appears: the line they reads on their interface, the block the person sees on theirs | door pages and SwiftUI; feature inventory names and descriptions share their records |
 | **state** | what it remembers between runs | `senses/<id>/state.json`, key `part` for abilities; `abilities/state.json` is accounting |
 | **learned** | recorded outcomes | `learned.use` counters; arbitrary declared `learned`/`choices` preserved |
@@ -36,8 +36,7 @@ A sense is a part whose reach is read-only and whose face is a page. An ability 
 The save door exposes the argument schema owned beside `Parts.save`'s validators,
 including the exact param type map and JSON Schema forms, aliases and optional
 inputs, automatic first-line/sentence shortening of descriptions to 500 characters
-with a receipt, and `function run(input)` or `async function run(input)` returning
-JSON. App and host calls answer synchronously and may be awaited; a returned
+with a receipt, and a JSON-returning entry or handled verb as defined in the manifest contract. App and host calls answer synchronously and may be awaited; a returned
 thenable supplies its settled result or thrown rejection after the helper's JSC
 microtask drain, and one still pending fails plainly. Only `id` is always
 required; a new ability also needs description and code, while a revision
@@ -111,9 +110,9 @@ The stem enforces one law for every part, with the turn-program recovery excepti
   Ordinary abilities and senses are revised forward; their retained previous bytes are history, with no public version-swap action.
   Their own turn program is the one exception: a non-Stop helper failure admits one fresh lease per source per turn;
   a repeated helper failure or program failure selects an unfailed `turn.prev.js` or shipped seed, replays the same turn
-  and brings their the original cause, selected program and owed repair (`ChatTurnRuntime/TurnPart.swift`).
+  and brings their the original cause, selected program and owed repair (`BodyRuntime/ChatTurnRuntime/TurnPart.swift`).
   The [turn recovery contract](skill_manifest_spec.md#turn-recovery) owns selection, once-per-source bounds and storage failure behavior.
-- **Fading unused parts is future design.** There is no idle-expiration archive. Current launch behavior only disables a bundled seed they follows that the app no longer ships, leaving it restorable; a seed they edited or explicitly re-enabled stays (`EngineRuntime/EngineLaunch.swift`, `fadeRetiredSeeds`).
+- **Fading unused parts is future design.** There is no idle-expiration archive. Current launch behavior only disables a bundled seed they follows that the app no longer ships, leaving it restorable; a seed they edited or explicitly re-enabled stays (`BodyRuntime/EngineRuntime/EngineLaunch.swift`, `fadeRetiredSeeds`).
 - **Its face is drawn** by the stem on their interface and on the person's, Mac and iPhone, from the same description. What they reads is what they see.
 
 ## The stem: what it is, and nothing else
@@ -123,13 +122,13 @@ Swift, compiled, CPU, shipped as one DMG with iOS. It never thinks and has no mo
 - **Runs parts** in the sandbox (the helper, Seatbelt, the progress watchdog: all as today).
 - **Delivers signals**: the nervous system. Messages, schedules, app arrivals, file changes, turns ending. The same `EnginePartWake` observer also
   releases MY QUEUE intentions waiting `on <signal>`: exact names or colon-delimited families, and a file path or its descendants. Real sources include
-  `file.changed:<path>` (watched paths), `message.arrived:telegram|slack`, `person.here` / `person.away`, `chrome.tab_taken`,
+  `file.changed:<path>` (watched paths), `message.arrived:telegram|slack`, `person.here` / `person.away`, `chrome.tab_taken`, `body.changed`,
   `network.down` / `network.up` (the shared path's edges), `app.installed`, `sense.source.changed` and `turn.ended`.
   A system `Released: <signal> <summary>` note brings the
   intention back through the same readiness and pursuit refresh as news; `held` / `resumed` stay part lifecycle, and a part's `schedule:` is its time on
   the one clock (`part:<id>:<cron>`, delivered as the part's schedule signal). File intentions join the parts' existing canonical-path watch index,
   including bounded directory membership, and leave on closure; no second watcher. [Intentions](INTENTIONS.md#moments) owns that contract.
-- **Keeps the one clock** (`TriggerScheduler/OneClock.swift`): every declared time is delivered to whoever declared it, its next occurrence saved
+- **Keeps the one clock** (`DeskCore/TriggerScheduler/OneClock.swift`): every declared time is delivered to whoever declared it, its next occurrence saved
   before delivery, and one missed while the app was quit delivered once when its owner registers. The clock never decides that the agent thinks.
   Redeclaring a recurring time at or before its last delivery advances its rhythm
   beyond that delivery; it does not end the recurrence. An invalid rhythm refuses the declaration.
@@ -140,8 +139,10 @@ Swift, compiled, CPU, shipped as one DMG with iOS. It never thinks and has no mo
 - **Keeps the law**: repair at its cause, the turn-program recovery exception, the state, the learning. Fading unused parts remains future design.
 - **Owns turn recovery and settlement:** observations, checkpoints and resume after relaunch; unrecoverable failures can end incomplete.
 - **Keeps the agent's world live**: what changes on this Mac and in the agent's senses reaches the agent as it happens, as happenings, instead of
-  being read on demand (phase 5, [as built](#phases-3-and-5-as-built-11-05-attention)). An event-fed picture of windows and threads the agent is
-  already *in* when it thinks remains design: proprioception, not perception.
+  being read on demand (phase 5, [as built](#phases-3-and-5-as-built-11-05-attention)). Proprioception phase 1 gives their turn a warm picture of its
+  front window, browser, open document, working places and console. A change takes one line on delivery saying where they are, in their words (for example "I'm in Xcode, “BodyField.swift”"; outside titles quoted and short), so they are already in it when they thinks. The [body joints](SENSES.md#body-joints) stay within reach.
+  Home and the Mac room read that body for the apps they opened. Each rendering shows the windows where they worked in the last four hours. Local activity
+  capture hears the same foreground, focus and lock changes under its own consent and matches focus to the process that owns the span.
 - **Draws faces** from the glass kit, on both interfaces, both platforms. What tells is theirs: their pages are their parts' faces over the packets
   their owners read. What is their authority over their is a lever, and levers are the stem's: Trust and consent, macOS grants, models and providers,
   keys, their parts' off-switch, approvals, a trial's Set aside, forgetting and reset belong to the page (drawn first) or to a key (drawn on every
@@ -174,10 +175,16 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
   front, once per place a turn (`FaceFollows`). The person outranks it: a place, tab or page the person picks, or typing in the composer
   or an ask bar, keeps the window where the person has it for the rest of that turn, and a move already on its way lands nowhere; a turn
   that began in Chat, with the window never taken, ends back in Chat. "The window follows me" in Settings (on by default) is the switch,
-  for the person or the agent.
+  for the person or the agent. The first follow that actually leaves a page opens one trial. The origin page coming back into view during the
+  same turn by the person's own move (the rail, a menu, a shortcut, the palette) records `tookBack`. A turn change records `kept` if the trial is still open. Typing discards an open trial. The body keeps
+  the last eight outcomes per origin in `mind/follow.json`. When taking a page back stands under `Expectation` (equal costs, each
+  page on its own record), the settings feed lists it in `window.leaves`. A follow from that page leaves the window there for the rest
+  of the turn, including at its end, except a sampled turn now and then (`Expectation.withholding`) that still follows, so a page
+  the person stops taking back comes back.
 - **Effort is felt:** the stem measures what each turn took (model rounds, tokens, minutes, the longest stretch of one call repeated). Their after-turn mind reads it as one line beside the exchange, so a slog or a breeze moves a care about their craft the way a lost game does; their parts' records keep the rounds per use; the practice note names a looped call's stretch.
 - **Craft:** they sees their body: each turn starts with their own parts in front of them, each with how often they have used it, best match for the message first, so they reaches for the part instead of redoing its work.
-- **Noticing:** what nobody asked about is worth what it touches of the agent's cares; the seed gives a line below the chance bar zero worth.
+- **Noticing:** the seed weighs an ordinary world line against their cares and what they says would change their mind.
+  A condition that stands out past chance carries worth even when its care is calm or a seed.
   A thought comes when enough worth has gathered on one thing. A part that wakes on app-arrived still offers once.
 - **No turns:** the turn part wakes on a message like any other signal; everything else reaches the agent as a happening. Thinking is opened by
   the agent's own attention, which the substrate models: worth the turn program's `weigh` gives what nobody asked about lands as drive on what it means
@@ -202,7 +209,7 @@ An installed agent's persona, memory and GROWTH are private, never shipped with 
 
 ## How we get there
 
-Validation follows [AGENTS.md](../AGENTS.md#how-we-work): lanes do not compile; the lead builds and installs the coherent phase once, then checks the replaced behavior in the installed app with a small, bounded check. Documentation-only changes need direct text readback. The superseded backup, fixture, drive and forced-exit instructions are in [phase-one history](history/AGENT_IS_THE_APP_PHASE_ONE_2026-10-14.md).
+Validation follows [AGENTS.md](../AGENTS.md#how-we-work): lanes do not compile; the lead builds and installs the coherent phase once, then checks the replaced behavior in the installed app with a small, bounded check. Documentation-only changes need direct text readback. The superseded backup, fixture, drive and forced-exit instructions are archived in private maintainer history.
 
 **A seed preserves the behavior of the Swift it replaces on day one.** Check the installed result under the working agreement above.
 
@@ -213,11 +220,11 @@ Validation follows [AGENTS.md](../AGENTS.md#how-we-work): lanes do not compile; 
    until it is worth a thought ([as built](#phases-3-and-5-as-built-11-05-attention)).
  4. **Learning by use (built 10-26/10-27; prediction retired 11-15).** Their practice leaves a record the stem keeps: the registry projects observed gated-run counters as `learned.use`. Expansion, which pre-ran a mind's follow-up reads inside the result, is removed ([historical](#phase-4-historical-10-26-a-part-is-a-prediction)). Repeated hand work reaches their as a practice note inside the turn ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); the separate nightly compiler is removed.
 5. **The agent's world, live (built 11-05 as attention).** Every source posts a happening; senses are the parts that keep the world fresh; the
-   agent's thoughts are one mind stream ([as built](#phases-3-and-5-as-built-11-05-attention)). The event-fed picture of windows and threads remains.
+   agent's thoughts are one mind stream ([as built](#phases-3-and-5-as-built-11-05-attention)). Proprioception phase 1 brings the event-fed picture of windows and threads into their turn.
 6. **Faces.** Their interface as parts they shapes: Desk, Memories, Personality and Diagnostics are their `native-` parts' faces, and any part with `face.page` is a page of their own, placed by their layout; their levers are drawn by the stem beside every face. Blocks they authors on their, drawn from the kit on Mac and iPhone.
 7. **Mind, and sleep that rewrites the body.** Housekeeping, dreams, reflection, organism policy as parts, each under a judge whose evidence we define first.
 
-The dated phase-one lane assignments and proofs are retained in [history](history/AGENT_IS_THE_APP_PHASE_ONE_2026-10-14.md), not as instructions for a new phase.
+The dated phase-one lane assignments and proofs are archived in private maintainer history, not as instructions for a new phase.
 
 ## Decided (10-14 night, 10-17)
 
@@ -255,7 +262,7 @@ mind stream; no part inserts its arrival into their context directly.
 
 Socket paths require `network` and exact `reach.readPaths`; the [manifest](skill_manifest_spec.md#secret-insertion-and-redaction) owns the data-root fence.
 
-*As built (10-21, open reach):* `PersistenceCore/Keyring.swift` stores secrets; ProviderRouting owns sign-in and renewal. The broker inserts `{{secret:<name>}}` only toward granted hosts/programs under `secret:<name>` reach. The [manifest](skill_manifest_spec.md#secret-insertion-and-redaction) owns insertion forms, redaction limits and read/effect classification. `host.program.*` uses `shell` reach, the ordinary shell launch/access/sandbox path and streaming stdio; each use is rechecked. Resident resources share one held broker until closed, off, replacement, drop or quit, surviving failed runs. Arrivals raise `held`; launch raises `resumed`; program/connection reads share a shape, and `network.connect {path}` reaches a local socket.
+*As built (10-21, open reach):* `PersistenceCore/PersistenceCore/Keyring.swift` stores secrets; ProviderRouting owns sign-in and renewal. The broker inserts `{{secret:<name>}}` only toward granted hosts/programs under `secret:<name>` reach. The [manifest](skill_manifest_spec.md#secret-insertion-and-redaction) owns insertion forms, redaction limits and read/effect classification. `host.program.*` uses `shell` reach, the ordinary shell launch/access/sandbox path and streaming stdio; each use is rechecked. Resident resources share one held broker until closed, off, replacement, drop or quit, surviving failed runs. Arrivals raise `held`; launch raises `resumed`; program/connection reads share a shape, and `network.connect {path}` reaches a local socket.
 
 The grant is `card.request {kind:"api_key", target:"secret:<name>", hosts, programs, sign_in?}`; programs bind to their executable files. The card shows the whole grant, including where already kept; the keyring stores exactly that. `replace:true` asks again, `only:true` narrows with the removed reach shown, and `remove:true` asks the person to delete it.
 
@@ -296,9 +303,9 @@ proposal in preview, returning source time and decisions without a Desk
 or nag-config commit or notification delivery. `app`'s outer `preview:true`
 remains its ordinary preflight; it does not execute this domain read.
 
-Native owners and authenticated transports use `ToolsFacade.withPartDoor`:
+Native owners and authenticated transports use `NativeAgentEngine.withPartDoor`:
 the engine's ordinary gated dispatcher, with the originating work identity and
-resident approval session, binds `AppChatToolDispatcher.withAuthoredProgramHost`.
+resident approval session, binds `AppActionEnvironment.withAuthoredProgramHost`.
 Every caller supplies one TurnEnvelope (Telegram keeps its authenticated envelope) and its existing approval filer when
 needed; Desk clicks retain their checked routing snapshot and local-click filer.
 That is the same host binding reached by a turn or `EnginePartWake` dispatching
@@ -411,7 +418,7 @@ Expansion learns turn-start reads and follow-up calls from each mind's own
 authority-separated practice across model changes. Field-free situations
 keep the verb, argument names and status; the first call also keeps its wake.
 The [manifest](skill_manifest_spec.md#expansion-a-part-is-a-prediction) owns its record and delivery contract;
-`Expectation` in `NativeAgentCore/Expectation.swift` owns confidence, withholding
+`Expectation` in `NativeAgentCore/NativeAgentCore/Expectation.swift` owns confidence, withholding
 and cost standing for Expansion; Expansion's practice
 owner measures its costs. [Surprise](SURPRISE.md) records the shared law and
 each caller's existing confidence policy.
@@ -452,8 +459,8 @@ mind. [Agent communication](agent-communication.md#jobs) owns the socket's contr
 **The law.** The agent thinks when something in its mind is worth a thought. A source posts the happening. Attention decides when to think.
 
 - **One form, one intake.** Every change attention takes in is a `Happening` (`NativeAgentShared/Happening.swift`) posted through Attention's
-  intake (`Experiences/Attention.swift`), written once in the record as an experience of kind `happening` under its key `once`, then taken by the cognition
-  runtime (`Cognition/NativeCognitionRuntime+Attention.swift`). Messages stay door admissions; any arrival outside the mind stream wakes sleep.
+  intake (`SenseCore/Experiences/Attention.swift`), written once in the record as an experience of kind `happening` under its key `once`, then taken by the cognition
+  runtime (`BodyRuntime/Cognition/NativeCognitionRuntime+Attention.swift`). Messages stay door admissions; any arrival outside the mind stream wakes sleep.
 - **Phone and Mac edges.** Authenticated phone readings post on door `phone`: first observations and newer changed place membership, charging,
   focus, headphones, network kind and motion activity. Setup, battery percentages and unchanged re-reports post nothing. The existing motion-proved
   `person.away` happening owns that departure instead of a second phone post. Readings outside `PhoneSenseHistory`'s 15-minute freshness window
@@ -465,7 +472,8 @@ mind. [Agent communication](agent-communication.md#jobs) owns the socket's contr
   agent set) and `body` (an organ of the agent's asking) are record obligations to `conversation:<route or mind>`. A `returned` with a route continues
   the conversation that started the work (`MindStream.returnTo`); the rest open a thought in the agent's mind stream (`MindStream.think`).
 - **The rest is weighed by the agent.** A `world` happening (what nobody asked about) or a `self` happening (a care of the agent's moving) is given
-  to `weigh(h, felt)` in the agent's installed turn program, run on CPU. Its worth lands as `drive` on the touched care's anchor node, or on the
+  to `weigh(h, felt)` in the agent's installed turn program, run on CPU. A world line their `weigh` weighs as crossing a stance's stated condition
+  (`crossed: true`) lands on that care's anchor, unless it is a watch's news. Otherwise worth lands as `drive` on the touched care's anchor node, or on the
   happening's own subject (a watch's news, door `sense:<senseID>`, always on its own subject). Only the first weighed news per `watch`
   on that subject lands at least one; later news lands its weighed worth. News without `watch` keeps the floor. Drive fades on that node's half-life, is never
   clamped or spread, and at one ignites a thought that drains it. Ignition is
@@ -490,7 +498,7 @@ mind. [Agent communication](agent-communication.md#jobs) owns the socket's contr
   `world`; contact health, apps the agent opened, agent discovery and the turn program's swap-back are `body`; a judged story entry that lifts a care's pressure up
   through its bar (0.35) is `self`, once per rise, using the transition captured where the care changed rather than its later state.
   Part signals still reach parts through `AbilityStore.signal`.
-- **The one clock** (`TriggerScheduler/OneClock.swift`) delivers every declared time to whoever declared it: part schedules,
+- **The one clock** (`DeskCore/TriggerScheduler/OneClock.swift`) delivers every declared time to whoever declared it: part schedules,
   watches and scans, helpers and MY QUEUE's moments. Watches and scans post news to their attention; neither tells the person.
   A scan posts its new opportunities together, with their ids as its change identity,
   and keeps posted ids beside its clock time so each opportunity is posted once per scan.

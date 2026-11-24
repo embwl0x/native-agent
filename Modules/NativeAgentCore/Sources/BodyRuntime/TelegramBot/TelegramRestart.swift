@@ -1,0 +1,101 @@
+import Foundation
+import NativeAgentShared
+import ProviderRouting
+import NativeAgentCore
+import MindCore
+import DeskCore
+import PersistenceCore
+
+// Blueprint: | `TelegramRestart.swift` | Only the owner may restart; defer termination until the reply attempt |
+
+public struct TelegramRestartBridge: Sendable {
+    public typealias DeferredRestart = @Sendable (
+        _ reason: String
+    ) async -> (envelope: JSONValue, armTerminate: (@Sendable () -> Void)?)
+
+    let dataRoot: URL
+    private let deferredRestart: DeferredRestart
+
+    public init(dataRoot: URL, deferredRestart: @escaping DeferredRestart) {
+        self.dataRoot = dataRoot
+        self.deferredRestart = deferredRestart
+    }
+
+    public func ownerUserId() throws -> Int64? {
+        try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false)?.ownerUserId
+    }
+
+    public func requestRestart(reason: String) async -> TelegramSlashDispatchOutcome {
+        // Commit the restart here; the poll loop arms termination after its reply attempt.
+        let (envelope, armTerminate) = await deferredRestart(reason)
+        guard case .object(let obj) = envelope else {
+            return TelegramSlashDispatchOutcome(
+                reply: "Restart failed: unexpected coordinator response."
+            )
+        }
+        if obj["status"]?.stringValue == "restarting", let armTerminate {
+            return TelegramSlashDispatchOutcome(
+                reply: "Restarting NativeAgent — back in under a minute. \(obj["note"]?.stringValue ?? "")",
+                afterReplySent: armTerminate
+            )
+        }
+        if obj["status"]?.stringValue == "restarting" {
+            // Refuse a restart without the post-reply termination handoff.
+            return TelegramSlashDispatchOutcome(
+                reply: "Restart failed: restart handoff was incomplete; NativeAgent is still running."
+            )
+        }
+        if obj["reason"]?.stringValue == "cooldown" {
+            let retry: String = {
+                if case .double(let n)? = obj["retryAfterSeconds"],
+                   let seconds = Int(exactly: n.rounded(.towardZero)) { return String(seconds) }
+                return "?"
+            }()
+            return TelegramSlashDispatchOutcome(
+                reply: "Restart refused: a tool-initiated restart fired within the last 10 minutes. Retry in \(retry)s."
+            )
+        }
+        return TelegramSlashDispatchOutcome(
+            reply: "Restart failed: \(obj["reason"]?.stringValue ?? "unknown"). \(obj["detail"]?.stringValue ?? "")"
+        )
+    }
+}
+
+extension SwiftNativeTelegramBot {
+    func dispatchRestartCommand(
+        args: [String],
+        chatId: Int?,
+        fromUserId: Int?,
+        chatType: String?
+    ) async -> TelegramSlashDispatchOutcome {
+        guard let restart = completenessDeps?.restart else {
+            return TelegramSlashDispatchOutcome(
+                reply: "restart is not wired in this build. Restart NativeAgent from the Mac app."
+            )
+        }
+        guard chatType == "private" else {
+            return TelegramSlashDispatchOutcome(
+                reply: "/restart only works in a private chat with the owner; group chats cannot restart the app."
+            )
+        }
+        let owner: Int64?
+        do { owner = try restart.ownerUserId() }
+        catch { return TelegramSlashDispatchOutcome(reply: "Restart unavailable: \(error.localizedDescription)") }
+        guard let chatId, let owner, owner == Int64(chatId) else {
+            return TelegramSlashDispatchOutcome(
+                reply: "/restart is owner-gated; this chat is not authorized."
+            )
+        }
+        // Private-chat sender and chat IDs must match; missing identity fails closed.
+        guard let fromUserId, Int64(fromUserId) == Int64(chatId) else {
+            return TelegramSlashDispatchOutcome(
+                reply: "/restart is owner-gated; this chat is not authorized."
+            )
+        }
+        let reasonText = args.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return await restart.requestRestart(
+            reason: reasonText.isEmpty ? "telegram /restart" : reasonText
+        )
+    }
+
+}

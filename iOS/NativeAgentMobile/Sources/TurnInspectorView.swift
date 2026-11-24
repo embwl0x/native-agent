@@ -149,7 +149,6 @@ struct TurnInspectorView: View {
         .task(id: sync.turnSummaries) { await read() }
         .task { await sync.refreshTurnSummariesSnapshot() }
         .refreshable { await sync.refreshTurnSummariesSnapshot() }
-        .macSyncErrorBanner()
     }
 
     private var shownFace: PartFace {

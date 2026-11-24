@@ -88,7 +88,7 @@ There is no planning model call. An ability that itself declares model work
 can still do that work. The authored runner's `returned` value is inspected
 for `needs_me`, inside the door's result receipt.
 
-MY QUEUE's carried ledger (`Desk/MyQueueCarried.swift`,
+MY QUEUE's carried ledger (`DeskCore/Desk/MyQueueCarried.swift`,
 `desk/my-queue-carried.json`) keeps the latest attempted occurrences (at most 256). It reserves an unknown-outcome receipt before effects and
 keeps the actual receipt through `settle` afterward. A stopped or interrupted
 attempt reaches their with that unknown outcome instead of running again.
@@ -221,5 +221,5 @@ The `compiled` manifest field has no reader or producer.
 
 | Lane | What | Owners |
 |---|---|---|
-| habits-reflex | H1 + H2 | Desk/MyQueue.swift, Desk/DeskCadence.swift (DeskStep.action), AppToolRuntime/AppToolExecutor+MyQueue.swift (queue.add/update action), Cognition/NativeCognitionRuntime+Pursuit.swift (run on due), EngineRuntime/EnginePartWake.swift run path (reuse), AgentWorkspace/CarriedHabits.swift (the habit line), NativeAgentCore/Expectation.swift (use), docs |
-| habits-keep | H3 + H4 | Resources/abilities/turn.js, ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift (familiarity nerve inside the turn), removed nightly compiler/recorder, docs/SURPRISE.md S3/S4 |
+| habits-reflex | H1 + H2 | DeskCore/Desk/MyQueue.swift, DeskCore/Desk/DeskCadence.swift (DeskStep.action), BodyRuntime/AppToolRuntime/AppToolExecutor+MyQueue.swift (queue.add/update action), BodyRuntime/Cognition/NativeCognitionRuntime+Pursuit.swift (run on due), BodyRuntime/EngineRuntime/EnginePartWake.swift run path (reuse), BodyRuntime/AgentWorkspace/CarriedHabits.swift (the habit line), NativeAgentCore/NativeAgentCore/Expectation.swift (use), docs |
+| habits-keep | H3 + H4 | Resources/abilities/turn.js, BodyRuntime/ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift (familiarity nerve inside the turn), removed nightly compiler/recorder, docs/SURPRISE.md S3/S4 |

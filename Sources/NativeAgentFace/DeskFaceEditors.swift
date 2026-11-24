@@ -35,7 +35,7 @@ import SwiftUI
             .sheet(item: $sheets.pageSheet) { which in
                 DeskPageSheetHost(sheet: which) { sheets.pageSheet = nil }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .openCommandPaletteRequest)) { _ in
+            .onMessage(OpenCommandPaletteRequest.self) { _ in
                 guard !quietOffscreenRead else { return }
                 sheets.finding = true
             }

@@ -9,7 +9,6 @@ import NativeAgentShared
 /// it. A control phrase ("let me take over") goes exactly as typed, so the body hears it as the command it is.
 struct ShellAskBar: View {
     @Environment(AppModel.self) private var appModel
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     /// The shown page's identity: each page keeps its own draft and its own record.
     let page: String
     @State private var openIssue: String?
@@ -19,8 +18,9 @@ struct ShellAskBar: View {
     private var text: Binding<String> {
         let draft = appModel.editBinding(subject, seed: "")
         return Binding(get: { draft.wrappedValue }, set: {
+            let typed = $0 != draft.wrappedValue
             draft.wrappedValue = $0
-            FaceFollows.shared.personTyped()
+            if typed { FaceFollows.shared.personTyped() }
         })
     }
     private var placeholder: String {
@@ -48,12 +48,7 @@ struct ShellAskBar: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .background {
-            if reduceTransparency {
-                shape.fill(Color(nsColor: .controlBackgroundColor)).overlay { shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1) }
-            }
-        }
-        .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
+        .houseSurface(in: shape)
     }
 
     /// The words leave the draft at Return and are held in the page's one record until the conversation answers: accepted drops them,
@@ -147,7 +142,7 @@ private struct ShellAskedLine: View {
         let line = Self.line(appModel.turnFace(for: sent.session), sent: sent)
         HStack(spacing: 6) {
             if line.needsYou {
-                Circle().fill(NativeAgentShell.needsYou).frame(width: 7, height: 7)
+                Circle().fill(NativeAgentShell.needsYou).frame(width: 7, height: 7).accessibilityHidden(true)
             }
             Text(line.text)
                 .font(ShellType.caption)
@@ -159,7 +154,7 @@ private struct ShellAskedLine: View {
                 .font(ShellType.captionMedium)
                 .foregroundStyle(NativeAgentShell.secondary)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 
     /// An approval waiting on the person in that conversation; else a turn running there, in the Steps line's words, led by "I'll read

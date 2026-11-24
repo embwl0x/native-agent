@@ -1,0 +1,64 @@
+import Foundation
+import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
+import DeskCore
+import MindCore
+// Blueprint: | `EngineConnectors.swift` | `NativeAgentEngine.withPartDoor`; Checked connector reads and rooted gated execution |
+
+extension NativeAgentEngine {
+    public func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:],
+        origin: String, platform: any ConnectorActionPlatform) async throws -> ConnectorActionReceipt {
+        try await withPartDoor(envelope: .personOnMac(origin)) { door in
+            try await ConnectorActions(platform: platform).runConnectorAction(
+                id: id, dryRun: dryRun, input: input, dataRoot: self.dataRoot, turn: door.turn)
+        }
+    }
+}
+
+/// Workspace and action reads share the engine’s connector owner.
+@MainActor
+extension ConnectorReadiness {
+    @discardableResult
+    public func refreshWorkspaces() async throws -> [WorkspaceRecord] {
+        let result: Result<[WorkspaceRecord], Error> = await workspacesRead.read({
+            do { return .success(try await ConnectorRegistryActions.listWorkspaces(root: root)) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let rows): workspaceSnapshot = rows; workspacesReadError = nil
+            case .failure(let error): workspacesReadError = error.localizedDescription
+            }
+        })
+        await refreshFace()
+        return try result.get()
+    }
+
+    @discardableResult
+    public func refreshActions() async throws -> ConnectorActionRegistry {
+        let result: Result<ConnectorActionRegistry, Error> = await actionsRead.read({
+            do { return .success(try await ConnectorActionRegistry.read(dataRoot: root, platform: platform)) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let registry): actions = registry; actionsReadError = nil
+            case .failure(let error): actionsReadError = error.localizedDescription
+            }
+        })
+        await capabilitiesDidChange?()
+        return try result.get()
+    }
+
+    public func addWorkspace(name: String, path: String, writable: Bool) async throws -> (added: WorkspaceRecord, refreshed: [WorkspaceRecord],
+        verified: Bool) {
+        let result = try await ConnectorRegistryActions.addWorkspace(name: name, path: path,
+            permissions: writable ? ["read", "write"] : ["read"], root: root)
+        workspacesRead.write {
+            workspaceSnapshot = result.refreshed
+            workspacesReadError = nil
+        }
+        await refreshFace()
+        return result
+    }
+
+}

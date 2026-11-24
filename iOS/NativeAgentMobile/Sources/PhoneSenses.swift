@@ -1,3 +1,4 @@
+import Observation
 import CoreLocation
 import CoreMotion
 import Foundation
@@ -8,7 +9,8 @@ import UIKit
 
 // Blueprint: | `PhoneSenses.swift` | Opt-in sense outbox; callback-owned wake readings and pairing-bound durable delivery |
 @MainActor
-final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
+@Observable
+final class PhoneSenses: NSObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhoneSenses()
     private struct Pending: Codable, Sendable {
         let event: PhoneSenseEvent
@@ -21,19 +23,19 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
         var latest: [String: PhoneSenseEvent] = [:]
         var pending: [Pending] = []
     }
-    @Published private(set) var enabled: Set<PhoneSenseEvent.Source> = []
-    @Published var errorMessage: String?
-    private var state = State()
+    private(set) var enabled: Set<PhoneSenseEvent.Source> = []
+    var errorMessage: String?
+    @ObservationIgnored private var state = State()
     private var available = false
-    private var work: Task<Void, Never>?
+    @ObservationIgnored private var work: Task<Void, Never>?
     private let storage = MobileLocalStorage()
     private let file = URL.applicationSupportDirectory.appendingPathComponent("phone-senses.json")
     private let motion = CMMotionActivityManager()
     private let location = CLLocationManager()
-    private var motionQuery: UUID?
-    private var focusAuthorization: Task<Void, Never>?
-    private lazy var bodyReadings = PhoneBodyReadings(owner: self)
-    private(set) var restorationTask: Task<Void, Never>?
+    @ObservationIgnored private var motionQuery: UUID?
+    @ObservationIgnored private var focusAuthorization: Task<Void, Never>?
+    @ObservationIgnored private lazy var bodyReadings = PhoneBodyReadings(owner: self)
+    @ObservationIgnored private(set) var restorationTask: Task<Void, Never>?
 
     private override init() {
         super.init()
@@ -402,7 +404,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
 }
 
 struct PhoneSensesSettings: View {
-    @ObservedObject private var senses = PhoneSenses.shared
+    private let senses = PhoneSenses.shared
     private var session: FacePageSession { iCloudSyncEngine.shared.pageSessions.page("phone-senses") }
     var body: some View {
         FaceView(face: face, door: door, session: session).task { senses.wake() }

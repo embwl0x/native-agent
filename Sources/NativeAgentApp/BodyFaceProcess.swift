@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import MacControl
+import MacNerves
 // Blueprint: | `BodyFaceProcess.swift` | Body-owned child process, inherited pipes and explicit window reopening; process exit owns retirement; orphans end |
 
 actor BodyFaceProcess {
@@ -51,11 +51,6 @@ actor BodyFaceProcess {
     func call(_ call: FaceCall, connection: UUID? = nil) async throws -> FaceReply {
         guard let endpoint else { throw FaceWireError.disconnected }
         return try await endpoint.call(call, connection: connection)
-    }
-
-    func renderPage(page: String, tab: String?, width: Double, height: Double, reader: UUID) async throws -> FaceReply {
-        guard let endpoint else { throw FaceWireError.disconnected }
-        return try await endpoint.renderPage(page: page, tab: tab, width: width, height: height, reader: reader)
     }
 
     private func connection() async throws -> BodyFaceConnection {
@@ -152,7 +147,7 @@ actor BodyFaceProcess {
         for window in NSRunningApplication.runningApplications(withBundleIdentifier: id) {
             var info = proc_bsdinfo()
             let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
-            guard proc_pidinfo(window.processIdentifier, PROC_PIDTBSDINFO, 0, &info, expected) == expected, info.pbi_ppid == 1 else { continue }
+            guard unsafe proc_pidinfo(window.processIdentifier, PROC_PIDTBSDINFO, 0, &info, expected) == expected, info.pbi_ppid == 1 else { continue }
             window.forceTerminate()
         }
     }

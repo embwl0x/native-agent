@@ -64,7 +64,6 @@ manifest, error, status = Open3.capture3('swift', 'package', '--package-path', R
 abort error unless status.success?
 dependencies = JSON.parse(manifest).fetch('dependencies').map { |entry| entry['sourceControl']&.first }.compact
 packages = ''
-grpc = ''
 dependencies.each do |dependency|
   url = dependency.fetch('location').fetch('remote').first.fetch('urlString')
   name = File.basename(url, '.git')
@@ -72,7 +71,6 @@ dependencies.each do |dependency|
   if requirement.key?('exact')
     version = requirement.fetch('exact').first
     packages += "  #{name}:\n    url: #{url}\n    exactVersion: #{version}\n"
-    grpc += "        .package(url: #{url.to_json}, exact: #{version.to_json}),\n" if url.start_with?('https://github.com/grpc/')
   else
     range = requirement.fetch('range').first
     lower, upper = range.fetch_values('lowerBound', 'upperBound')
@@ -81,4 +79,3 @@ dependencies.each do |dependency|
   end
 end
 replace_generated('project.yml', 'package requirements', packages)
-replace_generated('Modules/NativeAgentCore/Package.swift', 'gRPC requirements', grpc)

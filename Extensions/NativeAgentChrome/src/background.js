@@ -1,5 +1,5 @@
 import { MAX_SNAPSHOT_RESULT_BYTES, utf8Encoder, frameAddressFragment, boundSnapshotForTransport, pageActionResult, normalizedPageError } from "./page-evidence.js";
-import { BrowserWorkspace, tabNotOwnedError } from "./browser-workspace.js";
+import { BrowserWorkspace, readActiveTab, tabNotOwnedError } from "./browser-workspace.js";
 import { PageLoads } from "./page-load.js";
 import { captureScreenPreview, readPicturePreviewGeometry } from "./screen-preview.js";
 import {
@@ -19,6 +19,8 @@ import {
 
 let nativePort = null;
 let nativeReady = false;
+let activeTabRead;
+let lastActiveTab;
 let reloadingExtension = null; // "requested" or "retry", owned by the drain below.
 let nativeRequestsInFlight = 0;
 let lastExtensionError = null;
@@ -202,9 +204,14 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
+  void publishActiveTab();
   void workspace.yieldForTab(tabId, "tab_activated").catch(recordOwnershipFailure);
 });
+chrome.windows.onFocusChanged.addListener(windowId => void publishActiveTab(windowId));
 chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+  if (tab.active && (change.title !== undefined || change.url !== undefined || change.audible !== undefined)) {
+    void publishActiveTab();
+  }
   workspace.tabUpdated(tabId, change, tab);
   if (change.groupId !== undefined) void workspace.refresh().catch(recordOwnershipFailure);
 });
@@ -220,6 +227,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (owned) sendEvent("tab.closed", { tabId });
 });
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  if (activeTabRead || lastActiveTab?.tabId === removedTabId) void publishActiveTab();
   readyPageFrames.delete(removedTabId);
   workspace.tabRemoved(removedTabId);
   void workspace.refresh().then(async () => {
@@ -353,6 +361,8 @@ function retireNativePort(port, reason) {
   for (const requestId of activeNativeRequests) cancelNativeRequest(requestId);
   nativePort = null;
   nativeReady = false;
+  activeTabRead = undefined;
+  lastActiveTab = undefined;
   console.warn("NativeAgent Chrome connection ended:", reason);
   port.disconnect();
   reconcileNativeReconnectAlarm();
@@ -425,6 +435,7 @@ async function handleNativeMessage(rawRequest, port) {
     if (postNativeMessage(port, response)) {
       if (request.action === "attach") {
         nativeReady = true;
+        void publishActiveTab();
         clearTimeout(reloadRetryTimer);
         reloadRetryTimer = null;
         if (reloadRecovery) {
@@ -1424,6 +1435,8 @@ async function performSnapshotMutation({ ownedTab, route, payload, actionId, act
   let response;
   await workspace.requireForPageAction(payload);
   requireActiveRequest(actionId);
+  const click = action === "click" || action === "double_click";
+  const { documentId: previousDocument, url: previousURL } = click ? pageLoads.documents.get(ownedTab.tabId) ?? {} : {};
   try {
     response = await chrome.tabs.sendMessage(ownedTab.tabId, { ...pageMessage, tabId: ownedTab.tabId, userSequence: ownedTab.userSequence, actionId }, { frameId: route.frameId });
   } catch {
@@ -1448,12 +1461,18 @@ async function performSnapshotMutation({ ownedTab, route, payload, actionId, act
       detail: { error },
     });
   }
+  const current = click ? pageLoads.documents.get(ownedTab.tabId) : null;
+  const navigated = previousDocument && previousURL && current?.documentId && current.url && !current.error
+    && current.transitionQualifiers && (current.documentId !== previousDocument || current.url !== previousURL);
   return pageActionResult({
     actionId, action, ownedTab, payload, startedAt,
     outcome: response.result.outcome,
-    verification: response.result.verification,
+    // A committed navigation without a redirect is the click's own effect landing: verified. A redirect stays named, not verified.
+    verification: navigated && !current.transitionQualifiers.some(q => q === "client_redirect" || q === "server_redirect")
+      ? "verified" : response.result.verification,
     detail: {
       ...response.result,
+      ...(navigated ? { documentId: current.documentId, url: current.url, transitionQualifiers: current.transitionQualifiers } : {}),
       snapshotId: payload.snapshotId ?? null,
       ...(payload.nodeId !== undefined ? { nodeId: payload.nodeId } : {}),
       ...(payload.targetNodeId !== undefined ? { targetNodeId: payload.targetNodeId } : {}),
@@ -1487,8 +1506,10 @@ function keepRendering(tabId) {
   let hold = renderHolds.get(tabId);
   if (!hold) {
     const target = { tabId };
+    // An attach whose focus emulation is refused lets its session go before the hold fails, so the tab is not left attached.
     hold = { timer: null, ready: chrome.debugger.attach(target, "1.3")
-      .then(() => chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true })) };
+      .then(() => chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true })
+        .catch(async error => { await chrome.debugger.detach(target).catch(() => {}); throw error; })) };
     renderHolds.set(tabId, hold);
     const held = hold;
     held.ready.catch(error => {
@@ -2278,4 +2299,22 @@ function recordOwnershipFailure(error) { recordNativeError(error.message ?? Stri
 
 function sendEvent(event, payload) {
   if (nativePort) postNativeMessage(nativePort, eventEnvelope(event, payload));
+}
+
+async function publishActiveTab(windowId) {
+  const port = nativePort;
+  if (!port || !nativeReady) return;
+  const read = readActiveTab(chrome, windowId);
+  activeTabRead = read;
+  const tab = await read;
+  if (activeTabRead !== read || nativePort !== port) return;
+  activeTabRead = undefined;
+  const message = eventEnvelope("active_tab.changed", tab);
+  if (tab && utf8Encoder.encode(JSON.stringify(message)).byteLength > MAX_NATIVE_MESSAGE_BYTES) {
+    tab.title = null;
+    tab.url = null;
+  }
+  if (JSON.stringify(tab) === JSON.stringify(lastActiveTab)) return;
+  lastActiveTab = tab;
+  postNativeMessage(port, message);
 }

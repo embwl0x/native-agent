@@ -1,0 +1,184 @@
+import Foundation
+import SenseCore
+import MindCore
+import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
+import MacNerves
+import DeskCore
+// Blueprint: | `NativeCognitionRuntime+Readouts.swift` | `NativeCognitionRuntime`, `GrowthWeekFace`. |
+
+extension NativeCognitionRuntime {
+    public func changes() -> AsyncStream<NativeCognitionRuntimeChange> {
+        let id = UUID()
+        let pair = AsyncStream<NativeCognitionRuntimeChange>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        changeContinuations[id] = pair.continuation
+        pair.continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeChangeContinuation(id) }
+        }
+        return pair.stream
+    }
+
+    private func removeChangeContinuation(_ id: UUID) {
+        changeContinuations.removeValue(forKey: id)
+    }
+
+    public func publishRuntimeChange(reason: String) {
+        changeRevision &+= 1
+        let change = NativeCognitionRuntimeChange(
+            revision: changeRevision,
+            occurredAt: now(),
+            reason: String(reason.prefix(96))
+        )
+        for continuation in changeContinuations.values {
+            continuation.yield(change)
+        }
+    }
+
+    public func substrateForIntegration() async -> CognitiveSubstrate {
+        await bootstrap()
+        return substrate
+    }
+
+    /// A read joins the opening the mind's owner started; it never opens the mind itself.
+    public func observatoryDetail() async -> CognitiveObservatoryDetail {
+        await bootstrapTask?.value
+        let inspectFixedAt = now()
+        let organism = await organismKernel.refreshBodySchemaAndFrozenRead(
+            await organismBodySample(at: inspectFixedAt), integratesChemistry: false,
+            canonicalAffect: await substrate.canonicalAffectProjection(at: inspectFixedAt), fixedAt: inspectFixedAt)
+        let read = await substrate.frozenRead(at: inspectFixedAt)
+        let configuration = read.configuration
+        // One nonconsuming inspection supplies mode and cold preview; live previews mirror the last delivered capsule.
+        let inspectRequest = await requestWithOrganismProjection(
+            CognitiveCapsuleRequest(
+                surface: "chat",
+                userMessage: lastInjectedCapsule?.userMessage ?? "observatory preview",
+                mode: .inspectOnly,
+                maximumCharacters: min(1_200, configuration.maximumCapsuleCharacters)
+            ),
+            projection: organism.projection,
+            toward: organism.toward,
+            at: inspectFixedAt
+        )
+        // Read all workspace-derived fields from the same substrate epoch.
+        let feltMode = await substrate.feltModeReading(for: inspectRequest, from: read)
+
+        let capsulePreview: CognitiveCapsule?
+        let capsulePreviewInfo: CapsulePreviewInfo?
+        if let last = lastInjectedCapsule {
+            capsulePreview = last.capsule
+            capsulePreviewInfo = CapsulePreviewInfo(
+                source: .liveInjected,
+                userMessage: last.userMessage,
+                at: last.capsule.generatedAt
+            )
+        } else {
+            let synthetic = await substrate.compileFrozenCapsulePresentation(inspectRequest, from: read, turn: nil).capsule
+            let nonEmpty = synthetic.combined.isEmpty ? nil : synthetic
+            capsulePreview = nonEmpty
+            capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil, at: nil)
+        }
+        let receiptRead = await substrate.receiptReadSnapshot()
+        let schemas = await substrate.schemaProposalSnapshot()
+        let timeline = await substrate.developmentalTimelineSnapshot(proposals: schemas, limit: 240)
+        return CognitiveObservatoryDetail(
+            configuration: configuration,
+            summary: await substrate.observatorySnapshot(from: read),
+            substrate: read.snapshot,
+            workspace: read.workspace,
+            associations: read.associations,
+            schemaProposals: schemas,
+            developmentalTimeline: Array(timeline.prefix(40)),
+            growthWeek: await substrate.growthWeek(from: timeline),
+            reflections: await substrate.reflectionReceiptSnapshot(),
+            receiptRead: receiptRead,
+            organism: organism.snapshot,
+            capsulePreview: capsulePreview,
+            capsulePreviewInfo: capsulePreviewInfo,
+            feltMode: feltMode
+        )
+    }
+
+    public func doctorRead() async -> CognitiveDoctorRead? {
+        guard let bootstrapTask else { return nil }
+        await bootstrapTask.value
+        let date = now()
+        let cognition = await substrate.frozenRead(at: date)
+        let organism = await organismKernel.frozenRead(at: date)
+        return CognitiveDoctorRead(
+            configuration: cognition.configuration,
+            affect: cognition.affect,
+            substrate: cognition.snapshot,
+            workspace: cognition.workspace,
+            associations: cognition.associations,
+            associationMissingEndpointCount: cognition.associationMissingEndpointCount,
+            receiptRead: await substrate.receiptReadSnapshot(),
+            organism: organism.snapshot,
+            capsulePreviewInfo: lastInjectedCapsule.map {
+                CapsulePreviewInfo(source: .liveInjected, userMessage: $0.userMessage, at: $0.capsule.generatedAt)
+            }
+        )
+    }
+
+    public func subconsciousRuntimeState() async -> NativeSubconsciousRuntimeState {
+        let configuration = await substrate.configurationSnapshot()
+        let organism = await organismKernel.snapshot()
+        return NativeSubconsciousRuntimeState(
+            enabled: configuration.enabled,
+            capsuleEnabled: configuration.capsuleInjectionEnabled,
+            backgroundEnabled: configuration.backgroundMicrocyclesEnabled,
+            reflectionEnabled: configuration.reflectiveCallsEnabled,
+            reflectionBudget: configuration.dailyReflectionCallBudget,
+            organismEnabled: organism.enabled
+        )
+    }
+
+
+    public func lastInjectedCapsuleBridgeSummary() async -> CognitiveBridgeCapsuleSummary {
+        guard let last = lastInjectedCapsule else {
+            return CognitiveBridgeCapsuleSummary(
+                source: "none",
+                generatedAt: nil,
+                hasBodyLine: false,
+                bodyLine: nil,
+                dynamicContextCharacters: 0,
+                truncated: nil
+            )
+        }
+        let bodyLine = Self.bodyLine(inCapsuleDynamicContext: last.capsule.dynamicContext)
+        return CognitiveBridgeCapsuleSummary(
+            source: "live_injected",
+            generatedAt: last.capsule.generatedAt,
+            hasBodyLine: bodyLine != nil,
+            bodyLine: bodyLine,
+            dynamicContextCharacters: last.capsule.dynamicContext.count,
+            truncated: last.capsule.truncated
+        )
+    }
+}
+
+/// Keep source epoch with the readout and publication ordering in LatestRead; view rendering cannot launch projection work.
+actor GrowthWeekFace {
+    private let faces: Task<PartFaces, Never>
+    private var previous: JSONValue?
+    private var epoch: UInt64 = 0
+
+    init(dataRoot: URL, engine: @escaping @Sendable () throws -> NativeAgentEngine) {
+        faces = Task { @MainActor in
+            PartFaces(dataRoot: dataRoot) { id, input, version in
+                do { return try await engine().tools.face(id: id, input: input, version: version) }
+                catch { return .failure(.init(code: "door_unavailable", message: error.localizedDescription)) }
+            }
+        }
+    }
+
+    func read(_ input: JSONValue) async -> PartFaceSnapshot {
+        // Reuse the face for an unchanged frozen packet; part edits invalidate through its owner.
+        if input != previous { epoch &+= 1; previous = input }
+        let selectedEpoch = epoch
+        return await faces.value.sourceChanged(id: "growth-week", epoch: selectedEpoch, input: input)
+    }
+}

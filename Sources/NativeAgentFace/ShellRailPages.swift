@@ -1,3 +1,5 @@
+import Foundation
+import Observation
 import SwiftUI
 import NativeAgentShared
 
@@ -71,9 +73,38 @@ private struct ShownRailTab: ViewModifier {
     }
 }
 
+@MainActor @Observable
+final class ShellRailTabStore {
+    static let shared = ShellRailTabStore()
+    private var values: [SidebarItem: String] = [:]
+
+    func value(for item: SidebarItem, default fallback: String) -> String {
+        if let stored = values[item] { return stored }
+        return UserDefaults.standard.string(forKey: ShellRailTab.storageKey(item)) ?? fallback
+    }
+
+    func set(_ tab: String, for item: SidebarItem) {
+        let key = ShellRailTab.storageKey(item)
+        if UserDefaults.standard.string(forKey: key) != tab {
+            UserDefaults.standard.set(tab, forKey: key)
+        }
+        if values[item] != tab { values[item] = tab }
+    }
+
+    func binding(for item: SidebarItem, default fallback: String) -> Binding<String> {
+        Binding(
+            get: { self.value(for: item, default: fallback) },
+            set: { self.set($0, for: item) }
+        )
+    }
+}
+
 struct DiagnosticsRailPage: View {
-    @AppStorage(ShellRailTab.storageKey(.diagnostics)) private var tab = "diagnostics"
     @Environment(AppModel.self) private var appModel
+
+    private var tab: Binding<String> {
+        ShellRailTabStore.shared.binding(for: .diagnostics, default: "diagnostics")
+    }
 
     private struct RunSelection: Identifiable { let id: String }
 
@@ -86,13 +117,12 @@ struct DiagnosticsRailPage: View {
         SurfaceLayoutContent(appModel.shellLayout) { layout in
         ShellTabbedPage(
             title: "Diagnostics",
-            subtitlePage: .diagnostics,
             tabs: ShellRailTab.shown(.diagnostics, Self.tabs, layout),
-            selection: $tab
+            selection: tab
         ) { key in
             switch key {
             case "diagnostics":
-                FacePageView(page: "diagnostics", asTab: true, isReading: appModel.panelIsReading(.diagnostics))
+                FacePageView(page: "diagnostics", isReading: appModel.panelIsReading(.diagnostics))
             case "Cognition":
                 CognitionObservatoryView()
             case "Inspector": InspectorView()
@@ -103,7 +133,7 @@ struct DiagnosticsRailPage: View {
                             set: { if $0 == nil { appModel.diagnosticsRunID = nil } })) { run in
             ShellRunDetail(id: run.id)
         }
-        .keepsShownTab(.diagnostics, Self.tabs, $tab, layout)
+        .keepsShownTab(.diagnostics, Self.tabs, tab, layout)
         }
     }
 }

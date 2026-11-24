@@ -1,0 +1,343 @@
+import Foundation
+import PersistenceCore
+// Blueprint: | `AgentA2AWire.swift` | `AgentA2AWire`, `selectInterface`, `messageRequest`; One versioned part encoder. |
+
+/// Peers supply untrusted endpoints, parts and metadata; transport must authorize destinations and credentials.
+public enum AgentA2AWire {
+    public static let spoken = "A2A 0.3 JSONRPC or A2A 1.0 JSONRPC or HTTP+JSON"
+    public struct Interface: Sendable, Equatable {
+        public let endpoint: URL
+        public let version: String
+        public let binding: String
+        public let tenant: String?
+        public let securityRequirements: JSONValue
+        public let securitySchemes: JSONValue
+        public let streaming: Bool
+        public let extendedAgentCard: Bool
+        public let pushNotifications: Bool
+        public init(endpoint: URL, version: String, binding: String, tenant: String? = nil,
+                    securityRequirements: JSONValue = .array([]), securitySchemes: JSONValue = .object([:]), streaming: Bool = false,
+                    extendedAgentCard: Bool = false, pushNotifications: Bool = false) {
+            self.endpoint = endpoint; self.version = version; self.binding = binding; self.tenant = tenant
+            self.securityRequirements = securityRequirements; self.securitySchemes = securitySchemes
+            self.streaming = streaming
+            self.extendedAgentCard = extendedAgentCard; self.pushNotifications = pushNotifications
+        }
+    }
+
+    public struct Request: Sendable, Equatable {
+        public let url: URL
+        public let httpMethod: String
+        public let headers: [String: String]
+        public let body: JSONValue?
+        public let requestID: String?
+        package var streamInterface: Interface? = nil
+        package var expectedTaskID: String? = nil
+        package init(url: URL, httpMethod: String, headers: [String: String], body: JSONValue?,
+                     requestID: String?,
+                     streamInterface: Interface? = nil, expectedTaskID: String? = nil) {
+            self.url = url; self.httpMethod = httpMethod; self.headers = headers
+            self.body = body; self.requestID = requestID
+            self.streamInterface = streamInterface; self.expectedTaskID = expectedTaskID
+        }
+        public var isStreaming: Bool {
+            headers["Accept"] == "text/event-stream"
+        }
+    }
+
+    public struct Result: Sendable, Equatable {
+        public let kind: String
+        public let taskID: String?
+        public let contextID: String?
+        public let messageID: String?
+        public let text: String
+        public let parts: [JSONValue]
+        public let artifacts: [JSONValue]
+        public let state: String
+        public let terminal: Bool
+        /// A message is a reply, never proof that delegated work completed.
+        public let completed: Bool
+        public let needsInput: Bool
+        public let needsAuthentication: Bool
+        public var failure: ProviderFailure.Report? = nil
+    }
+
+    public enum WireError: Error, LocalizedError, Equatable {
+        case invalid(String)
+        case unsupported(String)
+        case remote(code: Int64, message: String)
+        public var errorDescription: String? {
+            switch self {
+            case .invalid(let reason): return "Invalid A2A evidence: \(reason)"
+            case .unsupported(let reason): return "Unsupported A2A interface: \(reason)"
+            case .remote(let code, let message): return "A2A peer error \(code): \(message)"
+            }
+        }
+    }
+
+    public static func selectInterface(card: JSONValue, cardURL: URL) throws -> Interface {
+        let card = try object(card, "agent card")
+        var streaming = false, extendedAgentCard = false, pushNotifications = false
+        if let capabilities = card["capabilities"] {
+            let caps = try object(capabilities, "capabilities")
+            func flag(_ name: String) throws -> Bool {
+                guard let value = caps[name] else { return false } // Omitted means not offered.
+                guard case .bool(let flag) = value else { throw WireError.invalid("capabilities.\(name) must be boolean") }
+                return flag
+            }
+            streaming = try flag("streaming")
+            extendedAgentCard = try flag("extendedAgentCard")
+            pushNotifications = try flag("pushNotifications")
+            for item in try array(caps["extensions"], "extensions") {
+                let ext = try object(item, "extension")
+                if let required = ext["required"] {
+                    guard case .bool(let flag) = required else { throw WireError.invalid("extension required must be boolean") }
+                    if flag { throw WireError.unsupported("required extension \(try optionalString(ext["uri"], "extension URI") ?? "unspecified")") }
+                }
+            }
+        }
+        let requirements = card["securityRequirements"] ?? card["security"] ?? .array([])
+        _ = try array(requirements, "security requirements")
+        let schemes = card["securitySchemes"] ?? .object([:])
+        _ = try object(schemes, "security schemes")
+        var candidates: [[String: JSONValue]] = []
+        if let supported = card["supportedInterfaces"] {
+            candidates = try array(supported, "supportedInterfaces").map { try object($0, "interface") }
+        } else {
+            let version = try requiredString(card["protocolVersion"], "protocolVersion")
+            guard canonicalVersion(version) == "0.3" else { throw WireError.unsupported("a card without supportedInterfaces declares protocol \(version)") }
+            candidates.append(["url": card["url"] ?? .null, "protocolVersion": .string(version),
+                               "protocolBinding": card["preferredTransport"] ?? .string("JSONRPC")])
+            for item in try array(card["additionalInterfaces"], "additionalInterfaces") {
+                let entry = try object(item, "additional interface")
+                candidates.append(["url": entry["url"] ?? .null, "protocolVersion": .string(version),
+                                   "protocolBinding": entry["transport"] ?? .null])
+            }
+        }
+        // The card's declared order is the peer's protocol/binding preference.
+        for entry in candidates {
+            let advertised = try requiredString(entry["protocolVersion"], "interface protocolVersion")
+            let binding = try requiredString(entry["protocolBinding"], "interface protocolBinding")
+            guard let version = canonicalVersion(advertised),
+                  binding == "JSONRPC" || (version == "1.0" && binding == "HTTP+JSON") else { continue }
+            let address = try requiredString(entry["url"], "interface URL")
+            guard var url = URL(string: address), let scheme = url.scheme?.lowercased(),
+                  ["https", "http"].contains(scheme), url.host != nil,
+                  url.user == nil, url.password == nil, url.fragment == nil else {
+                throw WireError.invalid("interface requires an absolute HTTP(S) URL without embedded credentials or fragment")
+            }
+            // Keep declared localhost on the literal loopback address that answered; never resolve it.
+            if url.host?.lowercased() == "localhost",
+               ["127.0.0.1", "::1", "[::1]"].contains(cardURL.host ?? ""),
+               url.scheme == cardURL.scheme, url.port == cardURL.port,
+               var local = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                local.host = cardURL.host
+                if let pinned = local.url { url = pinned }
+            }
+            return Interface(endpoint: url, version: version, binding: binding,
+                             tenant: try optionalString(entry["tenant"], "tenant"),
+                             securityRequirements: version == "0.3" ? (card["security"] ?? requirements) : requirements, securitySchemes: schemes,
+                             streaming: streaming, extendedAgentCard: extendedAgentCard, pushNotifications: pushNotifications)
+        }
+        throw WireError.unsupported("no advertised supported version/binding pair")
+    }
+
+    public static func messageRequest(text: String, messageID: String, contextID: String? = nil,
+                                      taskID: String? = nil, interface: Interface,
+                                      requestID: String? = nil, streaming: Bool = false,
+                                      pushConfiguration: JSONValue? = nil, fileParts: [JSONValue] = []) throws -> Request {
+        try validate(interface)
+        guard !streaming || interface.streaming else { throw WireError.unsupported("streaming was not offered") }
+        _ = try requiredString(.string(messageID), "messageId")
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WireError.invalid("empty message") }
+        let v03 = interface.version == "0.3"
+        let parts: [JSONValue] = [.object(["text": .string(text)])] + fileParts
+        var message: [String: JSONValue] = ["messageId": .string(messageID), "role": .string(v03 ? "user" : "ROLE_USER"),
+            "parts": .array(try parts.map { try wirePart($0, version: interface.version) })]
+        if v03 { message["kind"] = .string("message") }
+        if let contextID { message["contextId"] = .string(try requiredString(.string(contextID), "contextId")) }
+        if let taskID { message["taskId"] = .string(try requiredString(.string(taskID), "taskId")) }
+        var params: [String: JSONValue] = ["message": .object(message)]
+        if !streaming { params["configuration"] = .object(v03 ? ["blocking": .bool(false)] : ["returnImmediately": .bool(true)]) }
+        if let pushConfiguration {
+            try validatePushConfiguration(pushConfiguration, interface: interface)
+            var configuration = (try? object(params["configuration"] ?? .object([:]), "configuration")) ?? [:]
+            configuration["taskPushNotificationConfig"] = pushConfiguration
+            params["configuration"] = .object(configuration)
+        }
+        if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
+        let method = streaming ? (v03 ? "message/stream" : "SendStreamingMessage") : (v03 ? "message/send" : "SendMessage")
+        return try request(interface: interface, method: method, params: params,
+                           requestID: requestID ?? messageID, path: { streaming ? "/message:stream" : "/message:send" })
+    }
+
+    public static func cancelRequest(taskID: String, interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
+        try validate(interface)
+        var params: [String: JSONValue] = ["id": .string(try requiredString(.string(taskID), "taskId"))]
+        if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
+        return try request(interface: interface, method: interface.version == "0.3" ? "tasks/cancel" : "CancelTask",
+                           params: params, requestID: requestID, path: { try "/tasks/" + pathIdentifier(params["id"], "taskId") + ":cancel" }, taskID: taskID)
+    }
+
+    public static func taskRequest(taskID: String, interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
+        try validate(interface)
+        _ = try requiredString(.string(taskID), "taskId")
+        var params: [String: JSONValue] = ["id": .string(taskID)]
+        if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
+        return try request(interface: interface, method: interface.version == "0.3" ? "tasks/get" : "GetTask",
+                           params: params, requestID: requestID, path: { try "/tasks/" + pathIdentifier(params["id"], "taskId") },
+                           httpMethod: "GET", pathKeys: ["id"], taskID: taskID)
+    }
+
+    static func request(interface: Interface, method: String, params: [String: JSONValue], requestID: String,
+                        path: () throws -> String, httpMethod: String = "POST", pathKeys: Set<String> = [], taskID: String? = nil) throws -> Request {
+        let expectedTaskID: String? = if case .object(let message)? = params["message"], case .string(let id)? = message["taskId"] { id } else { taskID }
+        let rpc = interface.binding == "JSONRPC"
+        let streaming = ["message/stream", "SendStreamingMessage", "SubscribeToTask"].contains(method)
+        let headers = ["Content-Type": rpc ? "application/json" : "application/a2a+json",
+                       "Accept": streaming ? "text/event-stream" : (rpc ? "application/json" : "application/a2a+json"), "A2A-Version": interface.version]
+        if rpc {
+            _ = try requiredString(.string(requestID), "request ID")
+            return Request(url: interface.endpoint, httpMethod: "POST", headers: headers,
+                           body: .object(["jsonrpc": .string("2.0"), "id": .string(requestID),
+                                          "method": .string(method), "params": .object(params)]), requestID: requestID,
+                           streamInterface: interface, expectedTaskID: expectedTaskID)
+        }
+        guard var components = URLComponents(url: interface.endpoint, resolvingAgainstBaseURL: false) else { throw WireError.invalid("endpoint URL") }
+        let base = try httpPathBase(components, tenant: params["tenant"])
+        components.percentEncodedPath = try base + path()
+        var body = params
+        body.removeValue(forKey: "tenant")
+        if httpMethod != "POST" {
+            components.queryItems = try (components.queryItems ?? []) + body.keys.sorted().filter { !pathKeys.contains($0) }.map { key in
+                let text: String
+                switch body[key]! {
+                case .string(let value): text = value
+                case .int(let value): text = String(value)
+                case .bool(let value): text = value ? "true" : "false"
+                default: throw WireError.invalid("query parameter \(key)")
+                }
+                return URLQueryItem(name: key, value: text)
+            }
+        }
+        guard let url = components.url else { throw WireError.invalid("request URL") }
+        return Request(url: url, httpMethod: httpMethod, headers: headers,
+                       body: httpMethod == "POST" ? .object(body) : nil, requestID: nil,
+                       streamInterface: interface, expectedTaskID: expectedTaskID)
+    }
+
+    static func httpPathBase(_ components: URLComponents, tenant: JSONValue?) throws -> String {
+        let base = components.percentEncodedPath.hasSuffix("/") ? String(components.percentEncodedPath.dropLast()) : components.percentEncodedPath
+        guard let tenant else { return base }
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_~"))
+        guard case .string(let tenant) = tenant, !tenant.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, tenant != ".", tenant != "..",
+              let encoded = tenant.addingPercentEncoding(withAllowedCharacters: safe) else { throw WireError.invalid("tenant path identifier") }
+        return base + "/" + encoded
+    }
+
+    public static func normalizeResponse(_ value: JSONValue, interface: Interface,
+                                         expectedRequestID: String? = nil, expectedTaskID: String? = nil) throws -> Result {
+        try validate(interface)
+        var payload = try object(operationResult(value, interface: interface, requestID: expectedRequestID), "response")
+        let v03 = interface.version == "0.3"
+        let kind: String
+        if v03 { kind = try requiredString(payload["kind"], "result kind") }
+        else if payload["task"] != nil || payload["message"] != nil {
+            guard (payload["task"] != nil) != (payload["message"] != nil) else { throw WireError.invalid("ambiguous send response") }
+            kind = payload["task"] != nil ? "task" : "message"
+            payload = try object(payload[kind]!, kind)
+        } else if expectedTaskID != nil { kind = "task" } // GetTask returns a Task directly.
+        else { throw WireError.invalid("send response has no task or message") }
+        var parts: [JSONValue] = []
+        var artifacts: [JSONValue] = []
+        var messageID: String?
+        let contextID = try optionalString(payload["contextId"], "contextId")
+        var taskID: String?
+        var state = "reply"
+        var failure: ProviderFailure.Report?
+        if kind == "message" {
+            messageID = try validateMessage(payload, v03: v03)
+            failure = try providerFailure(payload)
+            taskID = try optionalString(payload["taskId"], "taskId")
+            parts = try array(payload["parts"], "message parts", required: true)
+        } else if kind == "task" {
+            taskID = try requiredString(payload["id"], "task ID")
+            let status = try object(payload["status"] ?? .null, "task status")
+            let wireState = try requiredString(status["state"], "task state")
+            state = try canonicalState(wireState, version: interface.version)
+            if let message = status["message"] {
+                let message = try object(message, "status message")
+                messageID = try validateMessage(message, v03: v03)
+                failure = try providerFailure(message)
+                parts = try array(message["parts"], "status message parts", required: true)
+            }
+            artifacts = try array(payload["artifacts"], "artifacts")
+            for artifact in artifacts {
+                let artifact = try object(artifact, "artifact")
+                _ = try requiredString(artifact["artifactId"], "artifact ID")
+                let artifactParts = try array(artifact["parts"], "artifact parts", required: true)
+                try validateParts(artifactParts, v03: v03)
+            }
+        } else { throw WireError.invalid("unsupported response kind \(kind)") }
+        if let expectedTaskID, taskID != expectedTaskID { throw WireError.invalid("task identity mismatch") }
+        try validateParts(parts, v03: v03)
+        let outputParts = parts + artifacts.flatMap { item -> [JSONValue] in
+            guard case .object(let object) = item, case .array(let parts)? = object["parts"] else { return [] }; return parts
+        }
+        let text = outputParts.compactMap { part -> String? in
+            guard case .object(let object) = part, case .string(let text)? = object["text"] else { return nil }; return text
+        }.joined(separator: "\n")
+        return Result(kind: kind, taskID: taskID, contextID: contextID, messageID: messageID, text: text,
+                      parts: parts, artifacts: artifacts, state: state,
+                      terminal: ["completed", "failed", "canceled", "rejected"].contains(state), completed: state == "completed",
+                      needsInput: state == "input-required", needsAuthentication: state == "auth-required", failure: failure)
+    }
+
+    private static func providerFailure(_ message: [String: JSONValue]) throws -> ProviderFailure.Report? {
+        guard let metadata = message["metadata"] else { return nil }
+        let fields = try object(metadata, "message metadata")
+        guard let failure = fields["provider_failure"] else { return nil }
+        do {
+            return try JSONDecoder().decode(ProviderFailure.Report.self, from: failure.serializedData(pretty: false))
+        } catch {
+            throw WireError.invalid("message metadata.provider_failure: \(error.localizedDescription)")
+        }
+    }
+
+    private static func validateMessage(_ message: [String: JSONValue], v03: Bool) throws -> String {
+        if v03 && message["kind"] != .string("message") { throw WireError.invalid("message kind") }
+        guard message["role"] == .string(v03 ? "agent" : "ROLE_AGENT") else { throw WireError.invalid("peer message role") }
+        return try requiredString(message["messageId"], "message ID")
+    }
+    private static func validateParts(_ parts: [JSONValue], v03: Bool) throws {
+        for part in parts {
+            _ = try canonicalPart(part, version: v03 ? "0.3" : "1.0")
+        }
+    }
+    package static func canonicalVersion(_ version: String) -> String? {
+        let pieces = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard (2...3).contains(pieces.count), pieces.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else { return nil }
+        let pair = pieces.prefix(2).joined(separator: ".")
+        return ["1.0", "0.3"].contains(pair) ? pair : nil
+    }
+    private static func validate(_ interface: Interface) throws {
+        guard ["1.0", "0.3"].contains(interface.version),
+              interface.binding == "JSONRPC" || (interface.version == "1.0" && interface.binding == "HTTP+JSON") else {
+            throw WireError.unsupported("version/binding")
+        }
+    }
+    private static func object(_ value: JSONValue, _ name: String) throws -> [String: JSONValue] {
+        guard case .object(let object) = value else { throw WireError.invalid("\(name) must be an object") }; return object
+    }
+    private static func array(_ value: JSONValue?, _ name: String, required: Bool = false) throws -> [JSONValue] {
+        guard let value else { if required { throw WireError.invalid("missing \(name)") }; return [] }
+        guard case .array(let array) = value else { throw WireError.invalid("\(name) must be an array") }; return array
+    }
+    private static func requiredString(_ value: JSONValue?, _ name: String) throws -> String {
+        guard case .string(let text)? = value,
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WireError.invalid("missing or invalid \(name)") }; return text
+    }
+    private static func optionalString(_ value: JSONValue?, _ name: String) throws -> String? {
+        guard let value else { return nil }; return try requiredString(value, name)
+    }
+}

@@ -1,25 +1,14 @@
 import AppKit
-import ApprovalTransactions
-import Agents
-import AppToolRuntime
-import AuthoredCapabilities
-import BackgroundLoops
-import ChatTurnContracts
-import ChatTurnRuntime
-import ChatToolRuntime
-import DoctorChecks
-import EngineRuntime
-import Experiences
+import BodyRuntime
+import SenseCore
+import MindCore
 import Foundation
-import MacControl
-import MacIntegration
+import MacNerves
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import PersonaEngine
-import Privacy
+import DeskCore
 import ProviderRouting
-import TrustCenter
 import UniformTypeIdentifiers
 // Blueprint: | `BodySettingsActHandler.swift` | Body platform acts, mounted presentation demands and pipe-owned reverse calls |
 
@@ -27,6 +16,7 @@ import UniformTypeIdentifiers
 final class BodySettingsActHandler: FaceActHandler {
     private weak var appModel: AppModel?
     private let engine: NativeAgentEngine
+    private let followHistory: BodyFollowHistory
     private var cards: BodyCardActions?
     private lazy var services = BodyFaceServices(engine: engine)
     private var palette: BodyFacePalette?
@@ -48,6 +38,7 @@ final class BodySettingsActHandler: FaceActHandler {
     init(appModel: AppModel) {
         self.appModel = appModel
         engine = appModel.engine
+        followHistory = BodyFollowHistory(dataRoot: appModel.engine.dataRoot, feed: appModel.engine.settingsFeed)
     }
 
     func rendererConnected(_ connection: UUID) async {
@@ -70,8 +61,9 @@ final class BodySettingsActHandler: FaceActHandler {
         await services.disconnect(connection)
     }
 
-    func configure() {
-        InlineInteractionResolver.platform = AppInlineInteractionPlatformPort()
+    func configure() async {
+        // The window never waits on what it learned: the history loads beside it and the feed carries it when read.
+        Task { [followHistory] in await followHistory.load() }
         BodyOAuthPlatform.call = { [engine] request in
             return try await engine.faceActs.call(request)
         }
@@ -83,7 +75,9 @@ final class BodySettingsActHandler: FaceActHandler {
             throw WireFailure(code: failure.code, message: NativeAppSecretRedactor.redactText(failure.message),
                 cause: failure.cause.map(NativeAppSecretRedactor.redactText), effects: failure.effects)
         } catch is CancellationError { throw CancellationError() }
-        catch {
+        catch let failure as PartCallError {
+            throw WireFailure(code: failure.code, message: NativeAppSecretRedactor.redactText(failure.message), cause: nil, effects: .unknown)
+        } catch {
             throw WireFailure(code: "settings_act_failed", message: "The requested operation could not complete.",
                 cause: NativeAppSecretRedactor.redactText(error.localizedDescription), effects: .unknown)
         }
@@ -96,6 +90,9 @@ final class BodySettingsActHandler: FaceActHandler {
         switch act {
         case .reportScene(let report):
             try BodyFacePresentation.report(report)
+            return .acknowledged
+        case .followSettled(let origin, let landing, let outcome):
+            try await followHistory.record(origin: origin, landing: landing, outcome: outcome)
             return .acknowledged
         case .reportInspector(let report):
             try BodyFaceDoctor.report(report)
@@ -153,20 +150,20 @@ final class BodySettingsActHandler: FaceActHandler {
         case .runMacControl(let request):
             return try await runFaceMacControl(request)
         case .notify(let title, let message):
-            let turn = Self.personTurn("mac_control.notify")
+            let turn = personTurn("mac_control.notify")
             let result = try await engine.trust.runMacControl(action: .notify, body: ["title": .string(title), "message": .string(message)],
                 notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn)
             return committed(PartFace.Value(result.toJSON(readContent: nil)))
         case .runDoctor(let request): return try await runDoctor(request)
         case .resolveApproval(let id, let decision):
             let record = try await engine.approvals.resolveApproval(id: id, decision: decision.rawValue, coordinator: .app(),
-                turn: Self.personTurn("approval." + decision.rawValue))
+                turn: personTurn("approval." + decision.rawValue))
             return committed(.object(["status": .string(record.status), "decision": record.decision.map(PartFace.Value.string) ?? .null]),
                 identities: [record.id])
         case .importGrokCredentials(let request):
             return try await importFaceGrokCredentials(request)
         case .setUpChrome:
-            let url = try await ChromeExtensionFolder.setUp(turn: Self.personTurn("chrome.setup"), context: .init(dataRoot: engine.dataRoot))
+            let url = try await ChromeExtensionFolder.setUp(turn: personTurn("chrome.setup"), context: .init(dataRoot: engine.dataRoot))
             return committed(.string(url.path), identities: ["chrome"])
         case .reindexSpotlight:
             return try await reindexFaceSpotlight()
@@ -219,7 +216,7 @@ final class BodySettingsActHandler: FaceActHandler {
                 renderer: try BodyFacePresentation.current(model: requireModel()).connection, titleOnly: key == .pageTitle(page))
             await engine.pages.refresh(page: page)
             return .observation(id: id)
-        case .sessions, .sessionPalette, .sessionSearch:
+        case .sessions, .sessionSearch:
             _ = try await engine.transcripts.readSessionIndex()
         case .sessionNavigation:
             await engine.transcripts.refreshNavigationIdentity()
@@ -292,7 +289,7 @@ final class BodySettingsActHandler: FaceActHandler {
         guard let action = MacControlWorkbenchAction(rawValue: request.action) else {
             throw PartCallError(code: "unknown_mac_action", message: "Choose a supported Mac control action.")
         }
-        let turn = Self.personTurn("mac_control." + request.action)
+        let turn = personTurn("mac_control." + request.action)
         let result = try await engine.trust.runMacControl(action: action, body: request.arguments.mapValues { JSONValue($0) },
             notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn)
         return committed(PartFace.Value(result.toJSON(readContent: nil)))
@@ -330,10 +327,10 @@ final class BodySettingsActHandler: FaceActHandler {
 
     /// Apply the requested Inbox action and refresh the list after it commits.
     private func runFaceInboxAction(id: String, action: String) async throws -> FaceActReply {
-        let turn = Self.personTurn("inbox." + action)
+        let turn = personTurn("inbox." + action)
         let target = try BodyFacePresentation.current(model: requireModel())
-        let effects = BodyInboxCardActionEffects(call: { try await target.call($0) }, renderer: target.connection)
-        try await ApprovalTransactions.InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot,
+        let effects = BodyInboxCardActionEffects(engine: engine, call: { try await target.call($0) }, renderer: target.connection)
+        try await BodyRuntime.InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot,
             turn: turn, effects: effects)
         var issue: WireFailure?
         do { _ = try await engine.inbox.list() }
@@ -459,9 +456,9 @@ final class BodySettingsActHandler: FaceActHandler {
         return appModel
     }
 
-    private static func personTurn(_ action: String) -> Turn {
+    private func personTurn(_ action: String) -> Turn {
         TurnRequest(message: "", sessionID: nil, surface: "native_actions",
-            envelope: .personOnMac("mac_ui:" + action, surface: "native_actions")).turn()
+            envelope: .personOnMac("mac_ui:" + action, surface: "native_actions")).turn(dataRoot: engine.dataRoot)
     }
 
     @concurrent private static func saveGrok(contact: String, secret: String, root: URL) async throws -> Bool {

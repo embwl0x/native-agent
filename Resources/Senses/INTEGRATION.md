@@ -6,11 +6,24 @@
 using its declared mode, version and verbs. All ten entries are live:
 OOXML/iWork/EPUB v7, RTF/RTFD v6 and Figma v5. Source comes from the matching
 ability file or the bundled built-in source. Preserve existing grown senses.
-Each entry is already self-contained; no dependency loader is needed.
+The helper installs the shared libraries once per sense realm before evaluating the manifest entry.
 The SDK's local `sense.redactText(text)` uses the shared Swift policy before
 source fragments are composed into news. It sends no plug messages and grants
-no progress credit. P1's sense.js is separately owned and may occupy this folder.
-P6 reads AUTHORING.md, frame.js, and the relevant builtin entry lazily.
+no progress credit. The SDK lives in sense.js.
+
+The program helper creates callable app and host members on first access through
+JavaScriptCore class callbacks. Reflecting on an app namespace asks its host
+for admitted names. The part kit supplies JavaScript request and batch semantics.
+The helper uses Acorn's exact-source line when a call has one proven location.
+For an indirect or ambiguous call it reads the active authored frame from JSC.
+
+Sense app reads, acts, notebook operations, page publication, presentation and
+news put their JSON fields in the flag-2 payload. The header carries the type,
+entry id and call id. App, act and notebook results and non-file source replies
+return raw JSON in the same payload, including a literal null. JSC parses that
+payload once. File replies keep their flag-1 binary attachment. The app answers
+publication and presentation with `publish_reply` and `present_reply` after
+checking the submitted value. A failure travels in the reply header.
 
 The host must supply file data bytes (as the documented Uint8Array), derive
 the published page's corner from its SenseRecord, and accept the documented

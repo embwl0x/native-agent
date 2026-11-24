@@ -30,15 +30,17 @@ struct ViewModeSwitch: View {
 }
 
 extension View {
-    func viewModeSwitch() -> some View {
+    func viewModeSwitch(visible: Bool) -> some View {
         overlay {
-            VStack {
-                HStack { Spacer(); ViewModeSwitch() }
-                Spacer()
+            if visible {
+                VStack(spacing: 0) {
+                    HStack { Spacer(); ViewModeSwitch() }
+                        .frame(height: NativeAgentShellLayout.titleBarInset)
+                    Spacer()
+                }
+                .padding(.trailing, 14)
+                .ignoresSafeArea(edges: .top)
             }
-            .padding(.top, 3)
-            .padding(.trailing, 10)
-            .ignoresSafeArea(edges: .top)
         }
     }
 }

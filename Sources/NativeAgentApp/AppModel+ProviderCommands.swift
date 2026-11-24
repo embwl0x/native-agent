@@ -1,25 +1,16 @@
 import Foundation
 import SwiftUI
-import EngineRuntime
+import BodyRuntime
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
-import AttentionRouting
-import DoctorChecks
 import WidgetKit
 import AppIntents
 import Observation
-import MemoryV2
-import BackgroundLoops
-import PersonaEngine
-import ChatTurnRuntime
-import ChatSessionWork
-import TrustCenter
-import MultimodalTTS
-import SystemOps
-import TelegramBot
-import DeviceSync
+import MindCore
+import SenseCore
+import DeskCore
 // Blueprint: | `AppModel+ProviderCommands.swift` | `AppModel`: checked provider reads, chat-brain saves and disconnect outcomes |
 
 @MainActor

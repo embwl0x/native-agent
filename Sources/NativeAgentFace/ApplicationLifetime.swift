@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import Observation
 import SwiftUI
-// Blueprint: | `ApplicationLifetime.swift` | Scene mounting, command admission and acknowledged navigation; the window follows the turn's attention |
+// Blueprint: | `ApplicationLifetime.swift` | Scene mounting and navigation; the window follows attention and learns which pages the person takes back |
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
@@ -36,21 +36,30 @@ final class ApplicationLifetime {
         replayTour: () -> Void, deliver: (NativeAgentNavigationDestination) -> Void)?
     /// The page the window showed right after the agent last moved it; the window coming to any other page was the person's choice.
     @ObservationIgnored private var agentShown: [String: PartFace.Value]?
+    /// The page the agent's last quiet move is landing on, until the scene shows it.
+    @ObservationIgnored private var agentLanding: String?
     /// How many times the person has brought the window to a page, so a turn can tell whether the person took the window during it.
     @ObservationIgnored private(set) var personMoves = 0
 
     var visiblePageInput: [String: PartFace.Value]? { mounted?.input() }
 
     /// The window shows another page. The page the agent's own move brought it to is the agent's; any other is the person's.
+    /// Whatever brought the person's page back (the rail, a menu, a shortcut, the palette), its coming back is what the window learns from.
     func sceneShown() {
-        if visiblePageInput == agentShown { agentShown = nil } else { personMoves += 1 }
+        if visiblePageInput == agentShown || (agentLanding != nil && visiblePageID == agentLanding) {
+            agentShown = nil; agentLanding = nil
+        } else {
+            personMoves += 1
+            FaceFollows.shared.personShowed(visiblePageID)
+        }
     }
     /// The person chose a place or a tab, which counts even when the page shown stays the same.
     func personChose() { personMoves += 1 }
-    var currentPage: QuietPage? {
+    var visiblePageID: String? {
         guard case .string(let page)? = visiblePageInput?["page"] else { return nil }
-        return QuietPages.page(named: page)
+        return page
     }
+    var currentPage: QuietPage? { visiblePageID.flatMap { QuietPages.page(named: $0) } }
 
     func configureMainWindowOpening(_ open: @escaping @MainActor () -> Void) {
         // The opener is set again each time Commands re-evaluate, which must not bring the window forward over a detached chat.
@@ -123,7 +132,8 @@ final class ApplicationLifetime {
         mounted.replayTour()
     }
     /// `wanted` is asked again after every wait and before anything moves: a move nobody wants any more changes nothing.
-    func navigate(_ request: FaceNavigationRequest, wanted: @MainActor () -> Bool = { true }) async throws -> FaceReply {
+    func navigate(_ request: FaceNavigationRequest, wanted: @MainActor () -> Bool = { true },
+                  followed: (@MainActor (String?, String?) -> Void)? = nil) async throws -> FaceReply {
         let target = request.destination
         guard let appModel else { throw FaceWireError.disconnected }
         func stillWanted() throws {
@@ -193,17 +203,29 @@ final class ApplicationLifetime {
         }
         try stillWanted()
         if request.policy == .quiet {
+            let origin = visiblePageID
             let delivered = deliverQuietly(destination)
-            if delivered { agentShown = visiblePageInput }
-            if delivered, let tab, let item { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
+            if delivered {
+                // The scene mounts the page after this returns: the move names where it is going, never what is still on screen.
+                agentShown = visiblePageInput
+                agentLanding = shown.page
+                // Her own page show and the window's follow are one thing, the window following her attention: either begins the turn's trial.
+                if let followed { followed(origin, shown.page) } else { FaceFollows.shared.agentMoved(from: origin, to: shown.page) }
+            }
+            if delivered, let tab, let item { ShellRailTabStore.shared.set(tab, for: item) }
             if delivered, let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
             FaceReports.shared.sceneChanged()
             return .navigation(.init(disposition: delivered ? .mounted : .unavailable, destination: shown,
                                      reason: delivered ? nil : "The main scene is not mounted."))
         }
+        let origin = visiblePageID
         let receipt = self.request(destination)
-        if receipt == .deliveredToMountedScene { agentShown = visiblePageInput }
-        if let tab, let item { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
+        if receipt == .deliveredToMountedScene {
+            agentShown = visiblePageInput
+            agentLanding = shown.page
+            FaceFollows.shared.agentMoved(from: origin, to: shown.page)
+        }
+        if let tab, let item { ShellRailTabStore.shared.set(tab, for: item) }
         if let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
         return .navigation(.init(disposition: receipt == .deliveredToMountedScene ? .mounted : .queued,
                                  destination: shown, reason: nil))
@@ -222,6 +244,10 @@ final class ApplicationLifetime {
 /// The person outranks it: once the person brings the window to a page, chooses a place or a tab, or types in the composer or an ask bar
 /// during a turn, the window stays where the person has it for the rest of that turn, and a move already on its way lands nowhere. When
 /// the turn ends the window stays, unless the turn began in Chat and the person never took the window: then it returns to Chat.
+/// It learns from what follows its move: the first move a turn makes away from the person's page is one trial, settled when the person
+/// deliberately chooses that page again (took it back) or when the turn ends (kept); typing voids it. Pages where taking it back stands
+/// (`window.leaves`, from the body's record) count as the person's from the start of the turn, except a sampled turn now and then
+/// (`window.sampling`) that follows anyway, so a page the person stops taking back comes back.
 @MainActor final class FaceFollows {
     static let shared = FaceFollows()
     private var turn: String?
@@ -231,33 +257,60 @@ final class ApplicationLifetime {
     private var beganInChat = false
     private var moved = false
     private var moving = false
+    private var trial: (origin: String, landing: String)?
+    /// One draw a turn against a left page's sampling chance, so the window's choice holds for the whole turn.
+    private var draw = Double.random(in: 0..<1)
     /// The move still to make and the turn it belongs to; it lands only while that turn is the window's and the person has not taken it.
-    private var owed: (destination: FaceDestination, turn: String?)?
+    private var owed: (destination: FaceDestination, turn: String?, observe: Bool)?
 
     func receive(_ attention: FaceAttention, appModel: AppModel) {
         if attention.turn != turn {
-            let backToChat = turn != nil && moved && beganInChat && !personTook()
+            settle(.kept)
+            let backToChat = turn != nil && moved && beganInChat && allowsMove(appModel)
             turn = attention.turn
             followed = []
             taken = false
             moved = false
             personMovesAtStart = ApplicationLifetime.shared.personMoves
+            draw = Double.random(in: 0..<1)
             let inChat = ApplicationLifetime.shared.currentPage?.item == .chat
-            if backToChat, !inChat { go(.init(page: "chat", item: nil, session: nil, message: nil), for: turn) }
+            if backToChat, !inChat {
+                go(.init(page: "chat", item: nil, session: nil, message: nil), for: turn, observe: false, appModel: appModel)
+            }
             // A turn that begins while the window goes back to Chat begins in Chat.
             beganInChat = inChat || backToChat
         }
         guard turn != nil, let link = attention.link, !followed.contains(link),
               case .page(let page, let item)? = FaceLink(link) else { return }
         followed.insert(link)
-        guard appModel.facePreference(WindowFollowsPreference.key, as: Bool.self) == true, !personTook() else { return }
+        guard allowsMove(appModel) else { return }
         moved = true
-        go(.init(page: page, item: item, session: nil, message: nil), for: turn)
+        go(.init(page: page, item: item, session: nil, message: nil), for: turn, observe: true, appModel: appModel)
+    }
+
+    /// Her own show moved the window during a turn: the same trial a follow begins, once a turn, unless the person already took the window.
+    func agentMoved(from origin: String?, to landing: String?) {
+        guard turn != nil, trial == nil, !personTook(), let origin, let landing, origin != landing else { return }
+        trial = (origin, landing)
+    }
+
+    /// The person's own page came back into view during the turn after the window had left it: the person took it back.
+    func personShowed(_ page: String?) {
+        if let page, trial?.origin == page { settle(.tookBack) }
+    }
+
+    private func settle(_ outcome: FollowOutcome) {
+        guard let trial else { return }
+        self.trial = nil
+        FaceReports.shared.submit(.followSettled(origin: trial.origin, landing: trial.landing, outcome: outcome))
     }
 
     /// The person wrote in the composer or an ask bar: during a turn, the window is the person's for the rest of it.
     func personTyped() {
-        if turn != nil { taken = true }
+        if turn != nil {
+            trial = nil
+            taken = true
+        }
     }
 
     /// Whether the person has taken the window this turn: typed, or brought the window to a page or chose a place or tab since it began.
@@ -266,19 +319,29 @@ final class ApplicationLifetime {
         return taken
     }
 
-    private func wants(_ owner: String?) -> Bool { owner == turn && !personTook() }
+    private func allowsMove(_ appModel: AppModel) -> Bool {
+        guard appModel.facePreference(WindowFollowsPreference.key, as: Bool.self) == true, !personTook() else { return false }
+        if let page = ApplicationLifetime.shared.visiblePageID, appModel.windowLeaves.contains(page),
+           draw >= appModel.windowSampling[page] ?? 0 { taken = true }
+        return !taken
+    }
 
-    private func go(_ destination: FaceDestination, for owner: String?) {
-        owed = (destination, owner)
+    private func go(_ destination: FaceDestination, for owner: String?, observe: Bool, appModel: AppModel) {
+        owed = (destination, owner, observe)
         guard !moving else { return }
         moving = true
         Task { @MainActor [self] in
             while let next = owed {
                 owed = nil
-                guard wants(next.turn) else { continue }
+                @MainActor func wanted() -> Bool { next.turn == self.turn && self.allowsMove(appModel) }
+                guard wanted() else { continue }
                 do {
                     _ = try await ApplicationLifetime.shared.navigate(.init(destination: next.destination, policy: .quiet),
-                                                                     wanted: { self.wants(next.turn) })
+                        wanted: wanted, followed: { origin, landing in
+                            if next.observe, self.trial == nil, let origin, let landing, origin != landing {
+                                self.trial = (origin, landing)
+                            }
+                        })
                 } catch {
                     ApplicationLifetime.shared.appModel?.setFailureStatus(error, action: "follow the turn's attention")
                 }

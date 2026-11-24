@@ -13,6 +13,9 @@ function labels(group) {
     return group.aliases.slice(0, 5).map(alias => "#" + alias).join(", ") +
         (group.count > 5 ? " and " + (group.count - 5) + " more" : "");
 }
+function count(n, one, many = one + "s") {
+    return n + " " + (n === 1 ? one : many);
+}
 function run(input) {
     if (input.kind === "desk") {
         const waiting = input.waiting, blocked = input.blocked, contradictions = input.contradictions;
@@ -21,35 +24,38 @@ function run(input) {
         }
         const parts = [], actions = [];
         if (waiting.count > 0) {
-            parts.push(waiting.count + " item(s) wait on your decision: " + labels(waiting));
-            actions.push("open Desk and decide items " + labels(waiting) + " marked waiting on you");
+            parts.push(count(waiting.count, "item") + (waiting.count === 1 ? " waits" : " wait") + " on your decision: " + labels(waiting) + ".");
+            actions.push("open Desk and decide " + (waiting.count === 1 ? "item " : "items ") + labels(waiting) + " marked waiting on you");
         }
         if (input.pendingApprovals > 0) {
-            parts.push(input.pendingApprovals + " pending approval(s) wait for your decision");
-            actions.push("open Approvals and decide the " + input.pendingApprovals + " pending request(s)");
+            parts.push(count(input.pendingApprovals, "pending approval") + (input.pendingApprovals === 1 ? " waits" : " wait") + " for your decision.");
+            actions.push("open Approvals and decide the " + count(input.pendingApprovals, "pending request"));
         }
         if (blocked.count > 0) {
-            const reasons = blocked.items.slice(0, 5).map(item => "#" + item.alias + ": " + item.reason).join("; ") +
-                (blocked.count > 5 ? "; and " + (blocked.count - 5) + " more" : "");
-            parts.push(blocked.count + " blocked item(s): " + reasons);
+            const lines = blocked.items.slice(0, 5).map(item => "#" + item.alias + ": " + item.reason);
+            if (blocked.count > 5) lines.push("+" + (blocked.count - 5) + " more");
+            parts.push(count(blocked.count, "blocked item") + ":\n" + lines.join("\n"));
             actions.push("open Desk and resolve " + labels(blocked) +
                 " using each recorded blocked reason or waiting party, clarifying the block there if neither is recorded");
         }
         if (contradictions.count > 0) {
-            parts.push(contradictions.count + " terminal parent(s) contain open descendants: " + labels(contradictions));
-            actions.push("press Repair in Diagnostics → Health checks to reconcile terminal parents " + labels(contradictions));
+            parts.push(count(contradictions.count, "terminal parent") + (contradictions.count === 1 ? " contains" : " contain")
+                + " open descendants: " + labels(contradictions) + ".");
+            actions.push("press Repair in Diagnostics → Health checks to reconcile "
+                + (contradictions.count === 1 ? "terminal parent " : "terminal parents ") + labels(contradictions));
         }
-        return {detail: parts.join("; ") + ".", humanAction: "For the named work, " + actions.join("; ") + "."};
+        return {detail: parts.join("\n"), humanAction: "For the named work, " + actions.join("; ") + "."};
     }
     if (input.kind === "activity") {
         const partial = input.malformedCount > 0
-            ? "Activity log " + (input.recordCount === 0 ? "unreadable" : "partially readable") + ": " + input.malformedCount +
-                " malformed row(s) in its bounded tail; " : "";
+            ? "Activity log " + (input.recordCount === 0 ? "unreadable" : "partially readable") + ": " + count(input.malformedCount, "malformed row")
+                + " in its bounded tail; " : "";
         const titles = input.recent.slice().sort((a, b) => a.createdAt === b.createdAt ? 0 : a.createdAt > b.createdAt ? -1 : 1)
             .slice(0, 3).map(row => row.title).join("; ");
-        return {detail: partial + input.reconciliationCount + " outcome(s) need reconciliation; " + input.failureCount +
-            " historical failure receipt(s) in the last 15 minutes of the retained activity tail" +
-            (titles.length === 0 ? "" : "; latest: " + titles) + ".", humanAction: null};
+        return {detail: partial + count(input.reconciliationCount, "outcome") + (input.reconciliationCount === 1 ? " needs" : " need")
+            + " reconciliation; " + count(input.failureCount, "historical failure receipt")
+            + " in the last 15 minutes of the retained activity tail"
+            + (titles.length === 0 ? "" : "; latest: " + titles) + ".", humanAction: null};
     }
     if (input.kind === "doctor") {
         const asks = [...new Set(input.asks.map(row => "• " + row.title + ": " + row.action))].sort();
@@ -120,24 +126,49 @@ function summarize(checks) {
     return s;
 }
 
-function headline(s) {
+function namedChecks(checks, bucket) {
+    const titles = checks.filter(c => c.bucket === bucket).map(c => c.title).filter(Boolean);
+    if (titles.length === 0) return "";
+    if (titles.length <= 2) return titles.join(", ");
+    return titles.slice(0, 2).join(", ") + " and " + (titles.length - 2) + " more";
+}
+
+function headline(s, checks) {
     if (s.total === 0) return "No checks have run yet.";
-    if (s.failing > 0) return "Some parts of the app are not working.";
-    if (s.warning > 0) return "The app is running, but some parts need attention.";
-    if (s.unclear > 0) return "The app is running. Some checks came back unclear.";
-    if (s.reading > 0) return "The app is running. Some checks are readings.";
-    // Inactive parts cannot establish the health of everything.
+    if (s.failing > 0) {
+        const failing = namedChecks(checks, "failing");
+        const warning = namedChecks(checks, "warning");
+        const parts = [failing ? "Not working: " + failing : "Some parts of the app are not working"];
+        if (warning) parts.push("needs attention: " + warning);
+        return parts.join("; ") + ".";
+    }
+    if (s.warning > 0) {
+        const warning = namedChecks(checks, "warning");
+        return warning ? "Needs attention: " + warning + "." : "The app is running, but some parts need attention.";
+    }
+    if (s.unclear > 0) {
+        const unclear = namedChecks(checks, "unclear");
+        return unclear ? "Unclear: " + unclear + "." : "The app is running. Some checks came back unclear.";
+    }
+    if (s.reading > 0) return s.reading === 1 ? "The app is running. One check is a reading." : "The app is running. Some checks are readings.";
     const inactive = [[s.off, "off"], [s.notNeeded, "not needed"]].filter(p => p[0] > 0).map(p => p[0] + " " + p[1]);
     return inactive.length === 0 ? "Everything looks healthy." : "Healthy; " + inactive.join(", ") + ".";
+}
+
+function statusBadge(s) {
+    const ok = s.healthy > 0 ? " · " + s.healthy + " ok" : "";
+    if (s.failing > 0) return s.failing + " not working" + ok;
+    if (s.warning > 0) return s.warning + (s.warning === 1 ? " needs attention" : " need attention") + ok;
+    return s.status;
 }
 
 function summaryDetail(s) {
     if (s.total === 0) return "Press Run checks to see how everything is doing.";
     const parts = [s.healthy + " working"];
-    if (s.warning > 0) parts.push(s.warning + " need attention");
+    if (s.warning > 0) parts.push(s.warning + (s.warning === 1 ? " needs attention" : " need attention"));
     if (s.failing > 0) parts.push(s.failing + " not working");
     if (s.unclear > 0) parts.push(s.unclear + " unclear");
-    if (s.reading > 0) parts.push(s.reading + " readings");
+    if (s.reading > 0) parts.push(s.reading + (s.reading === 1 ? " reading" : " readings"));
     if (s.off > 0) parts.push(s.off + " off");
     if (s.notNeeded > 0) parts.push(s.notNeeded + " not needed");
     return (s.total === 1 ? "1 area checked" : s.total + " areas checked") + ": " + parts.join(", ") + ".";
@@ -145,7 +176,7 @@ function summaryDetail(s) {
 
 function counts(s) {
     return [[s.healthy, "ok"], [s.warning, "warn"], [s.failing, "failed"], [s.off, "off"], [s.notNeeded, "not needed"],
-        [s.reading, "readings"], [s.unclear, "unclear"]].filter(p => p[0] > 0).map(p => p[0] + " " + p[1]).join(", ");
+        [s.reading, s.reading === 1 ? "reading" : "readings"], [s.unclear, "unclear"]].filter(p => p[0] > 0).map(p => p[0] + " " + p[1]).join(", ");
 }
 
 // Where a check belongs on the page, in the order the groups read.
@@ -232,15 +263,15 @@ function face(input) {
     const issue = doctor.reportIssue === null ? undefined : doctor.reportIssue;
     const checks = doctor.checks || [];
     const summary = summarize(checks);
-    const line = doctor.running ? "Running health checks." : doctor.runFailure !== null ? doctor.runFailure : headline(summary);
+    const line = doctor.running ? "Running health checks." : doctor.runFailure !== null ? doctor.runFailure : headline(summary, checks);
     const sections = [{id: "doctor", style: "list", footer: issue !== undefined ? issue : summaryDetail(summary), rows: [{
-        id: "doctor", title: "Health checks", value: issue === undefined ? summary.status : "unavailable",
+        id: "doctor", title: "Health checks", detail: line, value: issue === undefined ? statusBadge(summary) : "unavailable",
         at: doctor.completedAt === null ? undefined : doctor.completedAt,
         tone: doctor.running ? "live" : doctor.runFailure === null ? summary.tone : "attention",
         actions: doctor.running ? [] : [
-            {id: "doctor.run", label: "Run checks"},
+            {id: "doctor.run", label: "Run checks", role: "primary"},
             {id: "doctor.repair", label: "Repair safe issues"},
-            {id: "doctor.support_report", label: "Support report"}
+            {id: "doctor.support_report", label: "Support report", aside: true}
         ]
     }]}];
     if (doctor.running) {
@@ -295,9 +326,23 @@ function face(input) {
     }
     if (background.length > 0) sections.push({id: "background", title: "Background work", style: "list", footer: issue, rows: background});
 
-    const grouped = groups.map(g => [g, checks.filter(c => group(c.checkID) === g[0])]).filter(p => p[1].length > 0).map(p => {
+    const checkGroups = groups.map(g => [g, checks.filter(c => group(c.checkID) === g[0])]).filter(p => p[1].length > 0);
+    const hasHealthyGroup = checkGroups.some(p => summarize(p[1]).tone === "done");
+    const extra = (healthy.length > 0 || hasHealthyGroup ? 1 : 0) + healthy.length;
+    let childrenLeft = Math.max(0, 256 - checkGroups.length - extra);
+    const grouped = checkGroups.map((p, index) => {
         const s = summarize(p[1]);
-        return {id: "checks." + p[0][0], title: p[0][1], value: counts(s), tone: s.tone};
+        const notable = p[1].filter(c => c.bucket !== "healthy" && c.bucket !== "not needed");
+        const shown = notable.slice(0, Math.floor(childrenLeft / (checkGroups.length - index)));
+        childrenLeft -= shown.length;
+        const detail = notable.length === 0 ? undefined
+            : [["failing", "Not working"], ["warning", "Needs attention"], ["unclear", "Unclear"], ["off", "Off"], ["reading", "Reading"]]
+                .map(([bucket, label]) => { const names = namedChecks(p[1], bucket); return names ? label + ": " + names : ""; })
+                .concat(notable.length > shown.length ? ["Showing " + shown.length + " of " + notable.length] : [])
+                .filter(Boolean).join(" · ");
+        const childRows = shown.length === 0 ? undefined
+            : shown.map(c => ({id: "checks." + p[0][0] + "." + c.id, title: c.title, value: c.status, tone: tone(c.status, c.bucket)}));
+        return kit.row({id: "checks." + p[0][0], title: p[0][1], detail, value: counts(s), tone: s.tone, rows: childRows});
     });
     healthy.unshift(...grouped.filter(row => row.tone === "done"));
     const checkRows = grouped.length === 0 ? [{id: "checks.empty", title: "No measured checks yet", tone: "attention"}]
@@ -341,12 +386,14 @@ function face(input) {
     const activity = input.activity;
     let events = activity.tail.slice().reverse().map(e => ({id: "activity." + e.id, title: e.title,
         detail: dated(e.detail, e.createdAt, e.timeReadable), value: e.status, at: e.createdAt, tone: tone(e.status, e.bucket)}));
-    if (events.length === 0) {
-        events = [{id: "activity.empty", title: activity.failed ? "Recent activity is unavailable"
-            : activity.refreshed ? "No activity recorded yet" : "Recent activity has not been read", tone: "quiet"}];
+    if (events.length > 0 || activity.failed || !activity.refreshed) {
+        if (events.length === 0) {
+            events = [{id: "activity.empty", title: activity.failed ? "Recent activity is unavailable"
+                : "Recent activity has not been read", tone: "quiet"}];
+        }
+        sections.push({id: "activity", title: "Recent activity", style: "timeline",
+            footer: activity.failed ? "The activity log could not refresh. Any displayed events are the last loaded reading." : undefined, rows: events});
     }
-    sections.push({id: "activity", title: "Recent activity", style: "timeline",
-        footer: activity.failed ? "The activity log could not refresh. Any displayed events are the last loaded reading." : undefined, rows: events});
 
     const runs = input.runs;
     let runRows = runs.recent.map(r => {
@@ -366,5 +413,5 @@ function face(input) {
     sections.push({id: "runs", title: "Runs", style: "timeline",
         footer: runs.read === false ? "The run history could not refresh. Any displayed runs are the last loaded reading." : undefined, rows: runRows});
 
-    return {title: "Diagnostics", line, sections};
+    return {title: "Diagnostics", sections};
 }

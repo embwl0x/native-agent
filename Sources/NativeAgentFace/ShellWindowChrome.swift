@@ -188,9 +188,11 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
     @ViewBuilder var detail: () -> Detail
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar().focusSection()
-            detail().focusSection()
+        HouseGlassContainer(spacing: 0) {
+            HStack(spacing: 0) {
+                sidebar().focusSection()
+                detail().focusSection()
+            }
         }
         .background {
             ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture())

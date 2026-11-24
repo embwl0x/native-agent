@@ -14,12 +14,13 @@ enum MobileAgentPresentation {
 struct MobileAgentThreadView: View {
     let id: String
     private let sync = iCloudSyncEngine.shared
-    @EnvironmentObject private var pairing: PairingStore
+    @Environment(PairingStore.self) private var pairing
     @Environment(ChatStore.self) private var chatStore
     @State private var busy = false
     @State private var error: String?
     private var thread: MobileAgentThread? { sync.agentThreads[id] }
-    private var agent: MobileAgentRow? { sync.helpersSnapshot?.agents.first { $0.id == id } ?? thread?.agent }
+    private var listedAgent: MobileAgentRow? { sync.helpersSnapshot?.agents.first { $0.id == id } }
+    private var agent: MobileAgentRow? { listedAgent ?? thread?.agent }
 
     private var sendRestriction: String? {
         agent?.sendRestriction
@@ -29,35 +30,44 @@ struct MobileAgentThreadView: View {
     var body: some View {
         AlivePage(title: agent?.name ?? "Agent", line: agent.map(MobileAgentPresentation.line) ?? "Conversation with another agent.") {
             if !pairing.isPaired { AliveUnpairedReason() }
-            if let error { AliveSection("Couldn’t complete the request") { Text(error).aliveRow() } }
             FaceView(face: face, door: door, session: session)
             if busy { ProgressView("Waiting for Mac…").aliveRow() }
         }
-        .task { await refresh() }
+        .task(id: id) { await refresh() }
         .refreshable { await refresh() }
-        .onChange(of: agent) { _, _ in
+        .onChange(of: listedAgent?.summary) { _, summary in
+            guard let summary, thread?.agent.summary != summary else { return }
             Task { await refresh() }
         }
     }
 
     private var face: PartFace {
         var sections: [PartFace.Section] = []
+        if let error {
+            sections.append(.init(id: "error", title: "Couldn’t complete the request", rows: [.init(id: "cause", title: error, tone: .failed)]))
+        }
         if let thread {
-            sections = thread.lines.map { line in
-                .init(id: "exchange-" + line.id, title: line.speaker,
-                    footer: Date(timeIntervalSince1970: line.at).formatted(date: .abbreviated, time: .shortened), rows: [],
+            let exchanges = thread.lines.map { line in
+                PartFace.Section(id: "exchange-" + line.id, title: line.speaker,
+                    footer: line.at.isFinite && line.at > 0
+                        ? Date(timeIntervalSince1970: line.at).formatted(date: .abbreviated, time: .shortened) : nil,
+                    rows: [],
                     block: .init(kind: "document", key: line.id, text: line.text, format: "plain", copy: true))
             }
-            if sections.isEmpty { sections = [.init(id: "conversation", rows: [.init(id: "empty", title: "No exchanges yet.")])] }
+            if exchanges.isEmpty {
+                sections.append(.init(id: "conversation", rows: [.init(id: "empty", title: "No exchanges yet.")]))
+            } else {
+                sections += exchanges
+            }
             if thread.truncated {
                 sections.append(.init(id: "excerpt-note", rows: [
                     .init(id: "excerpt", title: "Recent excerpts; the full conversation remains on the Mac.", tone: .quiet)
                 ]))
             }
         } else {
-            sections = [.init(id: "conversation", rows: [
+            sections.append(.init(id: "conversation", rows: [
                 .init(id: "waiting", title: busy ? "Reading conversation from the Mac…" : "This conversation has not reached this iPhone.")
-            ])]
+            ]))
         }
         if let agent {
             sections.append(.init(id: "details", title: "Connection details", rows: [

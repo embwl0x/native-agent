@@ -31,12 +31,9 @@ public struct PanelFreshnessFace: FaceValue {
 
     public var panels: [String: Panel]
     public var sidebar: PanelRefreshStatus?
-    public var detached: [String: PanelRefreshStatus]
 
-    public init(panels: [String: Panel] = [:], sidebar: PanelRefreshStatus? = nil,
-                detached: [String: PanelRefreshStatus] = [:]) {
+    public init(panels: [String: Panel] = [:], sidebar: PanelRefreshStatus? = nil) {
         self.panels = panels
         self.sidebar = sidebar
-        self.detached = detached
     }
 }

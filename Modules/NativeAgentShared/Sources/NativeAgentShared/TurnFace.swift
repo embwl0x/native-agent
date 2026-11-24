@@ -236,7 +236,7 @@ public struct TurnFace: FaceValue {
     public let liveLine: String?
     public let workPill: String?
     public let steps: [Step]
-    public let preview: Preview?
+    public private(set) var preview: Preview?
     public let approvalStatus: String?
     /// Where the running turn's attention is now: the face link of the place its last call that worked names (`page:desk/<handle>`,
     /// `page:memories`). Nil between turns and before the turn has been anywhere; the window follows it (`WindowFollowsPreference`).
@@ -244,6 +244,16 @@ public struct TurnFace: FaceValue {
 
     public var isWorking: Bool { isBusy || isStreaming }
     public var isRunning: Bool { isWorking || isInFlight || phase.map { !$0.isTerminal } == true }
+
+    func supersedesPreview(of previous: TurnFace) -> Bool {
+        guard turnID != nil, phase?.isTerminal == false, card?.isTerminal != true,
+              let old = previous.preview, let new = preview,
+              old.imageData != nil, new.imageData != nil, old.imageError == nil, new.imageError == nil,
+              old.updatedAt <= new.updatedAt else { return false }
+        var prior = previous
+        prior.preview = new
+        return prior == self
+    }
 
     public init(sessionID: String, turnID: String?, activeTurnID: String?, phase: TurnPresentationPhase?, isInFlight: Bool,
                 card: MacChatTurnCardModel?, hasReservation: Bool, isBusy: Bool, isStreaming: Bool, isReplying: Bool, isThinking: Bool,
@@ -341,10 +351,6 @@ public struct TurnSessionsFace: FaceValue {
     }
 }
 
-extension Notification.Name {
-    public static let turnSessionsFacePublished = Notification.Name("turnSessionsFacePublished")
-}
-
 /// One quiet row, with navigation and cancellation reaching the turn's existing owners.
 public struct TurnElsewhereLine: View {
     public let movements: [TurnSessionsFace.Movement]
@@ -361,6 +367,14 @@ public struct TurnElsewhereLine: View {
         self.stop = stop
     }
 
+    private var controlTarget: CGFloat {
+        #if os(iOS)
+        44
+        #else
+        28
+        #endif
+    }
+
     public var body: some View {
         if let first = movements.first {
             HStack(spacing: 8) {
@@ -370,7 +384,7 @@ public struct TurnElsewhereLine: View {
                             .symbolEffect(.pulse, options: .repeating, isActive: first.isMoving && !reduceMotion)
                         Text(agentName + " · " + first.line).lineLimit(1).truncationMode(.tail)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: controlTarget, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .accessibilityHint("Open the conversation where this turn is running")
@@ -379,12 +393,20 @@ public struct TurnElsewhereLine: View {
                         ForEach(movements) { movement in
                             Button(movement.line) { open(movement.identity.sessionId) }
                         }
-                    } label: { Text("+\(movements.count - 1)") }
+                    } label: {
+                        Text("+\(movements.count - 1)")
+                            .frame(minWidth: controlTarget, minHeight: controlTarget)
+                            .contentShape(Rectangle())
+                    }
                     .accessibilityLabel("Other open turns")
                 }
                 if first.runID != nil {
-                    Button { stop(first.identity.sessionId) } label: { Image(systemName: "stop.fill") }
-                        .accessibilityLabel("Stop this turn")
+                    Button { stop(first.identity.sessionId) } label: {
+                        Image(systemName: "stop.fill")
+                            .frame(minWidth: controlTarget, minHeight: controlTarget)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Stop this turn")
                 }
             }
             .buttonStyle(.plain)

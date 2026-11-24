@@ -26,6 +26,12 @@ extension AppModel {
     func facePreference<Value: FacePreferenceScalar>(_ key: String, as: Value.Type) -> Value? {
         face.slot(.settings).select("preference.value:\(key)", as: SettingsFace.self) { $0?.preferences[key].flatMap(Value.read) }
     }
+    var windowLeaves: [String] {
+        face.slot(.settings).select("window.leaves", as: SettingsFace.self) { $0?.window?.leaves ?? [] }
+    }
+    var windowSampling: [String: Double] {
+        face.slot(.settings).select("window.sampling", as: SettingsFace.self) { $0?.window?.sampling ?? [:] }
+    }
     var settingsViewModeIssue: String? {
         face.slot(.settings).select("preference.issue:nativeagent.viewMode", as: SettingsFace.self) {
             $0?.preferenceIssues["nativeagent.viewMode"]

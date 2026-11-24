@@ -18,6 +18,7 @@ public enum NativeAgentSpacing {
     public static let pageTop: CGFloat = 36
     public static let rowInsetV: CGFloat = 14
     public static let eyebrowGap: CGFloat = 10
+    public static let chatRoomWidth: CGFloat = 740
 }
 
 public enum NativeAgentRadius {
@@ -28,7 +29,6 @@ public enum NativeAgentRadius {
 }
 
 public extension Color {
-    #if canImport(AppKit) || canImport(UIKit)
     static func adaptive(dark: UInt, light: UInt) -> Color {
         #if canImport(AppKit)
         Color(nsColor: NSColor(name: nil) { appearance in
@@ -39,7 +39,6 @@ public extension Color {
         Color(uiColor: UIColor { UIColor(Color(hex: $0.userInterfaceStyle == .dark ? dark : light)) })
         #endif
     }
-    #endif
 
     init(hex: UInt, opacity: Double = 1) {
         self.init(.sRGB, red: Double((hex >> 16) & 0xFF) / 255,

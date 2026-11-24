@@ -2,8 +2,8 @@
 
 The organism turns admitted events and current system evidence into bounded
 body state. Its implementation is in
-`Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/`; integration
-lives in the core `Cognition/NativeCognitionRuntime` files.
+`Modules/NativeAgentCore/Sources/MindCore/CognitiveSubstrate/Organism/`; integration
+lives in the core `BodyRuntime/Cognition/NativeCognitionRuntime` files.
 
 See [COGNITION_WIRING.md](COGNITION_WIRING.md) for the connections to memory,
 turns and background work.
@@ -175,7 +175,7 @@ Owners: `OrganismPersistence.swift`, `OrganismChemistry.swift`, `OrganismKernel.
 ### 4. Tenderness — event-driven: caring moments dose it, days fade it
 
 A caring judgment arrives through the shared interpretation in
-`ChatTurnRuntime/MindMemoryManager.swift`. `CognitiveSubstrate+CaringEvent.swift`
+`BodyRuntime/ChatTurnRuntime/MindMemoryManager.swift`. `CognitiveSubstrate+CaringEvent.swift`
 checks the originating turn and relay/encounter evidence before admitting it.
 Failed or unavailable interpretation supplies no caring verdict. A verdict
 uses exactly `none`, `cared_for`, `room_made`, `need_met` or `repair`, a string
@@ -232,12 +232,6 @@ term contributes its unfamiliar share, with familiarity and the resulting
 curiosity fading on the care owner's two-hour present-depth half-life. This
 language-independent lexical signal requires no new model call, keyword list,
 or absolute threshold; it does not claim semantic understanding of synonyms.
-The shared affect interpreter has no chosen-register judgment.
-Holding a private chosen register requires that shared interpretation and its
-journal fold to carry the choice and its stretch; it is not inferred from
-phrasing or another speaker's guess.
-or absolute threshold; semantic tags and bodily curiosity share it. It does
-not claim semantic understanding of synonyms.
 The existing shared interpretation carries `affect.chosenRegister` only when
 their reply states a self-chosen mood/register or its release. Its exact reply
 evidence is checked by the interpretation owner; incoming requests, guessed
@@ -378,10 +372,13 @@ A held slot paces waking reflection; a dream's reflection still reaches substrat
 
 `NativeCognitionRuntime+BodyContinuity.swift` owns
 `<dataRoot>/cognition/organism_state.json`; `OrganismPersistence.swift` defines
-the stored state and restoration/decay behavior. Its sole writer compares the
-decoded stored value with the value at persisted date precision before writing;
-JSON key or set order causes no write. Unreadable stored continuity remains a
-failure and is preserved. `savedAt` remains the chemistry's settlement anchor,
+the stored state and restoration/decay behavior. Its sole writer hashes sorted
+JSON with ISO 8601 dates and sorted dream completion IDs. A matching digest
+and file revision skip the write. Restore, Reset Body and Clear invalidate the
+remembered revision. Reading an unfamiliar revision checks its stored state
+before comparing canonical bytes. A damaged file produces a persistence
+failure and retains its bytes. Encoding checks the schema and embedded field
+and prediction IDs before publication. `savedAt` remains the chemistry's settlement anchor,
 so genuine elapsed decay is saved with the values it anchors.
 Only its current schema is accepted: encounter, epoch, lived watermark, field
 identities, outcome weights and current body fields are checked, with no rekeying
@@ -395,7 +392,7 @@ the 72-hour tissue-decay cap. Dream completion evidence reads only the checked
 diary modification times and parent writability cannot establish completion or
 store health. Missing marks contribute no completion evidence; damaged marks
 make the reading unavailable. The completion effect follows the
-[dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--schedule-artifacts-re-entry): its original section
+[dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--times-artifacts-re-entry): its original section
 UUID, time and felt summary are saved before publication. Attention receives
 that completion before optional body effects. The feeling frame reads the
 recorded night admission and the diary journal's retained published completion,
@@ -418,8 +415,7 @@ The sampler derives compatibility values from those readings; configuration avai
 remains exact and separate. APNs receipts with no HTTP answer remain unknown;
 only an actual HTTP rejection supplies provider-failure evidence. A missing
 fan-out receipt or diagnostic error alone never establishes a rejected write.
-Signed-phone, notification-target, APNs and ability/trace read failures carry `sourceUnavailable` and an owner repair obligation; failed inventory is never off/unconfigured, damaged newest outcomes never select older rows, and missing metadata never becomes now. Signed-phone writes first read the existing record under the same lock and refuse to overwrite unreadable evidence. Damaged
-remains exact and separate. Signed-phone, notification-target and ability/trace read failures carry `sourceUnavailable` and an owner repair obligation; failed inventory is never off/unconfigured, damaged newest outcomes never select older rows, and missing metadata never becomes now. Notification delivery reads the live kernel's current keyless publication-failure/signed-phone-receipt prediction, never optional APNS outcomes. Missing, pending and expired predictions supply no terminal evidence; the optional `notificationPathHealthy` projection becomes unknown without a supported delivery verdict, including when unconfigured. Its neutral value is unknown; a delivery start clears it, a signed receipt supports true and publication failure supports false. Reachable/stale peer signals change reachability alone. Current notification readings replace persisted compatibility values rather than preserving unsupported health. Neither publication nor process receipt proves display or user attention. Signed-phone writes first read the existing record under the same lock and refuse to overwrite unreadable evidence. Damaged
+Signed-phone, notification-target and ability/trace read failures carry `sourceUnavailable` and an owner repair obligation; failed inventory is never off/unconfigured, damaged newest outcomes never select older rows, and missing metadata never becomes now. Notification delivery reads the live kernel's current keyless publication-failure/signed-phone-receipt prediction, never optional APNs diagnostics. Missing, pending and expired predictions supply no terminal evidence; the optional `notificationPathHealthy` projection becomes unknown without a supported delivery verdict, including when unconfigured. Its neutral value is unknown; a delivery start clears it, a signed receipt supports true and publication failure supports false. Reachable/stale peer signals change reachability alone. Current notification readings replace persisted compatibility values rather than preserving unsupported health. Neither publication nor process receipt proves display or user attention. Signed-phone writes first read the existing record under the same lock and refuse to overwrite unreadable evidence. Damaged
 saved continuity remains unavailable and is not overwritten by a freshly initialized snapshot. Nothing
 writes the file before its restore has finished: the caring sink, the
 after-turn reaction, settle and reset join the cognition opening first (see

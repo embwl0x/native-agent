@@ -12,13 +12,6 @@ enum ActivityScreenPresentation {
         action != "studio.canon"
     }
 
-    /// Consume notification suppression once so a cancelled appearance cannot suppress the next refresh.
-    static func shouldRefreshOnAppear(skipInitialRefresh: inout Bool) -> Bool {
-        guard skipInitialRefresh else { return true }
-        skipInitialRefresh = false
-        return false
-    }
-
     /// Open the queue that can resolve the review request; the Activity summary cannot decide it.
     static func activityDestination(for notificationScreen: String) -> ActivitySection? {
         switch notificationScreen.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -30,7 +23,6 @@ enum ActivityScreenPresentation {
 
 struct ActivityView: View {
     private let sync = iCloudSyncEngine.shared
-    @Binding var skipInitialRefresh: Bool
     @Binding var navigationTarget: ActivitySection?
     /// A card a link elsewhere asked to open.
     @Binding var cardTarget: String?
@@ -38,11 +30,9 @@ struct ActivityView: View {
     @State private var path = NavigationPath()
 
     init(
-        skipInitialRefresh: Binding<Bool> = .constant(false),
         navigationTarget: Binding<ActivitySection?> = .constant(nil),
         cardTarget: Binding<String?> = .constant(nil)
     ) {
-        self._skipInitialRefresh = skipInitialRefresh
         self._navigationTarget = navigationTarget
         self._cardTarget = cardTarget
     }
@@ -57,7 +47,6 @@ struct ActivityView: View {
             AlivePage(title: today?.title ?? "Today", line: today?.line, style: .root) {
                 MobileFaceRows(page: "today") { path.append($0) }
             }
-            .macSyncErrorBanner()
             .navigationDestination(for: FaceDestination.self) { $0.view }
             .navigationDestination(for: ActivitySection.self) { section in
                 // Destinations share Activity's NavigationStack; nesting another breaks navigation.
@@ -67,12 +56,11 @@ struct ActivityView: View {
                 }
             }
             .refreshable {
+                _ = await sync.refreshSnapshotGroup(.faces)
                 await sync.refreshActivitySnapshot()
             }
             .task {
-                if !ActivityScreenPresentation.shouldRefreshOnAppear(skipInitialRefresh: &skipInitialRefresh) {
-                    return
-                }
+                _ = await sync.refreshSnapshotGroup(.faces)
                 await sync.refreshActivitySnapshot()
             }
             .onChange(of: navigationTarget) { _, section in
@@ -92,6 +80,7 @@ struct ActivityView: View {
                 #endif
             }
         }
+        .macSyncErrorBanner()
     }
 
     private func openRequestedSection(_ section: ActivitySection?) {
@@ -133,7 +122,7 @@ struct ActivityView: View {
             .init(id: "queues", style: .flow, rows: [
                 .init(id: "approvals", title: "Approvals and past decisions", open: "page:today/approvals"),
                 .init(id: "inbox", title: "Every note I've left you", open: "page:today/inbox"),
-                .init(id: "rem", title: "REM Replay Lineage", open: "page:today/cognitionProposals"),
+                .init(id: "rem", title: "Growth proposals", open: "page:today/cognitionProposals"),
             ]),
         ]), error: nil, owed: false)
     #endif

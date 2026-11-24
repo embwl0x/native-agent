@@ -1,22 +1,13 @@
-import EngineRuntime
-import ActivityWatch
-import ApprovalInbox
-import Connectors
+import BodyRuntime
+import MacNerves
 import ProviderRouting
-import AppToolRuntime
-import AuthoredCapabilities
+import SenseCore
 import Foundation
-import ApprovalTransactions
 import NativeAgentCore
 import NativeAgentShared
-import MemoryV2
+import MindCore
 import PersistenceCore
-import Privacy
-import ChatToolRuntime
-import Desk
-import MacIntegration
-import NotificationInbox
-import TrustPersistence
+import DeskCore
 // Blueprint: | `AppQuietToolHost.swift` | `AppQuietToolHost`: `inboxFence`, `inbox`, `provider` |
 
 @MainActor final class AppQuietToolHost: AppQuietSettingsHost, QuietToolHost {
@@ -264,7 +255,7 @@ extension AppQuietToolHost: QuietInboxHost {
     var interactionSource: String { InlineInteractionDelivery.source }
     func interactionForInboxItem(_ id: String, dataRoot: URL) async throws -> InlineInteraction? {
         let pointer = try await InlineInteractionDelivery.pointer(id: id, dataRoot: dataRoot)
-        return try await InlineInteractionResolver.interaction(id: pointer.interactionID, sessionID: pointer.sessionID, dataRoot: dataRoot)
+        return try await appModel.engine.interactions.interaction(id: pointer.interactionID, sessionID: pointer.sessionID)
     }
     func readInbox() async throws -> [InboxItemRecord] { try await appModel.engine.inbox.list() }
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord]) {
@@ -274,12 +265,12 @@ extension AppQuietToolHost: QuietInboxHost {
         if let face {
             try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
                 dataRootOverride: dataRootOverride, turn: turn,
-                effects: BodyInboxCardActionEffects(call: { try await face.call($0) }, renderer: face.connection))
+                effects: BodyInboxCardActionEffects(engine: appModel.engine, call: { try await face.call($0) }, renderer: face.connection))
             return
         }
         try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
             dataRootOverride: dataRootOverride, turn: turn,
-            effects: AppInboxCardActionEffects())
+            effects: AppInboxCardActionEffects(engine: appModel.engine))
     }
     func withdrawApproval(id: String, decidedBy: String) async throws {
         guard let turn = inboxTurn else {
@@ -302,7 +293,7 @@ extension AppQuietToolHost: QuietInboxHost {
     }
     func runCardControl(id: String, sessionID: String, choice: String?) async throws {
         guard let face else { throw FaceWireError.disconnected }
-        guard let card = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: appModel.engine.dataRoot) else {
+        guard let card = try await appModel.engine.interactions.interaction(id: id, sessionID: sessionID) else {
             throw PartCallError(code: "card_unavailable", message: "This request has no saved interaction.")
         }
         let answer = CardAnswer(identity: .init(card: id, session: sessionID, revision: card.revision),

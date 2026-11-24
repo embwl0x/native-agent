@@ -22,9 +22,8 @@ public struct OtherRoomExchange: Codable, Hashable, Identifiable, Sendable {
 
     public var title: String { contact + " ⇄ " + agent + " — " + Self.firstLine(message) }
     public var subtitle: String { Self.firstLine(reply) }
-    private static func firstLine(_ text: String) -> String {
-        let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
-        return line.count > 80 ? String(line.prefix(79)) + "…" : line
+    static func firstLine(_ text: String) -> String {
+        text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
     }
 
     /// Before the next transcript row by time; "" is the tail after the last.
@@ -42,12 +41,27 @@ public struct OtherRoomExchangePreview: View {
     public init(exchange: OtherRoomExchange) { self.exchange = exchange }
     public var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(exchange.title)
-            Text(exchange.subtitle).foregroundStyle(.secondary)
+            Text(titleLine)
+            Text(inlineLine(exchange.reply)).foregroundStyle(.secondary)
         }
         .font(.callout)
         .lineLimit(1)
+        .truncationMode(.tail)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var titleLine: AttributedString {
+        var line = AttributedString(exchange.contact + " ⇄ " + exchange.agent + " — ")
+        line.append(inlineLine(exchange.message))
+        return line
+    }
+
+    private func inlineLine(_ text: String) -> AttributedString {
+        let first = OtherRoomExchange.firstLine(text)
+        guard !first.isEmpty else { return AttributedString() }
+        var preview = ChatRichContentParser.inline(first).presentation
+        preview.link = nil
+        return preview
     }
 }
 

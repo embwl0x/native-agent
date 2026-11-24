@@ -85,7 +85,6 @@ open class TranscriptFragment: NSTextLayoutFragment {
 extension TranscriptBlock.Lead {
     /// The space above a block led this way. `message` is the platform's gap between messages: the Mac's
     /// `NativeAgentShellLayout.transcriptGap` (16), the phone's 26.
-    @available(macOS 15, iOS 18, *)
     public func topGap(message: CGFloat) -> CGFloat {
         switch self {
         case .none: 0

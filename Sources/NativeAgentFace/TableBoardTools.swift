@@ -45,14 +45,15 @@ struct TableBoardTools: View {
     }()
 
     var body: some View {
-        GlassEffectContainer {
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 4) { tools; camera }
-                VStack(alignment: .leading, spacing: 8) { HStack(spacing: 4) { tools }; HStack(spacing: 8) { camera } }
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 4) { tools; Divider().frame(height: 16).padding(.horizontal, 4); camera }.fixedSize()
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 4) { tools }.fixedSize()
+                HStack(spacing: 4) { camera }.fixedSize()
             }
-            .buttonStyle(.plain).foregroundStyle(.primary).font(ShellType.label).padding(8)
-            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
+        .buttonStyle(.plain).foregroundStyle(.primary).font(ShellType.label).padding(8)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onChange(of: picking) { _, now in if !now && tool == .card { tool = .select } }
     }
     private var tools: some View {
@@ -61,8 +62,9 @@ struct TableBoardTools: View {
                 tool = tool == option ? .select : option
                 picking = tool == .card
             } label: {
-                Label(option.rawValue, systemImage: option.symbol).padding(6)
+                Label(option.rawValue, systemImage: option.symbol).fixedSize().padding(6)
                     .background(tool == option ? Color.primary.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 7))
+                    .contentShape(RoundedRectangle(cornerRadius: 7))
             }
             .help(option.help)
             .popover(isPresented: Binding(get: { picking && option == .card }, set: { picking = $0 }),
@@ -70,10 +72,16 @@ struct TableBoardTools: View {
         }
     }
     @ViewBuilder private var camera: some View {
-        Button { zoom(0.8) } label: { Label("Zoom out", systemImage: "minus.magnifyingglass") }.help("Make the table smaller.")
-        Text("\(percent)%").monospacedDigit()
-        Button { zoom(1.25) } label: { Label("Zoom in", systemImage: "plus.magnifyingglass") }.help("Make the table larger.")
-        Button(action: fit) { Label("Fit", systemImage: "arrow.up.left.and.arrow.down.right") }.help("Centre the table and follow changes.")
+        Button { zoom(0.8) } label: {
+            Label("Zoom out", systemImage: "minus.magnifyingglass").fixedSize().padding(6).contentShape(Rectangle())
+        }.help("Make the table smaller.")
+        Text("\(percent)%").monospacedDigit().fixedSize().padding(.horizontal, 4)
+        Button { zoom(1.25) } label: {
+            Label("Zoom in", systemImage: "plus.magnifyingglass").fixedSize().padding(6).contentShape(Rectangle())
+        }.help("Make the table larger.")
+        Button(action: fit) {
+            Label("Fit", systemImage: "arrow.up.left.and.arrow.down.right").fixedSize().padding(6).contentShape(Rectangle())
+        }.help("Centre the table and follow changes.")
     }
 }
 
@@ -89,31 +97,29 @@ struct TableElementTools: View {
     let remove: () -> Void
     var open: (() -> Void)?
     var body: some View {
-        GlassEffectContainer {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 12) {
-                    if starting { Text("Start").font(.caption).foregroundStyle(.secondary) }
-                    Button(action: cross) { Label("Cross off", systemImage: "checkmark") }.help("Cross off the selected element.")
-                    Button(action: connect) { Label("Connect", systemImage: "arrow.up.right") }.disabled(!connectable)
-                        .help("Start an arrow from the selected card.")
-                    Button(action: remove) { Label("Delete", systemImage: "trash") }.help("Delete the selected element and attached arrows.")
-                    if let open { Button(action: open) { Label("Open", systemImage: "arrow.up.forward.square") }.help("Open the piece in Make.") }
-                }
-                if colours {
-                    HStack(spacing: 10) {
-                        ForEach(BoardPalette.names, id: \.self) { name in
-                            Button { recolor(name) } label: {
-                                Circle().fill(BoardPalette.fill(name)).frame(width: 18, height: 18)
-                                    .overlay(Circle().stroke((color ?? "white") == name
-                                        ? BoardPalette.words(name, table: true) : TodayPalette.cardStroke, lineWidth: 1))
-                            }.accessibilityLabel(name.capitalized).help("Colour the selected card " + name + ".")
-                        }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                if starting { Text("Start").font(.caption).foregroundStyle(.secondary) }
+                Button(action: cross) { Label("Cross off", systemImage: "checkmark") }.help("Cross off the selected element.")
+                Button(action: connect) { Label("Connect", systemImage: "arrow.up.right") }.disabled(!connectable)
+                    .help("Start an arrow from the selected card.")
+                Button(action: remove) { Label("Delete", systemImage: "trash") }.help("Delete the selected element and attached arrows.")
+                if let open { Button(action: open) { Label("Open", systemImage: "arrow.up.forward.square") }.help("Open the piece in Make.") }
+            }
+            if colours {
+                HStack(spacing: 10) {
+                    ForEach(BoardPalette.names, id: \.self) { name in
+                        Button { recolor(name) } label: {
+                            Circle().fill(BoardPalette.fill(name)).frame(width: 18, height: 18)
+                                .overlay(Circle().stroke((color ?? "white") == name
+                                    ? BoardPalette.words(name, table: true) : TodayPalette.cardStroke, lineWidth: 1))
+                        }.accessibilityLabel(name.capitalized).help("Colour the selected card " + name + ".")
                     }
                 }
             }
-            .buttonStyle(.plain).foregroundStyle(.primary).font(ShellType.label).padding(10)
-            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
+        .buttonStyle(.plain).foregroundStyle(.primary).font(ShellType.label).padding(10)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 

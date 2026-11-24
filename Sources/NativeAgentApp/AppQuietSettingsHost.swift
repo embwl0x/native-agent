@@ -1,16 +1,11 @@
-import ActivityWatch
-import AppToolRuntime
-import Cognition
-import Context
+import MacNerves
+import BodyRuntime
+import MindCore
 import Foundation
 import PersistenceCore
 import NativeAgentShared
 import ProviderRouting
-import Research
-import TrustCenter
-import MemoryV2
-import DeviceSync
-import EngineRuntime
+import DeskCore
 // Blueprint: | `AppQuietSettingsHost.swift` | Owner-declared settings; phone rows use signed requests, with no Mac copies |
 
 /// Settings adapters must share the UI's observed model actions.

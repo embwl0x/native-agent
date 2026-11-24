@@ -249,7 +249,8 @@ public struct FaceLongText: View {
 
     @concurrent nonisolated private static func parse(_ text: String) async throws -> AttributedString {
         try Task.checkCancellation()
-        return try AttributedString(markdown: text, options: .init(interpretedSyntax: .full, failurePolicy: .throwError))
+        // A document's links obey chat's link policy: an untrusted scheme keeps its words and loses the link.
+        return ChatLinkPolicy.sanitized(try AttributedString(markdown: text, options: .init(interpretedSyntax: .full, failurePolicy: .throwError)))
     }
 }
 
@@ -289,11 +290,13 @@ private struct FaceTextKit: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let view = scroll.documentView as? NSTextView else { return }
         if let markdown {
-            let value = NSAttributedString(markdown)
+            let value = Self.attributed(markdown)
             if view.attributedString() != value { view.textStorage?.setAttributedString(value) }
-        } else if view.string != text { view.string = text }
-        view.font = code ? .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular) : .systemFont(ofSize: NSFont.systemFontSize)
-        view.textColor = .labelColor
+        } else {
+            if view.string != text { view.string = text }
+            view.font = code ? .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular) : .systemFont(ofSize: NSFont.systemFontSize)
+            view.textColor = .labelColor
+        }
         if context.coordinator.find != find {
             context.coordinator.find = find
             scroll.window?.makeFirstResponder(view)
@@ -301,6 +304,27 @@ private struct FaceTextKit: NSViewRepresentable {
             command.tag = NSTextFinder.Action.showFindInterface.rawValue
             view.performTextFinderAction(command)
         }
+    }
+    private static func attributed(_ markdown: AttributedString) -> NSAttributedString {
+        var styled = AttributedString()
+        let base = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        for run in markdown.runs {
+            var segment = AttributedString(markdown[run.range])
+            if segment.appKit.font == nil {
+                let intent = run.inlinePresentationIntent ?? []
+                var font = intent.contains(.code)
+                    ? NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+                    : base
+                if intent.contains(.stronglyEmphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+                if intent.contains(.emphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
+                segment.appKit.font = font
+            }
+            if segment.appKit.foregroundColor == nil, segment.link == nil {
+                segment.appKit.foregroundColor = .labelColor
+            }
+            styled.append(segment)
+        }
+        return NSAttributedString(styled)
     }
 }
 #else
@@ -325,16 +349,43 @@ private struct FaceTextKit: UIViewRepresentable {
     }
     func updateUIView(_ view: UITextView, context: Context) {
         if let markdown {
-            let value = NSAttributedString(markdown)
+            let value = Self.attributed(markdown)
             if view.attributedText != value { view.attributedText = value }
-        } else if view.text != text { view.text = text }
-        view.font = code ? .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular)
-            : .preferredFont(forTextStyle: .body)
-        view.textColor = .label
+        } else {
+            if view.text != text { view.text = text }
+            view.font = code ? .monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular)
+                : .preferredFont(forTextStyle: .body)
+            view.textColor = .label
+        }
         if context.coordinator.find != find {
             context.coordinator.find = find
             view.findInteraction?.presentFindNavigator(showingReplace: false)
         }
+    }
+    private static func attributed(_ markdown: AttributedString) -> NSAttributedString {
+        var styled = AttributedString()
+        let base = UIFont.preferredFont(forTextStyle: .body)
+        for run in markdown.runs {
+            var segment = AttributedString(markdown[run.range])
+            if segment.uiKit.font == nil {
+                let intent = run.inlinePresentationIntent ?? []
+                var font = intent.contains(.code)
+                    ? UIFont.monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular)
+                    : base
+                var traits = font.fontDescriptor.symbolicTraits
+                if intent.contains(.stronglyEmphasized) { traits.insert(.traitBold) }
+                if intent.contains(.emphasized) { traits.insert(.traitItalic) }
+                if let descriptor = font.fontDescriptor.withSymbolicTraits(traits) {
+                    font = UIFont(descriptor: descriptor, size: 0)
+                }
+                segment.uiKit.font = font
+            }
+            if segment.uiKit.foregroundColor == nil, segment.link == nil {
+                segment.uiKit.foregroundColor = .label
+            }
+            styled.append(segment)
+        }
+        return NSAttributedString(styled)
     }
 }
 #endif

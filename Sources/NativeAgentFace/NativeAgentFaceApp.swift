@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Foundation
 import NativeAgentShared
 import UserNotifications
 // Blueprint: | `NativeAgentFaceApp.swift` | Copied window bootstrap; its only agent owner is the inherited pipe client; it ends with its body's process |
@@ -76,7 +77,7 @@ struct FaceWindowCommands: Commands {
             }.keyboardShortcut("b", modifiers: [.command, .option])
         }
         CommandMenu("Navigate") {
-            Button("Command palette…") { NotificationCenter.default.post(name: .openCommandPaletteRequest, object: nil) }
+            Button("Command palette…") { NotificationCenter.default.post(OpenCommandPaletteRequest()) }
                 .keyboardShortcut("k", modifiers: .command)
             if let layout = appModel.shellLayout {
                 ForEach(NavigateMenuPresentation.entries(layout)) { entry in

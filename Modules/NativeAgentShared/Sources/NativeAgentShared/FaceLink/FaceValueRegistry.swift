@@ -4,41 +4,39 @@ import Foundation
 public struct FaceValueRegistration: Sendable {
     public let name: String
     fileprivate let type: ObjectIdentifier
-    fileprivate let encode: @Sendable (AnyFaceValue) throws -> Data
-    fileprivate let decode: @Sendable (Data) throws -> AnyFaceValue
+    fileprivate let decode: @Sendable (any Decoder) throws -> AnyFaceValue
 
     public init<Value: FaceValue>(_ value: Value.Type, name: String) {
         self.name = name
         type = ObjectIdentifier(value)
-        encode = { erased in
-            guard let value = erased.base as? Value else { throw FaceWireError.valueType(name) }
-            return try JSONEncoder().encode(value)
-        }
-        decode = { data in AnyFaceValue(try JSONDecoder().decode(Value.self, from: data)) }
+        decode = { AnyFaceValue(try Value(from: $0)) }
     }
 }
 
 public struct FaceValueRegistry: Sendable {
-    private let registrations: [FaceValueRegistration]
+    private let types: [ObjectIdentifier: [FaceValueRegistration]]
+    private let names: [String: [FaceValueRegistration]]
 
-    public init(registrations: [FaceValueRegistration]) { self.registrations = registrations }
+    public init(registrations: [FaceValueRegistration]) {
+        types = Dictionary(grouping: registrations, by: \.type)
+        names = Dictionary(grouping: registrations, by: \.name)
+    }
 
-    fileprivate func encode(_ value: AnyFaceValue) throws -> (String, Data) {
-        let matches = registrations.filter { $0.type == ObjectIdentifier(Swift.type(of: value.base)) }
-        guard matches.count == 1, let entry = matches.first else {
-            throw FaceWireError.valueType(String(describing: Swift.type(of: value.base)))
+    fileprivate func name(of value: AnyFaceValue) throws(FaceWireError) -> String {
+        let type = Swift.type(of: value.base)
+        guard let matches = types[ObjectIdentifier(type)], matches.count == 1, let entry = matches.first else {
+            throw FaceWireError.valueType(String(describing: type))
         }
-        return (entry.name, try entry.encode(value))
+        return entry.name
     }
 
-    fileprivate func decode(name: String, data: Data) throws -> AnyFaceValue {
-        let matches = registrations.filter { $0.name == name }
-        guard let entry = matches.first else { throw FaceWireError.unknownValue(name) }
+    fileprivate func decode(name: String, from decoder: any Decoder) throws -> AnyFaceValue {
+        guard let matches = names[name], let entry = matches.first else { throw FaceWireError.unknownValue(name) }
         guard matches.count == 1 else { throw FaceWireError.duplicateValue(name) }
-        return try entry.decode(data)
+        return try entry.decode(decoder)
     }
 
-    public static var standard: FaceValueRegistry {
+    public static let standard: FaceValueRegistry = {
         FaceValueRegistry(registrations: [
             .init(ApprovalsFace.self, name: "approvals-face.v1"),
             .init(TranscriptFace.self, name: "transcript-face.v1"),
@@ -46,7 +44,6 @@ public struct FaceValueRegistry: Sendable {
             .init(SessionRowFace.self, name: "session-row-face.v1"),
             .init(SessionListFace.self, name: "session-list-face.v1"),
             .init(SessionSearchFace.self, name: "session-search-face.v1"),
-            .init(SessionPaletteFace.self, name: "session-palette-face.v1"),
             .init(SessionNavigationFace.self, name: "session-navigation-face.v1"),
             .init(CountReading.self, name: "count-reading.v1"),
             .init(InboxCountsFace.self, name: "inbox-counts-face.v1"),
@@ -96,11 +93,7 @@ public struct FaceValueRegistry: Sendable {
             .init(MakeShelfFace.self, name: "make-shelf-face.v1"),
             .init(MakePreviewFace.self, name: "make-preview-face.v1"),
             .init(SenseViewFace.self, name: "sense-view-face.v1"),
-            .init(MemoryDiagnosticsFace.self, name: "memory-diagnostics-face.v1"),
             .init(KnowledgeGraphFace.self, name: "knowledge-graph-face.v1"),
-            .init(FaceGraphNeighborhood.self, name: "graph-neighborhood-face.v1"),
-            .init(DreamDiaryFace.self, name: "dream-diary-face.v1"),
-            .init(DreamEntryFace.self, name: "dream-entry-face.v1"),
             .init(CognitionFace.self, name: "cognition-face.v1"),
             .init(ContextFlowHealthFace.self, name: "context-flow-health-face.v1"),
             .init(MoodFace.self, name: "mood-face.v1"),
@@ -112,9 +105,9 @@ public struct FaceValueRegistry: Sendable {
             .init(MacControlFace.self, name: "mac-control-face.v1"),
             .init(VoiceFace.self, name: "voice-face.v1"),
         ])
-    }
+    }()
 
-    fileprivate static func configured(in info: [CodingUserInfoKey: Any]) throws -> FaceValueRegistry {
+    fileprivate static func configured(in info: [CodingUserInfoKey: Any]) throws(FaceWireError) -> FaceValueRegistry {
         guard let key = CodingUserInfoKey.faceValueRegistry else { throw FaceWireError.registryConfiguration }
         guard let value = info[key] else { return .standard }
         guard let registry = value as? FaceValueRegistry else { throw FaceWireError.registryConfiguration }
@@ -132,20 +125,20 @@ extension AnyFaceValue: Codable {
     public init(from decoder: any Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
         self = try FaceValueRegistry.configured(in: decoder.userInfo).decode(
-            name: fields.decode(String.self, forKey: .name), data: fields.decode(Data.self, forKey: .payload))
+            name: fields.decode(String.self, forKey: .name), from: fields.superDecoder(forKey: .payload))
     }
 
     public func encode(to encoder: any Encoder) throws {
-        let (name, data) = try FaceValueRegistry.configured(in: encoder.userInfo).encode(self)
+        let name = try FaceValueRegistry.configured(in: encoder.userInfo).name(of: self)
         var fields = encoder.container(keyedBy: CodingKeys.self)
         try fields.encode(name, forKey: .name)
-        try fields.encode(data, forKey: .payload)
+        try base.encode(to: fields.superEncoder(forKey: .payload))
     }
 }
 
 public enum FaceWireError: Error, Sendable, LocalizedError {
     case unknownValue(String), duplicateValue(String), valueType(String), registryConfiguration
-    case invalidFrameLength(UInt64), truncatedFrame, invalidFeedOrder, disconnected, io(Int32)
+    case invalidFrameLength(UInt64), truncatedFrame, invalidFrame, invalidFeedOrder, disconnected, io(Int32)
 
     public var errorDescription: String? {
         switch self {
@@ -154,6 +147,7 @@ public enum FaceWireError: Error, Sendable, LocalizedError {
         case .valueType(let name): "The face value has no unique registration: \(name)."
         case .registryConfiguration: "The face value registry configuration is invalid."
         case .invalidFrameLength(let count): "My face frame has an invalid byte length: \(count)."
+        case .invalidFrame: "My face pipe received a malformed frame."
         case .truncatedFrame: "My face pipe closed during a frame."
         case .invalidFeedOrder: "My face feed has a missing snapshot, epoch or sequence."
         case .disconnected: "My connection closed. Open the window again to reconnect."

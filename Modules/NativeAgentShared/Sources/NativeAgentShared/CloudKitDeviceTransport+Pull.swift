@@ -1,6 +1,6 @@
-#if canImport(CloudKit) && !os(Linux)
 import Foundation
 import CloudKit
+import CryptoKit
 import OSLog
 // Blueprint: | `CloudKitDeviceTransport+Pull.swift` | Paginated record pulls with call-local traversal cursors up to the durable server-date watermark |
 
@@ -47,6 +47,8 @@ extension CloudKitDeviceTransport {
             NSSortDescriptor(key: "modificationDate", ascending: false)
         ]
 
+        // The Mac holds the pairing key: a payload that does not open under it was sealed under another pairing and can never be read here.
+        let keyHolder = role == .mac
         var combined = DeviceCKPullResult()
         var nextCursor: CKQueryOperation.Cursor?
         var firstPage = true
@@ -80,6 +82,9 @@ extension CloudKitDeviceTransport {
                     if let since, let date = ck.modificationDate, date <= since { return }
                     do {
                         holder.add(try Self.chatFields(in: ck, assetSecret: assetSecret))
+                    } catch CryptoKitError.authenticationFailure where keyHolder {
+                        // Passed like an old record, so it never holds newer messages behind it until retention deletes it.
+                        nativeLog("[ck-device] %@ was sealed under another pairing; passed", ck.recordID.recordName)
                     } catch {
                         nativeLog("[ck-device] chat payload unavailable for %@: %@", ck.recordID.recordName, error.localizedDescription)
                         holder.failPayload(Self.mapError(error))
@@ -155,4 +160,3 @@ extension CloudKitDeviceTransport {
     }
 
 }
-#endif

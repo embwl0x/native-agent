@@ -1,8 +1,7 @@
 import AppKit
-import AppToolRuntime
-import EngineRuntime
+import BodyRuntime
 import Foundation
-import MemoryV2
+import MindCore
 import NativeAgentShared
 import Observation
 import PersistenceCore
@@ -131,7 +130,7 @@ final class ApplicationLifetime {
     private let notificationCenter = NotificationCenter.default
     private var didFinishLaunching = false
     private var didBootstrapProcessServices = false
-    private var routeObserverTokens: [NSObjectProtocol] = []
+    private var routeObserverTokens: [NotificationCenter.ObservationToken] = []
     func applicationDidFinishLaunching() {
         guard !didFinishLaunching else { return }
         didFinishLaunching = true
@@ -159,30 +158,14 @@ final class ApplicationLifetime {
     private func installRouteObservers() {
         guard routeObserverTokens.isEmpty else { return }
 
-        observe(.openApprovalsRequest) { _ in .activity(.approvals) }
-        observe(.openTrustMultimodalRequest) { _ in
-            Task { @MainActor in SettingsLink.open(.trust) }
-            return nil
-        }
-        observe(.openCommandRouteRequest) { note in
-            NativeAgentNavigationDestination.route(note.object as? String)
-        }
-    }
-
-    private func observe(
-        _ name: Notification.Name,
-        destination: @escaping @Sendable (Notification) -> NativeAgentNavigationDestination?
-    ) {
-        let token = notificationCenter.addObserver(
-            forName: name,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            guard let target = destination(note) else { return }
-            Task { @MainActor [weak self] in
-                self?.request(target)
+        routeObserverTokens = [
+            notificationCenter.addObserver(of: nil, for: OpenApprovalsRequest.self) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.request(.activity(.approvals)) }
+            },
+            notificationCenter.addObserver(of: nil, for: OpenCommandRouteRequest.self) { [weak self] message in
+                guard let target = NativeAgentNavigationDestination.route(message.route) else { return }
+                Task { @MainActor [weak self] in self?.request(target) }
             }
-        }
-        routeObserverTokens.append(token)
+        ]
     }
 }

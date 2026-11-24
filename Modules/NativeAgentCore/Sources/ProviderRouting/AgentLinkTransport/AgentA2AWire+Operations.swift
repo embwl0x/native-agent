@@ -1,0 +1,122 @@
+import Foundation
+import PersistenceCore
+// Blueprint: | `AgentA2AWire+Operations.swift` | `AgentA2AWire`: `operationRequest`, `operationResult`, `normalizeTaskList` |
+
+extension AgentA2AWire {
+    /// Operations share canonical ProtoJSON dictionaries so REST cannot diverge.
+    public static func operationRequest(_ method: String, parameters: [String: JSONValue] = [:],
+                                        interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
+        guard interface.version == "1.0", ["JSONRPC", "HTTP+JSON"].contains(interface.binding) else {
+            throw WireError.unsupported("operation requires A2A 1.0")
+        }
+        var params = parameters
+        if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
+        let path: String
+        let verb: String
+        switch method {
+        case "GetExtendedAgentCard": path = "/extendedAgentCard"; verb = "GET"
+        case "ListTasks":
+            try validateListParameters(params)
+            path = "/tasks"; verb = "GET"
+        case "SubscribeToTask":
+            guard interface.streaming else { throw WireError.unsupported("streaming was not offered") }
+            path = try "/tasks/" + pathIdentifier(params["id"], "id") + ":subscribe"; verb = "GET"
+        case "CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig", "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig":
+            let collection = try "/tasks/" + pathIdentifier(params["taskId"], "taskId") + "/pushNotificationConfigs"
+            if method == "CreateTaskPushNotificationConfig" {
+                try validatePushConfiguration(.object(params), interface: interface)
+                path = collection; verb = "POST"
+            } else if method == "ListTaskPushNotificationConfigs" {
+                path = collection; verb = "GET"
+            } else {
+                path = try collection + "/" + pathIdentifier(params["id"], "id")
+                verb = method == "DeleteTaskPushNotificationConfig" ? "DELETE" : "GET"
+            }
+        default: throw WireError.unsupported("operation \(method)")
+        }
+        let expectedTaskID: String? = if method == "SubscribeToTask", case .string(let id)? = params["id"] { id } else { nil }
+        let pathKeys: Set<String> = method.contains("PushNotificationConfig") ? ["taskId", "id"] : (method == "SubscribeToTask" ? ["id"] : [])
+        return try request(interface: interface, method: method, params: params, requestID: requestID,
+                           path: { path }, httpMethod: verb, pathKeys: pathKeys, taskID: expectedTaskID)
+    }
+
+    static func pathIdentifier(_ value: JSONValue?, _ key: String) throws -> String {
+        guard case .string(let value)? = value, !value.isEmpty, value != ".", value != "..",
+              let encoded = value.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-_~"))) else {
+            throw WireError.invalid("missing or invalid \(key)")
+        }
+        return encoded
+    }
+
+    public static func operationResult(_ value: JSONValue, interface: Interface, requestID: String?) throws -> JSONValue {
+        guard interface.binding == "JSONRPC" else {
+            if case .object(let object) = value, let error = object["error"] {
+                guard case .object(let fields) = error, case .int(let code)? = fields["code"],
+                      case .string(let message)? = fields["message"] else { throw WireError.invalid("REST error") }
+                throw WireError.remote(code: code, message: message)
+            }
+            return value
+        }
+        guard case .object(let envelope) = value, envelope["jsonrpc"] == .string("2.0"),
+              let requestID, envelope["id"] == .string(requestID),
+              (envelope["result"] != nil) != (envelope["error"] != nil) else { throw WireError.invalid("JSON-RPC response identity") }
+        if case .object(let error)? = envelope["error"], case .int(let code)? = error["code"], case .string(let message)? = error["message"] {
+            throw WireError.remote(code: code, message: message)
+        }
+        guard let result = envelope["result"] else { throw WireError.invalid("RPC error") }
+        return result
+    }
+
+    public static func normalizeTaskList(_ value: JSONValue, interface: Interface, requestID: String?) throws -> JSONValue {
+        let result = try operationResult(value, interface: interface, requestID: requestID)
+        guard case .object(let object) = result else { throw WireError.invalid("task listing") }
+        let tasks: [JSONValue]
+        if case .array(let values)? = object["tasks"] { tasks = values }
+        else if object["tasks"] == nil { tasks = [] } else { throw WireError.invalid("tasks") }
+        for task in tasks {
+            guard case .object(let row) = task, case .string(let id)? = row["id"] else { throw WireError.invalid("listed task ID") }
+            let direct = Interface(endpoint: interface.endpoint, version: "1.0", binding: "HTTP+JSON")
+            _ = try normalizeResponse(task, interface: direct, expectedTaskID: id)
+        }
+        for key in ["pageSize", "totalSize"] {
+            if let value = object[key] { guard case .int(let count) = value, count >= 0 else { throw WireError.invalid(key) } }
+        }
+        if let value = object["nextPageToken"] { guard case .string = value else { throw WireError.invalid("nextPageToken") } }
+        return result
+    }
+
+    static func validateListParameters(_ params: [String: JSONValue]) throws {
+        guard Set(params.keys).isSubset(
+            of: [
+                "tenant",
+                "contextId",
+                "status",
+                "pageSize",
+                "pageToken",
+                "historyLength",
+                "statusTimestampAfter",
+                "includeArtifacts"]) else { throw WireError.invalid("ListTasks fields") }
+        for (key, value) in params {
+            switch key {
+            case "pageSize": guard case .int(let size) = value, (1...100).contains(size) else { throw WireError.invalid(key) }
+            case "historyLength": guard case .int(let size) = value, size >= 0 else { throw WireError.invalid(key) }
+            case "includeArtifacts": guard case .bool = value else { throw WireError.invalid(key) }
+            default: guard case .string = value else { throw WireError.invalid(key) }
+            }
+        }
+    }
+
+    public static func isLoopback(_ url: URL) -> Bool {
+        ["127.0.0.1", "::1", "[::1]"].contains(url.host?.lowercased() ?? "")
+    }
+
+    /// The receiver is loopback-only; callback admission also requires a running receiver.
+    public static func validatePushConfiguration(_ config: JSONValue, interface: Interface) throws {
+        guard interface.version == "1.0", interface.pushNotifications else { throw WireError.unsupported("push notifications were not offered") }
+        guard isLoopback(interface.endpoint), case .object(let object) = config,
+              case .string(let address)? = object["url"], let url = URL(string: address), isLoopback(url) else {
+            throw WireError.unsupported("this app's loopback webhook is reachable only by loopback peers; use streaming or task reads")
+        }
+        try AgentPeerHTTP.validateURL(url)
+    }
+}

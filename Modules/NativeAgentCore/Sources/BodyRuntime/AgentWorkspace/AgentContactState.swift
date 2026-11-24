@@ -1,0 +1,260 @@
+import Synchronization
+import Foundation
+import PersistenceCore
+import NativeAgentShared
+import SenseCore
+import NativeAgentCore
+// Blueprint: | `AgentContactState.swift` | `AgentPeerStore`, `AgentLocalHealth`, `not_reached`: contact identity and exact health evidence |
+// Only ACP/MCP schemes get protocol labels; local observations use 600-second freshness.
+// Unsent not_reached evidence stays retained without claiming a broken reply route.
+
+/// Identity merges only through explicit association, never a product, vendor or host name.
+public struct AgentContactIdentity: Sendable {
+    public let aliases: [String: String]
+    public let doors: [String: String]
+    let peers: [[String: String]]
+
+    /// Exact peer handles keep the contact's own display name, including associated doors.
+    package var peerNames: [String: String] {
+        Dictionary(uniqueKeysWithValues: peers.compactMap { peer in
+            guard let id = peer["id"], let name = peer["name"]?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return nil }
+            return ("peer:" + id, name)
+        })
+    }
+
+    package init(peers: [[String: String]], handles: [String: [String]] = [:]) {
+        self.peers = peers
+        let byID = Dictionary(uniqueKeysWithValues: peers.compactMap { peer in peer["id"].map { ($0, peer) } })
+        func who(_ id: String) -> String { byID[id]?["who"].flatMap { byID[$0] == nil ? nil : $0 } ?? id }
+        func key(_ who: String) -> String { handles[who]?.first?.lowercased() ?? "peer:" + who }
+        var aliases: [String: String] = [:], doors: [String: String] = [:]
+        for (id, peer) in byID {
+            let whoID = who(id), name = key(whoID)
+            if name != "peer:" + id { aliases["peer:" + id] = name }
+            if whoID == id { for handle in handles[id] ?? [] { aliases[handle.lowercased()] = name } }
+            guard name != "peer:" + id, let url = peer["endpoint"].flatMap(URL.init(string:)) else { continue }
+            doors["peer:" + id] = (peer["name"] ?? url.host ?? "") + (url.scheme == "acp" ? " (ACP)" : url.scheme == "mcp" ? " (MCP)" : "")
+        }
+        self.aliases = aliases; self.doors = doors
+    }
+
+    public func canonical(_ agent: String) -> String { aliases[agent] ?? agent }
+    public func members(_ agent: String) -> [String] {
+        let brain = canonical(agent)
+        return Array(Set([agent, brain] + aliases.keys.filter { aliases[$0] == brain })).sorted()
+    }
+    public func owners(_ owner: String) -> [String] {
+        members(peers.contains { $0["id"] == owner } ? "peer:" + owner : owner).map {
+            $0.hasPrefix("peer:") ? String($0.dropFirst(5)) : $0
+        }
+    }
+}
+
+/// Cheap local observations, never transport authority or proof a model will answer.
+public struct AgentLocalHealth: Codable, Sendable, Equatable {
+    public static func isRecent(_ at: Date) -> Bool { Date().timeIntervalSince(at) < 600 }
+    private var observedStatus: String?
+    private var observedDetail: String
+    private var presence: String? = nil
+    private var presenceWords: String? = nil
+    public var presenceStatus: String? { presence }
+    public var presenceDetail: String? { presenceWords }
+    private var installed: Bool? = nil
+    private var authenticationRequired: Bool? = nil
+    private var availability: String {
+        guard let installed else { return "unchecked" }
+        if !installed { return "unavailable" }
+        if authenticationRequired == true, !authenticated { return "signed_out" }
+        return lastGoodAt == nil ? "installed" : "ready"
+    }
+    public var status: String {
+        get { presenceStatus ?? replyStatus }
+        set { observedStatus = newValue }
+    }
+    public var replyStatus: String { observedStatus ?? availability }
+    public var replyDetail: String {
+        observedDetail.isEmpty ? (availability == "installed" ? "Installed; no reply proven yet" : availability == "ready" ? "Ready" : "") : observedDetail
+    }
+    public var detail: String {
+        get { presenceDetail ?? replyDetail }
+        set { observedDetail = newValue }
+    }
+    public var checkedAt: Date
+    public var authenticated: Bool
+    public var failureOperation: String?
+    public var brokenSince: Date?
+    public var lastGoodAt: Date?
+    public var repairAttemptedAt: Date?
+    public var repairDetail: String?
+    public var repairFor: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case observedStatus = "status", observedDetail = "detail"
+        case installed, authenticationRequired, checkedAt, authenticated, failureOperation, brokenSince, lastGoodAt, repairAttemptedAt, repairDetail, repairFor
+    }
+
+    public init(status: String, detail: String, checkedAt: Date, authenticated: Bool) {
+        self.observedStatus = status; self.observedDetail = detail; self.checkedAt = checkedAt; self.authenticated = authenticated
+    }
+
+    public mutating func present(_ presence: Self) {
+        self.presence = presence.status
+        presenceWords = presence.detail
+    }
+
+    public mutating func retainReplyEvidence() {
+        guard !sticky, let observedStatus, observedStatus != "unknown" else { return }
+        installed = ["ready", "installed", "signed_out"].contains(observedStatus) ? true : observedStatus == "unavailable" ? false : nil
+        authenticationRequired = observedStatus == "signed_out" || authenticated
+        if !["signed_out", "unavailable"].contains(observedStatus) { observedDetail = "" }
+        self.observedStatus = nil
+    }
+
+    public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/local-health.json") }
+    public static func read(_ root: URL) -> [String: Self] {
+        do { return try checkedRead(root) }
+        catch { return ["local-health": Self(status: "unknown", detail: "agents/local-health.json is unreadable; saved observations are unavailable.",
+            checkedAt: Date(), authenticated: false)] }
+    }
+    public static func checkedRead(_ root: URL) throws -> [String: Self] {
+        do {
+            return try JSONDecoder().decode([String: Self].self, from: Data(contentsOf: url(root)))
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
+    }
+    /// Said until a newer observation replaces it, not only while fresh.
+    public var sticky: Bool { brokenSince != nil || ["not_reached", "unverified", "interrupted", "stalled", "no_reply_by_deadline"].contains(observedStatus
+        ?? "") }
+    public var current: Bool { presenceStatus != nil || sticky || Self.isRecent(checkedAt) }
+    public var word: String? {
+        guard current else { return nil }
+        let text = status.replacingOccurrences(of: "_", with: " ")
+        return text.prefix(1).uppercased() + text.dropFirst()
+    }
+    public var problemWord: String? {
+        guard problem != nil else { return nil }
+        let text = (observedStatus ?? availability).replacingOccurrences(of: "_", with: " ")
+        return text.prefix(1).uppercased() + text.dropFirst()
+    }
+    /// Unverified routes need a new send as proof; only broken reply paths count as problems.
+    public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(observedStatus ?? availability) }
+    /// Presence words, overlaid live at every read: a state, never a problem.
+    public static let presenceStatuses: Set<String> = ["waiting", "inbound_only", "live"]
+    public var problem: String? {
+        current && !(["ready", "installed", "live", "unchecked"] + Self.presenceStatuses).contains(observedStatus ?? availability)
+            ? observedDetail + (repairDetail.map { " " + $0 } ?? "") : nil
+    }
+
+    public var projection: JSONValue {
+        let iso = ISO8601DateFormatter()
+        return .object(["status": .string(replyStatus), "detail": .string(problem ?? replyDetail),
+            "since": brokenSince.map { .string(iso.string(from: $0)) } ?? .null,
+            "last_good": lastGoodAt.map { .string(iso.string(from: $0)) } ?? .null,
+            "repair_at": repairAttemptedAt.map { .string(iso.string(from: $0)) } ?? .null,
+            "repair": repairDetail.map(JSONValue.string) ?? .null])
+    }
+
+    /// Auth recovery clears only an auth error, not an unrelated execution failure.
+    public func resolves(_ record: AgentConversationRecord) -> Bool {
+        guard current, authenticated, checkedAt >= record.updatedAt, record.phase == "attention",
+              failureOperation == record.operationID else { return false }
+        return Self.authenticationFailure(record.receipt)
+    }
+    public static func authenticationFailure(_ receipt: JSONValue?) -> Bool {
+        // Only the route owner's structured authentication evidence qualifies. Reply prose may describe an entirely different service's failure.
+        AgentConversationRecord.sendEvidence(receipt)["needs_authentication"] == .bool(true)
+    }
+
+}
+
+/// Declines and disconnects survive program updates; discovery and disconnect share a file lock.
+public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
+    public var name: String
+    public var version: String?
+    public var offeredAt: Date?
+    public var declinedAt: Date?
+    public var connectedAt: Date?
+
+    public init(name: String) { self.name = name }
+
+    public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/discovery.json") }
+    /// Empty only when the file is missing; nil when it is there but does not read, so a damaged file is never written over.
+    public static func read(_ root: URL) -> [String: Self]? {
+        try? checkedRead(root)
+    }
+    public static func checkedRead(_ root: URL) throws -> [String: Self] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        do { return try decoder.decode([String: Self].self, from: Data(contentsOf: url(root))) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
+    }
+    public static func write(_ offers: [String: Self], _ root: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(offers), to: url(root))
+    }
+
+    public var open: Bool { offeredAt != nil && declinedAt == nil && connectedAt == nil }
+}
+
+/// Fetches without read evidence stay unknown.
+public enum ContactReplyReads {
+    public struct Read: Codable, Sendable {
+        public let session: String
+        public let request: String
+        public let run: String
+        public let at: Date
+        public let final: Bool?
+        let textDigest: String?
+        // Older rows stored character offsets.
+        let delivered: [Range<Int>]?
+        let deliveredBytes: [Range<Int>]?
+
+        func byteCoverage(in text: String) -> RangeSet<Int> {
+            if let deliveredBytes { return RangeSet(deliveredBytes) }
+            let ranges: [Range<Int>] = (delivered ?? []).compactMap { range in
+                guard range.lowerBound >= 0,
+                      let start = text.index(text.startIndex, offsetBy: range.lowerBound, limitedBy: text.endIndex),
+                      let end = text.index(start, offsetBy: range.count, limitedBy: text.endIndex) else { return nil }
+                return text[..<start].utf8.count..<text[..<end].utf8.count
+            }
+            return RangeSet(ranges)
+        }
+    }
+    private static let lock = Mutex(())
+    public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/reply-reads.json") }
+    public static func read(_ root: URL) throws -> [Read] {
+        do { return try JSONDecoder().decode([Read].self, from: Data(contentsOf: url(root))) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+    }
+    public static func record(dataRoot: URL, session: String, request: String, run: String,
+                              text: String, delivered: RangeSet<Int>) {
+        guard !session.isEmpty, !request.isEmpty, !run.isEmpty else { return }
+        let digest = SHA256Hex.of(Data(text.utf8))
+        let complete = 0..<text.utf8.count
+        lock.withLock { _ in
+            do {
+                let file = url(dataRoot)
+                var rows = try read(dataRoot)
+                let index = rows.lastIndex { $0.session == session && $0.request == request && $0.run == run }
+                let previous = index.map { rows[$0] }.flatMap { $0.textDigest == digest ? $0 : nil }
+                if previous?.final == true { return }
+                let merged = (previous?.byteCoverage(in: text) ?? RangeSet()).union(delivered)
+                let final = complete.isEmpty || merged.ranges.first == complete
+                let coverage = final ? nil : Array(merged.ranges)
+                if previous?.deliveredBytes == coverage, previous?.final == final { return }
+                if let index { rows.remove(at: index) }
+                rows.append(Read(session: session, request: request, run: run, at: Date(),
+                                 final: final, textDigest: digest, delivered: nil, deliveredBytes: coverage))
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(Array(rows.suffix(2048))), to: file)
+            } catch {
+                RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "contacts.reply_read", owner: url(dataRoot).path,
+                    words: """
+                        The reply was fetched, but its read record could not be saved: \(error.localizedDescription). Do not fetch it again to repair this \
+                        record.
+                        """,
+                    tap: ToolFailureError.fileRepairInstruction(url(dataRoot), shape: "Preserve the Read array and repair its read/write access."))
+            }
+        }
+    }
+}

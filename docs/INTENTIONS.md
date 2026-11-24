@@ -70,12 +70,7 @@ reuse the previous condition's release. If no release arrives, the intention
 remains waiting. Each source edge then uses the same pursuit refresh
 as news; a part's deferred delivery does not release it again. Signal moments
 are prompt, like news and presence, and the moment's line names the release.
-File generations written by an intention's own habit or thought (including
-parts called within it) do not release that same intention. Its work identity
-owns the self-write stamp independently of the called part; other intentions
-watching that file still receive the change. Suppression uses the same exact
-file-generation registry as part echoes, never a time window; directory
-metadata alone cannot prove an echo and does not suppress member news.
+File-path signals compare the declared path's generation at the vnode event, including permission bits and nanosecond change time, with the generation confirmed by their write, copy, move or Trash operation. An exact echo stays quiet for parts and intentions. An outside change releases waiting intentions even if they writes again before delivery. Directory metadata alone cannot suppress member news.
 
 Open file-path intentions join the same `EnginePartWake` watch index as part
 headers, one watch per canonical path. Desk changes refresh their membership
@@ -206,11 +201,6 @@ neither record is available, the settlement stays owed. Recovery never speaks
 or runs the habit again. Speech failures leave a still-eligible intention due
 for the next read. Installed proof remains owed.
 
-`mind.cross {line, watch}` posts real input as a `world` happening: it releases
-the news intentions it touches like any source's line, without fabricating a
-release or making a nonmatching intention ready. Its `preview:true` refuses
-before posting ([Subconscious](SUBCONSCIOUS.md#run-a-clock-owner-now)).
-
 **Habits (H1/H2, source built).** `queue.add` can bind an `action` call;
 `queue.update {id, action?, say?, when?, until?}` changes only named fields
 under the Desk's unchanged-revision transaction. `action:null` drops a habit,
@@ -255,7 +245,7 @@ checked native facts and authored face; queue read failures remain unavailable
 evidence. Desk writes invalidate this reading.
 
 `schedule.create` schedules reads only: `connector_action` (a watch) and
-`proactive_scan`, each a time on the one clock (`TriggerScheduler/ScheduledReads.swift`,
+`proactive_scan`, each a time on the one clock (`DeskCore/TriggerScheduler/ScheduledReads.swift`,
 `watch:<id>`, `scan:<id>`; an id given with its kind's prefix keeps it once);
 any other kind refuses as unsupported, and the action's description points
 intentions, check-ins and reminders to `queue.add`. `schedule.list` and
@@ -478,7 +468,7 @@ already has:
 
 Before this change, they had two forms for one thing (10-29 snapshot).
 
-- **MY QUEUE** (`Desk/MyQueue.swift`): what they carries. It held their words,
+- **MY QUEUE** (`DeskCore/Desk/MyQueue.swift`): what they carries. It held their words,
   a `when`, an `origin`, a `replyRoute`, and `queue.done` / `queue.drop`, and
   it woke their through `ResidentWake.carriedArrival`. They used it 10 times in
   10 days, mostly with `after_card`. It had no time rhythm and no end.
@@ -514,7 +504,7 @@ One `DeskStep` in MY QUEUE, grown. Nothing new is stored elsewhere.
 | clock: rhythm | "every day at 9 and 4", "every 2 h 9 am–9 pm on Nov 4" | `every` with a step rhythm, a `moment:<handle>` time on the one clock; `IntentionClock` uses the clock's rhythm math and the step's filing time/until; home shows the next time |
 | person | "when User messages", "when User is here", "when User is away" | `when_user_messages`; `when_user_here` / `when_user_away` require the current `PersonPresence` transition to be newer than filing (the next arrival/departure). It reads Mac input and fresh phone motion; walking/driving newer than physical Mac input can infer away, never here. A silent/stale/unknown phone leaves Mac-only readiness intact. The presence edge refreshes carried readiness; its transition time makes each arrival its own offer. [Phone evidence contract](mobile_companion.md#where-the-person-is) |
 | world | "when there's news about the lease" | `on_news <words>`: each `world` happening's words are weighed against open intentions' words with the care law's warm embedder and chance bar (live cares count among the comparisons; no absolute floor), while the agent sleeps too. A touch writes a system Desk note, `Released: news: <first 160 characters> (<door>)`, carrying the exact topic condition. The locked release transaction rechecks that topic and filing revision. Readiness follows the shared release law above |
-| body signal | "when something changes in Downloads", "when a Telegram message arrives", "when the network returns" (`when: "on network.up"`), "when the person takes my tab" (`when: "on chrome.tab_taken"`) | Built: `on <signal>` matches exact names, colon families and file descendants. Real sources are `file.changed:<path>` (only watched paths), `message.arrived:telegram`, `message.arrived:slack`, `person.here`, `person.away`, `network.down`, `network.up`, `app.installed`, `sense.source.changed` and `turn.ended`. Network signals require a path state that holds five seconds ([wake contract](skill_manifest_spec.md#wake-signals)). The shared signal observer writes `Released: <signal> <summary>` with the exact condition identity and refreshes carried readiness under the shared release law above. File intentions join parts' existing watch index and leave when closed. `schedule:` is refused; `held` and `resumed` do not release intentions |
+| body signal | "when something changes in Downloads", "when a Telegram message arrives", "when the network returns" (`when: "on network.up"`), "when the person takes my tab" (`when: "on chrome.tab_taken"`) | Built: `on <signal>` matches exact names, colon families and file descendants. Real sources are `file.changed:<path>` (only watched paths), `message.arrived:telegram`, `message.arrived:slack`, `person.here`, `person.away`, `body.changed`, `chrome.tab_taken`, `network.down`, `network.up`, `app.installed`, `sense.source.changed` and `turn.ended`. Network signals require a path state that holds five seconds ([wake contract](skill_manifest_spec.md#wake-signals)). The shared signal observer writes `Released: <signal> <summary>` with the exact condition identity and refreshes carried readiness under the shared release law above. File intentions join parts' existing watch index and leave when closed. `schedule:` is refused; `held` and `resumed` do not release intentions |
 | situation | "next turn", "my own turn", "quiet", "after card X" | Existing MY QUEUE readiness |
 
 Talk is not a kind they sets. Every live intention can come to mind whenever
@@ -578,7 +568,7 @@ Any saved settlement for that step lands first.
   The carried line that brings a step back (`You meant to …`) and home's MY QUEUE
   rows (ready and waiting alike) name it the same way, `desk.read {query: <its words>}`
   finds it, and `desk.read {query: "my queue"}` lists the whole queue.
-- `ChatTurnRuntime/ChatOrchestration+Intentions.swift` reads
+- `BodyRuntime/ChatTurnRuntime/ChatOrchestration+Intentions.swift` reads
   `SwiftNativeDeskStore(dataRoot:).liveState()` and `MyQueue.entries` each
   turn; `TurnContextPreparation.swift` puts the result in `TurnReach.packet`,
   so it reaches both the provider and `diagnostics/fed/<session>.json`.
@@ -647,7 +637,7 @@ Any saved settlement for that step lands first.
 ## What stays a rhythm
 
 These are the body's clock, not things the agent intends. Each is a time on the
-one clock (`TriggerScheduler/OneClock.swift`), delivered to whoever declared it:
+one clock (`DeskCore/TriggerScheduler/OneClock.swift`), delivered to whoever declared it:
 
 - a part's own `schedule:` wakes (`part:<id>:<cron>`), from its header
 - `connector_action` watches (`watch:<id>`) and `proactive_scan` (`scan:<id>`)
@@ -679,14 +669,12 @@ files a second step. They are ready and archive like any other step.
 
 | Lane | What | Files |
 |---|---|---|
-| 1 Form | `moments`, `until`, `say`; readiness per moment; parse their words; the echo | `Desk/DeskCadence.swift`, `Desk/MyQueue.swift`, `AppToolRuntime/AppToolExecutor+MyQueue.swift` |
-| 2 Clock | One `moment:<handle>` time per step on the one clock, withdrawn at until; per-occurrence moment keys | `TriggerScheduler/OneClock.swift`, `Cognition/NativeCognitionRuntime+Pursuit.swift`, `AgentWorkspace/AgentQueue.swift` |
-| 3 World | Each world happening weighs world-moment intentions by the care law; presence changes ring person moments | `Cognition/NativeCognitionRuntime+Attention.swift`, `Cognition/NativeCognitionRuntime+Pursuit.swift`, `MacControl/PersonPresence.swift`, `EngineRuntime/EnginePartWake.swift` |
-| 4 Talk | Bounded open intentions in every turn's packet (implemented above) | `ChatTurnRuntime/ChatOrchestration+Intentions.swift`, `TurnContextPreparation.swift` |
-| 5 Surface | `queue.*` args, `schedule.*` off their surface, Today "Ahead", guides | `AppToolRuntime/AppActions+Declarations.swift`, `WorkOverviewRead+Today.swift`, `today-readout.js` |
-| 4 Talk | Intentions as context atoms; the "[You meant to …]" nudge; the 12-hour rest | `Context/*`, `ChatTurnRuntime/ChatOrchestration+CameToMind.swift` |
-| 5 Surface (implemented) | `queue.*` args; intention creation/updates refused by `schedule.*` with a `queue.add` remedy; Today "Ahead" clock intentions; rhythm-only guides | `AppToolRuntime/AppActions+Declarations.swift`, `TriggerScheduler/SchedulerJobNormalizer.swift`, `WorkOverviewRead+Today.swift`, `today-readout.js` |
-| 6 Clock and docs (source built) | MY QUEUE times on the one clock; the scheduler's next occurrences carried over once; Desk and Subconscious links | `IntentionClock.swift`, `EngineRuntime/EngineScheduledWork.swift`, Desk and queue readers |
+| 1 Form | `moments`, `until`, `say`; readiness per moment; parse their words; the echo | `DeskCore/Desk/DeskCadence.swift`, `DeskCore/Desk/MyQueue.swift`, `BodyRuntime/AppToolRuntime/AppToolExecutor+MyQueue.swift` |
+| 2 Clock | One `moment:<handle>` time per step on the one clock, withdrawn at until; per-occurrence moment keys | `DeskCore/TriggerScheduler/OneClock.swift`, `BodyRuntime/Cognition/NativeCognitionRuntime+Pursuit.swift`, `BodyRuntime/AgentWorkspace/AgentQueue.swift` |
+| 3 World | Each world happening weighs world-moment intentions by the care law; presence changes ring person moments | `BodyRuntime/Cognition/NativeCognitionRuntime+Attention.swift`, `BodyRuntime/Cognition/NativeCognitionRuntime+Pursuit.swift`, `MacNerves/MacControl/PersonPresence.swift`, `BodyRuntime/EngineRuntime/EnginePartWake.swift` |
+| 4 Talk | Bounded open intentions in every turn's packet (implemented above) | `BodyRuntime/ChatTurnRuntime/ChatOrchestration+Intentions.swift`, `TurnContextPreparation.swift` |
+| 5 Surface (implemented) | `queue.*` args; intention creation/updates refused by `schedule.*` with a `queue.add` remedy; Today "Ahead" clock intentions; rhythm-only guides | `BodyRuntime/AppToolRuntime/AppActions+Declarations.swift`, `DeskCore/TriggerScheduler/SchedulerJobNormalizer.swift`, `WorkOverviewRead+Today.swift`, `today-readout.js` |
+| 6 Clock and docs (source built) | MY QUEUE times on the one clock; the scheduler's next occurrences carried over once; Desk and Subconscious links | `IntentionClock.swift`, `BodyRuntime/EngineRuntime/EngineScheduledWork.swift`, Desk and queue readers |
 
 **Proof on them:**
 1. Their two live jobs are intentions; all three source jobs (including the cancel job) are disabled, and the durable pre-rewrite backup retains them. Previously disabled legacy definitions retain words, timing and pause with a first-migration disposition. Later restored legacy jobs stay stopped with one Desk notice; they are never reimported.

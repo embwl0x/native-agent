@@ -19,11 +19,6 @@ extension AppModel {
                 pendingChatMessageID = message
                 ApplicationLifetime.shared.request(.sidebar(.chat))
                 return .acknowledged
-            case .openDetachedConversation(let session):
-                return await DetachedChatWindowController.shared.open(sessionId: session)
-            case .closeDetachedConversation(let session):
-                DetachedChatWindowController.shared.close(sessionId: session)
-                return .acknowledged
             case .readDetachedConversations:
                 return .detachedSessions(DetachedChatWindowController.shared.detachedSessionIDs)
             case .readComposer(let session): return .composer(readFaceComposer(session: session))

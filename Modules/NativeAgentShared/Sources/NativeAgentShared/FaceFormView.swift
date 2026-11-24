@@ -12,7 +12,13 @@ public enum FaceSwitchTint {
         TextField(placeholder, text: text).textFieldStyle(.roundedBorder).accessibilityLabel(label)
     }
     static func lines(_ label: String, text: Binding<String>) -> some View {
-        TextEditor(text: text).font(.body).frame(minHeight: 160).accessibilityLabel(label)
+        let shape = RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous)
+        return TextEditor(text: text).font(.body).frame(minHeight: 160)
+            .scrollContentBackground(.hidden)
+            .padding(6)
+            .background(Color.primary.opacity(0.04), in: shape)
+            .overlay { shape.strokeBorder(Color.primary.opacity(0.14), lineWidth: 1).allowsHitTesting(false) }
+            .accessibilityLabel(label)
     }
     /// The system switch, on in a quiet neutral on the Mac: a column of switches in the system's accent is colour on every control, and the
     /// app's one accent means something else. The tint is on the switch itself, never on a page.
@@ -22,18 +28,38 @@ public enum FaceSwitchTint {
             .tint(FaceSwitchTint.on)
         #endif
     }
-    static func choice(_ label: String, options: [PartFace.Control.Option], value: Binding<String>, allowsEmpty: Bool) -> some View {
-        Picker(label, selection: value) {
-            if allowsEmpty { Text("Choose…").tag("") }
-            ForEach(options) { Text($0.label).tag($0.id) }
-        }.labelsHidden().pickerStyle(.menu)
+    /// A long list whose options carry a `path` nests into submenus, as Chat's model menu does; a short flat one stays one menu.
+    @ViewBuilder static func choice(_ label: String, options: [PartFace.Control.Option], value: Binding<String>, allowsEmpty: Bool) -> some View {
+        #if os(macOS)
+        let usesMenu = true
+        #else
+        let usesMenu = options.contains(where: { ($0.path?.count ?? 0) > 1 })
+        #endif
+        if usesMenu {
+            let selectedLabel = options.first { $0.id == value.wrappedValue }?.label ?? "Choose…"
+            Menu {
+                if allowsEmpty { Button("Choose…") { value.wrappedValue = "" } }
+                FaceChoiceMenu(options: options, depth: 0, value: value)
+            } label: {
+                Text(selectedLabel).lineLimit(1).truncationMode(.tail)
+            }
+            .accessibilityLabel(label)
+            .accessibilityValue(selectedLabel)
+        } else {
+            Picker(label, selection: value) {
+                if allowsEmpty { Text("Choose…").tag("") }
+                ForEach(options) { Text($0.label).tag($0.id) }
+            }.labelsHidden().pickerStyle(.menu)
+        }
     }
     static func date(_ label: String, value: Binding<Date>) -> some View {
         DatePicker(label, selection: value, displayedComponents: .date).labelsHidden()
     }
     static func number(_ label: String, words: String, increment: @escaping () -> Void, decrement: @escaping () -> Void) -> some View {
         Stepper { Text(words).monospacedDigit() } onIncrement: { increment() } onDecrement: { decrement() }
+            .fixedSize(horizontal: true, vertical: false)
             .accessibilityLabel(label)
+            .accessibilityValue(words)
     }
 }
 
@@ -70,12 +96,12 @@ extension FacePageSession {
     public func setFormValue(_ value: PartFace.Value, field: String, block: PartFace.Block, section: String) {
         guard block.protected != true, let spec = block.fields?.first(where: { $0.id == field }), spec.kind != "secret" else { return }
         drafts.set(value, for: formKey(block, field: field, section: section), baseline: spec.value ?? .null)
-        formErrors[block.key]?[field] = nil
+        if let state = self[row: block.key], state.formErrors[field] != nil { state.formErrors[field] = nil }
     }
 
     public func clearForm(_ block: PartFace.Block, section: String) {
         for field in block.fields ?? [] { drafts.clear(formKey(block, field: field.id, section: section)) }
-        formErrors[block.key] = nil
+        self[row: block.key]?.formErrors = [:]
     }
 
     func submitForm(_ block: PartFace.Block, section: String, action: PartFace.Action, door: any FaceDoor, validating: Bool = true) {
@@ -84,7 +110,7 @@ extension FacePageSession {
               action.runs(from: FaceView.door), block.doors?.contains(FaceView.door) != false else { return }
         let values = formValues(block, section: section)
         let errors = validating ? block.formIssues(values: values) : [:]
-        formErrors[block.key] = errors
+        editRow(block.key).formErrors = errors
         guard errors.isEmpty else { return }
         var edits: [String: String] = [:]
         for field in block.fields ?? [] { edits[field.id] = formKey(block, field: field.id, section: section) }
@@ -116,16 +142,16 @@ struct FaceFormBlock: View {
     }
 
     var body: some View {
-        if protected, FaceView.door != "mac" {
-            Text("This opens on your Mac.").foregroundStyle(.secondary)
+        if FaceView.door != "mac", protected || block.doors == ["mac"] {
+            note("This opens on your Mac.")
         } else if protected, !admitted {
             if let receiver = block.receiver, receiver.hasPrefix("keyring:"), let protectedEntry {
                 protectedEntry(block)
-            } else { Text("This form requires its protected entry owner.").foregroundStyle(.secondary) }
+            } else { note("This form requires its protected entry owner.") }
         } else if unsupported {
-            Text(PartFace.Block.updateNote).foregroundStyle(.secondary)
-        } else if block.doors?.contains(FaceView.door) == false {
-            Text("This form opens on " + (block.doors ?? []).joined(separator: " or ") + ".").foregroundStyle(.secondary)
+            note(PartFace.Block.updateNote)
+        } else if let doors = block.doors, !doors.contains(FaceView.door) {
+            note("This form opens on " + doors.joined(separator: " or ") + ".")
         } else {
             VStack(alignment: .leading, spacing: 12) {
                 ForEach(block.fields ?? []) { field in
@@ -134,7 +160,7 @@ struct FaceFormBlock: View {
                             Text(field.label).font(.callout)
                             SecureField(field.placeholder ?? field.label, text: secretForm.entry.binding(field.id))
                                 .textFieldStyle(.roundedBorder).privacySensitive().accessibilityLabel(field.label)
-                            if let error = session.formErrors[block.key]?[field.id] { Text(error).font(.caption).foregroundStyle(.red) }
+                            if let error = session[row: block.key]?.formErrors[field.id] { Text(error).font(.caption).foregroundStyle(.red) }
                         }
                     } else {
                         FaceFormField(field: field, block: plain, section: section, session: session, commit: commit)
@@ -146,8 +172,7 @@ struct FaceFormBlock: View {
                             if action.role == .destructive { confirming = action }
                             else { submit(action) }
                         }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(action.role == .destructive ? Color.red : .accentColor)
+                        .buttonStyle(FaceActionButtonStyle(fill: nil))
                         .disabled(session.held(item) || action.unavailable != nil)
                         .help(action.unavailable ?? action.label)
                     }
@@ -160,7 +185,8 @@ struct FaceFormBlock: View {
             .padding(style.insets)
             .onChange(of: secretForm?.entry.generation) { session.discardCheckResult(block.key) }
             .onChange(of: session.formValues(plain, section: section)) { session.discardCheckResult(block.key) }
-            .confirmationDialog(confirming?.label ?? "", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            .confirmationDialog(confirming?.label ?? "", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+                                titleVisibility: .visible) {
                 if let action = confirming {
                     Button(action.label, role: .destructive) {
                         submit(action); confirming = nil
@@ -171,6 +197,12 @@ struct FaceFormBlock: View {
         }
     }
 
+    private func note(_ text: String) -> some View {
+        Text(text).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(style.insets)
+    }
+
     private func commit() {
         let actions = (block.submit ?? []).filter { $0.runs(from: FaceView.door) && $0.unavailable == nil }
         guard let action = actions.first(where: { $0.role == .primary }) ?? (actions.count == 1 ? actions.first : nil) else { return }
@@ -179,18 +211,18 @@ struct FaceFormBlock: View {
     }
 
     @ViewBuilder private var outcome: some View {
-        if let refusal = session.refusals[block.key] { Text(refusal.localizedDescription).foregroundStyle(.red).textSelection(.enabled) }
+        if let refusal = session[row: block.key]?.refusal { Text(refusal.localizedDescription).foregroundStyle(.red).textSelection(.enabled) }
         let fields = Set((block.fields ?? []).map(\.id))
-        ForEach((session.formErrors[block.key] ?? [:]).keys.filter { !fields.contains($0) }.sorted(), id: \.self) { key in
-            if let words = session.formErrors[block.key]?[key] { Text(key + ": " + words).foregroundStyle(.red) }
+        ForEach((session[row: block.key]?.formErrors ?? [:]).keys.filter { !fields.contains($0) }.sorted(), id: \.self) { key in
+            if let words = session[row: block.key]?.formErrors[key] { Text(key + ": " + words).foregroundStyle(.red) }
         }
-        if let operation = session.operations[block.key] {
+        if let operation = session.operation(for: block.key) {
             if let outcome = operation.outcome, !operation.checking {
                 if let failure = outcome.failure { Text(failure.localizedDescription).foregroundStyle(.red).textSelection(.enabled) }
                 if let words = outcome.words { Text(words).textSelection(.enabled) }
                 if outcome.unresolved {
                     Text("Not sure that went through. Check before sending again.").foregroundStyle(.secondary)
-                    Button("Check") { session.check(item, door: door) }.buttonStyle(.plain)
+                    Button("Check") { session.check(item, door: door) }.buttonStyle(FaceActionButtonStyle(fill: nil))
                 }
             } else {
                 HStack {
@@ -226,7 +258,7 @@ private struct FaceFormField: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(field.label).font(.callout)
             control
-            if let error = session.formErrors[block.key]?[field.id] { Text(error).font(.caption).foregroundStyle(.red) }
+            if let error = session[row: block.key]?.formErrors[field.id] { Text(error).font(.caption).foregroundStyle(.red) }
         }
         .accessibilityElement(children: .contain)
     }
@@ -272,5 +304,32 @@ private struct FaceFormField: View {
         let changed = number + direction * (field.step ?? 1)
         guard changed.isFinite, field.min.map({ changed >= $0 }) != false, field.max.map({ changed <= $0 }) != false else { return }
         set(.double(changed))
+    }
+}
+
+/// One level of a nested choice: the options that end here (checked when chosen), then a submenu per group, in the order the options came.
+struct FaceChoiceMenu: View {
+    let options: [PartFace.Control.Option]
+    let depth: Int
+    let value: Binding<String>
+
+    private var leaves: [PartFace.Control.Option] { options.filter { ($0.path?.count ?? 1) <= depth + 1 } }
+    private var nested: [PartFace.Control.Option] { options.filter { ($0.path?.count ?? 1) > depth + 1 } }
+    private var groups: [String] {
+        var seen = Set<String>()
+        return nested.compactMap { $0.path?[depth] }.filter { seen.insert($0).inserted }
+    }
+
+    var body: some View {
+        if !leaves.isEmpty {
+            Picker("", selection: value) {
+                ForEach(leaves) { Text($0.path?.last ?? $0.label).tag($0.id) }
+            }.pickerStyle(.inline).labelsHidden()
+        }
+        ForEach(groups, id: \.self) { group in
+            Menu(group) {
+                FaceChoiceMenu(options: nested.filter { $0.path?[depth] == group }, depth: depth + 1, value: value)
+            }
+        }
     }
 }

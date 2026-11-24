@@ -1,5 +1,5 @@
 import SwiftUI
-import Combine
+import Observation
 import NativeAgentShared
 // Blueprint: | `MacActionReceipts.swift` | Mac Tools receipt identities, original retry values and approval reconciliation |
 
@@ -70,23 +70,26 @@ struct RemoteActionCard: Identifiable, Equatable {
 
 /// Never trim waiting-approval receipts: they are the user's route from an interrupted Mac action to Activity.
 @MainActor
-final class RemoteActionLedger: ObservableObject {
+@Observable
+final class RemoteActionLedger {
     static let shared = RemoteActionLedger()
 
-    @Published private(set) var actions: [RemoteActionCard] = []
+    private(set) var actions: [RemoteActionCard] = []
     private let maximumOrdinaryActions = 12
 
-    init() {
-        observeApprovals()
-    }
+    @ObservationIgnored private var approvalChanges: Task<Void, Never>?
 
-    private func observeApprovals() {
-        withObservationTracking {
-            reconcileApprovals(iCloudSyncEngine.shared.approvals)
-        } onChange: { [weak self] in
-            Task { @MainActor in self?.observeApprovals() }
+    init() {
+        let changes = Observations { iCloudSyncEngine.shared.approvals }
+        approvalChanges = Task { [weak self] in
+            for await approvals in changes {
+                guard !Task.isCancelled else { return }
+                self?.reconcileApprovals(approvals)
+            }
         }
     }
+
+    deinit { approvalChanges?.cancel() }
 
     @discardableResult
     func start(_ kind: RemoteActionKind, title: String, subtitle: String, operation: UUID) -> UUID {

@@ -1,25 +1,28 @@
+import Observation
 import Foundation
-import SwiftUI
 import AVFoundation
 import UIKit
 
 @MainActor
-final class VoiceOutputController: NSObject, ObservableObject {
-    @Published var isSpeaking = false
-    @Published var error: String?
+@Observable
+final class VoiceOutputController: NSObject {
+    var isSpeaking = false
+    var error: String?
     /// Spoken replies default to off; the person's saved choice takes precedence.
-    @AppStorage("voiceOutputEnabled") var enabled = false
+    private(set) var enabled = UserDefaults.standard.bool(forKey: "voiceOutputEnabled") {
+        didSet { UserDefaults.standard.set(enabled, forKey: "voiceOutputEnabled") }
+    }
 
     // Create synthesizer/audio state lazily so idle spoken replies do not acquire the route.
-    private var _synthesizer: AVSpeechSynthesizer?
-    private var preparationTask: Task<Void, Never>?
-    private var audioToken: UUID?
-    private(set) var audioSessionActive = false
+    @ObservationIgnored private var _synthesizer: AVSpeechSynthesizer?
+    @ObservationIgnored private var preparationTask: Task<Void, Never>?
+    @ObservationIgnored private var audioToken: UUID?
+    @ObservationIgnored private(set) var audioSessionActive = false
     private let configureAudioSession: @Sendable () throws -> Void
     private let activateAudioSession: @Sendable () throws -> Void
     /// Use notifyOthersOnDeactivation so other apps regain their audio route.
     private let deactivateAudioSession: @Sendable () throws -> Void
-    private var activeUtterance: AVSpeechUtterance?
+    @ObservationIgnored private var activeUtterance: AVSpeechUtterance?
 
     init(
         configureAudioSession: @escaping @Sendable () throws -> Void = {

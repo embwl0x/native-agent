@@ -5,25 +5,21 @@ import UserNotifications
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @ObservedObject private var phoneRequests = PhoneRequests.shared
+    private let phoneRequests = PhoneRequests.shared
     @Environment(ChatStore.self) private var chatStore
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
-    @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @Environment(PairingStore.self) private var pairingStore
+    @Environment(MacBridgeClient.self) private var bridgeClient
     @Environment(VoiceInputController.self) private var voiceInput
-    @EnvironmentObject private var voiceOutput: VoiceOutputController
+    @Environment(VoiceOutputController.self) private var voiceOutput
     private let talk = TalkModeController.shared
     private let sync = iCloudSyncEngine.shared
 
-    @StateObject private var inboxStore = InboxStore()
+    @State private var inboxStore = InboxStore()
 
     @State private var selection: Tab = ContentView.initialTabFromLaunchArgs()
-    @State private var isRefreshingActivityBadges = false
-    @State private var skipNextActivityInitialRefresh = false
-    @State private var openedFromNotificationLaunch = NativeAgentNotificationLaunchIntent.isPending
     @State private var notificationOpenRefreshTask: Task<Void, Never>? = nil
-    @State private var lastNotificationOpenAt: Date = .distantPast
     @State private var activityNavigationTarget: ActivitySection?
     /// A card a face's link asked Today to open.
     @State private var activityCardID: String?
@@ -42,6 +38,10 @@ struct ContentView: View {
     private var activityBadgeCount: Int? {
         guard let overview = sync.workOverview, overview.unavailable.isEmpty else { return nil }
         return overview.needsYouCount
+    }
+
+    private var isOpeningNotification: Bool {
+        notificationOpenRefreshTask != nil || NativeAgentNotificationLaunchIntent.isPending
     }
 
     private static func initialTabFromLaunchArgs() -> Tab {
@@ -70,7 +70,7 @@ struct ContentView: View {
                 TalkModeView(talk: talk)
             }
             .onAppear { consumePendingTalk() }
-            .onReceive(NotificationCenter.default.publisher(for: MobileTalkRoute.notification)) { _ in consumePendingTalk() }
+            .onMessage(MobileTalkRoute.Requested.self) { _ in consumePendingTalk() }
             .onChange(of: chatStore.isSwitchingSession) { _, switching in if !switching { consumePendingTalk() } }
             .onChange(of: pairingStore.iCloudPairingSecret) { _, _ in
                 talk.end(reason: "Talk ended because the Mac pairing changed.")
@@ -80,6 +80,7 @@ struct ContentView: View {
             }
             .sheet(item: Binding(get: { phoneRequests.presented }, set: { _ in })) { request in
                 PhoneRequestSheet(request: request)
+                    .id(request.id)
             }
             .task { await phoneRequests.resume() }
             .onChange(of: selection, initial: true) { before, after in
@@ -168,11 +169,10 @@ struct ContentView: View {
                 .tag(Tab.chat)
 
             ActivityView(
-                skipInitialRefresh: $skipNextActivityInitialRefresh,
                 navigationTarget: $activityNavigationTarget,
                 cardTarget: $activityCardID
             )
-                .environmentObject(inboxStore)
+                .environment(inboxStore)
                 .tabItem {
                     Label("Today", systemImage: "sun.max")
                     .environment(\.symbolVariants, .none)
@@ -184,13 +184,15 @@ struct ContentView: View {
                 // Directed work stays inside More's navigation stack; the Desk tab owns the canonical board.
                 MobileFacePage(page: "desk", style: .root)
             }
+                .macSyncErrorBanner()
                 .tabItem {
                     Label("Desk", systemImage: "rectangle.3.group")
                     .environment(\.symbolVariants, .none)
                 }
                 .tag(Tab.desk)
 
-            NavigationStack { SettingsViewFull() }
+            NavigationStack { SettingsViewFull(presentation: .root) }
+                .macSyncErrorBanner()
                 .tabItem {
                     Label("Settings", systemImage: "gearshape")
                     .environment(\.symbolVariants, .none)
@@ -211,7 +213,7 @@ struct ContentView: View {
             openSharedChatIfNeeded()
             if MobileQuickAskRoute.isPending { selection = .chat }
         }
-        .onReceive(NotificationCenter.default.publisher(for: MobileQuickAskRoute.notification)) { _ in
+        .onMessage(MobileQuickAskRoute.Requested.self) { _ in
             selection = .chat
         }
         .onChange(of: scenePhase) { _, phase in
@@ -227,7 +229,7 @@ struct ContentView: View {
         .onAppear {
             consumePendingNotificationOpenIfNeeded()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .nativeagentOpenActivity)) { _ in
+        .onMessage(NativeAgentNotificationLaunchIntent.Staged.self) { _ in
             consumePendingNotificationOpenIfNeeded()
         }
         .onChange(of: sync.approvals) { _, _ in
@@ -248,7 +250,9 @@ struct ContentView: View {
             }
         }
         .task {
-            if !openedFromNotificationLaunch { await refreshActivityBadges() }
+            guard !isOpeningNotification else { return }
+            await sync.refreshActivitySnapshot()
+            await pruneActivityNotifications()
         }
         .onDisappear {
             notificationOpenRefreshTask?.cancel()
@@ -286,75 +290,43 @@ struct ContentView: View {
         activityNavigationTarget = target == .activity
             ? ActivityScreenPresentation.activityDestination(for: screen)
             : nil
-        let now = Date()
-        if now.timeIntervalSince(lastNotificationOpenAt) < 1.0 {
-            selection = target
-            return
-        }
-        lastNotificationOpenAt = now
-        openedFromNotificationLaunch = true
-        skipNextActivityInitialRefresh = (target == .activity)
         selection = target
 
         notificationOpenRefreshTask?.cancel()
         notificationOpenRefreshTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 2_250_000_000)
-            guard !Task.isCancelled else { return }
-            await refreshActivityBadges(pruneNotifications: false)
-            openedFromNotificationLaunch = false
-        }
-    }
-
-    @MainActor
-    private func refreshActivityBadges(
-        pruneNotifications: Bool = true
-    ) async {
-        guard !isRefreshingActivityBadges else { return }
-        isRefreshingActivityBadges = true
-        defer { isRefreshingActivityBadges = false }
-        await sync.refreshActivitySnapshot()
-        if pairingStore.usesICloudTransport {
-            inboxStore.applySyncedInboxFromSnapshot()
-        }
-        if pruneNotifications {
-            await pruneActivityNotifications()
+            await iCloudBridge.shared.drainDeviceTransport()
+            if !Task.isCancelled { notificationOpenRefreshTask = nil }
         }
     }
 
     @MainActor
     private func pruneActivityNotifications() async {
-        await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
+        guard !Task.isCancelled, !isOpeningNotification,
+              sync.inboxSnapshotLoaded || sync.approvalsSnapshotLoaded else { return }
+        let center = UNUserNotificationCenter.current()
+        let delivered = await center.deliveredNotifications()
+        guard !Task.isCancelled, !isOpeningNotification else { return }
+        let idsToRemove = NativeAgentActivityNotificationCleaner.notificationIDsToRemove(
             activeInboxItems: sync.inboxSnapshotLoaded ? inboxStore.items : nil,
             pendingApprovalIDs: sync.approvalsSnapshotLoaded
                 ? Set(sync.approvals.filter { $0.outcome == .pending }.map(\.id))
-                : nil
+                : nil,
+            deliveredNotifications: delivered
         )
+        if !idsToRemove.isEmpty {
+            center.removeDeliveredNotifications(withIdentifiers: idsToRemove)
+        }
     }
 }
 
 enum NativeAgentActivityNotificationCleaner {
     /// Only a successfully read empty queue proves resolution; a missing queue remains unavailable.
-    static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord]?, pendingApprovalIDs: Set<String>?) async {
-        guard activeInboxItems != nil || pendingApprovalIDs != nil else { return }
-        let activeItemIDs = activeInboxItems.map { Set($0.filter { $0.isUnread }.map(\.id)) }
-        let center = UNUserNotificationCenter.current()
-        let delivered = await center.deliveredNotifications()
-        let idsToRemove = notificationIDsToRemove(
-            activeItemIDs: activeItemIDs,
-            pendingApprovalIDs: pendingApprovalIDs,
-            deliveredNotifications: delivered
-        )
-
-        if !idsToRemove.isEmpty {
-            center.removeDeliveredNotifications(withIdentifiers: idsToRemove)
-        }
-    }
-
-    private static func notificationIDsToRemove(
-        activeItemIDs: Set<String>?,
+    static func notificationIDsToRemove(
+        activeInboxItems: [InboxItemRecord]?,
         pendingApprovalIDs: Set<String>?,
         deliveredNotifications: [UNNotification]
     ) -> [String] {
+        let activeItemIDs = activeInboxItems.map { Set($0.filter { $0.isUnread }.map(\.id)) }
         var removeIDs: [String] = []
 
         for notification in deliveredNotifications {

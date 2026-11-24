@@ -113,7 +113,7 @@ references, each at most 8 MiB and 40 megapixels, 20 MiB total. `n` is clamped
 to 1–4; `timeout_seconds` to 30–1800, default 600. Masks, implicit prior-image
 references, compression and image reasoning-effort controls are refused.
 
-Implementation under `Modules/NativeAgentCore/Sources/ChatToolRuntime/`: routing,
-display and receipts in `SwiftToolDispatcher+ImageGenerationTools.swift`; transports
+Implementation under `Modules/NativeAgentCore/Sources/BodyRuntime/ChatToolRuntime/`: routing,
+display and receipts in `StudioActions+ImageGenerationTools.swift`; transports
 in `SwiftCodexImageGenerationClient.swift` and `SwiftOpenAIImageGenerationClient.swift`;
 reference admission and controls in `CodexImageGenerationControls.swift`.

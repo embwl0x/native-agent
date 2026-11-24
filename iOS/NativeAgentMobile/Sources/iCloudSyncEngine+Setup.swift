@@ -189,6 +189,7 @@ extension iCloudSyncEngine {
         // or mailbox work, and later deliveries change only what changed.
         _ = await refreshSnapshotGroup(.core)
         _ = await refreshSnapshotGroup(.chat)
+        _ = await refreshSnapshotGroup(.faces)
         pruneEphemeralDirectoriesIfDue()
         await settleUnobservedActionResponses()
     }

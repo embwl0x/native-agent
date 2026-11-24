@@ -42,81 +42,77 @@ extension ChatView {
             }
 
             let a11y = dynamicTypeSize.isAccessibilitySize
-            let layout = a11y
-                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
-                : AnyLayout(HStackLayout(alignment: .bottom, spacing: 2))
-            layout {
-                if !a11y { leadingButtons }
+            VStack(alignment: .leading, spacing: 4) {
                 if isRecordingVoice {
                     recordingStrip
                 } else {
                     MobileChatComposerField(draft: draft, placeholder: composerPlaceholder,
-                    focused: $composerIsFocused, accessibilitySize: a11y,
-                    isSwitchingSession: store.isSwitchingSession, onSubmit: submitMessage)
+                        focused: $composerIsFocused, accessibilitySize: a11y,
+                        isSwitchingSession: store.isSwitchingSession, onSubmit: submitMessage)
+                        .padding(.horizontal, 10)
                 }
 
-            HStack(spacing: 2) {
-                if a11y { leadingButtons; Spacer(minLength: 8) }
-                micButton
-                    .disabled(store.isSwitchingSession)
-                Button {
-                    composerIsFocused = false
-                    voiceInput.cancel(); voiceOutput.stop()
-                    TalkModeController.shared.begin(client: bridgeClient, controls: runtimeControls)
-                } label: {
-                    Image(systemName: "phone.arrow.up.right")
-                        .font(.system(size: 18)).frame(width: 44, height: 44)
-                }
-                .disabled(store.isSwitchingSession || voiceInput.isFinalizing)
-                .accessibilityLabel("Talk to \(agentDisplayName)")
-                .accessibilityHint("Start a hands-free conversation in this chat")
-
-                let replying = !voiceInput.isListening && !voiceInput.isStarting
-                    && (!store.stoppableRunIDs(client: bridgeClient).isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true))
-                if replying {
+                HStack(spacing: 2) {
+                    leadingButtons
+                    Spacer(minLength: 8)
+                    micButton
+                        .disabled(store.isSwitchingSession)
                     Button {
-                        guard !isChatSample else { return }
-                        store.stop(client: bridgeClient)
+                        composerIsFocused = false
+                        voiceInput.cancel(); voiceOutput.stop()
+                        TalkModeController.shared.begin(client: bridgeClient, controls: runtimeControls)
                     } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(AlivePalette.text)
-                            .frame(width: 36, height: 36)
-                            .background(NativeAgentMobileTheme.Colors.softFill, in: Circle())
-                            .frame(width: 44, height: 44)
+                        Image(systemName: "phone.arrow.up.right")
+                            .font(.system(size: 18)).frame(width: 44, height: 44)
                     }
-                    .accessibilityLabel("Stop generation")
-                }
-                // While she replies, a draft still sends: it reaches her in the turn she is in.
-                if !replying || canSend {
+                    .disabled(store.isSwitchingSession || voiceInput.isFinalizing)
+                    .accessibilityLabel("Talk to \(agentDisplayName)")
+                    .accessibilityHint("Start a hands-free conversation in this chat")
 
-                Button {
-                    if voiceInput.isListening || voiceInput.isStarting {
-                        sendWhenDictationLands = true
-                        voiceInput.stop()
-                    } else {
-                        submitMessage()
-                    }
-                } label: {
-                    let active = (canSend || voiceInput.isListening || voiceInput.isStarting) && !store.isSwitchingSession
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(active ? Color.white : AlivePalette.secondary)
-                        .frame(width: 36, height: 36)
-                        .background {
-                            Circle().fill(active
-                                ? HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true)
-                                : NativeAgentMobileTheme.Colors.softFill)
-                            .animation(
-                                AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion),
-                                value: active)
+                    let replying = !voiceInput.isListening && !voiceInput.isStarting
+                        && (!store.stoppableRunIDs(client: bridgeClient).isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true))
+                    if replying {
+                        Button {
+                            guard !isChatSample else { return }
+                            store.stop(client: bridgeClient)
+                        } label: {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(AlivePalette.text)
+                                .frame(width: 36, height: 36)
+                                .background(NativeAgentMobileTheme.Colors.softFill, in: Circle())
+                                .frame(width: 44, height: 44)
                         }
-                        .frame(width: 44, height: 44)
+                        .accessibilityLabel("Stop generation")
+                    }
+                    if !replying || canSend {
+                        Button {
+                            if voiceInput.isListening || voiceInput.isStarting {
+                                sendWhenDictationLands = true
+                                voiceInput.stop()
+                            } else {
+                                submitMessage()
+                            }
+                        } label: {
+                            let active = (canSend || voiceInput.isListening || voiceInput.isStarting) && !store.isSwitchingSession
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(active ? Color.white : AlivePalette.secondary)
+                                .frame(width: 36, height: 36)
+                                .background {
+                                    Circle().fill(active
+                                        ? HazeColor(stored: hazeColorRaw).control(dark: colorScheme == .dark, labelled: true)
+                                        : NativeAgentMobileTheme.Colors.softFill)
+                                    .animation(
+                                        AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion),
+                                        value: active)
+                                }
+                                .frame(width: 44, height: 44)
+                        }
+                        .disabled(!(canSend || voiceInput.isListening || voiceInput.isStarting) || store.isSwitchingSession || voiceInput.isFinalizing)
+                        .accessibilityLabel("Send message")
+                    }
                 }
-                .disabled(!(canSend || voiceInput.isListening || voiceInput.isStarting) || store.isSwitchingSession || voiceInput.isFinalizing)
-                .accessibilityLabel("Send message")
-                }
-            }
             }
         }
         .foregroundStyle(AlivePalette.text)
@@ -240,16 +236,19 @@ extension ChatView {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(pendingFiles) { file in
-                    HStack {
+                    HStack(spacing: 4) {
                         Label(file.name ?? "Document", systemImage: "doc")
                             .lineLimit(1)
+                            .padding(.leading, 12)
                         Button { pendingFiles.removeAll { $0.id == file.id } } label: {
                             Image(systemName: "xmark.circle.fill")
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                         .accessibilityLabel("Remove attached document")
                     }
                     .font(.footnote)
-                    .padding(10)
                     .background(AlivePalette.fill, in: Capsule())
                 }
                 if isLoadingPhotos {
@@ -297,40 +296,24 @@ extension ChatView {
         }
     }
 
-    /// Capture a local Sendable Bool: PhotosPicker's escaping @Sendable label cannot read MainActor-isolated state.
-    private var photosPickerButton: some View {
-        let loading = isLoadingPhotos
+    private var attachmentMenu: some View {
         let sessionKey = store.queueSessionKey(store.selectedSessionID)
         let retainedOutsidePicker = pendingPhotos.filter { photo in
             !selectedPhotoItems.contains { $0 == photo.pickerItem }
         }.count
-        return HStack(spacing: 0) {
-        PhotosPicker(
-            selection: Binding(get: { selectedPhotoItems }, set: { items in
+        let busy = store.isLoading || store.isSwitchingSession || isLoadingPhotos || fileLoadID != nil
+        let atLimit = pendingPhotos.count + pendingFiles.count >= maxPendingPhotos
+        return MobileAttachmentMenu(
+            selectedPhotoItems: Binding(get: { selectedPhotoItems }, set: { items in
                 guard composerSessionKey == sessionKey,
                       store.queueSessionKey(store.selectedSessionID) == sessionKey else { return }
                 selectedPhotoItems = items
             }),
-            maxSelectionCount: max(1, maxPendingPhotos - pendingFiles.count - retainedOutsidePicker),
-            matching: .images
-        ) {
-            Image(systemName: loading ? "hourglass" : "plus")
-                .font(.system(size: 18, weight: .regular))
-                .foregroundStyle(AlivePalette.secondary)
-                .frame(width: 44, height: 44)
-                .contentShape(Circle())
-        }
-        .disabled(store.isLoading || store.isSwitchingSession || loading || fileLoadID != nil || pendingPhotos.count + pendingFiles.count == maxPendingPhotos)
-        .accessibilityLabel("Add photos")
-        Button { showsFileImporter = true } label: {
-            Image(systemName: "doc.badge.plus")
-                .font(.system(size: 18, weight: .regular))
-                .foregroundStyle(AlivePalette.secondary)
-                .frame(width: 44, height: 44)
-        }
-        .disabled(store.isLoading || store.isSwitchingSession || loading || fileLoadID != nil || pendingFiles.count + pendingPhotos.count >= maxPendingPhotos)
-        .accessibilityLabel("Add PDF or text files")
-        }
+            canAttach: !busy && !atLimit,
+            isLoading: isLoadingPhotos || fileLoadID != nil,
+            maxPhotos: max(1, maxPendingPhotos - pendingFiles.count - retainedOutsidePicker),
+            onChooseFiles: { showsFileImporter = true }
+        )
     }
 
     private var micButton: some View {
@@ -372,7 +355,7 @@ extension ChatView {
             .buttonStyle(.plain)
             .accessibilityLabel("Cancel recording")
         } else {
-            photosPickerButton
+            attachmentMenu
         }
     }
 
@@ -564,6 +547,7 @@ final class MobileChatDraft {
 }
 
 private struct MobileChatComposerField: View {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     let draft: MobileChatDraft
     let placeholder: String
     @Binding var focused: Bool
@@ -572,7 +556,8 @@ private struct MobileChatComposerField: View {
     let onSubmit: () -> Void
 
     var body: some View {
-        MobileComposerTextView(text: draft.text, placeholder: placeholder, isFocused: focused, maxLines: accessibilitySize ? 8 : 5,
+        let maxLines = verticalSizeClass == .compact ? 2 : (accessibilitySize ? 8 : 5)
+        MobileComposerTextView(text: draft.text, placeholder: placeholder, isFocused: focused, maxLines: maxLines,
                                enabled: !isSwitchingSession, onChange: { draft.text = $0 }, onFocus: { focused = $0 }, onSubmit: onSubmit)
             .overlay(alignment: .topLeading) {
                 if draft.isEmpty {
@@ -589,8 +574,54 @@ private struct MobileChatComposerField: View {
     }
 }
 
-/// A vertical SwiftUI TextField runs full text layout for every size its stack proposes, several times a keystroke.
-/// This view lays the text out once per change and answers every other proposal from that one measure.
+private struct MobileAttachmentMenu: View {
+    @Binding var selectedPhotoItems: [PhotosPickerItem]
+    let canAttach: Bool
+    let isLoading: Bool
+    let maxPhotos: Int
+    let onChooseFiles: () -> Void
+    @State private var showsPhotosPicker = false
+
+    var body: some View {
+        Menu {
+            Button { showsPhotosPicker = true } label: {
+                Label("Photos", systemImage: "photo")
+            }
+            Button(action: onChooseFiles) {
+                Label("Files", systemImage: "doc")
+            }
+        } label: {
+            Image(systemName: isLoading ? "hourglass" : "plus")
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(AlivePalette.secondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
+        }
+        .disabled(!canAttach)
+        .accessibilityLabel("Add attachments")
+        .photosPicker(
+            isPresented: $showsPhotosPicker,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: maxPhotos,
+            matching: .images
+        )
+    }
+}
+
+private final class ComposerUITextView: UITextView {
+    var onLayoutWidth: ((CGFloat) -> Void)?
+    private var lastLayoutWidth: CGFloat = 0
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let width = bounds.width
+        if width > 0, width != lastLayoutWidth {
+            lastLayoutWidth = width
+            onLayoutWidth?(width)
+        }
+    }
+}
+
 private struct MobileComposerTextView: UIViewRepresentable {
     let text: String
     let placeholder: String
@@ -601,6 +632,7 @@ private struct MobileComposerTextView: UIViewRepresentable {
     let onFocus: (Bool) -> Void
     let onSubmit: () -> Void
 
+    @MainActor
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: MobileComposerTextView
         var measured: [CGFloat: CGFloat] = [:]
@@ -608,8 +640,34 @@ private struct MobileComposerTextView: UIViewRepresentable {
         var width: CGFloat = 0
         init(_ parent: MobileComposerTextView) { self.parent = parent }
 
+        func measuredHeight(in textView: UITextView, width: CGFloat) -> CGFloat {
+            if measuredFont != textView.font {
+                measured.removeAll()
+                measuredFont = textView.font
+            }
+            if let cached = measured[width] { return cached }
+            let full = ceil(textView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height)
+            measured[width] = full
+            return full
+        }
+
+        func syncScrollMode(_ textView: UITextView) {
+            let layoutWidth = textView.bounds.width
+            guard layoutWidth > 44 else { return }
+            let line = ceil(textView.font?.lineHeight ?? 22)
+            let limit = line * CGFloat(parent.maxLines)
+            let scrolls = measuredHeight(in: textView, width: layoutWidth) > limit
+            if textView.isScrollEnabled != scrolls {
+                textView.isScrollEnabled = scrolls
+                if scrolls {
+                    textView.scrollRangeToVisible(textView.selectedRange)
+                }
+            }
+        }
+
         func textViewDidChange(_ textView: UITextView) {
             measured.removeAll()
+            syncScrollMode(textView)
             parent.onChange(textView.text)
             textView.invalidateIntrinsicContentSize()
         }
@@ -624,9 +682,10 @@ private struct MobileComposerTextView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    func makeUIView(context: Context) -> UITextView {
-        let view = UITextView()
-        view.delegate = context.coordinator
+    func makeUIView(context: Context) -> ComposerUITextView {
+        let view = ComposerUITextView()
+        let coordinator = context.coordinator
+        view.delegate = coordinator
         view.backgroundColor = .clear
         view.textContainerInset = .zero
         view.textContainer.lineFragmentPadding = 0
@@ -637,20 +696,24 @@ private struct MobileComposerTextView: UIViewRepresentable {
         view.returnKeyType = .send
         view.isScrollEnabled = false
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.onLayoutWidth = { [weak coordinator, weak view] _ in
+            guard let coordinator, let view else { return }
+            coordinator.syncScrollMode(view)
+        }
         return view
     }
 
-    func updateUIView(_ view: UITextView, context: Context) {
+    func updateUIView(_ view: ComposerUITextView, context: Context) {
         context.coordinator.parent = self
         if view.text != text {
             view.text = text
             context.coordinator.measured.removeAll()
             view.invalidateIntrinsicContentSize()
         }
+        context.coordinator.syncScrollMode(view)
         view.isEditable = enabled
         view.accessibilityLabel = placeholder
         guard isFocused != view.isFirstResponder else { return }
-        // First responder changes cannot run inside a view update; the latest wish decides when this runs.
         let coordinator = context.coordinator
         Task { @MainActor [weak view] in
             guard let view, coordinator.parent.isFocused != view.isFirstResponder else { return }
@@ -658,23 +721,15 @@ private struct MobileComposerTextView: UIViewRepresentable {
         }
     }
 
-    func sizeThatFits(_ proposal: ProposedViewSize, uiView view: UITextView, context: Context) -> CGSize? {
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView view: ComposerUITextView, context: Context) -> CGSize? {
         let coordinator = context.coordinator
-        if coordinator.measuredFont != view.font {
-            coordinator.measured.removeAll()
-            coordinator.measuredFont = view.font
-        }
         let line = ceil(view.font?.lineHeight ?? 22)
         var width = proposal.width ?? coordinator.width
         if !width.isFinite { width = coordinator.width }
-        // The stack's probes at no width need no text layout: the field takes whatever room is left.
         guard width > 44 else { return CGSize(width: proposal.width ?? 44, height: line) }
         coordinator.width = width
-        let full = coordinator.measured[width] ?? ceil(view.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height)
-        coordinator.measured[width] = full
+        let full = coordinator.measuredHeight(in: view, width: width)
         let limit = line * CGFloat(maxLines)
-        let scrolls = full > limit
-        if view.isScrollEnabled != scrolls { view.isScrollEnabled = scrolls }
         return CGSize(width: proposal.width.map { $0.isFinite ? $0 : width } ?? width, height: min(full, limit))
     }
 }

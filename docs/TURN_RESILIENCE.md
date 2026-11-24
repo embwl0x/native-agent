@@ -1,17 +1,17 @@
 # Turn resilience map
 
 How a turn keeps working, stops, and leaves evidence. One brain, many doors:
-`EngineRuntime/EngineTurns.swift` holds Mac turn state through
+`BodyRuntime/EngineRuntime/EngineTurns.swift` holds Mac turn state through
 `MacChatTurnRuntime`; `ChatTurnRuntime` owns the shared turn engine.
 Mac views draw shared `TurnFace` values through their session-keyed face slots,
 projected off main by `TurnFaceProjection`. Lifecycle state remains operational
 authority. Time since movement is descriptive; it never changes phase or
-expires a streaming marker. See the [face feed](designs/separate-face.md#stage-one-turn-status).
+expires a streaming marker. See the [face feed](../Modules/NativeAgentCore/FACE_LINK.md).
 Source paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
 The agent's one door, `app`, is always on. `app {}` returns home, where they left
 off; `page`, `item`, `find`, `action` and `script` reach its contents.
-`AppToolRuntime/AppActions+Declarations.swift` defines the actions and
+`BodyRuntime/AppToolRuntime/AppActions+Declarations.swift` defines the actions and
 `AppScriptRunner.swift` binds scripts to the shared executor. The model-facing tool
 contract is in [One door](ONE_DOOR.md).
 
@@ -89,7 +89,7 @@ lifecycle and startup recovery remain the durable evidence owner.
 A call is ended when the thing it waits on is seen to be dead or not
 answering, exactly as Stop ends it, and the agent reads what was found dead.**
 The turn goes on: the agent reads the receipt and decides what to do.
-`PersistenceCore/CallBound.swift` holds the law.
+`PersistenceCore/PersistenceCore/CallBound.swift` holds the law.
 
 Each call has a watch (`TurnDeadline` on its active-work clock), and the
 watches of one outermost call and every call running inside it form one tree.
@@ -184,11 +184,16 @@ wall clock: the caller's own word, not the app's number. A tool's own default
 inside its code (a shell's 120 seconds, a build's 600) is that tool's, and it
 ends its own work; the call does not.
 
+Resident and helper model rounds share request fitting, incremental prose release
+and stream consumption in `ModelRoundKernel`. The resident turn handles arrivals
+through its turn program. The helper owns its instructions, transcript, token
+budget, condition result, receipts and stopped reply.
+
 Four boundaries give each call its watch, and every call a turn makes crosses
 one: `runSingleDispatch` for each call of a turn on the shared tool loop; a
 helper's turn's own dispatch (`runStandingBot`'s `standingBotExecution`), which does
 not use that loop;
-the app door's re-entry (`CanonicalToolNameDispatcher`'s
+the app door's re-entry (`DoorPipeline`'s
 `AppDoorReentry.perform`) for every nested call, which is how batch steps,
 script and part actions, reads and finds, folded calls, part thoughts' calls
 and every admitted primitive run; and `ToolHost.primitive` for the watch-frame
@@ -283,6 +288,13 @@ edge, including a loss followed immediately by a return.
 while a connection that cannot be established returns its transport error
 instead of becoming an unsent task held by URLSession.
 
+The selected profile in `ProviderRegistry` binds the account, credentials and
+telemetry root. `HTTPStreamTransport` opens one request and passes admitted
+SSE events to its Chat Completions, Responses or Anthropic Messages codec.
+The SSE parser reads field names as bytes and joins data lines before decoding
+the event payload. Provider EOF flushes pending data. Peer framing requires
+a blank delimiter and validates each line as UTF-8 within its byte limit.
+
 Error-body diagnostics wait for EOF, read error, the declared byte cap or
 cancellation. A failed read retains its partial diagnostic bytes, HTTP status
 and Retry-After when observed, and original read cause; its diagnostic includes
@@ -294,18 +306,14 @@ are separate from provider transport and require removal in their owning lanes.
 
 Anthropic-compatible message streams, including tool-free API and Kimi Code
 calls, use SSE. Codex stdout supplies real progress; synthetic keep-alives
-prove neither provider progress nor first output. Every Codex call uses the same
-stdout producer and one strict incremental UTF-8 decoder per pipe. Split scalars
-wait for their remaining bytes; invalid or unfinished scalars fail after process settlement, retaining
-valid prefixes and exact undecodable suffix bytes on the encoding error. Raw
-bytes are not written to diagnostics. Exit zero cannot make invalid encoding
-a successful reply.
-prove neither provider progress nor first output. Buffered Codex completion
-collects the same stdout stream as incremental completion. A strict UTF-8 decoder
-retains valid prefixes and exact undecodable suffix bytes; stdout EOF or a pipe
+prove neither provider progress nor first output. Every Codex call, buffered
+completion included, uses the same stdout producer and one strict incremental
+UTF-8 decoder per pipe. Split scalars wait for their remaining bytes; invalid or
+unfinished scalars fail the wait, retaining valid prefixes and exact undecodable
+suffix bytes on the encoding error. Raw bytes are not written to diagnostics.
+Exit zero cannot make invalid encoding a successful reply. Stdout EOF or a pipe
 read failure settles the model wait without awaiting process exit or stderr.
-Invalid or unfinished stdout scalars fail that wait. Raw bytes are not written
-to diagnostics. The invocation retains its process and both drains until actual
+The invocation retains its process and both drains until actual
 exit; `codex.process.exited` records its status and capture/encoding failures
 independently, including when stdout closed before exit. A late exit cannot
 change the already settled reply.
@@ -316,7 +324,7 @@ A call's input as it streams is movement the person sees, never a cut or a
 deadline; [the anatomy](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool)
 owns how it reaches the working card.
 
-`ProviderRouting/LLMClient+Real.swift` forwards the selected adapter through its
+`ProviderRouting/ProviderRouting/LLMClient+Real.swift` forwards the selected adapter through its
 cancellation and admission boundary. Whole-reply completion uses that same
 operation and checked collector, with or without a turn token budget. Its one
 reply owner releases the caller's wait at Stop while collection and forwarding
@@ -332,10 +340,6 @@ Provider failures give the turn part the cause and remedy; they authorize no
 automatic re-request. A retry chosen by the agent may be paced only by the
 server's explicit `retry_after`, never by a computed backoff or an assumed
 rate-limit wait.
-operation and checked collector, with or without a turn token budget. Stop
-leaves forwarding alive: the HTTP request observes cancellation, while Codex
-runs to stdout EOF while process settlement owns its later exit. Whole-reply
-settlement retains all produced output before returning cancellation.
 `TurnAdmission` gives the turn one `ProviderRecovery` part; a direct turn-engine
 entry creates it when no admission supplied one. The routed client's stream
 boundary reads that same owner on every model round. A standalone request owns
@@ -387,8 +391,11 @@ emptiness depends on whitespace, not on removing HTML or XML tags.
 `LLMCall.allowsSilentCompletion` declares whether a clean provider terminal
 without answer text or calls is a complete answer. The stem declares it for a
 thought from its native opening message's `attended` object, including checkpoint
-replay; other requests require output unless their caller explicitly declares
-silence valid. All adapters and the stem read that same declaration. Anthropic
+replay. Once prose has streamed to the person, it also permits silence on a trailing
+round carrying the [closing record for eligible writes](SURPRISE.md#the-law). A newly joined arrival
+restores the ordinary output requirement for that round. Other requests
+require output unless their caller explicitly declares silence valid. All adapters
+and the stem read that same declaration. Anthropic
 requires `end_turn` with every block closed, Responses requires a completed
 response, Chat Completions requires `stop` and `[DONE]`, and Codex requires EOF
 and successful process exit. Refusal, output limits, incomplete calls and missing
@@ -422,7 +429,7 @@ failures. Existing retained files keep their names and contents.
 
 ### 5. In-loop provider recovery
 
-`ChatTurnRuntime/TurnStem+Effects.swift` owns the loop and
+`BodyRuntime/ChatTurnRuntime/TurnStem+Effects.swift` owns the loop and
 `TurnStem+ModelRound.swift` its model round,
 including native-tool and text-marker protocols. One `TurnObservation` owns
 the model's next-round feedback for a limit, stream cut, correctness boundary,
@@ -522,9 +529,9 @@ elapsed time is presentation data and cannot replace that phase.
 
 ### 7. Cancellation trace
 
-`ChatTurnRuntime/ChatTurnSettlement.swift` records
+`BodyRuntime/ChatTurnRuntime/ChatTurnSettlement.swift` records
 `turn.cancelled` with a `where` field and persists the visible partial.
-`EngineRuntime/EngineTurns.swift` delegates Mac Stop to `MacChatTurnRuntime`.
+`BodyRuntime/EngineRuntime/EngineTurns.swift` delegates Mac Stop to `MacChatTurnRuntime`.
 Stop (the run's cancel flag) is the one cancel link: it cancels the turn's
 work at once, wherever it waits. The Mac registers the run at admission,
 before any await, so a Stop always names the live run. A door that stops listening only detaches;
@@ -551,7 +558,7 @@ reports its cause without an alternate summary pass.
 
 ### 9. Process continuation
 
-`TurnTrace/AbandonedTurnReconciler.swift` owns the small durably committed checkpoint at
+`SenseCore/TurnTrace/AbandonedTurnReconciler.swift` owns the small durably committed checkpoint at
 `chat/session_state/<session>/turn-<turnId>.json` (a worker, which has no
 conversation, owns `chat/session_state/worker-<runId>/` and removes it when it
 ends). Writes flush the encoded bytes and parent directory through PersistenceCore's
@@ -577,7 +584,7 @@ An unreadable checkpoint does not prevent discovery of readable siblings.
 Resume admission also requires the checkpoint's necessary terminal evidence
 to have clean trace coverage; an unreadable required day or checkpoint owes
 repair rather than admitting that resume.
-`EngineRuntime/EngineTurnContinuation.swift` restores the original admission,
+`BodyRuntime/EngineRuntime/EngineTurnContinuation.swift` restores the original admission,
 surface capabilities, peer provenance, helper ownership and delivery route.
 File-write verification rejects negative saved byte counts and checks read
 arithmetic before dispatch; malformed saved sizes cannot abort recovery.
@@ -598,7 +605,7 @@ observation names each call their part's log shows started without a receipt
 (tool and redacted arguments), and an attached Desk journal admits the same
 call proposed again (tool and argument digest) as that unresolved step, so its
 receipt settles it instead of a fresh step beside it. Oversize-result
-pages cannot survive the process; the observation says they are unavailable.
+pages from before the restart still read through `result.page`; the observation says so.
 Contact sends follow [their retained-handle restart law](agent-communication.md#honest-states):
 read existing work without a prompt or resend, or settle the send with its restart cause.
 
@@ -607,7 +614,7 @@ and `hasRedeliveryOwner` holds: no stopped reason or helper owner, and a
 Telegram, Slack or iOS reply route. It durably marks `deliveryPending` before
 the terminal append; the reply owner removes it after delivery settlement.
 Other terminals remove their checkpoint after the durable append. All retire the live spill scope; Mac recovery
-still posts chatTurnCompleted to refresh its transcript without pushed delivery.
+still posts `ChatTurnCompleted` to refresh its transcript without pushed delivery.
 If the answer was already saved, recovery uses it without another provider call.
 Reply owners and the continuation sweep start independently of senses
 registration. A resumed turn that reads a sense waits at that read's owner,
@@ -704,7 +711,7 @@ message identity.
 
 ## Reading a stopped turn
 
-`TurnTrace/TurnTracePersistLane.swift` writes a turn's events as details in the
+`SenseCore/TurnTrace/TurnTracePersistLane.swift` writes a turn's events as details in the
 record (`experiences/experiences.sqlite`, table `detail`, subject = the turn id).
 Read a turn's details by its id, then read `kind`, `ts`, `surface` and the
 terminal payload together. The record forgets details after two weeks

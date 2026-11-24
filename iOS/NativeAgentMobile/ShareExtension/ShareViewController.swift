@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -22,14 +23,17 @@ final class ShareViewController: UIViewController {
 }
 
 @MainActor
-final class ShareComposeModel: ObservableObject {
-    @Published var name = "NativeAgent"
-    @Published var note = ""
-    @Published var text = ""
-    @Published var attachments: [MultimodalAttachment] = []
-    @Published var loading = true
-    @Published var error: String?
-    @Published var saved = false
+@Observable
+final class ShareComposeModel {
+    var name = "NativeAgent"
+    var note = ""
+    var text = ""
+    var attachments: [MultimodalAttachment] = []
+    /// Each shared image, decoded once when it is prepared; the view never decodes on a body pass.
+    var previews: [String: UIImage] = [:]
+    var loading = true
+    var error: String?
+    var saved = false
     private let context: NSExtensionContext?
     private let id = UUID()
     fileprivate let pairingFingerprint = SharedChatInbox.identityDefaults?.string(forKey: SharedChatInbox.identityPairingKey)
@@ -51,6 +55,7 @@ final class ShareComposeModel: ObservableObject {
             }
             var parts: [String] = []
             var files: [MultimodalAttachment] = []
+            var images: [String: UIImage] = [:]
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
                     let data = try await data(from: provider, type: UTType.pdf.identifier)
@@ -66,8 +71,10 @@ final class ShareComposeModel: ObservableObject {
                     }).value else {
                         throw SharedChatInbox.failure("This image could not be prepared for chat.")
                     }
-                    files.append(MultimodalAttachment(type: "image", base64: jpeg.base64EncodedString(),
-                        mime: "image/jpeg", name: "Shared-\(files.count + 1).jpg", byteSize: jpeg.count))
+                    let image = MultimodalAttachment(type: "image", base64: jpeg.base64EncodedString(),
+                        mime: "image/jpeg", name: "Shared-\(files.count + 1).jpg", byteSize: jpeg.count)
+                    images[image.id] = UIImage(data: jpeg)
+                    files.append(image)
                 } else {
                     let type = provider.hasItemConformingToTypeIdentifier(UTType.url.identifier)
                         ? UTType.url.identifier : UTType.text.identifier
@@ -80,6 +87,7 @@ final class ShareComposeModel: ObservableObject {
             }
             text = joined
             attachments = files
+            previews = images
         } catch { self.error = error.localizedDescription }
     }
 
@@ -121,7 +129,7 @@ final class ShareComposeModel: ObservableObject {
 }
 
 private struct ShareComposeView: View {
-    @ObservedObject var model: ShareComposeModel
+    @Bindable var model: ShareComposeModel
 
     var body: some View {
         NavigationStack {
@@ -141,8 +149,7 @@ private struct ShareComposeView: View {
                         }
                         ForEach(model.attachments) { item in
                             VStack(alignment: .leading) {
-                                if item.type == "image", let data = Data(base64Encoded: item.base64),
-                                   let image = UIImage(data: data) {
+                                if let image = model.previews[item.id] {
                                     Image(uiImage: image).resizable().scaledToFit().frame(maxHeight: 180)
                                 }
                                 Label(item.name ?? "Attachment", systemImage: item.type == "image" ? "photo" : "doc")

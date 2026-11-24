@@ -1,5 +1,4 @@
-import AppToolRuntime
-import EngineRuntime
+import BodyRuntime
 import Foundation
 import SwiftUI
 import NativeAgentShared
@@ -9,10 +8,6 @@ import NativeAgentShared
 @MainActor
 enum SettingsLink {
     static func open(_ item: SidebarItem, tab: String? = nil) {
-        let mode = SimpleViewMode.resolved(UserDefaults.standard.string(forKey: SimpleViewMode.key) ?? "")
-        if mode != SimpleViewMode.simple && mode != SimpleViewMode.advanced {
-            UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key)
-        }
         // The window opens the page and its tab; her body keeps no window state of its own.
         var destination = NativeAgentNavigationDestination.sidebar(item).faceDestination
         destination?.item = tab

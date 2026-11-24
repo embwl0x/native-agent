@@ -90,7 +90,7 @@ private struct AliveHeaderLine: View {
 /// Mac status replaces the header line without moving the page; its target stays 44pt.
 private struct AliveConnectionLine: View {
     let line: String?
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @Environment(MacBridgeClient.self) private var bridgeClient
 
     var body: some View {
         if bridgeClient.connection.holds {
@@ -125,6 +125,7 @@ struct AlivePage<Trailing: View, Content: View>: View {
     var freshnessGroup: String?
     let trailing: Trailing
     let content: Content
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     init(title: String, line: String? = nil, style: AlivePageStyle = .pushed,
          freshnessGroup: String? = nil, @ViewBuilder trailing: () -> Trailing,
@@ -148,23 +149,37 @@ struct AlivePage<Trailing: View, Content: View>: View {
                 .aliveListRow(top: style == .root ? AliveMetrics.rootTop : 4, bottom: 4)
             }
             content
-                .listRowBackground(AlivePalette.fill)
+                .listRowBackground(reduceTransparency ? NativeAgentMobileTheme.Colors.contentSurface : AlivePalette.fill)
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .environment(\.aliveInList, true)
-        .environment(\.faceInList, true)
-        .environment(\.faceStyle, .phone)
+        .faceList()
+        .phoneFaceStyle()
         .alivePageChrome(title: title, root: style == .root)
     }
 }
 
 extension FaceStyle {
-    static let phone = FaceStyle(
-        insets: EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16), minimumHeight: 44,
-        title: .body.weight(.medium), detail: .subheadline, value: .subheadline.monospacedDigit(),
-        elevation: AlivePalette.fill, actionSurface: AlivePalette.fill,
-        card: { AnyView($0.background(AlivePalette.fill, in: RoundedRectangle(cornerRadius: 12))) })
+    static func phone(answer: Color, reduceTransparency: Bool) -> FaceStyle {
+        let surface = reduceTransparency ? NativeAgentMobileTheme.Colors.contentSurface : AlivePalette.fill
+        return FaceStyle(
+            insets: EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16), minimumHeight: 44,
+            title: .body.weight(.medium), detail: .subheadline, value: .subheadline.monospacedDigit(),
+            elevation: surface, actionSurface: surface, answer: answer,
+            card: { AnyView($0.background(surface, in: RoundedRectangle(cornerRadius: 12))) })
+    }
+}
+
+private struct PhoneFaceStyleModifier: ViewModifier {
+    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        let answer = HazeColor(stored: colorRaw).control(dark: colorScheme == .dark, labelled: true)
+        content.environment(\.faceStyle, .phone(answer: answer, reduceTransparency: reduceTransparency))
+    }
 }
 
 extension AlivePage where Trailing == EmptyView {
@@ -176,60 +191,17 @@ extension AlivePage where Trailing == EmptyView {
 }
 
 extension View {
-    /// Keep titles accessible without duplicating the visible header; fades protect content under floating navigation.
+    func phoneFaceStyle() -> some View {
+        modifier(PhoneFaceStyleModifier())
+    }
+
     func alivePageChrome(title: String, root: Bool) -> some View {
         mobileReadingScreen()
             .navigationTitle(title)
             .aliveHiddenTitle()
             .toolbar(root ? .hidden : .automatic, for: .navigationBar)
-            .aliveTopFade(holdsBar: !root)
-            .aliveBottomFade()
-    }
-
-    /// Fade content below floating controls; reserve bottom space so the last row remains reachable.
-    func aliveBottomFade() -> some View {
-        modifier(AliveBottomFade(room: AliveRoom()))
-    }
-
-    func aliveBottomFade<Room: View>(room: Room) -> some View {
-        modifier(AliveBottomFade(room: room))
-    }
-
-    /// Cover both room colour and haze beneath the pushed Back button so content cannot show through it.
-    @ViewBuilder func aliveTopFade(holdsBar: Bool = false) -> some View {
-        if holdsBar {
-            overlay {
-                GeometryReader { g in
-                    let bar = g.safeAreaInsets.top
-                    AliveRoom().mask {
-                        VStack(spacing: 0) {
-                            LinearGradient(stops: [.init(color: .black, location: 0),
-                                                   .init(color: .black, location: max(0, bar - 8) / (bar + 16)),
-                                                   .init(color: .clear, location: 1)],
-                                           startPoint: .top, endPoint: .bottom)
-                                .frame(height: bar + 16)
-                            Spacer(minLength: 0)
-                        }
-                        .ignoresSafeArea(edges: .top)
-                    }
-                }
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-            }
-        } else {
-            overlay(alignment: .top) {
-                GeometryReader { g in
-                    let y = g.frame(in: .global).minY
-                    LinearGradient(colors: [AlivePalette.room, AlivePalette.room.opacity(0)],
-                                   startPoint: .top, endPoint: .bottom)
-                        .frame(height: y > 0 ? y : g.safeAreaInsets.top)
-                        .offset(y: -y)
-                }
-                .frame(height: 0)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-            }
-        }
+            .scrollEdgeEffectStyle(.soft, for: .top)
+            .scrollEdgeEffectStyle(.soft, for: .bottom)
     }
 
     func aliveListRow(top: CGFloat = 0, bottom: CGFloat = 0) -> some View {
@@ -237,31 +209,5 @@ extension View {
             .listRowSeparator(.hidden)
             .listRowInsets(EdgeInsets(top: top, leading: AliveMetrics.pageInset, bottom: bottom,
                                       trailing: AliveMetrics.pageInset))
-    }
-}
-
-private struct AliveBottomFade<Room: View>: ViewModifier {
-    let room: Room
-
-    func body(content: Content) -> some View {
-        content.scrollEdgeEffectStyle(.soft, for: .bottom)
-        .overlay {
-            GeometryReader { g in
-                let fade = g.safeAreaInsets.bottom + 24
-                room.mask {
-                    VStack(spacing: 0) {
-                        Spacer(minLength: 0)
-                        LinearGradient(stops: [.init(color: .clear, location: 0),
-                                               .init(color: .black.opacity(0.85), location: 0.5),
-                                               .init(color: .black, location: 1)],
-                                       startPoint: .top, endPoint: .bottom)
-                            .frame(height: fade)
-                    }
-                    .ignoresSafeArea(edges: .bottom)
-                }
-            }
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-        }
     }
 }

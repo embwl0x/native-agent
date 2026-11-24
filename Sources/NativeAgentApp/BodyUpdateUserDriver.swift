@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-import Privacy
+import PersistenceCore
 import Sparkle
 // Blueprint: | `BodyUpdateUserDriver.swift` | Sparkle user-driver events and person replies held by their originating renderer |
 

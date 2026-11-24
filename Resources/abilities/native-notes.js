@@ -117,59 +117,85 @@ function pageOf(body, name, offset, previewChars) {
 
 function readScript(selection, limit) { return `
 if (count of accounts) is 0 then return "${NOT_CONFIGURED}"
-if (count of folders) is 0 then return "${NOT_CONFIGURED}"
+set folderRefs to folders
+if class of folderRefs is not list then error "Notes returned an invalid folder list."
+if (count of folderRefs) is 0 then return "${NOT_CONFIGURED}"
 set gaps to {}
-set hits to ${selection}
+set hits to ${selection === "notes" ? "(id of notes)" : selection}
+if class of hits is not list then error "Notes returned an invalid candidate list."
 -- A deleted note stays readable in Recently Deleted; it is not one of the person's notes.
 -- A note's folder comes from the folders' own note ids: Notes can't coerce
 -- "name of container" of an account note (-1700), so that read was never a source.
-set folderNames to {}
-set folderNoteIDs to {}
-repeat with fi from 1 to (count of folders)
+set readableFolders to {}
+set deletedIDs to {}
+set deletionGaps to {}
+repeat with fi from 1 to (count of folderRefs)
+    set fName to missing value
     try
-        set f to folder fi
-        set fName to (name of f) as string
+        set f to item fi of folderRefs
+        set folderName to name of f
+        if class of folderName is not text or folderName is "" then error "Notes returned an invalid folder name."
+        set fName to folderName
         set fIDs to (id of notes of f)
-        set end of folderNames to fName
-        set end of folderNoteIDs to fIDs
+        if class of fIDs is not list then error "Notes returned an invalid folder note id list."
+        repeat with folderNoteID in fIDs
+            set fid to contents of folderNoteID
+            if class of fid is not text or fid is "" then error "Notes returned an invalid folder note id."
+        end repeat
+        if fName is "Recently Deleted" then
+            set deletedIDs to deletedIDs & fIDs
+        else
+            set end of readableFolders to {f, fName, fIDs}
+        end if
     on error errorText number errorNumber
         if errorNumber is in ${PASSED_UP} then error errorText number errorNumber
-        set end of gaps to ("folders[" & fi & "]: " & errorText & " (" & errorNumber & ")")
+        set folderGap to ("folders[" & fi & "]: " & errorText & " (" & errorNumber & ")")
+        if fName is missing value or fName is "Recently Deleted" then
+            set end of deletionGaps to folderGap
+        else
+            set end of gaps to folderGap
+        end if
     end try
 end repeat
+if (count of deletionGaps) > 0 then return {0, {}, gaps & deletionGaps & {"Recently Deleted membership could not be read."}}
 set keptHits to {}
 repeat with i from 1 to (count of hits)
     try
         set h to item i of hits
-        set hid to (id of h) as string
-        set fd to missing value
-        repeat with k from 1 to (count of folderNames)
-            if (item k of folderNoteIDs) contains hid then
-                set fd to item k of folderNames
-                exit repeat
+        set hid to ${selection === "notes" ? "h" : "id of h"}
+        if class of hid is not text or hid is "" then error "Notes returned an invalid note id."
+        considering case
+            set matchedFolder to missing value
+            repeat with folderRow in readableFolders
+                if (item 3 of folderRow) contains hid then
+                    set matchedFolder to contents of folderRow
+                    exit repeat
+                end if
+            end repeat
+            if deletedIDs contains hid then
+                if matchedFolder is not missing value then set end of gaps to ("notes[" & i & "].folder: listed in Recently Deleted and a readable folder")
+            else if matchedFolder is missing value then
+                set end of gaps to ("notes[" & i & "].folder: in no readable folder, so it can't be told apart from a deleted note")
+            else
+                set end of keptHits to {hid, item 1 of matchedFolder, item 2 of matchedFolder}
             end if
-        end repeat
-        if fd is missing value then
-            set end of gaps to ("notes[" & i & "].folder: in no readable folder, so it can't be told apart from a deleted note")
-        else if fd is not "Recently Deleted" then
-            set end of keptHits to {contents of h, fd}
-        end if
+        end considering
     on error errorText number errorNumber
         if errorNumber is in ${PASSED_UP} then error errorText number errorNumber
         set end of gaps to ("notes[" & i & "]: " & errorText & " (" & errorNumber & ")")
     end try
 end repeat
-set hits to keptHits
-set totalHits to count of hits
+set totalHits to count of keptHits
 set rows to {}
 set countNote to 0
-repeat with i from 1 to totalHits
+repeat with i from 1 to (count of keptHits)
     if countNote ≥ ${limit} then exit repeat
     try
-        set candidate to item i of hits
-        set n to item 1 of candidate
-        set fd to item 2 of candidate
-        set nid to (id of n) as string
+        set candidate to item i of keptHits
+        set nid to item 1 of candidate
+        set f to item 2 of candidate
+        set fd to item 3 of candidate
+        set n to a reference to note id nid of f
         set nm to (name of n) as string
         -- A date that cannot be read travels as its error text, so the note is kept with its date unknown.
         try
@@ -228,8 +254,7 @@ function read(selection, limit, whole, offset) {
     if (total > rows.length) result.message = "Showing " + rows.length + " of " + total + "; narrow with query, or read one with title.";
     // No matching title or id is a successful empty read.
     if (whole && rows.length === 0 && gaps.length === 0) result.message = "No note has that title or id.";
-    if (gaps.length) result.message = "Readable notes returned with named gaps. Missing notes and the complete match total are unknown; "
-        + "repair the reported Notes reads.";
+    if (gaps.length) result.message = "At least " + total + " matches. The complete total is unknown because of the reported Notes read gaps.";
     return result;
 }
 

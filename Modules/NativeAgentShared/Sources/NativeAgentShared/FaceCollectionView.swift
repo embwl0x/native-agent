@@ -327,9 +327,13 @@ public struct FaceSelectionView: View {
     }
     private var list: some View {
         List {
-            FaceView(face: face, door: selectingDoor, session: session, leaf: leaf, rowFilter: rowFilter).environment(\.faceInList, true)
+            FaceView(face: face, door: selectingDoor, session: session, leaf: leaf, rowFilter: rowFilter)
         }
+            .faceList()
             .listStyle(.plain)
+            #if os(macOS)
+            .scrollContentBackground(.hidden)
+            #endif
             .scrollPosition(id: Binding(get: { session.scrollAnchor }, set: { session.scrollAnchor = $0 }), anchor: .top)
     }
     @ViewBuilder private var reading: some View {

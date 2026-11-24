@@ -1,10 +1,11 @@
-import EngineRuntime
+import BodyRuntime
 import AppIntents
 import Foundation
 import PersistenceCore
 import NativeAgentCore
 import NativeAgentShared
-import Transcripts
+import SenseCore
+import DeskCore
 // Blueprint: | `NativeAgentIntents.swift` | Named resident-agent Shortcuts; NativeAgentDoctorIntent admits and settles runs through the live DoctorFacade |
 
 struct ResidentAgentEntity: AppEntity {
@@ -164,7 +165,7 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         try await ApplicationLifetime.shared.prepare()
-        let start = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
+        let start = try await NativeAgentEngine.live.submitDeskTask(title: title, objective: objective)
         return .result(dialog: "Desk task started: \(start.deskItem.title).")
     }
 }

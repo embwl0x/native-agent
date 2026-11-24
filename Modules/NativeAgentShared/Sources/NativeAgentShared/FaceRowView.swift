@@ -21,17 +21,28 @@ struct FaceRowView: View {
     var columns: [PartFace.Row] = []
     /// Set when this row is one control of its parent's inline group: the parent's title, drawn as the word and its control alone.
     var cellOf: String? = nil
+    var leading: CGFloat = 0
+    @Environment(\.faceContainerWidth) private var containerWidth
+    #if os(macOS)
+    @Environment(FaceConfirmations.self) private var confirmations
+    private var pendingConfirmation: FaceConfirmations.Request? {
+        get { confirmations.pending }
+        nonmutating set { confirmations.pending = newValue }
+    }
+    #else
+    @State private var pendingConfirmation: FaceConfirmations.Request?
+    #endif
     @Environment(\.faceStyle) private var style
-    @Environment(\.faceInList) private var inList
-    @State private var confirming: PartFace.Action?
-    @State private var pendingSet: String?
-    @State private var pendingCall: PartFace.Call?
+    @Environment(\.faceListWidth) private var listWidth
+    private var inList: Bool { listWidth != nil }
+    @State private var confirmationSource = UUID()
     @State private var hovering = false
-    @State private var width: CGFloat = 0
     @State private var trailingWidth: CGFloat = 0
+    private var measuresControl: Bool { row.control != nil || row.group.contains { $0.control != nil } }
+    private var width: CGFloat { max(0, containerWidth - leading) }
 
     private var actions: [PartFace.Action] { row.actions ?? [] }
-    private var operation: FacePageSession.Operation? { session.operations[item.row] }
+    private var operation: FacePageSession.Operation? { session.operation(for: item.row) }
     private var pendingOperation: FacePageSession.Operation? { operation?.outcome == nil || operation?.checking == true ? operation : nil }
     private var sent: String? { operation?.outcome == nil ? operation?.submission.value : nil }
     private var compact: Bool {
@@ -40,6 +51,19 @@ struct FaceRowView: View {
     }
     private var focused: Bool { focus.wrappedValue?.item == item }
     private var handlesRowKeys: Bool { focused && focus.wrappedValue != .control(item) }
+    private var discloses: Bool { cellOf == nil && (row.holdsBeneath || row.expands == true) }
+    private var disclosed: Bool { discloses && session[open: .row(item)] }
+    private var rowInsets: EdgeInsets {
+        if inList { return EdgeInsets() }
+        if sectionStyle == .note || sectionStyle == .timeline || sectionStyle == .flow {
+            return EdgeInsets(top: style.insets.top, leading: 0, bottom: style.insets.bottom, trailing: 0)
+        }
+        return style.insets
+    }
+    private var hasTrailingContent: Bool {
+        row.control != nil || row.meter != nil || row.value?.isEmpty == false || row.at != nil || !row.group.isEmpty
+    }
+    private var clampsValueLabel: Bool { sectionStyle == .values && hasTrailingContent }
     private var primary: PartFace.Action? {
         let primaries = actions.filter { $0.role == .primary }
         return primaries.count == 1 ? primaries.first : actions.count == 1 ? actions.first : nil
@@ -50,9 +74,9 @@ struct FaceRowView: View {
         sectionStyle == .flow || row.tone == .attention || actions.contains { $0.role == .primary }
             || (row.open == nil && row.control == nil && actions.count == 1 && (row.value ?? "").isEmpty)
     }
-    /// A row with an inline group is never a pill: it draws as a line with its group in every section style.
+    /// A row with an inline group or disclosure draws as a line, including in a flow.
     private var pill: Bool {
-        sectionStyle == .flow && !inList && row.control == nil && row.group.isEmpty && (row.open != nil || actions.count <= 1)
+        sectionStyle == .flow && !inList && !discloses && row.control == nil && row.group.isEmpty && (row.open != nil || actions.count <= 1)
     }
     private var text: String {
         [row.title, row.detail, row.value, controlWords, groupWords, row.at].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " — ")
@@ -62,7 +86,7 @@ struct FaceRowView: View {
     private var groupWords: String? {
         guard !row.group.isEmpty else { return nil }
         return row.group.map { child in
-            let operation = session.operations[child.id]
+            let operation = session.operation(for: child.id)
             let sent = operation?.outcome == nil ? operation?.submission.value : nil
             guard let on = child.control?.on else { return child.title }
             return child.title + ((sent.map { $0 == "on" } ?? on) ? " on" : " off")
@@ -72,16 +96,29 @@ struct FaceRowView: View {
     private var controlWords: String? {
         guard let control = row.control else { return nil }
         if let text = control.text { return session.drafts.value(key, seed: text) }
-        if let number = control.number { return sent ?? String(number.value) }
+        if let number = control.number { return numberValue(number).map(PartFace.amount) }
         if let date = control.date { return sent ?? date }
         if let on = control.on { return (sent.map { $0 == "on" } ?? on) ? "on" : "off" }
         let selected = sent ?? control.selected
         return control.options?.first { $0.id == selected }?.label
     }
+    private func numberValue(_ number: PartFace.Control.Number) -> Double? {
+        guard let operation, operation.outcome == nil, operation.submission.action == "set" else { return number.value }
+        guard case .double(let value)? = operation.submission.expectedCall.args["value"] else { return nil }
+        return value
+    }
     private var key: String { session.draftKey(item) }
 
     var body: some View {
-        if cellOf != nil { cell } else { line }
+        Group {
+            if cellOf != nil { cell }
+            else { line }
+        }
+        #if !os(macOS)
+        .modifier(FaceConfirmationDialog(pending: $pendingConfirmation))
+        #endif
+        .onDisappear { dismissConfirmation(.row(confirmationSource)) }
+        .layoutValue(key: FaceFlowLine.self, value: cellOf == nil && sectionStyle == .flow && !inList && !pill)
     }
 
     private var line: some View {
@@ -89,25 +126,26 @@ struct FaceRowView: View {
             surface
             outcomeView
         }
-            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
             .contentShape(Rectangle())
             .onHover { hovering = $0 }
             .contextMenu { menu }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(Text(text))
             .accessibilityActions { accessibleActions }
-            .confirmationDialog(confirming.map { $0.label + " — " + row.title } ?? "", isPresented: Binding(
-                get: { confirming != nil }, set: { if !$0 { confirming = nil } }), titleVisibility: .visible) {
-                if let action = confirming {
-                    Button(action.label, role: .destructive) { run(action); confirming = nil }
-                }
-                Button("Cancel", role: .cancel) { confirming = nil }
-            }
             #if os(macOS)
             .focusable().focused(focus, equals: .row(item))
             .onKeyPress(keys: [.upArrow, .downArrow]) { press in
                 guard handlesRowKeys else { return .ignored }
                 move(item, press.key == .downArrow ? 1 : -1)
+                return .handled
+            }
+            .onKeyPress(keys: [.leftArrow, .rightArrow]) { press in
+                guard handlesRowKeys, discloses else { return .ignored }
+                let expand = press.key == .rightArrow
+                guard disclosed != expand else { return .ignored }
+                withAnimation(.snappy) {
+                    session[open: .row(item)] = expand
+                }
                 return .handled
             }
             .onKeyPress(.return) {
@@ -131,7 +169,7 @@ struct FaceRowView: View {
             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                 ForEach(actions) { action in
                     Button(action.label) { perform(action) }
-                        .foregroundStyle(action.role == .destructive ? Color.red : .primary)
+                        .foregroundStyle(.primary)
                         .buttonStyle(.automatic)
                         .disabled(session.held(item) || action.unavailable != nil)
                 }
@@ -141,44 +179,60 @@ struct FaceRowView: View {
 
     @ViewBuilder private var surface: some View {
         if pill {
-            // A command that can't run now still reads as one of the page's commands, greyed.
-            Button { _ = activate() } label: {
-                Text(row.title).font(.callout).lineLimit(1)
-                    .foregroundStyle(primary?.role == .destructive ? Color.red : .primary)
-                    .opacity(pendingOperation == nil ? 1 : 0)
-                    .overlay { if pendingOperation != nil { ProgressView().controlSize(.mini) } }
-                    .padding(.horizontal, 12).padding(.vertical, 6).background(Capsule().fill(.quaternary))
+            HStack(spacing: 8) {
+                // A command that can't run now still reads as one of the page's commands, greyed.
+                Button { _ = activate() } label: {
+                    Text(row.title).font(.callout).lineLimit(1)
+                        .foregroundStyle(row.tone == .failed ? FaceTone.color(.failed) : .primary)
+                        .opacity(pendingOperation == nil ? 1 : 0)
+                        .overlay { if pendingOperation != nil { ProgressView().controlSize(.mini) } }
+                        .padding(.horizontal, 12).padding(.vertical, 6).background(Capsule().fill(.quaternary))
+                }
+                .buttonStyle(.plain)
+                .disabled(row.open == nil && (primary == nil || primary?.unavailable != nil || session.held(item)))
+                .accessibilityHint(Text(row.detail ?? ""))
+                #if os(macOS)
+                .help(row.detail ?? "")
+                #endif
+                if let pendingOperation { cancelButton(pendingOperation).font(style.detail) }
             }
-            .buttonStyle(.plain)
-            .disabled(row.open == nil && (primary == nil || primary?.unavailable != nil || session.held(item)))
-            #if os(macOS)
-            .help(row.detail ?? "")
-            #endif
         } else {
             rowBody
                 .frame(maxWidth: .infinity, minHeight: max(0, style.minimumHeight - style.insets.top - style.insets.bottom), alignment: .leading)
-                .padding(inList ? EdgeInsets() : style.insets)
+                .padding(rowInsets)
                 .background(hovering || focused ? style.elevation : .clear)
-                .overlay(alignment: compact && row.control != nil ? .topTrailing : .trailing) {
+                .overlay(alignment: compact && measuresControl ? .topTrailing : .trailing) {
                     #if os(macOS)
-                    if let pendingOperation {
-                        // A pending act moves nothing on the page, however quick it turns out to be.
-                        HStack(spacing: 8) {
-                            ProgressView().controlSize(.mini)
-                            Button(door.cancellationLabel) { session.cancel(item) }.disabled(pendingOperation.cancelling).buttonStyle(.plain)
-                        }
-                        .font(style.detail).padding(4).background(style.actionSurface, in: RoundedRectangle(cornerRadius: 6))
-                        .padding(.trailing, style.insets.trailing)
-                    } else if !keepsActions, !actions.isEmpty, hovering || focused, row.control == nil || trailingWidth > 0 {
-                        actionStrip.padding(4).background(style.actionSurface, in: RoundedRectangle(cornerRadius: 6))
-                            .frame(maxWidth: max(0, width - style.insets.leading - style.insets.trailing
-                                - (!compact && row.control != nil ? trailingWidth + 12 : 0)), alignment: .trailing)
-                            .padding(.trailing, style.insets.trailing + (!compact && row.control != nil ? trailingWidth + 12 : 0))
-                            .padding(.top, compact && row.control != nil ? style.insets.top : 0)
+                    if row.group.isEmpty {
+                        let inset = !compact && measuresControl && pendingOperation == nil ? trailingWidth + 12 : 0
+                        floatingActions
+                            .padding(.leading, rowInsets.leading)
+                            .padding(.trailing, rowInsets.trailing + inset)
+                            .padding(.top, compact && measuresControl && pendingOperation == nil ? rowInsets.top : 0)
                     }
                     #endif
                 }
         }
+    }
+
+    #if os(macOS)
+    @ViewBuilder private var floatingActions: some View {
+        if let pendingOperation {
+            // A pending act moves nothing on the page, however quick it turns out to be.
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.mini)
+                cancelButton(pendingOperation)
+            }
+            .font(style.detail).padding(4).background(style.actionSurface, in: RoundedRectangle(cornerRadius: 6))
+        } else if !keepsActions, !actions.isEmpty, hovering || focused,
+                  !row.group.isEmpty || !measuresControl || trailingWidth > 0 {
+            actionStrip.padding(4).background(style.actionSurface, in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
+    #endif
+
+    private func cancelButton(_ operation: FacePageSession.Operation) -> some View {
+        Button(door.cancellationLabel) { session.cancel(item) }.disabled(operation.cancelling).buttonStyle(.plain)
     }
 
     private var rowBody: some View {
@@ -187,48 +241,86 @@ struct FaceRowView: View {
                 // The group is placed by what fits, not by a width threshold: beside the title when both fit, beneath it otherwise.
                 FaceBesideOrBeneath(spacing: 12, lineSpacing: 4) {
                     titleAndDetail
+                        #if os(macOS)
+                        .frame(minHeight: (!keepsActions && !actions.isEmpty) || pendingOperation != nil ? 32 : 0, alignment: .leading)
+                        .overlay(alignment: .trailing) { floatingActions }
+                        #endif
                     trailing
                 }
             } else if compact {
                 titleAndDetail
                 trailing.frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                HStack(alignment: .center, spacing: 12) {
+                HStack(alignment: stacksDetail ? .top : .center, spacing: 12) {
                     titleAndDetail
-                        .frame(width: sectionStyle == .values ? max(0, width * 0.45) : nil, alignment: .leading)
-                        .frame(maxWidth: sectionStyle == .values ? nil : .infinity, alignment: .leading)
+                        .frame(width: clampsValueLabel ? max(0, width * 0.45) : nil, alignment: .leading)
+                        .frame(maxWidth: clampsValueLabel ? nil : .infinity, alignment: .leading)
                     trailing
-                        .frame(maxWidth: row.control?.text != nil || sectionStyle == .values ? .infinity : nil, alignment: .trailing)
+                        .frame(maxWidth: row.control?.text != nil || clampsValueLabel ? .infinity : nil, alignment: .trailing)
                 }
             }
-            if keepsActions { actionStrip }
+            if keepsActions { actionStrip.padding(.leading, titleLeading) }
         }
         .background(alignment: .topLeading) {
             if connectsTimeline && !inList {
                 GeometryReader { geometry in
                     Rectangle().fill(.quaternary)
-                        .frame(width: 1, height: max(0, geometry.size.height + style.insets.top + style.insets.bottom - 7))
-                        .offset(x: 3, y: 13)
+                        .frame(width: 1, height: max(0, geometry.size.height + rowInsets.top + rowInsets.bottom - 7))
+                        .offset(x: 3 - leading, y: 13)
                 }
             }
         }
     }
 
+    private var chevronSize: CGFloat {
+        #if os(iOS)
+        28
+        #else
+        24
+        #endif
+    }
+
+    private var titleLeading: CGFloat {
+        #if os(iOS)
+        let spinner: CGFloat = 28
+        #else
+        let spinner: CGFloat = 24
+        #endif
+        return (discloses ? chevronSize + 8 : 0) + (waiting ? spinner : 0) + (sectionStyle == .timeline ? 15 : 0)
+            + (row.symbol?.isEmpty == false ? 26 : 0)
+    }
+
     private var titleAndDetail: some View {
         HStack(alignment: .top, spacing: 8) {
+            if sectionStyle == .timeline {
+                Circle().fill(FaceTone.color(row.tone)).frame(width: 7, height: 7).padding(.top, 6).offset(x: -leading)
+                    .accessibilityHidden(true)
+            }
+            if discloses {
+                Button {
+                    withAnimation(.snappy) {
+                        session[open: .row(item)].toggle()
+                    }
+                } label: {
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(disclosed ? 90 : 0))
+                        .frame(width: chevronSize, height: chevronSize)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text((disclosed ? "Collapse " : "Expand ") + row.title))
+                .accessibilityValue(disclosed ? "Expanded" : "Collapsed")
+            }
             if waiting { ProgressView().controlSize(.small) }
-            if sectionStyle == .timeline { Circle().fill(FaceTone.color(row.tone)).frame(width: 7, height: 7).padding(.top, 6) }
             if let symbol = row.symbol, !symbol.isEmpty {
                 Image(systemName: symbol).foregroundStyle(FaceTone.color(row.tone)).frame(width: 18)
+                    .accessibilityHidden(true)
             }
             Group {
                 if stacksDetail {
                     VStack(alignment: .leading, spacing: 2) { titleWords; detailWords }
                 } else {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        titleWords.layoutPriority(1)
-                        if detailFitsBeside { detailWords }
-                    }
+                    besideTitle
                     #if os(macOS)
                     .help(row.detail ?? "")
                     #endif
@@ -249,7 +341,8 @@ struct FaceRowView: View {
 
     private var titleWords: some View {
         FaceWordTitle(title: row.title, whole: whole).font(style.title)
-            .foregroundStyle(row.tone == .quiet || sectionStyle == .note ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            .foregroundStyle(row.tone == .failed ? AnyShapeStyle(FaceTone.color(.failed))
+                : row.tone == .quiet || sectionStyle == .note ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
     }
 
     @ViewBuilder private var detailWords: some View {
@@ -257,7 +350,13 @@ struct FaceRowView: View {
             if whole {
                 Text(detail).font(style.detail).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             } else {
-                Text(detail).font(style.detail).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                let singleLine = detail.split(whereSeparator: \.isNewline)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " · ")
+                if !singleLine.isEmpty {
+                    Text(singleLine).font(style.detail).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                }
             }
         }
     }
@@ -269,11 +368,35 @@ struct FaceRowView: View {
 
     /// The detail sits beside the title when real room is left for it; otherwise the title has the line and the detail is its tooltip.
     private var detailFitsBeside: Bool {
-        let room = width - style.insets.leading - style.insets.trailing - trailingWidth - 24
+        let room = width - rowInsets.leading - rowInsets.trailing - trailingWidth - 24
         return room - CGFloat(row.title.count) * 7.5 > 120
     }
 
-    private var trailing: some View {
+    @ViewBuilder private var besideTitle: some View {
+        if measuresControl {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                titleWords.layoutPriority(1)
+                if detailFitsBeside { detailWords }
+            }
+        } else if row.detail?.isEmpty == false {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    titleWords.layoutPriority(1)
+                    detailWords
+                }
+                .frame(idealWidth: CGFloat(row.title.count) * 7.5 + 132)
+                titleWords
+            }
+        } else { titleWords }
+    }
+
+    @ViewBuilder private var trailing: some View {
+        if measuresControl {
+            trailingContent.onGeometryChange(for: CGFloat.self) { $0.size.width } action: { trailingWidth = $0 }
+        } else { trailingContent }
+    }
+
+    private var trailingContent: some View {
         VStack(alignment: compact ? .leading : .trailing, spacing: 2) {
             if !row.group.isEmpty { group }
             if let control = row.control { controlView(control) }
@@ -289,9 +412,9 @@ struct FaceRowView: View {
                 Text(FaceTime.short(at) ?? at).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
             } else if row.open != nil && row.control == nil && row.value == nil {
                 Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
             }
         }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { trailingWidth = $0 }
     }
 
     /// The row's inline group: each child's word then its control, in the section's columns, so a missing child leaves its column empty.
@@ -302,7 +425,6 @@ struct FaceRowView: View {
                 let child = row.group.first(where: { $0.title == column.title })
                 Group {
                     if let child {
-                        // A cell is its child: another child in the same column is a new view with fresh confirmation state.
                         groupCell(child).id(child.id)
                     } else {
                         // Unseen, it holds the column's width: the same word and control another row draws here, under an item and an
@@ -321,8 +443,6 @@ struct FaceRowView: View {
                     waiting: false, connectsTimeline: false, cellOf: row.title)
     }
 
-    /// One control of an inline group: its short word, then its control. Its confirmation is this view's own; its pending and failure are
-    /// its own row's in the session, keyed by its own id, as a stacked row's are. The parent draws its failure beneath the line.
     private var cell: some View {
         HStack(alignment: .center, spacing: 8) {
             Text(row.title).font(style.detail).foregroundStyle(.secondary).lineLimit(1).fixedSize().accessibilityHidden(true)
@@ -339,10 +459,7 @@ struct FaceRowView: View {
     }
 
     private func controlView(_ control: PartFace.Control) -> some View {
-        controlBody(control).modifier(FaceSetConfirmation(question: control.confirm, pending: $pendingSet, send: { value in
-            submit("set", value, pendingCall)
-            pendingCall = nil
-        }))
+        controlBody(control).onDisappear { dismissConfirmation(.control(confirmationSource)) }
     }
 
     @ViewBuilder private func controlBody(_ control: PartFace.Control) -> some View {
@@ -355,11 +472,13 @@ struct FaceRowView: View {
                     submit("set", value, control.settingCall(value))
                 }
         } else if let number = control.number {
-            FaceFieldInput.number(label, words: sent ?? String(number.value),
-                                  increment: { changeNumber(number, direction: 1, control: control) },
-                                  decrement: { changeNumber(number, direction: -1, control: control) })
-            .focused(focus, equals: .control(item))
-            .disabled(session.held(item))
+            if let value = numberValue(number) {
+                FaceFieldInput.number(label, words: PartFace.amount(value),
+                                      increment: { changeNumber(number, direction: 1, control: control) },
+                                      decrement: { changeNumber(number, direction: -1, control: control) })
+                .focused(focus, equals: .control(item))
+                .disabled(session.held(item))
+            }
         } else if let iso = control.date {
             switch parsedDate(sent ?? iso) {
             case .success(let date):
@@ -384,11 +503,7 @@ struct FaceRowView: View {
     }
 
     private func changeNumber(_ number: PartFace.Control.Number, direction: Double, control: PartFace.Control) {
-        let current: Double
-        if let sent {
-            guard let value = Double(sent), value.isFinite else { return }
-            current = value
-        } else { current = number.value }
+        guard let current = numberValue(number) else { return }
         let value = current + direction * (number.step ?? 1)
         guard value.isFinite, number.min.map({ value >= $0 }) != false, number.max.map({ value <= $0 }) != false else { return }
         set(String(value), control)
@@ -491,7 +606,10 @@ struct FaceRowView: View {
 
     private func perform(_ action: PartFace.Action) {
         guard !session.held(item), action.unavailable == nil else { return }
-        if action.role == .destructive { confirming = action } else { run(action) }
+        if action.role == .destructive {
+            pendingConfirmation = .init(source: .row(confirmationSource), title: action.label + " — " + row.title,
+                                        label: action.label, role: .destructive) { run(action) }
+        } else { run(action) }
     }
 
     private func run(_ action: PartFace.Action) {
@@ -501,8 +619,16 @@ struct FaceRowView: View {
 
     private func set(_ value: String, _ control: PartFace.Control) {
         guard !session.held(item) else { return }
-        if control.confirm?.isEmpty == false { pendingCall = control.settingCall(value); pendingSet = value }
-        else { submit("set", value, control.settingCall(value)) }
+        let call = control.settingCall(value)
+        if let question = control.confirm, !question.isEmpty {
+            pendingConfirmation = .init(source: .control(confirmationSource), title: question, label: "Change", role: nil) {
+                submit("set", value, call)
+            }
+        } else { submit("set", value, call) }
+    }
+
+    private func dismissConfirmation(_ source: FaceConfirmations.Source) {
+        if pendingConfirmation?.source == source { pendingConfirmation = nil }
     }
 
     private func submit(_ action: String, _ value: String?, _ call: PartFace.Call?) {
@@ -519,8 +645,8 @@ struct FaceRowView: View {
     @ViewBuilder private func outcome(_ row: PartFace.Row, _ item: FaceItemID, word: String?) -> some View {
         let named = word.map { $0 + ": " } ?? ""
         let name = word.map { self.row.title + " · " + $0 } ?? row.title
-        if let refusal = session.refusals[item.row] { Text(named + refusal.localizedDescription).foregroundStyle(.red).textSelection(.enabled) }
-        if let operation = session.operations[item.row] {
+        if let refusal = session[row: item.row]?.refusal { Text(named + refusal.localizedDescription).foregroundStyle(.red).textSelection(.enabled) }
+        if let operation = session.operation(for: item.row) {
             if let outcome = operation.outcome, !operation.checking {
                 if let failure = outcome.failure {
                     Text(named + failure.localizedDescription).foregroundStyle(.red).textSelection(.enabled)
@@ -534,13 +660,13 @@ struct FaceRowView: View {
                         : "Not finished yet. Check before trying again."))
                         .foregroundStyle(.secondary)
                     if let words = outcome.words { Text(words).foregroundStyle(.secondary).textSelection(.enabled) }
-                    Button("Check") { session.check(item, door: door) }.buttonStyle(.plain)
+                    Button("Check") { session.check(item, door: door) }.buttonStyle(FaceActionButtonStyle(fill: nil))
                 }
                 if let undo = outcome.undo, !session.held(item) {
                     Button(word.map { "Undo " + $0 } ?? "Undo") {
                         session.submit(item, row: row.id, action: "undo", value: nil, call: undo, door: door,
                                        undoOf: operation.submission.id)
-                    }.buttonStyle(.plain)
+                    }.buttonStyle(FaceActionButtonStyle(fill: nil))
                 }
             } else {
                 #if !os(macOS)
@@ -582,20 +708,6 @@ private struct FaceWordTitle: View {
     }
 }
 
-private struct FaceSetConfirmation: ViewModifier {
-    let question: String?
-    @Binding var pending: String?
-    let send: (String) -> Void
-
-    func body(content: Content) -> some View {
-        content.confirmationDialog(question ?? "", isPresented: Binding(
-            get: { pending != nil }, set: { if !$0 { pending = nil } }), titleVisibility: .visible) {
-            Button("Change") { if let value = pending { send(value) }; pending = nil }
-            Button("Cancel", role: .cancel) { pending = nil }
-        }
-    }
-}
-
 /// A row's length as a bar: its share of the whole, set where it begins. The value's words say the amount; the bar is not read aloud.
 struct FaceMeterBar: View {
     let meter: PartFace.Row.Meter
@@ -606,9 +718,11 @@ struct FaceMeterBar: View {
             let whole = meter.max > 0 ? meter.max : 1
             let start = min(max((meter.start ?? 0) / whole, 0), 1)
             let length = min(max(meter.value / whole, 0), 1 - start)
+            let barWidth = min(geometry.size.width, max(2, geometry.size.width * length))
+            let offset = min(max(0, geometry.size.width - barWidth), geometry.size.width * start)
             ZStack(alignment: .leading) {
                 Capsule().fill(.quaternary)
-                Capsule().fill(color).frame(width: max(2, geometry.size.width * length)).offset(x: geometry.size.width * start)
+                Capsule().fill(color).frame(width: barWidth).offset(x: offset)
             }
         }
         .frame(width: 72, height: 6)

@@ -20,6 +20,7 @@ extension ContextFillPresentation {
 struct ComposerContextRing: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var status: SessionContextStatus? {
         let sessionId = sessionId
         return appModel.face.slot(.settings).select("providers.context.\(sessionId)", as: SettingsFace.self) {
@@ -56,9 +57,9 @@ struct ComposerContextRing: View {
     var body: some View {
         HStack(spacing: 5) {
             if status == nil {
-                Image(systemName: "questionmark.circle")
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
+                Circle()
+                    .stroke(NativeAgentShell.secondary, style: StrokeStyle(lineWidth: 1.5, dash: [2, 2]))
+                    .frame(width: 11, height: 11)
             } else {
                 ZStack {
                     Circle().stroke(NativeAgentShell.hairline, lineWidth: 1.5)
@@ -66,7 +67,10 @@ struct ComposerContextRing: View {
                         .trim(from: 0, to: usage.fillFraction)
                         .stroke(ringColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                        .animation(NativeAgentMotion.standard, value: usage.fillFraction)
+                        .animation(
+                            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
+                            value: usage.fillFraction
+                        )
                 }
                 .frame(width: 11, height: 11)
             }
