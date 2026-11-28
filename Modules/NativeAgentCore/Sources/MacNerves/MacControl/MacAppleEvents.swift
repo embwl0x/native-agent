@@ -204,8 +204,9 @@ public final class AppleScriptExecution: Sendable {
     }
 
     private static func permission(bundleID: String, url: URL, pid: pid_t?, ask: Bool = false) -> JSONValue {
-        let target = pid.map { NSAppleEventDescriptor(processIdentifier: $0) } ?? NSAppleEventDescriptor(applicationURL: url)
-        let code = automationStatus(target, ask: ask)
+        // Consent is answered by a running process. A stopped app has none to ask, and what macOS returns for its URL varies by release
+        // (-600, or -50 on 26.6), so a stopped app reads as not running: the ask opens it and macOS answers for real.
+        let code = pid.map { automationStatus(NSAppleEventDescriptor(processIdentifier: $0), ask: ask) } ?? OSStatus(-600)
         let state = code == 0 ? "allowed" : code == -1744 ? "needs_consent" : code == -1743 ? "denied" : "unavailable"
         var fields: [String: JSONValue] = ["bundle_id": .string(bundleID), "app_path": .string(url.path), "code": .int(Int64(code)),
                         "state": .string(state), "detail": .string(code == -1743
