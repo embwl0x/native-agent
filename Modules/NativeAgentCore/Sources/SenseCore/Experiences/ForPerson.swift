@@ -78,7 +78,7 @@ public enum Door: Hashable, Sendable {
     case conversation(String)
 
     /// The person's doors: the phone always, the thread it came from, and the Mac, which is let go at send time
-    /// when the person is not at it.
+    /// when the person is not at it. The phone is let go at send time when none is paired with this Mac.
     public static func person(thread: Door?) -> [Door] { [.phone] + [thread].compactMap { $0 } + [.mac] }
 
     public var key: String { "deliver:" + surface }

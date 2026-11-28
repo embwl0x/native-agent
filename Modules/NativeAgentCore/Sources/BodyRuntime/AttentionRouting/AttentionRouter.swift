@@ -110,6 +110,8 @@ public actor AttentionRouter {
         var verdicts: [String: NotificationDeliveryOutcome] = [:]
         var receipt: MobileNotificationDeliveryReceipt?
         var macPost: NativeAgentNotificationPostResult?
+        // The phone is a door only while a phone is paired with this Mac. An unreadable pairing file keeps the door: unknown is not none.
+        let noPhone = (try? PairedPhoneStore.pairedCountChecked(at: dataRoot.appendingPathComponent("paired_phones.json"))) == 0
         for (key, owed) in matter.owes.sorted(by: { $0.key < $1.key }) where key.hasPrefix("deliver:") && !owed.phase.isSettled {
             guard !stopped, !Task.isCancelled else { throw CancellationError() }
             guard let door = Door(address: owed.to) else {
@@ -120,7 +122,12 @@ public actor AttentionRouter {
             if case .conversation = door { continue }
             // Among the person's doors the Mac counts only while the person is at it (a caller that pinned the Mac named it); walking up later never alerts
             // again.
-            if door == .mac, matter.owes[Door.phone.key] != nil, !Self.atMac() {
+            if door == .mac, matter.owes[Door.phone.key] != nil, !noPhone, !Self.atMac() {
+                try await forPerson.letGo(id, door, .cancelled)
+                continue
+            }
+            // No phone is paired here: there is no door to fail at, so the matter stays with the Mac and Inbox.
+            if door == .phone, noPhone {
                 try await forPerson.letGo(id, door, .cancelled)
                 continue
             }

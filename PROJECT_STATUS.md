@@ -23,7 +23,7 @@ Diagnostics under Control → Advanced.
 
 | Area | Current source contract |
 |---|---|
-| Releases | Mac v0.6.23 is the current public release as of 2026-11-24 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through the App Store and TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
+| Releases | Mac v0.6.24 is the current public release as of 2026-11-28 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through the App Store and TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
 | iPhone link | Signed CloudKit records. Each side rings its bell (`chat.bell`, its newest sent record names) and the reader fetches bell and records by ID, so a message lands in seconds without waiting on CloudKit's query index; the query stays the backstop. See [the bell](docs/mobile_companion.md). |
 | Agent interface | The agent's one door, `app`, is always on. `app {}` is home; `page`, `item`, `find`, `action` and JavaScriptCore `script` reach capabilities through `AppActionRegistry`. |
 | Discovery | Pages and actions arrive in tool results. Argument binding and refused-call advice follow [the one-door contract](docs/ONE_DOOR.md). |

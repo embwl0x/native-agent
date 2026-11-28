@@ -1245,7 +1245,9 @@ The inbox (`ForPerson.inbox()`), held deliveries (`owed()`) and the phone's
 never a copy of a conversation: a matter is a row when it asks them, went wrong, or has no thread.
 
 The person's doors (`Door.person`): their phone always, the Telegram or Slack thread it came from, and the Mac, which is let go at
-send time when their own input does not show them there, so walking up later never alerts again. Two facts replace
+send time when their own input does not show them there, so walking up later never alerts again. The phone is let go at send time
+when no phone is paired with this Mac (an unreadable pairing file keeps it), and the Mac then keeps the matter whether or not they
+is at it. Two facts replace
 importance: an ask needs their answer, and a matter that went wrong breaks their quiet hours.
 An explicit pinned door also goes now for their own act: positive local Mac provenance
 (no peer origin or agent, explicitly not remote) needs neither a conversation nor request text.

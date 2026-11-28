@@ -4,6 +4,11 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.25 — no phone, no phone door (2026-11-28)
+
+- Delivery: a Mac with no paired iPhone no longer owes a delivery to the phone, so a relaunch files no "Delivery needs repair"; the Mac keeps
+  the matter whether or not the person is at it
+
 ## 0.6.24 — four places, one Table, a Stop that is a stop (2026-11-27)
 
 - Window: Simple shows Together, Table, the agent's own place and Control on Mac and iPhone; Command-K finds every page; one menu-bar line when
